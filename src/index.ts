@@ -149,16 +149,85 @@ export { ToolPermissionContext, createPermissionContext } from './tools/permissi
 export type { MemoryCategory, MemoryConfig } from './tools/memory-tool.js';
 
 // ---------------------------------------------------------------------------
+// Three-layer memory system
+// ---------------------------------------------------------------------------
+export { buildMemoryIndex }                                  from './memory/index-injector.js';
+export type { MemoryIndexOptions }                           from './memory/index-injector.js';
+
+export { TopicStore, getTopicStore, DEFAULT_TOPIC_DIR, COMMON_TOPICS } from './memory/topic-store.js';
+export type { TopicMeta, TopicSearchResult }                 from './memory/topic-store.js';
+
+export {
+  SessionLogger,
+  searchSessionLogs,
+  getRecentSessionLogs,
+  DEFAULT_SESSION_DIR,
+}                                                            from './memory/session-log.js';
+export type { SessionLogEntry, SessionSearchResult }         from './memory/session-log.js';
+
+// ---------------------------------------------------------------------------
+// Prompt assembly (AGENTS.md + Skills + Spec layers)
+// ---------------------------------------------------------------------------
+export { scanContent, stripYamlFrontmatter } from './prompt/injection-guard.js';
+export type { ScanResult }          from './prompt/injection-guard.js';
+
+export { loadAgentsMd }             from './prompt/agents-md.js';
+export type { AgentsMdResult, AgentsMdOptions } from './prompt/agents-md.js';
+
+export { resolveTaskSpec, formatTaskSpec } from './prompt/spec.js';
+export type { TaskSpec }            from './prompt/spec.js';
+
+export { loadSkills, formatSkills } from './prompt/skills.js';
+export type { Skill, SkillsConfig } from './prompt/skills.js';
+
+export { buildSystemPrompt }        from './prompt/builder.js';
+export type { SystemPromptLayers, BuiltPrompt } from './prompt/builder.js';
+
+// ---------------------------------------------------------------------------
+// Checkpoint (Gap 8 / Gap 9)
+// ---------------------------------------------------------------------------
+export {
+  CheckpointWriter,
+  generateRunId,
+  captureToDoSnapshot,
+  buildResumePrompt,
+} from './checkpoint/index.js';
+export type {
+  CheckpointData,
+  CheckpointSummary,
+  TodoSnapshot,
+} from './checkpoint/index.js';
+
+// ---------------------------------------------------------------------------
+// Verification — executable acceptance criteria (Principle 8)
+// ---------------------------------------------------------------------------
+export {
+  createVerificationGuard,
+  fileExists,
+  fileContains,
+  shellPasses,
+} from './verification/index.js';
+export type {
+  VerificationAssertion,
+  VerificationResult,
+} from './verification/index.js';
+
+// ---------------------------------------------------------------------------
 // Context
 // ---------------------------------------------------------------------------
 export { ContextCompressor, isContextLengthError } from './context/index.js';
 export type { CompressionConfig } from './context/index.js';
 
 // ---------------------------------------------------------------------------
-// Services
+// Services  (optional — import explicitly when needed; not part of core loop)
 // ---------------------------------------------------------------------------
-export { DreamService, getDreamService } from './services/dream.js';
-export type { DreamConfig } from './services/dream.js';
+// DreamService is a background memory-consolidation service.
+// It is intentionally NOT re-exported from the main entry point:
+// library consumers should opt-in explicitly rather than pulling in a
+// background service as a side-effect of importing the runtime.
+//
+//   import { DreamService, getDreamService } from '@hermes/runtime/services/dream';
+//
 
 // ---------------------------------------------------------------------------
 // Utils

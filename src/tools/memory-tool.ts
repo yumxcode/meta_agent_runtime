@@ -23,6 +23,8 @@ import path from 'path';
 import os from 'os';
 import { registerTools } from './registry.js';
 import type { ToolEntry, Observation, StalenessRisk } from '../types.js';
+import { getTopicStore }                               from '../memory/topic-store.js';
+import { searchSessionLogs, getRecentSessionLogs }     from '../memory/session-log.js';
 
 // ---------------------------------------------------------------------------
 // MemoryCategory
@@ -466,40 +468,53 @@ const memoryTools: ToolEntry[] = [
     definition: {
       name: 'memory',
       description:
-        'Manage persistent key-value memory entries across sessions. ' +
-        'Supports typed categories: user (user preferences/facts), feedback (agent lessons), ' +
-        'project (project state/decisions), reference (external knowledge). ' +
-        'Operations: read, write, delete, list, search, read_all, stats. ' +
-        'Use search to retrieve relevant entries by keyword rather than read_all. ' +
-        'Read results may include a staleness_risk hint — treat them as pointers, not ground truth.',
+        'Unified three-layer memory system. ' +
+        'Layer 1 (flat KV): read, write, delete, list, search, read_all, stats. ' +
+        'Layer 2 (topic files): list_topics, read_topic, write_topic, search_topics — ' +
+        'organises knowledge into per-domain markdown files; prefer read_topic over read_all. ' +
+        'Layer 3 (session logs): session_search, session_recent — ' +
+        'keyword search across persisted raw interaction history. ' +
+        'Read results include staleness_risk metadata — treat memories as hints, ' +
+        'not ground truth; verify against real environment when risk level is medium/high.',
       parameters: {
         type: 'object',
         properties: {
           operation: {
             type: 'string',
-            enum: ['read', 'write', 'delete', 'list', 'search', 'read_all', 'stats'],
+            enum: [
+              // Layer 1
+              'read', 'write', 'delete', 'list', 'search', 'read_all', 'stats',
+              // Layer 2
+              'list_topics', 'read_topic', 'write_topic', 'search_topics',
+              // Layer 3
+              'session_search', 'session_recent',
+            ],
             description: 'Operation to perform.',
           },
           key: {
             type: 'string',
-            description: 'Memory key. Can include category prefix like "project:api_key" or use the category field.',
+            description: 'Memory key (Layer 1). May include a category prefix, e.g. "project:api_key".',
           },
           value: {
             type: 'string',
-            description: 'Value to store (required for write).',
+            description: 'Value to store (required for write / write_topic).',
           },
           category: {
             type: 'string',
             enum: ['user', 'feedback', 'project', 'reference'],
-            description: 'Memory category for the entry. Helps organise and scope queries.',
+            description: 'Category for Layer 1 entries.',
+          },
+          topic: {
+            type: 'string',
+            description: 'Topic file name for Layer 2 operations (e.g. "architecture", "api-notes").',
           },
           query: {
             type: 'string',
-            description: 'Keyword query string for the search operation.',
+            description: 'Keyword query for search / search_topics / session_search.',
           },
           limit: {
             type: 'number',
-            description: 'Maximum number of search results to return (default 10).',
+            description: 'Max results to return (default: 10 for search, 20 for session_recent).',
           },
         },
         required: ['operation'],
@@ -507,11 +522,12 @@ const memoryTools: ToolEntry[] = [
     },
     handler: async (args, context): Promise<string | Observation> => {
       const operation = args['operation'] as string;
-      const key = args['key'] as string | undefined;
-      const value = args['value'] as string | undefined;
-      const category = args['category'] as MemoryCategory | undefined;
-      const query = args['query'] as string | undefined;
-      const limit = args['limit'] as number | undefined;
+      const key       = args['key']      as string | undefined;
+      const value     = args['value']    as string | undefined;
+      const category  = args['category'] as MemoryCategory | undefined;
+      const topic     = args['topic']    as string | undefined;
+      const query     = args['query']    as string | undefined;
+      const limit     = args['limit']    as number | undefined;
 
       const memoryPath = context.metadata?.['memoryPath'] as string | undefined;
       const store = getMemoryStore(memoryPath);
@@ -623,8 +639,91 @@ const memoryTools: ToolEntry[] = [
           ].join('\n');
         }
 
+        // -------------------------------------------------------------------
+        // Layer 2: Topic file operations
+        // -------------------------------------------------------------------
+
+        case 'list_topics': {
+          const ts     = getTopicStore(context.metadata?.['topicDir'] as string | undefined);
+          const topics = await ts.listTopics();
+          if (topics.length === 0) return 'No topic files found. Create one with write_topic.';
+          return topics
+            .map((t) => {
+              const tag  = t.isBuiltIn ? ' [built-in]' : ' [custom]';
+              const size = Math.round(t.fileSizeBytes / 1024);
+              return `${t.name}${tag}: ${t.entryCount} entries, ${size}KB — ${t.filePath}`;
+            })
+            .join('\n');
+        }
+
+        case 'read_topic': {
+          if (!topic) return 'Error: topic is required for read_topic';
+          const ts = getTopicStore(context.metadata?.['topicDir'] as string | undefined);
+          const content = await ts.readTopic(topic);
+          return content || `Topic "${topic}" is empty or does not exist.`;
+        }
+
+        case 'write_topic': {
+          if (!topic) return 'Error: topic is required for write_topic';
+          if (!key)   return 'Error: key is required for write_topic';
+          if (value === undefined) return 'Error: value is required for write_topic';
+          const ts = getTopicStore(context.metadata?.['topicDir'] as string | undefined);
+          const { warning } = await ts.write(topic, key, value);
+          const saved = `Saved "${key}" to topic "${topic}"`;
+          return warning ? `${saved}\n${warning}` : saved;
+        }
+
+        case 'search_topics': {
+          if (!query) return 'Error: query is required for search_topics';
+          const ts      = getTopicStore(context.metadata?.['topicDir'] as string | undefined);
+          const results = await ts.searchAll(query, limit ?? 10);
+          if (results.length === 0) return `No results across topic files for: "${query}"`;
+          return results
+            .map((r, i) => {
+              const risk = r.staleness ? ` ⚠️ [${r.staleness.level}]` : '';
+              return (
+                `${i + 1}. [${r.topic}] ${r.key}${risk} (score=${r.score})\n` +
+                `   ${r.preview}` +
+                (r.staleness ? `\n   ↳ ${r.staleness.hint}` : '')
+              );
+            })
+            .join('\n\n');
+        }
+
+        // -------------------------------------------------------------------
+        // Layer 3: Session log operations
+        // -------------------------------------------------------------------
+
+        case 'session_search': {
+          if (!query) return 'Error: query is required for session_search';
+          const sessionDir = context.metadata?.['sessionDir'] as string | undefined;
+          const results    = await searchSessionLogs(query, { sessionDir, limit: limit ?? 10 });
+          if (results.length === 0) return `No session log entries matched: "${query}"`;
+          return results
+            .map((r, i) => {
+              const when = new Date(r.ts).toLocaleString();
+              const src  = r.source === 'tool' ? `[tool:${r.toolName}]` : '[assistant]';
+              return `${i + 1}. ${when} | agent:${r.agentId} | iter:${r.iteration} ${src} (score=${r.score})\n   ${r.snippet}`;
+            })
+            .join('\n\n');
+        }
+
+        case 'session_recent': {
+          const sessionDir = context.metadata?.['sessionDir'] as string | undefined;
+          const entries    = await getRecentSessionLogs({ sessionDir, limit: limit ?? 20 });
+          if (entries.length === 0) return 'No session logs found.';
+          return entries
+            .map((e, i) => {
+              const when  = new Date(e.ts).toLocaleString();
+              const tools = e.toolCalls.map((tc) => tc.name).join(', ') || 'none';
+              const text  = e.assistantText.slice(0, 120) + (e.assistantText.length > 120 ? '…' : '');
+              return `${i + 1}. ${when} | agent:${e.agentId} | iter:${e.iteration}\n   ${text}\n   tools: ${tools}`;
+            })
+            .join('\n\n');
+        }
+
         default:
-          return `Unknown operation: "${operation}". Use: read, write, delete, list, search, read_all, stats`;
+          return `Unknown operation: "${operation}". Valid operations: read, write, delete, list, search, read_all, stats, list_topics, read_topic, write_topic, search_topics, session_search, session_recent`;
       }
     },
   },

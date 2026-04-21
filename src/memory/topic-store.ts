@@ -34,8 +34,11 @@ import type { StalenessRisk }               from '../types.js';
 
 export const DEFAULT_TOPIC_DIR = path.join(os.homedir(), '.hermes', 'topics');
 
-const BUILT_IN_TOPICS = ['user', 'project', 'feedback', 'reference'] as const;
-export type BuiltInTopic = (typeof BUILT_IN_TOPICS)[number];
+/**
+ * Common topic names — provided as a reference, not enforced by the runtime.
+ * Callers are free to use any topic names that fit their domain.
+ */
+export const COMMON_TOPICS = ['user', 'project', 'feedback', 'reference'] as const;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -119,7 +122,7 @@ export class TopicStore {
           filePath,
           entryCount:    stats.entries,
           fileSizeBytes: stats.fileSizeBytes,
-          isBuiltIn:     (BUILT_IN_TOPICS as readonly string[]).includes(name),
+          isBuiltIn:     (COMMON_TOPICS as readonly string[]).includes(name),
         });
       } catch { /* skip unreadable files */ }
     }

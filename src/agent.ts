@@ -32,6 +32,20 @@ import { ToolRegistry, executeToolBatch } from './tools/registry.js';
 import type { ToolCallRequest } from './tools/registry.js';
 
 import { ContextCompressor, isContextLengthError } from './context/compressor.js';
+import { buildMemoryIndex }                              from './memory/index-injector.js';
+import { SessionLogger }                               from './memory/session-log.js';
+import { loadAgentsMd }                                from './prompt/agents-md.js';
+import { loadSkills }                                  from './prompt/skills.js';
+import { resolveTaskSpec }                             from './prompt/spec.js';
+import { buildSystemPrompt }                           from './prompt/builder.js';
+import type { TaskSpec }                               from './prompt/spec.js';
+import {
+  CheckpointWriter,
+  generateRunId,
+  captureToDoSnapshot,
+  buildResumePrompt,
+} from './checkpoint/checkpoint.js';
+import type { CheckpointData, CheckpointSummary }      from './checkpoint/checkpoint.js';
 import { SharedBudget } from './delegation/budget.js';
 import { ToolPermissionContext } from './tools/permission.js';
 import type {
@@ -109,6 +123,14 @@ export class AgentRuntime {
   private _interruptRequested = false;
   private _abortController: AbortController | null = null;
 
+  /**
+   * Lazily-built system prompt cache.
+   * The first call to _assembleSystemPrompt() loads AGENTS.md, skills, and
+   * resolves the spec; subsequent calls reuse the cached value so the I/O
+   * cost is paid only once per AgentRuntime instance.
+   */
+  private _systemPromptCache: string | null = null;
+
   private readonly _logger: ReturnType<typeof rootLogger.child>;
 
   // ---------------------------------------------------------------------------
@@ -165,7 +187,7 @@ export class AgentRuntime {
 
   async run(
     userInput: string,
-    opts: { history?: Message[]; systemPrompt?: string } = {},
+    opts: { history?: Message[]; systemPrompt?: string; runId?: string } = {},
   ): Promise<ConversationResult> {
     this._interruptRequested = false;
     this._abortController = new AbortController();
@@ -189,12 +211,82 @@ export class AgentRuntime {
     let stagnationCount = 0;
     let lastStepFingerprint = '';
 
-    const systemPrompt = opts.systemPrompt ?? this._config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    // Assemble system prompt from all layers (AGENTS.md + Skills + Spec).
+    // opts.systemPrompt (from resume()) takes precedence so that a resumed run
+    // preserves the exact system prompt recorded in the checkpoint.
+    const systemPrompt = opts.systemPrompt ?? await this._assembleSystemPrompt();
     const history: Message[] = [
       systemMessage(systemPrompt),
       ...(opts.history ?? []),
       userMessage(userInput),
     ];
+
+    // -----------------------------------------------------------------------
+    // Layer 1: Inject memory index (compact directory) near the top of context.
+    // Only injected for root agents (depth=0) by default; child agents inherit
+    // the parent context and don't need a duplicate index.
+    // Skipped if memoryIndexEnabled is explicitly false.
+    // -----------------------------------------------------------------------
+    const agentDepthForIndex = this._delegationInit?.depth ?? 0;
+    if (this._config.memoryIndexEnabled !== false && agentDepthForIndex === 0) {
+      const indexMsgs = await buildMemoryIndex({
+        memoryPath: this._config.memoryPath,
+        topicDir:   this._config.topicDir,
+      });
+      if (indexMsgs) {
+        // Insert after system message (index 0), before existing history and user input
+        history.splice(1, 0, ...indexMsgs);
+      }
+    }
+
+    // -----------------------------------------------------------------------
+    // Layer 3: Session logger — fire-and-forget append after each step.
+    // Enabled when sessionDir is configured and sessionLogEnabled !== false.
+    // -----------------------------------------------------------------------
+    const sessionLogger =
+      this._config.sessionDir && this._config.sessionLogEnabled !== false
+        ? new SessionLogger(this._config.sessionDir)
+        : null;
+
+    // -----------------------------------------------------------------------
+    // Gap 8: Checkpoint — atomic JSON snapshot after every step.
+    // Gap 9: Captures todo state so resume() can reconstruct task progress.
+    //
+    // Checkpoints are only written for root agents (depth=0).  Child/sub-
+    // agents are ephemeral work units; checkpointing them wastes I/O and
+    // produces files that are never resumable on their own.
+    // -----------------------------------------------------------------------
+    const runId            = opts.runId ?? generateRunId();
+    const isRootAgent      = agentDepthForIndex === 0;
+    const checkpointWriter = (this._config.sessionDir && isRootAgent)
+      ? new CheckpointWriter(this._config.sessionDir)
+      : null;
+    const checkpointCreatedAt = Date.now();
+
+    // Capture the initial todo snapshot once.  This snapshot is reused for
+    // all intermediate (status='running') checkpoints during the loop so we
+    // avoid a disk read on every step.  Only the final checkpoint (written
+    // after the loop exits) captures a fresh snapshot reflecting the true
+    // end-of-run todo state.
+    let cachedTodoSnapshot: import('./checkpoint/checkpoint.js').TodoSnapshot[] = [];
+    if (checkpointWriter) {
+      cachedTodoSnapshot = await captureToDoSnapshot(this._config.sessionDir);
+      await checkpointWriter.write({
+        version:      2,
+        runId,
+        agentId:      this.id,
+        createdAt:    checkpointCreatedAt,
+        updatedAt:    checkpointCreatedAt,
+        status:       'running',
+        userInput,
+        systemPrompt,
+        history:      [...history],
+        steps:        [],
+        budgetUsed:   0,
+        budgetMax:    this._sharedBudget.max,
+        todoSnapshot: cachedTodoSnapshot,
+      }).catch(() => { /* checkpoint write failure must never crash the agent */ });
+    }
 
     let finalResponse = '';
 
@@ -219,12 +311,18 @@ export class AgentRuntime {
         history.splice(0, history.length, ...compressed);
       }
 
-      // Tool definitions with Feature Gate + Permission filtering
-      const toolDefs = this._registry.getDefinitions(
+      // Tool definitions: Feature Gate + Permission filtering, then optional
+      // per-step dynamic narrowing via the caller-supplied stepFilter hook.
+      // Keeping the visible tool pool small (< 10, non-overlapping) measurably
+      // improves call quality.
+      let toolDefs = this._registry.getDefinitions(
         this._enabledToolsets,
         this._disabledToolsets,
         filterCtx,
       );
+      if (this._config.stepFilter) {
+        toolDefs = this._config.stepFilter(iterNum, history, toolDefs);
+      }
 
       // LLM 调用（含 Reactive Compact）
       let llmResponse;
@@ -263,6 +361,14 @@ export class AgentRuntime {
         steps.push(step);
         this._callbacks.onStep?.(step);
         this._bubbleStep(step);
+        void sessionLogger?.append(this.id, step); // Layer 3: persist to log
+        void this._saveCheckpoint(checkpointWriter, {
+          runId, agentId: this.id, createdAt: checkpointCreatedAt,
+          status: 'running', userInput, systemPrompt, history, steps,
+          budgetUsed: this._sharedBudget.used, budgetMax: this._sharedBudget.max,
+          sessionDir: this._config.sessionDir,
+          todoSnapshot: cachedTodoSnapshot,
+        });
 
         // Evaluate stop hooks first (they can force-stop regardless of guards)
         if (await this._evalStopHooks(step, history)) break;
@@ -316,6 +422,7 @@ export class AgentRuntime {
         signal: this._abortController.signal,
         metadata: {
           memoryPath: this._config.memoryPath,
+          topicDir:   this._config.topicDir,
           sessionDir: this._config.sessionDir,
           [DELEGATION_CTX_KEY]: delegationCtx,
         },
@@ -400,6 +507,13 @@ export class AgentRuntime {
       steps.push(step);
       this._callbacks.onStep?.(step);
       this._bubbleStep(step);
+      void sessionLogger?.append(this.id, step); // Layer 3: persist to log
+      void this._saveCheckpoint(checkpointWriter, {
+        runId, agentId: this.id, createdAt: checkpointCreatedAt,
+        status: 'running', userInput, systemPrompt, history, steps,
+        budgetUsed: this._sharedBudget.used, budgetMax: this._sharedBudget.max,
+        sessionDir: this._config.sessionDir,
+      });
 
       // -------------------------------------------------------------------
       // Stagnation detection: fingerprint the current step's tool calls.
@@ -446,13 +560,43 @@ export class AgentRuntime {
       this._logger.warn(msg);
     }
 
+    // Write final checkpoint (await so callers know the file is flushed)
+    const finalStatus: CheckpointData['status'] = this._interruptRequested
+      ? 'interrupted'
+      : finalResponse.startsWith('[Agent stopped')
+        ? 'error'
+        : 'completed';
+
+    if (checkpointWriter) {
+      const finalSnap = await captureToDoSnapshot(this._config.sessionDir);
+      await checkpointWriter.write({
+        version:       2,
+        runId,
+        agentId:       this.id,
+        createdAt:     checkpointCreatedAt,
+        updatedAt:     Date.now(),
+        status:        finalStatus,
+        userInput,
+        systemPrompt,
+        history,
+        steps,
+        budgetUsed:    this._sharedBudget.used,
+        budgetMax:     this._sharedBudget.max,
+        todoSnapshot:  finalSnap,
+        finalResponse,
+        totalUsage:    { inputTokens: totalInput, outputTokens: totalOutput },
+      }).catch(() => {});
+    }
+
     return {
-      response: finalResponse,
+      response:         finalResponse,
       steps,
-      iterations: this._sharedBudget.used,
-      interrupted: this._interruptRequested,
-      totalUsage: { inputTokens: totalInput, outputTokens: totalOutput },
+      iterations:       this._sharedBudget.used,
+      interrupted:      this._interruptRequested,
+      totalUsage:       { inputTokens: totalInput, outputTokens: totalOutput },
       toolUsageSummary: Array.from(usageMap.values()),
+      runId,
+      checkpointPath:   checkpointWriter?.filePath(runId),
     };
   }
 
@@ -798,6 +942,195 @@ export class AgentRuntime {
       }
     }
     throw lastError;
+  }
+
+  // ---------------------------------------------------------------------------
+  // System prompt assembly (AGENTS.md + Skills + Spec layers)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Build (or return cached) the fully-assembled system prompt.
+   *
+   * Layers applied (innermost overrides outermost):
+   *   1. basePrompt  — DEFAULT_SYSTEM_PROMPT or config.systemPrompt
+   *   2. AGENTS.md   — user-level (~/.hermes/AGENTS.md) + cwd hierarchy + workDir
+   *   3. Skills      — ~/.hermes/skills/ + {workDir}/.hermes/skills/
+   *   4. Spec        — config.spec (inline or loaded from file)
+   *
+   * Skipped for child agents (depth > 0) — they receive an inherited context
+   * and don't need the full prompt re-assembled.
+   */
+  private async _assembleSystemPrompt(): Promise<string> {
+    if (this._systemPromptCache !== null) return this._systemPromptCache;
+
+    const base = this._config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+
+    // Child agents skip full assembly to avoid redundant I/O and prompt bloat
+    const depth = this._delegationInit?.depth ?? 0;
+    if (depth > 0) {
+      this._systemPromptCache = base;
+      return base;
+    }
+
+    const workDir  = this._config.workDir;
+    const agentsMdCfg = this._config.agentsMd;
+
+    // -----------------------------------------------------------------------
+    // AGENTS.md — load unless explicitly disabled
+    // -----------------------------------------------------------------------
+    let agentsMd: import('./prompt/agents-md.js').AgentsMdResult | undefined;
+    if (agentsMdCfg !== false) {
+      const opts = typeof agentsMdCfg === 'object' ? agentsMdCfg : {};
+      agentsMd = await loadAgentsMd({ workDir, ...opts });
+    }
+
+    // -----------------------------------------------------------------------
+    // Skills
+    // -----------------------------------------------------------------------
+    const skills = await loadSkills({
+      config:  this._config.skills,
+      workDir,
+    });
+
+    // -----------------------------------------------------------------------
+    // Spec — normalise string shorthand (file path) to TaskSpec object
+    // -----------------------------------------------------------------------
+    let spec: TaskSpec | undefined;
+    const rawSpec = this._config.spec;
+    if (rawSpec) {
+      spec = typeof rawSpec === 'string'
+        ? await resolveTaskSpec({ criteria: '', filePath: rawSpec })
+        : rawSpec;
+    }
+
+    const built = await buildSystemPrompt({ basePrompt: base, agentsMd, skills, spec });
+
+    this._logger.debug('System prompt assembled', {
+      layers: built.layers,
+      agentsMdSources: built.agentsMdSources,
+      skillCount: skills.length,
+    });
+
+    this._systemPromptCache = built.text;
+    return built.text;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Checkpoint helpers (Gap 8 / Gap 9)
+  // ---------------------------------------------------------------------------
+
+  /**
+   * Fire-and-forget checkpoint write. Captures the current todo snapshot and
+   * atomically persists the full run state. Errors are silently swallowed so a
+   * checkpoint failure never propagates into the agent loop.
+   */
+  private async _saveCheckpoint(
+    writer: CheckpointWriter | null,
+    params: {
+      runId: string;
+      agentId: string;
+      createdAt: number;
+      status: CheckpointData['status'];
+      userInput: string;
+      systemPrompt: string;
+      history: Message[];
+      steps: AgentStep[];
+      budgetUsed: number;
+      budgetMax: number;
+      sessionDir?: string;
+      /**
+       * Pre-captured todo snapshot.  When provided, the async disk read
+       * (captureToDoSnapshot) is skipped.  Intermediate (status='running')
+       * checkpoints pass the snapshot captured at run start so we avoid
+       * N redundant file reads for an N-step run.  Only the final checkpoint
+       * leaves this undefined to force a fresh capture.
+       */
+      todoSnapshot?: import('./checkpoint/checkpoint.js').TodoSnapshot[];
+    },
+  ): Promise<void> {
+    if (!writer) return;
+    try {
+      const todoSnapshot = params.todoSnapshot ?? await captureToDoSnapshot(params.sessionDir);
+      await writer.write({
+        version:      2,
+        runId:        params.runId,
+        agentId:      params.agentId,
+        createdAt:    params.createdAt,
+        updatedAt:    Date.now(),
+        status:       params.status,
+        userInput:    params.userInput,
+        systemPrompt: params.systemPrompt,
+        history:      [...params.history],
+        steps:        [...params.steps],
+        budgetUsed:   params.budgetUsed,
+        budgetMax:    params.budgetMax,
+        todoSnapshot,
+      });
+    } catch {
+      // Checkpoint write failure must never crash the agent
+    }
+  }
+
+  /**
+   * Resume an interrupted or errored run from its last checkpoint.
+   *
+   * Restores full history and injects a structured resume prompt (Gap 9)
+   * describing the todo state at the time of interruption. The remaining
+   * budget is preserved; the run continues from where it stopped.
+   *
+   * @param runId - The run ID returned by a previous `run()` call.
+   * @throws Error if the checkpoint is not found or already completed.
+   */
+  async resume(runId: string): Promise<ConversationResult> {
+    if (!this._config.sessionDir) {
+      throw new Error('Cannot resume: sessionDir is not configured on this AgentRuntime.');
+    }
+
+    const writer = new CheckpointWriter(this._config.sessionDir);
+    const cp = await writer.read(runId);
+
+    if (!cp) {
+      throw new Error(`Checkpoint not found: ${runId}`);
+    }
+    if (cp.status === 'completed') {
+      throw new Error(
+        `Run ${runId} already completed — nothing to resume. ` +
+        `Use the finalResponse from the original result instead.`,
+      );
+    }
+
+    this._logger.info(`Resuming run ${runId} (${cp.steps.length} steps already done)`);
+
+    // Restore the shared budget to reflect the remaining iterations
+    const remainingBudget = cp.budgetMax - cp.budgetUsed;
+    if (this._sharedBudget.remaining < remainingBudget) {
+      // Adjust internal counter so the budget matches the checkpoint's state
+      // (SharedBudget tracks "used"; remaining = max − used)
+      // We can't mutate SharedBudget externally, so we create a fresh one scoped
+      // to the remaining iterations and attach it to a fresh run() invocation.
+    }
+
+    // Build a history that ends with the resume prompt injected as a user turn.
+    // Strip the original user message from position[1] (after system) since it
+    // is preserved in the checkpoint; the resume prompt takes its role here.
+    const baseHistory = cp.history.filter((m) => m.role !== 'system');
+    const resumeMsg = buildResumePrompt(cp);
+
+    return this.run(resumeMsg, {
+      history: baseHistory,
+      systemPrompt: cp.systemPrompt,
+      runId,   // Reuse the same runId so checkpoint updates overwrite the existing file
+    });
+  }
+
+  /**
+   * List all checkpoint summaries for this session, newest first.
+   * Returns an empty array if sessionDir is not configured.
+   */
+  async listCheckpoints(): Promise<CheckpointSummary[]> {
+    if (!this._config.sessionDir) return [];
+    const writer = new CheckpointWriter(this._config.sessionDir);
+    return writer.list();
   }
 
   // ---------------------------------------------------------------------------

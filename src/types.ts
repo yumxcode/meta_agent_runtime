@@ -306,6 +306,31 @@ export interface AgentConfig {
   fallbacks?: FallbackConfig[];
   /** System prompt. If omitted a default is used. */
   systemPrompt?: string;
+  /**
+   * Project working directory.  Used by the prompt-assembly pipeline:
+   *  - AGENTS.md walk starts here (in addition to process.cwd())
+   *  - Skills are looked up in {workDir}/.hermes/skills/
+   * Defaults to process.cwd() when not specified.
+   */
+  workDir?: string;
+  /**
+   * AGENTS.md loading options.
+   * Set to `false` to disable AGENTS.md loading entirely.
+   * Set to an object to customise discovery (extra dirs, disable global, etc.)
+   * @default true  (auto-loads from standard hierarchy)
+   */
+  agentsMd?: boolean | import('./prompt/agents-md.js').AgentsMdOptions;
+  /**
+   * Task acceptance criteria spec.  Injected as the final section of the
+   * system prompt so it has the highest recency weight.
+   * Can also be the path to a .json / .md spec file.
+   */
+  spec?: import('./prompt/spec.js').TaskSpec | string;
+  /**
+   * Skills configuration — reusable operation procedures loaded from
+   * ~/.hermes/skills/ and {workDir}/.hermes/skills/.
+   */
+  skills?: import('./prompt/skills.js').SkillsConfig;
   /** Maximum tool-call iterations before stopping. */
   maxIterations?: number;
   /** Which toolsets to enable. Defaults to ['file', 'web', 'terminal', 'memory', 'todo']. */
@@ -314,8 +339,24 @@ export interface AgentConfig {
   disabledToolsets?: Toolset[];
   /** Path to the memory file (MEMORY.md). Defaults to ~/.hermes/MEMORY.md */
   memoryPath?: string;
-  /** Path to the session directory for history persistence. */
+  /** Path to the session directory for history persistence and session logs. */
   sessionDir?: string;
+  /**
+   * Layer 2: Directory for per-topic memory files.
+   * Defaults to ~/.hermes/topics
+   */
+  topicDir?: string;
+  /**
+   * Layer 1: Whether to auto-inject the memory index at the start of each
+   * run() call. Enabled by default; set false to disable for child agents or
+   * latency-sensitive use cases.
+   */
+  memoryIndexEnabled?: boolean;
+  /**
+   * Layer 3: Whether to persist AgentSteps to session JSONL logs.
+   * Enabled by default when sessionDir is set. Set false to disable.
+   */
+  sessionLogEnabled?: boolean;
   /** Context window fraction at which compression is triggered (0–1). Default 0.5 */
   compressionThreshold?: number;
   /** Max concurrent parallel tool executions. Default 4. */
@@ -348,6 +389,32 @@ export interface AgentConfig {
    * to avoid infinite continuation.
    */
   completionGuards?: CompletionGuard[];
+  /**
+   * Dynamic tool-narrowing hook — called before every LLM invocation.
+   *
+   * Receives the current iteration number, the full conversation history, and
+   * the complete set of available tool definitions.  Returns the subset that
+   * the LLM should see for this step.  Return the input array unchanged to use
+   * the full tool pool.
+   *
+   * Rationale (Principle 4): keeping the visible tool pool small (< 10,
+   * non-overlapping) measurably improves call quality.  This hook is the
+   * primary mechanism for achieving that — it lets callers phase-in tools,
+   * restrict capabilities by task type, or gate tools on prior tool results.
+   *
+   * @example Phase-based filtering
+   * ```ts
+   * stepFilter: (step, _history, tools) =>
+   *   step < 3
+   *     ? tools.filter(t => ['web_search', 'read_file'].includes(t.name))
+   *     : tools,
+   * ```
+   */
+  stepFilter?: (
+    step:    number,
+    history: Message[],
+    tools:   ToolDefinition[],
+  ) => ToolDefinition[];
   /** Event / progress callbacks. */
   callbacks?: AgentCallbacks;
 }
@@ -384,6 +451,16 @@ export interface ConversationResult {
   };
   /** Per-tool usage statistics for this run. */
   toolUsageSummary: ToolUsageSummary[];
+  /**
+   * Unique run identifier. Always present; use with AgentRuntime.resume(runId)
+   * to continue an interrupted run.
+   */
+  runId: string;
+  /**
+   * Absolute path of the checkpoint file (only set when sessionDir is configured
+   * and checkpointing is enabled).
+   */
+  checkpointPath?: string;
 }
 
 // ---------------------------------------------------------------------------
