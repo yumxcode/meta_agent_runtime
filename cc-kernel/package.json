@@ -1,0 +1,32 @@
+{
+  "name": "@meta-agent/cc-kernel",
+  "version": "0.1.0",
+  "description": "Claude Code QueryEngine + AppState — built from CC source for meta-agent internal use",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "node ../../scripts/build-kernel.mjs"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.54.0",
+    "@modelcontextprotocol/sdk": "^1.12.0",
+    "lodash-es": "^4.17.21",
+    "p-map": "^7.0.3",
+    "strip-ansi": "^7.1.0",
+    "zod": "^3.24.0"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "private": true,
+  "devDependencies": {
+    "esbuild": "^0.28.0"
+  }
+}

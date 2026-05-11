@@ -1,0 +1,39 @@
+{
+  "name": "@meta-agent/runtime",
+  "version": "0.1.0",
+  "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "import": "./dist/index.js",
+      "types": "./dist/index.d.ts"
+    }
+  },
+  "scripts": {
+    "build": "tsc --project tsconfig.json",
+    "dev": "tsc --project tsconfig.json --watch",
+    "test": "tsx examples/mock-test.ts && tsx examples/smoke-test-mock-server.ts",
+    "test:unit": "tsx examples/mock-test.ts",
+    "test:smoke": "tsx examples/smoke-test-mock-server.ts",
+    "test:live": "tsx examples/smoke-test.ts",
+    "test:deepseek": "tsx examples/smoke-test-deepseek.ts",
+    "test:provider": "tsx examples/smoke-test-deepseek.ts",
+    "inspect:prompt": "tsx examples/inspect-prompt.ts",
+    "inspect:prompt:live": "INSPECT_LIVE=1 tsx examples/inspect-prompt.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.54.0",
+    "@meta-agent/cc-kernel": "*"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "tsx": "^4.21.0",
+    "typescript": "^6.0.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  }
+}
