@@ -34,6 +34,7 @@ export type {
   SubAgentStatus,
   SubAgentConfig,
   SubAgentResult,
+  SubAgentProgressState,
   SubAgentRecord,
   CampaignEventMap,
   SubAgentCompletedEvent,

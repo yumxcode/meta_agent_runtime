@@ -18,12 +18,13 @@ import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import type { MetaAgentConfig, ResolvedConfig } from '../core/config.js'
 import type { MetaAgentTool } from '../core/types.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
-import { writeTask } from './SubAgentTaskStore.js'
+import { writeTask, readTask } from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
   TERMINAL_STATUSES,
   type SubAgentRecord,
   type SubAgentResult,
+  type SubAgentProgressState,
   type SubAgentTaskId,
 } from './types.js'
 
@@ -36,6 +37,54 @@ const ERROR_MAX_CHARS   = 500
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 3) + '...'
+}
+
+// ── Progress state extraction ─────────────────────────────────────────────────
+
+/** Regex matching provenance IDs: prov-{8+ hex chars} */
+const PROV_ID_RE = /\bprov-[a-f0-9]{8,}\b/g
+
+/**
+ * Regex for numbered-step markers.  Matches common patterns:
+ *   "Step 1:", "Step 1 —", "## Step 2", "**Step 3**", "### 4."
+ * Counts distinct step numbers to avoid inflating from repeated references.
+ */
+const STEP_NUMBER_RE = /(?:^|\s)(?:##+ )?(?:\*{0,2})step\s+(\d+)(?:\*{0,2})?(?:[:\s—]|$)/gim
+
+/**
+ * Extract a `SubAgentProgressState` from the accumulated output text.
+ *
+ * This is best-effort regex analysis — callers must treat the output as an
+ * orientation cue only, not as authoritative structured data.
+ */
+function extractProgressState(
+  text: string,
+  toolCallsCompleted: number,
+  lastCheckpoint: string | undefined,
+): SubAgentProgressState {
+  // Collect unique provenance IDs
+  const provenanceIds: string[] = []
+  const seenIds = new Set<string>()
+  for (const match of text.matchAll(PROV_ID_RE)) {
+    const id = match[0]
+    if (!seenIds.has(id)) {
+      seenIds.add(id)
+      provenanceIds.push(id)
+    }
+  }
+
+  // Count distinct step numbers (not raw match count — avoids double-counting)
+  const stepNums = new Set<string>()
+  for (const match of text.matchAll(STEP_NUMBER_RE)) {
+    if (match[1]) stepNums.add(match[1])
+  }
+
+  return {
+    toolCallsCompleted,
+    provenanceIds,
+    stepsCompleted: stepNums.size,
+    ...(lastCheckpoint ? { lastCheckpoint } : {}),
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -126,6 +175,7 @@ export class SubAgentRunner {
     let turnsUsed = 0
     let inputTokens = 0
     let outputTokens = 0
+    let toolResultCount = 0   // counts completed tool-call rounds (turn proxy)
 
     // Build the isolated session config.
     // Forward provider credentials from the parent session when explicit —
@@ -172,7 +222,6 @@ export class SubAgentRunner {
 
       // Run the agentic loop — consume the generator
       const gen = this.session.submit(cfg.taskDescription)
-      let toolResultCount = 0   // counts completed tool-call rounds (turn proxy)
 
       for await (const event of gen) {
         // Accumulate text
@@ -210,6 +259,9 @@ export class SubAgentRunner {
               outputTokens,
               costUsd:      event.totalCostUsd,
               durationMs:   Date.now() - startMs,
+              progressState: extractProgressState(
+                lastText, toolResultCount, this.record.latestCheckpoint,
+              ),
             })
             return
           }
@@ -226,6 +278,9 @@ export class SubAgentRunner {
             outputTokens,
             costUsd:      event.totalCostUsd,
             durationMs:   Date.now() - startMs,
+            progressState: extractProgressState(
+              lastText, toolResultCount, this.record.latestCheckpoint,
+            ),
           }
 
           await this._writeTerminal(isError ? 'failed' : 'completed', result)
@@ -243,6 +298,9 @@ export class SubAgentRunner {
         outputTokens,
         costUsd:      this.session.getEstimatedCost(),
         durationMs:   Date.now() - startMs,
+        progressState: extractProgressState(
+          lastText, toolResultCount, this.record.latestCheckpoint,
+        ),
       })
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err)
@@ -255,6 +313,9 @@ export class SubAgentRunner {
         outputTokens,
         costUsd:      this.session?.getEstimatedCost() ?? 0,
         durationMs:   Date.now() - startMs,
+        progressState: extractProgressState(
+          lastText, toolResultCount, this.record.latestCheckpoint,
+        ),
       })
     }
   }
@@ -287,7 +348,18 @@ export class SubAgentRunner {
     result: SubAgentResult,
   ): Promise<void> {
     // Guard against double-terminal (e.g. abort + error racing)
+    // Guard against double-terminal writes.
+    // IMPORTANT: also guard if the in-memory record is 'running' but the on-disk
+    // record has already been set to 'cancelled' by SubAgentBridge.cancelTask().
+    // Re-read the disk state to pick up any external cancellation.
     if (TERMINAL_STATUSES.has(this.record.status) && this.record.status !== 'running') return
+    const diskRecord = await readTask(this.record.taskId)
+    if (diskRecord && TERMINAL_STATUSES.has(diskRecord.status)) {
+      // Another code path (e.g. cancelTask) already wrote a terminal state.
+      // Update our in-memory record but do not overwrite the disk state.
+      this.record.status = diskRecord.status
+      return
+    }
 
     this.record.status      = status
     this.record.completedAt = Date.now()

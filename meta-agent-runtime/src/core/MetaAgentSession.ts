@@ -16,7 +16,8 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
-import { resolveConfig, DEFAULT_SYSTEM_PROMPT, type MetaAgentConfig, type ResolvedConfig } from './config.js'
+import { resolveConfig, isAnthropicProvider, DEFAULT_SYSTEM_PROMPT, type MetaAgentConfig, type ResolvedConfig } from './config.js'
+import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import {
   EMPTY_USAGE,
   accumulateUsage,
@@ -26,6 +27,7 @@ import {
   type MetaAgentTool,
   type TokenUsage,
   type ToolCallContext,
+  type ToolDescriptionContext,
 } from './types.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
 import { SectionRegistry } from './systemPromptSections.js'
@@ -33,6 +35,11 @@ import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from './stati
 import { buildDynamicSections, type AgentMode, type OutputStyle } from './dynamicPrompt.js'
 import { shouldCompact, runCompact } from './compact/autoCompact.js'
 import { saveStateSnapshot, cleanupStateSnapshot } from './compact/stateSnapshot.js'
+import {
+  saveRunStateSnapshot,
+  cleanupRunStateSnapshot,
+} from './compact/runStateSnapshot.js'
+import type { TaskContract } from './contract/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Cost estimation (approximate, based on public pricing)
@@ -83,6 +90,23 @@ export class MetaAgentSession {
   private totalUsage: TokenUsage
   private toolRegistry: Map<string, MetaAgentTool>
 
+  // ── Tool description cache ────────────────────────────────────────────────
+  /**
+   * Resolved description strings, keyed by tool name.
+   *
+   * Mirrors CC's toolSchemaCache: descriptions are resolved once per session
+   * (the first time buildApiToolsAsync() is called) and then reused.
+   * The cache is invalidated (flag set to true) whenever registerTool() adds
+   * or replaces a tool, so cross-tool references always reflect the current
+   * registry.
+   */
+  private _descriptionCache = new Map<string, string>()
+  /**
+   * When true, _descriptionCache must be rebuilt before the next API call.
+   * Starts true so the first submit() always populates the cache.
+   */
+  private _descriptionCacheDirty = true
+
   // ── Prompt engineering ────────────────────────────────────────────────────
   /** Cached once per deployment; never changes within a session. */
   private readonly staticPrompt: string = buildStaticSystemPrompt()
@@ -112,6 +136,14 @@ export class MetaAgentSession {
   private _lastSystemPrompt: string | null = null
 
   /**
+   * Plan-mode flag — shared mutable ref so EnterPlanMode / ExitPlanMode tools
+   * can flip it without holding a reference to the session itself.
+   * When true, every non-concurrency-safe tool call must be approved by the
+   * user via askUser() before it executes.
+   */
+  readonly _planModeRef: { active: boolean } = { active: false }
+
+  /**
    * Guards against concurrent submit() calls on the same session instance.
    *
    * MetaAgentSession is NOT concurrent-safe: mutableMessages is a plain array
@@ -122,6 +154,21 @@ export class MetaAgentSession {
    * immediate error rather than silently corrupting the conversation state.
    */
   private _submitInFlight = false
+
+  /**
+   * Optional SubAgentBridge — set via setSubAgentBridge().
+   * When present, D11 sub-agent notification section is injected every turn.
+   */
+  private _subAgentBridge: SubAgentBridge | undefined = undefined
+
+  /**
+   * Optional TaskContract — set via setTaskContract().
+   * When present, a memoized D0 goal-anchor section is prepended to every
+   * prompt turn so the model always sees the original user intent and
+   * acceptance criteria, even after compaction.
+   * Also embedded in RunStateSnapshots on circuit-breaker exits.
+   */
+  private _taskContract: TaskContract | undefined = undefined
 
   constructor(config: MetaAgentConfig = {}) {
     // Capture sentinel BEFORE resolveConfig() fills in the default — this is
@@ -233,10 +280,22 @@ export class MetaAgentSession {
       language: this.config.language,
       mcpServers: this.config.mcpServers,
       outputStyle: this.config.outputStyle,
-      // Per-query memory relevance: pass current prompt + client so D1b can
-      // select the most relevant topic files via Haiku side-call.
+      // Per-query memory relevance: only pass the client for Anthropic-backed
+      // sessions.  Third-party providers (DeepSeek, Qwen, custom proxies) do not
+      // expose claude-haiku-4-5-20251001, so the side-call would error.
+      // findRelevantMemories falls back to keyword matching when client is absent.
       currentQuery: prompt,
-      client: this.client,
+      client: isAnthropicProvider(this.config.baseURL) ? this.client : undefined,
+      // D11: sub-agent notifications — present when a bridge is attached via
+      // setSubAgentBridge().  Drains pending notifications into every prompt.
+      subAgentBridge: this._subAgentBridge,
+      // D0: task contract goal anchor — present when a contract is attached via
+      // setTaskContract().  Injected above all other dynamic sections so the
+      // original user intent is never displaced by compaction or volatile context.
+      taskContract: this._taskContract,
+      // D1c: agent directives — load AGENT.md from the project directory.
+      // Falls back to process.cwd() when projectDir is not set in config.
+      projectDir: this.config.projectDir,
     })
 
     const dynamicPrompt = await this.sectionRegistry.resolveToString(dynamicSections)
@@ -274,6 +333,18 @@ export class MetaAgentSession {
       // Budget guard
       const currentCost = estimateCost(this.config.model, this.totalUsage)
       if (currentCost >= this.config.maxBudgetUsd) {
+        // Persist a recoverable snapshot before yielding so callers can resume
+        // with full context about what was done and what remains.
+        void saveRunStateSnapshot({
+          sessionId:       this.sessionId,
+          taskContractId:  this._taskContract?.contractId,
+          stopReason:      'max_budget',
+          turnsUsed:       turnCount,
+          costUsd:         currentCost,
+          accumulatedText: accumulatedText,
+          sessionStartMs:  this.sessionStartMs,
+          rtx:             this.config.runtimeContext,
+        }).catch(() => {})
         yield {
           type: 'result',
           subtype: 'error_max_budget',
@@ -295,8 +366,8 @@ export class MetaAgentSession {
       // Build Anthropic API messages (convert internal format)
       const apiMessages = this.buildApiMessages()
 
-      // Build tool schemas for the API
-      const apiTools = this.buildApiTools()
+      // Build tool schemas for the API (resolves dynamic descriptions, cached)
+      const apiTools = await this.buildApiToolsAsync()
 
       // ── Stream one API response ─────────────────────────────────────────
       let toolUseCalls: Anthropic.ToolUseBlock[] = []
@@ -382,7 +453,16 @@ export class MetaAgentSession {
         // finalMsg.usage.input_tokens is the actual context size used this turn
         // (system prompt + all messages). If it exceeds our threshold, compact
         // the conversation history before the next turn to stay within limits.
-        if (shouldCompact(this.config.model, finalMsg.usage.input_tokens)) {
+        //
+        // CRITICAL SAFETY GUARD: never compact when the model returned tool_use
+        // blocks.  At this point the assistant message (with tool_use) has been
+        // pushed to history but the corresponding tool_result blocks have NOT
+        // yet been appended.  Compacting here would remove the tool_use blocks,
+        // leaving orphaned tool_result blocks in the next API call — which
+        // violates the Anthropic message protocol and causes HTTP 400 errors.
+        // We defer compaction until the start of the NEXT clean turn (where
+        // toolUseCalls.length === 0 and all results are already in history).
+        if (toolUseCalls.length === 0 && shouldCompact(this.config.model, finalMsg.usage.input_tokens)) {
           // Persist current state before compacting so the compact summary
           // can reference all provenance IDs produced in this session.
           await saveStateSnapshot(
@@ -435,6 +515,11 @@ export class MetaAgentSession {
       // ── If model stopped naturally, we're done ──────────────────────────
       if (lastStopReason === 'end_turn' || toolUseCalls.length === 0) {
         const totalCost = estimateCost(this.config.model, this.totalUsage)
+        // On successful completion, delete any stale RunStateSnapshot from a
+        // prior circuit-breaker hit so resumed sessions start clean.
+        void cleanupRunStateSnapshot(
+          this.sessionId, this._taskContract?.contractId,
+        ).catch(() => {})
         yield {
           type: 'result',
           subtype: 'success',
@@ -462,32 +547,86 @@ export class MetaAgentSession {
         }
       }
 
-      // Step 2: execute all tools in parallel.
-      // allSettled (vs all) ensures that one tool throwing does not silently
-      // abandon the other in-flight calls — every result is accounted for and
-      // returned to the model (Fix #11).
-      const settled = await Promise.allSettled(
-        toolUseCalls.map(async (tc) => ({
-          tc,
-          result: await this.callTool(tc),
-        }))
-      )
+      // Step 2: execute tool calls.
+      // Mirrors CC's toolOrchestration.ts partitionToolCalls() strategy:
+      //   • Consecutive concurrency-safe (read-only) tools run in parallel via
+      //     Promise.allSettled — safe because they have no filesystem side-effects.
+      //   • Every tool that is NOT concurrency-safe runs serially in its own
+      //     micro-batch, preventing write-write races (e.g. two bash commands
+      //     editing the same file simultaneously).
+      // In plan-mode each non-safe call is additionally gate-checked via askUser().
+      type ToolBatch = { concurrent: boolean; calls: Anthropic.ToolUseBlock[] }
+      const batches: ToolBatch[] = []
+      for (const tc of toolUseCalls) {
+        const tool = this.toolRegistry.get(tc.name)
+        const safe = tool?.isConcurrencySafe === true
+        const last = batches[batches.length - 1]
+        if (last && last.concurrent && safe) {
+          last.calls.push(tc)
+        } else {
+          batches.push({ concurrent: safe, calls: [tc] })
+        }
+      }
+
+      const allResults = new Map<string, { tc: Anthropic.ToolUseBlock; result: { content: string; isError: boolean } }>()
+
+      for (const batch of batches) {
+        if (batch.concurrent) {
+          // Parallel execution — all are concurrency-safe reads
+          const settled = await Promise.allSettled(
+            batch.calls.map(async (tc) => ({ tc, result: await this.callTool(tc) }))
+          )
+          for (const outcome of settled) {
+            const { tc, result } =
+              outcome.status === 'fulfilled'
+                ? outcome.value
+                : {
+                    tc: batch.calls[settled.indexOf(outcome)]!,
+                    result: { content: `Tool error: ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`, isError: true },
+                  }
+            allResults.set(tc.id, { tc, result })
+          }
+        } else {
+          // Serial execution — each call may have side effects
+          for (const tc of batch.calls) {
+            // Plan-mode gate: ask user before executing non-safe tools
+            if (this._planModeRef.active) {
+              const tool = this.toolRegistry.get(tc.name)
+              const askUserFn = (this.config as Record<string, unknown>)['askUser'] as ((q: string, opts: string[]) => Promise<string>) | undefined
+              if (askUserFn) {
+                const inputStr = JSON.stringify(tc.input, null, 2).slice(0, 400)
+                const answer = await askUserFn(
+                  `[Plan Mode] Allow tool "${tc.name}"?\n${inputStr}`,
+                  ['yes', 'no']
+                )
+                if (!answer.toLowerCase().startsWith('y')) {
+                  allResults.set(tc.id, {
+                    tc,
+                    result: { content: `[Plan Mode] Tool "${tc.name}" was not approved by user.`, isError: true },
+                  })
+                  continue
+                }
+              }
+            }
+            const result = await this.callTool(tc).catch(err => ({
+              content: `Tool error: ${err instanceof Error ? err.message : String(err)}`,
+              isError: true,
+            }))
+            allResults.set(tc.id, { tc, result })
+          }
+        }
+      }
 
       // Step 3: yield tool_result events and build the user message.
-      // Rejected entries (tool threw unexpectedly past callTool's catch) are
-      // surfaced as error tool results so the model can recover gracefully.
+      // Results are emitted in the original toolUseCalls order so the model
+      // receives a consistent, stable message regardless of execution order.
       const toolResultContent: ConversationMessage['content'] = []
-      for (const outcome of settled) {
-        const { tc, result } =
-          outcome.status === 'fulfilled'
-            ? outcome.value
-            : {
-                tc: toolUseCalls[settled.indexOf(outcome)]!,
-                result: {
-                  content: `Tool error: ${outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason)}`,
-                  isError: true,
-                },
-              }
+      for (const tc of toolUseCalls) {
+        const entry = allResults.get(tc.id) ?? {
+          tc,
+          result: { content: `Internal error: no result for tool "${tc.name}"`, isError: true },
+        }
+        const { result } = entry
         yield {
           type: 'tool_result' as const,
           toolUseId: tc.id,
@@ -515,7 +654,18 @@ export class MetaAgentSession {
       // Continue the loop with tool results in context
     }
 
-    // Max turns exceeded
+    // Max turns exceeded — persist a recoverable snapshot before yielding
+    const finalCost = estimateCost(this.config.model, this.totalUsage)
+    void saveRunStateSnapshot({
+      sessionId:       this.sessionId,
+      taskContractId:  this._taskContract?.contractId,
+      stopReason:      'max_turns',
+      turnsUsed:       turnCount,
+      costUsd:         finalCost,
+      accumulatedText: accumulatedText,
+      sessionStartMs:  this.sessionStartMs,
+      rtx:             this.config.runtimeContext,
+    }).catch(() => {})
     yield {
       type: 'result',
       subtype: 'error_max_turns',
@@ -525,7 +675,7 @@ export class MetaAgentSession {
       durationMs: Date.now() - startTime,
       numTurns: turnCount,
       stopReason: lastStopReason,
-      totalCostUsd: estimateCost(this.config.model, this.totalUsage),
+      totalCostUsd: finalCost,
       usage: this.totalUsage,
     }
   }
@@ -533,9 +683,12 @@ export class MetaAgentSession {
   /** Abort any in-progress API call. Safe to call multiple times. */
   interrupt(): void {
     this.abortController.abort()
-    // Delete any stale snapshot so the next submit() doesn't backfill with
+    // Delete any stale snapshots so the next submit() doesn't backfill with
     // records from the cancelled turn.
     void cleanupStateSnapshot(this.sessionId).catch(() => {})
+    void cleanupRunStateSnapshot(
+      this.sessionId, this._taskContract?.contractId,
+    ).catch(() => {})
     // Create a new controller so the session can be used again after interrupt
     this.abortController = new AbortController()
   }
@@ -550,6 +703,47 @@ export class MetaAgentSession {
       : tool
     this.toolRegistry.set(tool.name, wrapped)
     this.config.tools = [...this.toolRegistry.values()]
+    // Invalidate description cache: a new sibling tool may change other
+    // tools' cross-tool guidance (e.g. BashTool learns about a new grep).
+    this._descriptionCacheDirty = true
+  }
+
+  /**
+   * Dynamically update the appendSystemPrompt.
+   *
+   * Called by RoboticsSession (and other session wrappers) to inject
+   * per-turn context (R1-R5 sections) without rebuilding the entire session.
+   * The new value takes effect on the NEXT submit() call.
+   */
+  setAppendSystemPrompt(text: string): void {
+    this.config.appendSystemPrompt = text
+  }
+
+  /**
+   * Attach a SubAgentBridge to this session so that sub-agent completion
+   * notifications are automatically injected into the system prompt on every
+   * submit() turn (D11 section).
+   *
+   * Call this once after the bridge is created, before the first submit().
+   * The bridge is held by reference — notifications are drained from it lazily
+   * just before each API call so stale state never accumulates.
+   */
+  setSubAgentBridge(bridge: SubAgentBridge): void {
+    this._subAgentBridge = bridge
+  }
+
+  /**
+   * Attach a TaskContract to this session so that:
+   *   1. A memoized D0 goal-anchor section is prepended to every prompt turn.
+   *   2. The contract ID is embedded in RunStateSnapshots on circuit-breaker exits,
+   *      enabling callers to resume with the full original user intent.
+   *
+   * Call this when a task becomes long-running (campaign launch, sub-agent spawn,
+   * or explicit multi-step user request).  The contract is immutable — updates
+   * must go through TaskContractStore.update() and then re-set here.
+   */
+  setTaskContract(contract: TaskContract): void {
+    this._taskContract = contract
   }
 
   /** All messages in the current conversation. */
@@ -642,10 +836,39 @@ export class MetaAgentSession {
     return result
   }
 
-  private buildApiTools(): Anthropic.Tool[] {
+  /**
+   * Resolve all tool descriptions (static strings pass through; async functions
+   * are called with ToolDescriptionContext) and return Anthropic-format tool
+   * schemas.
+   *
+   * Results are memoised in _descriptionCache for the lifetime of the tool
+   * registry snapshot — mirrors CC's per-session toolSchemaCache.  The cache
+   * is invalidated by registerTool() so cross-tool references stay accurate.
+   */
+  private async buildApiToolsAsync(): Promise<Anthropic.Tool[]> {
+    if (this._descriptionCacheDirty) {
+      const tools = [...this.toolRegistry.values()]
+      const ctx: ToolDescriptionContext = {
+        tools,
+        toolNames: new Set(tools.map(t => t.name)),
+        sessionId: this.sessionId,
+        domain: this.config.domain,
+      }
+      // Resolve all descriptions in parallel (same as CC's Promise.all pattern)
+      await Promise.all(
+        tools.map(async t => {
+          const desc = typeof t.description === 'function'
+            ? await t.description(ctx)
+            : t.description
+          this._descriptionCache.set(t.name, desc)
+        })
+      )
+      this._descriptionCacheDirty = false
+    }
+
     return [...this.toolRegistry.values()].map(t => ({
       name: t.name,
-      description: t.description,
+      description: this._descriptionCache.get(t.name) ?? t.name,
       input_schema: t.inputSchema as Anthropic.Tool['input_schema'],
     }))
   }
@@ -669,6 +892,7 @@ export class MetaAgentSession {
       sessionId: this.sessionId,
       agentId: this.sessionId,
       abortSignal: this.abortController.signal,
+      planMode: this._planModeRef.active,
       // Inject runtime services so tools can use them directly (e.g. provenance query tools)
       ...(rtx ? {
         jobManager: rtx.jobManager,
@@ -681,7 +905,13 @@ export class MetaAgentSession {
       const result = await tool.call(tc.input as Record<string, unknown>, context)
       // Mark provenance dirty so the next submit() invalidates session_provenance
       // without a redundant provenanceTracker.list() call (Fix #4).
-      if (!result.isError && this.config.runtimeContext) {
+      //
+      // P2 fix: dirty flag must fire on BOTH success and error results —
+      // instrumentTool records failed calls too, so a failed tool call also
+      // produces a new provenance entry that must appear in the next turn's
+      // session_provenance section.  The previous `!result.isError` guard
+      // caused failures to be silently omitted from the next prompt.
+      if (this.config.runtimeContext) {
         this._provenanceDirty = true
       }
       return result

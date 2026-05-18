@@ -97,6 +97,15 @@ export interface ToolCallContext {
   jobManager?: import('../jobs/JobManager.js').JobManager
   vvChain?: import('../validation/VVHookChain.js').VVHookChain
   provenanceTracker?: import('../provenance/ProvenanceTracker.js').ProvenanceTracker
+  askUser?: (question: string, options: string[]) => Promise<string>
+  onMessage?: (message: string, status: 'normal' | 'proactive') => void
+  /**
+   * When true, the session is in "plan mode": every tool call that is NOT
+   * concurrency-safe must be approved by the user via askUser() before it
+   * executes.  Set/cleared by EnterPlanMode / ExitPlanMode tools through
+   * the shared planModeRef on the session.
+   */
+  planMode?: boolean
 }
 
 export interface ToolResult {
@@ -104,12 +113,70 @@ export interface ToolResult {
   isError: boolean
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool description context — passed to dynamic description functions
+// Mirrors CC's toolToAPISchema options, letting each tool inspect the full
+// set of registered siblings before producing its description string.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Runtime context available to a tool's description function.
+ *
+ * Analogous to CC's `toolToAPISchema` options object — passed to every
+ * tool whose `description` is an async function rather than a plain string.
+ * Allows tools to cross-reference sibling tools, domains, and session state
+ * when building their prompt (e.g. BashTool can say "use `grep` instead of rg").
+ */
+export interface ToolDescriptionContext {
+  /** All tools registered in this session, in registration order. */
+  readonly tools: readonly MetaAgentTool[]
+  /** Fast O(1) lookup: is tool X available in this session? */
+  readonly toolNames: ReadonlySet<string>
+  /** Current session ID (stable within a session). */
+  readonly sessionId: string
+  /** Engineering domain configured for this session. */
+  readonly domain?: string
+}
+
+/**
+ * A tool description is either:
+ *   - A plain string  (static, evaluated once at tool-creation time)
+ *   - An async function  (dynamic, evaluated lazily per-session and cached)
+ *
+ * Dynamic descriptions receive a ToolDescriptionContext so they can
+ * reference sibling tools, feature state, or domain at resolution time —
+ * identical to CC's async `tool.prompt(options)` pattern.
+ */
+export type ToolDescription =
+  | string
+  | ((ctx: ToolDescriptionContext) => Promise<string>)
+
 /** Base tool interface — Claude Code compatible */
 export interface MetaAgentTool {
   name: string
-  description: string
+  /**
+   * Tool description sent to the model via the Anthropic `tools[]` parameter.
+   *
+   * Accepts either a static string (backward-compatible) or an async function
+   * that receives ToolDescriptionContext and returns a string.  The session
+   * resolves functions lazily and caches the result until the tool registry
+   * changes (same behaviour as CC's per-session toolSchemaCache).
+   */
+  description: ToolDescription
   inputSchema: Record<string, unknown>  // JSON Schema object
   call(input: Record<string, unknown>, context: ToolCallContext): Promise<ToolResult>
+  /**
+   * When true, this tool is concurrency-safe (read-only / no filesystem side
+   * effects) and may be executed in parallel with other concurrency-safe tools
+   * in the same model turn.
+   *
+   * Mirrors CC's `isConcurrencySafe()` — tools that write files, run shell
+   * commands, or mutate any shared state must leave this unset (defaults to
+   * false), which forces them to run serially relative to other writes.
+   *
+   * Default: false (safe — unknown tools are treated as having side effects).
+   */
+  isConcurrencySafe?: boolean
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

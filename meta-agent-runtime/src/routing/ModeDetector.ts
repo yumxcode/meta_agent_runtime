@@ -1,11 +1,13 @@
 /**
- * ModeDetector — three-layer heuristic mode classification.
+ * ModeDetector — four-layer heuristic mode classification.
  *
  * Layer 1: Explicit hint (zero cost)
  *   If the caller passed mode !== 'auto', return immediately.
  *
  * Layer 2: Prompt heuristics (zero cost, synchronous)
  *   Priority order (highest → lowest):
+ *     0. ROBOTICS_ALWAYS — robotics-domain imperative patterns (ROS, SLAM,
+ *        gait, manipulation, sim-to-real, RL-for-robots). Override everything.
  *     A. CAMPAIGN_ALWAYS — inherent action patterns that are unambiguously
  *        "run a campaign now" (parameter sweep, background execution, etc.).
  *        These override even a DIRECT_OPENER.
@@ -59,7 +61,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 const LLM_DETECTION_MODEL = 'claude-haiku-4-5-20251001'
 
 const LLM_SYSTEM_PROMPT = `\
-You are a routing classifier for an engineering AI assistant that has three execution modes.
+You are a routing classifier for an engineering AI assistant that has four execution modes.
 
 direct   — The user is asking a question, requesting an explanation, doing a code
            review, or any single-turn conversational request. No tools or background
@@ -72,6 +74,11 @@ agentic  — The user wants to run a calculation, use tools, query results, or c
 campaign — The user explicitly wants to LAUNCH a new Design-of-Experiments (DOE)
            study, parameter sweep, Pareto optimisation, or multi-fidelity evaluation
            campaign. Background workers will run for minutes to hours.
+
+robotics — The user is developing robot algorithms or working on robotics tasks:
+  hardware testing, ROS/ROS2 integration, trajectory planning, SLAM, locomotion,
+  manipulation, sim-to-real, or deploying algorithms to physical robots.
+  Enables multi-agent orchestration and an experience store.
 
 Key distinctions:
 - Asking ABOUT campaign concepts (Pareto, DOE phases, fidelity) → direct
@@ -125,9 +132,27 @@ Mode: campaign
 User: Start an L0 evaluation campaign for the turbine blade designs.
 Mode: campaign
 
-Reply with exactly one word: direct, agentic, or campaign.`
+User: 我要开发四足机器人自适应步态算法
+Mode: robotics
 
-const VALID_MODES = new Set<string>(['direct', 'agentic', 'campaign'])
+User: 搜索SLAM论文然后设计实验验证
+Mode: robotics
+
+User: 在仿真中测试MPC轨迹追踪
+Mode: robotics
+
+User: 实现RL机械臂抓取并部署到ROS2
+Mode: robotics
+
+User: 给我解释CPG步态生成器原理
+Mode: direct
+
+User: 计算这个关节的最大扭矩
+Mode: agentic
+
+Reply with exactly one word: direct, agentic, campaign, or robotics.`
+
+const VALID_MODES = new Set<string>(['direct', 'agentic', 'campaign', 'robotics'])
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -158,6 +183,21 @@ function allMatches(
   }
   return out
 }
+
+// ── Tier 0: ROBOTICS_ALWAYS ───────────────────────────────────────────────────
+//
+// These patterns are inherently robotics-domain imperative signals. They fire
+// before CAMPAIGN_ALWAYS and override everything including DIRECT_OPENERs.
+
+const ROBOTICS_ALWAYS: Array<{ pattern: RegExp; label: string }> = [
+  { pattern: /\bROS2?\b|roslaunch|rclpy|roscpp/i, label: 'ROS/ROS2 framework' },
+  { pattern: /\bSLAM\b|建图定位|激光雷达建图|lidar.{0,8}mapp/i, label: 'SLAM / mapping' },
+  { pattern: /步态|gait|locomotion|trajectory.{0,15}robot|机器人.{0,10}轨迹|运动规划/i, label: 'robot motion / gait' },
+  { pattern: /机械臂|robotic.?arm|manipulat|end.?effector|抓取算法/i, label: 'robotic arm / manipulation' },
+  { pattern: /(?:强化学习|reinforcement.?learning|\bRL\b).{0,30}(?:robot|机器人|硬件|deploy)/i, label: 'RL for robotics' },
+  { pattern: /sim.?to.?real|仿真.{0,10}实物|sim2real/i, label: 'sim-to-real' },
+  { pattern: /(?:开发|实现|部署|设计实验|验证).{0,30}(?:机器人|robot|四足|六轴|无人机|\bUAV\b|\bdrone\b)/i, label: 'robot algo dev action' },
+]
 
 // ── Tier A: CAMPAIGN_ALWAYS ───────────────────────────────────────────────────
 //
@@ -327,7 +367,7 @@ export class ModeDetector {
       const msg = await withTimeout(
         client.messages.create({
           model: LLM_DETECTION_MODEL,
-          max_tokens: 5,
+          max_tokens: 10,
           system: LLM_SYSTEM_PROMPT,
           messages: [{ role: 'user', content: prompt }],
         }),
@@ -376,10 +416,16 @@ export class ModeDetector {
     }
 
     // Tools pre-registered → at least AGENTIC (tracked as a signal but won't
-    // prevent CAMPAIGN detection below)
+    // prevent CAMPAIGN/ROBOTICS detection below)
     const toolSignal: ModeSignal | null = hasTools
       ? { mode: 'agentic', label: 'tools pre-registered → minimum agentic' }
       : null
+
+    // ── Tier 0: ROBOTICS_ALWAYS ──────────────────────────────────────────────
+    const roboticsSignal = firstMatch(prompt, ROBOTICS_ALWAYS, 'robotics')
+    if (roboticsSignal) {
+      return { mode: 'robotics', confidence: 'heuristic', signals: [roboticsSignal, ...(toolSignal ? [toolSignal] : [])] }
+    }
 
     // ── Tier A: CAMPAIGN_ALWAYS ─────────────────────────────────────────────
     const alwaysSignal = firstMatch(prompt, CAMPAIGN_ALWAYS, 'campaign')

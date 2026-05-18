@@ -72,6 +72,17 @@ function hashRecord(input: unknown): string {
 // ProvenanceTracker
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Maximum number of records kept in the in-memory cache.
+ *
+ * At ~2 KB/record this is ~20 MB — acceptable for a session-scoped tracker.
+ * When the limit is hit the oldest 10 % of entries are evicted (by insertion
+ * order — Map preserves insertion order in V8 / JavaScriptCore / Bun).
+ * Records are always persisted to disk; eviction only affects the hot cache.
+ */
+const MAX_CACHE_ENTRIES = 10_000
+const EVICT_BATCH = Math.ceil(MAX_CACHE_ENTRIES * 0.1)  // evict 10 % at a time
+
 export class ProvenanceTracker {
   private readonly sessionId: string
 
@@ -251,6 +262,15 @@ export class ProvenanceTracker {
     await writeFile(tmp, JSON.stringify(rec, null, 2), 'utf-8')
     await rename(tmp, target)
 
+    // Evict oldest entries before inserting to keep the cache bounded.
+    // Disk is always the source of truth; eviction only drops hot-cache entries.
+    if (this.cache.size >= MAX_CACHE_ENTRIES) {
+      let evicted = 0
+      for (const key of this.cache.keys()) {
+        this.cache.delete(key)
+        if (++evicted >= EVICT_BATCH) break
+      }
+    }
     this.cache.set(rec.id, rec)
   }
 

@@ -118,6 +118,47 @@ export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> =
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// Progress state (structured mid-task and terminal progress data)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Structured progress snapshot for a sub-agent task.
+ *
+ * Allows the parent agent to understand what the sub-agent accomplished without
+ * having to parse the free-text summary.  Populated by SubAgentRunner at the
+ * result event; also saved to checkpoints so the parent can inspect progress
+ * mid-run via get_sub_agent_intermediate.
+ *
+ * Design: extraction is best-effort and regex-based.  Fields that cannot be
+ * determined are left as empty arrays / 0.  The parent must never treat these
+ * as authoritative — use them as orientation cues, not ground truth.
+ */
+export interface SubAgentProgressState {
+  /**
+   * Number of tool-call rounds completed (proxy for "steps done").
+   * Derived from tool_result event count in the agentic loop.
+   */
+  toolCallsCompleted: number
+  /**
+   * Provenance IDs (prov-xxxxxxxx) found in the accumulated output text.
+   * Enables the parent to call get_provenance() on sub-agent results.
+   */
+  provenanceIds: string[]
+  /**
+   * Estimated number of numbered steps completed by the sub-agent.
+   * Heuristic: counts "Step N:" / "## Step N" / "**Step N**" patterns.
+   * 0 when the sub-agent did not use step markers.
+   */
+  stepsCompleted: number
+  /**
+   * Last checkpoint text captured before the terminal state.
+   * Mirrors SubAgentRecord.latestCheckpoint but included in the result
+   * so it is available in the SubAgentCompletedEvent without a disk read.
+   */
+  lastCheckpoint?: string
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Result
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -137,6 +178,11 @@ export interface SubAgentResult {
   outputTokens: number
   costUsd: number
   durationMs: number
+  /**
+   * Structured progress state — populated by SubAgentRunner at terminal time.
+   * Optional for backward compatibility with records written by older versions.
+   */
+  progressState?: SubAgentProgressState
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

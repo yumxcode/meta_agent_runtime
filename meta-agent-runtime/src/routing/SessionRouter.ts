@@ -6,19 +6,30 @@
  * selects the right execution path transparently.
  *
  * Mode selection (in priority order):
- *   1. Caller explicitly sets mode: 'direct' | 'agentic' | 'campaign'
+ *   1. Caller explicitly sets mode: 'direct' | 'agentic' | 'campaign' | 'robotics'
  *   2. ModeDetector inspects the first prompt + environment (lazy, on submit)
  *   3. registerTool() auto-upgrades to minimum AGENTIC
  *
- * Mode upgrade rules (within a session):
- *   DIRECT → AGENTIC   triggered by registerTool() or agentic/campaign prompt
- *   AGENTIC → CAMPAIGN  triggered by campaign prompt or explicit mode set
- *   Never downgrades.
+ * Mode selection is intentionally single-shot:
+ *   - Mode is detected once on the FIRST submit() call.
+ *   - registerTool() before the first submit() can raise mode to minimum AGENTIC.
+ *   - After the backend is initialised, mode is FIXED for the session lifetime.
+ *   - There is no mid-session mode upgrade (agentic → campaign mid-conversation).
+ *
+ * Rationale: backends (MetaAgentSession, KernelBridge, RoboticsSession) maintain
+ * internal conversation state.  Transparently rebuilding a backend mid-session
+ * would require history migration with no safe guarantee — it is better to start
+ * a new session explicitly when mode needs to change.
+ *
+ * Mode upgrade (pre-first-submit only):
+ *   DIRECT  → AGENTIC   triggered by registerTool()
+ *   (any)   → explicit  triggered by RouterOptions.mode at construction time
  *
  * Execution backends:
  *   DIRECT   → MetaAgentSession (tools=[])          — one turn, no tool loop
  *   AGENTIC  → MetaAgentSession (with tools)         — full tool-use loop
  *   CAMPAIGN → KernelBridge     (with tools)         — CC engine + auto-compaction
+ *   ROBOTICS → RoboticsSession  (with tools)         — ExperienceStore + WorkflowLoader
  *
  * Public API mirrors MetaAgentSession so it is a drop-in replacement:
  *   submit(), registerTool(), interrupt(), getMessages(), getUsage(),
@@ -30,7 +41,7 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import type { MetaAgentConfig, ResolvedConfig } from '../core/config.js'
-import { resolveConfig } from '../core/config.js'
+import { resolveConfig, isAnthropicProvider } from '../core/config.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import { EMPTY_USAGE } from '../core/types.js'
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
@@ -81,10 +92,13 @@ export class SessionRouter {
     // them up when it's created. registerTool() handles any added later.
     this._pendingTools = [...(config.tools ?? [])]
 
-    // Detection client: fail-fast (3 s timeout, 1 retry) so a slow or
-    // unavailable API never blocks the user more than ~3 s. Falls back to
-    // heuristics automatically if the call fails (see ModeDetector._detectWithLLM).
-    this._detectionClient = this._cfg.apiKey
+    // Detection client: only create when (a) an API key is available AND (b)
+    // the provider is Anthropic.  Third-party providers (DeepSeek, Qwen, custom
+    // proxies) do not expose claude-haiku-4-5-20251001, so sending the Haiku
+    // side-call there would fail with a 404/400.  The detector falls back to
+    // regex heuristics automatically when this client is null (Task #22 fix).
+    // Fail-fast: 3 s timeout, 1 retry so a slow API never stalls session start.
+    this._detectionClient = (this._cfg.apiKey && isAnthropicProvider(this._cfg.baseURL))
       ? new Anthropic({
           apiKey:     this._cfg.apiKey,
           baseURL:    this._cfg.baseURL,
@@ -160,10 +174,9 @@ export class SessionRouter {
   // ── Internal ────────────────────────────────────────────────────────────────
 
   /**
-   * Lazily initialise the backend.
-   * Called on the first submit(); also called if mode was upgraded between submits
-   * (detects when _currentMode is set but _impl is stale — not possible with
-   * current upgrade logic, but guarded for safety).
+   * Lazily initialise the backend on the first submit().
+   * Mode is detected once here and fixed for the session lifetime.
+   * Subsequent submit() calls skip this entirely (_impl is already set).
    */
   private async _ensureImpl(prompt: string): Promise<void> {
     if (this._impl) return
@@ -187,8 +200,8 @@ export class SessionRouter {
       )
     }
 
-    // Create the backend
-    this._impl = this._createImpl(this._currentMode!)
+    // Create the backend (async for lazy-loaded backends like RoboticsSession)
+    this._impl = await this._createImpl(this._currentMode!)
 
     // Forward any tools that were registered before impl was created
     for (const tool of this._pendingTools) {
@@ -232,8 +245,13 @@ export class SessionRouter {
    *   CAMPAIGN → KernelBridge — uses CC's production QueryEngine which
    *               provides auto-compaction (essential for long-running
    *               campaigns that exhaust the context window).
+   *
+   *   ROBOTICS → RoboticsSession — wires ExperienceStore, GitWorkspaceManager,
+   *               WorkflowLoader, and multi-agent orchestration for robot
+   *               algorithm development. Imported lazily to avoid circular
+   *               deps during bootstrap.
    */
-  private _createImpl(mode: SessionMode): SessionImpl {
+  private async _createImpl(mode: SessionMode): Promise<SessionImpl> {
     switch (mode) {
       case 'direct': {
         // Pass an empty tools array so the model never attempts tool calls.
@@ -249,6 +267,17 @@ export class SessionRouter {
 
       case 'campaign': {
         return new KernelBridge(this._cfgAsConfig())
+      }
+
+      case 'robotics': {
+        // RoboticsSession wires ExperienceStore, GitWorkspaceManager, WorkflowLoader etc.
+        // Imported lazily to avoid circular deps during bootstrap.
+        const { RoboticsSession } = await import('../robotics/RoboticsSession.js')
+        const roboticsSession = new RoboticsSession(this._cfgAsConfig())
+        // init() restores or creates project state, registers tools, and primes
+        // R1-R5 dynamic sections.  Must complete before first submit().
+        await roboticsSession.init()
+        return roboticsSession
       }
     }
   }

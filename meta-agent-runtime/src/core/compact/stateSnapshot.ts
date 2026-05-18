@@ -27,6 +27,7 @@ import { join, dirname } from 'path'
 import { homedir } from 'os'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 import { MetaAgentContextStore } from '../../coordination/MetaAgentContextStore.js'
+import { CampaignStateStore } from '../../coordination/CampaignStateStore.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -43,11 +44,27 @@ export type CompactStateSnapshotRecord = {
   inputSummary: string
 }
 
-/** Minimal campaign state snapshot (phase + identity only). */
+/** Minimal campaign state snapshot (phase + identity + drift-guard fields). */
 export type CompactStateSnapshotCampaign = {
   campaignId: string
   projectName: string | undefined
   phase: string
+  /**
+   * Pre-rendered contextBlock from the campaign capsule.
+   * Reproduced verbatim in compact instructions so the compact model has the
+   * full campaign state even when no live context store is available.
+   */
+  contextBlock?: string
+  /**
+   * Human-readable objective strings, e.g. "maximize efficiency (W/kg)".
+   * Preserved across compaction so the model never forgets what it is optimising.
+   */
+  objectives?: string[]
+  /**
+   * Human-readable constraint strings, e.g. "mass ≤ 5.0 kg (inequality)".
+   * Preserved across compaction to prevent drift from constraint-violating proposals.
+   */
+  constraints?: string[]
 }
 
 /** Full snapshot written to disk after each tool call. */
@@ -149,16 +166,37 @@ export function saveStateSnapshot(
       }
 
       // Collect active campaigns
+      // Strategy: read CampaignSummary list from MetaAgentContextStore for phase/contextBlock,
+      // then attempt a CampaignStateStore.load() per campaign for objectives/constraints.
+      // Failures at any level are swallowed — the snapshot is advisory.
       try {
         const ctx = await MetaAgentContextStore.read()
         if (ctx?.activeCampaigns) {
-          for (const c of ctx.activeCampaigns) {
-            snapshot.activeCampaigns.push({
-              campaignId: c.campaignId,
-              projectName: c.projectName,
-              phase: c.phase,
-            })
-          }
+          // Parallel-load per-campaign design space (objectives + constraints).
+          // Each individual load failure is caught inside the map so one broken
+          // campaign never blocks others.
+          const enriched = await Promise.all(
+            ctx.activeCampaigns.map(async c => {
+              const base: CompactStateSnapshotCampaign = {
+                campaignId: c.campaignId,
+                projectName: c.projectName,
+                phase: c.phase,
+                contextBlock: c.contextBlock,
+              }
+              try {
+                const store = await CampaignStateStore.load(c.campaignId)
+                const { objectives, constraints } = store.designSpace
+                base.objectives = objectives.map(o =>
+                  `${o.direction} ${o.name}${o.unit ? ` (${o.unit})` : ''}`,
+                )
+                base.constraints = constraints.map(ct =>
+                  `${ct.name}: ${ct.expression} (${ct.type})`,
+                )
+              } catch { /* state file missing or corrupt — skip enrichment */ }
+              return base
+            }),
+          )
+          snapshot.activeCampaigns.push(...enriched)
         }
       } catch { /* context store unavailable — skip */ }
 

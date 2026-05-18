@@ -282,13 +282,20 @@ export class KernelBridge {
     }
 
     // Suppress ambient proxy env vars that would be picked up by CC's undici
-    // HTTP client.  We drive the Anthropic endpoint directly via ANTHROPIC_BASE_URL
-    // so an intermediate proxy only causes connection failures.
-    // Scoped here (not module-level) so the host process's proxy config for
-    // other HTTP clients is unaffected until KernelBridge actually needs to
-    // connect (Fix #13).
-    for (const k of ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy']) {
-      delete process.env[k]
+    // HTTP client during QueryEngine construction.  We drive the Anthropic
+    // endpoint directly via ANTHROPIC_BASE_URL so an intermediate proxy only
+    // causes connection failures.
+    //
+    // Save → delete → construct → restore so the deletion is scoped to the
+    // narrowest possible window and the host process's proxy configuration for
+    // every other HTTP client is preserved (Fix #13).
+    const PROXY_KEYS = ['HTTP_PROXY', 'HTTPS_PROXY', 'http_proxy', 'https_proxy', 'ALL_PROXY', 'all_proxy'] as const
+    const savedProxy: Partial<Record<string, string>> = {}
+    for (const k of PROXY_KEYS) {
+      if (process.env[k] !== undefined) {
+        savedProxy[k] = process.env[k]
+        delete process.env[k]
+      }
     }
 
     // Bootstrap CC globals (must happen before QueryEngine instantiation)
@@ -346,6 +353,13 @@ export class KernelBridge {
       abortController: this.abortController,
       verbose: false,
     })
+
+    // Restore saved proxy vars so the host process is not permanently affected
+    for (const k of PROXY_KEYS) {
+      if (Object.prototype.hasOwnProperty.call(savedProxy, k)) {
+        process.env[k] = savedProxy[k]
+      }
+    }
   }
 
   private _rebuildEngine() {

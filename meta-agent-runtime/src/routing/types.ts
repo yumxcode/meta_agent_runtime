@@ -1,7 +1,7 @@
 /**
  * Routing types — SessionMode and detection machinery.
  *
- * Three execution modes, ordered by weight:
+ * Four execution modes, ordered by weight:
  *
  *   DIRECT   — Single Anthropic API call. No tools, no agentic loop.
  *              For Q&A, discussion, code review — anything that doesn't
@@ -16,13 +16,18 @@
  *              + CampaignMonitor awareness. Activated explicitly when DOE /
  *              Pareto / multi-fidelity signals are detected.
  *
+ *   ROBOTICS — AGENTIC + ExperienceStore + GitWorkspaceManager + WorkflowLoader.
+ *              Activated when robotics-domain signals are detected (ROS, SLAM,
+ *              gait, manipulation, sim-to-real, RL-for-robots, etc.).
+ *
  * Mode upgrade path (within a session):
  *   DIRECT → AGENTIC → CAMPAIGN   (never downgrade)
+ *   DIRECT → AGENTIC → ROBOTICS   (robotics is a peer of campaign, not above it)
  */
 
 // ── SessionMode ───────────────────────────────────────────────────────────────
 
-export type SessionMode = 'direct' | 'agentic' | 'campaign'
+export type SessionMode = 'direct' | 'agentic' | 'campaign' | 'robotics'
 
 /**
  * 'auto'  — ModeDetector chooses based on prompt + environment.
@@ -35,6 +40,7 @@ export const MODE_WEIGHT: Record<SessionMode, number> = {
   direct:   0,
   agentic:  1,
   campaign: 2,
+  robotics: 3,
 }
 
 // ── Detection result ──────────────────────────────────────────────────────────
@@ -66,10 +72,11 @@ export interface RouterOptions {
   /**
    * Explicit mode hint. Default: 'auto'.
    *
-   * 'auto'   — ModeDetector runs on first submit().
-   * 'direct' — force single-turn, no tools.
-   * 'agentic'— force tool-use loop.
-   * 'campaign'— force full campaign coordination.
+   * 'auto'     — ModeDetector runs on first submit().
+   * 'direct'   — force single-turn, no tools.
+   * 'agentic'  — force tool-use loop.
+   * 'campaign' — force full campaign coordination.
+   * 'robotics' — force robotics multi-agent orchestration.
    */
   mode?: SessionModeHint
 

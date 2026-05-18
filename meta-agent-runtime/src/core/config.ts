@@ -85,6 +85,24 @@ function inferProviderFromURL(url: string): ModelProvider {
   return 'unknown'
 }
 
+/**
+ * Returns true when `baseURL` resolves to Anthropic's own API endpoint.
+ *
+ * Used to gate Haiku side-calls (mode detection, memory relevance selection)
+ * that must be skipped when the session is configured for a third-party
+ * provider (DeepSeek, Qwen, custom proxy) — those endpoints do not expose
+ * `claude-haiku-4-5-20251001` and would return a 404/400 error.
+ *
+ * Rules:
+ *   • undefined/empty → true  (resolveConfig() fills in api.anthropic.com)
+ *   • Contains "anthropic.com" → true
+ *   • Anything else → false
+ */
+export function isAnthropicProvider(baseURL?: string): boolean {
+  if (!baseURL) return true
+  return baseURL.includes('anthropic.com')
+}
+
 export interface MetaAgentConfig {
   // ── Identity ───────────────────────────────────────────────────────────────
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
@@ -160,6 +178,21 @@ export interface MetaAgentConfig {
    */
   mcpServers?: import('./dynamicPrompt.js').McpServerInstruction[]
 
+  // ── Project directory ─────────────────────────────────────────────────────
+  /**
+   * Root directory of the current project.  Used to discover `AGENT.md` /
+   * `.meta-agent/AGENT.md` and inject its contents as the D1c agent_directives
+   * section (workflow procedures, project-specific rules, important caveats).
+   *
+   * Resolution order (highest priority first):
+   *   1. `<projectDir>/.meta-agent/AGENT.md`  — project-scoped directives
+   *   2. `<projectDir>/AGENT.md`              — project root alternative
+   *   3. `~/.meta-agent/AGENT.md`             — global user directives
+   *
+   * Defaults to `process.cwd()` when omitted.
+   */
+  projectDir?: string
+
   // ── Phase 1 integration ───────────────────────────────────────────────────
   /**
    * When provided, every tool registered in the session is automatically
@@ -187,6 +220,9 @@ export type ResolvedConfig = Required<
   outputStyle?: OutputStyle
   mcpServers?: import('./dynamicPrompt.js').McpServerInstruction[]
 }
+
+// `projectDir` is always present after resolveConfig() because we default to process.cwd().
+// TypeScript's Required<> above already covers it; this comment is purely documentary.
 
 export const DEFAULT_SYSTEM_PROMPT = `\
 You are an expert engineering assistant. You help engineers solve complex problems \
@@ -221,5 +257,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     language: config.language,
     outputStyle: config.outputStyle,
     mcpServers: config.mcpServers,
+    // projectDir: default to cwd so AGENT.md discovery works out-of-the-box
+    projectDir: config.projectDir ?? process.cwd(),
   }
 }

@@ -23,6 +23,7 @@ import { MetaAgentContextStore } from './MetaAgentContextStore.js'
 import { ParetoAnalyzer } from './ParetoAnalyzer.js'
 import { WorkerCoordinator } from './WorkerCoordinator.js'
 import type { EvaluationHandler } from './WorkerCoordinator.js'
+import { USER_CHECKPOINT_PHASES } from './types.js'
 import type { CampaignPhase, CampaignSummary } from './types.js'
 
 // ── Configuration ─────────────────────────────────────────────────────────────
@@ -45,12 +46,41 @@ export interface WatchOptions {
   ladderConfig?: Partial<FidelityLadderConfig>
   /** Max parallel evaluations during auto-escalation. Default: 4. */
   maxConcurrent?: number
+  /**
+   * Override the default poll interval (5 s) for this watcher.
+   * Useful for testing (set to 100 ms) or slow-polling high-cost campaigns
+   * (set to 60_000 ms).
+   */
+  pollIntervalMs?: number
+  /**
+   * Per-phase timeout in milliseconds.  When a machine-driven phase exceeds
+   * its configured timeout the campaign is marked FAILED.
+   *
+   * Example:
+   *   phaseTimeouts: {
+   *     EVALUATING_L0:  30 * 60 * 1_000,   // 30 min
+   *     ESCALATING_L1:  2 * 60 * 60 * 1_000, // 2 h
+   *     ESCALATING_L2:  6 * 60 * 60 * 1_000, // 6 h
+   *   }
+   *
+   * Phases not listed fall back to the global MAX_POLL_DURATION_MS (24 h).
+   * User-checkpoint phases (PARETO_READY_*) are never timed out by the Monitor
+   * — they wait indefinitely for user input.
+   */
+  phaseTimeouts?: Partial<Record<CampaignPhase, number>>
 }
 
 // ── Active watchers registry (prevents duplicate intervals) ──────────────────
 // WatchOptions are captured in the setInterval closure — no separate map needed.
 
 const _active = new Map<string, NodeJS.Timeout>()
+
+// ── Per-phase start-time tracking (for phaseTimeouts) ────────────────────────
+// Maps campaignId → { phase, enteredAt } so each tick can check how long the
+// campaign has been in the *current* phase, independent of overall watch duration.
+
+interface _PhaseEntry { phase: string; enteredAt: number }
+const _phaseEntries = new Map<string, _PhaseEntry>()
 
 // ── P1-7: Per-campaign consecutive error counter ──────────────────────────────
 // Distinguishes transient disk errors (retry silently) from fatal errors (stop).
@@ -86,10 +116,16 @@ export class CampaignMonitor {
         : (notifyOrOpts ?? {})
 
     const startedAt = Date.now()
+    const effectivePollMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS
 
     const interval = setInterval(async () => {
+      // _tick() returns the phase it observed (or null when the campaign stopped
+      // or the store was unavailable).  We reuse this value in the timeout checks
+      // below to avoid a second CampaignStateStore.load() call per tick.
+      let tickPhase: CampaignPhase | null = null
+
       try {
-        await CampaignMonitor._tick(campaignId, opts)
+        tickPhase = await CampaignMonitor._tick(campaignId, opts)
         // Reset consecutive error count on a successful tick
         _consecutiveErrors.delete(campaignId)
       } catch (err) {
@@ -115,17 +151,59 @@ export class CampaignMonitor {
         }
       }
 
-      // Safety: stop watching after 24 h.
-      // Mark the campaign FAILED so it doesn't linger as a zombie on disk —
-      // a campaign that has been watched for 24 h without reaching a terminal
-      // state is stuck (workers died, process restarted, etc.).
-      if (Date.now() - startedAt > MAX_POLL_DURATION_MS) {
+      // ── Timeout checks ──────────────────────────────────────────────────────
+      //
+      // Two levels:
+      //   1. Per-phase timeout (opts.phaseTimeouts) — fires when the campaign has
+      //      been in its *current* machine-driven phase too long.
+      //   2. Global ceiling (MAX_POLL_DURATION_MS) — 24 h safety net for the
+      //      entire watch duration.
+      //
+      // User-checkpoint phases (PARETO_READY_*) are never timed out here —
+      // they block waiting for user input and have no meaningful deadline.
+      //
+      // We use `tickPhase` (returned by _tick) to avoid a second state load.
+      // If tickPhase is null the campaign has already stopped — skip checks.
+
+      if (tickPhase === null) return
+
+      const now = Date.now()
+      let timedOut = false
+      let timeoutReason = ''
+
+      // Per-phase timeout check — reuses tickPhase from _tick(); no extra I/O.
+      if (opts.phaseTimeouts) {
+        const currentPhase = tickPhase
+        // Skip user-checkpoint phases (they block on user input indefinitely)
+        if (!USER_CHECKPOINT_PHASES.has(currentPhase)) {
+          const phaseLimit = opts.phaseTimeouts[currentPhase]
+          if (phaseLimit !== undefined) {
+            // Record when we first observed this phase
+            const entry = _phaseEntries.get(campaignId)
+            if (!entry || entry.phase !== currentPhase) {
+              _phaseEntries.set(campaignId, { phase: currentPhase, enteredAt: now })
+            } else if (now - entry.enteredAt > phaseLimit) {
+              timedOut = true
+              timeoutReason =
+                `Phase timeout: campaign has been in phase ${currentPhase} for ` +
+                `${Math.round((now - entry.enteredAt) / 60_000)} min ` +
+                `(limit: ${Math.round(phaseLimit / 60_000)} min)`
+            }
+          }
+        }
+      }
+
+      // Global watch-duration ceiling
+      if (!timedOut && now - startedAt > MAX_POLL_DURATION_MS) {
+        timedOut = true
+        timeoutReason = 'Watch timeout: campaign did not complete within 24 h of monitoring'
+      }
+
+      if (timedOut) {
         try {
           const s = await CampaignStateStore.load(campaignId)
           if (s.phase !== 'DONE' && s.phase !== 'FAILED') {
-            await s.markFailed(
-              'Watch timeout: campaign did not complete within 24 h of monitoring',
-            )
+            await s.markFailed(timeoutReason)
             await CampaignMonitor._refreshContext()
           }
         } catch {
@@ -133,7 +211,7 @@ export class CampaignMonitor {
         }
         CampaignMonitor._stop(campaignId)
       }
-    }, POLL_INTERVAL_MS)
+    }, effectivePollMs)
 
     // Allow the Node.js process to exit even if this interval is running
     interval.unref?.()
@@ -166,35 +244,44 @@ export class CampaignMonitor {
       _active.delete(campaignId)
     }
     _consecutiveErrors.delete(campaignId)   // P1-7: clean up error counter
+    _phaseEntries.delete(campaignId)        // P1-31: clean up per-phase timeout tracking
     // Release all per-campaign runtime state (eval cache + mutation lock)
     CampaignStateStore.cleanup(campaignId)
   }
 
   /**
    * One poll tick: reload state, check completion, act if done.
+   *
+   * Returns the campaign phase observed during this tick, or null when the
+   * campaign has stopped (terminal phase or store unavailable).  The caller
+   * uses this return value for per-phase timeout checks so it does not need to
+   * issue a second CampaignStateStore.load() call.
    */
   private static async _tick(
     campaignId: string,
     opts: WatchOptions,
-  ): Promise<void> {
+  ): Promise<CampaignPhase | null> {
     let store: CampaignStateStore
     try {
       store = await CampaignStateStore.load(campaignId)
     } catch {
       // Campaign directory gone — stop watching
       CampaignMonitor._stop(campaignId)
-      return
+      return null
     }
 
     // Terminal phases — nothing left to watch
     if (store.phase === 'DONE' || store.phase === 'FAILED') {
       CampaignMonitor._stop(campaignId)
       await CampaignMonitor._refreshContext()
-      return
+      return null
     }
 
     // Reload to pick up Worker writes
     await store.reload()
+
+    // Capture phase after reload — this is the value returned to the caller.
+    const currentPhase = store.phase as CampaignPhase
 
     // PARETO_READY phases are user-checkpoint phases.
     // If autoEscalate is enabled and an evaluationHandler is provided,
@@ -206,14 +293,15 @@ export class CampaignMonitor {
       (store.phase === 'PARETO_READY_L0' || store.phase === 'PARETO_READY_L1')
     ) {
       await CampaignMonitor._autoEscalate(store, opts, ladder)
-      return
+      return currentPhase
     }
 
     // Phase not complete yet
-    if (!store.isCurrentPhaseComplete()) return
+    if (!store.isCurrentPhaseComplete()) return currentPhase
 
     // All tasks done → transition
     await CampaignMonitor._onPhaseComplete(store, opts)
+    return currentPhase
   }
 
   /**

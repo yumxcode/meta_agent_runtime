@@ -43,6 +43,19 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 // Types
 // ─────────────────────────────────────────────────────────────────────────────
 
+/** Valid scope values for memory entries. */
+export type MemoryScope = 'global' | 'project' | 'campaign' | 'domain'
+
+/** Valid confidence levels for memory entries. */
+export type MemoryConfidence = 'high' | 'medium' | 'low'
+
+const MEMORY_SCOPES: ReadonlySet<string> = new Set<MemoryScope>([
+  'global', 'project', 'campaign', 'domain',
+])
+const MEMORY_CONFIDENCES: ReadonlySet<string> = new Set<MemoryConfidence>([
+  'high', 'medium', 'low',
+])
+
 export type TopicFileHeader = {
   filename: string
   filePath: string
@@ -55,6 +68,26 @@ export type TopicFileHeader = {
   campaign: string | undefined
   source: string | undefined
   mtimeMs: number
+  // ── Scope & freshness metadata (optional, parsed from frontmatter) ─────────
+  /** Applicability scope.  Defaults to 'global' when absent. */
+  scope: MemoryScope | undefined
+  /** Engineering domain tag for domain-scoped memories. */
+  domain: string | undefined
+  /**
+   * ISO date string (YYYY-MM-DD) after which this memory should not be recalled.
+   * Prevents stale standard values / outdated material properties from polluting
+   * long-running task context.
+   */
+  validUntil: string | undefined
+  /** Model confidence in the stored fact. */
+  confidence: MemoryConfidence | undefined
+  /** Whether the fact has been verified against a primary source. */
+  sourceVerified: boolean | undefined
+  /**
+   * When true the memory should be presented with a revalidation notice
+   * so the model knows to confirm before use.
+   */
+  requiresRevalidation: boolean | undefined
 }
 
 export type RelevantMemory = {
@@ -120,6 +153,21 @@ export async function scanTopicFiles(
           const fm = parseFrontmatter(content)
           const rawType = fm['type']
           const parsedType = MEMORY_TYPES.find(t => t === rawType) as MemoryType | undefined
+
+          // Scope & freshness fields
+          const rawScope = fm['scope']
+          const parsedScope = MEMORY_SCOPES.has(rawScope ?? '')
+            ? rawScope as MemoryScope
+            : undefined
+          const rawConf = fm['confidence']
+          const parsedConf = MEMORY_CONFIDENCES.has(rawConf ?? '')
+            ? rawConf as MemoryConfidence
+            : undefined
+          const rawSv = fm['source_verified']
+          const parsedSv = rawSv === 'true' ? true : rawSv === 'false' ? false : undefined
+          const rawRv = fm['requires_revalidation']
+          const parsedRv = rawRv === 'true' ? true : rawRv === 'false' ? false : undefined
+
           return {
             filename: entry,
             filePath,
@@ -130,6 +178,13 @@ export async function scanTopicFiles(
             campaign: fm['campaign'],
             source: fm['source'],
             mtimeMs: stats.mtimeMs,
+            // Scope & freshness
+            scope:                parsedScope,
+            domain:               fm['domain'],
+            validUntil:           fm['valid_until'],
+            confidence:           parsedConf,
+            sourceVerified:       parsedSv,
+            requiresRevalidation: parsedRv,
           }
         } catch {
           return null // Unreadable or malformed file — skip silently
@@ -262,6 +317,84 @@ export interface FindRelevantMemoriesOptions {
   client?: Anthropic
   /** Maximum number of candidate (non-always-relevant) topic files to load. Default: 5 */
   maxCandidates?: number
+
+  // ── Scope & freshness filters ────────────────────────────────────────────
+  /**
+   * When provided, memories whose `scope` is `project` but whose project tag
+   * does not match are excluded.  Pass the current project/campaign identifier.
+   * Memories with `scope: 'global'` or no scope are always included.
+   */
+  projectScope?: string
+  /**
+   * Current campaign ID.  Memories with `scope: 'campaign'` whose `campaign`
+   * field does not match are excluded.
+   */
+  campaignScope?: string
+  /**
+   * Current engineering domain.  Memories with `scope: 'domain'` whose
+   * `domain` field does not match are excluded.
+   */
+  domainScope?: string
+  /**
+   * When true (default), memories whose `valid_until` date is in the past are
+   * excluded from recall.  Set to false to include expired memories (e.g., for
+   * debugging or explicit "show me all memories" queries).
+   */
+  filterStale?: boolean
+}
+
+// ── Scope/freshness filter predicate ─────────────────────────────────────────
+
+/**
+ * Returns true if the header passes all configured scope and freshness filters.
+ * "Pass" means: include the file in the recall set.
+ */
+function _passesFilters(
+  header: TopicFileHeader,
+  opts: FindRelevantMemoriesOptions,
+  nowDate: string,
+): boolean {
+  // ── Always-relevant types bypass ALL filters ───────────────────────────────
+  // user + feedback memories encode the current user's preferences and session
+  // feedback — they are session-scoped by definition and must never be silently
+  // dropped due to a stale valid_until date or a scope mismatch.
+  if (header.type && ALWAYS_RELEVANT.has(header.type)) return true
+
+  // ── Freshness: valid_until ──────────────────────────────────────────────────
+  // Default: filter stale memories (filterStale !== false).
+  if (opts.filterStale !== false && header.validUntil) {
+    // String comparison works for ISO dates (YYYY-MM-DD lexicographic order).
+    // valid_until is the LAST VALID day: a memory valid_until 2026-05-18 is still
+    // valid on 2026-05-18 but excluded on 2026-05-19 (nowDate > validUntil).
+    if (header.validUntil < nowDate) return false
+  }
+
+  // ── Scope filtering ────────────────────────────────────────────────────────
+
+  const scope = header.scope ?? 'global'
+
+  if (scope === 'project' && opts.projectScope) {
+    // Exclude project-scoped memories from different projects.
+    // Project-scoped memories MUST store their project identifier in the
+    // frontmatter `campaign:` field.  The `domain:` field is intentionally
+    // NOT used as a fallback here — domain tags are independent of project
+    // identity and conflating them would silently drop cross-domain memories
+    // that happen to share a domain name with a different project.
+    const tag = header.campaign ?? ''
+    if (tag && tag !== opts.projectScope) return false
+  }
+
+  if (scope === 'campaign' && opts.campaignScope) {
+    const tag = header.campaign ?? ''
+    if (tag && tag !== opts.campaignScope) return false
+  }
+
+  if (scope === 'domain' && opts.domainScope) {
+    const tag = header.domain ?? ''
+    if (tag && tag !== opts.domainScope) return false
+  }
+
+  return true
 }
 
 /**
@@ -270,6 +403,9 @@ export interface FindRelevantMemoriesOptions {
  * Always loads: user + feedback topic files (small, always applicable).
  * Loads from candidates: domain_knowledge, campaign_lessons, reference files
  *   selected by Haiku side-call (when client provided) or keyword match.
+ *
+ * Applies scope and freshness filters before selection so stale or out-of-scope
+ * memories cannot pollute a long-running task's context.
  *
  * Returns an array of { header, content } objects ready to inject into the
  * system prompt.  Empty array when no memory files exist yet.
@@ -287,9 +423,16 @@ export async function findRelevantMemories(
   const allHeaders = await scanTopicFiles(memoryDir)
   if (allHeaders.length === 0) return []
 
-  // Partition: always-relevant vs. query-dependent candidates
-  const alwaysHeaders = allHeaders.filter(h => h.type && ALWAYS_RELEVANT.has(h.type))
-  const candidateHeaders = allHeaders.filter(h => !ALWAYS_RELEVANT.has(h.type as MemoryType))
+  // Apply scope and freshness filters before partitioning.
+  // ISO date string for "today" — used for valid_until comparisons.
+  const nowDate = new Date().toISOString().slice(0, 10)
+  const filteredHeaders = allHeaders.filter(h => _passesFilters(h, opts, nowDate))
+
+  // Partition filtered headers: always-relevant vs. query-dependent candidates.
+  // user + feedback bypass scope filters (already handled in _passesFilters) but
+  // are still subject to valid_until checks.
+  const alwaysHeaders = filteredHeaders.filter(h => h.type && ALWAYS_RELEVANT.has(h.type))
+  const candidateHeaders = filteredHeaders.filter(h => !ALWAYS_RELEVANT.has(h.type as MemoryType))
 
   // Select candidates
   let selectedFilenames: string[]
@@ -308,16 +451,21 @@ export async function findRelevantMemories(
     selectedFilenames.includes(h.filename),
   )
 
-  // Load content for all selected files
+  // Load content for all selected files in parallel (P2 fix: was a serial loop)
   const toLoad = [...alwaysHeaders, ...selectedCandidates]
-  const memories: RelevantMemory[] = []
-
-  for (const header of toLoad) {
-    try {
+  const settled = await Promise.allSettled(
+    toLoad.map(async (header): Promise<RelevantMemory> => {
       const content = await readFile(header.filePath, 'utf-8')
-      memories.push({ header, content: content.trim() })
-    } catch {
-      // File disappeared between scan and load — skip
+      return { header, content: content.trim() }
+    }),
+  )
+
+  // Collect fulfilled results; silently skip files that disappeared between
+  // scan and load (rejected promise = file gone or permission error).
+  const memories: RelevantMemory[] = []
+  for (const outcome of settled) {
+    if (outcome.status === 'fulfilled') {
+      memories.push(outcome.value)
     }
   }
 

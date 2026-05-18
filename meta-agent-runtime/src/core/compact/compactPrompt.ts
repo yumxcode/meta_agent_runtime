@@ -16,139 +16,151 @@
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 import { MetaAgentContextStore } from '../../coordination/MetaAgentContextStore.js'
 import type { CompactStateSnapshot } from './stateSnapshot.js'
+import type { TaskContract } from '../contract/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared blocks (identical purpose to CC's equivalents)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export const NO_TOOLS_PREAMBLE = `CRITICAL: Respond with TEXT ONLY. Do NOT call any tools.
+export const NO_TOOLS_PREAMBLE = `严禁调用任何工具，仅输出纯文本。
 
-- Do NOT call find_duplicate_computation, get_provenance, list_recent_results, or ANY other tool.
-- You already have all the context you need in the conversation above.
-- Tool calls will be REJECTED and will waste your only turn — you will fail the task.
-- Your entire response must be plain text: an <analysis> block followed by a <summary> block.
+- 不得调用 find_duplicate_computation、get_provenance、list_recent_results 或任何其他工具。
+- 对话记录已包含你所需的全部上下文。
+- 工具调用将被拒绝，并消耗你唯一的输出机会——任务将因此失败。
+- 整个回复必须是纯文本：一个 <analysis> 块，紧接一个 <summary> 块。
 
 `
 
 const NO_TOOLS_TRAILER =
-  '\n\nREMINDER: Do NOT call any tools. Respond with plain text only — ' +
-  'an <analysis> block followed by a <summary> block. ' +
-  'Tool calls will be rejected and you will fail the task.'
+  '\n\n提醒：严禁调用任何工具。仅输出纯文本——' +
+  '一个 <analysis> 块，紧接一个 <summary> 块。' +
+  '工具调用将被拒绝，任务将因此失败。'
 
-const DETAILED_ANALYSIS_INSTRUCTION = `Before providing your final summary, wrap your analysis in <analysis> tags. In your analysis:
+const DETAILED_ANALYSIS_INSTRUCTION = `在输出最终摘要前，将你的分析过程包裹在 <analysis> 标签中。分析时请：
 
-1. Chronologically analyse each message and identify:
-   - The user's explicit engineering requests and intents
-   - Every tool call made, its provenance ID, and whether it passed V&V
-   - Escalation decisions and their supporting evidence
-   - V&V abort/warning events and how they were handled
-2. Double-check that EVERY provenance ID (prov-xxx) appearing in the conversation is captured in Chapter 4.
-3. Verify that the Optional Next Step quotes verbatim from the most recent messages.`
+1. 按时间顺序逐条分析每条消息，识别：
+   - 用户明确的工程需求和意图
+   - 每次工具调用、其 provenance ID，以及是否通过 V&V
+   - 升级决策及其支撑数据
+   - V&V 中止/警告事件及处理方式
+2. 核查对话中出现的 **每一个** provenance ID（prov-xxx）是否都已记录在第 4 章。
+3. 确认"可选下一步"中的引用确实来自最近消息的原文。`
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Meta-Agent Compact Prompt (10 chapters)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const METAAGENT_COMPACT_BODY = `Your task is to create a detailed summary of this engineering session so that work can continue without losing any computational context.
+const METAAGENT_COMPACT_BODY = `你的任务是为本次工程会话创建详尽摘要，确保后续工作能在不丢失任何计算上下文的情况下继续进行。
 
 ${DETAILED_ANALYSIS_INSTRUCTION}
 
-Your summary MUST include the following sections:
+摘要**必须**包含以下章节：
 
-1. Primary Request and Intent
-   Capture all of the user's explicit engineering requests and intents in detail.
+0. Task Contract（目标锚点）
+   [若本次会话无活跃 TaskContract，完全跳过本章。]
+   **严禁修改或缩短** Task Contract 中的任何内容，逐字复制以下字段：
+   - Primary Goal（主要目标）
+   - Non-Goals（非目标，明确超出范围的事项）
+   - Hard Constraints（硬性约束）
+   - Acceptance Criteria（验收标准，含每项的 pass/fail/unknown 状态）
+   - User-Approved Decisions（用户批准决策日志）
+   - Current Plan（当前计划步骤）
+   - Open Questions（待解决的开放性问题）
 
-2. Key Technical Concepts
-   List all important engineering concepts, DOE strategies, simulation tools, domain constants, and frameworks discussed.
+1. 主要需求与意图
+   详细记录用户全部明确的工程需求和意图。
 
-3. Campaign State
-   [Skip this section entirely if no engineering campaign was active.]
-   - Campaign ID, project name, and current phase
-   - Timeline: how and why the campaign reached its current phase (escalation decisions with numerical evidence, e.g. "L0 Pareto hypervolume 0.73 < threshold 0.85 → escalate to L1")
-   - Current Pareto front: number of non-dominated designs, objective values of key trade-off points
-   - Next intended action for the campaign
+2. 关键技术概念
+   列出讨论中涉及的重要工程概念、DOE 策略、仿真工具、领域常量及框架。
 
-4. Computations and Results  ← CRITICAL: include every provenance ID verbatim
-   List EVERY tool call recorded in this session. Format each as:
+3. Campaign 状态
+   [若本次会话未激活工程 campaign，完全跳过本章。]
+   - Campaign ID、项目名称及当前阶段
+   - 时间线：campaign 如何推进至当前阶段（升级决策及数值依据，例如"L0 Pareto 超体积 0.73 < 阈值 0.85 → 升级至 L1"）
+   - 当前 Pareto 前沿：非支配设计数量、关键权衡点的目标值
+   - Campaign 的下一步预期动作
+
+4. 计算记录与结果  ← 关键：必须逐字保留每个 provenance ID
+   列出本次会话中**每一次**工具调用。格式：
      [prov-xxx] tool_name(key=val, key=val, ...) → ✓/⚠/✗  fidelity=L0/L1/L2
-   These IDs are required to query computation history after compaction.
-   Do NOT summarise or omit any ID — they are permanent handles to disk-persisted records.
-   After compaction: use \`get_provenance(<id>)\` to recall a specific record, or
-   \`list_recent_results\` to search by tool name or time range.
+   这些 ID 是压缩后查询计算历史的唯一入口。
+   不得汇总或省略任何 ID——它们是磁盘持久化记录的永久句柄。
+   压缩后：使用 \`get_provenance(<id>)\` 查询单条记录，或
+   使用 \`list_recent_results\` 按工具名/时间范围搜索。
 
-5. V&V Events
-   List all validation/verification events:
-   - PRE-CALL ABORTs: [prov-xxx] tool_name — which hook triggered, what was wrong, how resolved
-   - POST-CALL ABORTs: [prov-xxx] tool_name — raw output issue, alternative action taken
-   - WARNINGs: [prov-xxx] tool_name — concern raised, whether result was used with caveats
+5. V&V 事件
+   列出所有验证/核查事件：
+   - PRE-CALL ABORT：[prov-xxx] tool_name — 触发的钩子、问题所在、处理方式
+   - POST-CALL ABORT：[prov-xxx] tool_name — 原始输出问题、已采取的替代动作
+   - WARNING：[prov-xxx] tool_name — 提出的顾虑、结果是否附条件使用
 
-6. Problem Solving
-   Document engineering problems solved and any ongoing troubleshooting efforts.
+6. 问题解决
+   记录已解决的工程问题及正在进行中的排查工作。
 
-7. All user messages
-   List ALL user messages verbatim (not tool results), up to the most recent 30.
-   If more than 30 exist, include the first 2 and then the most recent 28.
-   These are critical for understanding intent and direction changes.
+7. 全部用户消息
+   逐字列出**所有**用户消息（不含工具调用结果），最多保留最近 30 条。
+   若超过 30 条，保留最早 2 条 + 最近 28 条。
+   这些消息对理解意图变化至关重要。
 
-8. Pending Tasks
-   Outline any pending tasks explicitly requested by the user.
+8. 待办事项
+   列出用户明确要求的所有待处理任务。
 
-9. Current Work
-   Describe precisely what was being worked on immediately before this compaction, including the most recent tool call and its result.
+9. 当前工作
+   精确描述本次压缩前正在进行的工作，包括最近一次工具调用及其结果。
 
-10. Optional Next Step
-    The next step DIRECTLY in line with the user's most recent explicit request.
-    IMPORTANT: include direct verbatim quotes from the most recent messages showing exactly what was being worked on.
-    For campaign work, include the current phase name and the last provenance ID referenced.
+10. 可选下一步
+    与用户最近明确请求**直接相关**的下一步行动。
+    重要：必须包含最近消息的原文引用，以证明任务判断无偏差。
+    若为 campaign 工作，注明当前阶段名称及最后引用的 provenance ID。
 
-Here is the required output structure:
+输出格式示例：
 
 <example>
 <analysis>
-[Chronological analysis covering all provenance IDs and key decisions]
+[按时间顺序的分析，覆盖所有 provenance ID 及关键决策]
 </analysis>
 
 <summary>
-1. Primary Request and Intent:
-   [Detail]
+1. 主要需求与意图：
+   [详细描述]
 
-2. Key Technical Concepts:
-   - [Concept]
+2. 关键技术概念：
+   - [概念]
 
-3. Campaign State:
-   Campaign: my-battery-project (ID: camp-abc) | Phase: PARETO_READY_L1
-   Reached via: L0 complete (24 pts) → hypervolume 0.73 < 0.85 threshold → user approved L1 escalation
-   Pareto front (L1): 3 non-dominated designs; best trade-off at capacity=4.2 Ah, η=0.91
-   Next action: review L1 Pareto, decide escalate-L2 or report
+3. Campaign 状态：
+   Campaign: my-battery-project (ID: camp-abc) | 阶段：PARETO_READY_L1
+   推进路径：L0 完成（24 个点）→ 超体积 0.73 < 阈值 0.85 → 用户批准升级至 L1
+   L1 Pareto 前沿：3 个非支配设计；最佳权衡点 capacity=4.2 Ah, η=0.91
+   下一步：审查 L1 Pareto，决定升级至 L2 或进入报告阶段
 
-4. Computations and Results:
+4. 计算记录与结果：
    [prov-a1b2c3] battery_capacity_sim(capacity=4.2, temp=25) → ✓  fidelity=L0
    [prov-d4e5f6] battery_capacity_sim(capacity=4.5, temp=35) → ⚠  fidelity=L0
    [prov-g7h8i9] surrogate_eval(design_id=42) → ✓  fidelity=L1
 
-5. V&V Events:
-   ⚠ [prov-d4e5f6] battery_capacity_sim — POST-CALL WARNING: efficiency 1.12 > 1.0 (physical limit); used with caveat pending L1 confirmation
+5. V&V 事件：
+   ⚠ [prov-d4e5f6] battery_capacity_sim — POST-CALL WARNING：效率 1.12 > 1.0（超出物理上限）；附条件使用，待 L1 确认
 
-6. Problem Solving:
-   [Description]
+6. 问题解决：
+   [描述]
 
-7. All user messages:
-   - "Run DOE for battery optimisation, capacity 4–5 Ah, temperature 20–40 °C"
-   - "Approve L1 escalation"
+7. 全部用户消息：
+   - "为电池优化运行 DOE，容量 4–5 Ah，温度 20–40 °C"
+   - "批准 L1 升级"
 
-8. Pending Tasks:
-   - Review L1 Pareto front and decide escalation path
+8. 待办事项：
+   - 审查 L1 Pareto 前沿并决定升级路径
 
-9. Current Work:
-   Reviewing L1 Pareto front results. Last computation: [prov-g7h8i9] surrogate_eval returned 3 non-dominated designs.
+9. 当前工作：
+   正在审查 L1 Pareto 前沿结果。最后一次计算：[prov-g7h8i9] surrogate_eval 返回 3 个非支配设计。
 
-10. Optional Next Step:
-    Present L1 Pareto front to user and ask: "Escalate to L2 or proceed to REPORTING?"
-    (From most recent message: "Approve L1 escalation")
+10. 可选下一步：
+    向用户呈现 L1 Pareto 前沿，询问："升级至 L2 还是进入 REPORTING 阶段？"
+    （来自最近消息原文："批准 L1 升级"）
 </summary>
 </example>
 
-Please provide your summary based on the conversation, following this structure with precision.
+请按上述结构输出摘要，确保精确、完整。
 `
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -200,23 +212,72 @@ export async function buildCompactInstructions(
    * When omitted, the function fetches them itself.
    */
   prefetchedRecords?: Awaited<ReturnType<NonNullable<RuntimeContext['provenanceTracker']>['list']>>,
+  /**
+   * Active TaskContract for the current session.
+   * When provided, the compact instructions include a verbatim copy of the
+   * contract fields and a hard prohibition on modifying them, so compaction
+   * can never silently drop or rewrite the goal anchor.
+   */
+  taskContract?: TaskContract,
 ): Promise<string> {
   const lines: string[] = [
     '## Compact Instructions',
     '',
-    'When compacting this conversation, in addition to the standard sections, always include:',
+    '压缩本次会话时，除标准章节外，还必须包含以下内容：',
     '',
-    '**Computations and Results** (CRITICAL — do not omit any provenance ID):',
-    'List every tool call as: [prov-xxx] tool_name(key_params) → ✓/⚠/✗ fidelity=L0/L1/L2',
+    '**计算记录与结果**（关键——不得遗漏任何 provenance ID）：',
+    '格式：[prov-xxx] tool_name(key_params) → ✓/⚠/✗ fidelity=L0/L1/L2',
     '',
-    '**V&V Events**:',
-    'List all PRE-CALL ABORTs, POST-CALL ABORTs, and WARNINGs with their provenance IDs.',
+    '**V&V 事件**：',
+    '列出所有带 provenance ID 的 PRE-CALL ABORT、POST-CALL ABORT 和 WARNING。',
     '',
-    '**Campaign State** (if a campaign is active):',
-    'Include phase, escalation decisions with numerical evidence, and current Pareto summary.',
+    '**Campaign 状态**（若有活跃 campaign）：',
+    '包含阶段、带数值依据的升级决策，以及当前 Pareto 摘要。',
     '',
-    '**Optional Next Step** must include verbatim quotes from the most recent messages.',
+    '**可选下一步**必须包含最近消息的原文引用。',
   ]
+
+  // ── Task Contract preservation ────────────────────────────────────────────
+  //
+  // When a TaskContract is active, inject the full contract verbatim into the
+  // compact instructions.  The compact model MUST reproduce it word-for-word in
+  // the summary's Chapter 0 — this prevents any compaction from silently
+  // dropping the goal anchor or rewriting the primary goal.
+
+  if (taskContract) {
+    lines.push(
+      '',
+      '**Task Contract（目标锚点，严禁修改——必须逐字出现在摘要第 0 章）：**',
+      `  contractId: ${taskContract.contractId}`,
+      `  Primary Goal: ${taskContract.primaryGoal}`,
+    )
+    if (taskContract.nonGoals.length > 0) {
+      lines.push(`  Non-Goals: ${taskContract.nonGoals.join(' | ')}`)
+    }
+    if (taskContract.constraints.length > 0) {
+      lines.push(`  Hard Constraints: ${taskContract.constraints.join(' | ')}`)
+    }
+    if (taskContract.acceptanceCriteria.length > 0) {
+      lines.push('  Acceptance Criteria:')
+      for (const ac of taskContract.acceptanceCriteria) {
+        const icon = ac.status === 'pass' ? '✅' : ac.status === 'fail' ? '❌' : '⬜'
+        lines.push(`    ${icon} [${ac.id}] ${ac.description}`)
+      }
+    }
+    if (taskContract.userApprovedDecisions.length > 0) {
+      lines.push('  User-Approved Decisions:')
+      for (const d of taskContract.userApprovedDecisions) {
+        lines.push(`    [${d.at.slice(0, 10)}] ${d.decision}`)
+      }
+    }
+    if (taskContract.currentPlan.length > 0) {
+      lines.push('  Current Plan:')
+      taskContract.currentPlan.forEach((step, i) => lines.push(`    ${i + 1}. ${step}`))
+    }
+    if (taskContract.openQuestions.length > 0) {
+      lines.push(`  Open Questions: ${taskContract.openQuestions.join(' | ')}`)
+    }
+  }
 
   // ── Provenance records ────────────────────────────────────────────────────
   //
@@ -255,17 +316,17 @@ export async function buildCompactInstructions(
       if (!seenIds.has(r.id)) {
         snapshotLines.push(
           `  [${r.id}] ${r.toolName}(${r.inputSummary}) → ${r.vv} fidelity=L${r.fidelityLevel}  ` +
-          `[from snapshot@${new Date(snapshot.capturedAt).toISOString().slice(11, 16)}Z]`,
+          `[快照@${new Date(snapshot.capturedAt).toISOString().slice(11, 16)}Z]`,
         )
       }
     }
   }
 
   if (liveLines.length > 0 || snapshotLines.length > 0) {
-    lines.push('', 'Current session provenance records (must all appear in the compact):')
+    lines.push('', '当前会话 provenance 记录（必须全部出现在压缩摘要中）：')
     lines.push(...liveLines)
     if (snapshotLines.length > 0) {
-      lines.push('  [snapshot backfill — produced after compact instructions were built:]')
+      lines.push('  [快照补录——以下记录产生于压缩指令构建之后：]')
       lines.push(...snapshotLines)
     }
   }
@@ -291,8 +352,39 @@ export async function buildCompactInstructions(
   }
 
   if (campaignLines.length > 0) {
-    lines.push('', 'Current campaign state (must appear in Campaign State section):')
+    lines.push('', '当前 campaign 状态（必须出现在第 3 章 Campaign 状态中）：')
     lines.push(...campaignLines)
+  }
+
+  // ── Campaign drift-guard: objectives + constraints from snapshot ──────────
+  //
+  // Inject objectives and constraints from the snapshot so the compact model
+  // cannot silently drop them.  These fields are only present when
+  // CampaignStateStore.load() succeeded during snapshot capture.
+  if (snapshot && snapshot.activeCampaigns.length > 0) {
+    const driftLines: string[] = []
+    for (const c of snapshot.activeCampaigns) {
+      const name = c.projectName ?? c.campaignId
+      if (c.objectives && c.objectives.length > 0) {
+        driftLines.push(`  [${name}] 优化目标（必须逐字保留在第 3 章）：`)
+        for (const o of c.objectives) driftLines.push(`    - ${o}`)
+      }
+      if (c.constraints && c.constraints.length > 0) {
+        driftLines.push(`  [${name}] 硬性约束（必须逐字保留在第 3 章，不得省略）：`)
+        for (const ct of c.constraints) driftLines.push(`    - ${ct}`)
+      }
+      if (c.contextBlock) {
+        driftLines.push(`  [${name}] 快照时的 campaign 状态摘要（供核对）：`)
+        // Indent the contextBlock for readability
+        for (const line of c.contextBlock.split('\n').slice(0, 15)) {
+          driftLines.push(`    ${line}`)
+        }
+      }
+    }
+    if (driftLines.length > 0) {
+      lines.push('', 'Campaign 目标与约束（防漂移保护——不得在压缩中丢失）：')
+      lines.push(...driftLines)
+    }
   }
 
   return lines.join('\n')

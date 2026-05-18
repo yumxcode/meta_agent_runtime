@@ -32,6 +32,7 @@ import {
   type SubAgentCompletedEvent,
   type SubAgentFailedEvent,
 } from './types.js'
+import type { ISubAgentDispatcher } from './ISubAgentDispatcher.js'
 import type { MetaAgentTool } from '../core/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -55,13 +56,37 @@ export interface SpawnSubAgentOptions {
 // SubAgentBridge
 // ─────────────────────────────────────────────────────────────────────────────
 
-export class SubAgentBridge {
+export class SubAgentBridge implements ISubAgentDispatcher {
   /**
    * P1-8: Guard against duplicate bridges per session which would register
    * duplicate CampaignEventBus listeners and double-deliver notifications.
    * destroy() removes the session entry so the next session can create cleanly.
+   *
+   * ⚠ Memory leak risk: this static Map holds a strong reference to every
+   * SubAgentBridge ever created.  Callers MUST call bridge.destroy() when the
+   * parent session ends — otherwise the bridge (and its runners / timers /
+   * listeners) will be retained for the entire process lifetime.
+   *
+   * Pattern:
+   *   const bridge = new SubAgentBridge(session.sessionId)
+   *   try { ... } finally { bridge.destroy() }
    */
   private static readonly _bridgesBySessionId = new Map<string, SubAgentBridge>()
+
+  /**
+   * Retrieve an existing bridge for a session (for use in test teardown or
+   * emergency cleanup when the original bridge reference is lost).
+   */
+  static getBridge(sessionId: string): SubAgentBridge | undefined {
+    return SubAgentBridge._bridgesBySessionId.get(sessionId)
+  }
+
+  /** Destroy all bridges — use only in process-exit cleanup handlers. */
+  static destroyAll(): void {
+    for (const bridge of SubAgentBridge._bridgesBySessionId.values()) {
+      try { bridge.destroy() } catch { /* best-effort */ }
+    }
+  }
 
   private readonly parentSessionId: string
   /**
@@ -102,9 +127,17 @@ export class SubAgentBridge {
 
     this._onCompleted = (e) => {
       if (e.parentSessionId !== this.parentSessionId) return
+      const ps = e.result.progressState
+      const progressSuffix = ps
+        ? ` | 工具调用: ${ps.toolCallsCompleted}` +
+          (ps.stepsCompleted > 0 ? ` 步: ${ps.stepsCompleted}` : '') +
+          (ps.provenanceIds.length > 0
+            ? ` | provenance: ${ps.provenanceIds.slice(0, 5).join(', ')}${ps.provenanceIds.length > 5 ? ` (+${ps.provenanceIds.length - 5})` : ''}`
+            : '')
+        : ''
       this._enqueueNotification(
         `[${e.taskId}] ✓ 已完成 | ` +
-        `${e.result.turnsUsed} 轮 / $${e.result.costUsd.toFixed(4)} | ` +
+        `${e.result.turnsUsed} 轮 / $${e.result.costUsd.toFixed(4)}${progressSuffix} | ` +
         `摘要: ${e.result.summary.slice(0, 300)}${e.result.summary.length > 300 ? '…' : ''}`,
       )
       this._clearPollTimer(e.taskId)
@@ -239,10 +272,16 @@ export class SubAgentBridge {
 
     const runner = this.runners.get(taskId)
     if (runner) {
-      // Runner's abort controller is internal — we signal via the interrupt path.
-      // The runner listens to its own AbortSignal and calls session.interrupt().
-      // We write the cancelled record directly since the runner may not have
-      // processed the signal yet.
+      // Abort the runner's internal AbortController so the MetaAgentSession
+      // receives an interrupt signal.  We also write the cancelled record
+      // immediately (below) so the task appears cancelled right away rather
+      // than waiting for the runner to observe the abort signal.
+      // SubAgentRunner._writeTerminal() guards against overwriting a
+      // cancelled record, so there is no race condition.
+      runner.abort()
+      // Keep the runner in the map until it fully stops — the runner will
+      // reach its own terminal state (aborted → no further writes) and the
+      // map entry will be cleaned up at destroy() time.
     }
 
     // Write cancelled status immediately
@@ -315,9 +354,22 @@ export class SubAgentBridge {
         return
       }
       if (TERMINAL_STATUSES.has(record.status)) {
-        const resultLine = record.result?.success
-          ? `✓ 已完成 | ${record.result.turnsUsed} 轮 / $${record.result.costUsd.toFixed(4)} | 摘要: ${record.result.summary.slice(0, 300)}`
-          : `✗ 失败 | ${record.result?.error ?? 'unknown'}`
+        let resultLine: string
+        if (record.result?.success) {
+          const ps = record.result.progressState
+          const progressSuffix = ps
+            ? ` | 工具调用: ${ps.toolCallsCompleted}` +
+              (ps.stepsCompleted > 0 ? ` 步: ${ps.stepsCompleted}` : '') +
+              (ps.provenanceIds.length > 0
+                ? ` | provenance: ${ps.provenanceIds.slice(0, 5).join(', ')}${ps.provenanceIds.length > 5 ? ` (+${ps.provenanceIds.length - 5})` : ''}`
+                : '')
+            : ''
+          resultLine =
+            `✓ 已完成 | ${record.result.turnsUsed} 轮 / $${record.result.costUsd.toFixed(4)}${progressSuffix} | ` +
+            `摘要: ${record.result.summary.slice(0, 300)}`
+        } else {
+          resultLine = `✗ 失败 | ${record.result?.error ?? 'unknown'}`
+        }
         this._enqueueNotification(`[${taskId}] ${resultLine}`)
         this._clearPollTimer(taskId)
       }

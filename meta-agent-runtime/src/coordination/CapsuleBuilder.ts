@@ -15,6 +15,8 @@
 import type {
   CampaignContextCapsule,
   CampaignPhase,
+  Constraint,
+  DesignVariable,
   EvaluationResult,
   Objective,
   ParetoFront,
@@ -62,6 +64,31 @@ function buildContextBlock(
   const statusEmoji = statusIcon(phase)
   lines.push(`### ${statusEmoji} Campaign: ${projectName} [${phaseLabel}]`)
 
+  // ── Objectives (always shown — drift guard) ──
+  // Always include so the model cannot forget what it is optimising after
+  // compaction, even when no Pareto front exists yet.
+  if (objectives.length > 0) {
+    const objStr = objectives
+      .map(o => `${o.direction === 'minimize' ? '↓' : '↑'} ${o.name}${o.unit ? ` (${o.unit})` : ''}`)
+      .join('  ')
+    lines.push(`Objectives: ${objStr}`)
+  }
+
+  // ── Design variable ranges (compact form) ──
+  const variables = store.designSpace.variables
+  if (variables.length > 0) {
+    const varStr = variables
+      .map(v => formatVariable(v))
+      .join('  ')
+    lines.push(`Variables: ${varStr}`)
+  }
+
+  // ── Constraints (always shown — hard limits must never be forgotten) ──
+  const constraints = store.designSpace.constraints
+  if (constraints.length > 0) {
+    lines.push(`Constraints: ${constraints.map(c => formatConstraint(c)).join('  ')}`)
+  }
+
   // ── Progress ──
   if (totalPoints > 0) {
     const done = completedTaskCount
@@ -100,6 +127,29 @@ function buildContextBlock(
   }
 
   return lines.join('\n')
+}
+
+// ── Design space formatters ───────────────────────────────────────────────────
+
+function formatVariable(v: DesignVariable): string {
+  if ((v.type === 'continuous' || v.type === 'integer') && v.bounds) {
+    const unit = v.unit ? ` ${v.unit}` : ''
+    return `${v.name}∈[${v.bounds[0]}, ${v.bounds[1]}]${unit}`
+  }
+  if ((v.type === 'discrete' || v.type === 'categorical') && v.values) {
+    const vals = v.values.slice(0, 4).join('|')
+    const trailer = v.values.length > 4 ? `|…(${v.values.length})` : ''
+    return `${v.name}∈{${vals}${trailer}}`
+  }
+  return v.name
+}
+
+function formatConstraint(c: Constraint): string {
+  // Truncate long expressions to keep contextBlock compact
+  const expr = c.expression.length > 60
+    ? c.expression.slice(0, 57) + '…'
+    : c.expression
+  return `[${c.name}: ${expr}]`
 }
 
 // ── Structured data (for tool queries, not injected into context) ─────────────

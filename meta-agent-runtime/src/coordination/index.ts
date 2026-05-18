@@ -1,5 +1,11 @@
 /**
- * Coordination layer — public barrel.
+ * Coordination layer — internal barrel.
+ *
+ * @deprecated Import from `../campaign/index.js` (or `@meta-agent/runtime`)
+ * instead.  `src/campaign/index.ts` is now the unified entry point for both
+ * the Campaign Plugin Framework and this DOE coordination layer.
+ * This file is kept as the internal implementation barrel; direct imports
+ * from external packages should migrate to the `campaign/` path.
  *
  * Exports everything needed by consumers of the coordination system:
  *   - Campaign state machine (CampaignStateStore)

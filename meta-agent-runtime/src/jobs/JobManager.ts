@@ -219,13 +219,31 @@ export class JobManager {
    *
    * If the job is already complete, resolves immediately.
    * Multiple callers can await the same job.
+   *
+   * P1-9 fix: reattach() and loadSession() register jobs with a terminal
+   * status but without a `result` object (executor callbacks never fired).
+   * Previously, awaitJob() would fall through to registering a resolver that
+   * is never called — hanging permanently.
+   *
+   * Fix: if the in-memory record is terminal but has no result, reject
+   * immediately with the job's stored error message so the caller isn't stuck.
+   * A completed job without a result is treated as failed (shouldn't happen in
+   * normal flow, but defensive).
    */
   awaitJob(jobId: JobId, onProgress?: (p: JobProgress) => void): Promise<JobResult> {
     const rt = this.jobs.get(jobId)
     if (!rt) return Promise.reject(new Error(`Unknown job: ${jobId}`))
 
-    // Already done?
+    // Already done (executor callback populated rt.result)?
     if (rt.result) return Promise.resolve(rt.result)
+
+    // Terminal status but no result — reattached or loadSession() job that
+    // never passed through executor callbacks.  Return immediately to prevent
+    // a permanent hang.
+    if (TERMINAL_STATUSES.has(rt.job.status)) {
+      const errMsg = rt.job.error ?? `Job ${jobId} ended with status "${rt.job.status}"`
+      return Promise.reject(new Error(errMsg))
+    }
 
     return new Promise<JobResult>((resolve, reject) => {
       if (onProgress) rt.progressListeners.push(onProgress)

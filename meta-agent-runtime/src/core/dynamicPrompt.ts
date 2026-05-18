@@ -4,6 +4,8 @@
  * Two groups of sections (mirrors meta-agent-architecture.md §4.1 Dynamic Zone):
  *
  * PUBLIC BASE (all modes):
+ *   D1c agent_directives [memoized] — AGENT.md: workflow procedures, project rules, caveats
+ *   D0  task_contract    [memoized, keyed on updatedAt] — goal anchor (when present)
  *   D1a memory_guidance [memoized]  — taxonomy, write protocol, hard boundaries (static)
  *   D1b memory_content  [uncached]  — MEMORY.md index + per-query recalled topic files
  *   D2  env_info              — session_id, available tools, timestamp
@@ -25,6 +27,7 @@
  */
 
 import type Anthropic from '@anthropic-ai/sdk'
+import { WorkflowLoader } from '../workflow/WorkflowLoader.js'
 import {
   systemPromptSection,
   DANGEROUS_uncachedSystemPromptSection,
@@ -42,6 +45,9 @@ import {
   loadMemoryIndex,
 } from './memory/memdir.js'
 import { findRelevantMemories } from './memory/findRelevantMemories.js'
+import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
+import { buildSubAgentNotificationSection } from '../subagent/SubAgentBridge.js'
+import type { TaskContract } from './contract/types.js'
 
 // ── AgentMode ─────────────────────────────────────────────────────────────────
 
@@ -132,7 +138,25 @@ export function buildMemoryContentSection(
         parts.push('', '## Recalled memory files', '')
         for (const mem of relevant) {
           const { header, content } = mem
-          const meta = [header.type, header.date].filter(Boolean).join(' · ')
+
+          // Base meta: type · date
+          const metaParts: string[] = []
+          if (header.type) metaParts.push(header.type)
+          if (header.date) metaParts.push(header.date)
+
+          // Confidence annotation — low-confidence memories get a warning badge
+          if (header.confidence === 'low') metaParts.push('⚠ confidence:low')
+          else if (header.confidence === 'medium') metaParts.push('confidence:medium')
+
+          // Revalidation flag — model must re-verify before use
+          if (header.requiresRevalidation) metaParts.push('🔄 requires_revalidation')
+
+          // Source-verified badge for domain_knowledge
+          if (header.type === 'domain_knowledge' && header.sourceVerified === false) {
+            metaParts.push('⚠ source_unverified')
+          }
+
+          const meta = metaParts.join(' · ')
           parts.push(
             `### ${header.name}  (\`${header.filename}\`)`,
             meta ? `_${meta}_` : '',
@@ -148,6 +172,51 @@ export function buildMemoryContentSection(
     'Memory content changes as the model writes new memories and as different topic files ' +
     'are selected per user query.',
   )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D1c — Agent Directives  [memoized per session]
+//
+// Reads AGENT.md from the project directory and injects its full contents
+// verbatim.  AGENT.md is the project owner's place to declare:
+//   - Workflow procedures and phase gate criteria
+//   - Project-specific rules and conventions
+//   - Important caveats (e.g. deprecated APIs, known hardware quirks)
+//   - Any standing instructions that must persist across compaction
+//
+// Discovery (first match wins):
+//   1. <projectDir>/.meta-agent/AGENT.md   — project-scoped directives
+//   2. <projectDir>/AGENT.md               — project root alternative
+//   3. ~/.meta-agent/AGENT.md              — global user directives (fallback)
+//
+// The section is memoized per session: AGENT.md is read once on the first
+// submit() and cached for the session lifetime.  A new session always picks
+// up the latest version of the file.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Unified AGENT.md loader — delegates to WorkflowLoader.loadRaw() which is
+ * the single source of truth for the 3-path discovery cascade:
+ *   <projectDir>/.meta-agent/AGENT.md  →  <projectDir>/AGENT.md
+ *   →  ~/.meta-agent/AGENT.md
+ */
+function _loadAgentMd(projectDir: string): string | null {
+  return WorkflowLoader.loadRaw(projectDir)
+}
+
+export function buildAgentDirectivesSection(projectDir: string): SystemPromptSection {
+  // Memoized by section name — read once per SectionRegistry (= once per session).
+  // AGENT.md is a static config file; mid-session writes to it are not picked up
+  // until the next session (intentional — avoids surprising prompt changes mid-turn).
+  return systemPromptSection('agent_directives', () => {
+    const content = _loadAgentMd(projectDir)
+    if (!content) return null
+    return (
+      `## Agent Directives\n\n` +
+      `_Loaded from AGENT.md — project-specific workflow procedures, rules, and caveats._\n\n` +
+      content
+    )
+  })
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -565,6 +634,103 @@ export function buildPhaseGuidanceSection(): SystemPromptSection {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// D0 — Task Contract  [memoized until contract changes]
+//
+// Injected ABOVE all other sections when a TaskContract exists for the session.
+// This is the immutable goal anchor: compaction cannot remove or rewrite it.
+// Displayed in a prominent "DRIFT GUARD" block so the model always knows the
+// original intent, non-goals, constraints, and acceptance criteria status.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function buildTaskContractSection(
+  contract: TaskContract,
+): SystemPromptSection {
+  // Uses a memoized section keyed on contract.updatedAt — only rebuilt when the
+  // contract changes, so it's stable for prompt-cache across consecutive turns.
+  return systemPromptSection(`task_contract_${contract.updatedAt}`, () => {
+    const lines: string[] = []
+
+    lines.push('## ⚓ Task Contract (Goal Anchor — Immutable)')
+    lines.push('')
+    lines.push(`**Primary Goal:** ${contract.primaryGoal}`)
+
+    if (contract.nonGoals.length > 0) {
+      lines.push('')
+      lines.push('**Non-Goals (explicitly out of scope):**')
+      for (const ng of contract.nonGoals) lines.push(`  - ${ng}`)
+    }
+
+    if (contract.constraints.length > 0) {
+      lines.push('')
+      lines.push('**Hard Constraints:**')
+      for (const c of contract.constraints) lines.push(`  - ${c}`)
+    }
+
+    if (contract.acceptanceCriteria.length > 0) {
+      lines.push('')
+      lines.push('**Acceptance Criteria:**')
+      for (const ac of contract.acceptanceCriteria) {
+        const icon = ac.status === 'pass' ? '✅' : ac.status === 'fail' ? '❌' : '⬜'
+        lines.push(`  ${icon} [${ac.id}] ${ac.description}`)
+      }
+    }
+
+    if (contract.userApprovedDecisions.length > 0) {
+      lines.push('')
+      lines.push('**User-Approved Decisions:**')
+      for (const d of contract.userApprovedDecisions) {
+        const ts = d.at.slice(0, 10)
+        const evStr = d.evidence ? ` (evidence: ${d.evidence})` : ''
+        lines.push(`  - [${ts}] ${d.decision}${evStr}`)
+      }
+    }
+
+    if (contract.currentPlan.length > 0) {
+      lines.push('')
+      lines.push('**Current Plan:**')
+      contract.currentPlan.forEach((step, i) => lines.push(`  ${i + 1}. ${step}`))
+    }
+
+    if (contract.openQuestions.length > 0) {
+      lines.push('')
+      lines.push('**Open Questions (must resolve before completion):**')
+      for (const q of contract.openQuestions) lines.push(`  - ${q}`)
+    }
+
+    lines.push('')
+    lines.push(
+      '> ⚠ Do NOT propose actions that contradict the primary goal or violate any hard constraint above. ' +
+      'If you believe a change to the contract is needed, stop and ask the user explicitly.',
+    )
+
+    return lines.join('\n')
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D11 — Sub-Agent Notifications  [DANGEROUS_uncached]
+//
+// Drains pending completion/failure notifications from the SubAgentBridge and
+// injects them into the prompt so the parent agent sees results the moment they
+// are ready.  Returns null (no section added) when there are no pending
+// notifications or when no bridge is provided.
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function buildSubAgentNotificationsSection(
+  bridge: SubAgentBridge,
+): SystemPromptSection {
+  return DANGEROUS_uncachedSystemPromptSection(
+    'subagent_notifications',
+    () => {
+      const block = buildSubAgentNotificationSection(bridge)
+      return block || null
+    },
+    'Sub-agent completions arrive asynchronously; stale state would hide ' +
+    'completed results from the parent agent for an entire turn.',
+  )
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 // Public builder — assemble base + optional campaign assembly
 // ─────────────────────────────────────────────────────────────────────────────
 
@@ -589,12 +755,38 @@ export interface DynamicSectionOptions {
    * Falls back to keyword match on any error.
    */
   client?: Anthropic
+  /**
+   * SubAgentBridge for the current session.
+   * When provided, a volatile D11 section is added that drains pending
+   * sub-agent completion/failure notifications into every prompt turn.
+   * Without this, the parent agent cannot see sub-agent results automatically.
+   */
+  subAgentBridge?: SubAgentBridge
+  /**
+   * Active TaskContract for the current session.
+   * When provided, a memoized D0 section is prepended above all other dynamic
+   * sections so the model always has access to the original user intent,
+   * non-goals, constraints, and acceptance criteria — even across compaction.
+   */
+  taskContract?: TaskContract
+  /**
+   * Root directory of the current project.  Used to discover AGENT.md for the
+   * D1c agent_directives section.  Defaults to process.cwd() when omitted.
+   *
+   * Discovery order (first match wins):
+   *   1. <projectDir>/.meta-agent/AGENT.md   — project-scoped directives
+   *   2. <projectDir>/AGENT.md               — project root alternative
+   *   3. ~/.meta-agent/AGENT.md              — global user directives
+   */
+  projectDir?: string
 }
 
 /**
  * Returns the full list of dynamic sections for the given options.
  *
  * Ordering:
+ *   D1c agent_directives [memoized]    — AGENT.md: workflow, project rules, caveats
+ *   D0  task_contract    [memoized, keyed on updatedAt] — goal anchor (when present)
  *   D1a memory_guidance  [memoized]    — taxonomy + write protocol (static)
  *   D1b memory_content   [uncached]    — MEMORY.md index + recalled topic files
  *   D2  env_info         [memoized]
@@ -605,13 +797,24 @@ export interface DynamicSectionOptions {
  *   D5  mcp_instructions [memoized]
  *   D6  output_style     [memoized]
  *   D7  summarize_tool_results [memoized]
+ *   D11 subagent_notifications [uncached] — when subAgentBridge provided
  *   ── Campaign Assembly (campaign mode only) ──
  *   D8  campaign_context  [uncached]
  *   D9  session_provenance [memoized, invalidated on new records]
  *   D10 phase_guidance    [uncached]
  */
 export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptSection[] {
+  const effectiveProjectDir = opts.projectDir ?? process.cwd()
+
   const base: SystemPromptSection[] = [
+    // D1c: Agent Directives — project-specific workflow procedures, rules, and
+    // caveats loaded from AGENT.md.  Placed first so the project owner's standing
+    // instructions form the outermost framing before any session-specific context
+    // (task contract, memories, campaign state) is injected.
+    buildAgentDirectivesSection(effectiveProjectDir),
+    // D0: Task Contract — goal anchor immediately after project directives so the
+    // model sees original intent before any volatile sections.
+    ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),
     buildMemoryGuidanceSection(),
     buildMemoryContentSection(opts.currentQuery ?? '', opts.client),
     buildEnvInfoSection(opts.sessionId, opts.sessionStartMs, opts.tools),
@@ -622,6 +825,12 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     buildMcpInstructionsSection(opts.mcpServers),
     buildOutputStyleSection(opts.outputStyle),
     buildSummarizeToolResultsSection(),
+    // D11: sub-agent notifications — always injected when a bridge is present so
+    // the parent agent sees completed sub-tasks on the very next turn after they
+    // finish, regardless of session mode.
+    ...(opts.subAgentBridge
+      ? [buildSubAgentNotificationsSection(opts.subAgentBridge)]
+      : []),
   ]
 
   if (opts.mode !== 'campaign') return base

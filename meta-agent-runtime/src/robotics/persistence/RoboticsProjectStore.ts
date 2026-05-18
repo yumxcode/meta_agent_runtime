@@ -1,0 +1,82 @@
+import { createHash } from 'crypto'
+import { join } from 'path'
+import { homedir } from 'os'
+import { atomicWriteJson, readJsonFile } from '../../core/persist/index.js'
+import type { RoboticsProjectState, ActiveSubAgentRecord, RoboticsGitState } from '../types.js'
+
+const PROJECTS_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'projects')
+const RESUME_WINDOW_MS = 30 * 24 * 60 * 60 * 1000   // 30 days
+const MAX_PROGRESS_NOTES = 10
+
+function projectHash(projectDir: string): string {
+  return createHash('sha1').update(projectDir).digest('hex').slice(0, 16)
+}
+
+function projectBucketDir(dir: string): string {
+  return join(PROJECTS_ROOT, projectHash(dir))
+}
+
+function stateFile(dir: string): string {
+  return join(projectBucketDir(dir), 'state.json')
+}
+
+export class RoboticsProjectStore {
+  static async findByProjectDir(dir: string): Promise<RoboticsProjectState | null> {
+    const state = await readJsonFile<RoboticsProjectState>(stateFile(dir))
+    if (!state || state.schemaVersion !== '1.0') return null
+    if (Date.now() - state.lastActiveAt > RESUME_WINDOW_MS) return null
+    return state
+  }
+
+  static async save(state: RoboticsProjectState): Promise<void> {
+    await atomicWriteJson(stateFile(state.projectDir), state)
+  }
+
+  static async touch(projectDir: string): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(projectDir)
+    if (state) {
+      state.lastActiveAt = Date.now()
+      await RoboticsProjectStore.save(state)
+    }
+  }
+
+  static async appendProgress(projectDir: string, note: string): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(projectDir)
+    if (!state) return
+    state.progressNotes.push(`[${new Date().toISOString().slice(0, 16)}] ${note}`)
+    if (state.progressNotes.length > MAX_PROGRESS_NOTES) {
+      state.progressNotes = state.progressNotes.slice(-MAX_PROGRESS_NOTES)
+    }
+    await RoboticsProjectStore.save(state)
+  }
+
+  static async registerSubAgentTask(dir: string, record: ActiveSubAgentRecord): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(dir)
+    if (!state) return
+    state.activeSubAgentTasks = state.activeSubAgentTasks.filter(t => t.taskId !== record.taskId)
+    state.activeSubAgentTasks.push(record)
+    await RoboticsProjectStore.save(state)
+  }
+
+  static async completeSubAgentTask(dir: string, taskId: string): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(dir)
+    if (!state) return
+    state.activeSubAgentTasks = state.activeSubAgentTasks.filter(t => t.taskId !== taskId)
+    if (!state.completedSubAgentTaskIds.includes(taskId)) {
+      state.completedSubAgentTaskIds.push(taskId)
+    }
+    await RoboticsProjectStore.save(state)
+  }
+
+  static async updateGitState(dir: string, git: Partial<RoboticsGitState>): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(dir)
+    if (!state) return
+    state.git = {
+      ...state.git,
+      ...git,
+      subAgentBranches: { ...state.git.subAgentBranches, ...(git.subAgentBranches ?? {}) },
+      forkPoints: { ...state.git.forkPoints, ...(git.forkPoints ?? {}) },
+    }
+    await RoboticsProjectStore.save(state)
+  }
+}
