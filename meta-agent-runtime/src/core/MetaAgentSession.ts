@@ -16,6 +16,9 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
+import { writeFile, mkdir } from 'node:fs/promises'
+import { join } from 'node:path'
+import { homedir } from 'node:os'
 import { resolveConfig, isAnthropicProvider, DEFAULT_SYSTEM_PROMPT, type MetaAgentConfig, type ResolvedConfig } from './config.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import {
@@ -178,8 +181,11 @@ export class MetaAgentSession {
       config.systemPrompt === undefined || config.systemPrompt === DEFAULT_SYSTEM_PROMPT
 
     this.config = resolveConfig(config)
-    this.sessionId = randomUUID()
-    this.mutableMessages = []
+    // Allow callers (e.g. RoboticsSession) to pin the session ID so that debug
+    // file paths and SessionStore entries are consistent with the outer session.
+    this.sessionId = config.sessionId ?? randomUUID()
+    // Pre-load history for session resume (config.initialMessages)
+    this.mutableMessages = config.initialMessages ? [...config.initialMessages] : []
     this.abortController = new AbortController()
     this.totalUsage = EMPTY_USAGE
     this.toolRegistry = new Map(
@@ -372,6 +378,23 @@ export class MetaAgentSession {
       // ── Stream one API response ─────────────────────────────────────────
       let toolUseCalls: Anthropic.ToolUseBlock[] = []
 
+      // ── Debug: write outbound prompt to file ───────────────────────────
+      // Full request stored before the API call so it's available even if the
+      // call throws. File: ~/.meta-agent/debug/<sessionId>/turn-NNN-req.json
+      // Awaited (not fire-and-forget) so the file is guaranteed on disk before
+      // the LLM call starts — useful when debugging timeouts or crashes.
+      if (this.config.debugMode) {
+        await MetaAgentSession._writeDebugFile(this.sessionId, turnCount, 'req', {
+          turn:      turnCount,
+          timestamp: new Date().toISOString(),
+          session:   this.sessionId,
+          model:     this.config.model,
+          system:    systemPrompt,
+          messages:  apiMessages,
+          tools:     apiTools.map(t => ({ name: t.name, description: (t as unknown as Record<string,unknown>)['description'] })),
+        })
+      }
+
       try {
         const streamParams: Anthropic.MessageStreamParams = {
           model: this.config.model,
@@ -443,6 +466,22 @@ export class MetaAgentSession {
           }),
         }
         this.mutableMessages.push(assistantMessage)
+
+        // ── Debug: write inbound response to file ───────────────────────────
+        // File: ~/.meta-agent/debug/<sessionId>/turn-NNN-res.json
+        if (this.config.debugMode) {
+          await MetaAgentSession._writeDebugFile(this.sessionId, turnCount, 'res', {
+            turn:        turnCount,
+            timestamp:   new Date().toISOString(),
+            session:     this.sessionId,
+            stop_reason: finalMsg.stop_reason,
+            usage: {
+              input_tokens:  finalMsg.usage.input_tokens,
+              output_tokens: finalMsg.usage.output_tokens,
+            },
+            content: finalMsg.content,
+          })
+        }
 
         // Collect tool_use blocks
         toolUseCalls = finalMsg.content.filter(
@@ -780,6 +819,42 @@ export class MetaAgentSession {
     return this._lastSystemPrompt
   }
 
+  // ─── Debug file helper ─────────────────────────────────────────────────────
+
+  /**
+   * Write a debug snapshot to ~/.meta-agent/debug/<sessionId>/turn-NNN-<kind>.json
+   * Called fire-and-forget (void) — errors are silently swallowed so debug I/O
+   * never interrupts the main conversation flow.
+   *
+   * Files are full-fidelity (no truncation) so they can be diffed / inspected
+   * offline. The debug dir path is printed by the CLI at startup when --debug.
+   */
+  static async _writeDebugFile(
+    sessionId: string,
+    turn: number,
+    kind: 'req' | 'res',
+    payload: unknown,
+  ): Promise<void> {
+    try {
+      const dir = join(homedir(), '.meta-agent', 'debug', sessionId)
+      await mkdir(dir, { recursive: true })
+      const filename = `turn-${String(turn).padStart(3, '0')}-${kind}.json`
+      await writeFile(join(dir, filename), JSON.stringify(payload, null, 2), 'utf8')
+    } catch (err) {
+      // Print to stderr so debug-mode users can see I/O failures.
+      // Never throw — debug writes must not crash the session.
+      process.stderr.write(
+        `[meta-agent DEBUG] ⚠ 写入调试文件失败: ` +
+        `${err instanceof Error ? err.message : String(err)}\n`,
+      )
+    }
+  }
+
+  /** Return the debug log directory for this session (may not exist yet). */
+  getDebugDir(): string {
+    return join(homedir(), '.meta-agent', 'debug', this.sessionId)
+  }
+
   // ─── Private helpers ───────────────────────────────────────────────────────
 
   private buildApiMessages(): Anthropic.MessageParam[] {
@@ -899,6 +974,33 @@ export class MetaAgentSession {
         vvChain: rtx.vvChain,
         provenanceTracker: rtx.provenanceTracker,
       } : {}),
+    }
+
+    // ── Tool execution guard ────────────────────────────────────────────────
+    // Fires before every tool call when the CLI (or any caller) registers a
+    // beforeToolCall hook — e.g. interactive TTY confirmation for destructive ops.
+    if (this.config.beforeToolCall) {
+      const guard = await this.config.beforeToolCall(
+        tc.name,
+        tc.input as Record<string, unknown>,
+      )
+      if (guard.action === 'deny') {
+        return {
+          content:
+            `[操作已拒绝] ${guard.reason ?? '用户拒绝了此操作。'} ` +
+            `请尝试其他方式完成任务，或等待用户进一步指示。`,
+          isError: true,
+        }
+      }
+      if (guard.action === 'redirect') {
+        return {
+          content:
+            `[用户提供替代指导]\n${guard.instructions}\n\n` +
+            `请完全按照上述指导重新规划并执行，不要再尝试原来的方案。`,
+          isError: false,
+        }
+      }
+      // action === 'allow': fall through to normal execution
     }
 
     try {

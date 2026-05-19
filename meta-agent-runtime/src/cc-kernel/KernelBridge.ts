@@ -29,7 +29,7 @@ import { EMPTY_USAGE, accumulateUsage } from '../core/types.js'
 import { resolveConfig } from '../core/config.js'
 import type { MetaAgentConfig, ResolvedConfig } from '../core/config.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
-import { MetaAgentContextStore } from '../coordination/MetaAgentContextStore.js'
+import { MetaAgentContextStore } from '../campaign/index.js'
 import { buildCompactInstructions } from '../core/compact/compactPrompt.js'
 import {
   saveStateSnapshot,
@@ -81,11 +81,15 @@ process.env['META_AGENT_NO_VCR'] = '1'
  * gets fresh sessionId / runtime-services even after _rebuildEngine().
  * The `getSnapshotArgs` callback provides session metadata for the post-call
  * state snapshot (fire-and-forget — never blocks the tool result).
+ *
+ * `beforeToolCall` mirrors MetaAgentSession's guard so campaign mode also
+ * receives the interactive confirmation dialog for sensitive operations.
  */
 function wrapMetaAgentTool(
   tool: MetaAgentTool,
   getCallContext: () => import('../core/types.js').ToolCallContext,
   getSnapshotArgs: () => { sessionId: string; rtx: import('../runtime/RuntimeContext.js').RuntimeContext | undefined; sessionStartMs: number },
+  beforeToolCall?: import('../core/config.js').MetaAgentConfig['beforeToolCall'],
 ): any {
   return {
     name: tool.name,
@@ -106,14 +110,33 @@ function wrapMetaAgentTool(
     // After each call we fire a non-blocking snapshot so that if CC compacts
     // mid-turn, `buildCompactInstructions` can backfill from the snapshot.
     call: async (input: unknown) => {
+      // Apply the same interactive guard used in MetaAgentSession so campaign
+      // mode also pauses for user confirmation on sensitive operations.
+      if (beforeToolCall) {
+        const guard = await beforeToolCall(tool.name, input as Record<string, unknown>)
+        if (guard.action === 'deny') {
+          return {
+            data: `[操作已拒绝] ${guard.reason ?? '用户拒绝了此操作。'} 请尝试其他方式完成任务。`,
+            isError: true,
+          }
+        }
+        if (guard.action === 'redirect') {
+          return {
+            data: `[用户提供替代指导]\n${guard.instructions}\n\n请按照上述指导重新规划并执行。`,
+            isError: false,
+          }
+        }
+        // action === 'allow': fall through
+      }
       const result = await tool.call(input as Record<string, unknown>, getCallContext())
       // Fire-and-forget: write snapshot with the latest provenance + campaign state
       const { sessionId, rtx, sessionStartMs } = getSnapshotArgs()
       void saveStateSnapshot(sessionId, rtx, sessionStartMs).catch(() => {})
       return { data: result.content, isError: result.isError ?? false }
     },
-    // Required predicates
-    isConcurrencySafe: () => false,
+    // Required predicates — honour the tool's own declaration so read-only tools
+    // (grep, glob, web_fetch, etc.) can still be parallelised in campaign mode.
+    isConcurrencySafe: () => tool.isConcurrencySafe ?? false,
     isEnabled: () => true,
     isReadOnly: () => false,
     isDestructive: () => false,
@@ -335,7 +358,10 @@ export class KernelBridge {
       rtx: this.cfg.runtimeContext,
       sessionStartMs: this.sessionStartMs,
     })
-    const toolList = [...this.tools.values()].map(t => wrapMetaAgentTool(t, getCallContext, getSnapshotArgs))
+    const beforeToolCall = this.cfg.beforeToolCall
+    const toolList = [...this.tools.values()].map(t =>
+      wrapMetaAgentTool(t, getCallContext, getSnapshotArgs, beforeToolCall),
+    )
 
     this.engine = new QueryEngine({
       cwd: this.cwd,

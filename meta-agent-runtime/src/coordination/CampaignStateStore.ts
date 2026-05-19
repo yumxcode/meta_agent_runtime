@@ -18,16 +18,15 @@
 import { createHash } from 'crypto'
 import {
   appendFile,
-  mkdir,
   open,
   readFile,
   readdir,
-  rename,
   stat,
   writeFile,
 } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
+import { atomicWriteJson, ensureDir, readJsonFile } from '../core/persist/index.js'
 import type {
   CampaignContextCapsule,
   CampaignPhase,
@@ -215,9 +214,9 @@ export class CampaignStateStore {
   ): Promise<CampaignStateStore> {
     const campaignId = makeCampaignId(projectName)
     const dir = campaignDir(campaignId)
-    await mkdir(dir, { recursive: true })
-    await mkdir(join(dir, 'workers'), { recursive: true })
-    await mkdir(join(dir, 'snapshots'), { recursive: true })
+    await ensureDir(dir)
+    await ensureDir(join(dir, 'workers'))
+    await ensureDir(join(dir, 'snapshots'))
 
     const now = new Date().toISOString()
     const state: PersistedCampaignState = {
@@ -239,11 +238,12 @@ export class CampaignStateStore {
     return store
   }
 
-  /** Load an existing campaign from disk. Throws if not found. */
+  /** Load an existing campaign from disk. Throws if not found or corrupt. */
   static async load(campaignId: string): Promise<CampaignStateStore> {
-    const path = join(campaignDir(campaignId), 'state.json')
-    const raw = await readFile(path, 'utf-8')
-    const state = JSON.parse(raw) as PersistedCampaignState
+    const state = await readJsonFile<PersistedCampaignState>(
+      join(campaignDir(campaignId), 'state.json'),
+    )
+    if (!state) throw new Error(`Campaign "${campaignId}" not found or corrupt`)
     return new CampaignStateStore(state)
   }
 
@@ -611,21 +611,12 @@ export class CampaignStateStore {
 
   /** Persist a pre-computed context capsule. Called by CampaignMonitor. */
   async saveCapsule(capsule: CampaignContextCapsule): Promise<void> {
-    await writeFile(
-      this.paths.capsule,
-      JSON.stringify(capsule, null, 2),
-      'utf-8',
-    )
+    await atomicWriteJson(this.paths.capsule, capsule)
   }
 
   /** Read the most recent capsule, or null if not yet generated. */
   async getCapsule(): Promise<CampaignContextCapsule | null> {
-    try {
-      const raw = await readFile(this.paths.capsule, 'utf-8')
-      return JSON.parse(raw) as CampaignContextCapsule
-    } catch {
-      return null
-    }
+    return readJsonFile<CampaignContextCapsule>(this.paths.capsule)
   }
 
   // ── Report ──────────────────────────────────────────────────────────────────
@@ -670,10 +661,7 @@ export class CampaignStateStore {
   // ── Internal helpers ────────────────────────────────────────────────────────
 
   private async _writeState(): Promise<void> {
-    // Atomic write: write to .tmp then rename
-    const tmp = this.paths.state + '.tmp'
-    await writeFile(tmp, JSON.stringify(this._state, null, 2), 'utf-8')
-    await rename(tmp, this.paths.state)
+    await atomicWriteJson(this.paths.state, this._state)
   }
 
   private async _saveSnapshot(phase: CampaignPhase): Promise<void> {
@@ -686,6 +674,6 @@ export class CampaignStateStore {
     } catch {
       // doesn't exist — write it
     }
-    await writeFile(snapPath, JSON.stringify(this._state, null, 2), 'utf-8')
+    await atomicWriteJson(snapPath, this._state)
   }
 }

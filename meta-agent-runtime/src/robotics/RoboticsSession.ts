@@ -39,12 +39,16 @@ import type { MetaAgentConfig } from '../core/config.js'
 import { SectionRegistry } from '../core/systemPromptSections.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { ExperienceStore } from './ExperienceStore.js'
+import { ExperiencePendingStore } from './ExperiencePendingStore.js'
 import { HardwareProfile } from './HardwareProfile.js'
 import { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section } from './dynamicSections.js'
 import { createRoboticsTools } from './tools/index.js'
+import { createFsTools } from '../tools/fs/index.js'
+import { createBashTool } from '../tools/shell/bash/index.js'
+import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
 import { WorkflowLoader } from '../workflow/WorkflowLoader.js'
 import { WorkflowStateStore } from '../workflow/WorkflowStateStore.js'
 import type { WorkflowDefinition, WorkflowState } from '../workflow/types.js'
@@ -81,6 +85,8 @@ export class RoboticsSession {
   private readonly inner: MetaAgentSession
   private readonly bridge: SubAgentBridge
   private readonly store: ExperienceStore
+  /** Session-scoped pending experience buffer. Exposed so the CLI can drive review UI. */
+  readonly pendingExperiences: ExperiencePendingStore = new ExperiencePendingStore()
   private readonly hwProfile: HardwareProfile
   private readonly gitMgr: GitWorkspaceManager
   private readonly projectDir: string
@@ -97,9 +103,17 @@ export class RoboticsSession {
   private _agentMode: RoboticsAgentMode = 'multi'
   /** True once mode has been classified or overridden; prevents re-classification. */
   private _modeClassified = false
+  /** Heartbeat timer — touches lastActiveAt every HEARTBEAT_INTERVAL_MS */
+  private _heartbeatTimer: ReturnType<typeof setInterval> | null = null
+  /** True after dispose() has been called — prevents double-cleanup */
+  private _disposed = false
 
   /** Mirrors MetaAgentSession.sessionId */
   readonly sessionId: string
+
+  /** Heartbeat interval: 30 s. If lastActiveAt is older than 3× this, session is stale. */
+  static readonly HEARTBEAT_INTERVAL_MS = 30_000
+  static readonly STALE_SESSION_TTL_MS  = 3 * RoboticsSession.HEARTBEAT_INTERVAL_MS
 
   constructor(config: RoboticsSessionOptions = {}) {
     this.sessionId = randomUUID()
@@ -109,12 +123,15 @@ export class RoboticsSession {
       ? undefined
       : config.agentMode
 
-    // Build inner session (agentic mode — full tool support, no campaign sections)
+    // Build inner session (agentic mode — full tool support, no campaign sections).
+    // Pin sessionId to this.sessionId so debug file paths and SessionStore entries
+    // written by MetaAgentSession align with the ID exposed via getSessionId().
     this.inner = new MetaAgentSession({
       ...config,
-      robot: undefined,   // not a MetaAgentConfig field; strip to avoid type errors
-      projectDir: undefined,
-      agentMode: undefined,
+      sessionId:   this.sessionId, // ← align inner UUID with outer
+      robot:       undefined,      // not a MetaAgentConfig field; strip to avoid type errors
+      projectDir:  undefined,
+      agentMode:   undefined,
     } as MetaAgentConfig)
 
     // Infrastructure
@@ -140,8 +157,33 @@ export class RoboticsSession {
       this._state = existing
       this._resumedAt = existing.lastActiveAt
       await RoboticsProjectStore.touch(this.projectDir)
-      // Restore git worktrees that may still be on disk
-      await this.gitMgr.reconcileWorktrees(existing.git)
+
+      // ── Crash-recovery: detect abnormally terminated previous session ────
+      // If lastActiveAt is older than STALE_SESSION_TTL and there are active
+      // sub-agent tasks, the previous process died without calling dispose().
+      // Force-discard all active worktrees to prevent resource leaks.
+      const sessionAge = Date.now() - existing.lastActiveAt
+      const hasActiveTasks = existing.activeSubAgentTasks.length > 0
+      if (sessionAge > RoboticsSession.STALE_SESSION_TTL_MS && hasActiveTasks) {
+        for (const task of existing.activeSubAgentTasks) {
+          if (task.branchName) {
+            await this.gitMgr.removeWorktree(
+              task.taskId,
+              { deleteBranch: false },  // keep branch for forensics; only remove worktree
+            ).catch(() => undefined)
+          }
+          await RoboticsProjectStore.purgeStaleSubAgentTask(this.projectDir, task.taskId)
+        }
+      }
+
+      // ── Reconcile worktrees still on disk ────────────────────────────────
+      // staleIds = tasks whose worktree/branch no longer exists — purge them.
+      const staleIds = await this.gitMgr.reconcileWorktrees(existing.git)
+      if (staleIds.length > 0) {
+        for (const id of staleIds) {
+          await RoboticsProjectStore.purgeStaleSubAgentTask(this.projectDir, id)
+        }
+      }
       // Restore persisted agent mode (explicit override wins)
       if (this._modeOverride) {
         this._agentMode = this._modeOverride
@@ -188,12 +230,28 @@ export class RoboticsSession {
       projectDir: this.projectDir,
       robot: this.robot,
       experienceStore: this.store,
+      experiencePendingStore: this.pendingExperiences,
       hardwareProfile: this.hwProfile,
       gitManager: this.gitMgr,
     })
     for (const tool of roboticsTools) {
       this.inner.registerTool(tool)
     }
+
+    // ── 3b. Register foundational tools (file I/O, shell, sub-agent status) ──
+    //
+    // These are essential for the main agent to:
+    //   - Read log files / CSVs directly without dispatching sub-agents (glob, read_file, bash)
+    //   - Retrieve sub-agent results after experiment_dispatch (get_sub_agent_status)
+    //
+    // Without these the agent has no way to do direct analysis, falls back to
+    // dispatching sub-agents for every file operation — creating orphan tasks.
+    const fsTools = await createFsTools()
+    for (const tool of fsTools) {
+      this.inner.registerTool(tool)
+    }
+    this.inner.registerTool(await createBashTool())
+    this.inner.registerTool(makeGetSubAgentStatusTool(this.bridge))
 
     // ── 4. Register workflow tools (if workflow found) ────────────────────
     if (this._workflowDef) {
@@ -215,9 +273,64 @@ export class RoboticsSession {
     // ── 5. Register R1-R5 (+ W1 if workflow) dynamic sections ────────────
     this._buildSections()
 
+    // ── 6. Start heartbeat ────────────────────────────────────────────────
+    // Periodically touch lastActiveAt so crash-recovery on next startup
+    // can detect that this session was alive recently.
+    this._heartbeatTimer = setInterval(() => {
+      RoboticsProjectStore.touch(this.projectDir).catch(() => undefined)
+    }, RoboticsSession.HEARTBEAT_INTERVAL_MS)
+    // Allow Node to exit even if the timer is still running
+    if (this._heartbeatTimer.unref) this._heartbeatTimer.unref()
+
     return {
       resumed: Boolean(existing),
       sessionAgeMs: existing ? Date.now() - existing.lastActiveAt : undefined,
+    }
+  }
+
+  // ── Lifecycle: dispose ────────────────────────────────────────────────────
+
+  /**
+   * Gracefully shut down the session.
+   *
+   * - Stops the heartbeat timer
+   * - Cancels all in-flight sub-agent tasks via SubAgentBridge
+   * - Force-removes all active git worktrees (data is safe on branch)
+   * - Purges active task records from RoboticsProjectStore
+   *
+   * Safe to call multiple times (idempotent).
+   * Called automatically by the CLI on SIGINT / SIGTERM / uncaughtException.
+   */
+  async dispose(): Promise<void> {
+    if (this._disposed) return
+    this._disposed = true
+
+    // Stop heartbeat
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer)
+      this._heartbeatTimer = null
+    }
+
+    // Cancel running sub-agents
+    try {
+      await this.bridge.cancelAll()
+    } catch { /* best-effort */ }
+
+    // Clean up active worktrees and purge state records
+    const state = this._state
+    if (state && state.activeSubAgentTasks.length > 0) {
+      await Promise.allSettled(
+        state.activeSubAgentTasks.map(async task => {
+          // Remove worktree (keep branch for post-mortem)
+          if (task.worktreePath) {
+            await this.gitMgr.removeWorktree(
+              task.taskId,
+              { deleteBranch: false },
+            ).catch(() => undefined)
+          }
+          await RoboticsProjectStore.purgeStaleSubAgentTask(this.projectDir, task.taskId)
+        }),
+      )
     }
   }
 
@@ -397,7 +510,9 @@ Reply with exactly one word: single or multi`
           messages: [{ role: 'user', content: userContent }],
         }),
         timeout,
-      ]).finally(() => clearTimeout(timer!))
+      ]).finally(() => {
+        clearTimeout(timer!)
+      })
 
       const firstBlock = (msg as Anthropic.Message).content[0]
       const raw = firstBlock?.type === 'text'

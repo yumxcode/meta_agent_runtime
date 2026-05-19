@@ -47,10 +47,27 @@ export function buildR1Section(
 ${robotLine}You are operating in Robotics Mode — **single-agent variant** for direct implementation tasks.
 Handle everything yourself without dispatching sub-agents.
 
-### Experience-Driven Development
-- Run \`experience_search\` at the START of any new algorithm task
-- Run \`experience_write\` at the END of each task (success or failure)
-- Failures are as valuable as successes — always document root cause and workarounds
+### Direct Analysis First — Mandatory
+Before forming any hypothesis about why something isn't working:
+1. Use \`glob\`, \`read\`, \`bash\` to read logs, CSVs, and code directly yourself
+2. Show actual numbers from the data in your analysis
+3. Only after you have read and understood the data should you propose a fix
+
+### Experience Store — Purpose and Limits
+The experience store (\`experience_search\` / \`experience_write\`) is for:
+✅ Proven, reusable algorithmic knowledge (what worked, why, under what conditions)
+✅ Post-mortem of completed experiments (root cause, fix, outcome metrics)
+❌ NOT a message bus between agents — do not write to it to pass data to yourself
+❌ NOT a substitute for reading files — always read actual data first
+
+Write an experience entry **after you have solved the problem**, not before.
+A blank experience store means this is unexplored territory — proceed with direct analysis.
+
+### Task Completion
+You are done only when you have delivered a complete answer to the user.
+Searching tools and reading files is progress, not completion.
+Never stop at "I searched the experience store and found nothing."
+Always continue to direct file analysis, root-cause diagnosis, and concrete recommendations.
 
 > If the task grows in scope and would benefit from parallel experiments or isolated
 > code branches, let the user know so the session can be upgraded to multi-agent mode.`
@@ -61,34 +78,56 @@ Handle everything yourself without dispatching sub-agents.
 
 ${robotLine}You are operating in Robotics Mode — a multi-agent orchestration environment for algorithm development.
 
+### Tool Selection — Critical Rules
+
+| Task type | Correct tool | Wrong tool |
+|---|---|---|
+| Read a log file, CSV, or source file | \`glob\` / \`read\` / \`bash\` directly | ~~\`experiment_dispatch\`~~ |
+| Diagnose why real-robot data looks bad | \`read\` the file yourself | ~~\`experiment_dispatch\`~~ |
+| Run a new sim experiment with code changes | \`experiment_dispatch\` | — |
+| Run hardware-in-the-loop tests | \`experiment_dispatch\` | — |
+| Survey recent papers | \`paper_search\` | — |
+
+**Data that already exists on disk → read it yourself first, always.**
+Only dispatch a sub-agent when the task requires new code execution or isolated experimentation.
+
+### Experience Store — Purpose and Limits
+The experience store (\`experience_search\` / \`experience_write\`) is for:
+✅ Proven, reusable algorithmic knowledge (what worked, why, under what conditions)
+✅ Post-mortem of completed experiments recorded **by the sub-agent that ran them**
+❌ NOT a message bus — do not search it expecting to find sub-agent results
+❌ NOT a substitute for \`get_sub_agent_status\` — always use that to read sub-agent output
+
+To get results from a completed sub-agent: call **\`get_sub_agent_status task_id="<id>"\`**.
+The ExperimentSummary in that call IS the result — do not wait for it to appear in the experience store.
+
 ### Agent Roles Available
 - **PaperSearchAgent** (\`paper_search\`): Literature survey and synthesis
 - **ExperimentAgent** (\`experiment_dispatch\`): Isolated simulation / hardware experiments
-- **Main (you)**: Architecture decisions, integration, and sub-agent coordination
-
-### Noise Isolation Protocol
-> ⚠ ExperimentAgent sub-agents return only **structured ExperimentSummary JSON** — never raw logs.
-> Do NOT request or read raw worktree log files.
-> Trust the structured summary. If uncertain, dispatch an AnalysisAgent to verify.
+- **Main (you)**: Direct analysis, architecture decisions, integration, and coordination
 
 ### Git Coordination Protocol
 When a sub-agent task completes:
-1. Run \`get_sub_agent_status\` to read the ExperimentSummary
+1. Run \`get_sub_agent_status\` to read the ExperimentSummary — **this is the result**
 2. If \`outcome=success\` AND code changes are valuable:
    - Run \`git_diff_subagent\` to review what changed
    - If acceptable: run \`git_merge_subagent\` (default: squash)
    - Record a progress note with \`progress_note\`
 3. If \`outcome=partial\` or \`outcome=failure\`:
-   - The experience is already in ExperienceStore (written by the sub-agent)
    - Run \`git_discard_subagent\` to clean up the branch
    - Do NOT merge failed experiment code into main
-4. When main has significant code updates that running sub-agents should use:
+4. When main has significant updates that running sub-agents should use:
    - Run \`git_sync_to_subagent\` to rebase their branch onto main
 
 ### Experience-Driven Development
-- Run \`experience_search\` at the START of any new algorithm task
-- Run \`experience_write\` at the END of each task (success or failure)
-- Failures are as valuable as successes — always document root cause and workarounds`
+- Run \`experience_search\` at the START of any new algorithm task (unexplored territory is normal)
+- Run \`experience_write\` at the END of each solved task to record the proven solution
+- Failures are as valuable as successes — always document root cause and workarounds
+
+### Task Completion
+You are done only when you have synthesized all sub-agent results and delivered a complete answer.
+Dispatching sub-agents is the start of work, not the end.
+After dispatch → poll status → read summaries → synthesize → answer.`
   })
 }
 
@@ -146,20 +185,23 @@ export function buildR3Section(
 
           const age = Math.round((Date.now() - task.spawnedAt) / 60_000)
           const ageStr = age < 60 ? `${age}m` : `${Math.round(age / 60)}h`
+          const onComplete = task.on_complete ? task.on_complete.slice(0, 60) + (task.on_complete.length > 60 ? '…' : '') : '*(not set)*'
 
-          return `| ${task.taskId.slice(-8)} | ${statusIcon} ${status} | ${task.role} | ${task.title.slice(0, 35)} | ${gitInfo} | ${ageStr} ago |`
+          return `| ${task.taskId.slice(-8)} | ${statusIcon} ${status} | ${task.title.slice(0, 30)} | ${gitInfo} | ${ageStr} | ${onComplete} |`
         }),
       )
 
       return [
         '## Active Sub-Agent Tasks',
         '',
-        '| Task (last 8) | Status | Role | Title | Branch (±commits) | Age |',
+        '> ⚠️ For each completed task below, execute your committed `YOUR NEXT ACTION` before moving on.',
+        '',
+        '| Task (last 8) | Status | Title | Branch (±commits) | Age | YOUR NEXT ACTION |',
         '|---|---|---|---|---|---|',
         ...rows,
         '',
-        '> Use `get_sub_agent_status task_id="<taskId>"` for full details.',
-        '> Use `git_diff_subagent task_id="<taskId>"` before merging.',
+        '> `get_sub_agent_status task_id="<id>"` — read ExperimentSummary (the actual result).',
+        '> `git_diff_subagent task_id="<id>"` — review code changes before merging.',
       ].join('\n')
     },
     'Sub-agent status changes every turn; staleness causes incorrect merge decisions.',

@@ -1,14 +1,28 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ExperienceStore } from '../../ExperienceStore.js'
+import type { ExperiencePendingStore } from '../../ExperiencePendingStore.js'
 import type { RoboticsDomain } from '../../types.js'
 
-export function createExperienceWriteTool(store: ExperienceStore): MetaAgentTool {
+/**
+ * @param store        The shared cross-session ExperienceStore (NOT written to directly).
+ * @param pendingStore Session-scoped buffer — experiences queue here until the
+ *                     user reviews and approves them via `/experience review`.
+ *                     This prevents premature or low-quality entries from
+ *                     polluting the shared knowledge base.
+ */
+export function createExperienceWriteTool(
+  store: ExperienceStore,
+  pendingStore: ExperiencePendingStore,
+): MetaAgentTool {
   return {
     name: 'experience_write',
     description:
-      'Write a new experience entry to the robotics experience store. ' +
-      'Call this when an experiment or task concludes — success or failure — to preserve the lesson for future sessions. ' +
-      'Failure experiences are especially valuable: always document what went wrong and any workarounds found.',
+      'Propose a new experience entry to the robotics knowledge base. ' +
+      'The entry is queued for human review — it will NOT be committed until the user approves it ' +
+      'via the `/experience review` command. ' +
+      'Call this when an experiment or task reaches a clear conclusion (success OR failure). ' +
+      'Do NOT call mid-task or speculatively — wait until you have actionable findings. ' +
+      'Failure experiences are especially valuable: always document root cause and workarounds.',
     inputSchema: {
       type: 'object',
       required: ['domain', 'title', 'problem', 'solution', 'success', 'outcome_summary'],
@@ -90,33 +104,27 @@ export function createExperienceWriteTool(store: ExperienceStore): MetaAgentTool
     },
     async call(input): Promise<ToolResult> {
       try {
-        const id = await store.write({
-          domain: (input['domain'] as RoboticsDomain) ?? 'general',
-          title: String(input['title'] ?? ''),
-          problem: String(input['problem'] ?? ''),
-          solution: String(input['solution'] ?? ''),
-          outcome: {
-            success: Boolean(input['success']),
-            summary: String(input['outcome_summary'] ?? ''),
-            failureReason: input['failure_reason'] as string | undefined,
-            workarounds: input['workarounds'] as string[] | undefined,
-          },
-          algorithm: input['algorithm'] as string | undefined,
-          tags: (input['tags'] as string[] | undefined) ?? [],
-          robot: input['robot'] as string | undefined,
-          difficulty: (input['difficulty'] as 'low' | 'medium' | 'high' | undefined) ?? 'medium',
-          metrics: input['metrics'] as Record<string, number | string> | undefined,
-          relatedPapers: input['related_papers'] as string[] | undefined,
-          sourceTaskId: input['source_task_id'] as string | undefined,
-          fullReport: input['full_report'] as string | undefined,
-        })
+        // Queue in pending buffer — NOT committed to shared store yet.
+        // The user must review and approve via `/experience review`.
+        const pendingId = pendingStore.add(input as Record<string, unknown>)
+        const title = String(input['title'] ?? '(untitled)')
+        const success = Boolean(input['success'])
         return {
-          content: `✅ Experience written with ID: ${id}\nUse \`experience_load id="${id}"\` to retrieve it later.`,
+          content:
+            `⏸  经验已加入待审队列 (pending ID: ${pendingId})\n` +
+            `标题: ${title}\n` +
+            `结果: ${success ? '✅ 成功' : '❌ 失败'}\n\n` +
+            `此条经验不会自动写入共享知识库。\n` +
+            `请在对话结束后运行 /experience review 进行审核，` +
+            `由你决定是否提交、编辑或丢弃。`,
           isError: false,
         }
       } catch (err) {
         return { content: `experience_write failed: ${String(err)}`, isError: true }
       }
+      // `store` is passed in but only used by ExperiencePendingStore.commit() —
+      // see the `/experience review` REPL command in cli/index.ts.
+      void store
     },
   }
 }

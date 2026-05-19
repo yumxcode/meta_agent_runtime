@@ -33,8 +33,8 @@ import {
   DANGEROUS_uncachedSystemPromptSection,
   type SystemPromptSection,
 } from './systemPromptSections.js'
-import { MetaAgentContextStore } from '../coordination/MetaAgentContextStore.js'
-import { USER_CHECKPOINT_PHASES, MACHINE_PHASES } from '../coordination/types.js'
+
+import { MetaAgentContextStore, USER_CHECKPOINT_PHASES, MACHINE_PHASES } from '../campaign/index.js'
 import { campaignRegistry } from '../campaign/registry.js'
 import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import type { MetaAgentTool } from './types.js'
@@ -109,6 +109,7 @@ export function buildMemoryGuidanceSection(): SystemPromptSection {
 export function buildMemoryContentSection(
   currentQuery: string,
   client?: Anthropic,
+  sessionMode?: string,
 ): SystemPromptSection {
   return DANGEROUS_uncachedSystemPromptSection(
     'memory_content',
@@ -117,7 +118,7 @@ export function buildMemoryContentSection(
 
       const [index, relevant] = await Promise.all([
         loadMemoryIndex(),
-        findRelevantMemories({ query: currentQuery, memoryDir: MEMORY_DIR, client }),
+        findRelevantMemories({ query: currentQuery, memoryDir: MEMORY_DIR, client, sessionMode }),
       ])
 
       const parts: string[] = []
@@ -816,7 +817,7 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     // model sees original intent before any volatile sections.
     ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),
     buildMemoryGuidanceSection(),
-    buildMemoryContentSection(opts.currentQuery ?? '', opts.client),
+    buildMemoryContentSection(opts.currentQuery ?? '', opts.client, opts.mode),
     buildEnvInfoSection(opts.sessionId, opts.sessionStartMs, opts.tools),
     buildLanguageSection(opts.language),
     buildCurrentModeSection(opts.mode),

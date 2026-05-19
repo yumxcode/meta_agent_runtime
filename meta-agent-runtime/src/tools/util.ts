@@ -69,13 +69,17 @@ export async function loadToolPrompt(moduleUrl: string): Promise<string> {
  *   })
  */
 export function dynamicDescription(
-  moduleUrl: string,
+  moduleUrlOrContent: string,
   enhance: (base: string, ctx: ToolDescriptionContext) => string,
 ): ToolDescription {
-  let cachedBase: string | null = null
+  // When bundled by esbuild the build plugin pre-loads prompt.md at compile
+  // time and passes the content string directly (no file:// prefix).
+  // In normal (unbundled) mode this is a file:// URL and we read from disk.
+  const isUrl = moduleUrlOrContent.startsWith('file://')
+  let cachedBase: string | null = isUrl ? null : moduleUrlOrContent
   return async (ctx: ToolDescriptionContext): Promise<string> => {
     if (cachedBase === null) {
-      cachedBase = await loadToolPrompt(moduleUrl)
+      cachedBase = await loadToolPrompt(moduleUrlOrContent)
     }
     return enhance(cachedBase, ctx)
   }

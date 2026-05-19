@@ -25,7 +25,7 @@ import {
   MACHINE_PHASES,
   USER_CHECKPOINT_PHASES,
   DesignSpace,
-} from '../../coordination/types.js'
+} from '../../campaign/index.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // DOE business state (what the DOE plugin stores as its TState)

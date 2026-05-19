@@ -40,7 +40,7 @@ import type {
   SessionModeHint,
 } from './types.js'
 import { MODE_WEIGHT } from './types.js'
-import { CampaignStateStore } from '../coordination/CampaignStateStore.js'
+import { CampaignStateStore } from '../campaign/index.js'
 
 // ── Shared timeout utility (Fix #6) ──────────────────────────────────────────
 

@@ -116,6 +116,17 @@ export interface ActiveSubAgentRecord {
   worktreePath?: string
   spawnedAt: number
   lastCheckpointAt?: number
+  /**
+   * Why this sub-agent was dispatched (one sentence).
+   * Stored so R3 can remind the orchestrator of the causal context.
+   */
+  purpose?: string
+  /**
+   * What the orchestrator (main agent) will do once this task completes.
+   * Required for experiment_dispatch — prevents orphan tasks with no result handling.
+   * Displayed in R3 every turn so the agent never forgets its commitment.
+   */
+  on_complete?: string
 }
 
 // ── Agent orchestration mode ──────────────────────────────────────────────────

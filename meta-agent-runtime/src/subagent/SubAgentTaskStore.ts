@@ -14,9 +14,10 @@
  *   The caller (SubAgentRunner) invokes this in its finally block.
  */
 
-import { readFile, writeFile, unlink, mkdir } from 'fs/promises'
+import { unlink } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
+import { atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
 import type { SubAgentRecord, SubAgentTaskId } from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -36,23 +37,6 @@ function taskPath(taskId: SubAgentTaskId): string {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const _writeChains = new Map<SubAgentTaskId, Promise<void>>()
-let _dirEnsured = false
-let _dirFailureLogged = false
-
-async function _ensureDir(): Promise<boolean> {
-  if (_dirEnsured) return true
-  try {
-    await mkdir(subtaskDir(), { recursive: true })
-    _dirEnsured = true
-    return true
-  } catch (err) {
-    if (!_dirFailureLogged) {
-      console.error('[SubAgentTaskStore] Failed to create subtask directory:', err)
-      _dirFailureLogged = true
-    }
-    return false
-  }
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public API
@@ -64,12 +48,7 @@ async function _ensureDir(): Promise<boolean> {
 export async function readTask(
   taskId: SubAgentTaskId,
 ): Promise<SubAgentRecord | null> {
-  try {
-    const raw = await readFile(taskPath(taskId), 'utf-8')
-    return JSON.parse(raw) as SubAgentRecord
-  } catch {
-    return null
-  }
+  return readJsonFile<SubAgentRecord>(taskPath(taskId))
 }
 
 /**
@@ -85,8 +64,8 @@ export function writeTask(record: SubAgentRecord): Promise<void> {
   const taskId = record.taskId
 
   const doWrite = async () => {
-    if (!(await _ensureDir())) return
-    await writeFile(taskPath(taskId), JSON.stringify(record, null, 2), 'utf-8')
+    await ensureDir(subtaskDir())
+    await atomicWriteJson(taskPath(taskId), record)
   }
 
   const prev = _writeChains.get(taskId) ?? Promise.resolve()

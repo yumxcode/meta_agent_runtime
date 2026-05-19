@@ -341,6 +341,15 @@ export interface FindRelevantMemoriesOptions {
    * debugging or explicit "show me all memories" queries).
    */
   filterStale?: boolean
+  /**
+   * Current session mode.  Used to exclude mode-irrelevant memory types:
+   *   - 'robotics': excludes campaign_lessons (DOE-specific) unless domain='robotics'
+   *   - 'campaign': excludes memories with domain='robotics'
+   *   - 'direct' / 'agentic': no extra filtering beyond scope/freshness
+   * Prevents cross-mode memory contamination (e.g. battery DOE lessons appearing
+   * in a humanoid robot session).
+   */
+  sessionMode?: string
 }
 
 // ── Scope/freshness filter predicate ─────────────────────────────────────────
@@ -392,6 +401,18 @@ function _passesFilters(
   if (scope === 'domain' && opts.domainScope) {
     const tag = header.domain ?? ''
     if (tag && tag !== opts.domainScope) return false
+  }
+
+  // ── Session-mode filtering: prevent cross-mode contamination ──────────────
+  // Robotics sessions must not see DOE campaign lessons (they share no
+  // physical meaning). Campaign sessions must not see robotics hardware notes.
+  if (opts.sessionMode === 'robotics') {
+    // Exclude campaign_lessons unless they were explicitly tagged for robotics
+    if (header.type === 'campaign_lessons' && header.domain !== 'robotics') return false
+  }
+  if (opts.sessionMode === 'campaign') {
+    // Exclude memories explicitly tagged as robotics-domain
+    if (header.domain === 'robotics') return false
   }
 
   return true

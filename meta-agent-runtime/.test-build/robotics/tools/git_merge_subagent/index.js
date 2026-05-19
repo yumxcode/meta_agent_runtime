@@ -1,0 +1,72 @@
+import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
+export function createGitMergeSubAgentTool(gitMgr, projectDir) {
+    return {
+        name: 'git_merge_subagent',
+        description: 'Merge a completed sub-agent\'s branch into main. ' +
+            'Run git_diff_subagent first to review the changes. ' +
+            'Default strategy is squash (keeps main history clean). ' +
+            'Only merge sub-agents whose experiment outcome was success or partial with valuable code changes.',
+        inputSchema: {
+            type: 'object',
+            required: ['task_id'],
+            properties: {
+                task_id: {
+                    type: 'string',
+                    description: 'Sub-agent task ID whose branch to merge',
+                },
+                strategy: {
+                    type: 'string',
+                    enum: ['squash', 'merge', 'cherry-pick'],
+                    description: 'Merge strategy. squash (default): one clean commit. merge: preserve history. cherry-pick: specific commits only.',
+                },
+                message: {
+                    type: 'string',
+                    description: 'Commit message for the merge (defaults to auto-generated from task)',
+                },
+                commit_hashes: {
+                    type: 'array',
+                    items: { type: 'string' },
+                    description: 'For cherry-pick strategy: specific commit hashes to pick',
+                },
+            },
+        },
+        async call(input) {
+            if (!gitMgr.enabled) {
+                return { content: 'Git is not enabled for this project.', isError: true };
+            }
+            const taskId = String(input['task_id'] ?? '');
+            if (!taskId)
+                return { content: 'task_id is required', isError: true };
+            try {
+                const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                const branchName = state?.git.subAgentBranches[taskId];
+                if (!branchName) {
+                    return { content: `No git branch registered for task ${taskId}.`, isError: true };
+                }
+                const strategy = input['strategy'] ?? 'squash';
+                const result = await gitMgr.mergeTaskBranch(taskId, branchName, {
+                    strategy,
+                    message: input['message'],
+                    commitHashes: input['commit_hashes'],
+                });
+                // Clean up the worktree after merge
+                await gitMgr.removeWorktree(taskId, { deleteBranch: false });
+                await RoboticsProjectStore.completeSubAgentTask(projectDir, taskId);
+                return {
+                    content: [
+                        `✅ Merged \`${branchName}\` → main (strategy: ${strategy})`,
+                        `**Merge commit**: ${result.commitHash.slice(0, 12)}`,
+                        ``,
+                        `Worktree cleaned up. Branch \`${branchName}\` is preserved for reference.`,
+                        `To remove the branch: run \`git branch -D ${branchName}\``,
+                    ].join('\n'),
+                    isError: false,
+                };
+            }
+            catch (err) {
+                return { content: `git_merge_subagent failed: ${String(err)}`, isError: true };
+            }
+        },
+    };
+}
+//# sourceMappingURL=index.js.map

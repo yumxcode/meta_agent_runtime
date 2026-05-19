@@ -26,8 +26,8 @@ import { readFile, writeFile, unlink, mkdir } from 'fs/promises'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
-import { MetaAgentContextStore } from '../../coordination/MetaAgentContextStore.js'
-import { CampaignStateStore } from '../../coordination/CampaignStateStore.js'
+
+import { MetaAgentContextStore, CampaignStateStore } from '../../campaign/index.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types

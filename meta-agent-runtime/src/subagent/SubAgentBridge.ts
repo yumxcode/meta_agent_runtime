@@ -315,6 +315,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   }
 
   /**
+   * Cancel ALL running sub-agent tasks spawned by this bridge.
+   * Called by RoboticsSession.dispose() on graceful shutdown.
+   */
+  async cancelAll(reason = 'Session disposed'): Promise<void> {
+    const ids = [...this.runners.keys()]
+    await Promise.allSettled(ids.map(id => this.cancelTask(id, reason)))
+  }
+
+  /**
    * List all tasks spawned by this bridge's parent session.
    */
   async listTasks(): Promise<SubAgentRecord[]> {

@@ -13,7 +13,7 @@ import { ModeDetector } from '../src/routing/ModeDetector.js'
 import { SessionRouter } from '../src/routing/SessionRouter.js'
 import { MODE_WEIGHT } from '../src/routing/types.js'
 import type { SessionMode } from '../src/routing/types.js'
-import { MetaAgentContextStore } from '../src/coordination/MetaAgentContextStore.js'
+import { CampaignStateStore } from '../src/campaign/index.js'
 
 // ── Test harness ──────────────────────────────────────────────────────────────
 
@@ -205,8 +205,8 @@ function testSessionRouterWithHint(): void {
 async function testModeDetectorAsync(): Promise<void> {
   section('ModeDetector.detect() async — no active campaigns')
 
-  // Ensure no active campaigns on disk
-  await MetaAgentContextStore.clear()
+  // Ensure no active campaigns leak from a previous run
+  // (any leftover campaigns will be auto-expired by listActive()'s zombie check)
 
   // Short question with no campaigns → DIRECT
   const r1 = await ModeDetector.detect('什么是Pareto最优？')
@@ -216,17 +216,14 @@ async function testModeDetectorAsync(): Promise<void> {
   const r2 = await ModeDetector.detect('我需要启动一个DOE campaign来优化设计空间')
   assert(r2.mode === 'campaign', 'async: campaign prompt → campaign')
 
-  // Inject a fake active campaign and verify bump from DIRECT to AGENTIC
-  await MetaAgentContextStore.write({
-    schemaVersion: '1.0',
-    updatedAt: new Date().toISOString(),
-    activeCampaigns: [{
-      campaignId: 'c_test_router',
-      projectName: 'Router Test',
-      phase: 'EVALUATING_L0',
-      contextBlock: '### ⏳ Campaign: Router Test',
-    }],
+  // Create a real campaign on disk so CampaignStateStore.listActive() finds it
+  const fakeStore = await CampaignStateStore.create('router_test_project', {
+    variables: [{ name: 'x', type: 'continuous', bounds: [0, 1] }],
+    objectives: [{ name: 'y', direction: 'minimize' }],
+    constraints: [],
+    fidelityLevels: ['L0'],
   })
+  await fakeStore.transitionPhase('SAMPLING')   // move out of IDLE → definitely active
 
   const r3 = await ModeDetector.detect('什么是Pareto最优？')
   assert(r3.mode === 'agentic', 'async: short question bumped to agentic when campaigns active')
@@ -240,8 +237,8 @@ async function testModeDetectorAsync(): Promise<void> {
   const r4 = await ModeDetector.detect('我需要启动一个DOE campaign来优化设计空间')
   assert(r4.mode === 'campaign', 'async: campaign prompt stays campaign even with active campaigns')
 
-  // Clean up
-  await MetaAgentContextStore.clear()
+  // Clean up — mark failed so listActive() excludes it on the next test run
+  await fakeStore.markFailed('smoke-test cleanup')
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────

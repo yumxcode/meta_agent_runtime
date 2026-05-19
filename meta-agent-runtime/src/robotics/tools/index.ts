@@ -30,6 +30,7 @@
 import type { MetaAgentTool } from '../../core/types.js'
 import type { SubAgentBridge } from '../../subagent/SubAgentBridge.js'
 import { ExperienceStore } from '../ExperienceStore.js'
+import { ExperiencePendingStore } from '../ExperiencePendingStore.js'
 import { HardwareProfile } from '../HardwareProfile.js'
 import { GitWorkspaceManager } from '../git/GitWorkspaceManager.js'
 
@@ -46,6 +47,7 @@ import { createGitMergeSubAgentTool } from './git_merge_subagent/index.js'
 import { createGitDiffSubAgentTool } from './git_diff_subagent/index.js'
 import { createGitDiscardSubAgentTool } from './git_discard_subagent/index.js'
 
+export { ExperiencePendingStore }
 export {
   createExperienceSearchTool,
   createExperienceWriteTool,
@@ -72,6 +74,13 @@ export interface RoboticsToolsOptions {
   robot?: string
   /** Optional custom ExperienceStore instance (for testing / custom dir) */
   experienceStore?: ExperienceStore
+  /**
+   * Session-scoped pending experience buffer.
+   * When provided, experience_write queues entries here instead of committing
+   * directly to the shared store — requiring user review via `/experience review`.
+   * If omitted (e.g. in tests), experiences are committed immediately (legacy behaviour).
+   */
+  experiencePendingStore?: ExperiencePendingStore
   /** Optional custom HardwareProfile instance */
   hardwareProfile?: HardwareProfile
   /** Optional custom GitWorkspaceManager instance */
@@ -88,13 +97,15 @@ export interface RoboticsToolsOptions {
  */
 export function createRoboticsTools(opts: RoboticsToolsOptions): MetaAgentTool[] {
   const store = opts.experienceStore ?? new ExperienceStore()
+  // Use supplied pending store or fall back to a fresh one (tests / legacy callers)
+  const pendingStore = opts.experiencePendingStore ?? new ExperiencePendingStore()
   const hwProfile = opts.hardwareProfile ?? new HardwareProfile(undefined, opts.robot)
   const gitMgr = opts.gitManager ?? new GitWorkspaceManager(opts.projectDir)
 
   return [
     // ── Experience tools ─────────────────────────────────────────────────────
     createExperienceSearchTool(store),
-    createExperienceWriteTool(store),
+    createExperienceWriteTool(store, pendingStore),
     createExperienceLoadTool(store),
 
     // ── Hardware profile tools ───────────────────────────────────────────────

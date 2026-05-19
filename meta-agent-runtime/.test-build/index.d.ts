@@ -1,0 +1,58 @@
+/**
+ * @meta-agent/runtime — public API
+ */
+export { MetaAgentSession } from './core/MetaAgentSession.js';
+export { KernelBridge } from './cc-kernel/KernelBridge.js';
+export type { MetaAgentConfig, ResolvedConfig } from './core/config.js';
+export type { MetaAgentEvent, MetaAgentTextEvent, MetaAgentToolUseEvent, MetaAgentToolResultEvent, MetaAgentResultEvent, MetaAgentStreamEvent, MetaAgentRetryEvent, MetaAgentTool, ToolCallContext, ToolResult, TokenUsage, EngineeringDomain, ConversationMessage, } from './core/types.js';
+export { EMPTY_USAGE, accumulateUsage } from './core/types.js';
+export type { JobId, JobStatus, EngineeringJob, JobResult, JobProgress, JobContext, ProgressReporter, JobHandler, JobFilter, DimensionalRecord, JobArtifact, JobMetrics, JobCostEstimate, } from './jobs/index.js';
+export { makeJobId, TERMINAL_STATUSES, ACTIVE_STATUSES, JobStore, LocalExecutor, JobManager, } from './jobs/index.js';
+export type { Executor, ExecutorCallbacks, SubmitOptions } from './jobs/index.js';
+export type { VVPhase, VVSeverity, VVSuggestedAction, VVResult, VVContext, VVHook, } from './validation/index.js';
+export { defaultAction, requiresAbort, requiresPause, failures, maxSeverity, VVHookChain, OOMChecker, BUILT_IN_OOM_DB, PhysicsConstraintChecker, DimensionChecker, createDefaultVVChain, } from './validation/index.js';
+export type { OOMRange, OOMReferenceDB } from './validation/index.js';
+export type { ProvenanceId, ProvenanceRecord, ProvenanceInput, ProvenanceFilter, } from './provenance/index.js';
+export { makeProvenanceId, ProvenanceTracker } from './provenance/index.js';
+export type { BaseDimension, DimensionVector, PhysicalQuantity, DimensionError, DimensionSpec, ConversionResult, } from './units/index.js';
+export { BASE_DIMENSIONS, DIMENSIONLESS, DIMENSIONS, formatDimension, dimensionsMatch, multiplyDimensions, invertDimension, identifyDimension, UnitRegistry, defaultRegistry, DimensionalConsistencyChecker, defaultChecker, } from './units/index.js';
+export type { UnitDef } from './units/index.js';
+export { SessionRouter, ModeDetector, MODE_WEIGHT } from './routing/index.js';
+export type { SessionMode, SessionModeHint, DetectionConfidence, ModeSignal, ModeDetectionResult, RouterOptions, } from './routing/index.js';
+export { createRuntimeContext, instrumentTool } from './runtime/index.js';
+export type { RuntimeContext, RuntimeContextOptions, InstrumentOptions } from './runtime/index.js';
+export type { PhaseDefinition, ICampaignStore, GenericPersistedState, CampaignPlugin, AnyPlugin, GenericCampaignSummary, } from './campaign/index.js';
+export { GENERIC_SCHEMA_VERSION, campaignRegistry, GenericCampaignStore, listGenericCampaigns } from './campaign/index.js';
+export type { DesignVariable, Objective, Constraint, DesignSpace, DesignPoint, EvaluationResult, ParetoFront, WorkerTask, CampaignPhase, PersistedCampaignState, CampaignContextCapsule, MetaAgentSessionContext, CampaignSummary, } from './campaign/index.js';
+export { VALID_TRANSITIONS, PHASE_LABELS, MACHINE_PHASES, USER_CHECKPOINT_PHASES, CampaignStateStore, CampaignMonitor, MetaAgentContextStore, SESSION_DIR, ACTIVE_CONTEXT_FILE, buildCapsule, ParetoAnalyzer, DOESampler, makeDesignPoint, FidelityLadder, DEFAULT_FIDELITY_LADDER, WorkerCoordinator, } from './campaign/index.js';
+export type { NotifyFn, WatchOptions, FidelityLadderConfig, EvaluationHandler, WorkerCoordinatorOptions, } from './campaign/index.js';
+export type { SubAgentProgressState } from './subagent/types.js';
+export type { ISubAgentDispatcher } from './subagent/ISubAgentDispatcher.js';
+export type { RunStateSnapshot, RunStateStopReason, } from './core/compact/runStateSnapshot.js';
+export { saveRunStateSnapshot, loadRunStateSnapshot, cleanupRunStateSnapshot, getRunStateSnapshotPath, } from './core/compact/runStateSnapshot.js';
+export type { UserDecision, AcceptanceCriterion, TaskContract, } from './core/contract/types.js';
+export { makeContractId, createTaskContract, } from './core/contract/types.js';
+export { TaskContractStore } from './core/contract/TaskContractStore.js';
+export { createEchoTool, loadToolPrompt, createProvenanceTools, createGetProvenanceTool, createListRecentTool, createFindDuplicateTool, createGetLineageTool, EngineeringToolRegistry, defaultToolRegistry, FIDELITY_LABELS, } from './tools/index.js';
+export type { FidelityLevel, RegistryEntry } from './tools/index.js';
+export { createFsTools, createReadFileTool, createWriteFileTool, createEditFileTool, createGlobTool, createGrepTool, createNotebookEditTool, createShellTools, createBashTool, createPowerShellTool, createNetworkTools, createWebFetchTool, createWebSearchTool, createMcpTools, registerMcpClient, unregisterMcpClient, getRegisteredMcpServers, createMcpCallTool, createListMcpResourcesTool, createReadMcpResourceTool, createUiTools, createAskUserTool, createTodoWriteTool, getTodosForSession, deleteTodosForSession, createSendMessageTool, createSystemTools, createSleepTool, createCronCreateTool, createCronDeleteTool, createCronListTool, createEnterPlanModeTool, createExitPlanModeTool, createSkillTool, createConfigTool, listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession, createAgentTools, createRunAgentTool, createStandardTools, } from './tools/index.js';
+export type { McpClient, NetworkToolsOptions, WebSearchToolOptions, TodoItem, StandardToolsOptions, SystemToolsOptions, CronJob, } from './tools/index.js';
+export { WorkflowLoader } from './workflow/WorkflowLoader.js';
+export { WorkflowParser } from './workflow/WorkflowParser.js';
+export { WorkflowStateStore } from './workflow/WorkflowStateStore.js';
+export { buildW1Section } from './workflow/dynamicSection.js';
+export { createWorkflowStatusTool, createWorkflowCompleteGateTool, createWorkflowAdvanceTool, createWorkflowListPhasesTool, createWorkflowTools, } from './workflow/tools/index.js';
+export type { GateItem, WorkflowPhase, WorkflowDefinition, WorkflowState, } from './workflow/types.js';
+export { RoboticsSession } from './robotics/RoboticsSession.js';
+export type { RoboticsSessionOptions } from './robotics/RoboticsSession.js';
+export { ExperienceStore } from './robotics/ExperienceStore.js';
+export { HardwareProfile } from './robotics/HardwareProfile.js';
+export { GitWorkspaceManager } from './robotics/git/GitWorkspaceManager.js';
+export type { GitWorktreeRecord, GitSyncResult } from './robotics/git/GitWorkspaceManager.js';
+export { RoboticsProjectStore } from './robotics/persistence/RoboticsProjectStore.js';
+export { createRoboticsTools, createExperienceSearchTool, createExperienceWriteTool, createExperienceLoadTool, createHardwareProfileReadTool, createHardwareProfileWriteTool, createExperimentDispatchTool, createPaperSearchTool, createProgressNoteTool, createGitSyncToSubAgentTool, createGitMergeSubAgentTool, createGitDiffSubAgentTool, createGitDiscardSubAgentTool, } from './robotics/tools/index.js';
+export type { RoboticsToolsOptions } from './robotics/tools/index.js';
+export { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, } from './robotics/dynamicSections.js';
+export { makeExperienceId } from './robotics/types.js';
+export type { RoboticsDomain, RoboticsAgentRole, ExperienceEntry, ExperienceOutcome, ExperienceSearchQuery, ExperimentSpec, ExperimentSummary, HardwareProfileData, RoboticsGitState, ActiveSubAgentRecord, RoboticsProjectState, } from './robotics/types.js';
+//# sourceMappingURL=index.d.ts.map

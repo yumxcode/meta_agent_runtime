@@ -86,7 +86,10 @@ export class SessionRouter {
     const { mode, debugMode, ...sessionConfig } = config
     this._hint = mode ?? 'auto'
     this._debug = debugMode ?? false
-    this._cfg = resolveConfig(sessionConfig)
+    // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
+    // Without this, destructuring above strips debugMode from sessionConfig,
+    // making this.config.debugMode always undefined inside MetaAgentSession.
+    this._cfg = resolveConfig({ ...sessionConfig, debugMode })
 
     // If tools are supplied in config, note them as pending so the impl picks
     // them up when it's created. registerTool() handles any added later.
@@ -113,6 +116,35 @@ export class SessionRouter {
   /** Current active mode — null before first submit(). */
   get mode(): SessionMode | null {
     return this._currentMode
+  }
+
+  /**
+   * Return the lightweight Anthropic client used for side-calls (mode detection,
+   * experience summaries, etc.).  This client is short-timeout (3 s) and always
+   * targets the configured provider's API — it is intentionally separate from the
+   * main session client so side-calls never pollute conversation history.
+   *
+   * Returns null when no API key is available or the provider is non-Anthropic
+   * (third-party proxies don't expose claude-haiku-4-5-20251001).
+   *
+   * Callers that need a side-call model can use the fast haiku model for summaries
+   * (cheap + low-latency) — callers are responsible for choosing the model string.
+   */
+  getSideCallClient(): Anthropic | null {
+    return this._detectionClient
+  }
+
+  /**
+   * Return a minimal config snapshot needed for constructing a side-call client
+   * when getSideCallClient() returns null (e.g. non-Anthropic provider that still
+   * supports the messages API).  Exposes apiKey, baseURL, and resolved model.
+   */
+  getProviderConfig(): { apiKey: string | undefined; baseURL: string | undefined; model: string } {
+    return {
+      apiKey:  this._cfg.apiKey,
+      baseURL: this._cfg.baseURL,
+      model:   this._cfg.model,
+    }
   }
 
   /** True once the backend impl has been created. */
@@ -169,6 +201,56 @@ export class SessionRouter {
 
   getSessionId(): string {
     return this._impl?.getSessionId() ?? ''
+  }
+
+  /**
+   * Run mode detection for `prompt` without initialising the backend.
+   * Returns the resolved SessionMode.
+   *
+   * Idempotent: once mode is fixed after the first submit(), subsequent calls
+   * return immediately.  Intended for CLI callers that need to know mode
+   * BEFORE streaming the first response — e.g. to prompt for a hardware
+   * profile in robotics mode so the first AI turn already has hardware context.
+   */
+  async primeMode(prompt: string): Promise<SessionMode> {
+    if (this._currentMode !== null) return this._currentMode
+    const hasTools = this._pendingTools.length > 0
+    const result = await ModeDetector.detect(
+      prompt,
+      this._hint,
+      hasTools,
+      this._detectionClient ?? undefined,
+    )
+    this._raiseMode(result.mode)
+    return this._currentMode!
+  }
+
+  /**
+   * Gracefully dispose the active backend (if any).
+   *
+   * Only RoboticsSession implements dispose() — for MetaAgentSession and
+   * KernelBridge this is a no-op.  Called by signal handlers in the CLI so
+   * heartbeat timers, sub-agent runners, and git worktrees are cleaned up on
+   * SIGTERM / uncaughtException without relying on GC.
+   */
+  async dispose(): Promise<void> {
+    const impl = this._impl as (SessionImpl & { dispose?: () => Promise<void> }) | null
+    if (impl?.dispose) {
+      try { await impl.dispose() } catch { /* best-effort */ }
+    }
+  }
+
+  /**
+   * Return the robotics session's pending experience buffer (if mode=robotics).
+   * Returns null in all other modes or before the first submit().
+   * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
+   */
+  getPendingExperiences(): import('../robotics/ExperiencePendingStore.js').ExperiencePendingStore | null {
+    const impl = this._impl as any
+    if (impl && typeof impl.pendingExperiences === 'object' && impl.pendingExperiences !== null) {
+      return impl.pendingExperiences
+    }
+    return null
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────

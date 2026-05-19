@@ -68,6 +68,20 @@ export class RoboticsProjectStore {
     await RoboticsProjectStore.save(state)
   }
 
+  /**
+   * Remove a stale sub-agent task that could not be reconciled on session resume.
+   * Clears the task from activeSubAgentTasks, subAgentBranches, and forkPoints.
+   * Does NOT add to completedSubAgentTaskIds — stale tasks were never finished.
+   */
+  static async purgeStaleSubAgentTask(dir: string, taskId: string): Promise<void> {
+    const state = await RoboticsProjectStore.findByProjectDir(dir)
+    if (!state) return
+    state.activeSubAgentTasks = state.activeSubAgentTasks.filter(t => t.taskId !== taskId)
+    delete state.git.subAgentBranches[taskId]
+    delete state.git.forkPoints[taskId]
+    await RoboticsProjectStore.save(state)
+  }
+
   static async updateGitState(dir: string, git: Partial<RoboticsGitState>): Promise<void> {
     const state = await RoboticsProjectStore.findByProjectDir(dir)
     if (!state) return

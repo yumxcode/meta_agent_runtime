@@ -5,8 +5,8 @@
  * Ref: claude-code-source-code-main/src/QueryEngine.ts → QueryEngineConfig
  *
  * Provider auto-detection:
- *   ANTHROPIC_API_KEY  → https://api.anthropic.com       (Claude models)
- *   DEEPSEEK_API_KEY   → https://api.deepseek.com/anthropic  (deepseek-v4-flash / deepseek-v4-pro)
+ *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
+ *   DEEPSEEK_API_KEY   → https://api.deepseek.com/anthropic   (deepseek-chat / deepseek-reasoner)
  *   QWEN_API_KEY       → https://dashscope.aliyuncs.com/apps/anthropic  (qwen-max / qwen-plus)
  *
  * Explicit config.apiKey / config.baseURL always take precedence over env vars.
@@ -33,7 +33,7 @@ const PROVIDER_BASE_URLS: Record<ModelProvider, string> = {
 /** Default model for each provider (cheapest capable of tool-use) */
 const PROVIDER_DEFAULT_MODELS: Record<ModelProvider, string> = {
   anthropic: 'claude-opus-4-6',
-  deepseek:  'deepseek-v4-flash',   // fast + cheap; use deepseek-v4-pro for heavy reasoning
+  deepseek:  'deepseek-v4-flash',   // DeepSeek-V3 fast; use deepseek-v4-pro for R1 reasoning
   qwen:      'qwen-plus',
   unknown:   'claude-opus-4-6',
 }
@@ -103,8 +103,28 @@ export function isAnthropicProvider(baseURL?: string): boolean {
   return baseURL.includes('anthropic.com')
 }
 
+// ── Tool execution guard result ───────────────────────────────────────────────
+
+/**
+ * Returned by `MetaAgentConfig.beforeToolCall` to control what happens
+ * before a tool is executed.
+ */
+export type BeforeToolCallResult =
+  | { action: 'allow' }
+  | { action: 'deny'; reason?: string }
+  | { action: 'redirect'; instructions: string }
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 export interface MetaAgentConfig {
   // ── Identity ───────────────────────────────────────────────────────────────
+  /**
+   * Optional session ID override.  When set, MetaAgentSession uses this UUID
+   * instead of generating a fresh one.  Used by RoboticsSession to align its
+   * own sessionId with the inner session so debug file paths are consistent.
+   */
+  sessionId?: string
+
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
   apiKey?: string
 
@@ -201,6 +221,43 @@ export interface MetaAgentConfig {
    * system prompt (session preamble, path ③).
    */
   runtimeContext?: RuntimeContext
+
+  // ── Tool execution guard ──────────────────────────────────────────────────
+  /**
+   * Optional async hook called before every tool execution.
+   *
+   * Return values:
+   *   { action: 'allow' }                          — proceed normally
+   *   { action: 'deny',  reason?: string }         — block the call; the reason
+   *     is returned to the model as a tool result so it can try another approach
+   *   { action: 'redirect', instructions: string } — skip the call and return
+   *     the user's instructions as a tool result; the model replans accordingly
+   *
+   * Typical use: interactive CLI confirmation for destructive / side-effectful
+   * operations such as `pip install`, `rm -rf`, `git push`, `sudo`, etc.
+   * The CLI registers this hook only when running in interactive TTY mode.
+   */
+  beforeToolCall?: (
+    toolName: string,
+    input: Record<string, unknown>,
+  ) => Promise<BeforeToolCallResult>
+
+  // ── Session resume ────────────────────────────────────────────────────────
+  /**
+   * Pre-load conversation history to resume a previous session.
+   * Messages are prepended to mutableMessages before the first submit().
+   * Typically populated by SessionStore.loadHistory() in the CLI.
+   */
+  initialMessages?: import('./types.js').ConversationMessage[]
+
+  // ── Debug mode ────────────────────────────────────────────────────────────
+  /**
+   * When true, prints the full assembled system prompt + message array to
+   * stderr before each LLM API call, and prints the raw response content after.
+   * Intended for development / prompt-engineering troubleshooting.
+   * Enable via --debug CLI flag.
+   */
+  debugMode?: boolean
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -208,17 +265,30 @@ export interface MetaAgentConfig {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // Fields that are truly optional in the resolved config (no meaningful default):
-//   runtimeContext — absent = no V&V / provenance instrumentation
-//   language       — absent = model follows user's language
-//   outputStyle    — absent = model decides verbosity
+//   runtimeContext  — absent = no V&V / provenance instrumentation
+//   language        — absent = model follows user's language
+//   outputStyle     — absent = model decides verbosity
 //   mcpServers      — absent = no MCP instructions injected
+//   beforeToolCall  — absent = no interactive guard (non-TTY / programmatic use)
 export type ResolvedConfig = Required<
-  Omit<MetaAgentConfig, 'runtimeContext' | 'language' | 'outputStyle' | 'mcpServers'>
+  Omit<MetaAgentConfig,
+    | 'sessionId'
+    | 'runtimeContext'
+    | 'language'
+    | 'outputStyle'
+    | 'mcpServers'
+    | 'beforeToolCall'
+    | 'initialMessages'
+    | 'debugMode'
+  >
 > & {
   runtimeContext?: RuntimeContext
   language?: string
   outputStyle?: OutputStyle
   mcpServers?: import('./dynamicPrompt.js').McpServerInstruction[]
+  beforeToolCall?: MetaAgentConfig['beforeToolCall']
+  initialMessages?: MetaAgentConfig['initialMessages']
+  debugMode?: boolean
 }
 
 // `projectDir` is always present after resolveConfig() because we default to process.cwd().
@@ -245,7 +315,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     domain: config.domain ?? 'generic',
     systemPrompt: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPrompt: config.appendSystemPrompt ?? '',
-    maxTurns: config.maxTurns ?? 10,
+    maxTurns: config.maxTurns ?? Infinity,
     maxBudgetUsd: config.maxBudgetUsd ?? Infinity,
     maxTokens: config.maxTokens ?? 8192,
     tools: config.tools ?? [],
@@ -253,10 +323,13 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     maxRetries: config.maxRetries ?? 3,
     verbose: config.verbose ?? false,
     // Optional — pass through as-is; undefined = feature disabled
-    runtimeContext: config.runtimeContext,
-    language: config.language,
-    outputStyle: config.outputStyle,
-    mcpServers: config.mcpServers,
+    runtimeContext:  config.runtimeContext,
+    language:        config.language,
+    outputStyle:     config.outputStyle,
+    mcpServers:      config.mcpServers,
+    beforeToolCall:  config.beforeToolCall,
+    initialMessages: config.initialMessages,
+    debugMode:       config.debugMode,
     // projectDir: default to cwd so AGENT.md discovery works out-of-the-box
     projectDir: config.projectDir ?? process.cwd(),
   }

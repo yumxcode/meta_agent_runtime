@@ -61,7 +61,7 @@ export class DimensionChecker implements VVHook {
       hookName: this.name,
       passed: true,
       severity: 'info',
-      message: 'Dimension check passed',
+      message: 'Dimension check passed (stub — full implementation pending)',
       suggestedAction: 'continue',
     }
   }

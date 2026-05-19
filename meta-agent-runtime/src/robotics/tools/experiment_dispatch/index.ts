@@ -41,16 +41,26 @@ export function createExperimentDispatchTool(
       'Dispatch an experiment to an isolated ExperimentAgent sub-agent. ' +
       'The sub-agent runs in its own git worktree (if git is enabled) so changes do not pollute main. ' +
       'Set await_completion=false to run experiments in parallel. ' +
-      'The sub-agent will call experience_write automatically on completion.',
+      'The sub-agent will call experience_write automatically on completion. ' +
+      'REQUIRED: purpose (why you are dispatching) and on_complete (what YOU will do with the result). ' +
+      'These fields prevent orphan tasks and ensure results are always processed.',
     inputSchema: {
       type: 'object',
-      required: ['title', 'hypothesis', 'environment', 'procedure', 'success_criteria'],
+      required: ['title', 'hypothesis', 'environment', 'procedure', 'success_criteria', 'purpose', 'on_complete'],
       properties: {
         title: { type: 'string', description: 'Short experiment title (≤ 60 chars)' },
         hypothesis: { type: 'string', description: 'What you expect to happen / prove' },
         environment: { type: 'string', description: 'Simulation environment or hardware setup' },
         procedure: { type: 'string', description: 'Step-by-step procedure for the experiment' },
         success_criteria: { type: 'string', description: 'Quantitative success criteria (e.g. "success_rate ≥ 90%")' },
+        purpose: {
+          type: 'string',
+          description: 'One sentence: WHY you are dispatching this sub-agent (causal context from your plan).',
+        },
+        on_complete: {
+          type: 'string',
+          description: 'What YOU (the orchestrator) will do once this task completes — e.g. "call get_sub_agent_status, extract joint anomaly list, then propose DR parameter changes". This is your binding commitment.',
+        },
         max_turns: {
           type: 'number',
           description: 'Maximum agent turns (default 60)',
@@ -64,9 +74,35 @@ export function createExperimentDispatchTool(
           items: { type: 'string' },
           description: 'Extra tools to grant (default: bash, read_file, write_file, glob, grep, experience_write)',
         },
+        agent_instructions: {
+          type: 'string',
+          description:
+            'Optional domain-specific instructions appended to the sub-agent system prompt. ' +
+            'Use to inject analysis methods, required output format, domain constraints, or ' +
+            'task-specific rules that go beyond the generic experiment template. ' +
+            'Example: "统计每列NaN比例；检测关节角速度超出±5 rad/s的帧；输出markdown表格".',
+        },
       },
     },
     async call(input, ctx): Promise<ToolResult> {
+      // Hard-validate required continuation fields
+      const purpose    = String(input['purpose']    ?? '').trim()
+      const on_complete = String(input['on_complete'] ?? '').trim()
+      if (!purpose) {
+        return {
+          content: 'experiment_dispatch requires a non-empty "purpose" field. ' +
+            'Explain WHY you are dispatching this sub-agent before calling.',
+          isError: true,
+        }
+      }
+      if (!on_complete) {
+        return {
+          content: 'experiment_dispatch requires a non-empty "on_complete" field. ' +
+            'Describe what YOU will do with the result before dispatching.',
+          isError: true,
+        }
+      }
+
       const spec: ExperimentSpec = {
         title: String(input['title'] ?? ''),
         hypothesis: String(input['hypothesis'] ?? ''),
@@ -107,6 +143,8 @@ Rules:
           }
         }
 
+        const agentInstructions = String(input['agent_instructions'] ?? '').trim()
+
         const taskDescription = [
           `# Experiment: ${spec.title}`,
           '',
@@ -119,8 +157,11 @@ Rules:
           `## Success Criteria\n${spec.successCriteria}`,
           '',
           EXPERIMENT_AGENT_SYSTEM,
+          agentInstructions
+            ? `\n## Additional Instructions (from orchestrator)\n${agentInstructions}`
+            : '',
           gitContext,
-        ].join('\n')
+        ].filter(s => s !== '').join('\n')
 
         const record = await bridge.spawnSubAgent({
           config: {
@@ -139,15 +180,18 @@ Rules:
             subAgentBranches: { [record.taskId]: branchName },
             forkPoints: { [record.taskId]: '' },
           })
-          await RoboticsProjectStore.registerSubAgentTask(projectDir, {
-            taskId: record.taskId,
-            role: 'experiment',
-            title: spec.title,
-            branchName,
-            worktreePath,
-            spawnedAt: Date.now(),
-          })
         }
+        // Always register the task record (even without git) to track purpose + on_complete
+        await RoboticsProjectStore.registerSubAgentTask(projectDir, {
+          taskId: record.taskId,
+          role: 'experiment',
+          title: spec.title,
+          branchName,
+          worktreePath,
+          spawnedAt: Date.now(),
+          purpose,
+          on_complete,
+        })
 
         const awaitCompletion = input['await_completion'] as boolean | undefined
         if (awaitCompletion) {
@@ -178,10 +222,13 @@ Rules:
             `**Task ID**: ${record.taskId}`,
             `**Title**: ${spec.title}`,
             ...(branchName ? [`**Branch**: \`${branchName}\``] : []),
+            `**Purpose**: ${purpose}`,
             ``,
-            `Use \`get_sub_agent_status task_id="${record.taskId}"\` to check progress.`,
-            `Use \`git_diff_subagent task_id="${record.taskId}"\` to preview code changes.`,
-            `Use \`git_merge_subagent task_id="${record.taskId}"\` to merge successful results.`,
+            `⚠️  YOUR COMMITTED NEXT ACTION:`,
+            `${on_complete}`,
+            ``,
+            `When ready: \`get_sub_agent_status task_id="${record.taskId}"\` — this returns the ExperimentSummary.`,
+            `Do NOT use experience_search to find results — use get_sub_agent_status.`,
           ].join('\n'),
           isError: false,
         }

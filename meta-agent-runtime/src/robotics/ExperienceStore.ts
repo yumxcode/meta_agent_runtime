@@ -1,8 +1,8 @@
 import { createHash } from 'crypto'
-import { mkdir, readFile, readdir, rename, writeFile } from 'fs/promises'
-import { existsSync } from 'fs'
+import { readFile, readdir, writeFile } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
+import { atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
 import type { ExperienceEntry, ExperienceSearchQuery, RoboticsDomain } from './types.js'
 import { makeExperienceId } from './types.js'
 
@@ -20,7 +20,7 @@ export class ExperienceStore {
   }
 
   async ensureDir(): Promise<void> {
-    await mkdir(this.dir, { recursive: true })
+    await ensureDir(this.dir)
   }
 
   // ── Write ───────────────────────────────────────────────────────────────────
@@ -38,9 +38,7 @@ export class ExperienceStore {
       updatedAt: Date.now(),
     }
     const file = join(this.dir, `${id}.json`)
-    const tmp = file + '.tmp'
-    await writeFile(tmp, JSON.stringify(full, null, 2), 'utf-8')
-    await rename(tmp, file)
+    await atomicWriteJson(file, full)
     await this.rebuildIndex()
     return id
   }
@@ -75,11 +73,7 @@ export class ExperienceStore {
   // ── Load by ID ───────────────────────────────────────────────────────────────
 
   async load(id: string): Promise<ExperienceEntry | null> {
-    const file = join(this.dir, `${id}.json`)
-    try {
-      const raw = await readFile(file, 'utf-8')
-      return JSON.parse(raw) as ExperienceEntry
-    } catch { return null }
+    return readJsonFile<ExperienceEntry>(join(this.dir, `${id}.json`))
   }
 
   // ── Index ───────────────────────────────────────────────────────────────────
@@ -120,9 +114,8 @@ export class ExperienceStore {
     lines.push('`experience_search domain=<domain> tags=<tag1,tag2> keyword=<word>`')
     lines.push('`experience_load id=<id>` — load full entry with report')
 
-    const tmp = this.indexPath + '.tmp'
-    await writeFile(tmp, lines.join('\n'), 'utf-8')
-    await rename(tmp, this.indexPath)
+    // Index is Markdown not JSON — use writeFile directly (not atomicWriteJson)
+    await writeFile(this.indexPath, lines.join('\n'), 'utf-8')
   }
 
   async listIds(): Promise<string[]> {

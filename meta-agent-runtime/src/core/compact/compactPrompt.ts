@@ -14,7 +14,7 @@
  */
 
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
-import { MetaAgentContextStore } from '../../coordination/MetaAgentContextStore.js'
+import { MetaAgentContextStore } from '../../campaign/index.js'
 import type { CompactStateSnapshot } from './stateSnapshot.js'
 import type { TaskContract } from '../contract/types.js'
 

@@ -139,18 +139,38 @@ export class GitWorkspaceManager {
     }
   }
 
-  async reconcileWorktrees(gitState: RoboticsGitState): Promise<void> {
+  /**
+   * Reconcile persisted worktree records against disk on session resume.
+   *
+   * For each recorded sub-agent branch:
+   *   - If the worktree directory exists and is healthy → keep it as-is.
+   *   - If missing → try to restore via `git worktree add`.
+   *   - If restore also fails (branch deleted, repo moved, etc.) → treat the
+   *     task as stale and return its ID so the caller can purge it from state.
+   *
+   * Returns the list of stale task IDs that could not be reconciled.
+   * The caller is responsible for removing them from RoboticsProjectStore.
+   */
+  async reconcileWorktrees(gitState: RoboticsGitState): Promise<string[]> {
+    const staleTaskIds: string[] = []
     for (const [taskId, branchName] of Object.entries(gitState.subAgentBranches)) {
       const worktreePath = join(this.worktreeBaseDir, taskId)
       try {
         await stat(worktreePath)
         await this._gitIn(worktreePath, ['status'])
+        // Healthy — nothing to do
       } catch {
-        await this._git(['worktree', 'add', worktreePath, branchName]).catch(() => {
-          console.warn(`[GitWorkspaceManager] Cannot restore worktree for ${taskId}`)
-        })
+        // Worktree missing — try to restore
+        const restored = await this._git(['worktree', 'add', worktreePath, branchName])
+          .then(() => true)
+          .catch(() => false)
+        if (!restored) {
+          // Cannot restore — mark stale for cleanup
+          staleTaskIds.push(taskId)
+        }
       }
     }
+    return staleTaskIds
   }
 
   private async _git(args: string[]): Promise<string> {
