@@ -1,1 +1,0 @@
-{"version":3,"file":"WorkflowParser.d.ts","sourceRoot":"","sources":["../../src/workflow/WorkflowParser.ts"],"names":[],"mappings":"AAAA,OAAO,KAAK,EAAE,kBAAkB,EAA2B,MAAM,YAAY,CAAA;AAE7E,qBAAa,cAAc;IACzB,MAAM,CAAC,KAAK,CAAC,GAAG,EAAE,MAAM,EAAE,UAAU,EAAE,MAAM,GAAG,kBAAkB;CAyClE"}

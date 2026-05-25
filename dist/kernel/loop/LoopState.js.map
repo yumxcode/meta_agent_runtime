@@ -1,0 +1,1 @@
+{"version":3,"file":"LoopState.js","sourceRoot":"","sources":["../../../src/kernel/loop/LoopState.ts"],"names":[],"mappings":"AAoCA,MAAM,UAAU,gBAAgB,CAC9B,QAAyB,EACzB,KAAa;IAEb,OAAO;QACL,QAAQ;QACR,mBAAmB,EAAE,SAAS;QAC9B,4BAA4B,EAAE,CAAC;QAC/B,uBAAuB,EAAE,SAAS;QAClC,2BAA2B,EAAE,KAAK;QAClC,SAAS,EAAE,CAAC;QACZ,YAAY,EAAE,KAAK;QACnB,iBAAiB,EAAE,KAAK;KACzB,CAAA;AACH,CAAC"}

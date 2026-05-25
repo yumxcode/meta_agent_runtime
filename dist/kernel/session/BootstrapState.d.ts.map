@@ -1,0 +1,1 @@
+{"version":3,"file":"BootstrapState.d.ts","sourceRoot":"","sources":["../../../src/kernel/session/BootstrapState.ts"],"names":[],"mappings":"AAAA;;;GAGG;AAEH,MAAM,WAAW,cAAc;IAC7B,SAAS,EAAE,MAAM,CAAA;IACjB,GAAG,EAAE,MAAM,CAAA;IACX,WAAW,EAAE,MAAM,CAAA;CACpB;AAED,wBAAgB,oBAAoB,CAAC,GAAG,CAAC,EAAE,MAAM,EAAE,SAAS,CAAC,EAAE,MAAM,GAAG,cAAc,CAMrF"}
