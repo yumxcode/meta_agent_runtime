@@ -12,7 +12,7 @@
  *     └─ sectionRegistry: SectionRegistry ← R1-R5 dynamic prompt sections
  *
  * On every submit():
- *   1. First call only: classify agent mode (single vs multi) via Haiku side-call.
+ *   1. First call only: classify agent mode (single vs multi) via flash model side-call.
  *      After classification, invalidate R1 cache so it re-renders with the correct
  *      mode, then gets memoized for all subsequent turns.
  *   2. Resolve R1-R5 sections → combined string
@@ -57,9 +57,9 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
      *
      * - 'single' — disable sub-agent dispatching; main agent handles everything.
      * - 'multi'  — full multi-agent orchestration (experiment_dispatch, paper_search, git).
-     * - 'auto'   — (default) classify via Haiku on first submit() using task context.
+     * - 'auto'   — (default) classify via flash model on first submit() using task context.
      *
-     * When set explicitly, no Haiku side-call is made.
+     * When set explicitly, no flash model side-call is made.
      * Persisted to project state; resumed sessions inherit the stored mode unless
      * an explicit override is provided here.
      */
@@ -98,6 +98,13 @@ export declare class RoboticsSession {
     private readonly _sessionStartMs;
     /** #11: Guard against concurrent submit() calls on the same RoboticsSession. */
     private _submitInFlight;
+    /**
+     * Last assembled stable system prompt (memoized sections only).
+     * Used to deduplicate setAppendSystemPrompt() calls across turns so that
+     * messages[0] stays byte-identical when only volatile context changed,
+     * preserving the DeepSeek KV cache prefix across conversation turns.
+     */
+    private _lastStablePrompt;
     /**
      * Plan B context boundary — set once after task claim when the session has prior history.
      * Injected as the first section in _getRoboticsExtensions() to anchor the AI's perception
@@ -200,17 +207,46 @@ export declare class RoboticsSession {
      */
     destroy(): void;
     /**
-     * Return the robotics-specific sections (R1-R5, + optional W1) to be injected
-     * as modeExtensions into buildDynamicSections().
+     * Stable robotics extensions — injected into the system message via
+     * buildDynamicSections({ modeExtensions }).
      *
-     * D4c (tool_invocation_protocol) is no longer included here — it is emitted by
-     * buildDynamicSections() itself (robotics variant: general rules only, no V&V).
+     * All sections here must be memoized (systemPromptSection) so that the
+     * system message stays byte-identical across turns, preserving the DeepSeek
+     * KV cache prefix.  Sections that change at most once per session (on mode
+     * classification, hardware write, workflow advance, team operations) are
+     * acceptable here — their infrequent invalidations are expected.
+     *
+     * Contents:
+     *   W1  workflow_phase     — memoized, invalidated on workflow_advance
+     *   R1  robotics_domain    — memoized, invalidated on mode classification (once)
+     *   team section           — memoized, invalidated on team operations
+     *   R4  hardware_profile   — memoized, rarely changes
+     */
+    private _getStableRoboticsExtensions;
+    /**
+     * Volatile robotics extensions — injected into the user message prefix via
+     * buildVolatileContextSections({ volatileExtensions }).
+     *
+     * These sections change frequently (every turn or on tool calls) and must
+     * stay out of the system message to avoid invalidating the DeepSeek KV cache.
+     *
+     * Contents:
+     *   R2  experience_index      — recomputed each turn (disk read)
+     *   R3  subagent_tasks        — recomputed each turn (bridge + git query)
+     *   R5  progress_notes        — recomputed each turn (state read)
+     *   team_context_boundary     — fixed content once set, but must appear every turn
+     */
+    private _getVolatileRoboticsExtensions;
+    /**
+     * @deprecated Use _getStableRoboticsExtensions() + _getVolatileRoboticsExtensions()
+     * to separate system-message sections from user-prefix sections.
+     * Kept for backward compatibility; returns all sections combined.
      */
     private _getRoboticsExtensions;
     /**
      * Classify whether this session should use single-agent or multi-agent mode.
      *
-     * Uses a one-shot Haiku call (~300–500 ms, ~$0.00012) with:
+     * Uses a one-shot flash model call (~300–500 ms, ~$0.00012) with:
      *   - The user's first prompt
      *   - Robot name (if known)
      *   - AGENT.md content (if present, from D1c)

@@ -18,6 +18,7 @@
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
  *   -j, --json              Output raw JSON events (for piping)
+ *   -y, --yes               Auto-approve sensitive tools in trusted scripts
  *   -v, --version           Show version
  *   -h, --help              Show help
  */

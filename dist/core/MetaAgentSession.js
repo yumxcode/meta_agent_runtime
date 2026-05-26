@@ -32,7 +32,7 @@ import { resolveConfig, isAnthropicProvider, DEFAULT_SYSTEM_PROMPT, } from './co
 import { createSandboxExecutor } from '../sandbox/index.js';
 import { SectionRegistry } from './systemPromptSections.js';
 import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY } from './staticPrompt.js';
-import { buildDynamicSections } from './dynamicPrompt.js';
+import { buildDynamicSections, buildVolatileContextSections, formatVolatileContext, } from './dynamicPrompt.js';
 import { AgenticSession } from '../modes/AgenticSession.js';
 // ─────────────────────────────────────────────────────────────────────────────
 // MetaAgentSession
@@ -42,7 +42,13 @@ export class MetaAgentSession {
     sessionId;
     sessionStartMs = Date.now();
     // ── Prompt engineering ────────────────────────────────────────────────────
-    staticPrompt = buildStaticSystemPrompt();
+    /**
+     * Per-mode static prompt cache.  MetaAgentSession is never used for campaign
+     * mode (CampaignSession handles that path), so in practice this map contains
+     * at most one entry ('agentic' or 'robotics').  The Map avoids rebuilding the
+     * string on every submit() while still supporting hypothetical mode switches.
+     */
+    _staticPromptCache = new Map();
     sectionRegistry = new SectionRegistry();
     _usingDefaultPrompt;
     /**
@@ -50,6 +56,14 @@ export class MetaAgentSession {
      * null until the first submit().
      */
     _lastSystemPrompt = null;
+    /**
+     * Stable (memoized-only) system prompt from the most recent submit().
+     * Used to deduplicate setAppendSystemPrompt() calls: the inner session's
+     * system message is only updated when content actually changes, preserving
+     * the DeepSeek KV cache prefix across turns where only volatile context
+     * (memory, subagent notifications, …) differs.
+     */
+    _lastStableSystemPrompt = null;
     /**
      * Dynamic suffix set by setAppendSystemPrompt().
      * Injected after the dynamic sections on every submit().
@@ -147,12 +161,18 @@ export class MetaAgentSession {
         }
     }
     async *_submitInner(prompt, mode) {
-        // ── Build system prompt ────────────────────────────────────────────────
+        // ── Step 1: Stable system prompt (memoized sections only) ──────────────
+        //
+        // These sections never change within a turn — they are computed once per
+        // session (or on explicit invalidation) and cached by SectionRegistry.
+        // Keeping the system message byte-identical across turns is the key
+        // requirement for DeepSeek prefix KV cache: any change to messages[0]
+        // collapses the cacheable prefix to zero, losing all conversation history.
         if (this._provenanceDirty) {
             this.sectionRegistry.invalidate('session_provenance');
             this._provenanceDirty = false;
         }
-        const dynamicSections = buildDynamicSections({
+        const stableSections = buildDynamicSections({
             sessionId: this.sessionId,
             sessionStartMs: this.sessionStartMs,
             mode,
@@ -161,37 +181,65 @@ export class MetaAgentSession {
             language: this.config.language,
             mcpServers: this.config.mcpServers,
             outputStyle: this.config.outputStyle,
-            currentQuery: prompt,
-            // Only pass Anthropic client for providers that support haiku side-calls
-            client: isAnthropicProvider(this.config.baseURL) ? this.client : undefined,
-            subAgentBridge: this._subAgentBridge,
             taskContract: this._taskContract,
             projectDir: this.config.projectDir,
+            // NOTE: currentQuery / client / subAgentBridge are intentionally omitted —
+            // those drove D1b and D11 which are now in the volatile user prefix.
         });
-        const dynamicPrompt = await this.sectionRegistry.resolveToString(dynamicSections);
-        // Assemble the full effective system prompt
-        // Ordering mirrors the original MetaAgentSession exactly:
-        //   Default  → staticPrompt + BOUNDARY + dynamicPrompt + '\n\n' + appendSuffix
-        //   Custom   → config.systemPrompt + '\n\n' + appendSuffix + '\n\n' + dynamicPrompt
-        let fullPrompt;
+        const stablePrompt = await this.sectionRegistry.resolveToString(stableSections);
+        // Assemble the full stable system prompt string
+        let fullStablePrompt;
         if (!this._usingDefaultPrompt) {
-            fullPrompt = this.config.systemPrompt ?? '';
+            fullStablePrompt = this.config.systemPrompt ?? '';
             if (this._appendSuffix)
-                fullPrompt += '\n\n' + this._appendSuffix;
-            if (dynamicPrompt)
-                fullPrompt += '\n\n' + dynamicPrompt;
+                fullStablePrompt += '\n\n' + this._appendSuffix;
+            if (stablePrompt)
+                fullStablePrompt += '\n\n' + stablePrompt;
         }
         else {
-            fullPrompt = this.staticPrompt + SYSTEM_PROMPT_DYNAMIC_BOUNDARY + dynamicPrompt;
+            // Build mode-specific static prompt lazily and cache per mode.
+            // MetaAgentSession is only used for 'agentic' and 'robotics' modes;
+            // 'campaign' would be a safety fallback (CampaignSession handles that path).
+            const staticMode = mode === 'robotics' ? 'robotics' :
+                mode === 'campaign' ? 'campaign' : 'agentic';
+            let staticPrompt = this._staticPromptCache.get(staticMode);
+            if (!staticPrompt) {
+                staticPrompt = buildStaticSystemPrompt(staticMode);
+                this._staticPromptCache.set(staticMode, staticPrompt);
+            }
+            fullStablePrompt = staticPrompt + SYSTEM_PROMPT_DYNAMIC_BOUNDARY + stablePrompt;
             if (this._appendSuffix)
-                fullPrompt += '\n\n' + this._appendSuffix;
+                fullStablePrompt += '\n\n' + this._appendSuffix;
         }
-        this._lastSystemPrompt = fullPrompt;
-        // Inject into the inner session — because inner was created with
-        // systemPrompt:'', the full prompt is injected entirely via appendSystemPrompt.
-        this._inner.setAppendSystemPrompt(fullPrompt);
-        // ── Delegate to AgenticSession ────────────────────────────────────────
-        yield* this._inner.submit(prompt);
+        // Only call setAppendSystemPrompt when the content actually changed.
+        // Identical content → identical messages[0] token sequence → cache hit.
+        if (fullStablePrompt !== this._lastStableSystemPrompt) {
+            this._inner.setAppendSystemPrompt(fullStablePrompt);
+            this._lastStableSystemPrompt = fullStablePrompt;
+        }
+        this._lastSystemPrompt = fullStablePrompt;
+        // ── Step 2: Volatile user-message prefix (per-turn, never cached) ─────
+        //
+        // D1b (memory), D11 (subagent notifications), and campaign D8/D9/D10 are
+        // resolved here and prepended to the user message as XML-tagged context.
+        // This keeps messages[0] stable while still giving the model fresh
+        // per-turn state on every submission.
+        const volatileSections = buildVolatileContextSections({
+            currentQuery: prompt,
+            client: isAnthropicProvider(this.config.baseURL) ? this.client : undefined,
+            mode,
+            domain: this.config.domain,
+            subAgentBridge: this._subAgentBridge,
+            rtx: this.config.runtimeContext,
+            sessionStartMs: this.sessionStartMs,
+        });
+        const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections);
+        const volatilePrefix = formatVolatileContext(volatileSections, resolvedVolatile);
+        const effectivePrompt = volatilePrefix
+            ? `${volatilePrefix}\n\n---\n\n${prompt}`
+            : prompt;
+        // ── Step 3: Delegate to AgenticSession ────────────────────────────────
+        yield* this._inner.submit(effectivePrompt);
     }
     /**
      * Register a tool with the session.

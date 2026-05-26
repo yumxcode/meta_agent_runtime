@@ -78,9 +78,10 @@ export class SessionRouter {
         this._pendingTools = [...(config.tools ?? [])];
         // Detection client: only create when (a) an API key is available AND (b)
         // the provider is Anthropic.  Third-party providers (DeepSeek, Qwen, custom
-        // proxies) do not expose claude-haiku-4-5-20251001, so sending the Haiku
-        // side-call there would fail with a 404/400.  The detector falls back to
-        // regex heuristics automatically when this client is null (Task #22 fix).
+        // proxies) do not expose claude-haiku-4-5-20251001 (the Anthropic flash model),
+        // so sending the flash model side-call there would fail with a 404/400.
+        // The detector falls back to regex heuristics automatically when this client
+        // is null (Task #22 fix).
         // Fail-fast: 3 s timeout, 1 retry so a slow API never stalls session start.
         this._detectionClient = (this._cfg.apiKey && isAnthropicProvider(this._cfg.baseURL))
             ? new Anthropic({
@@ -103,10 +104,10 @@ export class SessionRouter {
      * main session client so side-calls never pollute conversation history.
      *
      * Returns null when no API key is available or the provider is non-Anthropic
-     * (third-party proxies don't expose claude-haiku-4-5-20251001).
+     * (third-party proxies don't expose claude-haiku-4-5-20251001, the Anthropic flash model).
      *
-     * Callers that need a side-call model can use the fast haiku model for summaries
-     * (cheap + low-latency) — callers are responsible for choosing the model string.
+     * Callers that need a side-call model should use resolvedConfig.flashModel
+     * (cheap + low-latency, provider-agnostic) — callers are responsible for choosing the model string.
      */
     getSideCallClient() {
         return this._detectionClient;

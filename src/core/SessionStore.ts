@@ -42,6 +42,10 @@ export interface SessionMeta {
   workspace?: string
 }
 
+export interface SessionListOptions {
+  workspace?: string
+}
+
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
 function sessionDir(sessionId: string): string {
@@ -147,9 +151,21 @@ export class SessionStore {
    * Return the session index, newest first.
    * @param limit  Maximum number of entries to return (default: 10).
    */
-  static async listSessions(limit = 10): Promise<SessionMeta[]> {
+  static async listSessions(limit = 10, options: SessionListOptions = {}): Promise<SessionMeta[]> {
     const index = await readIndex()
-    return index.slice(0, limit)
+    const workspace = options.workspace
+    const filtered = workspace
+      ? index.filter(entry => entry.workspace === workspace)
+      : index
+    return filtered.slice(0, limit)
+  }
+
+  /**
+   * Return one session metadata record by ID, or null if it is not indexed.
+   */
+  static async getSession(sessionId: string): Promise<SessionMeta | null> {
+    const index = await readIndex()
+    return index.find(entry => entry.sessionId === sessionId) ?? null
   }
 
   /**

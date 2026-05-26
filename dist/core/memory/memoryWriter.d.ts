@@ -1,7 +1,7 @@
 /**
  * Post-session memory writer.
  *
- * Runs a small Haiku side-call at session shutdown to decide whether the
+ * Runs a small flash model side-call at session shutdown to decide whether the
  * conversation contains public, mode-wide memories worth persisting.  The model
  * returns structured proposals only; this module performs all filesystem writes
  * so frontmatter stays constrained and mode boundaries are enforced.

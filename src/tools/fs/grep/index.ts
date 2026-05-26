@@ -4,6 +4,7 @@ import { join } from 'path'
 import { promisify } from 'util'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
+import { assertInsideWorkspace } from '../workspaceGuard.js'
 
 const execFileAsync = promisify(execFile)
 let _rgAvailable: boolean | null = null
@@ -33,7 +34,7 @@ export async function createGrepTool(): Promise<MetaAgentTool> {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Regular expression pattern' },
-        path: { type: 'string', description: 'File or directory to search. Default: cwd' },
+        path: { type: 'string', description: 'File or directory to search. Default: workspace root' },
         glob: { type: 'string', description: 'Glob filter (e.g. "*.ts")' },
         output_mode: { type: 'string', enum: ['content', 'files_with_matches', 'count'], description: 'Default: files_with_matches' },
         context: { type: 'number', description: 'Lines of context around matches' },
@@ -45,10 +46,13 @@ export async function createGrepTool(): Promise<MetaAgentTool> {
     },
     async call(input: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolResult> {
       const pattern = input['pattern'] as string
-      const searchPath = (input['path'] as string | undefined) ?? process.cwd()
+      const workspaceRoot = _ctx.workspaceRoot ?? process.cwd()
+      const searchPath = (input['path'] as string | undefined) ?? workspaceRoot
       const outputMode = (input['output_mode'] as string | undefined) ?? 'files_with_matches'
       const headLimit = typeof input['head_limit'] === 'number' ? input['head_limit'] : 250
       if (!pattern) return { content: 'Error: pattern is required', isError: true }
+      const workspaceError = assertInsideWorkspace(searchPath, workspaceRoot)
+      if (workspaceError) return { content: workspaceError, isError: true }
 
       if (await isRgAvailable()) {
         try {

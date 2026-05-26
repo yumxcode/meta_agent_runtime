@@ -4,12 +4,12 @@
  * Architecture mirrors CC's findRelevantMemories.ts:
  *   1. Scan all topic files and extract frontmatter headers
  *   2. Split files into always-relevant (user + feedback) and candidates
- *   3. Select candidates via Haiku side-call (when Anthropic client provided)
+ *   3. Select candidates via flash model side-call (when client provided)
  *      or keyword match (fallback)
  *   4. Load and return file content for selected files
  *
  * Differences from CC:
- *   - Uses Haiku (not Sonnet) for relevance — task is simpler, cost lower
+ *   - Uses flash model (not primary model) for relevance — task is simpler, cost lower
  *   - No alreadySurfaced dedup (all injected via system prompt, not per-turn)
  *   - campaign_lessons type: only loaded in campaign mode by default
  *   - robot_lessons type: only loaded in robotics mode by default
@@ -80,7 +80,7 @@ export interface FindRelevantMemoriesOptions {
  *
  * Always loads: user + feedback topic files (small, always applicable).
  * Loads from candidates: domain_knowledge, campaign_lessons, robot_lessons, reference files
- *   selected by Haiku side-call (when client provided) or keyword match.
+ *   selected by flash model side-call (when client provided) or keyword match.
  *
  * Applies scope and mode filters before selection so out-of-scope memories
  * cannot pollute a long-running task's context.

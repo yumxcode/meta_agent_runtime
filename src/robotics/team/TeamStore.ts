@@ -369,6 +369,7 @@ async function fileText(path: string): Promise<string | null> {
   try {
     return await readFile(path, 'utf8')
   } catch {
+    // File missing or unreadable — caller handles null to mean "not found".
     return null
   }
 }
@@ -558,6 +559,7 @@ export class TeamStore {
         .map(l => normalizeRepoPath(l.trim()))
         .filter(Boolean)
     } catch {
+      // git diff failed (e.g. branch not found, not a git repo) — return empty list.
       return []
     }
   }
@@ -1019,6 +1021,7 @@ export class TeamStore {
     try {
       await execFileAsync('git', ['restore', '--source', upstreamBranch, '--', TEAM_DIR], { cwd: this.projectDir, timeout: 30_000 })
     } catch {
+      // `git restore` was added in git 2.23 — fall back to the older `git checkout` form.
       await execFileAsync('git', ['checkout', upstreamBranch, '--', TEAM_DIR], { cwd: this.projectDir, timeout: 30_000 })
     }
 
@@ -1057,6 +1060,7 @@ export class TeamStore {
         }
       }
     } catch {
+      // git ls-files failed or output unparseable — report no conflicts rather than crashing.
       conflictedPaths = []
     }
 
@@ -1225,6 +1229,7 @@ export class TeamStore {
         .map(line => line.trim())
         .filter(Boolean)
     } catch {
+      // git unavailable or not a git repo — treat as no local changes.
       return []
     }
   }
@@ -1402,6 +1407,8 @@ export class TeamStore {
         .map(line => normalizeRepoPath(line.slice(2).trim().split(' -> ').pop() ?? ''))
         .filter(Boolean)
     } catch {
+      // git unavailable or not a git repo — return empty list so callers
+      // can still proceed without workspace-change context.
       return []
     }
   }

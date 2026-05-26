@@ -113,10 +113,10 @@ export declare class SessionRouter {
      * main session client so side-calls never pollute conversation history.
      *
      * Returns null when no API key is available or the provider is non-Anthropic
-     * (third-party proxies don't expose claude-haiku-4-5-20251001).
+     * (third-party proxies don't expose claude-haiku-4-5-20251001, the Anthropic flash model).
      *
-     * Callers that need a side-call model can use the fast haiku model for summaries
-     * (cheap + low-latency) — callers are responsible for choosing the model string.
+     * Callers that need a side-call model should use resolvedConfig.flashModel
+     * (cheap + low-latency, provider-agnostic) — callers are responsible for choosing the model string.
      */
     getSideCallClient(): Anthropic | null;
     /**

@@ -58,6 +58,17 @@ function finaliseAccumulator(acc) {
         stopReason: acc.stopReason,
     };
 }
+const NO_PROGRESS_REPEAT_LIMIT = 3;
+function stableStringify(value) {
+    if (value === null || typeof value !== 'object') {
+        const encoded = JSON.stringify(value);
+        return encoded === undefined ? String(value) : encoded;
+    }
+    if (Array.isArray(value))
+        return `[${value.map(stableStringify).join(',')}]`;
+    const record = value;
+    return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`;
+}
 // ── Main loop ────────────────────────────────────────────────────────────────
 export async function* runKernelLoop(ctx) {
     const { config, mutableMessages, abortController, fileCache, sessionId } = ctx;
@@ -69,6 +80,8 @@ export async function* runKernelLoop(ctx) {
     let totalCost = ctx.cumulativeCostUsd;
     let allPermissionDenials = [];
     let resultText = '';
+    let lastToolRequestSignature = '';
+    let repeatedToolRequestCount = 0;
     // Helper: push messages to both mutableMessages and state
     function append(...msgs) {
         mutableMessages.push(...msgs);
@@ -309,13 +322,14 @@ export async function* runKernelLoop(ctx) {
         })));
         const lastMsg = assistantMessages[assistantMessages.length - 1];
         const stopReason = lastMsg?.stopReason ?? null;
+        const assistantText = assistantMessages
+            .flatMap(m => m.content)
+            .filter((b) => b.type === 'text')
+            .map(b => b.text)
+            .join('');
         // ── Step 14: no-tools path ───────────────────────────────────────────────
         if (toolUseRequests.length === 0) {
-            resultText = assistantMessages
-                .flatMap(m => m.content)
-                .filter((b) => b.type === 'text')
-                .map(b => b.text)
-                .join('');
+            resultText = assistantText;
             // 14b: max_output_tokens recovery
             if (isMaxOutputTokensStopReason(stopReason)) {
                 if (state.maxOutputTokensOverride === undefined &&
@@ -335,6 +349,22 @@ export async function* runKernelLoop(ctx) {
             }
             // 14e: normal completion
             return done('success');
+        }
+        const toolRequestSignature = toolUseRequests
+            .map(req => `${req.toolName}:${stableStringify(req.input)}`)
+            .join('\n');
+        if (toolRequestSignature === lastToolRequestSignature && assistantText.trim().length === 0) {
+            repeatedToolRequestCount++;
+        }
+        else {
+            lastToolRequestSignature = toolRequestSignature;
+            repeatedToolRequestCount = 1;
+        }
+        if (repeatedToolRequestCount >= NO_PROGRESS_REPEAT_LIMIT) {
+            resultText =
+                `Stopped: the model repeated the same tool request ${repeatedToolRequestCount} times without making progress.`;
+            yield { type: 'text_delta', delta: resultText, sessionId };
+            return done('no_progress');
         }
         // Emit tool_use events
         for (const req of toolUseRequests) {

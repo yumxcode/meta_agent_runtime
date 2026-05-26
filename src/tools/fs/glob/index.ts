@@ -2,17 +2,37 @@ import { readdir, stat } from 'fs/promises'
 import { join, relative, basename } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
+import { assertInsideWorkspace } from '../workspaceGuard.js'
 
 function matchGlob(pattern: string, filePath: string): boolean {
-  const seg = pattern
-    .replace(/[.+^${}()|[\]\\]/g, (c) => ['*', '?'].includes(c) ? c : `\\${c}`)
-    .replace(/\\\./g, '\\.')
-    .replace(/\*\*\//g, '(?:.+/)?')
-    .replace(/\*\*/g, '.*')
-    .replace(/(?<!\.\*)\*/g, '[^/]*')
-    .replace(/\?/g, '[^/]')
-    .replace(/\{([^}]+)\}/g, (_: string, g: string) => `(${g.split(',').map((s: string) => s.trim()).join('|')})`)
-  try { return new RegExp(`^${seg}$`).test(filePath) } catch { return false }
+  let out = ''
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!
+    const next = pattern[i + 1]
+    const afterNext = pattern[i + 2]
+    if (ch === '*' && next === '*' && afterNext === '/') {
+      out += '(?:.*\\/)?'
+      i += 2
+    } else if (ch === '*' && next === '*') {
+      out += '.*'
+      i += 1
+    } else if (ch === '*') {
+      out += '[^/]*'
+    } else if (ch === '?') {
+      out += '[^/]'
+    } else if (ch === '{') {
+      const end = pattern.indexOf('}', i + 1)
+      if (end > i) {
+        out += `(${pattern.slice(i + 1, end).split(',').map(s => s.trim().replace(/[.+^${}()|[\]\\]/g, '\\$&')).join('|')})`
+        i = end
+      } else {
+        out += '\\{'
+      }
+    } else {
+      out += ch.replace(/[.+^${}()|[\]\\]/g, '\\$&')
+    }
+  }
+  try { return new RegExp(`^${out}$`).test(filePath) } catch { return false }
 }
 
 const SKIP_DIRS = new Set(['node_modules', '.git', 'dist', '.next', 'coverage', '__pycache__'])
@@ -48,14 +68,17 @@ export async function createGlobTool(): Promise<MetaAgentTool> {
       type: 'object',
       properties: {
         pattern: { type: 'string', description: 'Glob pattern (e.g. "**/*.ts")' },
-        path: { type: 'string', description: 'Directory to search in. Defaults to cwd.' },
+        path: { type: 'string', description: 'Directory to search in. Defaults to workspace root.' },
       },
       required: ['pattern'],
     },
     async call(input: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolResult> {
       const pattern = input['pattern'] as string
-      const searchPath = (input['path'] as string | undefined) ?? process.cwd()
+      const workspaceRoot = _ctx.workspaceRoot ?? process.cwd()
+      const searchPath = (input['path'] as string | undefined) ?? workspaceRoot
       if (!pattern) return { content: 'Error: pattern is required', isError: true }
+      const workspaceError = assertInsideWorkspace(searchPath, workspaceRoot)
+      if (workspaceError) return { content: workspaceError, isError: true }
       try {
         const allFiles: Array<{ path: string; mtime: number }> = []
         await walkDir(searchPath, allFiles, 5000, _ctx.abortSignal)

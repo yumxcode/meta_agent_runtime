@@ -242,6 +242,7 @@ export async function listGenericCampaigns() {
         entries = await fs.readdir(CAMPAIGNS_DIR);
     }
     catch {
+        // Campaigns directory does not exist yet — return empty list.
         return [];
     }
     const results = [];

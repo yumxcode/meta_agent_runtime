@@ -39,10 +39,11 @@ export interface PendingExperience {
 export class ExperiencePendingStore {
   private readonly _pending: PendingExperience[] = []
   private readonly _filePath: string | null
+  private _persistTail: Promise<void> = Promise.resolve()
 
-  constructor(projectDir?: string) {
+  constructor(projectDir?: string, root = PENDING_ROOT) {
     this._filePath = projectDir
-      ? join(PENDING_ROOT, `${createHash('sha256').update(projectDir).digest('hex').slice(0, 16)}.json`)
+      ? join(root, `${createHash('sha256').update(projectDir).digest('hex').slice(0, 16)}.json`)
       : null
   }
 
@@ -96,6 +97,11 @@ export class ExperiencePendingStore {
     this._persistSoon()
   }
 
+  /** Wait for queued persistence writes to drain. Primarily useful in tests and graceful shutdown. */
+  async flush(): Promise<void> {
+    await this._persistTail
+  }
+
   /**
    * Commit one pending entry to the ExperienceStore.
    * Returns the committed experience ID, or null on failure.
@@ -131,22 +137,32 @@ export class ExperiencePendingStore {
       this.remove(pendingId)
       return id
     } catch {
+      // ExperienceStore.add threw (validation error, disk failure).
+      // Return null so the caller can surface the failure without crashing.
       return null
     }
   }
 
   private _persistSoon(): void {
-    void this._persist().catch(() => {})
+    const snapshot = this._pending.map(item => ({
+      pendingId: item.pendingId,
+      proposedAt: item.proposedAt,
+      input: { ...item.input },
+    }))
+    this._persistTail = this._persistTail
+      .catch(() => {})
+      .then(() => this._persist(snapshot))
+      .catch(() => {})
   }
 
-  private async _persist(): Promise<void> {
+  private async _persist(snapshot: PendingExperience[]): Promise<void> {
     if (!this._filePath) return
-    if (this._pending.length === 0) {
+    if (snapshot.length === 0) {
       await rm(this._filePath, { force: true }).catch(() => undefined)
       return
     }
     await mkdir(dirname(this._filePath), { recursive: true })
-    await writeFile(this._filePath, JSON.stringify(this._pending, null, 2), 'utf-8')
+    await writeFile(this._filePath, JSON.stringify(snapshot, null, 2), 'utf-8')
   }
 }
 

@@ -32,7 +32,13 @@ import type { TaskContract } from './contract/types.js';
 export declare class MetaAgentSession {
     readonly sessionId: string;
     private readonly sessionStartMs;
-    private readonly staticPrompt;
+    /**
+     * Per-mode static prompt cache.  MetaAgentSession is never used for campaign
+     * mode (CampaignSession handles that path), so in practice this map contains
+     * at most one entry ('agentic' or 'robotics').  The Map avoids rebuilding the
+     * string on every submit() while still supporting hypothetical mode switches.
+     */
+    private readonly _staticPromptCache;
     private readonly sectionRegistry;
     private readonly _usingDefaultPrompt;
     /**
@@ -40,6 +46,14 @@ export declare class MetaAgentSession {
      * null until the first submit().
      */
     private _lastSystemPrompt;
+    /**
+     * Stable (memoized-only) system prompt from the most recent submit().
+     * Used to deduplicate setAppendSystemPrompt() calls: the inner session's
+     * system message is only updated when content actually changes, preserving
+     * the DeepSeek KV cache prefix across turns where only volatile context
+     * (memory, subagent notifications, …) differs.
+     */
+    private _lastStableSystemPrompt;
     /**
      * Dynamic suffix set by setAppendSystemPrompt().
      * Injected after the dynamic sections on every submit().

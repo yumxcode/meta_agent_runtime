@@ -1,7 +1,7 @@
 /**
  * Post-session memory writer.
  *
- * Runs a small Haiku side-call at session shutdown to decide whether the
+ * Runs a small flash model side-call at session shutdown to decide whether the
  * conversation contains public, mode-wide memories worth persisting.  The model
  * returns structured proposals only; this module performs all filesystem writes
  * so frontmatter stays constrained and mode boundaries are enforced.
@@ -258,6 +258,7 @@ export async function runPostSessionMemoryWriter(
       : await readFile(join(memoryDir, MEMORY_ENTRYPOINT_NAME), 'utf-8')
     existingIndex = rawIndex?.slice(0, MAX_EXISTING_INDEX_CHARS) ?? ''
   } catch {
+    // MEMORY.md does not exist yet (new workspace) — treat as empty index.
     existingIndex = ''
   }
   const transcript = buildTranscript(messages)

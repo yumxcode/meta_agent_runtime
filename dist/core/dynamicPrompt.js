@@ -203,7 +203,10 @@ export function buildLanguageSection(language) {
 // ─────────────────────────────────────────────────────────────────────────────
 export function buildCurrentModeSection(mode) {
     const modeDescriptions = {
-        agentic: 'AGENTIC — 允许多轮工具调用；不得启动或推进 campaign。',
+        // Agentic：说明多轮工具调用已启用即可。
+        // "不得启动 campaign" 是多余的负面约束——campaign 工具根本没有注册，
+        // 模型调用不了，该句只是浪费 token。
+        agentic: 'AGENTIC — 多轮工具调用已启用。',
         campaign: 'CAMPAIGN — 完整多步骤 campaign 工作流已激活；按指示使用 campaign 和仿真工具。',
         robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置、Git 工作区及子 Agent 编排已激活。优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
     };
@@ -395,13 +398,33 @@ across iterations signals that the design space is not yet fully explored.`;
 //
 // 汉化，强制性语言（MUST / 此要求强制执行）保留，确保模型不会跳过记录步骤。
 // ─────────────────────────────────────────────────────────────────────────────
-export function buildSummarizeToolResultsSection() {
+export function buildSummarizeToolResultsSection(mode = 'agentic') {
     return systemPromptSection('summarize_tool_results', () => {
+        // 关键结果的判定条件因模式而异：
+        //   campaign — 有 V&V 状态（⚠/✗）和溯源 ID，需全部标注
+        //   agentic  — 有溯源 ID，无 V&V 状态
+        //   robotics — 无溯源 ID，无 V&V；只需追踪数值结果用于后续步骤
+        if (mode === 'campaign') {
+            return (`## 中间结果追踪\n\n` +
+                `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
+                `以下情况的结果视为"关键结果"：` +
+                `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
+                `始终包含数值、单位和溯源 ID。` +
+                `此要求强制执行——不得推迟到后续轮次再记录。`);
+        }
+        if (mode === 'agentic') {
+            return (`## 中间结果追踪\n\n` +
+                `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
+                `以下情况的结果视为"关键结果"：` +
+                `（a）用于后续计算，（b）将出现在最终报告中。` +
+                `结果含溯源 ID 时须一并标注。` +
+                `此要求强制执行——不得推迟到后续轮次再记录。`);
+        }
+        // robotics
         return (`## 中间结果追踪\n\n` +
             `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
             `以下情况的结果视为"关键结果"：` +
-            `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
-            `始终包含数值、单位和溯源 ID。` +
+            `（a）用于后续步骤，（b）将出现在最终报告中。` +
             `此要求强制执行——不得推迟到后续轮次再记录。`);
     });
 }
@@ -454,6 +477,8 @@ export function buildSessionProvenanceSection(rtx, sessionStartMs) {
                 `\`find_duplicate_computation\` 重复检查`);
         }
         catch {
+            // Provenance listing is advisory; any error (missing store, corrupt record)
+            // silently skips the section rather than crashing the prompt assembly.
             return null;
         }
     });
@@ -527,6 +552,8 @@ export function buildPhaseGuidanceSection() {
             return `## Campaign 阶段指导\n\n${guidanceLines.join('\n\n')}`;
         }
         catch {
+            // Phase guidance is advisory; any error (plugin crash, store unavailable)
+            // silently omits the section rather than breaking the prompt assembly.
             return null;
         }
     }, 'Phase guidance must reflect the current campaign phase, which can change ' +
@@ -610,29 +637,83 @@ export function buildSubAgentNotificationsSection(bridge) {
         'completed results from the parent agent for an entire turn.');
 }
 /**
- * Returns the full list of dynamic sections for the given options.
+ * Build the volatile context sections that must be injected as a user message
+ * prefix rather than into the system message.
  *
- * Ordering:
- *   D1c agent_directives [memoized]    — AGENT.md: workflow, project rules, caveats
- *   D0  task_contract    [memoized, keyed on updatedAt] — goal anchor (when present)
- *   D1b memory_content   [uncached]    — MEMORY.md index + recalled topic files
- *   D2  env_info         [memoized]
- *   D3  language         [memoized]
- *   D4  current_mode     [memoized]
- *   D4a engineering_standards [memoized] — agentic/campaign modes
- *   D4b campaign_knowledge    [memoized] — mode === 'campaign'
- *   D4c tool_invocation_protocol [memoized] — mode-trimmed: robotics=general only;
- *                                             agentic=+provenance; campaign=+provenance+V&V
- *   Rx  modeExtensions    [caller-managed] — optional mode-specific sections (e.g. R1-R5)
- *   D5  mcp_instructions [memoized]
- *   D6  output_style     [memoized]
- *   D7  summarize_tool_results [memoized]
- *   D11 subagent_notifications [uncached] — when subAgentBridge provided
- *   ── Campaign Assembly (campaign mode only) ──
- *   D8  campaign_context  [uncached]
- *   D9  session_provenance [memoized, invalidated on new records]
- *   D10 phase_guidance    [uncached]
+ * Resolve via the caller's SectionRegistry, then format with formatVolatileContext().
+ *
+ * Usage:
+ *   const volatileSections = buildVolatileContextSections({ currentQuery: prompt, ... })
+ *   const resolved = await sectionRegistry.resolve(volatileSections)
+ *   const prefix = formatVolatileContext(volatileSections, resolved)
+ *   const effectivePrompt = prefix ? `${prefix}\n\n---\n\n${prompt}` : prompt
  */
+export function buildVolatileContextSections(opts) {
+    const sections = [
+        // D1b — per-query memory recall (always first so the model has memory context
+        // before reading mode-specific state)
+        buildMemoryContentSection(opts.currentQuery ?? '', opts.client, opts.mode, opts.domain),
+    ];
+    // Rx — caller-provided mode-specific volatile sections (R2, R3, R5, team, etc.)
+    if (opts.volatileExtensions) {
+        sections.push(...opts.volatileExtensions);
+    }
+    // D11 — sub-agent completion/failure notifications
+    if (opts.subAgentBridge) {
+        sections.push(buildSubAgentNotificationsSection(opts.subAgentBridge));
+    }
+    // Campaign assembly — D8/D9/D10 (campaign mode only)
+    if (opts.mode === 'campaign') {
+        sections.push(buildCampaignContextSection());
+        if (opts.rtx && opts.sessionStartMs !== undefined) {
+            sections.push(buildSessionProvenanceSection(opts.rtx, opts.sessionStartMs));
+        }
+        sections.push(buildPhaseGuidanceSection());
+    }
+    return sections;
+}
+/** Maps internal section names to the XML tag used in the user message prefix. */
+const VOLATILE_SECTION_TAGS = {
+    memory_content: 'memory',
+    experience_index: 'experience_index',
+    robotics_subagents: 'subagent_status',
+    robotics_progress: 'progress',
+    robotics_team_mode: 'team_status',
+    team_context_boundary: 'context_boundary',
+    subagent_notifications: 'notifications',
+    campaign_context: 'campaign_context',
+    session_provenance: 'session_provenance',
+    phase_guidance: 'phase_guidance',
+};
+/**
+ * Format resolved volatile section content as an XML-tagged user message prefix.
+ *
+ * Returns null when no sections produced content (no prefix to prepend).
+ *
+ * Output format:
+ *   <context>
+ *   <memory>
+ *   ...
+ *   </memory>
+ *
+ *   <subagent_status>
+ *   ...
+ *   </subagent_status>
+ *   </context>
+ */
+export function formatVolatileContext(sections, resolved) {
+    const blocks = [];
+    for (let i = 0; i < sections.length; i++) {
+        const content = resolved[i];
+        if (!content)
+            continue;
+        const tag = VOLATILE_SECTION_TAGS[sections[i].name] ?? sections[i].name;
+        blocks.push(`<${tag}>\n${content.trim()}\n</${tag}>`);
+    }
+    if (blocks.length === 0)
+        return null;
+    return `<context>\n${blocks.join('\n\n')}\n</context>`;
+}
 export function buildDynamicSections(opts) {
     const effectiveProjectDir = opts.projectDir ?? process.cwd();
     const base = [
@@ -644,39 +725,27 @@ export function buildDynamicSections(opts) {
         // D0: Task Contract — goal anchor immediately after project directives so the
         // model sees original intent before any volatile sections.
         ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),
-        buildMemoryContentSection(opts.currentQuery ?? '', opts.client, opts.mode, opts.domain),
+        // NOTE: D1b (memory_content) has been moved to buildVolatileContextSections().
+        // It must NOT be in the system message — DeepSeek KV cache requires the
+        // system message to be byte-identical across turns to get prefix cache hits.
         buildEnvInfoSection(opts.sessionId, opts.sessionStartMs),
         buildLanguageSection(opts.language),
         buildCurrentModeSection(opts.mode),
         buildEngineeringStandardsSection(opts.mode),
         buildCampaignKnowledgeSection(opts.mode),
         buildToolInvocationSection(opts.mode),
-        // Rx: mode-specific extensions — injected here so they appear after the
+        // Rx: mode-specific STABLE extensions — injected here so they appear after the
         // shared tool protocol but before infrastructure sections (MCP, output style).
-        // Resolved by the caller's SectionRegistry alongside all other sections.
+        // Only pass memoized sections here; volatile mode sections go to modeExtensions
+        // in buildVolatileContextSections() instead.
         ...(opts.modeExtensions ?? []),
         buildMcpInstructionsSection(opts.mcpServers),
         buildOutputStyleSection(opts.outputStyle),
-        buildSummarizeToolResultsSection(),
-        // D11: sub-agent notifications — always injected when a bridge is present so
-        // the parent agent sees completed sub-tasks on the very next turn after they
-        // finish, regardless of session mode.
-        ...(opts.subAgentBridge
-            ? [buildSubAgentNotificationsSection(opts.subAgentBridge)]
-            : []),
+        buildSummarizeToolResultsSection(opts.mode),
+        // NOTE: D11 (subagent_notifications) has been moved to buildVolatileContextSections().
+        // NOTE: D8/D9/D10 (campaign_context/session_provenance/phase_guidance) have been
+        // moved to buildVolatileContextSections() — campaign state changes every few seconds.
     ];
-    // Campaign assembly is only needed in campaign mode.
-    // robotics / agentic / direct modes skip D8-D10.
-    if (opts.mode !== 'campaign')
-        return base;
-    // Campaign Assembly — only in campaign mode
-    const campaignAssembly = [
-        buildCampaignContextSection(),
-        ...(opts.rtx
-            ? [buildSessionProvenanceSection(opts.rtx, opts.sessionStartMs)]
-            : []),
-        buildPhaseGuidanceSection(),
-    ];
-    return [...base, ...campaignAssembly];
+    return base;
 }
 //# sourceMappingURL=dynamicPrompt.js.map

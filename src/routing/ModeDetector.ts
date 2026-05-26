@@ -49,7 +49,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 // ── LLM classification ────────────────────────────────────────────────────────
 //
-// One-shot Haiku call: ~300–500 ms, ~$0.00012 per detection, fires once per
+// One-shot flash model call: ~300–500 ms, ~$0.00012 per detection, fires once per
 // session. Falls back to heuristic on any error or timeout.
 
 const LLM_DETECTION_MODEL = 'deepseek-v4-flash'
@@ -272,7 +272,7 @@ export class ModeDetector {
   /**
    * Full async detect — layers 1–3 including the env disk check.
    *
-   * When `client` is provided, Layer 2 uses a one-shot Haiku call instead of
+   * When `client` is provided, Layer 2 uses a one-shot flash model call instead of
    * regex heuristics. This costs ~300–500 ms and ~$0.00012 per session, and
    * handles every edge case (language, intent, domain vocabulary) that the
    * heuristics cannot. Falls back to heuristics automatically on any error.
@@ -304,7 +304,7 @@ export class ModeDetector {
   }
 
   /**
-   * One-shot Haiku classification. Returns a result with confidence='llm'.
+   * One-shot flash model classification. Returns a result with confidence='llm'.
    * On any error (network, timeout, unexpected output) silently falls back
    * to the heuristic path so the session always proceeds.
    */
@@ -442,6 +442,8 @@ export class ModeDetector {
       const active = await CampaignStateStore.listActive()
       return active.length > 0
     } catch {
+      // Campaign store unavailable (missing dir, corrupt index) — assume no active
+      // campaigns so mode detection falls through to heuristics.
       return false
     }
   }

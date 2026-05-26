@@ -136,7 +136,7 @@ export interface ActiveSubAgentRecord {
  * multi  — full multi-agent orchestration; experiment_dispatch, paper_search,
  *          Git worktree isolation, and noise-isolation protocol all active.
  *
- * Classified by Haiku on first submit() using task context + AGENT.md signals.
+ * Classified by flash model on first submit() using task context + AGENT.md signals.
  * Persisted in project state so resumed sessions keep the same mode.
  */
 export type RoboticsAgentMode = 'single' | 'multi'

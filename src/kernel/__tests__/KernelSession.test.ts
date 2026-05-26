@@ -208,6 +208,27 @@ describe('KernelSession — max turns', () => {
     const result = events.find(e => e.type === 'result')
     expect(result?.subtype).toBe('error_max_turns')
   })
+
+  it('stops repeated identical tool calls even when maxTurns is Infinity', async () => {
+    const echoTool: KernelTool = {
+      name: 'echo',
+      description: 'echo',
+      inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+      inputJSONSchema: { type: 'object' as const, properties: { msg: { type: 'string' } } },
+      call: async () => ({ data: 'echoed' }),
+      isConcurrencySafe: () => false,
+    }
+
+    mockStream.mockImplementation(() => toolUseStream(crypto.randomUUID(), 'echo', { msg: 'same' }))
+
+    const session = new KernelSession(makeConfig({ maxTurns: Infinity, tools: [echoTool] }))
+    const events = await collectEvents(session, 'Echo forever')
+    const result = events.find(e => e.type === 'result')
+
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.resultText).toContain('repeated the same tool request')
+    expect(mockStream).toHaveBeenCalledTimes(3)
+  })
 })
 
 describe('KernelSession — interrupt', () => {

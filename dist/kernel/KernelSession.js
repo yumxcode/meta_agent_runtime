@@ -143,6 +143,7 @@ export class KernelSession {
             const subtypeMap = {
                 success: 'success',
                 max_turns: 'error_max_turns',
+                no_progress: 'error_during_execution',
                 blocking_limit: 'error_blocking_limit',
                 aborted_streaming: 'error_during_execution',
                 aborted_tools: 'error_during_execution',

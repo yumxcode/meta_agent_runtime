@@ -1,5 +1,6 @@
 import Anthropic from '@anthropic-ai/sdk';
 import { loadToolPrompt } from '../../util.js';
+export const DEFAULT_WEB_SEARCH_MODEL = 'claude-sonnet-4-6';
 export async function createWebSearchTool(options = {}) {
     const description = await loadToolPrompt(import.meta.url);
     return {
@@ -31,7 +32,7 @@ export async function createWebSearchTool(options = {}) {
                     ...(input['blocked_domains'] ? { blocked_domains: input['blocked_domains'] } : {}),
                 };
                 const response = await client.messages.create({
-                    model: options.model ?? 'deepseek-v4-flash',
+                    model: options.model ?? DEFAULT_WEB_SEARCH_MODEL,
                     max_tokens: 1024,
                     tools: [webSearchTool],
                     messages: [{ role: 'user', content: `Search: ${query}. Provide a concise summary with sources.` }],

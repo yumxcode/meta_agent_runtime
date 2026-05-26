@@ -1,0 +1,1 @@
+{"version":3,"file":"SensitiveCommandPatterns.d.ts","sourceRoot":"","sources":["../../../src/kernel/permissions/SensitiveCommandPatterns.ts"],"names":[],"mappings":"AAAA,MAAM,WAAW,gBAAgB;IAC/B,OAAO,EAAE,MAAM,CAAA;IACf,KAAK,EAAE,MAAM,CAAA;CACd;AAED,eAAO,MAAM,wBAAwB,EAAE,gBAAgB,EAkCtD,CAAA;AAED,wBAAgB,2BAA2B,CAAC,OAAO,EAAE,MAAM,GAAG,MAAM,GAAG,IAAI,CAK1E"}

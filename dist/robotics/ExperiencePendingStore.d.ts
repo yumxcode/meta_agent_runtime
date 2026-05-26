@@ -25,7 +25,8 @@ export interface PendingExperience {
 export declare class ExperiencePendingStore {
     private readonly _pending;
     private readonly _filePath;
-    constructor(projectDir?: string);
+    private _persistTail;
+    constructor(projectDir?: string, root?: string);
     /** Load pending entries persisted for this project, if any. */
     load(): Promise<void>;
     /** Queue an experience for later review. Returns the temporary pending ID. */
@@ -38,6 +39,8 @@ export declare class ExperiencePendingStore {
     remove(pendingId: string): boolean;
     /** Clear all pending entries (e.g. on session end after review). */
     clear(): void;
+    /** Wait for queued persistence writes to drain. Primarily useful in tests and graceful shutdown. */
+    flush(): Promise<void>;
     /**
      * Commit one pending entry to the ExperienceStore.
      * Returns the committed experience ID, or null on failure.

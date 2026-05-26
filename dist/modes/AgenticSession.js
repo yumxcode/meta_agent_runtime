@@ -4,7 +4,7 @@
  * This is the main replacement for MetaAgentSession when running with the
  * new cc-kernel. Supports:
  *   - Multi-turn tool-use loop (up to maxTurns)
- *   - Auto-compact (Haiku summariser)
+ *   - Auto-compact (flash model summariser)
  *   - Streaming events
  *   - Tool registration / upsert
  *   - Interrupt
@@ -64,7 +64,7 @@ export class AgenticSession {
             }),
             planModeRef: config.planModeRef,
             askUser: config.askUser,
-            maxTurns: resolved.maxTurns === Infinity ? 200 : resolved.maxTurns,
+            maxTurns: resolved.maxTurns,
             maxBudgetUsd: resolved.maxBudgetUsd,
             maxOutputTokens: resolved.maxTokens,
             maxRetries: resolved.maxRetries,

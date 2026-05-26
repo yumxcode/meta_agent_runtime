@@ -76,7 +76,7 @@ export class CampaignSession {
       }),
       planModeRef: config.planModeRef,
       askUser: config.askUser,
-      maxTurns: resolved.maxTurns === Infinity ? 500 : resolved.maxTurns,
+      maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
       maxOutputTokens: resolved.maxTokens,
       maxRetries: resolved.maxRetries,
@@ -151,9 +151,20 @@ export class CampaignSession {
     }
     this._submitInFlight = true
 
-    // Build enriched suffix (campaign context + compact instructions)
+    // Build volatile campaign context (campaign state + compact instructions) and
+    // inject it as a user-message prefix rather than via setAppendSystemPrompt().
+    //
+    // Rationale: DeepSeek KV cache is prefix-match on the full token sequence.
+    // Calling setAppendSystemPrompt() every turn changes messages[0] (the system
+    // message), which collapses the cacheable prefix to zero — losing cache hits
+    // on the entire conversation history.  Injecting the volatile content into the
+    // user message instead keeps messages[0] identical across turns.
     const suffix = await this._buildEnrichedSuffix()
-    this._engine.setAppendSystemPrompt(suffix)
+    const effectivePrompt = suffix
+      ? `<context>\n<campaign_state>\n${suffix}\n</campaign_state>\n</context>\n\n---\n\n${prompt}`
+      : prompt
+    // NOTE: setAppendSystemPrompt is intentionally NOT called here.
+    // The system prompt (resolved.systemPrompt = static S1-S6) stays frozen.
 
     const state: TranslationState = {
       sessionId: this._sessionId,
@@ -164,7 +175,7 @@ export class CampaignSession {
     }
 
     try {
-      for await (const event of this._engine.submitMessage(prompt)) {
+      for await (const event of this._engine.submitMessage(effectivePrompt)) {
         if (event.type === 'tool_use') state.turnCount++
         if (event.type === 'result') {
           this._totalCostUsd = event.costUsd

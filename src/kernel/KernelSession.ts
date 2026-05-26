@@ -186,10 +186,11 @@ export class KernelSession {
   ): ResultEvent {
     if (loopResult) {
       type Subtype = ResultEvent['subtype']
-      const subtypeMap: Record<LoopTerminationReason, Subtype> = {
-        success:           'success',
-        max_turns:         'error_max_turns',
-        blocking_limit:    'error_blocking_limit',
+        const subtypeMap: Record<LoopTerminationReason, Subtype> = {
+          success:           'success',
+          max_turns:         'error_max_turns',
+          no_progress:       'error_during_execution',
+          blocking_limit:    'error_blocking_limit',
         aborted_streaming: 'error_during_execution',
         aborted_tools:     'error_during_execution',
         max_budget_usd:    'error_max_budget_usd',

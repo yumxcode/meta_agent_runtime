@@ -4,6 +4,8 @@ import { loadToolPrompt } from '../../util.js'
 
 export interface WebSearchToolOptions { apiKey?: string; model?: string }
 
+export const DEFAULT_WEB_SEARCH_MODEL = 'claude-sonnet-4-6'
+
 export async function createWebSearchTool(options: WebSearchToolOptions = {}): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
@@ -33,7 +35,7 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
           ...(input['blocked_domains'] ? { blocked_domains: input['blocked_domains'] } : {}),
         }
         const response = await (client.messages as unknown as { create: (p: unknown, o: unknown) => Promise<{ content: Array<{ type: string; text?: string }> }> }).create({
-          model: options.model ?? 'deepseek-v4-flash',
+          model: options.model ?? DEFAULT_WEB_SEARCH_MODEL,
           max_tokens: 1024,
           tools: [webSearchTool],
           messages: [{ role: 'user', content: `Search: ${query}. Provide a concise summary with sources.` }],

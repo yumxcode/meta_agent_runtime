@@ -1,9 +1,10 @@
 import { existsSync, readFileSync, realpathSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, isAbsolute, join, resolve, sep } from 'path'
+import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
 import type { ToolPermissionDeclaration } from '../../core/types.js'
+import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
 
 type BeforeToolCallResult =
   | { action: 'allow' }
@@ -31,44 +32,6 @@ export interface ToolPermissionOverride extends ToolPermissionDeclaration {
   enabled?: boolean
 }
 
-const SENSITIVE_BASH_PATTERNS: Array<{ pattern: RegExp; label: string }> = [
-  // ── File deletion ──────────────────────────────────────────────────────────
-  { pattern: /\brm\b/, label: 'rm (file deletion)' },
-  { pattern: /\brmdir\b/, label: 'rmdir' },
-  { pattern: /\bunlink\b/, label: 'unlink' },
-  { pattern: /\btrash\b/, label: 'trash' },
-  { pattern: /\bshred\b/, label: 'shred' },
-  // ── Git destructive operations ─────────────────────────────────────────────
-  { pattern: /\bgit\s+push\b/, label: 'git push' },
-  { pattern: /\bgit\s+clean\b/, label: 'git clean' },
-  { pattern: /\bgit\s+branch\b.*-[dD]\b/, label: 'git branch delete' },
-  { pattern: /\bgit\s+tag\b.*-[dD]\b/, label: 'git tag delete' },
-  { pattern: /\bgit\s+reset\s+--hard\b/, label: 'git reset --hard' },
-  // ── Package installs ───────────────────────────────────────────────────────
-  { pattern: /\bpip3?\s+install\b/, label: 'pip install' },
-  { pattern: /\bconda\s+install\b/, label: 'conda install' },
-  { pattern: /\bapt(?:-get)?\s+install\b/, label: 'apt install' },
-  { pattern: /\bbrew\s+install\b/, label: 'brew install' },
-  { pattern: /\bnpm\b.*\b(?:install|i)\b.*\b(?:-g|--global)\b/, label: 'npm install -g' },
-  // ── Downloads ─────────────────────────────────────────────────────────────
-  { pattern: /\bcurl\b.*\s-[a-zA-Z]*[oO][a-zA-Z]*\s/, label: 'curl download' },
-  { pattern: /\bwget\b/, label: 'wget' },
-  // ── High-risk system operations ────────────────────────────────────────────
-  { pattern: /\bsudo\b/, label: 'sudo' },
-  { pattern: /\bcurl\b.*\|\s*(ba)?sh\b/, label: 'curl pipe to shell' },
-  { pattern: /\bwget\b.*\|\s*(ba)?sh\b/, label: 'wget pipe to shell' },
-  { pattern: /\bchmod\s+(-R\s+)?777\b/, label: 'chmod 777' },
-  { pattern: /\bchown\s+(-R\s+)?/, label: 'chown' },
-  // ── In-place file edits (modifies existing files without explicit path in tool input) ──
-  // NOTE: plain `>` / `>>` / `tee` redirections are intentionally NOT flagged here.
-  // Writing to relative paths inside the workspace is safe; writing to absolute paths
-  // outside the workspace is already blocked by findWorkspaceViolation() above.
-  // Keeping broad redirection patterns causes constant false positives for legitimate
-  // operations like `2>/dev/null`, `cat > file <<'EOF'`, and `echo x > log.txt`.
-  { pattern: /\bsed\s+.*\s-i(?:\s|$)/, label: 'sed in-place edit' },
-  { pattern: /\bperl\s+.*\s-i(?:\s|$)/, label: 'perl in-place edit' },
-]
-
 const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   read_file: { category: 'read', pathFields: ['file_path'], requiresWorkspace: true, planMode: 'allow' },
   write_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
@@ -77,6 +40,7 @@ const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   glob: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
   grep: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
   bash: { category: 'execute', cwdField: 'cwd', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+  powershell: { category: 'execute', cwdField: 'cwd', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
   web_fetch: { category: 'network', planMode: 'allow' },
 }
 
@@ -143,13 +107,54 @@ function resolveForPolicy(path: string, workspaceRoot: string): string {
   if (existsSync(absolute)) return realpathSync(absolute)
   const ancestor = findExistingAncestor(absolute)
   const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor)
-  return resolve(realAncestor, absolute.slice(ancestor.length))
+  return resolve(realAncestor, relative(ancestor, absolute))
 }
 
 function isInsideWorkspace(path: string, workspaceRoot: string): boolean {
   const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
   const target = resolveForPolicy(path, workspace)
   return target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
+}
+
+/**
+ * Known real OS root directory names.
+ * A path whose first component is NOT in this set (e.g. `/settings`, `/api`) is
+ * almost certainly a URL segment, route path, or code literal — not a filesystem
+ * path that could violate workspace boundaries.
+ */
+const KNOWN_OS_ROOT_DIRS = new Set([
+  // Linux / macOS common roots
+  'Users', 'home', 'root', 'etc', 'var', 'usr', 'opt', 'lib', 'lib64',
+  'bin', 'sbin', 'boot', 'sys', 'proc', 'run', 'srv', 'mnt', 'media',
+  // macOS-specific
+  'private', 'Library', 'System', 'Applications', 'Volumes', 'cores', 'Network',
+  // Other real roots
+  'data', 'snap', 'app', 'tmp',
+])
+
+/**
+ * Returns true only if `candidate` looks like a real filesystem path.
+ *
+ * Filters out false positives that appear inside heredocs or string literals:
+ *   - `//`  (bash comment or protocol-relative URL)
+ *   - `/^\d{12}/`  (regex pattern)
+ *   - `/settings`  (React Router route)
+ *   - `/api/v1`    (URL path)
+ *
+ * The heuristic: the first path component must be a known OS root directory
+ * and must not contain regex/special characters.
+ */
+function looksLikeFilesystemPath(candidate: string): boolean {
+  // Reject trivial: just slashes, empty
+  if (!candidate || /^\/+$/.test(candidate)) return false
+  // Extract first component (the word immediately after the leading /)
+  const inner = candidate.slice(1)
+  const slash2 = inner.indexOf('/')
+  const firstComp = slash2 >= 0 ? inner.slice(0, slash2) : inner
+  // First component must be a clean identifier (no regex meta-chars)
+  if (!/^[A-Za-z0-9._\-~@]+$/.test(firstComp)) return false
+  // Only flag paths whose first component is a real OS root directory
+  return KNOWN_OS_ROOT_DIRS.has(firstComp)
 }
 
 function findWorkspaceViolation(
@@ -167,12 +172,15 @@ function findWorkspaceViolation(
     }
   }
 
-  if (toolName === 'bash') {
+  if (toolName === 'bash' || toolName === 'powershell') {
     const command = String(input['command'] ?? '')
     const absPathPattern = /(?:^|\s|['"])(\/(?:[^\s'"`$;&|()<>]+\/?)+)/g
     let match: RegExpExecArray | null
     while ((match = absPathPattern.exec(command)) !== null) {
       const candidate = match[1]!
+      // Skip anything that doesn't look like a real filesystem path (URL segments,
+      // route strings like /settings, regex patterns like /^\d+/, comments //).
+      if (!looksLikeFilesystemPath(candidate)) continue
       if (
         !(allowTmp && (candidate.startsWith('/tmp/') || candidate.startsWith('/var/tmp/'))) &&
         !candidate.startsWith('/dev/') &&
@@ -196,10 +204,7 @@ function findWorkspaceViolation(
 
 function detectSensitiveBash(input: Record<string, unknown>): string | null {
   const command = String(input['command'] ?? '')
-  for (const { pattern, label } of SENSITIVE_BASH_PATTERNS) {
-    if (pattern.test(command)) return label
-  }
-  return null
+  return detectSensitiveShellCommand(command)
 }
 
 async function applyBeforeToolGuard(
@@ -267,14 +272,18 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       if (violation) return { behavior: 'deny', reason: violation }
     }
 
-    const sensitiveLabel = detectSensitiveBash(record)
-    if (sensitiveLabel || (options.beforeToolCall && permission.sensitive === true && tool.name !== 'bash')) {
+    const sensitiveLabel = tool.name === 'bash' || tool.name === 'powershell'
+      ? detectSensitiveBash(record)
+      : null
+    if (sensitiveLabel || (permission.sensitive === true && tool.name !== 'bash' && tool.name !== 'powershell')) {
       const guard = await applyBeforeToolGuard(
         tool.name,
         record,
         options,
         context,
-        `Tool "${tool.name}" requires approval.`,
+        sensitiveLabel
+          ? `Tool "${tool.name}" requires approval for ${sensitiveLabel}.`
+          : `Tool "${tool.name}" requires approval.`,
       )
       if (guard.behavior !== 'allow') return guard
     }

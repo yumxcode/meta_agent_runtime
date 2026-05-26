@@ -316,6 +316,7 @@ export async function listGenericCampaigns(): Promise<GenericCampaignSummary[]> 
   try {
     entries = await fs.readdir(CAMPAIGNS_DIR)
   } catch {
+    // Campaigns directory does not exist yet — return empty list.
     return []
   }
 

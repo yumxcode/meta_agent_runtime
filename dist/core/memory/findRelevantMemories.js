@@ -4,12 +4,12 @@
  * Architecture mirrors CC's findRelevantMemories.ts:
  *   1. Scan all topic files and extract frontmatter headers
  *   2. Split files into always-relevant (user + feedback) and candidates
- *   3. Select candidates via Haiku side-call (when Anthropic client provided)
+ *   3. Select candidates via flash model side-call (when client provided)
  *      or keyword match (fallback)
  *   4. Load and return file content for selected files
  *
  * Differences from CC:
- *   - Uses Haiku (not Sonnet) for relevance — task is simpler, cost lower
+ *   - Uses flash model (not primary model) for relevance — task is simpler, cost lower
  *   - No alreadySurfaced dedup (all injected via system prompt, not per-turn)
  *   - campaign_lessons type: only loaded in campaign mode by default
  *   - robot_lessons type: only loaded in robotics mode by default
@@ -185,7 +185,7 @@ function keywordScore(header, queryTokens) {
     return score;
 }
 // ─────────────────────────────────────────────────────────────────────────────
-// Haiku-based selection (preferred)
+// Flash model selection (preferred)
 // ─────────────────────────────────────────────────────────────────────────────
 const RELEVANCE_MODEL = 'deepseek-v4-flash';
 const RELEVANCE_SYSTEM_PROMPT = `\
@@ -205,14 +205,14 @@ Rules:
 - If no memories would clearly help, return {"selected": []}.
 
 Output format: {"selected": ["filename1.md", "filename2.md"]}`;
-async function selectByHaiku(query, candidates, client) {
+async function selectByFlashModel(query, candidates, client) {
     if (candidates.length === 0)
         return [];
     const manifest = candidates
         .map(h => `${h.filename}: [${h.type}] ${h.name} — ${h.description}`)
         .join('\n');
     try {
-        // 3 s timeout: this is a pre-turn side-call; a hung Haiku request would
+        // 3 s timeout: this is a pre-turn side-call; a hung flash model request would
         // stall every submit() for up to 600 s (SDK default).  On timeout the
         // catch block falls through to keyword-based selection (Fix #5).
         const msg = await withTimeout(client.messages.create({
@@ -273,7 +273,7 @@ function _passesFilters(header, opts) {
  *
  * Always loads: user + feedback topic files (small, always applicable).
  * Loads from candidates: domain_knowledge, campaign_lessons, robot_lessons, reference files
- *   selected by Haiku side-call (when client provided) or keyword match.
+ *   selected by flash model side-call (when client provided) or keyword match.
  *
  * Applies scope and mode filters before selection so out-of-scope memories
  * cannot pollute a long-running task's context.
@@ -295,9 +295,9 @@ export async function findRelevantMemories(opts) {
     // Select candidates
     let selectedFilenames;
     if (client && query.trim() && candidateHeaders.length > 0) {
-        // Preferred: Haiku side-call
-        selectedFilenames = await selectByHaiku(query, candidateHeaders, client);
-        // Fallback to keyword match if Haiku returned nothing (handles empty query / network failure)
+        // Preferred: flash model side-call
+        selectedFilenames = await selectByFlashModel(query, candidateHeaders, client);
+        // Fallback to keyword match if flash model returned nothing (handles empty query / network failure)
         if (selectedFilenames.length === 0 && query.trim()) {
             selectedFilenames = selectByKeyword(query, candidateHeaders, maxCandidates);
         }

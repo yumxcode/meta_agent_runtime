@@ -1,5 +1,5 @@
 import { existsSync, realpathSync } from 'fs';
-import { dirname, isAbsolute, resolve, sep } from 'path';
+import { dirname, isAbsolute, relative, resolve, sep } from 'path';
 function findExistingAncestor(path) {
     let current = path;
     while (!existsSync(current)) {
@@ -16,7 +16,7 @@ function resolvePathForGuard(path, workspaceRoot) {
         return realpathSync(absolute);
     const ancestor = findExistingAncestor(absolute);
     const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor);
-    return resolve(realAncestor, absolute.slice(ancestor.length));
+    return resolve(realAncestor, relative(ancestor, absolute));
 }
 export function assertInsideWorkspace(path, workspaceRoot = process.cwd()) {
     const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot);

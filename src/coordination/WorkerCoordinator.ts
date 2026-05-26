@@ -202,6 +202,8 @@ export class WorkerCoordinator {
         ...partial,
       }
     } catch {
+      // Evaluation handler threw; null signals the coordinator to skip this
+      // design point so other workers can continue processing the queue.
       return null
     }
   }

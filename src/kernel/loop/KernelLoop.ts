@@ -51,6 +51,7 @@ import type { FileStateCache } from '../session/FileStateCache.js'
 export type LoopTerminationReason =
   | 'success'
   | 'max_turns'
+  | 'no_progress'
   | 'blocking_limit'
   | 'aborted_streaming'
   | 'aborted_tools'
@@ -143,6 +144,18 @@ function finaliseAccumulator(acc: StreamAccumulator): {
   }
 }
 
+const NO_PROGRESS_REPEAT_LIMIT = 3
+
+function stableStringify(value: unknown): string {
+  if (value === null || typeof value !== 'object') {
+    const encoded = JSON.stringify(value)
+    return encoded === undefined ? String(value) : encoded
+  }
+  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
+}
+
 // ── Main loop ────────────────────────────────────────────────────────────────
 
 export async function* runKernelLoop(
@@ -158,6 +171,8 @@ export async function* runKernelLoop(
   let totalCost = ctx.cumulativeCostUsd
   let allPermissionDenials: PermissionDenial[] = []
   let resultText = ''
+  let lastToolRequestSignature = ''
+  let repeatedToolRequestCount = 0
 
   // Helper: push messages to both mutableMessages and state
   function append(...msgs: KernelMessage[]): void {
@@ -448,14 +463,15 @@ export async function* runKernelLoop(
 
     const lastMsg = assistantMessages[assistantMessages.length - 1]
     const stopReason = lastMsg?.stopReason ?? null
+    const assistantText = assistantMessages
+      .flatMap(m => m.content)
+      .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+      .map(b => b.text)
+      .join('')
 
     // ── Step 14: no-tools path ───────────────────────────────────────────────
     if (toolUseRequests.length === 0) {
-      resultText = assistantMessages
-        .flatMap(m => m.content)
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text)
-        .join('')
+      resultText = assistantText
 
       // 14b: max_output_tokens recovery
       if (isMaxOutputTokensStopReason(stopReason)) {
@@ -481,6 +497,22 @@ export async function* runKernelLoop(
 
       // 14e: normal completion
       return done('success')
+    }
+
+    const toolRequestSignature = toolUseRequests
+      .map(req => `${req.toolName}:${stableStringify(req.input)}`)
+      .join('\n')
+    if (toolRequestSignature === lastToolRequestSignature && assistantText.trim().length === 0) {
+      repeatedToolRequestCount++
+    } else {
+      lastToolRequestSignature = toolRequestSignature
+      repeatedToolRequestCount = 1
+    }
+    if (repeatedToolRequestCount >= NO_PROGRESS_REPEAT_LIMIT) {
+      resultText =
+        `Stopped: the model repeated the same tool request ${repeatedToolRequestCount} times without making progress.`
+      yield { type: 'text_delta', delta: resultText, sessionId }
+      return done('no_progress')
     }
 
     // Emit tool_use events

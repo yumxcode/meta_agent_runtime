@@ -1,0 +1,7 @@
+{
+  "tools": {
+    "write_file":    { "sensitive": false },
+    "edit_file":     { "sensitive": false },
+    "notebook_edit": { "sensitive": false }
+  }
+}

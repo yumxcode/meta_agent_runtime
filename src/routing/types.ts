@@ -42,7 +42,7 @@ export const MODE_WEIGHT: Record<SessionMode, number> = {
 
 export type DetectionConfidence =
   | 'explicit'   // caller set mode directly — no heuristics needed
-  | 'llm'        // Haiku one-shot classification
+  | 'llm'        // flash model one-shot classification
   | 'heuristic'  // keyword/pattern match in the prompt
   | 'env'        // active campaigns on disk → minimum agentic
   | 'default'    // no signals found; fell back to AGENTIC

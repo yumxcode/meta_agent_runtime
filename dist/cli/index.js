@@ -18,6 +18,7 @@
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
  *   -j, --json              Output raw JSON events (for piping)
+ *   -y, --yes               Auto-approve sensitive tools in trusted scripts
  *   -v, --version           Show version
  *   -h, --help              Show help
  */
@@ -31,6 +32,8 @@ import { HardwareProfile } from '../robotics/HardwareProfile.js';
 import { ExperienceStore } from '../robotics/ExperienceStore.js';
 import { TEAM_PLANNER_SYSTEM, buildTeamPlannerUserMessage, parseTeamPlannerPlan, } from '../robotics/team/TeamPlanner.js';
 import { SessionStore } from '../core/SessionStore.js';
+import { detectProvider } from '../core/config.js';
+import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveCommandPatterns.js';
 import { resolveTemplate } from './hardwareTemplate.js';
 import { createStandardTools } from '../tools/index.js';
 // ── Version ───────────────────────────────────────────────────────────────────
@@ -80,6 +83,7 @@ ${bold('OPTIONS')}
   -s, --system <text>   Custom system prompt
   -t, --max-turns <n>   Max agentic turns per message (default: unlimited)
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
+  -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
   -j, --json            Output raw JSON events
   -v, --version         Print version
@@ -168,6 +172,7 @@ function parseCliArgs() {
                 system: { type: 'string', short: 's' },
                 'max-turns': { type: 'string', short: 't' },
                 resume: { type: 'string', short: 'r' },
+                yes: { type: 'boolean', short: 'y', default: false },
                 debug: { type: 'boolean', short: 'd', default: false },
                 json: { type: 'boolean', short: 'j', default: false },
                 version: { type: 'boolean', short: 'v', default: false },
@@ -230,6 +235,7 @@ function parseCliArgs() {
         system: parsed.values['system'],
         json: parsed.values['json'],
         debug: parsed.values['debug'],
+        yes: parsed.values['yes'],
         prompt: promptParts.length > 0 ? promptParts.join(' ') : null,
         maxTurns,
         resume: parsed.values['resume'],
@@ -285,6 +291,25 @@ function resolveExplicitApiKey(opts) {
     if (!opts.apiKey)
         return undefined;
     return validateKey(opts.apiKey, '--api-key');
+}
+function assertApiKeyConfigured(opts) {
+    const explicitApiKey = resolveExplicitApiKey(opts);
+    if (explicitApiKey)
+        opts.apiKey = explicitApiKey;
+    const detected = detectProvider({
+        apiKey: explicitApiKey,
+        baseURL: opts.baseUrl,
+        model: opts.model,
+    });
+    if (detected.apiKey)
+        return;
+    console.error(red('Error: API key is required before starting a session.') + '\n' +
+        dim('Set one of these environment variables, or pass --api-key:') + '\n' +
+        `  ${cyan('export DEEPSEEK_API_KEY="sk-..."')} ${dim('(default provider)')}\n` +
+        `  ${cyan('export QWEN_API_KEY="sk-..."')}\n` +
+        `  ${cyan('export ANTHROPIC_API_KEY="sk-..."')}\n` +
+        `  ${cyan('meta-agent --api-key sk-... "your prompt"')}\n`);
+    process.exit(1);
 }
 // ── Workspace helpers ─────────────────────────────────────────────────────────
 /** Prompt the user to confirm or enter a working directory (interactive only) */
@@ -560,27 +585,15 @@ function buildHardwareSystemPrompt(profileText) {
         `**重要：** 本会话仅操作上述硬件，不得假设其他硬件特性。`,
     ].join('\n');
 }
-const SENSITIVE_PATTERNS = [
-    { pattern: /\bpip3?\s+(install|uninstall)\b/i, label: 'pip install/uninstall' },
-    { pattern: /\bconda\s+(install|remove|env\s+remove)\b/i, label: 'conda install/remove' },
-    { pattern: /\bnpm\s+(install|uninstall|publish|ci)\b/i, label: 'npm install/uninstall' },
-    { pattern: /\byarn\s+(add|remove|publish)\b/i, label: 'yarn add/remove' },
-    { pattern: /\bpnpm\s+(install|uninstall|publish|add|remove)\b/i, label: 'pnpm install/remove' },
-    { pattern: /\brm\s+(?:.*\s+)?-[rRf]{1,3}[\s-]/, label: 'recursive/force delete (rm)' },
-    { pattern: /\brm\s+-[rRf]/, label: 'recursive/force delete (rm)' },
-    { pattern: /\bgit\s+push\b/, label: 'git push' },
-    { pattern: /\bgit\s+branch\b.*-[dD]\b/, label: 'git branch delete' },
-    { pattern: /\bgit\s+tag\b.*-[dD]\b/, label: 'git tag delete' },
-    { pattern: /\bgit\s+reset\s+--hard\b/, label: 'git reset --hard' },
-    { pattern: /\bsudo\b/, label: 'sudo' },
-    { pattern: /\bcurl\b.*\|\s*(ba)?sh\b/, label: 'curl pipe to shell' },
-    { pattern: /\bwget\b.*\|\s*(ba)?sh\b/, label: 'wget pipe to shell' },
-    { pattern: /(^|[^>])>\s*[^&\s]/, label: 'shell output redirection' },
-    { pattern: />>\s*[^&\s]/, label: 'shell append redirection' },
-    { pattern: /\btee\s+(?:-[a-zA-Z]+\s+)*[^\s|;&]+/, label: 'tee file write' },
-    { pattern: /\bsed\s+.*\s-i(?:\s|$)/, label: 'sed in-place edit' },
-    { pattern: /\bperl\s+.*\s-i(?:\s|$)/, label: 'perl in-place edit' },
-];
+// ── Sensitive operation guard ─────────────────────────────────────────────────
+//
+// Before executing a bash command that matches any pattern below, the CLI
+// pauses and shows a three-option confirmation dialog:
+//   1. 允许  — proceed
+//   2. 拒绝  — block; model retries with another approach
+//   3. 告诉 AI 怎么做 — user provides alternative instructions; model replans
+//
+// The guard is only active in interactive TTY sessions (never in --json / pipe).
 /**
  * Check if a tool call should trigger the interactive guard.
  * Returns the matched label, or null if no sensitive pattern matched.
@@ -594,13 +607,12 @@ function detectSensitiveOp(toolName, input, workspace) {
         return toolName;
     if (toolName === 'notebook_edit')
         return toolName;
-    if (toolName !== 'bash')
+    if (toolName !== 'bash' && toolName !== 'powershell')
         return null;
     const cmd = String(input['command'] ?? '');
-    for (const { pattern, label } of SENSITIVE_PATTERNS) {
-        if (pattern.test(cmd))
-            return label;
-    }
+    const sensitiveLabel = detectSensitiveShellCommand(cmd);
+    if (sensitiveLabel)
+        return sensitiveLabel;
     // Workspace boundary check: absolute paths that escape the workspace root
     if (workspace) {
         const cwd = input['cwd'];
@@ -667,15 +679,15 @@ async function runTeamWriteGuard(router, toolName, input, workspace) {
     if (issues.length === 0)
         return null;
     const errors = issues.filter((issue) => issue.severity === 'error');
-    const preview = issues.slice(0, 6).map((issue) => `- ${String(issue.severity ?? 'warning')}: ${String(issue.message ?? issue)}`).join('\n');
     if (errors.length > 0) {
+        const preview = errors.slice(0, 6).map((issue) => `- error: ${String(issue.message ?? issue)}`).join('\n');
         return {
             action: 'deny',
             reason: `Team 边界检查阻止了此次写入：\n${preview}\n\n请使用 /team check 查看冲突详情，认领正确的任务，更新模块所有者，或与对应 unit 协调后再继续。`,
         };
     }
-    process.stdout.write(`\n${yellow('⚠')}  ${bold('Team boundary warning')}\n` +
-        `${preview}\n\n`);
+    // Non-fatal warnings are silently dropped — they don't block the operation,
+    // and printing them causes noise for users who aren't actively using team mode.
     return null;
 }
 /**
@@ -763,16 +775,19 @@ rl, initialMessages, getRouter) {
         }
         catch { /* ignore */ }
     }
+    if (opts.yes) {
+        cfg.beforeToolCall = async () => ({ action: 'allow' });
+    }
     // Register interactive tool guard — only in interactive TTY sessions.
     // Uses the REPL's existing readline interface so stdin is never double-owned.
-    if (rl && !opts.json && isTTY) {
+    if (!opts.yes && rl && !opts.json && isTTY) {
         const workspace = opts.workspace;
         cfg.beforeToolCall = async (toolName, input) => {
             const teamGuard = await runTeamWriteGuard(getRouter?.(), toolName, input, workspace);
             if (teamGuard)
                 return teamGuard;
-            const opLabel = toolName === 'bash'
-                ? (detectSensitiveOp(toolName, input, workspace) ?? 'bash command')
+            const opLabel = toolName === 'bash' || toolName === 'powershell'
+                ? (detectSensitiveOp(toolName, input, workspace) ?? 'shell command')
                 : detectSensitiveOp(toolName, input, workspace);
             if (!opLabel)
                 return { action: 'allow' };
@@ -805,53 +820,61 @@ const EXPERIENCE_SUMMARY_SYSTEM = `你是一个精炼知识的助理。
  * Falls back silently if no client is available or the call fails.
  */
 async function streamExperienceSummary(router, entries) {
-    // Prefer the existing side-call client (already has correct timeout/retries).
-    // Fall back to building our own from the provider config.
-    let client = router.getSideCallClient();
-    if (!client) {
-        const { apiKey, baseURL } = router.getProviderConfig();
-        if (!apiKey)
-            return; // no key at all — silently skip
-        client = new (await import('@anthropic-ai/sdk')).default({
-            apiKey,
-            baseURL,
-            timeout: 8_000,
-            maxRetries: 1,
-        });
-    }
-    // Build a concise JSON summary of the entries for the LLM
-    const entrySummaries = entries.map((e, i) => {
-        const inp = e.input;
-        return {
-            index: i + 1,
-            title: inp['title'] ?? '(untitled)',
-            domain: inp['domain'] ?? 'general',
-            success: inp['success'] ?? true,
-            problem: String(inp['problem'] ?? '').slice(0, 200),
-            solution: String(inp['solution'] ?? '').slice(0, 200),
-        };
-    });
-    const userMessage = `新提议的经验条目（共 ${entries.length} 条）：\n\n` +
-        JSON.stringify(entrySummaries, null, 2);
+    // Entire function is wrapped in a single try/catch so NO exception — including
+    // those from getSideCallClient(), getProviderConfig(), dynamic import, or
+    // entries.map() — can escape to the caller and become an unhandled rejection
+    // that kills the process.
     try {
+        // Prefer the existing side-call client (already has correct timeout/retries).
+        // Fall back to building our own from the provider config.
+        let client = router.getSideCallClient();
+        if (!client) {
+            const { apiKey, baseURL } = router.getProviderConfig();
+            if (!apiKey)
+                return; // no key at all — silently skip
+            client = new (await import('@anthropic-ai/sdk')).default({
+                apiKey,
+                baseURL,
+                timeout: 8_000,
+                maxRetries: 1,
+            });
+        }
+        // Build a concise JSON summary of the entries for the LLM
+        const entrySummaries = entries.map((e, i) => {
+            const inp = e.input;
+            return {
+                index: i + 1,
+                title: inp['title'] ?? '(untitled)',
+                domain: inp['domain'] ?? 'general',
+                success: inp['success'] ?? true,
+                problem: String(inp['problem'] ?? '').slice(0, 200),
+                solution: String(inp['solution'] ?? '').slice(0, 200),
+            };
+        });
+        const userMessage = `新提议的经验条目（共 ${entries.length} 条）：\n\n` +
+            JSON.stringify(entrySummaries, null, 2);
         const { flashModel } = router.getProviderConfig();
-        const sideModel = flashModel;
         const stream = await client.messages.stream({
-            model: sideModel,
+            model: flashModel,
             max_tokens: 512,
             system: EXPERIENCE_SUMMARY_SYSTEM,
             messages: [{ role: 'user', content: userMessage }],
         });
-        process.stdout.write(`\n${dim('─── 经验提议摘要 (side-call) ───────────────────────────────────')}\n`);
+        // Buffer output first — only print header/footer if there is actual content.
+        let summaryText = '';
         for await (const event of stream) {
             if (event.type === 'content_block_delta' &&
                 event.delta.type === 'text_delta') {
-                process.stdout.write(event.delta.text);
+                summaryText += event.delta.text;
             }
         }
-        process.stdout.write(`\n${dim('─────────────────────────────────────────────────────────────')}\n\n`);
+        if (summaryText.trim()) {
+            process.stdout.write(`\n${dim('─── 经验提议摘要 (side-call) ───────────────────────────────────')}\n`);
+            process.stdout.write(summaryText);
+            process.stdout.write(`\n${dim('─────────────────────────────────────────────────────────────')}\n\n`);
+        }
     }
-    catch { /* best-effort — side-call failure must never crash the REPL */ }
+    catch { /* best-effort — side-call failure must NEVER crash the REPL */ }
 }
 // ── Stream a single prompt ────────────────────────────────────────────────────
 async function streamPrompt(router, prompt, jsonMode) {
@@ -953,11 +976,11 @@ async function streamPrompt(router, prompt, jsonMode) {
  * Show the last N sessions and let the user choose one to resume.
  * Returns the loaded ConversationMessage[] (empty if user declines).
  */
-async function runSessionPicker(rl) {
-    const sessions = await SessionStore.listSessions(8);
+async function runSessionPicker(rl, workspace) {
+    const sessions = await SessionStore.listSessions(8, { workspace });
     if (sessions.length === 0)
         return null;
-    console.log(`\n${bold('历史会话:')} ${dim('(选择一个以继续上次对话)')}\n`);
+    console.log(`\n${bold('历史会话:')} ${dim('(仅显示当前 workspace，选择一个以继续上次对话)')}\n`);
     sessions.forEach((s, i) => {
         const ago = formatAge(Date.now() - s.lastActivity);
         const preview = s.firstPrompt.slice(0, 60);
@@ -978,7 +1001,7 @@ async function runSessionPicker(rl) {
         return null;
     }
     console.log(green(`✓ 已加载 ${messages.length} 条历史消息，继续上次 ${selected.mode} 模式会话。\n`));
-    return { sessionId: selected.sessionId, messages };
+    return { sessionId: selected.sessionId, messages, mode: selected.mode };
 }
 function formatAge(ms) {
     const s = Math.floor(ms / 1000);
@@ -1178,19 +1201,19 @@ async function buildTeamPlannerSnapshot(controller) {
     };
 }
 async function callTeamPlanner(router, input, snapshot) {
-    let client = router.getSideCallClient();
-    if (!client) {
-        const { apiKey, baseURL } = router.getProviderConfig();
-        if (!apiKey)
-            return null;
-        client = new (await import('@anthropic-ai/sdk')).default({
-            apiKey,
-            baseURL,
-            timeout: 12_000,
-            maxRetries: 1,
-        });
-    }
     try {
+        let client = router.getSideCallClient();
+        if (!client) {
+            const { apiKey, baseURL } = router.getProviderConfig();
+            if (!apiKey)
+                return null;
+            client = new (await import('@anthropic-ai/sdk')).default({
+                apiKey,
+                baseURL,
+                timeout: 12_000,
+                maxRetries: 1,
+            });
+        }
         const { flashModel } = router.getProviderConfig();
         const message = await client.messages.create({
             model: flashModel,
@@ -1205,6 +1228,8 @@ async function callTeamPlanner(router, input, snapshot) {
         return parseTeamPlannerPlan(text);
     }
     catch {
+        // Side-call failure (network error, rate limit, SDK init error) must never
+        // crash the REPL — return null so the caller falls back to no-plan mode.
         return null;
     }
 }
@@ -1817,6 +1842,7 @@ async function runRepl(opts) {
         console.log(`${bold('meta-agent')}  ${dim(`v${VERSION}`)}\n` +
             `Mode: ${cyan(opts.mode === 'auto' ? 'auto-detect' : opts.mode)}` +
             (opts.hardwareId ? `  ${dim('hw:')} ${cyan(opts.hardwareId)}` : '') +
+            (opts.yes ? `  ${yellow('[AUTO-APPROVE]')}` : '') +
             (opts.debug ? `  ${yellow('[DEBUG]')}` : '') +
             `  ${dim('(type /help for commands, Ctrl+D to quit)')}\n`);
         if (opts.debug) {
@@ -1842,26 +1868,44 @@ async function runRepl(opts) {
             // Explicit --resume <id> or --resume last
             let targetId = opts.resume;
             if (targetId === 'last') {
-                const sessions = await SessionStore.listSessions(1);
+                const sessions = await SessionStore.listSessions(1, { workspace: opts.workspace });
                 targetId = sessions[0]?.sessionId ?? '';
             }
             if (targetId) {
-                resumedMessages = await SessionStore.loadHistory(targetId);
+                const meta = await SessionStore.getSession(targetId);
+                if (meta && meta.workspace !== opts.workspace) {
+                    console.log(yellow(`⚠  会话 ${targetId.slice(0, 8)}… 属于其他 workspace，已拒绝恢复。`) + '\n' +
+                        dim(`当前: ${opts.workspace ?? '(unset)'}`) + '\n' +
+                        dim(`会话: ${meta.workspace ?? '(unknown)'}`) + '\n');
+                }
+                else {
+                    resumedMessages = await SessionStore.loadHistory(targetId);
+                    // Restore the mode from the saved session.
+                    if (meta && opts.mode === 'auto' && meta.mode && meta.mode !== 'auto') {
+                        opts.mode = meta.mode;
+                    }
+                }
                 if (resumedMessages.length > 0) {
                     console.log(green(`✓ 已恢复会话 ${targetId.slice(0, 8)}… (${resumedMessages.length} 条历史)\n`));
                 }
-                else {
+                else if (!meta || meta.workspace === opts.workspace) {
                     console.log(yellow(`⚠  找不到会话 ${targetId}，将新建会话。\n`));
                 }
             }
         }
         else {
             // Auto-show session picker if recent sessions exist
-            const sessions = await SessionStore.listSessions(1);
+            const sessions = await SessionStore.listSessions(1, { workspace: opts.workspace });
             if (sessions.length > 0) {
-                const resumed = await runSessionPicker(rl);
-                if (resumed)
+                const resumed = await runSessionPicker(rl, opts.workspace);
+                if (resumed) {
                     resumedMessages = resumed.messages;
+                    // Restore the mode from the saved session so the router starts in the
+                    // correct mode instead of re-detecting it from the first user message.
+                    if (opts.mode === 'auto' && resumed.mode && resumed.mode !== 'auto') {
+                        opts.mode = resumed.mode;
+                    }
+                }
             }
         }
     }
@@ -1886,6 +1930,12 @@ async function runRepl(opts) {
     const seenTeamReminderEvents = new Set();
     let teamReminderInitialized = false;
     let teamReminderRunning = false;
+    // Only show Team 动态 notifications after the user explicitly uses a /team command
+    // in this session. Prevents noise for users with a team.json who aren't using team mode.
+    let teamModeUsed = false;
+    // Guards against showing the hardware-binding prompt more than once per session
+    // (set to true after the first prompt, even if the user skips it).
+    let hardwareBindingPrompted = false;
     let interactiveInputActive = false;
     const setInteractiveActive = (v) => { interactiveInputActive = v; };
     const teamReminderTimer = (!opts.json && isTTY)
@@ -1909,7 +1959,7 @@ async function runRepl(opts) {
                         teamReminderInitialized = true;
                         return;
                     }
-                    if (fresh.length > 0) {
+                    if (fresh.length > 0 && teamModeUsed) {
                         process.stdout.write(`\n${yellow('Team 动态')}\n`);
                         fresh.slice(-5).forEach((event) => {
                             process.stdout.write(`  - ${String(event?.message ?? event)}\n`);
@@ -2014,6 +2064,14 @@ async function runRepl(opts) {
         // Does the chunk leave content buffered in readline (text after last \n)?
         const lastNl = s.lastIndexOf('\n');
         _hasBufferedTail = lastNl >= 0 && lastNl < s.length - 1;
+        // If a paste-flush timer is pending and this looks like a keyboard keystroke
+        // (no newlines, ≤4 bytes — covers ASCII keys, UTF-8 multi-byte chars, arrow
+        // key escape sequences), cancel the timer so we don't flush mid-word.
+        // The flush will happen naturally when the user presses Enter.
+        if (_pasteTimer && !s.includes('\n') && buf.length <= 4) {
+            clearTimeout(_pasteTimer);
+            _pasteTimer = null;
+        }
     });
     rl.on('line', (rawLine) => {
         if (Date.now() < ignoreInputUntil)
@@ -2079,17 +2137,21 @@ async function runRepl(opts) {
         exiting = true;
         if (teamReminderTimer)
             clearInterval(teamReminderTimer);
-        if (!opts.json) {
-            // Remind user if there are uncommitted experience entries
-            const pending = router.getPendingExperiences();
-            const pendingCount = pending?.count ?? 0;
-            if (pendingCount > 0) {
-                console.log(`\n${yellow(`⏸  ${pendingCount} 条经验待审核`)} — ` +
-                    `${dim('下次在同一项目启动 robotics 模式后，可用 /experience review 继续审核。')}\n`);
-            }
-            console.log(`\n${dim('Goodbye.')}\n`);
-        }
         void (async () => {
+            try {
+                if (!opts.json) {
+                    // Show LLM-guided experience summary at session end (not per-turn).
+                    const pending = router.getPendingExperiences();
+                    const pendingCount = pending?.count ?? 0;
+                    if (pendingCount > 0 && pending) {
+                        await streamExperienceSummary(router, [...pending.list()]);
+                        console.log(`${yellow(`⏸  ${pendingCount} 条经验待审核`)} — ` +
+                            `${dim('下次在同一项目启动 robotics 模式后，可用 /experience review 继续审核。')}\n`);
+                    }
+                    console.log(`\n${dim('Goodbye.')}\n`);
+                }
+            }
+            catch { /* best-effort — close-path errors must not block process exit */ }
             try {
                 await router.dispose();
             }
@@ -2193,12 +2255,12 @@ async function runRepl(opts) {
                     const sessionsSub = input.split(/\s+/).slice(1).join(' ').toLowerCase().trim();
                     if (sessionsSub === 'clear') {
                         // ── /sessions clear — delete sessions ───────────────────────────
-                        const sessions = await SessionStore.listSessions(50);
+                        const sessions = await SessionStore.listSessions(50, { workspace: opts.workspace });
                         if (sessions.length === 0) {
-                            console.log(dim('\n暂无历史会话。\n'));
+                            console.log(dim('\n当前 workspace 暂无历史会话。\n'));
                             break;
                         }
-                        console.log(`\n${bold('选择要删除的会话:')} ${dim('(输入序号删除，all 删除全部，回车取消)')}\n`);
+                        console.log(`\n${bold('选择要删除的会话:')} ${dim('(仅当前 workspace；输入序号删除，all 删除全部，回车取消)')}\n`);
                         sessions.forEach((s, i) => {
                             const ago = formatAge(Date.now() - s.lastActivity);
                             const preview = s.firstPrompt.slice(0, 60);
@@ -2212,9 +2274,9 @@ async function runRepl(opts) {
                             // cancelled
                         }
                         else if (choiceTrimmed === 'all') {
-                            const confirm = await askQuestion(rl, `${yellow('⚠  确认删除全部 ')}${sessions.length}${yellow(' 条历史会话？[y/N] ')}`);
+                            const confirm = await askQuestion(rl, `${yellow('⚠  确认删除当前 workspace 的全部 ')}${sessions.length}${yellow(' 条历史会话？[y/N] ')}`);
                             if (confirm.trim().toLowerCase() === 'y') {
-                                await SessionStore.deleteAllSessions();
+                                await Promise.all(sessions.map(session => SessionStore.deleteSession(session.sessionId)));
                                 console.log(green(`\n✓ 已删除全部 ${sessions.length} 条历史会话。\n`));
                             }
                             else {
@@ -2236,12 +2298,12 @@ async function runRepl(opts) {
                     }
                     else {
                         // ── /sessions — list & resume ────────────────────────────────────
-                        const sessions = await SessionStore.listSessions(8);
+                        const sessions = await SessionStore.listSessions(8, { workspace: opts.workspace });
                         if (sessions.length === 0) {
-                            console.log(dim('\n暂无历史会话。\n'));
+                            console.log(dim('\n当前 workspace 暂无历史会话。\n'));
                         }
                         else {
-                            console.log(`\n${bold('历史会话:')} ${dim('(输入序号加载并继续上次对话)')}\n`);
+                            console.log(`\n${bold('历史会话:')} ${dim('(仅当前 workspace；输入序号加载并继续上次对话)')}\n`);
                             sessions.forEach((s, i) => {
                                 const ago = formatAge(Date.now() - s.lastActivity);
                                 const preview = s.firstPrompt.slice(0, 60);
@@ -2298,6 +2360,7 @@ async function runRepl(opts) {
                         console.log(`\n${dim('已退出 team 入口引导；当前仍是正常 robot mode。再次输入 /team 可重新选择工作。')}\n`);
                         break;
                     }
+                    teamModeUsed = true; // user explicitly entered team mode — enable notifications
                     await handleTeamCommand(input, router, opts, rl, setInteractiveActive);
                     break;
                 }
@@ -2322,16 +2385,17 @@ async function runRepl(opts) {
         // hardware profile before the AI responds — ensuring the first turn already
         // has hardware context in the system prompt.
         // primeMode() is a no-op after the first submit(), so this only fires once.
-        if (opts.mode === 'auto' && !opts.hardwareId && !opts.json && isTTY) {
+        if (opts.mode === 'auto' && !opts.hardwareId && !hardwareBindingPrompted && !opts.json && isTTY) {
             const primed = await router.primeMode(input);
             if (primed === 'robotics') {
+                hardwareBindingPrompted = true;
                 console.log(`\n${c.magenta}robotics${c.reset} 模式已激活。` +
                     `在继续之前，请绑定一个硬件配置。\n`);
                 const hp = new HardwareProfile();
                 const selected = await selectHardwareProfile(hp, opts.workspace, rl);
                 opts.hardwareId = selected.name || undefined;
                 hardwareProfileText = selected.profileText;
-                // Lock mode so the new router skips re-detection (no second Haiku call)
+                // Lock mode so the new router skips re-detection (no second flash model call)
                 opts.mode = 'robotics';
                 router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter);
                 if (opts.hardwareId) {
@@ -2359,18 +2423,23 @@ async function runRepl(opts) {
                 debugDirShown = true;
             }
         }
-        // ── LLM-guided experience review when new entries appear ─────────────────
-        // If the AI proposed new experiences during this turn, fire a side-call to
-        // summarise them and guide the user.  The side-call uses a completely separate
-        // Anthropic client instance — it does NOT touch the main session's message
-        // history (same pattern as compact's side-call).
-        if (!interrupted && !opts.json) {
-            const pending = router.getPendingExperiences();
-            const pendingCountAfter = pending?.count ?? 0;
-            const newCount = pendingCountAfter - pendingCountBefore;
-            if (newCount > 0 && pending) {
-                const newEntries = pending.list().slice(-newCount);
-                await streamExperienceSummary(router, newEntries);
+        // ── Post-turn: hardware binding catch-up ─────────────────────────────────
+        // If primeMode() didn't detect robotics but the AI response upgraded the
+        // mode internally, prompt for hardware here so subsequent turns get context.
+        if (!interrupted && !opts.json && isTTY &&
+            router.mode === 'robotics' && !opts.hardwareId && !hardwareBindingPrompted) {
+            hardwareBindingPrompted = true;
+            console.log(`\n${c.magenta}robotics${c.reset} 模式已激活，请绑定硬件配置以优化后续回复。\n`);
+            const hp = new HardwareProfile();
+            const selected = await selectHardwareProfile(hp, opts.workspace, rl);
+            opts.hardwareId = selected.name || undefined;
+            hardwareProfileText = selected.profileText;
+            if (hardwareProfileText) {
+                opts.mode = 'robotics';
+                router = makeRouter(opts, hardwareProfileText, rl, undefined, getCurrentRouter);
+            }
+            if (opts.hardwareId) {
+                console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定，后续回复将包含硬件上下文。\n`));
             }
         }
         // ── Persist session after each turn ──────────────────────────────────────
@@ -2431,6 +2500,7 @@ async function main() {
     // Sanitize env-var API keys once so detectProvider() receives clean values
     sanitizeEnvKeys();
     const opts = parseCliArgs();
+    assertApiKeyConfigured(opts);
     if (opts.prompt !== null) {
         await runSingleTurn(opts);
     }

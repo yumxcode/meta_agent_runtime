@@ -71,7 +71,7 @@ export declare function buildOutputStyleSection(style?: OutputStyle): SystemProm
 export declare function buildEngineeringStandardsSection(mode: AgentMode): SystemPromptSection;
 export declare function buildToolInvocationSection(mode: AgentMode): SystemPromptSection;
 export declare function buildCampaignKnowledgeSection(mode: AgentMode): SystemPromptSection;
-export declare function buildSummarizeToolResultsSection(): SystemPromptSection;
+export declare function buildSummarizeToolResultsSection(mode?: AgentMode): SystemPromptSection;
 export declare function buildCampaignContextSection(): SystemPromptSection;
 export declare function buildSessionProvenanceSection(rtx: RuntimeContext, sessionStartMs: number): SystemPromptSection;
 export declare function buildPhaseGuidanceSection(): SystemPromptSection;
@@ -94,8 +94,8 @@ export interface DynamicSectionOptions {
      */
     currentQuery?: string;
     /**
-     * Anthropic client for the Haiku memory-relevance side-call.
-     * When provided, topic file selection uses a Haiku one-shot instead of keyword match.
+     * Client for the flash model memory-relevance side-call.
+     * When provided, topic file selection uses a flash model one-shot instead of keyword match.
      * Falls back to keyword match on any error.
      */
     client?: Anthropic;
@@ -165,5 +165,60 @@ export interface DynamicSectionOptions {
  *   D9  session_provenance [memoized, invalidated on new records]
  *   D10 phase_guidance    [uncached]
  */
+export interface VolatileContextOptions {
+    /** Current user query — passed to D1b for per-query memory relevance. */
+    currentQuery?: string;
+    /** Client for flash model memory side-call; falls back to keyword match. */
+    client?: Anthropic;
+    /** Agent mode — scopes D1b memory relevance and enables campaign sections. */
+    mode?: AgentMode;
+    /** Engineering domain — filters domain-scoped memories in D1b. */
+    domain?: string;
+    /** SubAgentBridge — when provided, D11 subagent_notifications is included. */
+    subAgentBridge?: SubAgentBridge;
+    /**
+     * Mode-specific volatile extensions resolved by the caller's SectionRegistry.
+     * Examples for robotics mode:
+     *   buildR2Section(store)               — experience_index
+     *   buildR3Section(bridge, git, state)  — subagent_tasks
+     *   buildR5Section(state, resumedAt)    — progress_notes
+     *   buildTeamSection(store, watcher)    — team_status
+     */
+    volatileExtensions?: SystemPromptSection[];
+    /** RuntimeContext — required for D9 session_provenance in campaign mode. */
+    rtx?: RuntimeContext;
+    /** Session start timestamp — required for D9 in campaign mode. */
+    sessionStartMs?: number;
+}
+/**
+ * Build the volatile context sections that must be injected as a user message
+ * prefix rather than into the system message.
+ *
+ * Resolve via the caller's SectionRegistry, then format with formatVolatileContext().
+ *
+ * Usage:
+ *   const volatileSections = buildVolatileContextSections({ currentQuery: prompt, ... })
+ *   const resolved = await sectionRegistry.resolve(volatileSections)
+ *   const prefix = formatVolatileContext(volatileSections, resolved)
+ *   const effectivePrompt = prefix ? `${prefix}\n\n---\n\n${prompt}` : prompt
+ */
+export declare function buildVolatileContextSections(opts: VolatileContextOptions): SystemPromptSection[];
+/**
+ * Format resolved volatile section content as an XML-tagged user message prefix.
+ *
+ * Returns null when no sections produced content (no prefix to prepend).
+ *
+ * Output format:
+ *   <context>
+ *   <memory>
+ *   ...
+ *   </memory>
+ *
+ *   <subagent_status>
+ *   ...
+ *   </subagent_status>
+ *   </context>
+ */
+export declare function formatVolatileContext(sections: SystemPromptSection[], resolved: (string | null)[]): string | null;
 export declare function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptSection[];
 //# sourceMappingURL=dynamicPrompt.d.ts.map

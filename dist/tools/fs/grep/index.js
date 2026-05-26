@@ -3,6 +3,7 @@ import { readdir, readFile, stat } from 'fs/promises';
 import { join } from 'path';
 import { promisify } from 'util';
 import { dynamicDescription } from '../../util.js';
+import { assertInsideWorkspace } from '../workspaceGuard.js';
 const execFileAsync = promisify(execFile);
 let _rgAvailable = null;
 const FALLBACK_MAX_FILES = 5_000;
@@ -37,7 +38,7 @@ export async function createGrepTool() {
             type: 'object',
             properties: {
                 pattern: { type: 'string', description: 'Regular expression pattern' },
-                path: { type: 'string', description: 'File or directory to search. Default: cwd' },
+                path: { type: 'string', description: 'File or directory to search. Default: workspace root' },
                 glob: { type: 'string', description: 'Glob filter (e.g. "*.ts")' },
                 output_mode: { type: 'string', enum: ['content', 'files_with_matches', 'count'], description: 'Default: files_with_matches' },
                 context: { type: 'number', description: 'Lines of context around matches' },
@@ -49,11 +50,15 @@ export async function createGrepTool() {
         },
         async call(input, _ctx) {
             const pattern = input['pattern'];
-            const searchPath = input['path'] ?? process.cwd();
+            const workspaceRoot = _ctx.workspaceRoot ?? process.cwd();
+            const searchPath = input['path'] ?? workspaceRoot;
             const outputMode = input['output_mode'] ?? 'files_with_matches';
             const headLimit = typeof input['head_limit'] === 'number' ? input['head_limit'] : 250;
             if (!pattern)
                 return { content: 'Error: pattern is required', isError: true };
+            const workspaceError = assertInsideWorkspace(searchPath, workspaceRoot);
+            if (workspaceError)
+                return { content: workspaceError, isError: true };
             if (await isRgAvailable()) {
                 try {
                     const args = ['--no-heading'];

@@ -270,7 +270,10 @@ export function buildLanguageSection(language?: string): SystemPromptSection {
 
 export function buildCurrentModeSection(mode: AgentMode): SystemPromptSection {
   const modeDescriptions: Record<AgentMode, string> = {
-    agentic:  'AGENTIC — 允许多轮工具调用；不得启动或推进 campaign。',
+    // Agentic：说明多轮工具调用已启用即可。
+    // "不得启动 campaign" 是多余的负面约束——campaign 工具根本没有注册，
+    // 模型调用不了，该句只是浪费 token。
+    agentic:  'AGENTIC — 多轮工具调用已启用。',
     campaign: 'CAMPAIGN — 完整多步骤 campaign 工作流已激活；按指示使用 campaign 和仿真工具。',
     robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置、Git 工作区及子 Agent 编排已激活。优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
   }
@@ -526,14 +529,38 @@ across iterations signals that the design space is not yet fully explored.`
 // 汉化，强制性语言（MUST / 此要求强制执行）保留，确保模型不会跳过记录步骤。
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function buildSummarizeToolResultsSection(): SystemPromptSection {
+export function buildSummarizeToolResultsSection(mode: AgentMode = 'agentic'): SystemPromptSection {
   return systemPromptSection('summarize_tool_results', () => {
+    // 关键结果的判定条件因模式而异：
+    //   campaign — 有 V&V 状态（⚠/✗）和溯源 ID，需全部标注
+    //   agentic  — 有溯源 ID，无 V&V 状态
+    //   robotics — 无溯源 ID，无 V&V；只需追踪数值结果用于后续步骤
+    if (mode === 'campaign') {
+      return (
+        `## 中间结果追踪\n\n` +
+        `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
+        `以下情况的结果视为"关键结果"：` +
+        `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
+        `始终包含数值、单位和溯源 ID。` +
+        `此要求强制执行——不得推迟到后续轮次再记录。`
+      )
+    }
+    if (mode === 'agentic') {
+      return (
+        `## 中间结果追踪\n\n` +
+        `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
+        `以下情况的结果视为"关键结果"：` +
+        `（a）用于后续计算，（b）将出现在最终报告中。` +
+        `结果含溯源 ID 时须一并标注。` +
+        `此要求强制执行——不得推迟到后续轮次再记录。`
+      )
+    }
+    // robotics
     return (
       `## 中间结果追踪\n\n` +
       `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
       `以下情况的结果视为"关键结果"：` +
-      `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
-      `始终包含数值、单位和溯源 ID。` +
+      `（a）用于后续步骤，（b）将出现在最终报告中。` +
       `此要求强制执行——不得推迟到后续轮次再记录。`
     )
   })
@@ -607,6 +634,8 @@ export function buildSessionProvenanceSection(
         `\`find_duplicate_computation\` 重复检查`
       )
     } catch {
+      // Provenance listing is advisory; any error (missing store, corrupt record)
+      // silently skips the section rather than crashing the prompt assembly.
       return null
     }
   })
@@ -691,6 +720,8 @@ export function buildPhaseGuidanceSection(): SystemPromptSection {
         }
         return `## Campaign 阶段指导\n\n${guidanceLines.join('\n\n')}`
       } catch {
+        // Phase guidance is advisory; any error (plugin crash, store unavailable)
+        // silently omits the section rather than breaking the prompt assembly.
         return null
       }
     },
@@ -817,8 +848,8 @@ export interface DynamicSectionOptions {
    */
   currentQuery?: string
   /**
-   * Anthropic client for the Haiku memory-relevance side-call.
-   * When provided, topic file selection uses a Haiku one-shot instead of keyword match.
+   * Client for the flash model memory-relevance side-call.
+   * When provided, topic file selection uses a flash model one-shot instead of keyword match.
    * Falls back to keyword match on any error.
    */
   client?: Anthropic
@@ -889,6 +920,156 @@ export interface DynamicSectionOptions {
  *   D9  session_provenance [memoized, invalidated on new records]
  *   D10 phase_guidance    [uncached]
  */
+// ─────────────────────────────────────────────────────────────────────────────
+// Volatile context sections — injected as a user message prefix, NOT into
+// the system message.
+//
+// Background: DeepSeek uses automatic prefix-match KV caching.  The full token
+// sequence is [system_msg][conv_history][current_user_msg].  If the system
+// message changes on any turn, the cache prefix collapses to zero and ALL
+// conversation history loses its cached KV state — not just the system tokens.
+//
+// Solution: keep the system message frozen (only stable memoized sections) and
+// inject volatile per-turn context into the user message as XML-tagged blocks:
+//
+//   <context>
+//   <memory>...</memory>
+//   <subagent_status>...</subagent_status>
+//   ...
+//   </context>
+//
+//   ---
+//
+//   {actual user message}
+//
+// Sections returned (resolved via the caller's SectionRegistry):
+//   D1b  memory_content        [uncached] — per-query recalled memories
+//   Rx   volatileExtensions    [caller-managed] — mode-specific volatile sections
+//                               (e.g. R2 experience_index, R3 subagent_tasks,
+//                                R5 progress_notes, team section)
+//   D11  subagent_notifications [uncached] — pending sub-agent completions
+//   D8   campaign_context      [uncached] — campaign mode only
+//   D9   session_provenance    [memoized/invalidated] — campaign mode only
+//   D10  phase_guidance        [uncached] — campaign mode only
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface VolatileContextOptions {
+  /** Current user query — passed to D1b for per-query memory relevance. */
+  currentQuery?: string
+  /** Client for flash model memory side-call; falls back to keyword match. */
+  client?: Anthropic
+  /** Agent mode — scopes D1b memory relevance and enables campaign sections. */
+  mode?: AgentMode
+  /** Engineering domain — filters domain-scoped memories in D1b. */
+  domain?: string
+  /** SubAgentBridge — when provided, D11 subagent_notifications is included. */
+  subAgentBridge?: SubAgentBridge
+  /**
+   * Mode-specific volatile extensions resolved by the caller's SectionRegistry.
+   * Examples for robotics mode:
+   *   buildR2Section(store)               — experience_index
+   *   buildR3Section(bridge, git, state)  — subagent_tasks
+   *   buildR5Section(state, resumedAt)    — progress_notes
+   *   buildTeamSection(store, watcher)    — team_status
+   */
+  volatileExtensions?: SystemPromptSection[]
+  /** RuntimeContext — required for D9 session_provenance in campaign mode. */
+  rtx?: RuntimeContext
+  /** Session start timestamp — required for D9 in campaign mode. */
+  sessionStartMs?: number
+}
+
+/**
+ * Build the volatile context sections that must be injected as a user message
+ * prefix rather than into the system message.
+ *
+ * Resolve via the caller's SectionRegistry, then format with formatVolatileContext().
+ *
+ * Usage:
+ *   const volatileSections = buildVolatileContextSections({ currentQuery: prompt, ... })
+ *   const resolved = await sectionRegistry.resolve(volatileSections)
+ *   const prefix = formatVolatileContext(volatileSections, resolved)
+ *   const effectivePrompt = prefix ? `${prefix}\n\n---\n\n${prompt}` : prompt
+ */
+export function buildVolatileContextSections(opts: VolatileContextOptions): SystemPromptSection[] {
+  const sections: SystemPromptSection[] = [
+    // D1b — per-query memory recall (always first so the model has memory context
+    // before reading mode-specific state)
+    buildMemoryContentSection(
+      opts.currentQuery ?? '',
+      opts.client,
+      opts.mode,
+      opts.domain,
+    ),
+  ]
+
+  // Rx — caller-provided mode-specific volatile sections (R2, R3, R5, team, etc.)
+  if (opts.volatileExtensions) {
+    sections.push(...opts.volatileExtensions)
+  }
+
+  // D11 — sub-agent completion/failure notifications
+  if (opts.subAgentBridge) {
+    sections.push(buildSubAgentNotificationsSection(opts.subAgentBridge))
+  }
+
+  // Campaign assembly — D8/D9/D10 (campaign mode only)
+  if (opts.mode === 'campaign') {
+    sections.push(buildCampaignContextSection())
+    if (opts.rtx && opts.sessionStartMs !== undefined) {
+      sections.push(buildSessionProvenanceSection(opts.rtx, opts.sessionStartMs))
+    }
+    sections.push(buildPhaseGuidanceSection())
+  }
+
+  return sections
+}
+
+/** Maps internal section names to the XML tag used in the user message prefix. */
+const VOLATILE_SECTION_TAGS: Record<string, string> = {
+  memory_content:         'memory',
+  experience_index:       'experience_index',
+  robotics_subagents:     'subagent_status',
+  robotics_progress:      'progress',
+  robotics_team_mode:     'team_status',
+  team_context_boundary:  'context_boundary',
+  subagent_notifications: 'notifications',
+  campaign_context:       'campaign_context',
+  session_provenance:     'session_provenance',
+  phase_guidance:         'phase_guidance',
+}
+
+/**
+ * Format resolved volatile section content as an XML-tagged user message prefix.
+ *
+ * Returns null when no sections produced content (no prefix to prepend).
+ *
+ * Output format:
+ *   <context>
+ *   <memory>
+ *   ...
+ *   </memory>
+ *
+ *   <subagent_status>
+ *   ...
+ *   </subagent_status>
+ *   </context>
+ */
+export function formatVolatileContext(
+  sections: SystemPromptSection[],
+  resolved: (string | null)[],
+): string | null {
+  const blocks: string[] = []
+  for (let i = 0; i < sections.length; i++) {
+    const content = resolved[i]
+    if (!content) continue
+    const tag = VOLATILE_SECTION_TAGS[sections[i].name] ?? sections[i].name
+    blocks.push(`<${tag}>\n${content.trim()}\n</${tag}>`)
+  }
+  if (blocks.length === 0) return null
+  return `<context>\n${blocks.join('\n\n')}\n</context>`
+}
+
 export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptSection[] {
   const effectiveProjectDir = opts.projectDir ?? process.cwd()
 
@@ -901,40 +1082,27 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     // D0: Task Contract — goal anchor immediately after project directives so the
     // model sees original intent before any volatile sections.
     ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),
-    buildMemoryContentSection(opts.currentQuery ?? '', opts.client, opts.mode, opts.domain),
+    // NOTE: D1b (memory_content) has been moved to buildVolatileContextSections().
+    // It must NOT be in the system message — DeepSeek KV cache requires the
+    // system message to be byte-identical across turns to get prefix cache hits.
     buildEnvInfoSection(opts.sessionId, opts.sessionStartMs),
     buildLanguageSection(opts.language),
     buildCurrentModeSection(opts.mode),
     buildEngineeringStandardsSection(opts.mode),
     buildCampaignKnowledgeSection(opts.mode),
     buildToolInvocationSection(opts.mode),
-    // Rx: mode-specific extensions — injected here so they appear after the
+    // Rx: mode-specific STABLE extensions — injected here so they appear after the
     // shared tool protocol but before infrastructure sections (MCP, output style).
-    // Resolved by the caller's SectionRegistry alongside all other sections.
+    // Only pass memoized sections here; volatile mode sections go to modeExtensions
+    // in buildVolatileContextSections() instead.
     ...(opts.modeExtensions ?? []),
     buildMcpInstructionsSection(opts.mcpServers),
     buildOutputStyleSection(opts.outputStyle),
-    buildSummarizeToolResultsSection(),
-    // D11: sub-agent notifications — always injected when a bridge is present so
-    // the parent agent sees completed sub-tasks on the very next turn after they
-    // finish, regardless of session mode.
-    ...(opts.subAgentBridge
-      ? [buildSubAgentNotificationsSection(opts.subAgentBridge)]
-      : []),
+    buildSummarizeToolResultsSection(opts.mode),
+    // NOTE: D11 (subagent_notifications) has been moved to buildVolatileContextSections().
+    // NOTE: D8/D9/D10 (campaign_context/session_provenance/phase_guidance) have been
+    // moved to buildVolatileContextSections() — campaign state changes every few seconds.
   ]
 
-  // Campaign assembly is only needed in campaign mode.
-  // robotics / agentic / direct modes skip D8-D10.
-  if (opts.mode !== 'campaign') return base
-
-  // Campaign Assembly — only in campaign mode
-  const campaignAssembly: SystemPromptSection[] = [
-    buildCampaignContextSection(),
-    ...(opts.rtx
-      ? [buildSessionProvenanceSection(opts.rtx, opts.sessionStartMs)]
-      : []),
-    buildPhaseGuidanceSection(),
-  ]
-
-  return [...base, ...campaignAssembly]
+  return base
 }

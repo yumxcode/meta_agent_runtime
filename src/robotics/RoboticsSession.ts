@@ -12,7 +12,7 @@
  *     └─ sectionRegistry: SectionRegistry ← R1-R5 dynamic prompt sections
  *
  * On every submit():
- *   1. First call only: classify agent mode (single vs multi) via Haiku side-call.
+ *   1. First call only: classify agent mode (single vs multi) via flash model side-call.
  *      After classification, invalidate R1 cache so it re-renders with the correct
  *      mode, then gets memoized for all subsequent turns.
  *   2. Resolve R1-R5 sections → combined string
@@ -55,7 +55,11 @@ import { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section } from './dynamicSections.js'
-import { buildDynamicSections } from '../core/dynamicPrompt.js'
+import {
+  buildDynamicSections,
+  buildVolatileContextSections,
+  formatVolatileContext,
+} from '../core/dynamicPrompt.js'
 import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
@@ -84,9 +88,9 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
    *
    * - 'single' — disable sub-agent dispatching; main agent handles everything.
    * - 'multi'  — full multi-agent orchestration (experiment_dispatch, paper_search, git).
-   * - 'auto'   — (default) classify via Haiku on first submit() using task context.
+   * - 'auto'   — (default) classify via flash model on first submit() using task context.
    *
-   * When set explicitly, no Haiku side-call is made.
+   * When set explicitly, no flash model side-call is made.
    * Persisted to project state; resumed sessions inherit the stored mode unless
    * an explicit override is provided here.
    */
@@ -130,6 +134,13 @@ export class RoboticsSession {
   /** #11: Guard against concurrent submit() calls on the same RoboticsSession. */
   private _submitInFlight = false
   /**
+   * Last assembled stable system prompt (memoized sections only).
+   * Used to deduplicate setAppendSystemPrompt() calls across turns so that
+   * messages[0] stays byte-identical when only volatile context changed,
+   * preserving the DeepSeek KV cache prefix across conversation turns.
+   */
+  private _lastStablePrompt: string | null = null
+  /**
    * Plan B context boundary — set once after task claim when the session has prior history.
    * Injected as the first section in _getRoboticsExtensions() to anchor the AI's perception
    * of where this task starts.
@@ -162,7 +173,7 @@ export class RoboticsSession {
     this.inner = new AgenticSession({
       ...config,
       sessionId:    this.sessionId,           // ← align inner UUID with outer
-      systemPrompt: buildStaticSystemPrompt(), // base static context (S1-S6)
+      systemPrompt: buildStaticSystemPrompt('robotics'), // base static context (S1-S6, robotics-trimmed)
       robot:        undefined,                 // not a MetaAgentConfig field
       projectDir:   this.projectDir,
       agentMode:    undefined,
@@ -410,25 +421,49 @@ export class RoboticsSession {
       await this._classifyAgentMode(prompt)
     }
 
-    // Build the full dynamic prompt through the unified pipeline (D1c-D11 + R1-R5).
-    // R-sections are injected as modeExtensions after D4c, keeping core/ free of
-    // robotics/ dependencies.  Volatile sections recompute each turn; memoized ones
-    // are served from the SectionRegistry cache.
-    const allSections = buildDynamicSections({
+    // ── Stable system prompt (memoized sections) ──────────────────────────────
+    // Only R1 (domain identity), R4 (hardware profile), W1 (workflow phase if
+    // present), and the team section go here — all are memoized and change at
+    // most once per session (on mode classification, hardware write, workflow
+    // advance, or team operation).  Keeping these sections stable is what lets
+    // DeepSeek cache the entire conversation history prefix across turns.
+    const stableSections = buildDynamicSections({
       mode:           'robotics',
-      modeExtensions: this._getRoboticsExtensions(),
+      modeExtensions: this._getStableRoboticsExtensions(),
       sessionId:      this.sessionId,
       sessionStartMs: this._sessionStartMs,
-      currentQuery:   prompt,
-      subAgentBridge: this.bridge,
       projectDir:     this.projectDir,
+      // currentQuery / subAgentBridge intentionally omitted — those drive
+      // D1b and D11 which are now in the volatile user prefix below.
     })
-    const roboticsPrompt = await this.sectionRegistry.resolveToString(allSections)
-    this._lastSystemPrompt = roboticsPrompt
-    this.inner.setAppendSystemPrompt(roboticsPrompt)
+    const stablePrompt = await this.sectionRegistry.resolveToString(stableSections)
+    this._lastSystemPrompt = stablePrompt
+
+    // Only update inner session's system message when content actually changed.
+    if (stablePrompt !== this._lastStablePrompt) {
+      this.inner.setAppendSystemPrompt(stablePrompt)
+      this._lastStablePrompt = stablePrompt
+    }
+
+    // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
+    // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
+    // team_context_boundary, D1b (memory), and D11 (notifications) are resolved
+    // here and prepended to the user message as XML-tagged context blocks.
+    const volatileSections = buildVolatileContextSections({
+      currentQuery:       prompt,
+      mode:               'robotics',
+      subAgentBridge:     this.bridge,
+      volatileExtensions: this._getVolatileRoboticsExtensions(),
+    })
+    const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
+    const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
+
+    const effectivePrompt = volatilePrefix
+      ? `${volatilePrefix}\n\n---\n\n${prompt}`
+      : prompt
 
     try {
-      yield* this.inner.submit(prompt)
+      yield* this.inner.submit(effectivePrompt)
       // Touch persistence so lastActiveAt is current
       await RoboticsProjectStore.touch(this.projectDir).catch(() => undefined)
     } finally {
@@ -635,28 +670,59 @@ export class RoboticsSession {
   // ── Private ───────────────────────────────────────────────────────────────
 
   /**
-   * Return the robotics-specific sections (R1-R5, + optional W1) to be injected
-   * as modeExtensions into buildDynamicSections().
+   * Stable robotics extensions — injected into the system message via
+   * buildDynamicSections({ modeExtensions }).
    *
-   * D4c (tool_invocation_protocol) is no longer included here — it is emitted by
-   * buildDynamicSections() itself (robotics variant: general rules only, no V&V).
+   * All sections here must be memoized (systemPromptSection) so that the
+   * system message stays byte-identical across turns, preserving the DeepSeek
+   * KV cache prefix.  Sections that change at most once per session (on mode
+   * classification, hardware write, workflow advance, team operations) are
+   * acceptable here — their infrequent invalidations are expected.
+   *
+   * Contents:
+   *   W1  workflow_phase     — memoized, invalidated on workflow_advance
+   *   R1  robotics_domain    — memoized, invalidated on mode classification (once)
+   *   team section           — memoized, invalidated on team operations
+   *   R4  hardware_profile   — memoized, rarely changes
    */
-  private _getRoboticsExtensions() {
+  private _getStableRoboticsExtensions() {
     const sections = [
       buildR1Section(this.robot, () => this._agentMode),
-      buildTeamSection(this.teamStore, this.teamWatcher), // after R1 — team context follows domain identity
-      buildR2Section(this.store),
-      buildR3Section(
-        this.bridge,
-        this.gitMgr,
-        () => this._state,
-      ),
+      buildTeamSection(this.teamStore, this.teamWatcher),
       buildR4Section(this.hwProfile, this.robot),
+    ]
+
+    // W1 goes first when a workflow is loaded (it provides the most critical context)
+    if (this._workflowDef) {
+      const w1 = buildW1Section(this._workflowDef, () => this._workflowState)
+      return [w1, ...sections]
+    }
+
+    return sections
+  }
+
+  /**
+   * Volatile robotics extensions — injected into the user message prefix via
+   * buildVolatileContextSections({ volatileExtensions }).
+   *
+   * These sections change frequently (every turn or on tool calls) and must
+   * stay out of the system message to avoid invalidating the DeepSeek KV cache.
+   *
+   * Contents:
+   *   R2  experience_index      — recomputed each turn (disk read)
+   *   R3  subagent_tasks        — recomputed each turn (bridge + git query)
+   *   R5  progress_notes        — recomputed each turn (state read)
+   *   team_context_boundary     — fixed content once set, but must appear every turn
+   */
+  private _getVolatileRoboticsExtensions() {
+    const sections = [
+      buildR2Section(this.store),
+      buildR3Section(this.bridge, this.gitMgr, () => this._state),
       buildR5Section(() => this._state, this._resumedAt),
     ]
 
-    // Plan B: context boundary — prepend before all other sections so the AI reads it first.
-    // Only included after teamSetContextBoundary() has been called (non-null).
+    // Plan B: context boundary — prepend before other volatile sections so
+    // the model reads the task scope immediately after <context>.
     if (this._teamContextBoundary) {
       const boundary = this._teamContextBoundary
       sections.unshift(DANGEROUS_uncachedSystemPromptSection(
@@ -666,16 +732,19 @@ export class RoboticsSession {
       ))
     }
 
-    // W1 goes first when a workflow is loaded (it provides the most critical context)
-    if (this._workflowDef) {
-      const w1 = buildW1Section(
-        this._workflowDef,
-        () => this._workflowState,
-      )
-      return [w1, ...sections]
-    }
-
     return sections
+  }
+
+  /**
+   * @deprecated Use _getStableRoboticsExtensions() + _getVolatileRoboticsExtensions()
+   * to separate system-message sections from user-prefix sections.
+   * Kept for backward compatibility; returns all sections combined.
+   */
+  private _getRoboticsExtensions() {
+    return [
+      ...this._getStableRoboticsExtensions(),
+      ...this._getVolatileRoboticsExtensions(),
+    ]
   }
 
   // ── Agent mode classification ─────────────────────────────────────────────
@@ -683,7 +752,7 @@ export class RoboticsSession {
   /**
    * Classify whether this session should use single-agent or multi-agent mode.
    *
-   * Uses a one-shot Haiku call (~300–500 ms, ~$0.00012) with:
+   * Uses a one-shot flash model call (~300–500 ms, ~$0.00012) with:
    *   - The user's first prompt
    *   - Robot name (if known)
    *   - AGENT.md content (if present, from D1c)

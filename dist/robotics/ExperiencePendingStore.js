@@ -24,9 +24,10 @@ const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pendi
 export class ExperiencePendingStore {
     _pending = [];
     _filePath;
-    constructor(projectDir) {
+    _persistTail = Promise.resolve();
+    constructor(projectDir, root = PENDING_ROOT) {
         this._filePath = projectDir
-            ? join(PENDING_ROOT, `${createHash('sha256').update(projectDir).digest('hex').slice(0, 16)}.json`)
+            ? join(root, `${createHash('sha256').update(projectDir).digest('hex').slice(0, 16)}.json`)
             : null;
     }
     /** Load pending entries persisted for this project, if any. */
@@ -78,6 +79,10 @@ export class ExperiencePendingStore {
         this._pending.length = 0;
         this._persistSoon();
     }
+    /** Wait for queued persistence writes to drain. Primarily useful in tests and graceful shutdown. */
+    async flush() {
+        await this._persistTail;
+    }
     /**
      * Commit one pending entry to the ExperienceStore.
      * Returns the committed experience ID, or null on failure.
@@ -115,21 +120,31 @@ export class ExperiencePendingStore {
             return id;
         }
         catch {
+            // ExperienceStore.add threw (validation error, disk failure).
+            // Return null so the caller can surface the failure without crashing.
             return null;
         }
     }
     _persistSoon() {
-        void this._persist().catch(() => { });
+        const snapshot = this._pending.map(item => ({
+            pendingId: item.pendingId,
+            proposedAt: item.proposedAt,
+            input: { ...item.input },
+        }));
+        this._persistTail = this._persistTail
+            .catch(() => { })
+            .then(() => this._persist(snapshot))
+            .catch(() => { });
     }
-    async _persist() {
+    async _persist(snapshot) {
         if (!this._filePath)
             return;
-        if (this._pending.length === 0) {
+        if (snapshot.length === 0) {
             await rm(this._filePath, { force: true }).catch(() => undefined);
             return;
         }
         await mkdir(dirname(this._filePath), { recursive: true });
-        await writeFile(this._filePath, JSON.stringify(this._pending, null, 2), 'utf-8');
+        await writeFile(this._filePath, JSON.stringify(snapshot, null, 2), 'utf-8');
     }
 }
 function isPendingExperience(value) {

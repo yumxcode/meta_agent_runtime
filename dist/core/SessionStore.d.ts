@@ -23,6 +23,9 @@ export interface SessionMeta {
     firstPrompt: string;
     workspace?: string;
 }
+export interface SessionListOptions {
+    workspace?: string;
+}
 export declare class SessionStore {
     /**
      * Append a batch of new messages to the session's history file.
@@ -43,7 +46,11 @@ export declare class SessionStore {
      * Return the session index, newest first.
      * @param limit  Maximum number of entries to return (default: 10).
      */
-    static listSessions(limit?: number): Promise<SessionMeta[]>;
+    static listSessions(limit?: number, options?: SessionListOptions): Promise<SessionMeta[]>;
+    /**
+     * Return one session metadata record by ID, or null if it is not indexed.
+     */
+    static getSession(sessionId: string): Promise<SessionMeta | null>;
     /**
      * Check whether a session directory exists (quick existence check).
      */
