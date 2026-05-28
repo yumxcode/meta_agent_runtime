@@ -1,4 +1,4 @@
-import { DANGEROUS_uncachedSystemPromptSection } from '../core/systemPromptSections.js';
+import { systemPromptSection } from '../core/systemPromptSections.js';
 function formatAge(ms) {
     const diff = Date.now() - ms;
     if (diff < 60_000)
@@ -10,7 +10,7 @@ function formatAge(ms) {
     return `${Math.floor(diff / 86_400_000)}d ago`;
 }
 export function buildW1Section(definition, getState) {
-    return DANGEROUS_uncachedSystemPromptSection('workflow_phase', () => {
+    return systemPromptSection('workflow_phase', () => {
         const state = getState();
         if (!state)
             return null;
@@ -54,6 +54,6 @@ export function buildW1Section(definition, getState) {
             lines.push('', `> **Next**: ${nextPhase.chineseName} (${nextPhase.englishName})`);
         }
         return lines.join('\n');
-    }, 'Gate completion and phase advancement happen mid-session; stale phase info causes incorrect gating decisions.');
+    });
 }
 //# sourceMappingURL=dynamicSection.js.map

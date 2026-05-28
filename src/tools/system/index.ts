@@ -10,6 +10,7 @@ export { listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession } from
 export type { CronJob } from './cronStore.js'
 
 import type { MetaAgentTool } from '../../core/types.js'
+import type { AgentMode } from '../../core/dynamicPrompt.js'
 import { createSleepTool } from './sleep/index.js'
 import { createCronCreateTool } from './cron_create/index.js'
 import { createCronDeleteTool } from './cron_delete/index.js'
@@ -25,6 +26,11 @@ export interface SystemToolsOptions {
    * Defaults to process.cwd() when omitted.
    */
   cwd?: string
+  /**
+   * Session mode — determines which mode-specific skill directory is searched.
+   * Defaults to 'agentic' when omitted.
+   */
+  mode?: AgentMode
   /**
    * Shared plan-mode ref injected into enter_plan_mode / exit_plan_mode.
    * When omitted a private ref is created (tools will still work, but the
@@ -43,7 +49,7 @@ export async function createSystemTools(options: SystemToolsOptions = {}): Promi
     createCronListTool(),
     createEnterPlanModeTool(planModeRef),
     createExitPlanModeTool(planModeRef),
-    createSkillTool(options.cwd),
+    createSkillTool(options.cwd, options.mode ?? 'agentic'),
     createConfigTool(options.cwd),
   ])
 }

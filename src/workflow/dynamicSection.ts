@@ -1,4 +1,4 @@
-import { DANGEROUS_uncachedSystemPromptSection, type SystemPromptSection } from '../core/systemPromptSections.js'
+import { systemPromptSection, type SystemPromptSection } from '../core/systemPromptSections.js'
 import type { WorkflowDefinition, WorkflowState } from './types.js'
 
 function formatAge(ms: number): string {
@@ -13,7 +13,7 @@ export function buildW1Section(
   definition: WorkflowDefinition,
   getState: () => WorkflowState | null,
 ): SystemPromptSection {
-  return DANGEROUS_uncachedSystemPromptSection('workflow_phase', () => {
+  return systemPromptSection('workflow_phase', () => {
     const state = getState()
     if (!state) return null
     const currentPhase = definition.phases.find(p => p.id === state.currentPhaseId)
@@ -53,5 +53,5 @@ export function buildW1Section(
       lines.push('', `> **Next**: ${nextPhase.chineseName} (${nextPhase.englishName})`)
     }
     return lines.join('\n')
-  }, 'Gate completion and phase advancement happen mid-session; stale phase info causes incorrect gating decisions.')
+  })
 }

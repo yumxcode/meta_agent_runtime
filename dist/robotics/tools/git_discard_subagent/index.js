@@ -1,9 +1,9 @@
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
-export function createGitDiscardSubAgentTool(gitMgr, projectDir) {
+export function createGitDiscardSubAgentTool(gitMgr, projectDir, sessionId) {
     return {
         name: 'git_discard_subagent',
         description: 'Discard a sub-agent\'s branch (failed or unwanted experiment code). ' +
-            'The experience written by the sub-agent is PRESERVED in ExperienceStore — knowledge survives even when code is discarded. ' +
+            'Any experience proposed by the sub-agent remains in the pending review queue; approve it with /experience review to preserve the lesson. ' +
             'Use this when an experiment failed and you do not want to merge its code changes.',
         inputSchema: {
             type: 'object',
@@ -27,11 +27,11 @@ export function createGitDiscardSubAgentTool(gitMgr, projectDir) {
             if (!taskId)
                 return { content: 'task_id is required', isError: true };
             try {
-                const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                const state = await RoboticsProjectStore.findBySession(projectDir, sessionId);
                 const branchName = state?.git.subAgentBranches[taskId];
                 const deleteBranch = Boolean(input['delete_branch']);
                 await gitMgr.removeWorktree(taskId, { deleteBranch, branchName });
-                await RoboticsProjectStore.completeSubAgentTask(projectDir, taskId);
+                await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId);
                 return {
                     content: [
                         `🗑 Sub-agent branch discarded (task: ${taskId})`,
@@ -41,8 +41,8 @@ export function createGitDiscardSubAgentTool(gitMgr, projectDir) {
                                 : `Branch \`${branchName}\` preserved (run \`git branch -D ${branchName}\` to remove).`
                             : '',
                         ``,
-                        `⚡ The ExperienceStore entry written by this sub-agent is PRESERVED.`,
-                        `Run \`experience_search\` to find the lessons learned.`,
+                        `⚡ Any experience proposed by this sub-agent remains pending review.`,
+                        `Run \`/experience review\` to approve, edit, or discard the lesson.`,
                     ].filter(Boolean).join('\n'),
                     isError: false,
                 };

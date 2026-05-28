@@ -26,6 +26,7 @@
 import { parseArgs } from 'node:util'
 import * as readline from 'node:readline'
 import { createInterface } from 'node:readline'
+import { once } from 'node:events'
 import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -33,6 +34,8 @@ import { SessionRouter } from '../routing/SessionRouter.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
 import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
+import { PhysicalAnchorPendingStore } from '../robotics/PhysicalAnchorPendingStore.js'
+import { PhysicalAnchorStore } from '../robotics/PhysicalAnchorStore.js'
 import {
   TEAM_PLANNER_SYSTEM,
   buildTeamPlannerUserMessage,
@@ -54,7 +57,8 @@ import { createStandardTools } from '../tools/index.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.1.0'
+const VERSION = '0.2.1'
+const DEFAULT_CLI_MAX_TURNS = 50
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
 
@@ -103,10 +107,11 @@ ${bold('OPTIONS')}
       --model <model>   Model override (default: deepseek-v4-flash)
       --fallback-model <model>  Model to retry with when primary lacks a feature
   -s, --system <text>   Custom system prompt
-  -t, --max-turns <n>   Max agentic turns per message (default: unlimited)
+  -t, --max-turns <n>   Max agentic turns per message (default: 50; use "infinity" for no cap)
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
+      --show-thinking   Show model thinking deltas in the terminal
   -j, --json            Output raw JSON events
   -v, --version         Print version
   -h, --help            Show this help
@@ -144,6 +149,8 @@ ${bold('INTERACTIVE COMMANDS')}
   /sessions clear       Delete sessions (pick one or delete all)
   /experience           Show pending experience queue (robotics mode)
   /experience review    Interactively review & commit pending experiences
+  /anchor               Show pending physical anchor queue (robotics mode)
+  /anchor review        Interactively review & commit pending physical anchors
   /clear                Start a new session (same workspace/hardware)
   /exit  or  Ctrl+D     Quit
 
@@ -193,9 +200,10 @@ interface CliOptions {
   system: string | undefined
   json: boolean
   debug: boolean                  // --debug: log full prompts + responses to stderr
+  showThinking: boolean           // --show-thinking: stream thinking deltas to terminal
   yes: boolean                    // --yes: auto-approve sensitive tool calls
   prompt: string | null
-  maxTurns: number | undefined    // --max-turns override; undefined → unlimited
+  maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
 }
 
@@ -216,6 +224,7 @@ function parseCliArgs(): CliOptions {
         resume:       { type: 'string',  short: 'r' },
         yes:          { type: 'boolean', short: 'y', default: false },
         debug:        { type: 'boolean', short: 'd', default: false },
+        'show-thinking': { type: 'boolean', default: false },
         json:         { type: 'boolean', short: 'j', default: false },
         version:      { type: 'boolean', short: 'v', default: false },
         help:         { type: 'boolean', short: 'h', default: false },
@@ -273,6 +282,7 @@ function parseCliArgs(): CliOptions {
     system:     parsed.values['system']   as string | undefined,
     json:       parsed.values['json']     as boolean,
     debug:      parsed.values['debug']    as boolean,
+    showThinking: parsed.values['show-thinking'] as boolean,
     yes:        parsed.values['yes']      as boolean,
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
@@ -835,8 +845,9 @@ function makeRouter(
   if (opts.fallbackModel) cfg.fallbackModel = opts.fallbackModel
   if (opts.mode !== 'auto') cfg.mode    = opts.mode
 
-  // Apply maxTurns: explicit flag wins; otherwise unlimited
-  cfg.maxTurns = opts.maxTurns ?? Infinity
+  // Apply maxTurns: explicit flag wins; otherwise cap each user turn so a
+  // single prompt cannot run for hours without a checkpoint.
+  cfg.maxTurns = opts.maxTurns ?? DEFAULT_CLI_MAX_TURNS
 
   // Debug mode
   if (opts.debug) cfg.debugMode = true
@@ -851,16 +862,53 @@ function makeRouter(
   // Session resume: pre-load conversation history
   if (initialMessages && initialMessages.length > 0) {
     cfg.initialMessages = initialMessages
+    // Signal to RoboticsSession that this is an explicit resume so R5 shows
+    // the resume banner and prior progress notes.
+    cfg.explicitResume = true
   }
 
-  // Build composite system prompt: workspace constraint + user system
+  // Multi-agent escalation confirmation — shown when flash classifier suggests 'multi'.
+  // Interrupts the streaming turn with a yes/no prompt before the first API call.
+  cfg.onEscalationRequest = async (reason: string): Promise<boolean> => {
+    if (opts.json) return false  // non-interactive mode: always deny
+    if (opts.yes) return true    // auto-approve mode: always allow
+
+    process.stdout.write(
+      `\n${yellow('⚡ Multi-Agent 升级请求')}\n` +
+      `   ${dim('理由：')}${reason}\n\n` +
+      `   Multi-Agent 模式将启用并行子 Agent 编排、独立 Git 分支隔离和实验调度。\n` +
+      `   单次任务费用和延迟会相应增加。\n\n` +
+      `   是否升级到 Multi-Agent 模式？ ${dim('[y/N]')} `,
+    )
+
+    return new Promise<boolean>(resolve => {
+      // Use raw stdin so we don't disturb the outer readline interface
+      process.stdin.setRawMode?.(true)
+      process.stdin.resume()
+      process.stdin.setEncoding('utf8')
+      const onKey = (key: string) => {
+        process.stdin.setRawMode?.(false)
+        process.stdin.pause()
+        process.stdin.removeListener('data', onKey)
+        const answer = key.trim().toLowerCase()
+        const confirmed = answer === 'y'
+        process.stdout.write(confirmed ? `${green('y')}\n\n` : `${dim('N')}\n\n`)
+        resolve(confirmed)
+      }
+      process.stdin.once('data', onKey)
+    })
+  }
+
+  // Build composite stable prompt suffix: workspace constraint + user system.
+  // Keep the runtime's default static prompt intact; replacing systemPrompt here
+  // would drop the Meta-Agent identity, execution discipline, and tool protocol.
   // NOTE: hardware profile is intentionally omitted here — RoboticsSession's R4
   // dynamic section loads it from the JSON store using cfg.robot, which avoids
   // the duplication+contradiction that occurred when both paths injected hardware.
   const workspaceBlock  = opts.workspace ? buildWorkspaceSystemPrompt(opts.workspace) : ''
   const userSystem      = opts.system ?? ''
   const composed        = [workspaceBlock, userSystem].filter(Boolean).join('\n\n')
-  if (composed) cfg.systemPrompt = composed
+  if (composed) cfg.appendSystemPrompt = composed
 
   // Change process cwd to workspace so relative paths work correctly
   if (opts.workspace) {
@@ -923,20 +971,6 @@ async function streamExperienceSummary(
   // entries.map() — can escape to the caller and become an unhandled rejection
   // that kills the process.
   try {
-    // Prefer the existing side-call client (already has correct timeout/retries).
-    // Fall back to building our own from the provider config.
-    let client = router.getSideCallClient()
-    if (!client) {
-      const { apiKey, baseURL } = router.getProviderConfig()
-      if (!apiKey) return   // no key at all — silently skip
-      client = new (await import('@anthropic-ai/sdk')).default({
-        apiKey,
-        baseURL,
-        timeout:    8_000,
-        maxRetries: 1,
-      })
-    }
-
     // Build a concise JSON summary of the entries for the LLM
     const entrySummaries = entries.map((e, i) => {
       const inp = e.input
@@ -953,7 +987,45 @@ async function streamExperienceSummary(
     const userMessage = `新提议的经验条目（共 ${entries.length} 条）：\n\n` +
       JSON.stringify(entrySummaries, null, 2)
 
-    const { flashModel } = router.getProviderConfig()
+    const { apiKey, baseURL, flashModel } = router.getProviderConfig()
+    if (!apiKey) return
+
+    if (flashModel.startsWith('deepseek-')) {
+      const OpenAI = (await import('openai')).default
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
+      const stream = await client.chat.completions.create({
+        model:      flashModel,
+        max_tokens: 512,
+        stream:     true,
+        messages: [
+          { role: 'system', content: EXPERIENCE_SUMMARY_SYSTEM },
+          { role: 'user', content: userMessage },
+        ],
+      })
+
+      let summaryText = ''
+      for await (const chunk of stream) {
+        summaryText += chunk.choices[0]?.delta?.content ?? ''
+      }
+      if (summaryText.trim()) {
+        process.stdout.write(`\n${dim('─── 经验提议摘要 (side-call) ───────────────────────────────────')}\n`)
+        process.stdout.write(summaryText)
+        process.stdout.write(`\n${dim('─────────────────────────────────────────────────────────────')}\n\n`)
+      }
+      return
+    }
+
+    // Prefer the existing side-call client (already has correct timeout/retries).
+    // Fall back to building our own from the provider config.
+    let client = router.getSideCallClient()
+    if (!client) {
+      client = new (await import('@anthropic-ai/sdk')).default({
+        apiKey,
+        baseURL,
+        timeout:    8_000,
+        maxRetries: 1,
+      })
+    }
 
     const stream = await client.messages.stream({
       model:      flashModel,
@@ -982,26 +1054,63 @@ async function streamExperienceSummary(
 
 // ── Stream a single prompt ────────────────────────────────────────────────────
 
+const DEFAULT_CLI_MAX_VISIBLE_CHARS = 200_000
+
+function getCliMaxVisibleChars(): number {
+  const raw = process.env['META_AGENT_CLI_MAX_VISIBLE_CHARS']
+  if (!raw) return DEFAULT_CLI_MAX_VISIBLE_CHARS
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return DEFAULT_CLI_MAX_VISIBLE_CHARS
+  return Math.min(2_000_000, Math.max(10_000, parsed))
+}
+
+async function safeStdoutWrite(text: string): Promise<void> {
+  if (!text) return
+  if (process.stdout.write(text)) return
+  await once(process.stdout, 'drain')
+}
+
 async function streamPrompt(
   router: SessionRouter,
   prompt: string,
   jsonMode: boolean,
+  showThinking = false,
 ): Promise<void> {
   const gen = router.submit(prompt)
   let hasText = false
   let thinkingOpen = false   // whether we're currently inside a thinking block
+  let visibleChars = 0
+  let visibleTruncated = false
+  const visibleLimit = getCliMaxVisibleChars()
+
+  async function writeVisible(text: string): Promise<void> {
+    if (!text || visibleTruncated) return
+    const remaining = visibleLimit - visibleChars
+    if (remaining <= 0) {
+      visibleTruncated = true
+      await safeStdoutWrite(`\n${yellow('⚠')}  ${yellow('本轮终端输出已达到显示上限，后续内容已隐藏。')} ${dim('完整上下文仍保留在会话历史中。')}\n`)
+      return
+    }
+    const chunk = text.length > remaining ? text.slice(0, remaining) : text
+    visibleChars += chunk.length
+    await safeStdoutWrite(chunk)
+    if (chunk.length < text.length) {
+      visibleTruncated = true
+      await safeStdoutWrite(`\n${yellow('⚠')}  ${yellow('本轮终端输出已达到显示上限，后续内容已隐藏。')} ${dim('完整上下文仍保留在会话历史中。')}\n`)
+    }
+  }
 
   // ── Thinking block helpers ────────────────────────────────────────────────
-  function openThinkingBlock(): void {
+  async function openThinkingBlock(): Promise<void> {
     if (thinkingOpen) return
-    process.stdout.write(
+    await safeStdoutWrite(
       `\n${dim('┌─ 思考中 ──────────────────────────────────────────────────────')}\n`,
     )
     thinkingOpen = true
   }
-  function closeThinkingBlock(): void {
+  async function closeThinkingBlock(): Promise<void> {
     if (!thinkingOpen) return
-    process.stdout.write(
+    await safeStdoutWrite(
       `\n${dim('└───────────────────────────────────────────────────────────────')}\n`,
     )
     thinkingOpen = false
@@ -1015,57 +1124,59 @@ async function streamPrompt(
       }
       switch (event.type) {
         case 'thinking_delta': {
-          openThinkingBlock()
-          process.stdout.write(dim(event.delta))
+          if (showThinking) {
+            await openThinkingBlock()
+            await writeVisible(dim(event.delta))
+          }
           break
         }
         case 'text': {
           // Close any open thinking block before the first reply text
-          closeThinkingBlock()
+          await closeThinkingBlock()
           if (!hasText) {
-            process.stdout.write(`\n${bold(green('agent'))} › `)
+            await safeStdoutWrite(`\n${bold(green('agent'))} › `)
             hasText = true
           }
-          process.stdout.write(event.text)
+          await writeVisible(event.text)
           break
         }
         case 'tool_use': {
-          process.stdout.write(
+          await safeStdoutWrite(
             `\n${dim('⚙')}  ${cyan(event.toolName)} ${gray(JSON.stringify(event.toolInput).slice(0, 80))}\n`,
           )
           break
         }
         case 'tool_result': {
           const preview = String(event.content ?? '').slice(0, 120)
-          process.stdout.write(
+          await safeStdoutWrite(
             `   ${dim('→')} ${gray(preview)}${preview.length >= 120 ? gray('…') : ''}\n`,
           )
           break
         }
         case 'api_retry': {
-          process.stdout.write(
+          await safeStdoutWrite(
             `\n${yellow('⚠')}  retrying (attempt ${event.attempt}/${event.maxRetries}, delay ${event.retryDelayMs}ms)\n`,
           )
           break
         }
         case 'result': {
-          closeThinkingBlock()
-          if (hasText) process.stdout.write('\n')
+          await closeThinkingBlock()
+          if (hasText) await safeStdoutWrite('\n')
           // Show explicit warnings for non-success result subtypes so the user
           // is never silently left wondering why the agent stopped.
           if (event.subtype === 'error_max_turns') {
-            process.stdout.write(
+            await safeStdoutWrite(
               `\n${yellow('⚠')}  ${yellow('已达到本轮最大步数上限。')} ` +
-              `${dim('继续输入以接着分析，或用 --max-turns <n> 提高上限（默认无限制）。')}\n`,
+              `${dim('继续输入以接着分析，或用 --max-turns <n> 提高上限。')}\n`,
             )
           } else if (event.subtype === 'error_max_budget') {
-            process.stdout.write(
+            await safeStdoutWrite(
               `\n${yellow('⚠')}  ${yellow('已超出 token 预算上限。')} ` +
               `${dim('任务已提前终止。可继续输入或拆分为更小的子任务。')}\n`,
             )
           } else if (event.subtype === 'error_during_execution') {
             const errDetails = (event as { errors?: string[] }).errors?.join('\n  ')
-            process.stdout.write(
+            await safeStdoutWrite(
               `\n${red('✗')}  ${red('执行过程中发生错误。')} ` +
               `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
               (errDetails ? `${red('  错误详情：')} ${errDetails}\n` : ''),
@@ -1078,7 +1189,7 @@ async function streamPrompt(
                         : mode === 'agentic'  ? green(mode)
                         : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
                         : gray(mode)
-          process.stdout.write(
+          await safeStdoutWrite(
             `\n${gray('─'.repeat(56))}\n` +
             `${modeTag}  ` +
             `${gray(`in:${usage.inputTokens} out:${usage.outputTokens}`)}  ` +
@@ -1208,6 +1319,81 @@ async function reviewPendingExperiences(
   if (committed > 0 || remaining > 0) {
     console.log(
       `\n${green(`✓ 已提交 ${committed} 条`)}` +
+      (remaining > 0 ? `  ${yellow(`剩余 ${remaining} 条待审`)}` : '') +
+      '\n',
+    )
+  }
+  return committed
+}
+
+// ── Physical anchor review ─────────────────────────────────────────────────────
+
+/**
+ * Interactive review of pending physical anchor proposals.
+ * Shows each candidate; user can approve (y), discard (n), or skip (s).
+ * Returns the count of committed anchors.
+ */
+async function reviewPendingPhysicalAnchors(
+  rl: readline.Interface,
+  pending: PhysicalAnchorPendingStore,
+  store: PhysicalAnchorStore,
+): Promise<number> {
+  const entries = [...pending.list()]
+  if (entries.length === 0) {
+    console.log(dim('\n暂无待审物理锚点。\n'))
+    return 0
+  }
+
+  console.log(
+    `\n${bold('物理锚点审核')} ${dim(`(${entries.length} 条待审)`)}\n` +
+    `${dim('每个锚点由 AI 在本次会话中提议（或会话结束时自动提取），需要你审核后才会写入跨 session 知识库。')}\n`,
+  )
+
+  let committed = 0
+  for (const entry of entries) {
+    const inp = entry.input
+    const title       = String(inp['title'] ?? '(无标题)')
+    const domain      = String(inp['domain'] ?? 'general')
+    const scope       = String(inp['scope'] ?? 'code')
+    const fact        = String(inp['fact'] ?? '').slice(0, 300)
+    const implication = String(inp['implication'] ?? '').slice(0, 200)
+    const confidence  = String(inp['confidence_tier'] ?? 'observed')
+    const tags        = (inp['tags'] as string[] | undefined)?.join(', ') ?? ''
+    const proposed    = new Date(entry.proposedAt).toLocaleTimeString()
+
+    const scopeLabel  = scope === 'global' ? green(scope) : scope === 'robot' ? cyan(scope) : dim(scope)
+
+    console.log(
+      `\n${'─'.repeat(60)}\n` +
+      `${bold(title)} ${dim(`[${domain}]`)} ${scopeLabel} ${dim(`conf:${confidence}`)}\n` +
+      `${dim('事实:')} ${fact}\n` +
+      `${dim('含义:')} ${implication}\n` +
+      (tags ? `${dim('标签:')} ${tags}\n` : '') +
+      `${dim('提议时间:')} ${proposed}\n` +
+      `${'─'.repeat(60)}\n`,
+    )
+
+    const choice = await askQuestion(rl, `提交 [y=是 / n=丢弃 / s=跳过]: `)
+    if (choice.toLowerCase() === 'y' || choice.toLowerCase() === 'yes') {
+      const id = await pending.commit(entry.pendingId, store)
+      if (id) {
+        console.log(green(`  ✓ 已提交 (ID: ${id})`))
+        committed++
+      } else {
+        console.log(red('  ✗ 提交失败（字段校验未通过）'))
+      }
+    } else if (choice.toLowerCase() === 'n') {
+      pending.remove(entry.pendingId)
+      console.log(dim('  已丢弃'))
+    } else {
+      console.log(dim('  已跳过 (保留在待审队列)'))
+    }
+  }
+
+  const remaining = pending.count
+  if (committed > 0 || remaining > 0) {
+    console.log(
+      `\n${green(`✓ 已提交 ${committed} 条物理锚点`)}` +
       (remaining > 0 ? `  ${yellow(`剩余 ${remaining} 条待审`)}` : '') +
       '\n',
     )
@@ -1353,10 +1539,25 @@ async function buildTeamPlannerSnapshot(controller: TeamCliController): Promise<
 
 async function callTeamPlanner(router: SessionRouter, input: string, snapshot: TeamPlannerSnapshot): Promise<TeamPlannerPlan | null> {
   try {
+    const { apiKey, baseURL, flashModel } = router.getProviderConfig()
+    if (!apiKey) return null
+
+    if (flashModel.startsWith('deepseek-')) {
+      const OpenAI = (await import('openai')).default
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
+      const message = await client.chat.completions.create({
+        model:      flashModel,
+        max_tokens: 900,
+        messages: [
+          { role: 'system', content: TEAM_PLANNER_SYSTEM },
+          { role: 'user', content: buildTeamPlannerUserMessage(input, snapshot) },
+        ],
+      })
+      return parseTeamPlannerPlan(message.choices[0]?.message?.content ?? '')
+    }
+
     let client = router.getSideCallClient()
     if (!client) {
-      const { apiKey, baseURL } = router.getProviderConfig()
-      if (!apiKey) return null
       client = new (await import('@anthropic-ai/sdk')).default({
         apiKey,
         baseURL,
@@ -1365,7 +1566,6 @@ async function callTeamPlanner(router: SessionRouter, input: string, snapshot: T
       })
     }
 
-    const { flashModel } = router.getProviderConfig()
     const message = await client.messages.create({
       model:      flashModel,
       max_tokens: 900,
@@ -2080,7 +2280,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // Robotics mode registers its own tools internally (RoboticsSession.init).
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
-      system: { cwd: opts.workspace },
+      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -2100,6 +2300,38 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // Guards against showing the hardware-binding prompt more than once per session
   // (set to true after the first prompt, even if the user skips it).
   let hardwareBindingPrompted = false
+  const persistCurrentSession = async (currentInput: string): Promise<void> => {
+    if (opts.json) return
+    try {
+      const sessionId = router.getSessionId()
+      if (!sessionId) return
+      const messages = router.getMessages()
+      if (messages.length <= savedMessageCount) return
+      const firstUserMsg = messages.find(m => m.role === 'user')
+      const firstPromptText = firstUserMsg
+        ? (typeof firstUserMsg.content === 'string'
+            ? firstUserMsg.content
+            : JSON.stringify(firstUserMsg.content)
+          ).slice(0, 80)
+        : currentInput.slice(0, 80)
+      await SessionStore.append(
+        sessionId,
+        {
+          mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
+          startTime:     Date.now(),
+          lastActivity:  Date.now(),
+          messageCount:  messages.length,
+          firstPrompt:   firstPromptText,
+          workspace:     opts.workspace,
+        },
+        messages,
+        savedMessageCount,
+      )
+      savedMessageCount = messages.length
+    } catch {
+      // session save is best-effort — never crash the REPL
+    }
+  }
   let interactiveInputActive = false
   const setInteractiveActive = (v: boolean) => { interactiveInputActive = v }
   const teamReminderTimer = (!opts.json && isTTY)
@@ -2306,6 +2538,17 @@ async function runRepl(opts: CliOptions): Promise<void> {
               `${dim('下次在同一项目启动 robotics 模式后，可用 /experience review 继续审核。')}\n`,
             )
           }
+          // Show pending physical anchor count (populated after dispose() extraction).
+          // Note: we can only read the count that was already in queue before dispose();
+          // the post-session Flash extraction runs inside dispose() below.
+          const pendingAnchors = router.getPendingPhysicalAnchors()
+          const anchorCount = pendingAnchors?.count ?? 0
+          if (anchorCount > 0) {
+            console.log(
+              `${yellow(`⚓  ${anchorCount} 条物理锚点待审核`)} — ` +
+              `${dim('下次在同一项目启动 robotics 模式后，可用 /anchor review 审核提交。')}\n`,
+            )
+          }
           console.log(`\n${dim('Goodbye.')}\n`)
         }
       } catch { /* best-effort — close-path errors must not block process exit */ }
@@ -2368,7 +2611,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
               opts.hardwareId     = selected.name || undefined
               hardwareProfileText = selected.profileText
               // Rebuild router with the new hardware binding (keeps same workspace/key/model)
+              await router.dispose().catch(() => undefined)
               router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter)
+              savedMessageCount = 0
               console.log(green('\n✓ 硬件配置已更新，新会话已启动。\n'))
             }
           } else {
@@ -2422,7 +2667,11 @@ async function runRepl(opts: CliOptions): Promise<void> {
             } else if (choiceTrimmed === 'all') {
               const confirm = await askQuestion(rl, `${yellow('⚠  确认删除当前 workspace 的全部 ')}${sessions.length}${yellow(' 条历史会话？[y/N] ')}`)
               if (confirm.trim().toLowerCase() === 'y') {
-                await Promise.all(sessions.map(session => SessionStore.deleteSession(session.sessionId)))
+                // Use deleteAllSessions() instead of concurrent deleteSession() calls.
+                // Concurrent calls each read → filter → write the same index file,
+                // causing a last-writer-wins race where only one session is removed.
+                // deleteAllSessions() clears the index in one atomic write.
+                await SessionStore.deleteAllSessions()
                 console.log(green(`\n✓ 已删除全部 ${sessions.length} 条历史会话。\n`))
               } else {
                 console.log(dim('\n已取消。\n'))
@@ -2464,6 +2713,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
                   console.log(yellow('⚠  找不到历史记录。\n'))
                 } else {
                   console.log(green(`✓ 已加载 ${messages.length} 条历史消息，继续 ${selected.mode} 模式。\n`))
+                  opts.mode = selected.mode as CliOptions['mode']
+                  await router.dispose().catch(() => undefined)
                   router = makeRouter(opts, hardwareProfileText || undefined, rl, messages, getCurrentRouter)
                   savedMessageCount = messages.length
                 }
@@ -2492,6 +2743,26 @@ async function runRepl(opts: CliOptions): Promise<void> {
           }
           break
         }
+        case '/anchor': {
+          const subCmd = input.split(/\s+/).slice(1).join(' ').toLowerCase()
+          const pendingAnchors = router.getPendingPhysicalAnchors()
+          if (subCmd === 'review') {
+            if (!pendingAnchors) {
+              console.log(yellow('\n/anchor review 仅在 robotics 模式下可用。\n'))
+            } else {
+              const store = new PhysicalAnchorStore()
+              await reviewPendingPhysicalAnchors(rl, pendingAnchors, store)
+            }
+          } else {
+            const count = pendingAnchors?.count ?? 0
+            if (count > 0) {
+              console.log(`\n${yellow(`⏸  ${count} 条物理锚点待审核`)} — 使用 ${cyan('/anchor review')} 审核提交\n`)
+            } else {
+              console.log(`\n${dim('暂无待审物理锚点。')}\n`)
+            }
+          }
+          break
+        }
         case '/team': {
           const [, rawTeamSub = ''] = input.split(/\s+/)
           const teamSub = rawTeamSub.toLowerCase()
@@ -2504,6 +2775,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           break
         }
         case '/clear':
+          await router.dispose().catch(() => undefined)
           router = makeRouter(opts, undefined, rl, undefined, getCurrentRouter)
           savedMessageCount = 0
           console.log(green('\nNew session started.\n'))
@@ -2540,6 +2812,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
         hardwareProfileText = selected.profileText
         // Lock mode so the new router skips re-detection (no second flash model call)
         opts.mode = 'robotics'
+        await router.dispose().catch(() => undefined)
         router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter)
         if (opts.hardwareId) {
           console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定。\n`))
@@ -2547,17 +2820,31 @@ async function runRepl(opts: CliOptions): Promise<void> {
       }
     }
 
-    // Snapshot pending experience count before this turn so we can detect new additions
+    // Snapshot pending counts before this turn so we can detect new additions
     const pendingCountBefore = router.getPendingExperiences()?.count ?? 0
+    const anchorCountBefore = router.getPendingPhysicalAnchors()?.count ?? 0
 
     try {
-      await streamPrompt(router, input, opts.json)
+      await streamPrompt(router, input, opts.json, opts.showThinking)
     } catch (err) {
       if (!interrupted) {
         const msg = err instanceof Error ? err.message : String(err)
         console.error(`\n${red('Error:')} ${msg}\n`)
       }
     }
+
+    // ── Post-turn: nudge for newly queued physical anchors ───────────────────
+    if (!opts.json) {
+      const anchorCountAfter = router.getPendingPhysicalAnchors()?.count ?? 0
+      const newAnchors = anchorCountAfter - anchorCountBefore
+      if (newAnchors > 0) {
+        process.stdout.write(
+          `\n${yellow(`⚓  ${newAnchors} 条新物理锚点待审核`)} — ` +
+          `${dim('使用 /anchor review 审核并提交至知识库。')}\n`,
+        )
+      }
+    }
+    void pendingCountBefore // suppress unused-variable lint
 
     // ── Show real debug dir once we have a sessionId ──────────────────────────
     if (opts.debug && !debugDirShown) {
@@ -2585,8 +2872,11 @@ async function runRepl(opts: CliOptions): Promise<void> {
       opts.hardwareId     = selected.name || undefined
       hardwareProfileText = selected.profileText
       if (hardwareProfileText) {
+        await persistCurrentSession(input)
         opts.mode = 'robotics'
+        await router.dispose().catch(() => undefined)
         router = makeRouter(opts, hardwareProfileText, rl, undefined, getCurrentRouter)
+        savedMessageCount = 0
       }
       if (opts.hardwareId) {
         console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定，后续回复将包含硬件上下文。\n`))
@@ -2596,37 +2886,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // ── Persist session after each turn ──────────────────────────────────────
     // Append only the new messages (since savedMessageCount) so the file grows
     // incrementally rather than being rewritten on every turn.
-    if (!opts.json) {
-      try {
-        const sessionId = router.getSessionId()
-        if (sessionId) {
-          const messages = router.getMessages()
-          if (messages.length > savedMessageCount) {
-            const firstUserMsg = messages.find(m => m.role === 'user')
-            const firstPromptText = firstUserMsg
-              ? (typeof firstUserMsg.content === 'string'
-                  ? firstUserMsg.content
-                  : JSON.stringify(firstUserMsg.content)
-                ).slice(0, 80)
-              : input.slice(0, 80)
-            await SessionStore.append(
-              sessionId,
-              {
-                mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
-                startTime:     Date.now(),
-                lastActivity:  Date.now(),
-                messageCount:  messages.length,
-                firstPrompt:   firstPromptText,
-                workspace:     opts.workspace,
-              },
-              messages,
-              savedMessageCount,
-            )
-            savedMessageCount = messages.length
-          }
-        }
-      } catch { /* session save is best-effort — never crash the REPL */ }
-    }
+    await persistCurrentSession(input)
 
     rl.prompt()
   }
@@ -2640,7 +2900,7 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   // Register standard tools (robotics registers its own)
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
-      system: { cwd: opts.workspace },
+      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -2648,11 +2908,13 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   }
 
   try {
-    await streamPrompt(router, opts.prompt!, opts.json)
+    await streamPrompt(router, opts.prompt!, opts.json, opts.showThinking)
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err)
     console.error(red(`Error: ${msg}`))
-    process.exit(1)
+    process.exitCode = 1
+  } finally {
+    await router.dispose().catch(() => undefined)
   }
 }
 

@@ -1,7 +1,7 @@
-export function initialLoopState(messages, model) {
+export function initialLoopState(messages, model, autoCompactTracking) {
     return {
         messages,
-        autoCompactTracking: undefined,
+        autoCompactTracking,
         maxOutputTokensRecoveryCount: 0,
         maxOutputTokensOverride: undefined,
         hasAttemptedReactiveCompact: false,

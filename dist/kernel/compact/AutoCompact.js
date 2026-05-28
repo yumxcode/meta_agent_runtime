@@ -13,7 +13,7 @@ const SKIPPED_QUERY_SOURCES = new Set(['compact', 'session_memory']);
  * @param tracking          - Current circuit breaker state
  * @param compactOptions    - Options forwarded to compactConversation
  */
-export async function autoCompactIfNeeded(messagesForQuery, model, fileCache, querySource, tracking, maxOutputTokens, compactOptions) {
+export async function autoCompactIfNeeded(messagesForQuery, model, fileCache, querySource, tracking, maxOutputTokens, compactOptions, force = false) {
     const currentTracking = tracking ?? {
         compacted: false,
         turnId: crypto.randomUUID(),
@@ -35,7 +35,7 @@ export async function autoCompactIfNeeded(messagesForQuery, model, fileCache, qu
     // ── Token threshold check ─────────────────────────────────────────────────
     const tokenCount = tokenCountWithEstimation(messagesForQuery);
     const { isAtCompactThreshold } = calculateTokenWarningState(tokenCount, model, maxOutputTokens);
-    if (!isAtCompactThreshold) {
+    if (!force && !isAtCompactThreshold) {
         return { wasCompacted: false, tracking: { ...currentTracking, turnCounter: currentTracking.turnCounter + 1 } };
     }
     // ── Run compact ───────────────────────────────────────────────────────────
@@ -50,6 +50,7 @@ export async function autoCompactIfNeeded(messagesForQuery, model, fileCache, qu
         return {
             wasCompacted: true,
             postCompactMessages: result.postCompactMessages,
+            summaryTokenEstimate: result.summaryTokenEstimate,
             tracking: newTracking,
         };
     }

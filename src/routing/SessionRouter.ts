@@ -101,6 +101,10 @@ export class SessionRouter {
   private readonly _debug: boolean
   /** Robot/platform name forwarded to RoboticsSession (undefined = no hardware binding). */
   private readonly _robot: string | undefined
+  /** Whether user explicitly resumed a prior session — forwarded to RoboticsSession. */
+  private readonly _explicitResume: boolean
+  /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
+  private readonly _onEscalationRequest: ((reason: string) => Promise<boolean>) | undefined
   /**
    * Lightweight Anthropic client used exclusively for one-shot mode detection.
    * Separate from the backend session client: short timeout (3 s), 1 retry,
@@ -118,10 +122,12 @@ export class SessionRouter {
   private _memoryWriterDone = false
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
-    const { mode, debugMode, robot, ...sessionConfig } = config
+    const { mode, debugMode, robot, explicitResume, onEscalationRequest, ...sessionConfig } = config
     this._hint = mode ?? 'auto'
     this._debug = debugMode ?? false
     this._robot = robot
+    this._explicitResume = explicitResume ?? false
+    this._onEscalationRequest = onEscalationRequest
     // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
     // Without this, destructuring above strips debugMode from sessionConfig,
     // making this.config.debugMode always undefined inside MetaAgentSession.
@@ -262,6 +268,7 @@ export class SessionRouter {
       this._hint,
       hasTools,
       this._detectionClient ?? undefined,
+      this._cfg.flashModel,
     )
     this._raiseMode(result.mode)
     return this._currentMode!
@@ -287,6 +294,8 @@ export class SessionRouter {
           // Thread the configured flashModel so pure-Anthropic setups don't
           // silently skip memory writing because of a missing DeepSeek key.
           model: this._cfg.flashModel,
+          apiKey: this._cfg.apiKey,
+          baseURL: this._cfg.baseURL,
         })
       } catch {
         // Best-effort: memory extraction must never block shutdown.
@@ -315,6 +324,19 @@ export class SessionRouter {
     return null
   }
 
+  /**
+   * Return the robotics session's pending physical anchor buffer (if mode=robotics).
+   * Returns null in all other modes or before the first submit().
+   * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
+   */
+  getPendingPhysicalAnchors(): import('../robotics/PhysicalAnchorPendingStore.js').PhysicalAnchorPendingStore | null {
+    const impl = this._impl as any
+    if (impl && typeof impl.pendingPhysicalAnchors === 'object' && impl.pendingPhysicalAnchors !== null) {
+      return impl.pendingPhysicalAnchors
+    }
+    return null
+  }
+
   getRoboticsTeamController(): RoboticsTeamController | null {
     if (this._currentMode !== 'robotics') return null
     const impl = this._impl as RoboticsTeamController | undefined
@@ -338,6 +360,7 @@ export class SessionRouter {
       this._hint,
       hasTools,
       this._detectionClient ?? undefined,
+      this._cfg.flashModel,
     )
 
     // Apply the detected mode (respecting any prior raise from registerTool)
@@ -408,7 +431,12 @@ export class SessionRouter {
         // RoboticsSession wires ExperienceStore, GitWorkspaceManager, WorkflowLoader etc.
         // Imported lazily to avoid circular deps during bootstrap.
         const { RoboticsSession } = await import('../robotics/RoboticsSession.js')
-        const roboticsSession = new RoboticsSession({ ...this._cfgAsConfig(), robot: this._robot })
+        const roboticsSession = new RoboticsSession({
+          ...this._cfgAsConfig(),
+          robot: this._robot,
+          explicitResume: this._explicitResume,
+          onEscalationRequest: this._onEscalationRequest,
+        })
         // init() restores or creates project state, registers tools, and primes
         // R1-R5 dynamic sections.  Must complete before first submit().
         await roboticsSession.init()

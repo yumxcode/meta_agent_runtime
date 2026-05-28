@@ -15,12 +15,20 @@ export function createWorkflowCompleteGateTool(projectDir, definition, onStateCh
             const gateId = String(input['gate_id'] ?? '').trim();
             if (!gateId)
                 return { content: 'Error: gate_id is required', isError: true };
-            // Verify gate belongs to current phase
-            const allGates = definition.phases.flatMap(p => p.gateItems);
-            const gate = allGates.find(g => g.id === gateId);
-            if (!gate)
-                return { content: `Error: gate "${gateId}" not found. Run workflow_status to see valid IDs.`, isError: true };
-            const state = await WorkflowStateStore.completeGateItem(projectDir, gateId);
+            const currentState = await WorkflowStateStore.readCompatible(projectDir, definition);
+            if (!currentState)
+                return { content: 'Error: workflow state is not compatible with current definition.', isError: true };
+            const currentPhase = definition.phases.find(p => p.id === currentState.currentPhaseId);
+            if (!currentPhase)
+                return { content: `Error: unknown workflow phase "${currentState.currentPhaseId}".`, isError: true };
+            const gate = currentPhase.gateItems.find(g => g.id === gateId);
+            if (!gate) {
+                return {
+                    content: `Error: gate "${gateId}" is not part of the current phase "${currentPhase.id}". Run workflow_status to see valid IDs.`,
+                    isError: true,
+                };
+            }
+            const state = await WorkflowStateStore.completeCurrentPhaseGateItem(projectDir, definition, gateId);
             onStateChange(state);
             const evidence = input['evidence'] ? ` Evidence: ${input['evidence']}` : '';
             return { content: `✓ Gate "${gateId}" marked complete.${evidence}\nRun workflow_status to see updated gate status.`, isError: false };

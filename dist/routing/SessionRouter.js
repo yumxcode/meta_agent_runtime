@@ -50,6 +50,10 @@ export class SessionRouter {
     _debug;
     /** Robot/platform name forwarded to RoboticsSession (undefined = no hardware binding). */
     _robot;
+    /** Whether user explicitly resumed a prior session — forwarded to RoboticsSession. */
+    _explicitResume;
+    /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
+    _onEscalationRequest;
     /**
      * Lightweight Anthropic client used exclusively for one-shot mode detection.
      * Separate from the backend session client: short timeout (3 s), 1 retry,
@@ -65,10 +69,12 @@ export class SessionRouter {
     /** Ensures post-session memory extraction runs at most once. */
     _memoryWriterDone = false;
     constructor(config = {}) {
-        const { mode, debugMode, robot, ...sessionConfig } = config;
+        const { mode, debugMode, robot, explicitResume, onEscalationRequest, ...sessionConfig } = config;
         this._hint = mode ?? 'auto';
         this._debug = debugMode ?? false;
         this._robot = robot;
+        this._explicitResume = explicitResume ?? false;
+        this._onEscalationRequest = onEscalationRequest;
         // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
         // Without this, destructuring above strips debugMode from sessionConfig,
         // making this.config.debugMode always undefined inside MetaAgentSession.
@@ -189,7 +195,7 @@ export class SessionRouter {
         if (this._currentMode !== null)
             return this._currentMode;
         const hasTools = this._pendingTools.length > 0;
-        const result = await ModeDetector.detect(prompt, this._hint, hasTools, this._detectionClient ?? undefined);
+        const result = await ModeDetector.detect(prompt, this._hint, hasTools, this._detectionClient ?? undefined, this._cfg.flashModel);
         this._raiseMode(result.mode);
         return this._currentMode;
     }
@@ -213,6 +219,8 @@ export class SessionRouter {
                     // Thread the configured flashModel so pure-Anthropic setups don't
                     // silently skip memory writing because of a missing DeepSeek key.
                     model: this._cfg.flashModel,
+                    apiKey: this._cfg.apiKey,
+                    baseURL: this._cfg.baseURL,
                 });
             }
             catch {
@@ -249,6 +257,18 @@ export class SessionRouter {
         }
         return null;
     }
+    /**
+     * Return the robotics session's pending physical anchor buffer (if mode=robotics).
+     * Returns null in all other modes or before the first submit().
+     * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
+     */
+    getPendingPhysicalAnchors() {
+        const impl = this._impl;
+        if (impl && typeof impl.pendingPhysicalAnchors === 'object' && impl.pendingPhysicalAnchors !== null) {
+            return impl.pendingPhysicalAnchors;
+        }
+        return null;
+    }
     getRoboticsTeamController() {
         if (this._currentMode !== 'robotics')
             return null;
@@ -266,7 +286,7 @@ export class SessionRouter {
             return;
         // Detect mode — LLM path when client is available, heuristic fallback otherwise
         const hasTools = this._pendingTools.length > 0;
-        const result = await ModeDetector.detect(prompt, this._hint, hasTools, this._detectionClient ?? undefined);
+        const result = await ModeDetector.detect(prompt, this._hint, hasTools, this._detectionClient ?? undefined, this._cfg.flashModel);
         // Apply the detected mode (respecting any prior raise from registerTool)
         this._raiseMode(result.mode);
         if (this._debug) {
@@ -322,7 +342,12 @@ export class SessionRouter {
                 // RoboticsSession wires ExperienceStore, GitWorkspaceManager, WorkflowLoader etc.
                 // Imported lazily to avoid circular deps during bootstrap.
                 const { RoboticsSession } = await import('../robotics/RoboticsSession.js');
-                const roboticsSession = new RoboticsSession({ ...this._cfgAsConfig(), robot: this._robot });
+                const roboticsSession = new RoboticsSession({
+                    ...this._cfgAsConfig(),
+                    robot: this._robot,
+                    explicitResume: this._explicitResume,
+                    onEscalationRequest: this._onEscalationRequest,
+                });
                 // init() restores or creates project state, registers tools, and primes
                 // R1-R5 dynamic sections.  Must complete before first submit().
                 await roboticsSession.init();

@@ -10,6 +10,7 @@
  */
 import Anthropic from '@anthropic-ai/sdk';
 import { buildThinkingParam } from '../utils/ThinkingConfig.js';
+import { DebugWriter } from './DebugWriter.js';
 import { isRetryableError, isPromptTooLongError, isFallbackTriggeredError, PromptTooLongError, FallbackTriggeredError, } from './Errors.js';
 const DEFAULT_MAX_TOKENS = 32_768;
 const DEFAULT_MAX_RETRIES = 5;
@@ -67,6 +68,11 @@ export async function* streamMessages(params, config, onRetry) {
         ...(toolsParam.length > 0 ? { tools: toolsParam } : {}),
         ...(thinkingParam ? { thinking: thinkingParam } : {}),
     };
+    // Open debug file once (outside retry loop — one file per logical call)
+    const writer = await DebugWriter.open(params.sessionId, params.model, config.debug);
+    if (writer) {
+        await writer.writeRequest(requestParams);
+    }
     let attempt = 0;
     while (true) {
         try {
@@ -76,6 +82,8 @@ export async function* streamMessages(params, config, onRetry) {
             for await (const event of stream) {
                 yield event;
             }
+            if (writer)
+                await writer.close();
             return;
         }
         catch (error) {
@@ -89,6 +97,8 @@ export async function* streamMessages(params, config, onRetry) {
             if (!isRetryableError(error) ||
                 attempt >= (config.maxRetries ?? DEFAULT_MAX_RETRIES) ||
                 params.abortSignal.aborted) {
+                if (writer)
+                    await writer.close().catch(() => { });
                 throw error;
             }
             attempt++;

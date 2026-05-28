@@ -22,6 +22,7 @@ export declare class KernelSession {
     private _totalUsage;
     private _totalCostUsd;
     private _fileCache;
+    private _autoCompactTracking;
     private readonly _sessionId;
     private readonly _cwd;
     private _permissionDenials;

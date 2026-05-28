@@ -8,6 +8,7 @@ import type { KernelConfig } from '../types/KernelConfig.js';
 import type { KernelEvent, PermissionDenial } from '../types/KernelEvent.js';
 import type { KernelMessage } from '../types/KernelMessage.js';
 import type { TokenUsage } from '../types/TokenUsage.js';
+import { type AutoCompactTrackingState } from '../compact/AutoCompact.js';
 import type { FileStateCache } from '../session/FileStateCache.js';
 export type LoopTerminationReason = 'success' | 'max_turns' | 'no_progress' | 'blocking_limit' | 'aborted_streaming' | 'aborted_tools' | 'max_budget_usd' | 'error';
 export interface LoopResult {
@@ -20,6 +21,7 @@ export interface LoopResult {
     fallbackTriggered: boolean;
     permissionDenials: PermissionDenial[];
     finalMessages: KernelMessage[];
+    autoCompactTracking: AutoCompactTrackingState | undefined;
 }
 export interface KernelLoopContext {
     config: KernelConfig;
@@ -30,6 +32,7 @@ export interface KernelLoopContext {
     sessionId: string;
     cwd: string;
     cumulativeCostUsd: number;
+    autoCompactTracking?: AutoCompactTrackingState;
 }
 export declare function runKernelLoop(ctx: KernelLoopContext): AsyncGenerator<KernelEvent, LoopResult>;
 //# sourceMappingURL=KernelLoop.d.ts.map

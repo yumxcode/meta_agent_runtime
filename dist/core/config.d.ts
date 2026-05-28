@@ -6,7 +6,7 @@
  *
  * Provider auto-detection:
  *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
- *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash / deepseek-v4-pro, native OpenAI format)
+ *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash, native OpenAI format)
  *   QWEN_API_KEY       → https://dashscope.aliyuncs.com/apps/anthropic  (qwen-max / qwen-plus)
  *
  * Explicit config.apiKey / config.baseURL always take precedence over env vars.

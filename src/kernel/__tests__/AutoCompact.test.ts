@@ -180,19 +180,32 @@ describe('autoCompactIfNeeded — threshold', () => {
     )
     expect(result.wasCompacted).toBe(true)
   })
+
+  it('force-compacts even when below threshold', async () => {
+    mockTokenCount.mockReturnValue(BELOW_THRESHOLD)
+    mockCompact.mockResolvedValue({ postCompactMessages: makeMessages(1), summaryTokenEstimate: 123 })
+
+    const result = await autoCompactIfNeeded(
+      makeMessages(), MODEL, new FileStateCache(), 'main', freshTracking(), MAX_OUTPUT, COMPACT_OPTIONS, true,
+    )
+
+    expect(result.wasCompacted).toBe(true)
+    expect(result.summaryTokenEstimate).toBe(123)
+  })
 })
 
 describe('autoCompactIfNeeded — success path', () => {
   it('returns postCompactMessages from compactConversation', async () => {
     const compacted = makeMessages(3)
     mockTokenCount.mockReturnValue(ABOVE_THRESHOLD)
-    mockCompact.mockResolvedValue({ postCompactMessages: compacted, summaryTokenEstimate: 0 })
+    mockCompact.mockResolvedValue({ postCompactMessages: compacted, summaryTokenEstimate: 42 })
 
     const result = await autoCompactIfNeeded(
       makeMessages(), MODEL, new FileStateCache(), 'main', freshTracking(), MAX_OUTPUT, COMPACT_OPTIONS,
     )
     expect(result.wasCompacted).toBe(true)
     expect(result.postCompactMessages).toBe(compacted)
+    expect(result.summaryTokenEstimate).toBe(42)
   })
 
   it('resets tracking state on success', async () => {

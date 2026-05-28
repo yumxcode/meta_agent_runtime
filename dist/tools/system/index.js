@@ -24,7 +24,7 @@ export async function createSystemTools(options = {}) {
         createCronListTool(),
         createEnterPlanModeTool(planModeRef),
         createExitPlanModeTool(planModeRef),
-        createSkillTool(options.cwd),
+        createSkillTool(options.cwd, options.mode ?? 'agentic'),
         createConfigTool(options.cwd),
     ]);
 }

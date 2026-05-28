@@ -53,6 +53,7 @@ export class AgenticSession {
             sessionId: config.sessionId, // honour caller-pinned session ID
             cwd: resolved.projectDir ?? process.cwd(),
             systemPrompt: resolved.systemPrompt,
+            appendSystemPrompt: resolved.appendSystemPrompt,
             initialMessages: toKernelMessages(resolved.initialMessages),
             tools: [],
             canUseTool: createPermissionPolicy({
@@ -82,6 +83,7 @@ export class AgenticSession {
             includeDefaultBetas: isAnthropic ? undefined : false,
             betas: isAnthropic ? ['token-efficient-tools-2025-02-19'] : [],
             querySource: 'main',
+            debug: resolved.debugMode,
         });
         this._sessionId = this._engine.getSessionId();
         for (const tool of resolved.tools) {

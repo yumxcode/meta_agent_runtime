@@ -15,6 +15,22 @@ export const ROBOTICS_DOMAINS: RoboticsDomain[] = [
 export type RoboticsAgentRole =
   | 'orchestrator' | 'paper_search' | 'experiment' | 'code' | 'analysis' | 'deployment'
 
+// ── Knowledge confidence ─────────────────────────────────────────────────────
+export type KnowledgeConfidenceTier =
+  | 'observed'      // Seen in this project/session/robotics run.
+  | 'reproduced'    // Confirmed across repeated observations.
+  | 'derived'       // Derived from physics, math, datasheets, or specs.
+  | 'reported'      // Reported by papers/docs/forums but not locally verified.
+  | 'hypothesis'    // Plausible but not yet verified.
+
+export const KNOWLEDGE_CONFIDENCE_TIERS: KnowledgeConfidenceTier[] = [
+  'observed', 'reproduced', 'derived', 'reported', 'hypothesis',
+]
+
+export type KnowledgeScope = 'global' | 'robot' | 'code'
+
+export const KNOWLEDGE_SCOPES: KnowledgeScope[] = ['global', 'robot', 'code']
+
 // ── Experience Store ──────────────────────────────────────────────────────────
 export interface ExperienceOutcome {
   success: boolean
@@ -37,6 +53,24 @@ export interface ExperienceEntry {
   problem: string        // ≤ 500 chars
   solution: string       // ≤ 800 chars
   outcome: ExperienceOutcome
+  /**
+   * Same-domain abstract principle extracted by flash model at write time.
+   * Used for same-domain principle matching in ExperiencePatternChecker.
+   * Example: "Spatial resolution × map size determines peak memory; estimate before coding."
+   */
+  abstractPrinciple?: string
+  /** How strongly this experience should be trusted when retrieved. */
+  confidenceTier?: KnowledgeConfidenceTier
+  /** Experiment log, commit, report, paper, datasheet, or other supporting references. */
+  evidenceRefs?: string[]
+  /** Number of independent observations supporting this lesson. Defaults to 1. */
+  observationCount?: number
+  /** Number of later observations that contradicted this lesson. Defaults to 0. */
+  contradictionCount?: number
+  /** Assumptions this experience falsified. Especially important for failures. */
+  invalidatedAssumptions?: string[]
+  /** Last time the lesson was checked against observation or source evidence. */
+  lastVerifiedAt?: number
   metrics?: Record<string, number | string>
   sourceTaskId?: string
   sourceSessionId?: string
@@ -60,6 +94,46 @@ export function makeExperienceId(): string {
   return `exp_${ts}_${uuid8}`
 }
 
+// ── Physical Anchor Store ────────────────────────────────────────────────────
+export interface PhysicalAnchorEntry {
+  id: string             // 'pa_<timestamp>_<uuid8>'
+  schemaVersion: '1.0'
+  createdAt: number
+  updatedAt: number
+  domain: RoboticsDomain
+  /** Scope controls where this anchor should be considered applicable. */
+  scope: KnowledgeScope
+  robot?: string
+  title: string          // ≤ 80 chars
+  /** Concrete physical/device fact the model should not infer away. */
+  fact: string           // ≤ 800 chars
+  /** Mechanism explaining why the fact matters, if known. */
+  mechanism?: string     // ≤ 800 chars
+  /** Operational implication for planning/debugging. */
+  implication: string    // ≤ 800 chars
+  tags: string[]
+  confidenceTier: KnowledgeConfidenceTier
+  evidenceRefs: string[]
+  source?: string
+  lastVerifiedAt?: number
+  invalidates?: string[]
+}
+
+export interface PhysicalAnchorSearchQuery {
+  domain?: RoboticsDomain
+  scope?: KnowledgeScope
+  robot?: string
+  tags?: string[]
+  keyword?: string
+  limit?: number
+}
+
+export function makePhysicalAnchorId(): string {
+  const ts = Date.now().toString(36)
+  const uuid8 = randomUUID().replace(/-/g, '').slice(0, 8)
+  return `pa_${ts}_${uuid8}`
+}
+
 // ── Experiment types ──────────────────────────────────────────────────────────
 export interface ExperimentSpec {
   title: string
@@ -78,7 +152,8 @@ export interface ExperimentSummary {
   keyFindings: string[]
   failureAnalysis?: string
   nextSuggestions: string[]
-  experienceId?: string  // ID written to ExperienceStore
+  /** Pending ID returned by experience_write; becomes an ExperienceStore ID only after review approval. */
+  pendingExperienceId?: string
   branchName?: string    // git branch with experiment code
   durationMs: number
   turnsUsed: number

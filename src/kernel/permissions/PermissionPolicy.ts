@@ -258,10 +258,11 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     context,
   ): Promise<CanUseToolResult> => {
     const record = asRecord(input)
-    const permission = mergePermissionDeclaration(
-      mergePermissionDeclaration(DEFAULT_TOOL_PERMISSIONS[tool.name], tool.permission),
+    const configuredPermission = mergePermissionDeclaration(
+      DEFAULT_TOOL_PERMISSIONS[tool.name],
       permissionConfig.tools?.[tool.name],
     )
+    const permission = mergePermissionDeclaration(configuredPermission, tool.permission)
 
     if (permission.enabled === false) {
       return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` }

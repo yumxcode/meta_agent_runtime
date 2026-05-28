@@ -12,7 +12,7 @@ import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
 import { initialLoopState, type LoopState } from './LoopState.js'
 import { applyToolResultBudget } from '../tools/ToolResultBudget.js'
-import { autoCompactIfNeeded } from '../compact/AutoCompact.js'
+import { autoCompactIfNeeded, type AutoCompactTrackingState } from '../compact/AutoCompact.js'
 import { streamMessages } from '../api/AnthropicClient.js'
 import { streamDeepSeekMessages } from '../api/DeepSeekClient.js'
 import {
@@ -68,6 +68,7 @@ export interface LoopResult {
   fallbackTriggered: boolean
   permissionDenials: PermissionDenial[]
   finalMessages: KernelMessage[]
+  autoCompactTracking: AutoCompactTrackingState | undefined
 }
 
 // ── Context passed in from KernelSession ─────────────────────────────────────
@@ -81,6 +82,7 @@ export interface KernelLoopContext {
   sessionId: string
   cwd: string
   cumulativeCostUsd: number
+  autoCompactTracking?: AutoCompactTrackingState
 }
 
 // ── Streaming accumulator for one assistant message ───────────────────────────
@@ -166,7 +168,7 @@ export async function* runKernelLoop(
   const canUseTool = config.canUseTool ?? defaultCanUseTool
   const maxTurns = config.maxTurns ?? 100
 
-  let state: LoopState = initialLoopState([...mutableMessages], config.model)
+  let state: LoopState = initialLoopState([...mutableMessages], config.model, ctx.autoCompactTracking)
   let totalUsage: TokenUsage = emptyUsage()
   let totalCost = ctx.cumulativeCostUsd
   let allPermissionDenials: PermissionDenial[] = []
@@ -191,6 +193,7 @@ export async function* runKernelLoop(
       fallbackTriggered: state.fallbackTriggered,
       permissionDenials: allPermissionDenials,
       finalMessages: [...mutableMessages],
+      autoCompactTracking: state.autoCompactTracking,
     }
   }
 
@@ -200,6 +203,9 @@ export async function* runKernelLoop(
 
     // ── Step 5: autoCompactIfNeeded ──────────────────────────────────────────
     const messagesForQuery = [...getMessagesAfterCompactBoundary(budgetedMessages)]
+    const effectiveSystemPrompt = [config.systemPrompt, config.appendSystemPrompt]
+      .filter(Boolean)
+      .join('\n\n')
 
     const compactResult = config.compact?.enabled === false
       ? {
@@ -215,14 +221,14 @@ export async function* runKernelLoop(
           messagesForQuery,
           state.currentModel,
           fileCache,
-          config.querySource,
+          config.compact?.querySource ?? config.querySource,
           state.autoCompactTracking,
           state.maxOutputTokensOverride ?? config.maxOutputTokens,
           {
             model: config.compact?.model,
             apiKey: config.apiKey,
             baseURL: config.baseURL,
-            systemPrompt: config.systemPrompt,
+            systemPrompt: effectiveSystemPrompt,
             customInstructions: config.compact?.customInstructions,
             abortSignal: signal,
             maxRetries: config.maxRetries,
@@ -245,7 +251,10 @@ export async function* runKernelLoop(
 
       yield {
         type: 'compact_boundary',
-        compactMetadata: { summaryTokens: 0, previousTokens: tokenCountWithEstimation(messagesForQuery) },
+        compactMetadata: {
+          summaryTokens: compactResult.summaryTokenEstimate ?? 0,
+          previousTokens: tokenCountWithEstimation(messagesForQuery),
+        },
         sessionId,
       }
     } else {
@@ -267,9 +276,7 @@ export async function* runKernelLoop(
     }
 
     // ── Steps 7+8: stream API + accumulate messages ───────────────────────────
-    const systemPrompt = [config.systemPrompt, config.appendSystemPrompt]
-      .filter(Boolean)
-      .join('\n\n')
+    const systemPrompt = effectiveSystemPrompt
     const messagesForApi = state.fallbackTriggered
       ? stripThinkingBlocksFromMessages(currentMessagesForQuery)
       : currentMessagesForQuery
@@ -403,6 +410,47 @@ export async function* runKernelLoop(
       }
     } catch (err: unknown) {
       if (err instanceof PromptTooLongError) {
+        if (
+          config.compact?.enabled !== false &&
+          !state.hasAttemptedReactiveCompact
+        ) {
+          const reactiveCompactResult = await autoCompactIfNeeded(
+            currentMessagesForQuery,
+            state.currentModel,
+            fileCache,
+            config.compact?.querySource ?? config.querySource,
+            state.autoCompactTracking,
+            state.maxOutputTokensOverride ?? config.maxOutputTokens,
+            {
+              model: config.compact?.model,
+              apiKey: config.apiKey,
+              baseURL: config.baseURL,
+              systemPrompt: effectiveSystemPrompt,
+              customInstructions: config.compact?.customInstructions,
+              abortSignal: signal,
+              maxRetries: config.maxRetries,
+            },
+            true,
+          )
+          state = {
+            ...state,
+            autoCompactTracking: reactiveCompactResult.tracking,
+            hasAttemptedReactiveCompact: true,
+          }
+          if (reactiveCompactResult.wasCompacted && reactiveCompactResult.postCompactMessages) {
+            mutableMessages.splice(0, mutableMessages.length, ...reactiveCompactResult.postCompactMessages)
+            state = { ...state, messages: [...mutableMessages] }
+            yield {
+              type: 'compact_boundary',
+              compactMetadata: {
+                summaryTokens: reactiveCompactResult.summaryTokenEstimate ?? 0,
+                previousTokens: tokenCountWithEstimation(currentMessagesForQuery),
+              },
+              sessionId,
+            }
+            continue
+          }
+        }
         resultText = PROMPT_TOO_LONG_ERROR_MESSAGE
         yield { type: 'text_delta', delta: PROMPT_TOO_LONG_ERROR_MESSAGE, sessionId }
         return done('blocking_limit')

@@ -12,7 +12,7 @@
  *   - Uses flash model (not primary model) for relevance — task is simpler, cost lower
  *   - No alreadySurfaced dedup (all injected via system prompt, not per-turn)
  *   - campaign_lessons type: only loaded in campaign mode by default
- *   - robot_lessons type: only loaded in robotics mode by default
+ *   - robot_lessons type: removed; all robotics experience lives in ExperienceStore
  *   - max 5 candidate files (same as CC)
  */
 import type Anthropic from '@anthropic-ai/sdk';
@@ -67,19 +67,25 @@ export interface FindRelevantMemoriesOptions {
     domainScope?: string;
     /**
      * Current session mode.  Used to exclude mode-irrelevant memory types:
-     *   - 'robotics': excludes campaign_lessons; includes robot_lessons
-     *   - 'campaign': excludes robot_lessons; includes campaign_lessons
-     *   - 'agentic': excludes both mode-specific lesson types
+     *   - 'campaign': includes campaign_lessons (excluded in all other modes)
+     *   - 'robotics' / 'agentic': excludes campaign_lessons
      * Prevents cross-mode memory contamination (e.g. battery DOE lessons appearing
-     * in a humanoid robot session).
+     * in a robotics session).  Note: robot_lessons has been removed — all robotics
+     * experience is stored in ExperienceStore, not in memory.
      */
     sessionMode?: string;
+    /**
+     * Flash model identifier to use for relevance selection.
+     * Defaults to RELEVANCE_MODEL_FALLBACK when omitted.
+     * Pass detectProvider(config).flashModel for correct provider routing.
+     */
+    flashModel?: string;
 }
 /**
  * Find and load the memory files most relevant to the current query.
  *
  * Always loads: user + feedback topic files (small, always applicable).
- * Loads from candidates: domain_knowledge, campaign_lessons, robot_lessons, reference files
+ * Loads from candidates: domain_knowledge, campaign_lessons, reference files
  *   selected by flash model side-call (when client provided) or keyword match.
  *
  * Applies scope and mode filters before selection so out-of-scope memories

@@ -1,11 +1,11 @@
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
-export function createProgressNoteTool(projectDir) {
+export function createProgressNoteTool(projectDir, sessionId) {
     return {
         name: 'progress_note',
         description: 'Write a progress note to the robotics project store. ' +
             'Notes are shown in the R5 section when the session resumes (e.g. the next day). ' +
             'Call this at significant milestones: phase completion, sub-agent results, key decisions. ' +
-            'Keep notes concise — they accumulate across the session (max 10 retained).',
+            'Keep notes concise — they accumulate within this session (max 15 retained, oldest evicted).',
         inputSchema: {
             type: 'object',
             required: ['note'],
@@ -25,11 +25,11 @@ export function createProgressNoteTool(projectDir) {
             if (!note)
                 return { content: 'note is required', isError: true };
             try {
-                await RoboticsProjectStore.appendProgress(projectDir, note);
+                await RoboticsProjectStore.appendProgress(projectDir, sessionId, note);
                 // Optionally update the current phase label in state
                 const phase = input['current_phase'];
                 if (phase) {
-                    const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                    const state = await RoboticsProjectStore.findBySession(projectDir, sessionId);
                     if (state) {
                         state.currentPhase = phase;
                         await RoboticsProjectStore.save(state);

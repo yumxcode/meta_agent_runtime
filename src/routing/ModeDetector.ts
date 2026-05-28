@@ -52,7 +52,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 // One-shot flash model call: ~300–500 ms, ~$0.00012 per detection, fires once per
 // session. Falls back to heuristic on any error or timeout.
 
-const LLM_DETECTION_MODEL = 'deepseek-v4-flash'
+const LLM_DETECTION_MODEL = 'claude-haiku-4-5-20251001'
 
 const LLM_SYSTEM_PROMPT = `\
 You are a routing classifier for an engineering AI assistant that has three execution modes.
@@ -285,6 +285,7 @@ export class ModeDetector {
     hint: SessionModeHint = 'auto',
     hasTools = false,
     client?: Anthropic,
+    model = LLM_DETECTION_MODEL,
   ): Promise<ModeDetectionResult> {
     // Layer 1: explicit — bypass everything
     if (hint !== 'auto') {
@@ -297,7 +298,7 @@ export class ModeDetector {
 
     // Layer 2: LLM classification (preferred) or heuristic fallback
     const classification = client
-      ? await ModeDetector._detectWithLLM(prompt, hasTools, client)
+      ? await ModeDetector._detectWithLLM(prompt, hasTools, client, model)
       : ModeDetector.detectSync(prompt, 'auto', hasTools)
 
     return classification
@@ -312,6 +313,7 @@ export class ModeDetector {
     prompt: string,
     hasTools: boolean,
     client: Anthropic,
+    model: string,
   ): Promise<ModeDetectionResult> {
     try {
       // 5 s timeout: routing is on the critical path to the first API call.
@@ -320,7 +322,7 @@ export class ModeDetector {
       // (Fix #6).
       const msg = await withTimeout(
         client.messages.create({
-          model: LLM_DETECTION_MODEL,
+          model,
           max_tokens: 10,
           system: LLM_SYSTEM_PROMPT,
           messages: [{ role: 'user', content: prompt }],

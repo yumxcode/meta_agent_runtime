@@ -19,6 +19,7 @@ export { OOMChecker, BUILT_IN_OOM_DB } from './built-in/OOMChecker.js';
 export type { OOMRange, OOMReferenceDB } from './built-in/OOMChecker.js';
 export { PhysicsConstraintChecker } from './built-in/PhysicsConstraintChecker.js';
 export { DimensionChecker } from './built-in/DimensionChecker.js';
+export { ExperiencePatternChecker, FailurePatternChecker } from './built-in/FailurePatternChecker.js';
 import { VVHookChain } from './VVHookChain.js';
 export declare function createDefaultVVChain(): VVHookChain;
 //# sourceMappingURL=index.d.ts.map

@@ -20,6 +20,7 @@
  *   N+         : tool_use  (one per tool call, in order)
  */
 import OpenAI from 'openai';
+import { DebugWriter } from './DebugWriter.js';
 import { isRetryableError, isPromptTooLongError, PromptTooLongError, } from './Errors.js';
 // ── Constants ─────────────────────────────────────────────────────────────────
 const DEEPSEEK_BASE_URL = 'https://api.deepseek.com';
@@ -118,7 +119,7 @@ export async function* streamDeepSeekMessages(params, config, onRetry) {
         try {
             // eslint-disable-next-line @typescript-eslint/no-explicit-any
             const stream = await client.chat.completions.create(baseRequest, { signal: params.abortSignal });
-            yield* processStream(stream, config.debug);
+            yield* processStream(stream, config.debug, params.sessionId, baseRequest);
             return;
         }
         catch (error) {
@@ -151,7 +152,12 @@ export async function* streamDeepSeekMessages(params, config, onRetry) {
  * on message_start and outputTokens on message_delta, both of which are used
  * only when message_stop triggers finaliseAccumulator().
  */
-async function* processStream(stream, debug) {
+async function* processStream(stream, debug, sessionId, reqPayload) {
+    // Open debug file (no-op when debug is false or sessionId is absent)
+    const writer = await DebugWriter.open(sessionId, reqPayload?.['model'] ?? 'deepseek', debug);
+    if (writer && reqPayload) {
+        await writer.writeRequest(reqPayload);
+    }
     // Block index tracking
     let nextBlockIdx = 0;
     let thinkingBlockIdx = -1;
@@ -163,9 +169,6 @@ async function* processStream(stream, debug) {
     let outputTokens = 0;
     let stopReason = null;
     for await (const chunk of stream) {
-        if (debug) {
-            process.stderr.write(`[DeepSeek] ${JSON.stringify(chunk)}\n`);
-        }
         // ── Usage chunk (last chunk, choices is empty) ──────────────────────────
         if (chunk.usage) {
             const u = chunk.usage;
@@ -259,5 +262,7 @@ async function* processStream(stream, debug) {
         usage: { output_tokens: outputTokens },
     };
     yield { type: 'message_stop' };
+    if (writer)
+        await writer.close();
 }
 //# sourceMappingURL=DeepSeekClient.js.map

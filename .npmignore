@@ -1,0 +1,21 @@
+# Test infrastructure — never ship to npm
+dist/**/__tests__/
+src/
+fixtures/
+examples/
+scripts/
+*.test.ts
+*.test.js
+*.test.d.ts
+*.test.js.map
+*.test.d.ts.map
+
+# Dev configs
+tsconfig*.json
+vitest.config.ts
+.eslintrc*
+.prettierrc*
+
+# Misc
+*.tgz
+test-debug-pipeline.mjs

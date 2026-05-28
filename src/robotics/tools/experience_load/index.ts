@@ -1,5 +1,5 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
-import type { ExperienceStore } from '../../ExperienceStore.js'
+import { isExperienceId, type ExperienceStore } from '../../ExperienceStore.js'
 
 export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool {
   return {
@@ -21,6 +21,7 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
     async call(input): Promise<ToolResult> {
       const id = String(input['id'] ?? '')
       if (!id) return { content: 'id is required', isError: true }
+      if (!isExperienceId(id)) return { content: `Invalid experience id: ${id}`, isError: true }
       try {
         const entry = await store.load(id)
         if (!entry) return { content: `Experience not found: ${id}`, isError: true }
@@ -29,6 +30,7 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
           `# ${entry.title}`,
           `**ID**: ${entry.id}`,
           `**Domain**: ${entry.domain} | **Difficulty**: ${entry.difficulty}`,
+          `**Confidence**: ${entry.confidenceTier ?? 'observed'} | **Observations**: ${entry.observationCount ?? 1} | **Contradictions**: ${entry.contradictionCount ?? 0}`,
           ...(entry.algorithm ? [`**Algorithm**: ${entry.algorithm}`] : []),
           ...(entry.robot ? [`**Robot**: ${entry.robot}`] : []),
           ...(entry.tags.length ? [`**Tags**: ${entry.tags.join(', ')}`] : []),
@@ -46,9 +48,13 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
           ...(entry.outcome.workarounds?.length
             ? ['\n**Workarounds**:', ...entry.outcome.workarounds.map(w => `- ${w}`)]
             : []),
+          ...(entry.invalidatedAssumptions?.length
+            ? ['\n**Invalidated assumptions**:', ...entry.invalidatedAssumptions.map(a => `- ${a}`)]
+            : []),
           '',
           ...(entry.metrics ? ['## Metrics', ...Object.entries(entry.metrics).map(([k, v]) => `- **${k}**: ${v}`), ''] : []),
           ...(entry.relatedPapers?.length ? ['## Related Papers', ...entry.relatedPapers.map(p => `- ${p}`), ''] : []),
+          ...(entry.evidenceRefs?.length ? ['## Evidence References', ...entry.evidenceRefs.map(ref => `- ${ref}`), ''] : []),
           ...(entry.sourceTaskId ? [`**Source task**: ${entry.sourceTaskId}`, ''] : []),
           ...(entry.fullReport ? ['---', '## Full Report', entry.fullReport] : []),
         ]

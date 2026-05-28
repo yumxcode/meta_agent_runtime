@@ -13,6 +13,7 @@ import type { KernelTool } from '../types/KernelTool.js'
 import type { KernelConfig, ThinkingConfig } from '../types/KernelConfig.js'
 import type { APIMessage } from '../messages/MessageNormalizer.js'
 import { buildThinkingParam } from '../utils/ThinkingConfig.js'
+import { DebugWriter } from './DebugWriter.js'
 import {
   isRetryableError,
   isPromptTooLongError,
@@ -116,6 +117,12 @@ export async function* streamMessages(
     ...(thinkingParam ? { thinking: thinkingParam } : {}),
   }
 
+  // Open debug file once (outside retry loop — one file per logical call)
+  const writer = await DebugWriter.open(params.sessionId, params.model, config.debug)
+  if (writer) {
+    await writer.writeRequest(requestParams as unknown as Record<string, unknown>)
+  }
+
   let attempt = 0
   while (true) {
     try {
@@ -126,6 +133,7 @@ export async function* streamMessages(
       for await (const event of stream) {
         yield event as unknown as StreamEvent
       }
+      if (writer) await writer.close()
       return
     } catch (error: unknown) {
       if (isPromptTooLongError(error)) {
@@ -144,6 +152,7 @@ export async function* streamMessages(
         attempt >= (config.maxRetries ?? DEFAULT_MAX_RETRIES) ||
         params.abortSignal.aborted
       ) {
+        if (writer) await writer.close().catch(() => {})
         throw error
       }
 

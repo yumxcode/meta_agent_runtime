@@ -68,5 +68,23 @@ export interface RouterOptions {
      * selection (stored as `opts.hardwareId`).
      */
     robot?: string;
+    /**
+     * Whether the user explicitly chose to resume a previous robotics session
+     * (e.g. via --resume flag or the interactive session picker).
+     *
+     * When true, RoboticsSession shows the resume banner and injects previous
+     * progress notes into R5.  When false (default), prior project state is
+     * still loaded for continuity (git state, agent mode) but R5 is suppressed
+     * so a fresh start in the same workspace doesn't pollute the context with
+     * stale progress from earlier sessions.
+     */
+    explicitResume?: boolean;
+    /**
+     * Called when the flash classifier suggests escalating from single-agent to
+     * multi-agent mode.  The CLI implementation should print a confirmation prompt
+     * and return true if the user agrees.  When absent, escalation is denied and
+     * the session stays in single-agent mode.
+     */
+    onEscalationRequest?: (reason: string) => Promise<boolean>;
 }
 //# sourceMappingURL=types.d.ts.map

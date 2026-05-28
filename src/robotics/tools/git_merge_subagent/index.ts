@@ -6,6 +6,7 @@ import type { SubAgentTaskId } from '../../../subagent/types.js'
 export function createGitMergeSubAgentTool(
   gitMgr: GitWorkspaceManager,
   projectDir: string,
+  sessionId: string,
 ): MetaAgentTool {
   return {
     name: 'git_merge_subagent',
@@ -46,7 +47,7 @@ export function createGitMergeSubAgentTool(
       if (!taskId) return { content: 'task_id is required', isError: true }
 
       try {
-        const state = await RoboticsProjectStore.findByProjectDir(projectDir)
+        const state = await RoboticsProjectStore.findBySession(projectDir, sessionId)
         const branchName = state?.git.subAgentBranches[taskId]
         if (!branchName) {
           return { content: `No git branch registered for task ${taskId}.`, isError: true }
@@ -61,7 +62,7 @@ export function createGitMergeSubAgentTool(
 
         // Clean up the worktree after merge
         await gitMgr.removeWorktree(taskId, { deleteBranch: false })
-        await RoboticsProjectStore.completeSubAgentTask(projectDir, taskId)
+        await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId)
 
         return {
           content: [

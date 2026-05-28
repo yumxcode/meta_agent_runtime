@@ -3,10 +3,9 @@
  *
  * Single global memory directory: ~/.claude/meta-agent/memory/
  *
- * Unlike Claude Code (per-project paths), meta-agent memory is global because
- * domain_knowledge, campaign_lessons, and robot_lessons must be shared across
- * engineering projects and sessions.
- * Per-project isolation can be added later via a subdirectory overlay if needed.
+ * Memory is global and intentionally limited to user profile / feedback entries.
+ * Engineering knowledge lives in ExperienceStore, provenance, project docs, or
+ * AGENT.md rather than in memory.
  */
 import { homedir } from 'os';
 import { join, sep } from 'path';

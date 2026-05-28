@@ -6,6 +6,8 @@
  * returns structured proposals only; this module performs all filesystem writes
  * so frontmatter stays constrained and mode boundaries are enforced.
  */
+import Anthropic from '@anthropic-ai/sdk';
+import OpenAI from 'openai';
 import { appendFile, mkdir, readFile, writeFile } from 'fs/promises';
 import { join } from 'path';
 import { ensureMemoryDirExists, loadMemoryIndex } from './memdir.js';
@@ -59,13 +61,11 @@ function buildTranscript(messages) {
         return full;
     return full.slice(full.length - MAX_TRANSCRIPT_CHARS);
 }
-function allowedTypesForMode(mode) {
-    const base = ['user', 'feedback', 'domain_knowledge', 'reference'];
-    if (mode === 'campaign')
-        return new Set([...base, 'campaign_lessons']);
-    if (mode === 'robotics')
-        return new Set([...base, 'robot_lessons']);
-    return new Set(base);
+function allowedTypesForMode(_mode) {
+    // Memory is strictly limited to user profile and agent-behaviour feedback.
+    // All engineering experience (lessons, domain knowledge, references) lives in
+    // ExperienceStore or project docs — never in memory.
+    return new Set(['user', 'feedback']);
 }
 function sanitizeScalar(value, max = 240) {
     if (typeof value !== 'string')
@@ -165,7 +165,7 @@ function normalizeProposal(raw, mode, domain) {
     if (!allowedTypesForMode(mode).has(type))
         return null;
     const filename = sanitizeFilename(raw.filename, name);
-    const normalizedDomain = sanitizeScalar(raw.domain, 80) ?? (type === 'domain_knowledge' ? domain : undefined);
+    const normalizedDomain = sanitizeScalar(raw.domain, 80) ?? domain;
     const indexLine = sanitizeScalar(raw.index_line, 300) ??
         `- [${name}](${filename}) - ${description}`;
     return {
@@ -184,9 +184,9 @@ function normalizeProposal(raw, mode, domain) {
     };
 }
 export async function runPostSessionMemoryWriter(opts) {
-    const { client, mode, domain, messages, memoryDir = MEMORY_DIR, model = DEFAULT_MEMORY_WRITER_MODEL } = opts;
-    if (!client || messages.length === 0) {
-        return { attempted: false, written: [], skipped: ['no_client_or_messages'] };
+    const { client, mode, domain, messages, memoryDir = MEMORY_DIR, model = DEFAULT_MEMORY_WRITER_MODEL, apiKey, baseURL, } = opts;
+    if (messages.length === 0) {
+        return { attempted: false, written: [], skipped: ['no_messages'] };
     }
     if (memoryDir === MEMORY_DIR)
         await ensureMemoryDirExists();
@@ -207,25 +207,27 @@ export async function runPostSessionMemoryWriter(opts) {
     if (!transcript.trim()) {
         return { attempted: false, written: [], skipped: ['empty_transcript'] };
     }
-    const response = await withTimeout(client.messages.create({
+    const userContent = [
+        `Mode: ${mode}`,
+        `Domain: ${domain ?? 'generic'}`,
+        '',
+        'Existing MEMORY.md index:',
+        existingIndex || '(empty)',
+        '',
+        'Session transcript:',
+        transcript,
+    ].join('\n');
+    const raw = await callMemoryWriterModel({
+        client,
         model,
-        max_tokens: 1800,
+        apiKey,
+        baseURL,
         system: buildSystemPrompt(mode),
-        messages: [{
-                role: 'user',
-                content: [
-                    `Mode: ${mode}`,
-                    `Domain: ${domain ?? 'generic'}`,
-                    '',
-                    'Existing MEMORY.md index:',
-                    existingIndex || '(empty)',
-                    '',
-                    'Session transcript:',
-                    transcript,
-                ].join('\n'),
-            }],
-    }), 8_000);
-    const raw = response.content[0]?.type === 'text' ? response.content[0].text : '';
+        user: userContent,
+    });
+    if (!raw.trim()) {
+        return { attempted: true, written: [], skipped: ['empty_model_response'] };
+    }
     const parsed = extractJson(raw);
     const proposals = Array.isArray(parsed?.memories)
         ? parsed.memories
@@ -259,5 +261,39 @@ export async function runPostSessionMemoryWriter(opts) {
         written.push(proposal.filename);
     }
     return { attempted: true, written, skipped };
+}
+async function callMemoryWriterModel(opts) {
+    if (opts.model.startsWith('deepseek-')) {
+        const client = new OpenAI({
+            apiKey: opts.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
+            baseURL: opts.baseURL ?? 'https://api.deepseek.com',
+            maxRetries: 1,
+        });
+        const response = await withTimeout(client.chat.completions.create({
+            model: opts.model,
+            max_tokens: 1800,
+            messages: [
+                { role: 'system', content: opts.system },
+                { role: 'user', content: opts.user },
+            ],
+        }), 8_000);
+        return response.choices[0]?.message?.content ?? '';
+    }
+    const anthropicClient = opts.client ?? (opts.apiKey
+        ? new Anthropic({
+            apiKey: opts.apiKey,
+            baseURL: opts.baseURL,
+            maxRetries: 1,
+        })
+        : null);
+    if (!anthropicClient)
+        return '';
+    const response = await withTimeout(anthropicClient.messages.create({
+        model: opts.model,
+        max_tokens: 1800,
+        system: opts.system,
+        messages: [{ role: 'user', content: opts.user }],
+    }), 8_000);
+    return response.content[0]?.type === 'text' ? response.content[0].text : '';
 }
 //# sourceMappingURL=memoryWriter.js.map

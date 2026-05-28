@@ -36,12 +36,14 @@ Return a structured JSON block at the end:
 }
 \`\`\`
 
-Also call experience_write to record the literature survey as an experience entry.
+Also call experience_write to propose the literature survey as a pending experience entry.
+The main session user must approve it with /experience review before it is committed.
 `
 
 export function createPaperSearchTool(
   bridge: ISubAgentDispatcher,
   projectDir: string,
+  sessionId: string,
 ): MetaAgentTool {
   return {
     name: 'paper_search',
@@ -105,7 +107,7 @@ export function createPaperSearchTool(
           abortSignal: ctx.abortSignal,
         })
 
-        await RoboticsProjectStore.registerSubAgentTask(projectDir, {
+        await RoboticsProjectStore.registerSubAgentTask(projectDir, sessionId, {
           taskId: record.taskId,
           role: 'paper_search',
           title: `Paper search: ${query.slice(0, 50)}`,
@@ -122,7 +124,7 @@ export function createPaperSearchTool(
             status = latest?.status ?? 'failed'
           }
           const final = await bridge.getStatus(record.taskId)
-          await RoboticsProjectStore.completeSubAgentTask(projectDir, record.taskId)
+          await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
 
           if (final?.status === 'completed') {
             return { content: `📚 Paper search complete.\n\n${final.result ?? ''}`, isError: false }

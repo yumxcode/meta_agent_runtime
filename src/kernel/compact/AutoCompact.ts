@@ -31,6 +31,8 @@ export interface AutoCompactResult {
   wasCompacted: boolean
   /** New messages if compaction ran (replaces the pre-compact messages in the loop) */
   postCompactMessages?: KernelMessage[]
+  /** Estimated token count of the compact summary */
+  summaryTokenEstimate?: number
   /** Updated tracking state */
   tracking: AutoCompactTrackingState
 }
@@ -55,6 +57,7 @@ export async function autoCompactIfNeeded(
   tracking: AutoCompactTrackingState | undefined,
   maxOutputTokens: number | undefined,
   compactOptions: CompactOptions,
+  force = false,
 ): Promise<AutoCompactResult> {
   const currentTracking: AutoCompactTrackingState = tracking ?? {
     compacted: false,
@@ -82,7 +85,7 @@ export async function autoCompactIfNeeded(
   const tokenCount = tokenCountWithEstimation(messagesForQuery)
   const { isAtCompactThreshold } = calculateTokenWarningState(tokenCount, model, maxOutputTokens)
 
-  if (!isAtCompactThreshold) {
+  if (!force && !isAtCompactThreshold) {
     return { wasCompacted: false, tracking: { ...currentTracking, turnCounter: currentTracking.turnCounter + 1 } }
   }
 
@@ -100,6 +103,7 @@ export async function autoCompactIfNeeded(
     return {
       wasCompacted: true,
       postCompactMessages: result.postCompactMessages,
+      summaryTokenEstimate: result.summaryTokenEstimate,
       tracking: newTracking,
     }
   } catch (_error: unknown) {

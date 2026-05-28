@@ -3,6 +3,34 @@ import { makeTextUserMessage } from './messages/MessageFactory.js';
 import { FileStateCache } from './session/FileStateCache.js';
 import { createBootstrapState } from './session/BootstrapState.js';
 import { runKernelLoop } from './loop/KernelLoop.js';
+const VOLATILE_CONTEXT_PREFIX_START = '<context>\n';
+const VOLATILE_CONTEXT_PREFIX_END = '\n</context>\n\n---\n\n';
+function stripVolatileContextPrefix(text) {
+    if (!text.startsWith(VOLATILE_CONTEXT_PREFIX_START))
+        return text;
+    const end = text.lastIndexOf(VOLATILE_CONTEXT_PREFIX_END);
+    if (end < 0)
+        return text;
+    return text.slice(end + VOLATILE_CONTEXT_PREFIX_END.length);
+}
+function stripVolatileContextFromMessages(messages) {
+    for (const msg of messages) {
+        if (msg.role !== 'user')
+            continue;
+        let changed = false;
+        const content = msg.content.map(block => {
+            if (block.type !== 'text')
+                return block;
+            const stripped = stripVolatileContextPrefix(block.text);
+            if (stripped === block.text)
+                return block;
+            changed = true;
+            return { ...block, text: stripped };
+        });
+        if (changed)
+            msg.content = content;
+    }
+}
 export class KernelSession {
     _config;
     _messages = [];
@@ -10,6 +38,7 @@ export class KernelSession {
     _totalUsage = emptyUsage();
     _totalCostUsd = 0;
     _fileCache;
+    _autoCompactTracking;
     _sessionId;
     _cwd;
     _permissionDenials = [];
@@ -36,6 +65,7 @@ export class KernelSession {
         try {
             // Fresh abort controller for this submitMessage call
             this._abortController = new AbortController();
+            stripVolatileContextFromMessages(this._messages);
             // Build user message
             const userMessage = typeof prompt === 'string'
                 ? makeTextUserMessage(prompt)
@@ -59,6 +89,7 @@ export class KernelSession {
                     sessionId: this._sessionId,
                     cwd: this._cwd,
                     cumulativeCostUsd: this._totalCostUsd,
+                    autoCompactTracking: this._autoCompactTracking,
                 });
                 let step = await gen.next();
                 while (!step.done) {
@@ -71,12 +102,15 @@ export class KernelSession {
             catch (err) {
                 loopError = err;
             }
+            const resultEvent = this._buildResultEvent(loopResult, loopError);
+            stripVolatileContextFromMessages(this._messages);
             // Emit terminal result event
-            yield this._buildResultEvent(loopResult, loopError);
+            yield resultEvent;
             // Update session cumulative state
             if (loopResult) {
                 this._totalUsage = addUsage(this._totalUsage, loopResult.totalUsage);
                 this._totalCostUsd = loopResult.costUsd;
+                this._autoCompactTracking = loopResult.autoCompactTracking;
                 this._permissionDenials.push(...loopResult.permissionDenials);
                 if (loopResult.fallbackTriggered) {
                     this._config = { ...this._config, model: loopResult.finalModel };

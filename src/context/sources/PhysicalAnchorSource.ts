@@ -1,0 +1,76 @@
+/**
+ * PhysicalAnchorSource — manifest-line provider for R6 Physical Anchors section.
+ *
+ * Unlike ExperienceSource (which feeds ContextPager slots via listExperiences),
+ * PhysicalAnchorSource only provides a compact manifest line.  Physical anchor
+ * slots are loaded proactively in R6 (high-confidence global/robot scope) or
+ * on demand via physical_anchor_search / physical_anchor_load.
+ */
+
+import type { PhysicalAnchorStore } from '../../robotics/PhysicalAnchorStore.js'
+
+export class PhysicalAnchorSource {
+  constructor(private readonly store: PhysicalAnchorStore) {}
+
+  /**
+   * One-line summary for the Manifest layer.
+   * Shows total count, scope breakdown (global/robot/code), and top domains.
+   * Example: "Physical anchors: 7 total | global:2 robot:3 code:2 | motion_planning:4"
+   */
+  async getManifestLine(): Promise<string> {
+    try {
+      const all = await this.store.search({ limit: 100 })
+      if (all.length === 0) return 'Physical anchors: none yet'
+
+      // Scope breakdown
+      const scopeCounts: Record<string, number> = { global: 0, robot: 0, code: 0 }
+      const domainCounts: Record<string, number> = {}
+      for (const a of all) {
+        scopeCounts[a.scope] = (scopeCounts[a.scope] ?? 0) + 1
+        domainCounts[a.domain] = (domainCounts[a.domain] ?? 0) + 1
+      }
+
+      const scopeParts = Object.entries(scopeCounts)
+        .filter(([, n]) => n > 0)
+        .map(([s, n]) => `${s}:${n}`)
+        .join(' ')
+
+      const topDomains = Object.entries(domainCounts)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 2)
+        .map(([d, n]) => `${d}:${n}`)
+        .join(', ')
+
+      return `Physical anchors: ${all.length} total | ${scopeParts}${topDomains ? ` | ${topDomains}` : ''}`
+    } catch {
+      return 'Physical anchors: (unavailable)'
+    }
+  }
+
+  /**
+   * Load top-priority anchors for proactive R6 slot injection.
+   * Returns up to `limit` high-confidence global and robot-scoped anchors
+   * that should always be visible without a tool call.
+   */
+  async loadPriorityAnchors(limit = 3): Promise<Awaited<ReturnType<PhysicalAnchorStore['search']>>> {
+    try {
+      // Load global anchors (universal physics / spec facts)
+      const global = await this.store.search({ scope: 'global', limit })
+      // Load robot-specific anchors (platform constraints)
+      const robot = await this.store.search({ scope: 'robot', limit })
+
+      // Merge, deduplicate, cap
+      const seen = new Set<string>()
+      const result: typeof global = []
+      for (const a of [...global, ...robot]) {
+        if (!seen.has(a.id) && result.length < limit) {
+          seen.add(a.id)
+          result.push(a)
+        }
+      }
+      return result
+    } catch {
+      return []
+    }
+  }
+}

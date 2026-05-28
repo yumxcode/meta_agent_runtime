@@ -12,7 +12,7 @@
  *   - Uses flash model (not primary model) for relevance — task is simpler, cost lower
  *   - No alreadySurfaced dedup (all injected via system prompt, not per-turn)
  *   - campaign_lessons type: only loaded in campaign mode by default
- *   - robot_lessons type: only loaded in robotics mode by default
+ *   - robot_lessons type: removed; all robotics experience lives in ExperienceStore
  *   - max 5 candidate files (same as CC)
  */
 
@@ -22,23 +22,7 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
 import { MEMORY_TYPES, type MemoryType } from './types.js'
 import type { AgentMode } from '../dynamicPrompt.js'
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Shared utility: promise with hard timeout (Fix #5)
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Race `promise` against a timeout of `ms` milliseconds.
- * Rejects with a TimeoutError if the timeout fires first.
- * Always clears the timer to avoid leaking into the event loop.
- */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms`)), ms)
-  })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
-}
+import { withTimeout } from '../utils/withTimeout.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -52,7 +36,8 @@ const MEMORY_SCOPES: ReadonlySet<string> = new Set<MemoryScope>([
 ])
 const MAX_TOPIC_FILES_TO_SCAN = 500
 const MAX_FRONTMATTER_BYTES = 64 * 1024
-const MAX_MEMORY_CONTENT_BYTES = 100 * 1024
+const MAX_MEMORY_CONTENT_BYTES = 24 * 1024
+const MAX_MEMORY_CONTEXT_BYTES = 64 * 1024
 
 export type TopicFileHeader = {
   filename: string
@@ -127,6 +112,18 @@ function truncateMemoryContent(content: string): string {
   return (
     content.slice(0, MAX_MEMORY_CONTENT_BYTES) +
     `\n\n[Memory file truncated: ${bytes} bytes exceeds ${MAX_MEMORY_CONTENT_BYTES} byte limit.]`
+  ).trim()
+}
+
+function truncateToBytes(content: string, maxBytes: number, totalBytes: number): string {
+  if (Buffer.byteLength(content, 'utf-8') <= maxBytes) return content
+  let out = content
+  while (Buffer.byteLength(out, 'utf-8') > maxBytes && out.length > 0) {
+    out = out.slice(0, Math.floor(out.length * 0.9))
+  }
+  return (
+    out +
+    `\n\n[Memory context truncated: total recalled memories exceeded ${totalBytes} byte budget.]`
   ).trim()
 }
 
@@ -210,6 +207,20 @@ export async function scanTopicFiles(
 /** These types are loaded on every turn regardless of query. */
 const ALWAYS_RELEVANT: ReadonlySet<MemoryType> = new Set(['user', 'feedback'])
 
+/**
+ * Maximum number of `feedback` files loaded per turn.
+ *
+ * `feedback` is always-relevant (no flash filter), so all matching files are
+ * loaded unconditionally.  As a session ages, feedback files accumulate and
+ * silently inflate per-turn token cost.  Capping at the most recent N entries
+ * prevents long-cycle token growth while keeping the highest-signal feedback
+ * (most recent corrections) always in context.
+ *
+ * `user` files are not capped — typically 1-2 files, and user profile is fully
+ * stable context that should always be present.
+ */
+const MAX_FEEDBACK_FILES = 5
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Keyword-based selection (fallback)
 // ─────────────────────────────────────────────────────────────────────────────
@@ -247,7 +258,9 @@ function keywordScore(header: TopicFileHeader, queryTokens: Set<string>): number
 // Flash model selection (preferred)
 // ─────────────────────────────────────────────────────────────────────────────
 
-const RELEVANCE_MODEL = 'deepseek-v4-flash'
+// flashModel is now passed in via opts.client — kept as fallback for callers
+// that don't provide a flashModel string.
+const RELEVANCE_MODEL_FALLBACK = 'deepseek-v4-flash'
 
 const RELEVANCE_SYSTEM_PROMPT = `\
 You are selecting engineering memory files that will be useful to an AI assistant as it processes a user query.
@@ -260,7 +273,6 @@ Rules:
 - Include only memories you are certain will help. If unsure, exclude.
 - For domain_knowledge: include only when the query needs that specific physical constant, material, or standard.
 - For campaign_lessons: include only when the query is about a DOE or campaign problem in the same domain.
-- For robot_lessons: include only when the query is about a robotics problem or robot-mode failure/warning in the same domain.
 - For reference: include only when the query likely needs that external system.
 - Do NOT select memories for tools the AI is already actively invoking (those are already in context).
 - If no memories would clearly help, return {"selected": []}.
@@ -271,6 +283,7 @@ async function selectByFlashModel(
   query: string,
   candidates: TopicFileHeader[],
   client: Anthropic,
+  flashModel: string = RELEVANCE_MODEL_FALLBACK,
 ): Promise<string[]> {
   if (candidates.length === 0) return []
 
@@ -284,7 +297,7 @@ async function selectByFlashModel(
     // catch block falls through to keyword-based selection (Fix #5).
     const msg = await withTimeout(
       client.messages.create({
-        model: RELEVANCE_MODEL,
+        model: flashModel,
         max_tokens: 256,
         system: RELEVANCE_SYSTEM_PROMPT,
         messages: [{
@@ -335,13 +348,19 @@ export interface FindRelevantMemoriesOptions {
   domainScope?: string
   /**
    * Current session mode.  Used to exclude mode-irrelevant memory types:
-   *   - 'robotics': excludes campaign_lessons; includes robot_lessons
-   *   - 'campaign': excludes robot_lessons; includes campaign_lessons
-   *   - 'agentic': excludes both mode-specific lesson types
+   *   - 'campaign': includes campaign_lessons (excluded in all other modes)
+   *   - 'robotics' / 'agentic': excludes campaign_lessons
    * Prevents cross-mode memory contamination (e.g. battery DOE lessons appearing
-   * in a humanoid robot session).
+   * in a robotics session).  Note: robot_lessons has been removed — all robotics
+   * experience is stored in ExperienceStore, not in memory.
    */
   sessionMode?: string
+  /**
+   * Flash model identifier to use for relevance selection.
+   * Defaults to RELEVANCE_MODEL_FALLBACK when omitted.
+   * Pass detectProvider(config).flashModel for correct provider routing.
+   */
+  flashModel?: string
 }
 
 // ── Scope/freshness filter predicate ─────────────────────────────────────────
@@ -369,9 +388,9 @@ function _passesFilters(
     if (tag && tag !== opts.domainScope) return false
   }
 
-  // ── Session-mode filtering: prevent cross-mode contamination ──────────────
-  if (header.type === 'campaign_lessons' && opts.sessionMode !== 'campaign') return false
-  if (header.type === 'robot_lessons' && opts.sessionMode !== 'robotics') return false
+  // ── Session-mode filtering ────────────────────────────────────────────────
+  // Memory now only contains 'user' and 'feedback' types, both of which are
+  // always relevant regardless of mode. No cross-mode filtering needed.
 
   return true
 }
@@ -380,7 +399,7 @@ function _passesFilters(
  * Find and load the memory files most relevant to the current query.
  *
  * Always loads: user + feedback topic files (small, always applicable).
- * Loads from candidates: domain_knowledge, campaign_lessons, robot_lessons, reference files
+ * Loads from candidates: domain_knowledge, campaign_lessons, reference files
  *   selected by flash model side-call (when client provided) or keyword match.
  *
  * Applies scope and mode filters before selection so out-of-scope memories
@@ -407,14 +426,38 @@ export async function findRelevantMemories(
 
   // Partition filtered headers: always-relevant vs. query-dependent candidates.
   // user + feedback bypass scope filters (already handled in _passesFilters).
-  const alwaysHeaders = filteredHeaders.filter(h => h.type && ALWAYS_RELEVANT.has(h.type))
+  const alwaysHeadersRaw = filteredHeaders.filter(h => h.type && ALWAYS_RELEVANT.has(h.type))
   const candidateHeaders = filteredHeaders.filter(h => !ALWAYS_RELEVANT.has(h.type as MemoryType))
+
+  // Apply per-type caps to always-relevant headers to prevent silent token growth.
+  // `feedback` is capped at MAX_FEEDBACK_FILES most-recent entries (sorted by mtime desc).
+  // `user` is uncapped — typically 1-2 files and essential for calibration.
+  const alwaysHeaders = alwaysHeadersRaw.reduce<TopicFileHeader[]>((acc, h) => {
+    if (h.type === 'feedback') {
+      const existing = acc.filter(x => x.type === 'feedback')
+      if (existing.length >= MAX_FEEDBACK_FILES) {
+        // Already have the max; keep only if this file is newer than the oldest one
+        const oldestIdx = existing.reduce(
+          (minIdx, x, i, arr) => x.mtimeMs < arr[minIdx].mtimeMs ? i : minIdx,
+          0,
+        )
+        const oldest = existing[oldestIdx]
+        if (h.mtimeMs > oldest.mtimeMs) {
+          // Replace oldest with this newer file
+          return acc.map(x => x === oldest ? h : x)
+        }
+        return acc   // this file is older than all we already have — skip
+      }
+    }
+    acc.push(h)
+    return acc
+  }, [])
 
   // Select candidates
   let selectedFilenames: string[]
   if (client && query.trim() && candidateHeaders.length > 0) {
     // Preferred: flash model side-call
-    selectedFilenames = await selectByFlashModel(query, candidateHeaders, client)
+    selectedFilenames = await selectByFlashModel(query, candidateHeaders, client, opts.flashModel)
     // Fallback to keyword match if flash model returned nothing (handles empty query / network failure)
     if (selectedFilenames.length === 0 && query.trim()) {
       selectedFilenames = selectByKeyword(query, candidateHeaders, maxCandidates)
@@ -436,12 +479,26 @@ export async function findRelevantMemories(
     }),
   )
 
-  // Collect fulfilled results; silently skip files that disappeared between
-  // scan and load (rejected promise = file gone or permission error).
+  // Collect fulfilled results under a total byte budget; silently skip files
+  // that disappeared between scan and load (rejected promise = file gone or
+  // permission error). This prevents a few large always-relevant memories from
+  // silently dominating every turn's prompt.
   const memories: RelevantMemory[] = []
+  let usedBytes = 0
   for (const outcome of settled) {
     if (outcome.status === 'fulfilled') {
+      const bytes = Buffer.byteLength(outcome.value.content, 'utf-8')
+      const remaining = MAX_MEMORY_CONTEXT_BYTES - usedBytes
+      if (remaining <= 1024) continue
+      if (bytes > remaining) {
+        memories.push({
+          ...outcome.value,
+          content: truncateToBytes(outcome.value.content, remaining, MAX_MEMORY_CONTEXT_BYTES),
+        })
+        break
+      }
       memories.push(outcome.value)
+      usedBytes += bytes
     }
   }
 

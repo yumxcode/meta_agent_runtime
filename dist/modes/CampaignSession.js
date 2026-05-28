@@ -17,6 +17,7 @@ import { instrumentTool } from '../runtime/instrumentTool.js';
 import { MetaAgentContextStore } from '../campaign/index.js';
 import { buildCompactInstructions } from '../core/compact/compactPrompt.js';
 import { saveStateSnapshot, loadStateSnapshot, cleanupStateSnapshot } from '../core/compact/stateSnapshot.js';
+import { buildCampaignMemoryBlock } from './campaignMemory.js';
 import { toKernelTool } from './toolAdapter.js';
 import { translateKernelEvent } from './eventAdapter.js';
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js';
@@ -58,6 +59,7 @@ export class CampaignSession {
             fallbackIncludeDefaultBetas: resolved.fallbackIncludeDefaultBetas,
             cwd: resolved.projectDir ?? process.cwd(),
             systemPrompt: resolved.systemPrompt,
+            appendSystemPrompt: resolved.appendSystemPrompt,
             initialMessages: toKernelMessages(resolved.initialMessages),
             tools: [],
             canUseTool: createPermissionPolicy({
@@ -80,6 +82,7 @@ export class CampaignSession {
             },
             thinkingConfig: { type: 'adaptive' },
             querySource: 'main',
+            debug: resolved.debugMode,
             // token-efficient-tools reduces schema token overhead for multi-tool sessions
             betas: ['token-efficient-tools-2025-02-19'],
         });
@@ -137,7 +140,7 @@ export class CampaignSession {
         // message), which collapses the cacheable prefix to zero — losing cache hits
         // on the entire conversation history.  Injecting the volatile content into the
         // user message instead keeps messages[0] identical across turns.
-        const suffix = await this._buildEnrichedSuffix();
+        const suffix = await this._buildEnrichedSuffix(prompt);
         const effectivePrompt = suffix
             ? `<context>\n<campaign_state>\n${suffix}\n</campaign_state>\n</context>\n\n---\n\n${prompt}`
             : prompt;
@@ -187,8 +190,18 @@ export class CampaignSession {
     getUsage() { return { ...this._usage }; }
     getEstimatedCost() { return this._totalCostUsd; }
     // ── Enriched suffix builder (identical to KernelBridge._buildEnrichedSuffix) ─
-    async _buildEnrichedSuffix() {
+    async _buildEnrichedSuffix(prompt) {
         const parts = [];
+        // Part 0: memory content — MEMORY.md index + per-query recalled topic files.
+        // Other modes (agentic, robotics) inject this via buildVolatileContextSections()
+        // → buildMemoryContentSection(). CampaignSession builds its own per-turn prefix,
+        // so we call the equivalent helper directly here to keep memory consistent.
+        try {
+            const memoryBlock = await buildCampaignMemoryBlock(prompt);
+            if (memoryBlock)
+                parts.push(memoryBlock);
+        }
+        catch { /* swallow — memory is best-effort */ }
         // Part 1: active campaign context block
         try {
             const campaignContext = await MetaAgentContextStore.buildInjectionBlock();

@@ -22,6 +22,9 @@ export interface WorkflowDefinition {
     globalContext: string;
     phases: WorkflowPhase[];
     sourceFile: string;
+    sourceKind?: 'workflow_file' | 'agent_tag';
+    workflowBlockHash?: string;
+    workflowDefinitionHash?: string;
 }
 export interface PhaseHistory {
     phaseId: string;
@@ -34,11 +37,20 @@ export interface WorkflowState {
     projectDir: string;
     mode: string;
     workflowSourceFile: string;
+    workflowBlockHash?: string;
+    workflowDefinitionHash?: string;
     currentPhaseId: string;
     currentPhaseEnteredAt: number;
     completedGateItems: string[];
     phaseHistory: PhaseHistory[];
 }
+export interface WorkflowRepairInput {
+    mode: string;
+    sourceFile: string;
+    sourceKind: 'workflow_file' | 'agent_tag';
+    content: string;
+}
+export type WorkflowRepairer = (input: WorkflowRepairInput) => Promise<string | null>;
 export interface GateCheckResult {
     canAdvance: boolean;
     blockedBy: GateItem[];

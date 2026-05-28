@@ -24,6 +24,7 @@ import type { KernelTool } from '../types/KernelTool.js'
 import type { KernelConfig, ThinkingConfig } from '../types/KernelConfig.js'
 import type { StreamEvent } from './AnthropicClient.js'
 import type { DeepSeekMessage } from '../messages/DeepSeekMessageNormalizer.js'
+import { DebugWriter } from './DebugWriter.js'
 import {
   isRetryableError,
   isPromptTooLongError,
@@ -173,7 +174,7 @@ export async function* streamDeepSeekMessages(
           { signal: params.abortSignal },
         )
 
-      yield* processStream(stream, config.debug)
+      yield* processStream(stream, config.debug, params.sessionId, baseRequest as Record<string, unknown>)
       return
     } catch (error: unknown) {
       if (isPromptTooLongError(error)) {
@@ -223,7 +224,15 @@ type UsageWithDetails = OpenAI.CompletionUsage & {
 async function* processStream(
   stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
   debug?: boolean,
+  sessionId?: string,
+  reqPayload?: Record<string, unknown>,
 ): AsyncGenerator<StreamEvent> {
+  // Open debug file (no-op when debug is false or sessionId is absent)
+  const writer = await DebugWriter.open(sessionId, reqPayload?.['model'] as string ?? 'deepseek', debug)
+  if (writer && reqPayload) {
+    await writer.writeRequest(reqPayload)
+  }
+
   // Block index tracking
   let nextBlockIdx = 0
   let thinkingBlockIdx = -1
@@ -237,9 +246,6 @@ async function* processStream(
   let stopReason: string | null = null
 
   for await (const chunk of stream) {
-    if (debug) {
-      process.stderr.write(`[DeepSeek] ${JSON.stringify(chunk)}\n`)
-    }
 
     // ── Usage chunk (last chunk, choices is empty) ──────────────────────────
     if (chunk.usage) {
@@ -344,4 +350,6 @@ async function* processStream(
   }
 
   yield { type: 'message_stop' }
+
+  if (writer) await writer.close()
 }

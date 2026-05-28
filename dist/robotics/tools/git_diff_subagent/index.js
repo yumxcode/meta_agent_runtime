@@ -1,5 +1,5 @@
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
-export function createGitDiffSubAgentTool(gitMgr, projectDir) {
+export function createGitDiffSubAgentTool(gitMgr, projectDir, sessionId) {
     return {
         name: 'git_diff_subagent',
         isConcurrencySafe: true,
@@ -24,7 +24,7 @@ export function createGitDiffSubAgentTool(gitMgr, projectDir) {
             if (!taskId)
                 return { content: 'task_id is required', isError: true };
             try {
-                const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                const state = await RoboticsProjectStore.findBySession(projectDir, sessionId);
                 const branchName = state?.git.subAgentBranches[taskId];
                 if (!branchName) {
                     return {

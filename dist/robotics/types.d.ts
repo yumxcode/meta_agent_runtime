@@ -1,6 +1,10 @@
 export type RoboticsDomain = 'motion_planning' | 'perception' | 'manipulation' | 'locomotion' | 'navigation' | 'simulation' | 'hardware_interface' | 'deployment' | 'calibration' | 'general';
 export declare const ROBOTICS_DOMAINS: RoboticsDomain[];
 export type RoboticsAgentRole = 'orchestrator' | 'paper_search' | 'experiment' | 'code' | 'analysis' | 'deployment';
+export type KnowledgeConfidenceTier = 'observed' | 'reproduced' | 'derived' | 'reported' | 'hypothesis';
+export declare const KNOWLEDGE_CONFIDENCE_TIERS: KnowledgeConfidenceTier[];
+export type KnowledgeScope = 'global' | 'robot' | 'code';
+export declare const KNOWLEDGE_SCOPES: KnowledgeScope[];
 export interface ExperienceOutcome {
     success: boolean;
     summary: string;
@@ -21,6 +25,24 @@ export interface ExperienceEntry {
     problem: string;
     solution: string;
     outcome: ExperienceOutcome;
+    /**
+     * Same-domain abstract principle extracted by flash model at write time.
+     * Used for same-domain principle matching in ExperiencePatternChecker.
+     * Example: "Spatial resolution × map size determines peak memory; estimate before coding."
+     */
+    abstractPrinciple?: string;
+    /** How strongly this experience should be trusted when retrieved. */
+    confidenceTier?: KnowledgeConfidenceTier;
+    /** Experiment log, commit, report, paper, datasheet, or other supporting references. */
+    evidenceRefs?: string[];
+    /** Number of independent observations supporting this lesson. Defaults to 1. */
+    observationCount?: number;
+    /** Number of later observations that contradicted this lesson. Defaults to 0. */
+    contradictionCount?: number;
+    /** Assumptions this experience falsified. Especially important for failures. */
+    invalidatedAssumptions?: string[];
+    /** Last time the lesson was checked against observation or source evidence. */
+    lastVerifiedAt?: number;
     metrics?: Record<string, number | string>;
     sourceTaskId?: string;
     sourceSessionId?: string;
@@ -37,6 +59,38 @@ export interface ExperienceSearchQuery {
     limit?: number;
 }
 export declare function makeExperienceId(): string;
+export interface PhysicalAnchorEntry {
+    id: string;
+    schemaVersion: '1.0';
+    createdAt: number;
+    updatedAt: number;
+    domain: RoboticsDomain;
+    /** Scope controls where this anchor should be considered applicable. */
+    scope: KnowledgeScope;
+    robot?: string;
+    title: string;
+    /** Concrete physical/device fact the model should not infer away. */
+    fact: string;
+    /** Mechanism explaining why the fact matters, if known. */
+    mechanism?: string;
+    /** Operational implication for planning/debugging. */
+    implication: string;
+    tags: string[];
+    confidenceTier: KnowledgeConfidenceTier;
+    evidenceRefs: string[];
+    source?: string;
+    lastVerifiedAt?: number;
+    invalidates?: string[];
+}
+export interface PhysicalAnchorSearchQuery {
+    domain?: RoboticsDomain;
+    scope?: KnowledgeScope;
+    robot?: string;
+    tags?: string[];
+    keyword?: string;
+    limit?: number;
+}
+export declare function makePhysicalAnchorId(): string;
 export interface ExperimentSpec {
     title: string;
     hypothesis: string;
@@ -53,7 +107,8 @@ export interface ExperimentSummary {
     keyFindings: string[];
     failureAnalysis?: string;
     nextSuggestions: string[];
-    experienceId?: string;
+    /** Pending ID returned by experience_write; becomes an ExperienceStore ID only after review approval. */
+    pendingExperienceId?: string;
     branchName?: string;
     durationMs: number;
     turnsUsed: number;

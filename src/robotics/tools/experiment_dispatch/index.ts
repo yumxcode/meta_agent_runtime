@@ -11,7 +11,9 @@ Your task is to execute the assigned robotics experiment faithfully and report r
 
 Rules:
 1. Work ONLY within your designated working directory. Do not access files outside it.
-2. After completion, call experience_write to record what you learned (success OR failure).
+2. After completion, call experience_write to propose what you learned (success OR failure).
+   The tool returns a pending ID; the main session user must approve it with /experience review
+   before it becomes a committed ExperienceStore entry.
 3. Return a structured ExperimentSummary JSON block in your final message:
    \`\`\`json
    {
@@ -21,7 +23,7 @@ Rules:
      "keyFindings": ["..."],
      "failureAnalysis": "<optional>",
      "nextSuggestions": ["..."],
-     "experienceId": "<id from experience_write>",
+     "pendingExperienceId": "<pending id from experience_write, if queued>",
      "branchName": "<git branch if applicable>",
      "durationMs": <number>,
      "turnsUsed": <number>
@@ -35,6 +37,7 @@ export function createExperimentDispatchTool(
   bridge: ISubAgentDispatcher,
   gitMgr: GitWorkspaceManager,
   projectDir: string,
+  sessionId: string,
 ): MetaAgentTool {
   return {
     name: 'experiment_dispatch',
@@ -42,7 +45,7 @@ export function createExperimentDispatchTool(
       'Dispatch an experiment to an isolated ExperimentAgent sub-agent. ' +
       'The sub-agent runs in its own git worktree (if git is enabled) so changes do not pollute main. ' +
       'Set await_completion=false to run experiments in parallel. ' +
-      'The sub-agent will call experience_write automatically on completion. ' +
+      'The sub-agent will call experience_write automatically on completion, creating a pending review entry. ' +
       'REQUIRED: purpose (why you are dispatching) and on_complete (what YOU will do with the result). ' +
       'These fields prevent orphan tasks and ensure results are always processed.',
     inputSchema: {
@@ -178,13 +181,13 @@ Rules:
 
         // Persist git state if a worktree was created
         if (branchName && worktreePath) {
-          await RoboticsProjectStore.updateGitState(projectDir, {
+          await RoboticsProjectStore.updateGitState(projectDir, sessionId, {
             subAgentBranches: { [record.taskId]: branchName },
             forkPoints: { [record.taskId]: forkPoint ?? '' },
           })
         }
         // Always register the task record (even without git) to track purpose + on_complete
-        await RoboticsProjectStore.registerSubAgentTask(projectDir, {
+        await RoboticsProjectStore.registerSubAgentTask(projectDir, sessionId, {
           taskId: record.taskId,
           role: 'experiment',
           title: spec.title,
@@ -206,7 +209,7 @@ Rules:
           }
           const final = await bridge.getStatus(record.taskId)
           if (final?.status === 'completed') {
-            await RoboticsProjectStore.completeSubAgentTask(projectDir, record.taskId)
+            await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
             return {
               content: `✅ Experiment completed.\n\nTask ID: ${record.taskId}\n\n${final.result ?? ''}`,
               isError: false,

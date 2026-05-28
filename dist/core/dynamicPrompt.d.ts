@@ -5,6 +5,7 @@
  *
  * PUBLIC BASE (all modes):
  *   D1c agent_directives [memoized] — AGENT.md: workflow procedures, project rules, caveats
+ *   D1d skill_manifest   [memoized] — compact index of user-defined skills for this mode
  *   D0  task_contract    [memoized, keyed on updatedAt] — goal anchor (when present)
  *   D1b memory_content  [uncached]  — MEMORY.md index + per-query recalled topic files
  *
@@ -42,6 +43,11 @@ import type { TaskContract } from './contract/types.js';
 export type AgentMode = 'agentic' | 'campaign' | 'robotics';
 export declare function buildMemoryContentSection(currentQuery: string, client?: Anthropic, sessionMode?: string, domainScope?: string): SystemPromptSection;
 export declare function buildAgentDirectivesSection(projectDir: string): SystemPromptSection;
+/**
+ * Build D1d: a compact skill manifest for the current mode.
+ * Memoized — skills are read once on the first submit() per session.
+ */
+export declare function buildSkillManifestSection(mode: AgentMode, projectDir: string): SystemPromptSection;
 export declare function buildEnvInfoSection(sessionId: string, sessionStartMs: number): SystemPromptSection;
 export declare function buildLanguageSection(language?: string): SystemPromptSection;
 export declare function buildCurrentModeSection(mode: AgentMode): SystemPromptSection;

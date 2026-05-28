@@ -6,7 +6,7 @@
  * returns structured proposals only; this module performs all filesystem writes
  * so frontmatter stays constrained and mode boundaries are enforced.
  */
-import type Anthropic from '@anthropic-ai/sdk';
+import Anthropic from '@anthropic-ai/sdk';
 import type { ConversationMessage } from '../types.js';
 import type { AgentMode } from '../dynamicPrompt.js';
 export type MemoryWriteResult = {
@@ -29,6 +29,9 @@ export interface RunMemoryWriterOptions {
      * otherwise the side-call will fail silently and no memories will be written.
      */
     model?: string;
+    /** API key/baseURL used when the memory writer must create its own side-call client. */
+    apiKey?: string;
+    baseURL?: string;
 }
 export declare function runPostSessionMemoryWriter(opts: RunMemoryWriterOptions): Promise<MemoryWriteResult>;
 //# sourceMappingURL=memoryWriter.d.ts.map

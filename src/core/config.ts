@@ -6,7 +6,7 @@
  *
  * Provider auto-detection:
  *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
- *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash / deepseek-v4-pro, native OpenAI format)
+ *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash, native OpenAI format)
  *   QWEN_API_KEY       → https://dashscope.aliyuncs.com/apps/anthropic  (qwen-max / qwen-plus)
  *
  * Explicit config.apiKey / config.baseURL always take precedence over env vars.
@@ -35,7 +35,7 @@ const PROVIDER_BASE_URLS: Record<ModelProvider, string> = {
 /** Default (primary interaction) model for each provider */
 const PROVIDER_DEFAULT_MODELS: Record<ModelProvider, string> = {
   anthropic: 'claude-opus-4-6',
-  deepseek:  'deepseek-v4-pro',    // DeepSeek-V4 Pro (R1 reasoning) — primary interaction model
+  deepseek:  'deepseek-v4-flash',  // DeepSeek-V4 Flash — primary interaction model
   qwen:      'qwen-plus',
   unknown:   'claude-opus-4-6',
 }

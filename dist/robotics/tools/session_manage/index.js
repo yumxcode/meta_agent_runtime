@@ -11,8 +11,8 @@ export function createSessionListTool() {
     return {
         name: 'session_list',
         description: 'List all persisted robotics sessions, sorted by most-recently-active first. ' +
-            'Shows projectDir, robot, idle days, star status, tags, and current phase. ' +
-            'Use this to browse history before starring or tagging a session.',
+            'Shows sessionId (short), projectDir, robot, idle days, star status, tags, and current phase. ' +
+            'Use the sessionId shown here with session_star and session_tag.',
         isConcurrencySafe: true,
         inputSchema: {
             type: 'object',
@@ -46,19 +46,23 @@ export function createSessionListTool() {
             const lines = [
                 `## Sessions (${sessions.length})`,
                 '',
-                '| ★ | Project | Robot | Idle | Tags | Phase |',
-                '|---|---------|-------|------|------|-------|',
+                '| ★ | Session | Project | Robot | Idle | Tags | Phase |',
+                '|---|---------|---------|-------|------|------|-------|',
                 ...sessions.map(s => {
                     const star = s.starred ? '⭐' : '○';
-                    const proj = s.projectDir.length > 40
-                        ? '…' + s.projectDir.slice(-38)
+                    const sid = s.sessionId.slice(0, 8); // short 8-char prefix
+                    const proj = s.projectDir.length > 35
+                        ? '…' + s.projectDir.slice(-33)
                         : s.projectDir;
                     const robot = s.robot ?? '—';
                     const idle = s.idleDays === 0 ? 'today' : `${s.idleDays}d`;
                     const tags = s.tags.length > 0 ? s.tags.join(', ') : '—';
                     const phase = s.currentPhase ?? '—';
-                    return `| ${star} | \`${proj}\` | ${robot} | ${idle} | ${tags} | ${phase} |`;
+                    return `| ${star} | \`${sid}\` | \`${proj}\` | ${robot} | ${idle} | ${tags} | ${phase} |`;
                 }),
+                '',
+                '> Use the full sessionId with `session_star` / `session_tag`. ' +
+                    'Run `session_list` to see short IDs — pass the exact `sessionId` from the state.',
             ];
             return { content: lines.join('\n'), isError: false };
         },
@@ -68,29 +72,34 @@ export function createSessionListTool() {
 export function createSessionStarTool() {
     return {
         name: 'session_star',
-        description: 'Star or unstar a session by its projectDir. ' +
+        description: 'Star or unstar a session by its projectDir + sessionId. ' +
             'Starred sessions are exempt from the 7-day auto-purge. ' +
-            'Use session_list first to find the projectDir of the session you want.',
+            'Use session_list first to find the projectDir and sessionId.',
         inputSchema: {
             type: 'object',
             properties: {
                 projectDir: {
                     type: 'string',
-                    description: 'Absolute path of the project whose session to star/unstar.',
+                    description: 'Absolute path of the project.',
+                },
+                sessionId: {
+                    type: 'string',
+                    description: 'Full sessionId of the session to star/unstar (from session_list).',
                 },
                 starred: {
                     type: 'boolean',
                     description: 'true = star the session; false = remove the star.',
                 },
             },
-            required: ['projectDir', 'starred'],
+            required: ['projectDir', 'sessionId', 'starred'],
         },
         async call(input) {
             const projectDir = input['projectDir'];
+            const sessionId = input['sessionId'];
             const starred = input['starred'];
-            await RoboticsProjectStore.star(projectDir, starred);
+            await RoboticsProjectStore.star(projectDir, sessionId, starred);
             const action = starred ? 'Starred ⭐' : 'Unstarred';
-            return { content: `${action}: \`${projectDir}\``, isError: false };
+            return { content: `${action}: \`${projectDir}\` (session \`${sessionId.slice(0, 8)}\`)`, isError: false };
         },
     };
 }
@@ -100,13 +109,18 @@ export function createSessionTagTool() {
         name: 'session_tag',
         description: 'Set the tags for a session. Replaces the existing tag list entirely. ' +
             'Pass an empty array to clear all tags. ' +
-            'Tags are free-form strings, e.g. ["go2", "mpc", "sprint-3"].',
+            'Tags are free-form strings, e.g. ["go2", "mpc", "sprint-3"]. ' +
+            'Use session_list first to find the projectDir and sessionId.',
         inputSchema: {
             type: 'object',
             properties: {
                 projectDir: {
                     type: 'string',
-                    description: 'Absolute path of the project whose session to tag.',
+                    description: 'Absolute path of the project.',
+                },
+                sessionId: {
+                    type: 'string',
+                    description: 'Full sessionId of the session to tag (from session_list).',
                 },
                 tags: {
                     type: 'array',
@@ -114,16 +128,20 @@ export function createSessionTagTool() {
                     description: 'New tag list. Replaces the existing tags.',
                 },
             },
-            required: ['projectDir', 'tags'],
+            required: ['projectDir', 'sessionId', 'tags'],
         },
         async call(input) {
             const projectDir = input['projectDir'];
+            const sessionId = input['sessionId'];
             const tags = input['tags'];
-            await RoboticsProjectStore.setTags(projectDir, tags);
+            await RoboticsProjectStore.setTags(projectDir, sessionId, tags);
             const tagStr = tags.length > 0
                 ? tags.map(t => `\`${t}\``).join(', ')
                 : '*(none)*';
-            return { content: `Tags updated for \`${projectDir}\`: ${tagStr}`, isError: false };
+            return {
+                content: `Tags updated for \`${projectDir}\` (session \`${sessionId.slice(0, 8)}\`): ${tagStr}`,
+                isError: false,
+            };
         },
     };
 }

@@ -6,6 +6,7 @@ import type { SubAgentTaskId } from '../../../subagent/types.js'
 export function createGitSyncToSubAgentTool(
   gitMgr: GitWorkspaceManager,
   projectDir: string,
+  sessionId: string,
 ): MetaAgentTool {
   return {
     name: 'git_sync_to_subagent',
@@ -31,7 +32,7 @@ export function createGitSyncToSubAgentTool(
       if (!taskId) return { content: 'task_id is required', isError: true }
 
       try {
-        const state = await RoboticsProjectStore.findByProjectDir(projectDir)
+        const state = await RoboticsProjectStore.findBySession(projectDir, sessionId)
         const branchName = state?.git.subAgentBranches[taskId]
         if (!branchName) {
           return { content: `No git branch registered for task ${taskId}. Sync not needed.`, isError: true }

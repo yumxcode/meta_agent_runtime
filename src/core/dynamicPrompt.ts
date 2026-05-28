@@ -5,6 +5,7 @@
  *
  * PUBLIC BASE (all modes):
  *   D1c agent_directives [memoized] — AGENT.md: workflow procedures, project rules, caveats
+ *   D1d skill_manifest   [memoized] — compact index of user-defined skills for this mode
  *   D0  task_contract    [memoized, keyed on updatedAt] — goal anchor (when present)
  *   D1b memory_content  [uncached]  — MEMORY.md index + per-query recalled topic files
  *
@@ -55,6 +56,7 @@ import { findRelevantMemories } from './memory/findRelevantMemories.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { buildSubAgentNotificationSection } from '../subagent/SubAgentBridge.js'
 import type { TaskContract } from './contract/types.js'
+import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/system/skill/index.js'
 
 // ── AgentMode ─────────────────────────────────────────────────────────────────
 
@@ -143,8 +145,8 @@ export function buildMemoryContentSection(
           // Revalidation flag — model must re-verify before use
           if (header.requiresRevalidation) metaParts.push('🔄 requires_revalidation')
 
-          // Source-verified badge for domain_knowledge
-          if (header.type === 'domain_knowledge' && header.sourceVerified === false) {
+          // Source-verified badge (legacy field — domain_knowledge type no longer used)
+          if (header.sourceVerified === false) {
             metaParts.push('⚠ source_unverified')
           }
 
@@ -169,9 +171,11 @@ export function buildMemoryContentSection(
 // ─────────────────────────────────────────────────────────────────────────────
 // D1c — Agent Directives  [memoized per session]
 //
-// Reads AGENT.md from the project directory and injects its full contents
-// verbatim.  AGENT.md is the project owner's place to declare:
-//   - Workflow procedures and phase gate criteria
+// Reads AGENT.md from the project directory and injects its soft-control
+// contents. Any explicit <META-WORKFLOW> block is stripped before injection
+// because the workflow state machine consumes that block structurally.
+// AGENT.md is the project owner's place to declare:
+//   - Project procedures and preferences
 //   - Project-specific rules and conventions
 //   - Important caveats (e.g. deprecated APIs, known hardware quirks)
 //   - Any standing instructions that must persist across compaction
@@ -187,13 +191,14 @@ export function buildMemoryContentSection(
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
- * Unified AGENT.md loader — delegates to WorkflowLoader.loadRaw() which is
- * the single source of truth for the 3-path discovery cascade:
+ * Unified AGENT.md loader — delegates to WorkflowLoader.loadAgentDirectives()
+ * which is the single source of truth for the 3-path discovery cascade and
+ * strips explicit <META-WORKFLOW> blocks before D1c injection:
  *   <projectDir>/.meta-agent/AGENT.md  →  <projectDir>/AGENT.md
  *   →  ~/.meta-agent/AGENT.md
  */
 function _loadAgentMd(projectDir: string): string | null {
-  return WorkflowLoader.loadRaw(projectDir)
+  return WorkflowLoader.loadAgentDirectives(projectDir)
 }
 
 export function buildAgentDirectivesSection(projectDir: string): SystemPromptSection {
@@ -205,8 +210,61 @@ export function buildAgentDirectivesSection(projectDir: string): SystemPromptSec
     if (!content) return null
     return (
       `## Agent Directives\n\n` +
-      `_Loaded from AGENT.md — project-specific workflow procedures, rules, and caveats._\n\n` +
+      `_Loaded from AGENT.md — project-specific rules, preferences, and caveats._\n\n` +
       content
+    )
+  })
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// D1d — Skill Manifest  [memoized per session]
+//
+// Ultra-compact index of user-defined skills available in this mode.
+// Skills are separate from tools — they are Markdown files containing
+// specialised instructions, templates, or domain knowledge.  This section
+// tells the model what skills exist so it can proactively call
+// `skill(action="load", name="<name>")` when a skill is relevant.
+//
+// Token budget: ~5 tokens per skill (name only) + ~10 tokens header.
+// No skill content is injected here — only names + one-line description.
+//
+// Discovery order (see skill/index.ts for details):
+//   1. <projectDir>/.meta-agent/skills/         — project-scoped
+//   2. ~/.meta-agent/skills/<mode>/             — user global, mode-specific
+//   3. ~/.meta-agent/skills/                    — user global, all modes
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Build D1d: a compact skill manifest for the current mode.
+ * Memoized — skills are read once on the first submit() per session.
+ */
+export function buildSkillManifestSection(mode: AgentMode, projectDir: string): SystemPromptSection {
+  return systemPromptSection('skill_manifest', async () => {
+    const names = await listAllSkillNames(projectDir, mode)
+    if (names.length === 0) return null
+
+    // For each skill, extract a one-line description (first non-heading line).
+    // Cap at 12 skills to keep the manifest tight; extras are still loadable.
+    const shown = names.slice(0, 12)
+    const lines = await Promise.all(
+      shown.map(async name => {
+        try {
+          const content = await readSkill(name, projectDir, mode)
+          const desc = content ? extractSkillDescription(content) : ''
+          return desc ? `  • ${name} — ${desc}` : `  • ${name}`
+        } catch {
+          return `  • ${name}`
+        }
+      }),
+    )
+
+    const overflow = names.length > 12 ? `\n  *(${names.length - 12} more — use \`skill list\`)*` : ''
+
+    return (
+      `## Available Skills\n\n` +
+      `*Load any skill with \`skill(action="load", name="<name>")\` to inject its full instructions.*\n\n` +
+      lines.join('\n') +
+      overflow
     )
   })
 }
@@ -538,30 +596,30 @@ export function buildSummarizeToolResultsSection(mode: AgentMode = 'agentic'): S
     if (mode === 'campaign') {
       return (
         `## 中间结果追踪\n\n` +
-        `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
-        `以下情况的结果视为"关键结果"：` +
+        `工具调用产生关键结果时，必须在后续分析或最终报告中准确引用。` +
+        `以下情况视为"关键结果"：` +
         `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
         `始终包含数值、单位和溯源 ID。` +
-        `此要求强制执行——不得推迟到后续轮次再记录。`
+        `不要复述无决策价值的普通工具输出。`
       )
     }
     if (mode === 'agentic') {
       return (
         `## 中间结果追踪\n\n` +
-        `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
-        `以下情况的结果视为"关键结果"：` +
+        `工具调用产生关键结果时，必须在后续分析或最终报告中准确引用。` +
+        `以下情况视为"关键结果"：` +
         `（a）用于后续计算，（b）将出现在最终报告中。` +
         `结果含溯源 ID 时须一并标注。` +
-        `此要求强制执行——不得推迟到后续轮次再记录。`
+        `不要复述无决策价值的普通工具输出。`
       )
     }
     // robotics
     return (
       `## 中间结果追踪\n\n` +
-      `每次工具调用后，**必须**在继续操作前将结果记入推理过程。` +
-      `以下情况的结果视为"关键结果"：` +
+      `工具调用产生关键结果时，必须在后续分析或最终报告中准确引用。` +
+      `以下情况视为"关键结果"：` +
       `（a）用于后续步骤，（b）将出现在最终报告中。` +
-      `此要求强制执行——不得推迟到后续轮次再记录。`
+      `不要复述无决策价值的普通工具输出。`
     )
   })
 }
@@ -1079,6 +1137,12 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     // instructions form the outermost framing before any session-specific context
     // (task contract, memories, campaign state) is injected.
     buildAgentDirectivesSection(effectiveProjectDir),
+    // D1d: Skill Manifest — compact list of user-defined skills available in this
+    // mode.  Placed immediately after project directives so the model knows what
+    // skills are available before any session-specific context is injected.
+    // Skills are separate from tools: they are Markdown files the model loads
+    // on demand via skill(action="load") — no skill content is injected here.
+    buildSkillManifestSection(opts.mode, effectiveProjectDir),
     // D0: Task Contract — goal anchor immediately after project directives so the
     // model sees original intent before any volatile sections.
     ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),

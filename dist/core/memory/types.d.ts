@@ -1,19 +1,20 @@
 /**
  * Meta-Agent Memory — 类型分类与提示词文本块
  *
- * 六种记忆类型（对比 CC 的四种）：
- *   user             — 与 CC 一致
- *   feedback         — 与 CC 一致
- *   domain_knowledge — 替换 CC 的 reference，用于已验证的工程事实
- *   campaign_lessons — 新增：从已完成 DOE campaign 中提炼的可迁移经验
- *   robot_lessons    — 新增：robotics mode 中可迁移的错误、警告、避坑经验
- *   reference        — 外部系统指针（与 CC 的 reference 类似，范围更窄）
+ * 两种记忆类型（精简设计）：
+ *   user     — 用户画像：角色、背景、沟通偏好
+ *   feedback — 用户对 agent 行为的纠正与确认
  *
- * Mode-specific hard boundaries:
- *   campaign: 仿真结果 → ProvenanceTracker；活跃状态 → campaign_context；参数 → Campaign 配置
- *   robotics: 成熟工程经验 → ExperienceStore；memory 只记录公共偏好、警告和错误模式
+ * Hard boundaries（全模式适用）：
+ *   - 成功/失败经验、算法陷阱、调参记录 → ExperienceStore（experience_write 工具）
+ *   - 工程计算结果 → ProvenanceTracker（campaign 模式）或代码注释
+ *   - 活跃状态、任务进度 → campaign_context / robotics R5 section（自动注入）
+ *   - 领域知识、外部 API 指针 → 项目文档或 AGENT.md，不写入 memory
+ *
+ * 设计原则：memory 只存"关于用户"的信息，不存"关于世界"或"关于工程"的信息。
+ * 工程经验由 ExperienceStore 统一管理，具备结构化检索和跨 session 复用能力。
  */
-export declare const MEMORY_TYPES: readonly ["user", "feedback", "domain_knowledge", "campaign_lessons", "robot_lessons", "reference"];
+export declare const MEMORY_TYPES: readonly ["user", "feedback"];
 export type MemoryType = (typeof MEMORY_TYPES)[number];
 export declare const MEMORY_FRONTMATTER_EXAMPLE: readonly string[];
 export declare const TYPES_SECTION: readonly string[];

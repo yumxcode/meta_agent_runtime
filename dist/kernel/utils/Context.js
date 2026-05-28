@@ -42,6 +42,7 @@ export function getContextWindowSize(model) {
 const AUTOCOMPACT_BUFFER_TOKENS = 13_000;
 const MANUAL_COMPACT_BUFFER_TOKENS = 3_000;
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_768;
+const LONG_CONTEXT_AUTOCOMPACT_CAP = 180_000;
 export function calculateTokenWarningState(currentTokenCount, model, maxOutputTokens = DEFAULT_MAX_OUTPUT_TOKENS) {
     // Allow override via env (CC: CLAUDE_AUTOCOMPACT_PCT_OVERRIDE)
     const pctOverride = process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'];
@@ -59,6 +60,13 @@ export function calculateTokenWarningState(currentTokenCount, model, maxOutputTo
     }
     else {
         autoCompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS;
+    }
+    if (!pctOverride && contextWindow > DEFAULT_CONTEXT_WINDOW) {
+        const rawCap = process.env['META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD'];
+        const cap = rawCap ? Number.parseInt(rawCap, 10) : LONG_CONTEXT_AUTOCOMPACT_CAP;
+        if (Number.isFinite(cap) && cap > 0) {
+            autoCompactThreshold = Math.min(autoCompactThreshold, cap);
+        }
     }
     const blockingLimit = effectiveContextWindow - MANUAL_COMPACT_BUFFER_TOKENS;
     return {

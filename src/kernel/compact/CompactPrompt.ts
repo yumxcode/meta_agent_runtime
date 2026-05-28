@@ -62,6 +62,12 @@ Describe in detail what was being worked on at the time the conversation was com
 ## 9. Optional Next Step
 If the conversation was clearly heading in a specific direction, describe the single most important next action.`
 
+const VOLATILE_CONTEXT_INSTRUCTION = `
+Volatile context blocks:
+- User messages may begin with a <context>...</context> block followed by "---".
+- Treat that block as ephemeral runtime state, not as a user request.
+- Preserve only durable facts that are necessary to continue the task; do not copy full memory indexes, experience manifests, notifications, or progress dashboards into the summary.`
+
 const NO_TOOLS_TRAILER =
   'REMINDER: Do NOT call any tools. Respond with TEXT ONLY. ' +
   'Your response must contain only the summary content.'
@@ -93,6 +99,7 @@ export function buildCompactPrompt(customInstructions?: string): string {
     BASE_COMPACT_PROMPT,
     DETAILED_ANALYSIS_INSTRUCTION,
     SECTION_INSTRUCTIONS,
+    VOLATILE_CONTEXT_INSTRUCTION,
   ]
 
   if (customInstructions) {

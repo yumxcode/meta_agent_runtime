@@ -98,6 +98,7 @@ export function instrumentTool(
         validationResults: preResults,
         artifacts: [],
       })
+      const preAbortProvSuffix = provId ? `\n[provenance: ${provId}]` : ''
       return {
         content:
           `[V&V PRE-CALL ABORT] Tool "${tool.name}" was blocked before execution.\n\n` +
@@ -106,7 +107,7 @@ export function instrumentTool(
           `• The tool was NOT executed — no computation was performed.\n` +
           `• Fix the inputs that triggered the violation above, then retry the call.\n` +
           `• If you believe the input is correct, inspect the provenance record below for the full validation detail before deciding whether to escalate or skip this tool call.\n` +
-          `\n[provenance: ${provId}]`,
+          preAbortProvSuffix,
         isError: true,
       }
     }
@@ -168,7 +169,9 @@ export function instrumentTool(
     })
 
     // ── ⑤ Result annotation ─────────────────────────────────────────────────
-    const provSuffix = `\n\n[provenance: ${provId}]`
+    // provId is '' when a NoopProvenanceTracker is in use (e.g. robotics mode).
+    // Skip annotation entirely in that case to keep tool results clean.
+    const provSuffix = provId ? `\n\n[provenance: ${provId}]` : ''
 
     if (requiresAbort(postResults)) {
       const msgs = failures(postResults).map(r => `• [${r.hookName}] ${r.message}`).join('\n')

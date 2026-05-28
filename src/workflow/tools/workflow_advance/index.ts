@@ -35,7 +35,7 @@ export function createWorkflowAdvanceTool(
           if (!answer.includes('Yes')) return { content: 'Advance cancelled by user.', isError: false }
           // Mark approval gates as completed
           for (const g of check.needsApproval) {
-            await WorkflowStateStore.completeGateItem(projectDir, g.id)
+            await WorkflowStateStore.completeCurrentPhaseGateItem(projectDir, definition, g.id)
           }
         }
       }

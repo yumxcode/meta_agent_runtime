@@ -6,6 +6,23 @@ import { makeExperienceId } from './types.js';
 const EXPERIENCE_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'experiences');
 const INDEX_FILE = 'EXPERIENCE_INDEX.md';
 const MAX_INDEX_ENTRIES = 100; // hard cap on index entries shown
+const EXPERIENCE_ID_RE = /^exp_[0-9a-z]+_[0-9a-f]{8}$/;
+export function isExperienceId(id) {
+    return EXPERIENCE_ID_RE.test(id);
+}
+const CONFIDENCE_WEIGHT = {
+    reproduced: 500,
+    observed: 400,
+    derived: 350,
+    reported: 200,
+    hypothesis: 100,
+};
+export function experienceRetrievalScore(entry) {
+    const tier = entry.confidenceTier ?? 'observed';
+    const observations = Math.max(1, entry.observationCount ?? 1);
+    const contradictions = Math.max(0, entry.contradictionCount ?? 0);
+    return CONFIDENCE_WEIGHT[tier] + Math.min(observations, 10) * 8 - contradictions * 40;
+}
 export class ExperienceStore {
     dir;
     indexPath;
@@ -58,14 +75,30 @@ export class ExperienceStore {
             }
             return true;
         });
-        // sort by createdAt descending
-        filtered.sort((a, b) => b.createdAt - a.createdAt);
+        // Prefer stronger evidence; keep recency as a tiebreaker.
+        filtered.sort((a, b) => {
+            const scoreDelta = experienceRetrievalScore(b) - experienceRetrievalScore(a);
+            return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt;
+        });
         // strip fullReport from search results
         return filtered.slice(0, limit).map(e => { const { fullReport: _, ...rest } = e; return rest; });
     }
     // ── Load by ID ───────────────────────────────────────────────────────────────
     async load(id) {
+        if (!isExperienceId(id))
+            return null;
         return readJsonFile(join(this.dir, `${id}.json`));
+    }
+    async getStats() {
+        const entries = await this._loadAll();
+        const domainCounts = {};
+        let failures = 0;
+        for (const e of entries) {
+            if (!e.outcome.success)
+                failures += 1;
+            domainCounts[e.domain] = (domainCounts[e.domain] ?? 0) + 1;
+        }
+        return { total: entries.length, failures, domainCounts };
     }
     // ── Index ───────────────────────────────────────────────────────────────────
     async loadIndexMarkdown() {
@@ -96,7 +129,8 @@ export class ExperienceStore {
             for (const e of domEntries) {
                 const icon = e.outcome.success ? '✓' : '✗';
                 const tags = e.tags.slice(0, 4).join(', ');
-                lines.push(`- [${e.id}] **${e.title}** | ${icon} ${e.outcome.summary.slice(0, 60)} | tags: ${tags}`);
+                const confidence = e.confidenceTier ?? 'observed';
+                lines.push(`- [${e.id}] **${e.title}** | ${icon} ${e.outcome.summary.slice(0, 60)} | confidence: ${confidence} | tags: ${tags}`);
             }
             lines.push('');
         }
@@ -109,7 +143,10 @@ export class ExperienceStore {
     async listIds() {
         try {
             const files = await readdir(this.dir);
-            return files.filter(f => f.startsWith('exp_') && f.endsWith('.json')).map(f => f.replace('.json', ''));
+            return files
+                .filter(f => f.endsWith('.json'))
+                .map(f => f.replace('.json', ''))
+                .filter(isExperienceId);
         }
         catch {
             return [];

@@ -27,7 +27,8 @@
  *   - agentMode is persisted in project state; resumed sessions keep prior mode.
  *
  * Workflow integration:
- *   - WorkflowLoader.load('robotics', projectDir) finds AGENT.md
+ *   - WorkflowLoader.loadWithRepair('robotics', projectDir) finds explicit workflow
+ *     files or <META-WORKFLOW> blocks in AGENT.md
  *   - If found: W1 section registered + workflow tools injected
  *
  * System prompt layout:
@@ -41,6 +42,7 @@
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool } from '../core/types.js';
 import type { MetaAgentConfig } from '../core/config.js';
 import { ExperiencePendingStore } from './ExperiencePendingStore.js';
+import { PhysicalAnchorPendingStore } from './PhysicalAnchorPendingStore.js';
 import type { RoboticsAgentMode } from './types.js';
 import { type TeamModuleAddInput, type TeamSyncSummary, type TeamTaskAddInput, type TeamTaskStatus } from './team/TeamStore.js';
 import { type TeamWatcherEvent } from './team/TeamWatcher.js';
@@ -64,6 +66,25 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
      * an explicit override is provided here.
      */
     agentMode?: RoboticsAgentMode | 'auto';
+    /**
+     * Called when the flash classifier determines that multi-agent orchestration
+     * would benefit the task.  The caller (e.g. CLI) should present a confirmation
+     * prompt and return true to allow escalation, or false to stay in single mode.
+     *
+     * @param reason  Human-readable explanation of why multi-agent was suggested.
+     *
+     * When not provided, escalation is silently denied — the session stays in
+     * single-agent mode even if the flash model recommends multi.
+     */
+    onEscalationRequest?: (reason: string) => Promise<boolean>;
+    /**
+     * Whether this session was explicitly resumed by the user (e.g. via --resume or
+     * the session picker).  When true, R5 will show the resume banner and previous
+     * progress notes.  When false (default), prior project state is loaded for
+     * continuity (git state, agent mode) but R5 is suppressed — the user started
+     * a fresh conversation in the same workspace.
+     */
+    explicitResume?: boolean;
 }
 export declare class RoboticsSession {
     private readonly inner;
@@ -73,20 +94,35 @@ export declare class RoboticsSession {
     private readonly store;
     /** Session-scoped pending experience buffer. Exposed so the CLI can drive review UI. */
     readonly pendingExperiences: ExperiencePendingStore;
+    private readonly physicalAnchors;
+    /** Session-scoped pending physical anchor buffer. Exposed for CLI /anchor review. */
+    readonly pendingPhysicalAnchors: PhysicalAnchorPendingStore;
+    private readonly anchorSource;
     private readonly hwProfile;
     private readonly gitMgr;
     private readonly teamStore;
     private readonly teamWatcher;
     private readonly projectDir;
     private readonly robot;
+    private readonly _userAppendPrompt;
     private readonly sectionRegistry;
+    /** Demand-paged knowledge context manager */
+    private readonly contextPager;
+    /** Knowledge source for proactive failure pre-loading during reasoning phase */
+    private readonly experienceSource;
+    /** Flash-model intent analyzer for pre-loading relevant context */
+    private queryAnalyzer;
+    /** Shared FlashClient — passed to tools that need flash (e.g. experience_write) */
+    private _flashClient;
     /** Explicit caller override; undefined means 'auto' (classify on first submit). */
     private readonly _modeOverride;
+    /** Callback to ask the user whether to escalate to multi-agent mode. */
+    private readonly _onEscalationRequest;
     private _state;
     private _resumedAt;
     private _workflowDef;
     private _workflowState;
-    /** Resolved agent mode. Starts as 'multi' (safe default) until classified. */
+    /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
     private _agentMode;
     /** True once mode has been classified or overridden; prevents re-classification. */
     private _modeClassified;
@@ -116,6 +152,18 @@ export declare class RoboticsSession {
     /** Heartbeat interval: 30 s. If lastActiveAt is older than 3× this, session is stale. */
     static readonly HEARTBEAT_INTERVAL_MS = 30000;
     static readonly STALE_SESSION_TTL_MS: number;
+    /** Whether the caller explicitly resumed this session (controls R5 visibility). */
+    private readonly _explicitResume;
+    /**
+     * The sessionId used for all RoboticsProjectStore reads/writes.
+     *
+     * Fresh session  → equals this.sessionId (new UUID, new isolated state file).
+     * Resumed session → equals the original session's sessionId so progress notes
+     *                   accumulate in the same bucket rather than starting fresh.
+     *
+     * Set during init() once we know whether we are resuming.
+     */
+    private _storeSessionId;
     constructor(config?: RoboticsSessionOptions);
     /**
      * Initialise the session: restore or create project state, then register
@@ -140,6 +188,18 @@ export declare class RoboticsSession {
      * Called automatically by the CLI on SIGINT / SIGTERM / uncaughtException.
      */
     dispose(): Promise<void>;
+    /**
+     * After the session ends, send the conversation transcript to the flash
+     * model and ask it to identify concrete physical/hardware/physics facts that
+     * warrant a PhysicalAnchor entry.  Each candidate is added to the pending
+     * store for human review — it is never auto-committed.
+     *
+     * Silently skipped when:
+     *   - no FlashClient is available
+     *   - fewer than 3 conversation turns (not enough context)
+     *   - flash call times out or fails
+     */
+    private _extractAnchorsPostSession;
     submit(prompt: string): AsyncGenerator<MetaAgentEvent>;
     registerTool(tool: MetaAgentTool): void;
     interrupt(): void;
@@ -231,10 +291,12 @@ export declare class RoboticsSession {
      * stay out of the system message to avoid invalidating the DeepSeek KV cache.
      *
      * Contents:
-     *   R2  experience_index      — recomputed each turn (disk read)
-     *   R3  subagent_tasks        — recomputed each turn (bridge + git query)
-     *   R5  progress_notes        — recomputed each turn (state read)
-     *   team_context_boundary     — fixed content once set, but must appear every turn
+     *   R2  experience_index        — recomputed each turn (disk read)
+     *   R3  subagent_tasks          — recomputed each turn (bridge + git query)
+     *   R5  progress_notes          — recomputed each turn (state read)
+     *   R6  physical_anchors        — recomputed each turn (device/physics facts)
+     *   R7  compact_instructions    — preserves task IDs + hardware constraints for compact agent
+     *   team_context_boundary       — fixed content once set, but must appear every turn
      */
     private _getVolatileRoboticsExtensions;
     /**
@@ -243,6 +305,7 @@ export declare class RoboticsSession {
      * Kept for backward compatibility; returns all sections combined.
      */
     private _getRoboticsExtensions;
+    private _repairWorkflowDefinition;
     /**
      * Classify whether this session should use single-agent or multi-agent mode.
      *

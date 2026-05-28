@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.1.0",
+  "version": "0.2.1",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -15,7 +15,9 @@
     "meta-agent": "./dist/cli.mjs"
   },
   "files": [
-    "dist"
+    "dist",
+    "!dist/**/__tests__/**",
+    "!dist/**/__tests__"
   ],
   "scripts": {
     "build": "tsc --project tsconfig.json && node scripts/build-cli.js",

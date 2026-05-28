@@ -7,7 +7,8 @@
  * so frontmatter stays constrained and mode boundaries are enforced.
  */
 
-import type Anthropic from '@anthropic-ai/sdk'
+import Anthropic from '@anthropic-ai/sdk'
+import OpenAI from 'openai'
 import { appendFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import type { ConversationMessage, ContentBlock } from '../types.js'
@@ -77,6 +78,9 @@ export interface RunMemoryWriterOptions {
    * otherwise the side-call will fail silently and no memories will be written.
    */
   model?: string
+  /** API key/baseURL used when the memory writer must create its own side-call client. */
+  apiKey?: string
+  baseURL?: string
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -112,11 +116,11 @@ function buildTranscript(messages: readonly ConversationMessage[]): string {
   return full.slice(full.length - MAX_TRANSCRIPT_CHARS)
 }
 
-function allowedTypesForMode(mode: string): ReadonlySet<MemoryType> {
-  const base: MemoryType[] = ['user', 'feedback', 'domain_knowledge', 'reference']
-  if (mode === 'campaign') return new Set([...base, 'campaign_lessons'])
-  if (mode === 'robotics') return new Set([...base, 'robot_lessons'])
-  return new Set(base)
+function allowedTypesForMode(_mode: string): ReadonlySet<MemoryType> {
+  // Memory is strictly limited to user profile and agent-behaviour feedback.
+  // All engineering experience (lessons, domain knowledge, references) lives in
+  // ExperienceStore or project docs — never in memory.
+  return new Set<MemoryType>(['user', 'feedback'])
 }
 
 function sanitizeScalar(value: unknown, max = 240): string | undefined {
@@ -220,7 +224,7 @@ function normalizeProposal(
   if (!allowedTypesForMode(mode).has(type)) return null
 
   const filename = sanitizeFilename(raw.filename, name)
-  const normalizedDomain = sanitizeScalar(raw.domain, 80) ?? (type === 'domain_knowledge' ? domain : undefined)
+  const normalizedDomain = sanitizeScalar(raw.domain, 80) ?? domain
   const indexLine =
     sanitizeScalar(raw.index_line, 300) ??
     `- [${name}](${filename}) - ${description}`
@@ -244,9 +248,18 @@ function normalizeProposal(
 export async function runPostSessionMemoryWriter(
   opts: RunMemoryWriterOptions,
 ): Promise<MemoryWriteResult> {
-  const { client, mode, domain, messages, memoryDir = MEMORY_DIR, model = DEFAULT_MEMORY_WRITER_MODEL } = opts
-  if (!client || messages.length === 0) {
-    return { attempted: false, written: [], skipped: ['no_client_or_messages'] }
+  const {
+    client,
+    mode,
+    domain,
+    messages,
+    memoryDir = MEMORY_DIR,
+    model = DEFAULT_MEMORY_WRITER_MODEL,
+    apiKey,
+    baseURL,
+  } = opts
+  if (messages.length === 0) {
+    return { attempted: false, written: [], skipped: ['no_messages'] }
   }
 
   if (memoryDir === MEMORY_DIR) await ensureMemoryDirExists()
@@ -266,29 +279,28 @@ export async function runPostSessionMemoryWriter(
     return { attempted: false, written: [], skipped: ['empty_transcript'] }
   }
 
-  const response = await withTimeout(
-    client.messages.create({
-      model,
-      max_tokens: 1800,
-      system: buildSystemPrompt(mode),
-      messages: [{
-        role: 'user',
-        content: [
-          `Mode: ${mode}`,
-          `Domain: ${domain ?? 'generic'}`,
-          '',
-          'Existing MEMORY.md index:',
-          existingIndex || '(empty)',
-          '',
-          'Session transcript:',
-          transcript,
-        ].join('\n'),
-      }],
-    }),
-    8_000,
-  )
+  const userContent = [
+    `Mode: ${mode}`,
+    `Domain: ${domain ?? 'generic'}`,
+    '',
+    'Existing MEMORY.md index:',
+    existingIndex || '(empty)',
+    '',
+    'Session transcript:',
+    transcript,
+  ].join('\n')
 
-  const raw = response.content[0]?.type === 'text' ? response.content[0].text : ''
+  const raw = await callMemoryWriterModel({
+    client,
+    model,
+    apiKey,
+    baseURL,
+    system: buildSystemPrompt(mode),
+    user: userContent,
+  })
+  if (!raw.trim()) {
+    return { attempted: true, written: [], skipped: ['empty_model_response'] }
+  }
   const parsed = extractJson(raw)
   const proposals = Array.isArray((parsed as { memories?: unknown } | null)?.memories)
     ? ((parsed as { memories: unknown[] }).memories as MemoryProposal[])
@@ -326,4 +338,55 @@ export async function runPostSessionMemoryWriter(
   }
 
   return { attempted: true, written, skipped }
+}
+
+async function callMemoryWriterModel(opts: {
+  client?: Anthropic | null
+  model: string
+  apiKey?: string
+  baseURL?: string
+  system: string
+  user: string
+}): Promise<string> {
+  if (opts.model.startsWith('deepseek-')) {
+    const client = new OpenAI({
+      apiKey: opts.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
+      baseURL: opts.baseURL ?? 'https://api.deepseek.com',
+      maxRetries: 1,
+    })
+    const response = await withTimeout(
+      client.chat.completions.create({
+        model: opts.model,
+        max_tokens: 1800,
+        messages: [
+          { role: 'system', content: opts.system },
+          { role: 'user', content: opts.user },
+        ],
+      }),
+      8_000,
+    )
+    return response.choices[0]?.message?.content ?? ''
+  }
+
+  const anthropicClient = opts.client ?? (
+    opts.apiKey
+      ? new Anthropic({
+          apiKey: opts.apiKey,
+          baseURL: opts.baseURL,
+          maxRetries: 1,
+        })
+      : null
+  )
+  if (!anthropicClient) return ''
+  const response = await withTimeout(
+    anthropicClient.messages.create({
+      model: opts.model,
+      max_tokens: 1800,
+      system: opts.system,
+      messages: [{ role: 'user', content: opts.user }],
+    }),
+    8_000,
+  )
+
+  return response.content[0]?.type === 'text' ? response.content[0].text : ''
 }

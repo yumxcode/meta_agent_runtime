@@ -38,7 +38,7 @@ export declare class ModeDetector {
      * Without `client`, behaviour is unchanged from the previous heuristic-only
      * implementation.
      */
-    static detect(prompt: string, hint?: SessionModeHint, hasTools?: boolean, client?: Anthropic): Promise<ModeDetectionResult>;
+    static detect(prompt: string, hint?: SessionModeHint, hasTools?: boolean, client?: Anthropic, model?: string): Promise<ModeDetectionResult>;
     /**
      * One-shot flash model classification. Returns a result with confidence='llm'.
      * On any error (network, timeout, unexpected output) silently falls back

@@ -6,6 +6,7 @@ import type { SubAgentTaskId } from '../../../subagent/types.js'
 export function createGitDiffSubAgentTool(
   gitMgr: GitWorkspaceManager,
   projectDir: string,
+  sessionId: string,
 ): MetaAgentTool {
   return {
     name: 'git_diff_subagent',
@@ -32,7 +33,7 @@ export function createGitDiffSubAgentTool(
       if (!taskId) return { content: 'task_id is required', isError: true }
 
       try {
-        const state = await RoboticsProjectStore.findByProjectDir(projectDir)
+        const state = await RoboticsProjectStore.findBySession(projectDir, sessionId)
         const branchName = state?.git.subAgentBranches[taskId]
         if (!branchName) {
           return {

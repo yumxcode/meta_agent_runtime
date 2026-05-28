@@ -1,5 +1,5 @@
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
-export function createGitSyncToSubAgentTool(gitMgr, projectDir) {
+export function createGitSyncToSubAgentTool(gitMgr, projectDir, sessionId) {
     return {
         name: 'git_sync_to_subagent',
         description: 'Push the latest main branch commits to a running sub-agent\'s worktree via rebase. ' +
@@ -23,7 +23,7 @@ export function createGitSyncToSubAgentTool(gitMgr, projectDir) {
             if (!taskId)
                 return { content: 'task_id is required', isError: true };
             try {
-                const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                const state = await RoboticsProjectStore.findBySession(projectDir, sessionId);
                 const branchName = state?.git.subAgentBranches[taskId];
                 if (!branchName) {
                     return { content: `No git branch registered for task ${taskId}. Sync not needed.`, isError: true };

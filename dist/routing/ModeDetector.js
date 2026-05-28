@@ -38,7 +38,7 @@ function withTimeout(promise, ms) {
 //
 // One-shot flash model call: ~300–500 ms, ~$0.00012 per detection, fires once per
 // session. Falls back to heuristic on any error or timeout.
-const LLM_DETECTION_MODEL = 'deepseek-v4-flash';
+const LLM_DETECTION_MODEL = 'claude-haiku-4-5-20251001';
 const LLM_SYSTEM_PROMPT = `\
 You are a routing classifier for an engineering AI assistant that has three execution modes.
 
@@ -239,7 +239,7 @@ export class ModeDetector {
      * Without `client`, behaviour is unchanged from the previous heuristic-only
      * implementation.
      */
-    static async detect(prompt, hint = 'auto', hasTools = false, client) {
+    static async detect(prompt, hint = 'auto', hasTools = false, client, model = LLM_DETECTION_MODEL) {
         // Layer 1: explicit — bypass everything
         if (hint !== 'auto') {
             return {
@@ -250,7 +250,7 @@ export class ModeDetector {
         }
         // Layer 2: LLM classification (preferred) or heuristic fallback
         const classification = client
-            ? await ModeDetector._detectWithLLM(prompt, hasTools, client)
+            ? await ModeDetector._detectWithLLM(prompt, hasTools, client, model)
             : ModeDetector.detectSync(prompt, 'auto', hasTools);
         return classification;
     }
@@ -259,14 +259,14 @@ export class ModeDetector {
      * On any error (network, timeout, unexpected output) silently falls back
      * to the heuristic path so the session always proceeds.
      */
-    static async _detectWithLLM(prompt, hasTools, client) {
+    static async _detectWithLLM(prompt, hasTools, client, model) {
         try {
             // 5 s timeout: routing is on the critical path to the first API call.
             // A network partition or rate-limit backoff should not stall session
             // start for 600 s (SDK default).  Falls back to heuristics on timeout
             // (Fix #6).
             const msg = await withTimeout(client.messages.create({
-                model: LLM_DETECTION_MODEL,
+                model,
                 max_tokens: 10,
                 system: LLM_SYSTEM_PROMPT,
                 messages: [{ role: 'user', content: prompt }],

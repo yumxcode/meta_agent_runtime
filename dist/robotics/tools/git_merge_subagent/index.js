@@ -1,5 +1,5 @@
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js';
-export function createGitMergeSubAgentTool(gitMgr, projectDir) {
+export function createGitMergeSubAgentTool(gitMgr, projectDir, sessionId) {
     return {
         name: 'git_merge_subagent',
         description: 'Merge a completed sub-agent\'s branch into main. ' +
@@ -38,7 +38,7 @@ export function createGitMergeSubAgentTool(gitMgr, projectDir) {
             if (!taskId)
                 return { content: 'task_id is required', isError: true };
             try {
-                const state = await RoboticsProjectStore.findByProjectDir(projectDir);
+                const state = await RoboticsProjectStore.findBySession(projectDir, sessionId);
                 const branchName = state?.git.subAgentBranches[taskId];
                 if (!branchName) {
                     return { content: `No git branch registered for task ${taskId}.`, isError: true };
@@ -51,7 +51,7 @@ export function createGitMergeSubAgentTool(gitMgr, projectDir) {
                 });
                 // Clean up the worktree after merge
                 await gitMgr.removeWorktree(taskId, { deleteBranch: false });
-                await RoboticsProjectStore.completeSubAgentTask(projectDir, taskId);
+                await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId);
                 return {
                     content: [
                         `✅ Merged \`${branchName}\` → main (strategy: ${strategy})`,

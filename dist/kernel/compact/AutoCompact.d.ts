@@ -24,6 +24,8 @@ export interface AutoCompactResult {
     wasCompacted: boolean;
     /** New messages if compaction ran (replaces the pre-compact messages in the loop) */
     postCompactMessages?: KernelMessage[];
+    /** Estimated token count of the compact summary */
+    summaryTokenEstimate?: number;
     /** Updated tracking state */
     tracking: AutoCompactTrackingState;
 }
@@ -37,5 +39,5 @@ export interface AutoCompactResult {
  * @param tracking          - Current circuit breaker state
  * @param compactOptions    - Options forwarded to compactConversation
  */
-export declare function autoCompactIfNeeded(messagesForQuery: readonly KernelMessage[], model: string, fileCache: FileStateCache, querySource: string | undefined, tracking: AutoCompactTrackingState | undefined, maxOutputTokens: number | undefined, compactOptions: CompactOptions): Promise<AutoCompactResult>;
+export declare function autoCompactIfNeeded(messagesForQuery: readonly KernelMessage[], model: string, fileCache: FileStateCache, querySource: string | undefined, tracking: AutoCompactTrackingState | undefined, maxOutputTokens: number | undefined, compactOptions: CompactOptions, force?: boolean): Promise<AutoCompactResult>;
 //# sourceMappingURL=AutoCompact.d.ts.map

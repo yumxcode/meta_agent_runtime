@@ -47,6 +47,7 @@ export function getContextWindowSize(model: string): number {
 const AUTOCOMPACT_BUFFER_TOKENS = 13_000
 const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_768
+const LONG_CONTEXT_AUTOCOMPACT_CAP = 180_000
 
 export interface TokenWarningState {
   /** Context is at or above the autocompact trigger threshold */
@@ -79,6 +80,14 @@ export function calculateTokenWarningState(
     }
   } else {
     autoCompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+  }
+
+  if (!pctOverride && contextWindow > DEFAULT_CONTEXT_WINDOW) {
+    const rawCap = process.env['META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD']
+    const cap = rawCap ? Number.parseInt(rawCap, 10) : LONG_CONTEXT_AUTOCOMPACT_CAP
+    if (Number.isFinite(cap) && cap > 0) {
+      autoCompactThreshold = Math.min(autoCompactThreshold, cap)
+    }
   }
 
   const blockingLimit = effectiveContextWindow - MANUAL_COMPACT_BUFFER_TOKENS

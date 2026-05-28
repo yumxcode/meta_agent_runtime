@@ -2,7 +2,7 @@ import { mkdtemp, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterEach, describe, expect, it } from 'vitest'
-import { ExperiencePendingStore } from '../ExperiencePendingStore.js'
+import { ExperiencePendingStore, validateExperienceInput } from '../ExperiencePendingStore.js'
 
 const tempDirs: string[] = []
 
@@ -45,5 +45,28 @@ describe('ExperiencePendingStore persistence', () => {
     expect(reloaded.count).toBe(2)
     reloaded.clear()
     await reloaded.flush()
+  })
+})
+
+describe('ExperiencePendingStore validation', () => {
+  const baseInput = {
+    domain: 'general',
+    title: 'Lesson',
+    problem: 'Problem',
+    solution: 'Solution',
+    outcome_summary: 'Outcome',
+  }
+
+  it('parses string "false" as false instead of truthy', () => {
+    const normalized = validateExperienceInput({ ...baseInput, success: 'false' })
+
+    expect(normalized.ok).toBe(true)
+    if (normalized.ok) expect(normalized.value.success).toBe(false)
+  })
+
+  it('rejects non-boolean success values that are not explicit true/false strings', () => {
+    const normalized = validateExperienceInput({ ...baseInput, success: 'no' })
+
+    expect(normalized.ok).toBe(false)
   })
 })

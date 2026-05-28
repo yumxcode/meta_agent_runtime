@@ -37,10 +37,11 @@ export interface LoopState {
 export function initialLoopState(
   messages: KernelMessage[],
   model: string,
+  autoCompactTracking?: AutoCompactTrackingState,
 ): LoopState {
   return {
     messages,
-    autoCompactTracking: undefined,
+    autoCompactTracking,
     maxOutputTokensRecoveryCount: 0,
     maxOutputTokensOverride: undefined,
     hasAttemptedReactiveCompact: false,

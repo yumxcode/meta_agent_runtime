@@ -12,6 +12,20 @@ export class WorkflowStateStore {
     return s?.schemaVersion === '1.0' ? s : null
   }
 
+  static isCompatible(definition: WorkflowDefinition, state: WorkflowState): boolean {
+    if (state.schemaVersion !== '1.0') return false
+    if (state.mode !== definition.mode) return false
+    if (state.workflowSourceFile !== definition.sourceFile) return false
+    if (definition.workflowBlockHash && state.workflowBlockHash !== definition.workflowBlockHash) return false
+    if (definition.workflowDefinitionHash && state.workflowDefinitionHash !== definition.workflowDefinitionHash) return false
+    return definition.phases.some(p => p.id === state.currentPhaseId)
+  }
+
+  static async readCompatible(projectDir: string, definition: WorkflowDefinition): Promise<WorkflowState | null> {
+    const state = await WorkflowStateStore.read(projectDir)
+    return state && WorkflowStateStore.isCompatible(definition, state) ? state : null
+  }
+
   static async write(projectDir: string, state: WorkflowState): Promise<void> {
     await atomicWriteJson(WorkflowStateStore.stateFile(projectDir), state)
   }
@@ -24,6 +38,8 @@ export class WorkflowStateStore {
       projectDir,
       mode: definition.mode,
       workflowSourceFile: definition.sourceFile,
+      workflowBlockHash: definition.workflowBlockHash,
+      workflowDefinitionHash: definition.workflowDefinitionHash,
       currentPhaseId: firstPhase.id,
       currentPhaseEnteredAt: Date.now(),
       completedGateItems: [],
@@ -43,14 +59,34 @@ export class WorkflowStateStore {
     return state
   }
 
+  static async completeCurrentPhaseGateItem(
+    projectDir: string,
+    definition: WorkflowDefinition,
+    gateItemId: string,
+  ): Promise<WorkflowState> {
+    const state = await WorkflowStateStore.readCompatible(projectDir, definition)
+    if (!state) throw new Error('Workflow state is not compatible with current definition')
+    const phase = definition.phases.find(p => p.id === state.currentPhaseId)
+    if (!phase) throw new Error(`Unknown workflow phase: ${state.currentPhaseId}`)
+    if (!phase.gateItems.some(g => g.id === gateItemId)) {
+      throw new Error(`Gate "${gateItemId}" is not part of the current workflow phase`)
+    }
+    if (!state.completedGateItems.includes(gateItemId)) {
+      state.completedGateItems.push(gateItemId)
+      await WorkflowStateStore.write(projectDir, state)
+    }
+    return state
+  }
+
   static async advancePhase(
     projectDir: string,
     definition: WorkflowDefinition,
     advancedBy: 'agent' | 'user',
   ): Promise<{ newPhase: WorkflowPhase; state: WorkflowState }> {
-    const state = await WorkflowStateStore.read(projectDir)
-    if (!state) throw new Error('Workflow state not initialised')
+    const state = await WorkflowStateStore.readCompatible(projectDir, definition)
+    if (!state) throw new Error('Workflow state is not compatible with current definition')
     const currentIdx = definition.phases.findIndex(p => p.id === state.currentPhaseId)
+    if (currentIdx < 0) throw new Error(`Unknown workflow phase: ${state.currentPhaseId}`)
     const nextPhase = definition.phases[currentIdx + 1]
     if (!nextPhase) throw new Error('Already at the final phase')
     const now = Date.now()
@@ -65,7 +101,14 @@ export class WorkflowStateStore {
 
   static checkGates(definition: WorkflowDefinition, state: WorkflowState): GateCheckResult {
     const phase = definition.phases.find(p => p.id === state.currentPhaseId)
-    if (!phase) return { canAdvance: true, blockedBy: [], needsApproval: [], suggested: [] }
+    if (!phase) {
+      return {
+        canAdvance: false,
+        blockedBy: [],
+        needsApproval: [],
+        suggested: [],
+      }
+    }
     const completed = new Set(state.completedGateItems)
     const gates = phase.gateItems.map(g => ({ ...g, completed: completed.has(g.id) }))
     return {

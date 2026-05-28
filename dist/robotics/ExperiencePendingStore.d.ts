@@ -15,6 +15,7 @@
  * robotics project; they are never auto-committed.
  */
 import type { ExperienceStore } from './ExperienceStore.js';
+import { type KnowledgeConfidenceTier, type RoboticsDomain } from './types.js';
 export interface PendingExperience {
     /** Temporary pending ID (not the final ExperienceStore ID). */
     pendingId: string;
@@ -49,4 +50,36 @@ export declare class ExperiencePendingStore {
     private _persistSoon;
     private _persist;
 }
+type NormalizedExperienceInput = {
+    domain: RoboticsDomain;
+    title: string;
+    problem: string;
+    solution: string;
+    success: boolean;
+    outcomeSummary: string;
+    difficulty: 'low' | 'medium' | 'high';
+    tags: string[];
+    algorithm?: string;
+    robot?: string;
+    failureReason?: string;
+    workarounds?: string[];
+    metrics?: Record<string, number | string>;
+    relatedPapers?: string[];
+    sourceTaskId?: string;
+    fullReport?: string;
+    abstractPrinciple?: string;
+    confidenceTier: KnowledgeConfidenceTier;
+    evidenceRefs?: string[];
+    observationCount?: number;
+    contradictionCount?: number;
+    invalidatedAssumptions?: string[];
+    lastVerifiedAt?: number;
+};
+export declare function validateExperienceInput(input: Record<string, unknown>): {
+    ok: true;
+    value: NormalizedExperienceInput;
+} | {
+    ok: false;
+};
+export {};
 //# sourceMappingURL=ExperiencePendingStore.d.ts.map

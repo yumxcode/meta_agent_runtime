@@ -25,5 +25,5 @@ export interface LoopState {
      */
     fallbackTriggered: boolean;
 }
-export declare function initialLoopState(messages: KernelMessage[], model: string): LoopState;
+export declare function initialLoopState(messages: KernelMessage[], model: string, autoCompactTracking?: AutoCompactTrackingState): LoopState;
 //# sourceMappingURL=LoopState.d.ts.map

@@ -70,12 +70,15 @@ export function createExperienceSearchTool(store: ExperienceStore): MetaAgentToo
           return [
             `### [${e.id}] ${e.title}`,
             `**Domain**: ${e.domain} | **Difficulty**: ${e.difficulty} | **Outcome**: ${status} ${e.outcome.summary}`,
+            `**Confidence**: ${e.confidenceTier ?? 'observed'} | **Observations**: ${e.observationCount ?? 1} | **Contradictions**: ${e.contradictionCount ?? 0}`,
             ...(e.algorithm ? [`**Algorithm**: ${e.algorithm}${metrics}`] : []),
             ...(e.tags.length ? [`**Tags**: ${e.tags.join(', ')}`] : []),
             `**Problem**: ${e.problem}`,
             `**Solution**: ${e.solution}`,
             ...(e.outcome.failureReason ? [`**Failure reason**: ${e.outcome.failureReason}`] : []),
             ...(e.outcome.workarounds?.length ? [`**Workarounds**: ${e.outcome.workarounds.join('; ')}`] : []),
+            ...(e.invalidatedAssumptions?.length ? [`**Invalidated assumptions**: ${e.invalidatedAssumptions.join('; ')}`] : []),
+            ...(e.evidenceRefs?.length ? [`**Evidence refs**: ${e.evidenceRefs.slice(0, 4).join('; ')}`] : []),
             `> Use \`experience_load id="${e.id}"\` for the full report.`,
             '',
           ].join('\n')

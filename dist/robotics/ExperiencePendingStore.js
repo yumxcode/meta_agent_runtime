@@ -18,7 +18,7 @@ import { createHash } from 'crypto';
 import { mkdir, readFile, writeFile, rm } from 'fs/promises';
 import { homedir } from 'os';
 import { dirname, join } from 'path';
-import { ROBOTICS_DOMAINS } from './types.js';
+import { KNOWLEDGE_CONFIDENCE_TIERS, ROBOTICS_DOMAINS } from './types.js';
 const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pending-experiences');
 // ── ExperiencePendingStore ────────────────────────────────────────────────────
 export class ExperiencePendingStore {
@@ -115,6 +115,13 @@ export class ExperiencePendingStore {
                 relatedPapers: normalized.value.relatedPapers,
                 sourceTaskId: normalized.value.sourceTaskId,
                 fullReport: normalized.value.fullReport,
+                abstractPrinciple: normalized.value.abstractPrinciple,
+                confidenceTier: normalized.value.confidenceTier,
+                evidenceRefs: normalized.value.evidenceRefs,
+                observationCount: normalized.value.observationCount,
+                contradictionCount: normalized.value.contradictionCount,
+                invalidatedAssumptions: normalized.value.invalidatedAssumptions,
+                lastVerifiedAt: normalized.value.lastVerifiedAt,
             });
             this.remove(pendingId);
             return id;
@@ -156,13 +163,14 @@ function isPendingExperience(value) {
         Boolean(record['input']) &&
         typeof record['input'] === 'object';
 }
-function validateExperienceInput(input) {
+export function validateExperienceInput(input) {
     const domain = normalizeDomain(input['domain']);
     const title = requiredString(input['title'], 80);
     const problem = requiredString(input['problem'], 500);
     const solution = requiredString(input['solution'], 800);
     const outcomeSummary = requiredString(input['outcome_summary'], 200);
-    if (!domain || !title || !problem || !solution || !outcomeSummary)
+    const success = normalizeSuccess(input['success']);
+    if (!domain || !title || !problem || !solution || !outcomeSummary || success === null)
         return { ok: false };
     return {
         ok: true,
@@ -171,7 +179,7 @@ function validateExperienceInput(input) {
             title,
             problem,
             solution,
-            success: Boolean(input['success']),
+            success,
             outcomeSummary,
             difficulty: normalizeDifficulty(input['difficulty']),
             tags: normalizeStringArray(input['tags'], 20, 40) ?? [],
@@ -183,6 +191,13 @@ function validateExperienceInput(input) {
             relatedPapers: normalizeStringArray(input['related_papers'], 20, 120),
             sourceTaskId: optionalString(input['source_task_id'], 120),
             fullReport: optionalString(input['full_report'], 20_000),
+            abstractPrinciple: optionalString(input['abstract_principle'], 400),
+            confidenceTier: normalizeConfidenceTier(input['confidence_tier']) ?? 'observed',
+            evidenceRefs: normalizeStringArray(input['evidence_refs'], 20, 300),
+            observationCount: normalizeNonNegativeInteger(input['observation_count'], 1),
+            contradictionCount: normalizeNonNegativeInteger(input['contradiction_count'], 0),
+            invalidatedAssumptions: normalizeStringArray(input['invalidated_assumptions'], 10, 240),
+            lastVerifiedAt: normalizeTimestamp(input['last_verified_at']),
         },
     };
 }
@@ -203,6 +218,23 @@ function normalizeDomain(value) {
 }
 function normalizeDifficulty(value) {
     return value === 'low' || value === 'medium' || value === 'high' ? value : 'medium';
+}
+function normalizeConfidenceTier(value) {
+    return typeof value === 'string' && KNOWLEDGE_CONFIDENCE_TIERS.includes(value)
+        ? value
+        : undefined;
+}
+function normalizeSuccess(value) {
+    if (typeof value === 'boolean')
+        return value;
+    if (typeof value === 'string') {
+        const normalized = value.trim().toLowerCase();
+        if (normalized === 'true')
+            return true;
+        if (normalized === 'false')
+            return false;
+    }
+    return null;
 }
 function normalizeStringArray(value, maxItems, maxLen) {
     if (!Array.isArray(value))
@@ -227,5 +259,15 @@ function normalizeMetrics(value) {
         out[safeKey] = typeof raw === 'string' ? raw.slice(0, 200) : raw;
     }
     return Object.keys(out).length ? out : undefined;
+}
+function normalizeNonNegativeInteger(value, fallback) {
+    if (typeof value !== 'number' || !Number.isFinite(value))
+        return fallback;
+    return Math.max(0, Math.floor(value));
+}
+function normalizeTimestamp(value) {
+    if (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)
+        return undefined;
+    return Math.floor(value);
 }
 //# sourceMappingURL=ExperiencePendingStore.js.map

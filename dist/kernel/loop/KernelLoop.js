@@ -75,7 +75,7 @@ export async function* runKernelLoop(ctx) {
     const signal = abortController.signal;
     const canUseTool = config.canUseTool ?? defaultCanUseTool;
     const maxTurns = config.maxTurns ?? 100;
-    let state = initialLoopState([...mutableMessages], config.model);
+    let state = initialLoopState([...mutableMessages], config.model, ctx.autoCompactTracking);
     let totalUsage = emptyUsage();
     let totalCost = ctx.cumulativeCostUsd;
     let allPermissionDenials = [];
@@ -98,6 +98,7 @@ export async function* runKernelLoop(ctx) {
             fallbackTriggered: state.fallbackTriggered,
             permissionDenials: allPermissionDenials,
             finalMessages: [...mutableMessages],
+            autoCompactTracking: state.autoCompactTracking,
         };
     }
     while (true) {
@@ -105,6 +106,9 @@ export async function* runKernelLoop(ctx) {
         const budgetedMessages = applyToolResultBudget(state.messages, config.tools);
         // ── Step 5: autoCompactIfNeeded ──────────────────────────────────────────
         const messagesForQuery = [...getMessagesAfterCompactBoundary(budgetedMessages)];
+        const effectiveSystemPrompt = [config.systemPrompt, config.appendSystemPrompt]
+            .filter(Boolean)
+            .join('\n\n');
         const compactResult = config.compact?.enabled === false
             ? {
                 wasCompacted: false,
@@ -115,11 +119,11 @@ export async function* runKernelLoop(ctx) {
                     consecutiveFailures: 0,
                 },
             }
-            : await autoCompactIfNeeded(messagesForQuery, state.currentModel, fileCache, config.querySource, state.autoCompactTracking, state.maxOutputTokensOverride ?? config.maxOutputTokens, {
+            : await autoCompactIfNeeded(messagesForQuery, state.currentModel, fileCache, config.compact?.querySource ?? config.querySource, state.autoCompactTracking, state.maxOutputTokensOverride ?? config.maxOutputTokens, {
                 model: config.compact?.model,
                 apiKey: config.apiKey,
                 baseURL: config.baseURL,
-                systemPrompt: config.systemPrompt,
+                systemPrompt: effectiveSystemPrompt,
                 customInstructions: config.compact?.customInstructions,
                 abortSignal: signal,
                 maxRetries: config.maxRetries,
@@ -137,7 +141,10 @@ export async function* runKernelLoop(ctx) {
             currentMessagesForQuery = [...getMessagesAfterCompactBoundary(state.messages)];
             yield {
                 type: 'compact_boundary',
-                compactMetadata: { summaryTokens: 0, previousTokens: tokenCountWithEstimation(messagesForQuery) },
+                compactMetadata: {
+                    summaryTokens: compactResult.summaryTokenEstimate ?? 0,
+                    previousTokens: tokenCountWithEstimation(messagesForQuery),
+                },
                 sessionId,
             };
         }
@@ -153,9 +160,7 @@ export async function* runKernelLoop(ctx) {
             return done('blocking_limit');
         }
         // ── Steps 7+8: stream API + accumulate messages ───────────────────────────
-        const systemPrompt = [config.systemPrompt, config.appendSystemPrompt]
-            .filter(Boolean)
-            .join('\n\n');
+        const systemPrompt = effectiveSystemPrompt;
         const messagesForApi = state.fallbackTriggered
             ? stripThinkingBlocksFromMessages(currentMessagesForQuery)
             : currentMessagesForQuery;
@@ -275,6 +280,36 @@ export async function* runKernelLoop(ctx) {
         }
         catch (err) {
             if (err instanceof PromptTooLongError) {
+                if (config.compact?.enabled !== false &&
+                    !state.hasAttemptedReactiveCompact) {
+                    const reactiveCompactResult = await autoCompactIfNeeded(currentMessagesForQuery, state.currentModel, fileCache, config.compact?.querySource ?? config.querySource, state.autoCompactTracking, state.maxOutputTokensOverride ?? config.maxOutputTokens, {
+                        model: config.compact?.model,
+                        apiKey: config.apiKey,
+                        baseURL: config.baseURL,
+                        systemPrompt: effectiveSystemPrompt,
+                        customInstructions: config.compact?.customInstructions,
+                        abortSignal: signal,
+                        maxRetries: config.maxRetries,
+                    }, true);
+                    state = {
+                        ...state,
+                        autoCompactTracking: reactiveCompactResult.tracking,
+                        hasAttemptedReactiveCompact: true,
+                    };
+                    if (reactiveCompactResult.wasCompacted && reactiveCompactResult.postCompactMessages) {
+                        mutableMessages.splice(0, mutableMessages.length, ...reactiveCompactResult.postCompactMessages);
+                        state = { ...state, messages: [...mutableMessages] };
+                        yield {
+                            type: 'compact_boundary',
+                            compactMetadata: {
+                                summaryTokens: reactiveCompactResult.summaryTokenEstimate ?? 0,
+                                previousTokens: tokenCountWithEstimation(currentMessagesForQuery),
+                            },
+                            sessionId,
+                        };
+                        continue;
+                    }
+                }
                 resultText = PROMPT_TOO_LONG_ERROR_MESSAGE;
                 yield { type: 'text_delta', delta: PROMPT_TOO_LONG_ERROR_MESSAGE, sessionId };
                 return done('blocking_limit');

@@ -9,12 +9,18 @@ export { createConfigTool } from './config/index.js';
 export { listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession } from './cronStore.js';
 export type { CronJob } from './cronStore.js';
 import type { MetaAgentTool } from '../../core/types.js';
+import type { AgentMode } from '../../core/dynamicPrompt.js';
 export interface SystemToolsOptions {
     /**
      * Working directory for skill and config tools.
      * Defaults to process.cwd() when omitted.
      */
     cwd?: string;
+    /**
+     * Session mode — determines which mode-specific skill directory is searched.
+     * Defaults to 'agentic' when omitted.
+     */
+    mode?: AgentMode;
     /**
      * Shared plan-mode ref injected into enter_plan_mode / exit_plan_mode.
      * When omitted a private ref is created (tools will still work, but the

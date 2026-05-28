@@ -6,10 +6,13 @@
  * R3 — Active Sub-Agent Tasks + Git Branch Status (volatile — changes each turn)
  * R4 — Hardware Profile (memoized)
  * R5 — Session Resume / Progress Notes (volatile — notes append during session)
+ * R6 — Physical Anchors (volatile — device/physics facts)
  *
  * Sections are registered into the SectionRegistry in RoboticsSession.
  */
 import { systemPromptSection, DANGEROUS_uncachedSystemPromptSection, } from '../core/systemPromptSections.js';
+import { ExperienceSource } from '../context/sources/ExperienceSource.js';
+import { PhysicalAnchorSource } from '../context/sources/PhysicalAnchorSource.js';
 // ── R1 — Robotics Domain Context ─────────────────────────────────────────────
 /**
  * Build R1 section.
@@ -47,7 +50,7 @@ The experience store (\`experience_search\` / \`experience_write\`) is for:
 ❌ NOT a message bus between agents — do not write to it to pass data to yourself
 ❌ NOT a substitute for reading files — always read actual data first
 
-Write an experience entry **after you have solved the problem**, not before.
+Propose an experience entry **after you have solved the problem**, not before; it will wait for user review before becoming shared knowledge.
 A blank experience store means this is unexplored territory — proceed with direct analysis.
 
 ### Task Completion
@@ -107,7 +110,7 @@ When a sub-agent task completes:
 
 ### Experience-Driven Development
 - Run \`experience_search\` at the START of any new algorithm task (unexplored territory is normal)
-- Run \`experience_write\` at the END of each solved task to record the proven solution
+- Run \`experience_write\` at the END of each solved task to propose the proven solution for user review
 - Failures are as valuable as successes — always document root cause and workarounds
 
 ### Task Completion
@@ -116,20 +119,54 @@ Dispatching sub-agents is the start of work, not the end.
 After dispatch → poll status → read summaries → synthesize → answer.`;
     });
 }
-// ── R2 — Experience Index ─────────────────────────────────────────────────────
-export function buildR2Section(store) {
+// ── R2 — Experience Index (demand-paged, committed entries only) ─────────────
+//
+// Two-layer rendering:
+//   Layer 1 — Manifest: ultra-compact always-visible index (~100 tokens)
+//             Shows total count, domain breakdown, active checked-out slots.
+//   Layer 2 — Checked-out slots: full content paged in by VV hooks / QueryAnalyzer
+//             Budget-limited (default 1500 tokens), rendered by ContextPager.
+//
+// When pager is not provided the section falls back to the full index dump
+// (backward-compatible for callers that have not yet wired up ContextPager).
+//
+// The optional `source` parameter accepts a pre-built ExperienceSource so
+// callers (RoboticsSession) can share one instance rather than constructing a
+// new one inside the async callback on every turn.
+export function buildR2Section(store, pager, source) {
     return DANGEROUS_uncachedSystemPromptSection('experience_index', async () => {
-        try {
-            const index = await store.loadIndexMarkdown();
-            if (!index || index.trim().length === 0) {
-                return `## Experience Index\n*No experiences recorded yet. Use \`experience_write\` after completing tasks.*`;
+        // ── No pager: legacy full-dump mode ───────────────────────────────────
+        if (!pager) {
+            try {
+                const index = await store.loadIndexMarkdown();
+                if (!index || index.trim().length === 0) {
+                    return `## Experience Index\n*No experiences recorded yet. Use \`experience_write\` after completing tasks.*`;
+                }
+                return index;
             }
-            return index;
+            catch {
+                return `## Experience Index\n*Could not load experience index.*`;
+            }
+        }
+        // ── Pager mode: manifest + checked-out slots ───────────────────────────
+        try {
+            // Reuse the caller-provided source; only create a new instance as a
+            // fallback for backward-compatible callers that omit the parameter.
+            const effectiveSource = source ?? new ExperienceSource(store);
+            const manifestLine = await effectiveSource.getManifestLine();
+            // Manifest layer — always rendered
+            const manifest = pager.renderManifest([manifestLine]);
+            // Checked-out layer — budget-limited, populated by VV hooks / QueryAnalyzer
+            const checkedOut = pager.renderForTurn();
+            const parts = [manifest];
+            if (checkedOut)
+                parts.push(checkedOut);
+            return parts.join('\n\n');
         }
         catch {
-            return `## Experience Index\n*Could not load experience index.*`;
+            return `## Experience Index\n*Could not load experience context.*`;
         }
-    }, 'Experience entries can be approved from the CLI review flow between turns; the index must reflect newly committed entries.');
+    }, 'Experience entries and paged-in failure details change each turn; must stay current.');
 }
 // ── R3 — Active Sub-Agent Tasks + Git Status ─────────────────────────────────
 export function buildR3Section(bridge, gitMgr, getState) {
@@ -217,6 +254,92 @@ export function buildR4Section(hwProfile, robot) {
             return null;
         }
     });
+}
+// ── R6 — Physical Anchors (progressive disclosure) ───────────────────────────
+//
+// Three layers:
+//   Layer 1 — Manifest: one-line count with scope breakdown (always visible).
+//             "Physical anchors: 7 total | global:2 robot:3 code:2 | motion_planning:4"
+//   Layer 2 — Priority slots: top global + robot anchors auto-expanded (≤3 entries).
+//             These are cross-session safety facts that should never be missed.
+//   Layer 3 — On-demand: code-scoped anchors loaded via physical_anchor_search /
+//             physical_anchor_load when the agent determines they're relevant.
+//
+// When no pager is provided, falls back to layer 2 inline (backward-compatible).
+// pendingCount is shown so the user knows anchors await review after the session.
+export function buildR6Section(anchorStore, pager, _currentQuery, _robot, anchorSource, pendingCount = 0) {
+    const effectiveSource = anchorSource ?? new PhysicalAnchorSource(anchorStore);
+    return DANGEROUS_uncachedSystemPromptSection('physical_anchors', async () => {
+        try {
+            const all = await anchorStore.search({ limit: 100 });
+            // ── Empty state ────────────────────────────────────────────────────────
+            if (all.length === 0) {
+                const pendingNote = pendingCount > 0
+                    ? ` (${pendingCount} pending review — run \`/anchor review\` to commit)`
+                    : '';
+                return [
+                    '## Physical Anchors',
+                    `No physical anchors recorded yet${pendingNote}. ` +
+                        'Use `physical_anchor_write` to propose hardware facts, measured physical behavior, ' +
+                        'datasheet constraints, or device quirks that should anchor future reasoning.',
+                ].join('\n');
+            }
+            // ── Layer 1: Manifest line ────────────────────────────────────────────
+            const manifestLine = await effectiveSource.getManifestLine();
+            const pendingNote = pendingCount > 0
+                ? `  *(${pendingCount} pending review — \`/anchor review\`)*`
+                : '';
+            // ── Layer 2: Priority slots (global + robot scope only) ──────────────
+            const priorityAnchors = await effectiveSource.loadPriorityAnchors(3);
+            if (pager) {
+                // Manifest-style rendering for pager mode
+                const manifest = pager.renderManifest([manifestLine + pendingNote]);
+                const checkedOut = pager.renderForTurn();
+                const parts = [manifest];
+                if (checkedOut)
+                    parts.push(checkedOut);
+                return parts.join('\n\n');
+            }
+            // ── Non-pager fallback: inline manifest + priority slots ──────────────
+            const lines = [
+                '## Physical Anchors',
+                `> ${manifestLine}${pendingNote}`,
+            ];
+            if (priorityAnchors.length > 0) {
+                lines.push('', '### High-Priority Anchors (global / robot scope)');
+                for (const anchor of priorityAnchors) {
+                    lines.push('', formatPhysicalAnchorSlot(anchor));
+                }
+            }
+            const codeCount = all.filter(a => a.scope === 'code').length;
+            if (codeCount > 0) {
+                lines.push('', `*${codeCount} code-scoped anchor(s) available — use \`physical_anchor_search\` ` +
+                    `or \`physical_anchor_load\` to retrieve them when relevant.*`);
+            }
+            else if (priorityAnchors.length === 0) {
+                lines.push('', 'Use `physical_anchor_search` or `physical_anchor_load` when a physical/device fact may constrain this turn.');
+            }
+            return lines.join('\n');
+        }
+        catch {
+            return null;
+        }
+    }, 'Physical anchors can be added during the session and scope / pending count change; must stay current.');
+}
+export function formatPhysicalAnchorSlot(anchor) {
+    const lines = [
+        `**[${anchor.id}] ${anchor.title}**`,
+        `Scope: ${anchor.scope}  Domain: ${anchor.domain}  Confidence: ${anchor.confidenceTier}`,
+        `Fact: ${anchor.fact}`,
+    ];
+    if (anchor.mechanism)
+        lines.push(`Mechanism: ${anchor.mechanism}`);
+    lines.push(`Implication: ${anchor.implication}`);
+    if (anchor.robot)
+        lines.push(`Robot: ${anchor.robot}`);
+    if (anchor.evidenceRefs.length)
+        lines.push(`Evidence: ${anchor.evidenceRefs.slice(0, 3).join(' / ')}`);
+    return lines.join('\n');
 }
 // ── R5 — Session Resume / Progress Notes ─────────────────────────────────────
 //

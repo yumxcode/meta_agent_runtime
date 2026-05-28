@@ -191,7 +191,8 @@ export function createPermissionPolicy(options = {}) {
     const allowTmp = permissionConfig.workspace?.allowTmp !== false;
     return async (tool, input, _assistantMessageUuid, _toolUseId, context) => {
         const record = asRecord(input);
-        const permission = mergePermissionDeclaration(mergePermissionDeclaration(DEFAULT_TOOL_PERMISSIONS[tool.name], tool.permission), permissionConfig.tools?.[tool.name]);
+        const configuredPermission = mergePermissionDeclaration(DEFAULT_TOOL_PERMISSIONS[tool.name], permissionConfig.tools?.[tool.name]);
+        const permission = mergePermissionDeclaration(configuredPermission, tool.permission);
         if (permission.enabled === false) {
             return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` };
         }

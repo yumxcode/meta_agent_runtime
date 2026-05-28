@@ -89,6 +89,10 @@ export declare class SessionRouter {
     private readonly _debug;
     /** Robot/platform name forwarded to RoboticsSession (undefined = no hardware binding). */
     private readonly _robot;
+    /** Whether user explicitly resumed a prior session — forwarded to RoboticsSession. */
+    private readonly _explicitResume;
+    /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
+    private readonly _onEscalationRequest;
     /**
      * Lightweight Anthropic client used exclusively for one-shot mode detection.
      * Separate from the backend session client: short timeout (3 s), 1 retry,
@@ -179,6 +183,12 @@ export declare class SessionRouter {
      * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
      */
     getPendingExperiences(): import('../robotics/ExperiencePendingStore.js').ExperiencePendingStore | null;
+    /**
+     * Return the robotics session's pending physical anchor buffer (if mode=robotics).
+     * Returns null in all other modes or before the first submit().
+     * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
+     */
+    getPendingPhysicalAnchors(): import('../robotics/PhysicalAnchorPendingStore.js').PhysicalAnchorPendingStore | null;
     getRoboticsTeamController(): RoboticsTeamController | null;
     /**
      * Lazily initialise the backend on the first submit().

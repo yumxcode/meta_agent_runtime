@@ -20,8 +20,16 @@ vi.mock('../api/AnthropicClient.js', () => ({
   streamMessages: vi.fn(),
 }))
 
+vi.mock('../compact/CompactConversation.js', () => ({
+  compactConversation: vi.fn(),
+}))
+
 import { streamMessages } from '../api/AnthropicClient.js'
+import { compactConversation } from '../compact/CompactConversation.js'
+import { PromptTooLongError } from '../api/Errors.js'
+import { makeCompactBoundaryMessage, makeTextUserMessage } from '../messages/MessageFactory.js'
 const mockStream = vi.mocked(streamMessages)
+const mockCompact = vi.mocked(compactConversation)
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -312,5 +320,74 @@ describe('KernelSession — cumulative usage', () => {
     const usage = session.getTotalUsage()
     expect(usage.inputTokens).toBeGreaterThan(100)
     expect(usage.outputTokens).toBeGreaterThan(50)
+  })
+})
+
+describe('KernelSession — compact integration', () => {
+  function compactedMessages(summary = 'Summary after compact') {
+    return [
+      makeCompactBoundaryMessage(),
+      makeTextUserMessage(summary, { isCompactSummary: true }),
+    ]
+  }
+
+  it('reactively compacts and retries once when the API reports prompt-too-long', async () => {
+    let calls = 0
+    mockStream.mockImplementation(async function* () {
+      calls++
+      if (calls === 1) throw new PromptTooLongError()
+      yield* textStream('recovered')
+    })
+    mockCompact.mockResolvedValue({
+      postCompactMessages: compactedMessages(),
+      summaryTokenEstimate: 77,
+    })
+
+    const session = new KernelSession(makeConfig({ compact: { enabled: true } }))
+    const events = await collectEvents(session, 'large prompt')
+
+    expect(mockCompact).toHaveBeenCalledOnce()
+    expect(mockStream).toHaveBeenCalledTimes(2)
+    const boundary = events.find(e => e.type === 'compact_boundary')
+    expect(boundary?.compactMetadata.summaryTokens).toBe(77)
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('success')
+  })
+
+  it('persists compact failure tracking across submitMessage calls', async () => {
+    mockStream.mockImplementation(async function* () {
+      throw new PromptTooLongError()
+    })
+    mockCompact.mockRejectedValue(new Error('compact failed'))
+
+    const session = new KernelSession(makeConfig({ compact: { enabled: true } }))
+
+    for (let i = 0; i < 4; i++) {
+      const events = await collectEvents(session, `large prompt ${i}`)
+      const result = events.find(e => e.type === 'result')
+      expect(result?.subtype).toBe('error_blocking_limit')
+    }
+
+    expect(mockCompact).toHaveBeenCalledTimes(3)
+  })
+
+  it('honours compact.querySource during reactive compact', async () => {
+    mockStream.mockImplementation(async function* () {
+      throw new PromptTooLongError()
+    })
+    mockCompact.mockResolvedValue({
+      postCompactMessages: compactedMessages(),
+      summaryTokenEstimate: 1,
+    })
+
+    const session = new KernelSession(makeConfig({
+      compact: { enabled: true, querySource: 'compact' },
+      querySource: 'main',
+    }))
+    const events = await collectEvents(session, 'large prompt')
+
+    expect(mockCompact).not.toHaveBeenCalled()
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('error_blocking_limit')
   })
 })

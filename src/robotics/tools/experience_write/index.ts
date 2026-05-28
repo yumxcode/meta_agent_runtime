@@ -1,18 +1,52 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ExperienceStore } from '../../ExperienceStore.js'
-import type { ExperiencePendingStore } from '../../ExperiencePendingStore.js'
-import type { RoboticsDomain } from '../../types.js'
+import { validateExperienceInput, type ExperiencePendingStore } from '../../ExperiencePendingStore.js'
+import type { FlashClient } from '../../../core/flash/FlashClient.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Flash prompt: extract same-domain abstract principle
+// ─────────────────────────────────────────────────────────────────────────────
+
+const PRINCIPLE_SYSTEM = `\
+Extract the single most transferable abstract principle from a robotics experiment.
+
+The principle should be:
+- Domain-bounded: transferable within the same robotics domain, without forcing cross-domain generalization
+- Mechanistic: capture the root cause or success mechanism, not the surface symptom
+- Concise: 1-2 sentences maximum
+
+Examples of good principles:
+- "Spatial resolution × map size × branching factor determines peak memory; estimate before coding."
+- "Algorithm latency must be bounded relative to control loop frequency; otherwise state estimation diverges."
+- "Sim-to-real gap is largest for contact-rich or high-frequency tasks; validate with real hardware at first milestone."
+- "Gradient-based optimizers diverge when reward scale differs by orders of magnitude across terms; normalize first."
+
+Return only the principle text. No JSON, no explanation, no preamble.`
+
+function hashForCache(text: string): string {
+  let h = 5381
+  for (let i = 0; i < text.length; i++) {
+    h = (h * 33) ^ text.charCodeAt(i)
+  }
+  return (h >>> 0).toString(36)
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Tool
+// ─────────────────────────────────────────────────────────────────────────────
 
 /**
  * @param store        The shared cross-session ExperienceStore (NOT written to directly).
  * @param pendingStore Session-scoped buffer — experiences queue here until the
  *                     user reviews and approves them via `/experience review`.
- *                     This prevents premature or low-quality entries from
- *                     polluting the shared knowledge base.
+ * @param flash        Optional FlashClient for abstract principle extraction.
+ *                     If provided, a 3s flash call extracts the same-domain
+ *                     principle at write time.
  */
 export function createExperienceWriteTool(
-  store: ExperienceStore,
+  _store: ExperienceStore,
   pendingStore: ExperiencePendingStore,
+  flash?: FlashClient,
 ): MetaAgentTool {
   return {
     name: 'experience_write',
@@ -22,7 +56,7 @@ export function createExperienceWriteTool(
       'via the `/experience review` command. ' +
       'Call this when an experiment or task reaches a clear conclusion (success OR failure). ' +
       'Do NOT call mid-task or speculatively — wait until you have actionable findings. ' +
-      'Failure experiences are especially valuable: always document root cause and workarounds.',
+      'Failure experiences are especially valuable: always document root cause, invalidated assumptions, and workarounds.',
     inputSchema: {
       type: 'object',
       required: ['domain', 'title', 'problem', 'solution', 'success', 'outcome_summary'],
@@ -100,21 +134,87 @@ export function createExperienceWriteTool(
           type: 'string',
           description: 'Optional full Markdown report (not shown in index; loaded on demand)',
         },
+        confidence_tier: {
+          type: 'string',
+          enum: ['observed', 'reproduced', 'derived', 'reported', 'hypothesis'],
+          description: 'Evidence strength. Defaults to observed because experience_write should be used after completed work.',
+        },
+        evidence_refs: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Supporting logs, commits, reports, papers, datasheets, or tool outputs',
+        },
+        observation_count: {
+          type: 'number',
+          description: 'Independent observations supporting this lesson (default 1)',
+        },
+        contradiction_count: {
+          type: 'number',
+          description: 'Later observations contradicting this lesson (default 0)',
+        },
+        invalidated_assumptions: {
+          type: 'array',
+          items: { type: 'string' },
+          description: 'Prior assumptions shown false by this experience, especially for failures',
+        },
+        last_verified_at: {
+          type: 'number',
+          description: 'Unix timestamp in ms when this lesson was last verified',
+        },
       },
     },
     async call(input): Promise<ToolResult> {
       try {
-        // Queue in pending buffer — NOT committed to shared store yet.
-        // The user must review and approve via `/experience review`.
-        const pendingId = pendingStore.add(input as Record<string, unknown>)
-        const title = String(input['title'] ?? '(untitled)')
-        const success = Boolean(input['success'])
+        const normalized = validateExperienceInput(input as Record<string, unknown>)
+        if (!normalized.ok) {
+          return {
+            content:
+              'experience_write rejected invalid input. Required fields: ' +
+              'domain, title, problem, solution, success(boolean), outcome_summary.',
+            isError: true,
+          }
+        }
+        const title = normalized.value.title
+        const success = normalized.value.success
+
+        // ── Extract abstract principle via flash (3 s timeout) ────────────
+        // The principle supports same-domain matching in ExperiencePatternChecker.
+        // On timeout or error we proceed without it — the entry is still useful.
+        let abstractPrinciple: string | undefined
+        if (flash) {
+          const userContext = [
+            `Title: ${title}`,
+            `Domain: ${normalized.value.domain}`,
+            `Outcome: ${success ? 'success' : 'failure'}`,
+            `Problem: ${normalized.value.problem.slice(0, 300)}`,
+            `Solution: ${normalized.value.solution.slice(0, 400)}`,
+            normalized.value.failureReason ? `Failure reason: ${normalized.value.failureReason.slice(0, 200)}` : '',
+          ].filter(Boolean).join('\n')
+
+          const raw = await flash.query({
+            system: PRINCIPLE_SYSTEM,
+            user: userContext,
+            maxTokens: 120,
+            timeoutMs: 3_000,
+            cacheKey: `principle:${hashForCache(userContext)}`,
+          })
+          if (raw?.trim()) abstractPrinciple = raw.trim().slice(0, 400)
+        }
+
+        // ── Queue in pending buffer ───────────────────────────────────────
+        const enrichedInput: Record<string, unknown> = {
+          ...input as Record<string, unknown>,
+          ...(abstractPrinciple ? { abstract_principle: abstractPrinciple } : {}),
+        }
+        const pendingId = pendingStore.add(enrichedInput)
+
         return {
           content:
             `⏸  经验已加入待审队列 (pending ID: ${pendingId})\n` +
             `标题: ${title}\n` +
-            `结果: ${success ? '✅ 成功' : '❌ 失败'}\n\n` +
-            `此条经验不会自动写入共享知识库。\n` +
+            `结果: ${success ? '✅ 成功' : '❌ 失败'}\n` +
+            (abstractPrinciple ? `原理: ${abstractPrinciple}\n` : '') +
+            `\n此条经验不会自动写入共享知识库。\n` +
             `请在对话结束后运行 /experience review 进行审核，` +
             `由你决定是否提交、编辑或丢弃。`,
           isError: false,
@@ -122,9 +222,6 @@ export function createExperienceWriteTool(
       } catch (err) {
         return { content: `experience_write failed: ${String(err)}`, isError: true }
       }
-      // `store` is passed in but only used by ExperiencePendingStore.commit() —
-      // see the `/experience review` REPL command in cli/index.ts.
-      void store
     },
   }
 }
