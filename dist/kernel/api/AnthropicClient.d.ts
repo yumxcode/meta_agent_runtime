@@ -60,6 +60,8 @@ export interface StreamParams {
     /** Whether to include kernel default beta headers. Default: true. */
     includeDefaultBetas?: boolean;
 }
+/** Test/dispose hook — drop all cached SDK clients. */
+export declare function clearAnthropicClientCache(): void;
 /**
  * Stream messages from the Anthropic API.
  * Yields raw SDK stream events; the caller is responsible for reconstructing

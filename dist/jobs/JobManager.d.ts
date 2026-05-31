@@ -33,7 +33,40 @@ export declare class JobManager {
     private readonly executor;
     private readonly sessionId;
     private readonly jobs;
+    /**
+     * S2: LRU cap on terminal jobs held in memory.  Active (queued / running)
+     * jobs are NEVER evicted regardless of this cap — only completed / failed /
+     * cancelled records count toward the limit.  Default keeps the most recent
+     * 200 completed records for `list()` / `await()` re-attach; tune via
+     * `META_AGENT_KEEP_TERMINAL_JOBS` env var or `setTerminalJobCap()`.
+     */
+    private _terminalJobCap;
+    private static readonly DEFAULT_TERMINAL_JOB_CAP;
+    /**
+     * S2: insertion-ordered list of terminal job IDs (oldest first) used by the
+     * LRU eviction pass.  We can't rely on `jobs.keys()` order because jobs may
+     * transition from active → terminal arbitrarily.
+     */
+    private readonly _terminalOrder;
     constructor(sessionId: string, executor?: Executor);
+    /**
+     * Override the LRU cap on terminal jobs.  Pass `Infinity` to disable
+     * eviction (useful for tests that want to inspect every job afterwards).
+     */
+    setTerminalJobCap(cap: number): void;
+    /**
+     * S2: Forget a single terminal job.  No-op for active jobs (returns false)
+     * so callers can't accidentally drop work in flight.
+     */
+    forgetJob(jobId: JobId): boolean;
+    /**
+     * S2: Forget every terminal job whose completion time is older than `ts`.
+     * Returns the number evicted.  Falls back to submittedAt when completedAt
+     * is unavailable.
+     */
+    forgetCompletedBefore(ts: number): number;
+    /** S2: drop in-memory state for every terminal job. Used by host shutdown. */
+    forgetAllCompleted(): number;
     /**
      * Submit a new job and return its ID immediately.
      *
@@ -86,6 +119,9 @@ export declare class JobManager {
      */
     loadSession(): Promise<EngineeringJob[]>;
     private _transition;
+    /** S2: drop oldest terminal jobs until size ≤ _terminalJobCap. */
+    private _evictTerminalIfOverCap;
+    private _dropFromTerminalOrder;
     /**
      * Persist a job record with up to MAX_PERSIST_RETRIES attempts, using
      * exponential back-off between retries (100 ms → 200 ms → 400 ms).

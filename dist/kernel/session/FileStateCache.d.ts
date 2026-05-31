@@ -13,12 +13,18 @@ export interface FileEntry {
     readAt: number;
     /** File size at read time (bytes), used for compact re-attach size estimate */
     sizeBytes: number;
+    /**
+     * Last-known mtime (ms) of the file at read time.
+     * Used by edit_file to detect concurrent modifications between read and edit
+     * (TOCTOU defence). Undefined for legacy callers that don't supply it.
+     */
+    mtimeMs?: number;
 }
 export declare class FileStateCache {
     private _entries;
     private _maxEntries;
     constructor(maxEntries?: number);
-    record(path: string, sizeBytes: number): void;
+    record(path: string, sizeBytes: number, mtimeMs?: number): void;
     has(path: string): boolean;
     get(path: string): FileEntry | undefined;
     getAll(): FileEntry[];

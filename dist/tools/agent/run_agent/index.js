@@ -43,14 +43,30 @@ export async function createRunAgentTool(bridge) {
                  * both branches so no timer leaks under Bun or Node.
                  */
                 const abortableSleep = (ms) => new Promise((resolve) => {
-                    const timer = setTimeout(resolve, ms);
+                    let settled = false;
+                    let timer;
+                    const onAbort = () => {
+                        if (settled)
+                            return;
+                        settled = true;
+                        clearTimeout(timer);
+                        resolve();
+                    };
+                    timer = setTimeout(() => {
+                        if (settled)
+                            return;
+                        settled = true;
+                        ctx.abortSignal.removeEventListener('abort', onAbort);
+                        resolve();
+                    }, ms);
                     // Resolve immediately on abort — the timer is cleared to prevent
                     // the orphaned callback from firing 500ms later (memory + CPU leak
                     // when many agents are running concurrently under Bun).
-                    ctx.abortSignal.addEventListener('abort', () => {
-                        clearTimeout(timer);
-                        resolve();
-                    }, { once: true });
+                    if (ctx.abortSignal.aborted) {
+                        onAbort();
+                        return;
+                    }
+                    ctx.abortSignal.addEventListener('abort', onAbort, { once: true });
                 });
                 const startMs = Date.now();
                 while (Date.now() - startMs < MAX_WAIT_MS) {

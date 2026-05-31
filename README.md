@@ -4,9 +4,10 @@
 
 ## 特性概览
 
+- **主 LLM 扩展思考（默认开启）**：默认 `thinkingConfig: { type: 'adaptive' }`，Anthropic 走 `thinking: { budget_tokens: 16k }`，DeepSeek/Qwen 走 `reasoning_effort: 'max'`；可通过 `thinkingConfig: { type: 'disabled' }` 关闭。
 - **多轮工具循环**：支持模型在同一任务中连续调用文件、Shell、网络、MCP、自定义工具等能力，直到任务完成或达到限制。
 - **自动上下文压缩**：长会话接近上下文窗口上限时自动压缩历史，保留关键状态和任务目标。
-- **模式路由**：`SessionRouter` 可按提示词和环境自动选择 `direct`、`agentic`、`campaign`、`robotics` 模式。
+- **模式路由**：`SessionRouter` 可按提示词和环境自动选择 `agentic`、`campaign`、`robotics` 模式。
 - **工程验证与确认**：内置 V&V Hook，可在工具调用前后执行量级、单位、物理约束等检查。
 - **数据溯源**：每次工程工具调用可记录 provenance ID，支持追踪输入、输出、验证结果和依赖链。
 - **Campaign 工作流**：支持 DOE 参数扫描、论文复现、多阶段实验、人工检查点和多目标 Pareto 分析。
@@ -99,7 +100,6 @@ meta-agent --json "检查项目结构"
 | 模式 | 适用场景 | 说明 |
 | --- | --- | --- |
 | `auto` | 默认入口 | 根据首个请求和环境自动选择后端 |
-| `direct` | 单轮问答 | 不进入完整工具循环，适合轻量回答 |
 | `agentic` | 通用工程任务 | 多轮工具调用、文件修改、命令执行、上下文压缩 |
 | `campaign` | 长周期实验 | DOE、论文复现、阶段推进、人工检查点、溯源记录 |
 | `robotics` | 机器人开发 | 硬件档案、经验库、工作流、子代理、Git 工作树协作 |
@@ -180,6 +180,33 @@ const safeTool = instrumentTool(runSimulationTool, {
 
 session.registerTool(safeTool)
 ```
+
+## 扩展思考（thinking / reasoning）
+
+主 LLM 调用默认打开 thinking，模型会先在隐藏的 `thinking` block 里推理再给出答案。
+
+```ts
+import { SessionRouter } from '@meta-agent/runtime'
+
+// 默认即开启 — 等价于 thinkingConfig: { type: 'adaptive' }
+const session = new SessionRouter({ projectDir: process.cwd() })
+
+// 明确关闭（对成本/延迟敏感的轻量问答）
+new SessionRouter({ thinkingConfig: { type: 'disabled' } })
+
+// Anthropic 自定义预算
+new SessionRouter({ thinkingConfig: { type: 'enabled', budgetTokens: 32_000 } })
+```
+
+不同 provider 的映射：
+
+| Provider | 启用时发送 |
+| --- | --- |
+| Anthropic | `thinking: { type: 'enabled', budget_tokens: N }` + `interleaved-thinking-2025-05-14` beta |
+| DeepSeek | `reasoning_effort: 'max'`（同时上报 `reasoning_content` 流） |
+| Qwen | 走 Anthropic-compat 端点，与 Anthropic 行为一致 |
+
+回退到 `fallbackModel` 时，会自动切换到 `fallbackThinkingConfig`（默认 `disabled`），避免 fallback 模型不支持 thinking 时再次失败。
 
 ## 权限控制
 
@@ -299,7 +326,7 @@ npm run pack
 src/
 ├── kernel/       # 流式模型调用、工具循环、compact、权限和成本统计
 ├── core/         # 高层 Session、配置、系统提示、记忆、任务契约
-├── modes/        # direct / agentic / campaign 后端适配
+├── modes/        # agentic / campaign 后端适配
 ├── routing/      # 模式检测和 SessionRouter
 ├── tools/        # 内置工具集合
 ├── validation/   # V&V Hook 与内置检查器
@@ -344,4 +371,4 @@ import type {
 
 ## 版本
 
-当前包版本：`0.1.0`。
+当前包版本：`0.2.1`。

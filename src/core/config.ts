@@ -157,6 +157,23 @@ export interface MetaAgentConfig {
   /** Fallback model used when the primary model cannot satisfy request features. */
   fallbackModel?: string
 
+  /**
+   * Thinking ("extended thinking" / "reasoning") config for the primary model.
+   *
+   *   { type: 'disabled' }                            — no thinking blocks
+   *   { type: 'adaptive' }                            — let the kernel pick a
+   *                                                     budget (16 000 tokens
+   *                                                     for Anthropic;
+   *                                                     reasoning_effort='max'
+   *                                                     for DeepSeek / Qwen)
+   *   { type: 'enabled', budgetTokens: 32_000 }       — fixed Anthropic budget
+   *
+   * Default: `{ type: 'adaptive' }`. Thinking is ON by default so the model
+   * can deliberate before responding; explicitly set `{ type: 'disabled' }` to
+   * opt out (e.g. on cost-sensitive or latency-critical paths).
+   */
+  thinkingConfig?: ThinkingConfig
+
   /** Thinking config to use after model fallback. Defaults to disabled. */
   fallbackThinkingConfig?: ThinkingConfig
 
@@ -327,6 +344,7 @@ export type ResolvedConfig = Required<
     | 'fallbackThinkingConfig'
     | 'fallbackBetas'
     | 'fallbackIncludeDefaultBetas'
+    | 'thinkingConfig'
   >
 > & {
   runtimeContext?: RuntimeContext
@@ -340,6 +358,12 @@ export type ResolvedConfig = Required<
   initialMessages?: MetaAgentConfig['initialMessages']
   debugMode?: boolean
   fallbackModel?: string
+  /**
+   * Resolved primary-model thinking config.  Always populated by
+   * resolveConfig() — defaults to `{ type: 'adaptive' }` when the caller did
+   * not specify it.
+   */
+  thinkingConfig: ThinkingConfig
   fallbackThinkingConfig?: ThinkingConfig
   fallbackBetas?: string[]
   fallbackIncludeDefaultBetas?: boolean
@@ -372,6 +396,9 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     model,
     flashModel,
     fallbackModel: resolvedFallbackModel,
+    // Default to adaptive so the primary LLM thinks before answering. Callers
+    // can opt out by passing `{ type: 'disabled' }`.
+    thinkingConfig: config.thinkingConfig ?? { type: 'adaptive' },
     fallbackThinkingConfig: config.fallbackThinkingConfig,
     fallbackBetas: config.fallbackBetas,
     fallbackIncludeDefaultBetas: config.fallbackIncludeDefaultBetas,

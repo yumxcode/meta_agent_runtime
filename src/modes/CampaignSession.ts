@@ -44,6 +44,8 @@ export class CampaignSession {
   private _totalCostUsd = 0
   /** #11: Guard against concurrent submit() calls on the same session. */
   private _submitInFlight = false
+  /** S1: guard against double dispose. */
+  private _disposed = false
   private _usage: TokenUsage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -87,7 +89,10 @@ export class CampaignSession {
         model: resolved.flashModel,
         // ## Compact Instructions injected via appendSystemPrompt each submit()
       },
-      thinkingConfig: { type: 'adaptive' },
+      // Thinking on the primary model — honours resolved.thinkingConfig so
+      // callers can opt out via `{ type: 'disabled' }`.  Defaults to adaptive,
+      // matching the previous campaign-mode behaviour.
+      thinkingConfig: resolved.thinkingConfig,
       querySource: 'main',
       debug: resolved.debugMode,
       // token-efficient-tools reduces schema token overhead for multi-tool sessions
@@ -205,6 +210,19 @@ export class CampaignSession {
   interrupt(): void {
     this._engine.interrupt()
     void cleanupStateSnapshot(this._sessionId).catch(() => {})
+  }
+
+  /**
+   * S1 + S9: Release per-session resources.  Forwards to the inner KernelSession
+   * dispose (clears messages / fileCache / tools closures), drops our own
+   * registered-tools array, and removes the on-disk state snapshot. Idempotent.
+   */
+  async dispose(): Promise<void> {
+    if (this._disposed) return
+    this._disposed = true
+    try { this._engine.dispose() } catch { /* best-effort */ }
+    this._registeredTools.length = 0
+    await cleanupStateSnapshot(this._sessionId).catch(() => {})
   }
 
   getMessages(): readonly ConversationMessage[] {

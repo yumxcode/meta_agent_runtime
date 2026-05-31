@@ -18,6 +18,7 @@ export declare class PhysicalAnchorPendingStore {
     flush(): Promise<void>;
     commit(pendingId: string, store: PhysicalAnchorStore): Promise<string | null>;
     private _persistSoon;
+    private _trimToLimit;
     private _persist;
 }
 type NormalizedPhysicalAnchorInput = {

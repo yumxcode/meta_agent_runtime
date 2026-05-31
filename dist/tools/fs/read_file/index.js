@@ -46,7 +46,7 @@ export async function createReadFileTool() {
                 // Jupyter notebooks
                 if (ext === '.ipynb') {
                     const raw = await readFile(filePath, 'utf-8');
-                    _ctx.readFileState?.record(filePath, fileStat.size);
+                    _ctx.readFileState?.record(filePath, fileStat.size, fileStat.mtimeMs);
                     const nb = JSON.parse(raw);
                     const cells = nb.cells ?? [];
                     const lines = [];
@@ -57,7 +57,7 @@ export async function createReadFileTool() {
                     return { content: lines.join('\n'), isError: false };
                 }
                 const raw = await readFile(filePath, 'utf-8');
-                _ctx.readFileState?.record(filePath, fileStat.size);
+                _ctx.readFileState?.record(filePath, fileStat.size, fileStat.mtimeMs);
                 const allLines = raw.split('\n');
                 const startIdx = offset - 1;
                 const sliced = allLines.slice(startIdx, startIdx + limit);

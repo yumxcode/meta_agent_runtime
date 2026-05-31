@@ -4,6 +4,7 @@ import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { KNOWLEDGE_CONFIDENCE_TIERS, KNOWLEDGE_SCOPES, ROBOTICS_DOMAINS, } from './types.js';
 const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pending-physical-anchors');
+const MAX_PENDING_ENTRIES = 500;
 export class PhysicalAnchorPendingStore {
     _pending = [];
     _filePath;
@@ -26,12 +27,16 @@ export class PhysicalAnchorPendingStore {
                 if (isPendingPhysicalAnchor(item))
                     this._pending.push(item);
             }
+            this._trimToLimit();
         }
         catch {
             // Missing or malformed pending file: start empty.
         }
     }
     add(input) {
+        if (this._pending.length >= MAX_PENDING_ENTRIES) {
+            throw new Error(`Pending physical anchor queue limit reached (${MAX_PENDING_ENTRIES}); run /anchor review before adding more.`);
+        }
         const pendingId = `pa_pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
         this._pending.push({ pendingId, proposedAt: Date.now(), input });
         this._persistSoon();
@@ -80,6 +85,12 @@ export class PhysicalAnchorPendingStore {
             .catch(() => { })
             .then(() => this._persist(snapshot))
             .catch(() => { });
+    }
+    _trimToLimit() {
+        if (this._pending.length <= MAX_PENDING_ENTRIES)
+            return;
+        this._pending.splice(0, this._pending.length - MAX_PENDING_ENTRIES);
+        this._persistSoon();
     }
     async _persist(snapshot) {
         if (!this._filePath)

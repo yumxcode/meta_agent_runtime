@@ -43,8 +43,10 @@ import type { ConversationMessage, MetaAgentEvent, MetaAgentTool } from '../core
 import type { MetaAgentConfig } from '../core/config.js';
 import { ExperiencePendingStore } from './ExperiencePendingStore.js';
 import { PhysicalAnchorPendingStore } from './PhysicalAnchorPendingStore.js';
+import { PrinciplePendingStore } from './PrinciplePendingStore.js';
+import { proposePrincipleFromExperience } from './PrinciplePromotion.js';
 import type { RoboticsAgentMode } from './types.js';
-import { type TeamModuleAddInput, type TeamSyncSummary, type TeamTaskAddInput, type TeamTaskStatus } from './team/TeamStore.js';
+import { type TeamNoteInput, type TeamSyncSummary, type TeamTaskAddInput, type TeamTaskStatus } from './team/TeamStore.js';
 import { type TeamWatcherEvent } from './team/TeamWatcher.js';
 export interface RoboticsSessionOptions extends MetaAgentConfig {
     /** Robot/platform name (e.g. 'go2', 'franka_panda'). Injected into R1 & R4. */
@@ -97,6 +99,9 @@ export declare class RoboticsSession {
     private readonly physicalAnchors;
     /** Session-scoped pending physical anchor buffer. Exposed for CLI /anchor review. */
     readonly pendingPhysicalAnchors: PhysicalAnchorPendingStore;
+    private readonly principles;
+    /** Session-scoped pending principle buffer. Exposed for CLI /principle review. */
+    readonly pendingPrinciples: PrinciplePendingStore;
     private readonly anchorSource;
     private readonly hwProfile;
     private readonly gitMgr;
@@ -176,6 +181,7 @@ export declare class RoboticsSession {
         resumed: boolean;
         sessionAgeMs?: number;
     }>;
+    proposePrincipleForExperience(experienceId: string, reason: 'confidence_threshold' | 'explicit_user_request'): Promise<Awaited<ReturnType<typeof proposePrincipleFromExperience>>>;
     /**
      * Gracefully shut down the session.
      *
@@ -208,44 +214,39 @@ export declare class RoboticsSession {
     getEstimatedCost(): number;
     getLastSystemPrompt(): string | null;
     getSessionId(): string;
-    teamInit(github?: string): Promise<import("./team/TeamStore.js").TeamState>;
-    teamJoin(github?: string, human?: string): Promise<import("./team/TeamStore.js").TeamState>;
-    teamClaim(taskId: string): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        task: import("./team/TeamStore.js").TeamTask;
-        warnings: string[];
-    }>;
-    /** Transition a claimed/backlog task to in_progress (begin active work). */
-    teamStart(taskId?: string): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        task: import("./team/TeamStore.js").TeamTask;
-    }>;
+    teamInit(github?: string): Promise<import("./team/types.js").TeamState>;
+    teamJoin(github?: string, human?: string): Promise<import("./team/types.js").TeamState>;
+    teamStatus(): Promise<import("./team/types.js").TeamState | null>;
     teamTaskAdd(input: TeamTaskAddInput): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        task: import("./team/TeamStore.js").TeamTask;
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
+    }>;
+    /** Exclusively take a task; throws if owned by another unit. */
+    teamTake(taskId: string): Promise<{
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
+    }>;
+    /** Release a task you own (no-op if you don't own it). */
+    teamDrop(taskId?: string): Promise<{
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
+    }>;
+    /** Force-take a task currently owned by someone else; records audit attempt. */
+    teamSteal(taskId: string, reason?: string): Promise<{
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
+        previousOwner?: string;
+    }>;
+    /** Append a single direction+outcome attempt to a task you own. */
+    teamNote(input: TeamNoteInput): Promise<{
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
+        attempt: import("./team/types.js").TeamAttempt;
     }>;
     teamTaskStatus(taskId: string, status: TeamTaskStatus): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        task: import("./team/TeamStore.js").TeamTask;
+        state: import("./team/types.js").TeamState;
+        task: import("./team/types.js").TeamTask;
     }>;
-    teamModuleAdd(input: TeamModuleAddInput): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        module: import("./team/TeamStore.js").TeamModule;
-    }>;
-    teamModuleOwner(name: string, ownerUnit?: string): Promise<{
-        state: import("./team/TeamStore.js").TeamState;
-        module: import("./team/TeamStore.js").TeamModule;
-    }>;
-    teamCheck(): Promise<import("./team/TeamStore.js").TeamConflictReport>;
-    teamCheckPaths(paths: string[]): Promise<import("./team/TeamStore.js").TeamConflictReport>;
-    teamBranch(taskId?: string): Promise<import("./team/TeamStore.js").TeamBranchResult>;
-    teamPush(): Promise<import("./team/TeamStore.js").TeamPushResult>;
-    teamPr(taskId?: string): Promise<import("./team/TeamStore.js").TeamPrDraftResult>;
-    teamHandoff(taskId?: string, note?: string): Promise<import("./team/TeamStore.js").TeamHandoffResult>;
-    teamOnboarding(): Promise<import("./team/TeamStore.js").TeamOnboardingSummary>;
-    teamGitHubIssuesSync(taskId?: string): Promise<import("./team/TeamStore.js").TeamGitHubIssueSyncResult[]>;
-    teamGitHubProjectAdd(projectNumber: string, owner?: string): Promise<import("./team/TeamStore.js").TeamGitHubProjectResult>;
-    teamStatus(): Promise<import("./team/TeamStore.js").TeamState | null>;
     teamSync(): Promise<TeamSyncSummary>;
     teamPull(): Promise<import("./team/TeamStore.js").TeamPullResult>;
     teamConflicts(): Promise<import("./team/TeamStore.js").MergeConflictReport>;

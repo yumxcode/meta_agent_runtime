@@ -48,6 +48,7 @@ export declare class ExperiencePendingStore {
      */
     commit(pendingId: string, store: ExperienceStore): Promise<string | null>;
     private _persistSoon;
+    private _trimToLimit;
     private _persist;
 }
 type NormalizedExperienceInput = {

@@ -19,36 +19,34 @@
  */
 import { z } from 'zod';
 export declare const TeamTaskStatusSchema: z.ZodEnum<{
-    cancelled: "cancelled";
-    backlog: "backlog";
-    claimed: "claimed";
-    in_progress: "in_progress";
-    blocked: "blocked";
-    review: "review";
-    done: "done";
+    open: "open";
     paused: "paused";
-    handoff: "handoff";
+    done: "done";
 }>;
+export declare const TeamAttemptSchema: z.ZodObject<{
+    at: z.ZodString;
+    unit: z.ZodString;
+    direction: z.ZodString;
+    outcome: z.ZodString;
+    ref: z.ZodOptional<z.ZodString>;
+}, z.core.$strip>;
 export declare const TeamTaskSchema: z.ZodObject<{
     id: z.ZodString;
     title: z.ZodString;
     status: z.ZodEnum<{
-        cancelled: "cancelled";
-        backlog: "backlog";
-        claimed: "claimed";
-        in_progress: "in_progress";
-        blocked: "blocked";
-        review: "review";
-        done: "done";
+        open: "open";
         paused: "paused";
-        handoff: "handoff";
+        done: "done";
     }>;
-    module: z.ZodOptional<z.ZodString>;
     ownerUnit: z.ZodOptional<z.ZodString>;
-    branch: z.ZodOptional<z.ZodString>;
-    githubIssueNumber: z.ZodOptional<z.ZodNumber>;
-    githubIssueUrl: z.ZodOptional<z.ZodString>;
-    paths: z.ZodArray<z.ZodString>;
+    claimedAt: z.ZodOptional<z.ZodString>;
+    attempts: z.ZodArray<z.ZodObject<{
+        at: z.ZodString;
+        unit: z.ZodString;
+        direction: z.ZodString;
+        outcome: z.ZodString;
+        ref: z.ZodOptional<z.ZodString>;
+    }, z.core.$strip>>;
     updatedAt: z.ZodString;
 }, z.core.$strip>;
 export declare const TeamUnitSchema: z.ZodObject<{
@@ -57,19 +55,12 @@ export declare const TeamUnitSchema: z.ZodObject<{
     machine: z.ZodString;
     status: z.ZodEnum<{
         active: "active";
-        idle: "idle";
-        offline: "offline";
+        away: "away";
     }>;
     currentTask: z.ZodOptional<z.ZodString>;
     lastSeen: z.ZodString;
 }, z.core.$strip>;
-export declare const TeamModuleSchema: z.ZodObject<{
-    name: z.ZodString;
-    ownerUnit: z.ZodOptional<z.ZodString>;
-    paths: z.ZodArray<z.ZodString>;
-    responsibilities: z.ZodArray<z.ZodString>;
-}, z.core.$strip>;
-export declare const TeamStateSchema: z.ZodObject<{
+export declare const TeamStateV10Schema: z.ZodObject<{
     schemaVersion: z.ZodLiteral<"1.0">;
     project: z.ZodString;
     github: z.ZodOptional<z.ZodString>;
@@ -85,13 +76,13 @@ export declare const TeamStateSchema: z.ZodObject<{
         title: z.ZodString;
         status: z.ZodEnum<{
             cancelled: "cancelled";
+            paused: "paused";
+            done: "done";
             backlog: "backlog";
             claimed: "claimed";
             in_progress: "in_progress";
             blocked: "blocked";
             review: "review";
-            done: "done";
-            paused: "paused";
             handoff: "handoff";
         }>;
         module: z.ZodOptional<z.ZodString>;
@@ -117,7 +108,97 @@ export declare const TeamStateSchema: z.ZodObject<{
     decisions: z.ZodArray<z.ZodString>;
     updatedAt: z.ZodString;
 }, z.core.$strip>;
-export type TeamStateValidated = z.infer<typeof TeamStateSchema>;
+export declare const TeamStateV20Schema: z.ZodObject<{
+    schemaVersion: z.ZodLiteral<"2.0">;
+    project: z.ZodString;
+    github: z.ZodOptional<z.ZodString>;
+    goals: z.ZodArray<z.ZodString>;
+    tasks: z.ZodArray<z.ZodObject<{
+        id: z.ZodString;
+        title: z.ZodString;
+        status: z.ZodEnum<{
+            open: "open";
+            paused: "paused";
+            done: "done";
+        }>;
+        ownerUnit: z.ZodOptional<z.ZodString>;
+        claimedAt: z.ZodOptional<z.ZodString>;
+        attempts: z.ZodArray<z.ZodObject<{
+            at: z.ZodString;
+            unit: z.ZodString;
+            direction: z.ZodString;
+            outcome: z.ZodString;
+            ref: z.ZodOptional<z.ZodString>;
+        }, z.core.$strip>>;
+        updatedAt: z.ZodString;
+    }, z.core.$strip>>;
+    units: z.ZodArray<z.ZodObject<{
+        id: z.ZodString;
+        human: z.ZodOptional<z.ZodString>;
+        machine: z.ZodString;
+        status: z.ZodEnum<{
+            active: "active";
+            away: "away";
+        }>;
+        currentTask: z.ZodOptional<z.ZodString>;
+        lastSeen: z.ZodString;
+    }, z.core.$strip>>;
+    updatedAt: z.ZodString;
+}, z.core.$strip>;
+export declare const TeamStateSchema: z.ZodObject<{
+    schemaVersion: z.ZodLiteral<"2.0">;
+    project: z.ZodString;
+    github: z.ZodOptional<z.ZodString>;
+    goals: z.ZodArray<z.ZodString>;
+    tasks: z.ZodArray<z.ZodObject<{
+        id: z.ZodString;
+        title: z.ZodString;
+        status: z.ZodEnum<{
+            open: "open";
+            paused: "paused";
+            done: "done";
+        }>;
+        ownerUnit: z.ZodOptional<z.ZodString>;
+        claimedAt: z.ZodOptional<z.ZodString>;
+        attempts: z.ZodArray<z.ZodObject<{
+            at: z.ZodString;
+            unit: z.ZodString;
+            direction: z.ZodString;
+            outcome: z.ZodString;
+            ref: z.ZodOptional<z.ZodString>;
+        }, z.core.$strip>>;
+        updatedAt: z.ZodString;
+    }, z.core.$strip>>;
+    units: z.ZodArray<z.ZodObject<{
+        id: z.ZodString;
+        human: z.ZodOptional<z.ZodString>;
+        machine: z.ZodString;
+        status: z.ZodEnum<{
+            active: "active";
+            away: "away";
+        }>;
+        currentTask: z.ZodOptional<z.ZodString>;
+        lastSeen: z.ZodString;
+    }, z.core.$strip>>;
+    updatedAt: z.ZodString;
+}, z.core.$strip>;
+export type TeamStateV10 = z.infer<typeof TeamStateV10Schema>;
+export type TeamStateV20 = z.infer<typeof TeamStateV20Schema>;
+export type TeamStateValidated = TeamStateV20;
+/** Latest schema-version literal; bump alongside additions to the union. */
+export declare const TEAM_STATE_LATEST_VERSION: "2.0";
+/**
+ * Migrate any historic team-state record forward to the latest schema, then
+ * validate.  Currently handles:
+ *   - v2.0 → no-op
+ *   - v1.0 → drop modules/decisions/paths/branch/github-issue fields;
+ *            collapse 9-state status into open|paused|done;
+ *            initialise empty attempts[].
+ *
+ * Returns the upgraded + validated state, or null when the input is neither
+ * a known historic shape nor a parseable current payload.
+ */
+export declare function migrateTeamState(raw: unknown): TeamStateValidated | null;
 export declare const JobStatusSchema: z.ZodEnum<{
     submitted: "submitted";
     queued: "queued";

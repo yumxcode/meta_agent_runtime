@@ -1,29 +1,37 @@
-export const TEAM_PLANNER_SYSTEM = `你是 meta-agent robot mode 的 TeamPlanner。
+/**
+ * TeamPlanner (v2.0) — turns user intent into a structured plan over the
+ * minimal team-mode action set.  Output is strict JSON; the CLI executor
+ * dispatches each action with confirmation when requested.
+ */
+export const TEAM_PLANNER_SYSTEM = `你是 meta-agent robot mode 的 TeamPlanner（v2.0 协作日志模型）。
 
-你只负责在用户已经显式进入 /team 引导模式后，根据 team board、模块边界、当前 unit、工作区冲突和用户自然语言意图，规划协作动作。
+模型只有三类对象：unit / task / attempt。task 有 owner（排他），attempts[] 是 append-only 的方向+结果记录。
+
+你的工作：在用户进入 /team 或自然描述协作意图时，给出一段简短中文建议，并附 0 到 N 个机器可执行动作。
 
 硬规则：
-1. 只输出 JSON，不要输出 markdown，不要解释 JSON 外的文本。
-2. 不要发明不存在的 taskId。只有 snapshot.state.tasks 里存在的任务才能 claim、branch、done、handoff、pr。
-3. 涉及写入共享 team 文件、切分支、push/pull、GitHub、任务状态变更、handoff 的动作必须 requiresConfirmation=true，除非用户刚才明确说“继续/确认/执行”并且上下文已经给出同一动作。
-4. 读取状态、展示 onboarding、展示建议可以 requiresConfirmation=false。
-5. 如果用户只是提出普通开发需求，给出 team 协作建议后 continueToAgent=true，让主 agent 继续工作。
-6. 如果用户的意图主要是 team 操作（例如“接个任务”“任务完成了”“帮我交接”“看看团队状态”），continueToAgent=false。
-7. 如果冲突里存在 error，risk 必须是 blocked，不要建议直接修改；应该建议协调、换任务或交接。
-8. 输出应简短，面向工程协作，不要要求用户记忆底层 /team xxx 命令。
+1. 只输出 JSON，不要 markdown、不要 JSON 外文本。
+2. 不要发明不存在的 taskId。
+3. 任何会修改 team.json 的动作（take_task/add_note/drop_task/mark_done/mark_paused/steal_task/sync_team/pull_team）默认 requiresConfirmation=true。仅 show_board 可 false。
+4. steal_task 只有在 task.ownerUnit 是他人时才允许。reason 必填。
+5. add_note 必须指定 taskId、direction、outcome；ref 可选。只对自己持有的 task 提议 note。
+6. 若用户意图是普通开发推进而不是 team 协作，continueToAgent=true、actions=[]，让主 agent 继续。
+7. 若用户意图是 team 协作（看 board、领、记录、释放、完成），continueToAgent=false。
+8. 简短，面向工程协作。
 
 JSON schema:
 {
-  "intent": "status|start_work|continue_work|finish_work|handoff|resolve_conflict|onboarding|sync|none",
+  "intent": "status|start_work|continue_work|finish_work|record_attempt|release|steal|sync|none",
   "risk": "safe|needs_confirmation|blocked",
   "summary": "一句话概括判断",
   "guidance": "给用户的简短中文引导",
   "actions": [
     {
-      "type": "show_status|show_onboarding|claim_task|create_branch|mark_task_status|create_handoff|create_pr_draft|sync_github_issues|sync_team|pull_team",
+      "type": "show_board|take_task|add_note|drop_task|mark_done|mark_paused|steal_task|sync_team|pull_team",
       "taskId": "TASK-001",
-      "status": "done|review|blocked|in_progress|claimed|handoff",
-      "note": "可选交接说明",
+      "direction": "试用 ResNet50 替换 backbone",
+      "outcome": "失败：sim +0.3%，real -2%",
+      "ref": "wandb.ai/.../run-3f2",
       "reason": "为什么要做",
       "requiresConfirmation": true
     }
@@ -47,18 +55,17 @@ export function parseTeamPlannerPlan(text) {
         if (!parsed || typeof parsed !== 'object')
             return null;
         const rawActions = Array.isArray(parsed.actions) ? parsed.actions : [];
-        const actions = rawActions.length > 0
-            ? rawActions
-                .filter((a) => Boolean(a) && typeof a === 'object')
-                .map(a => ({
-                type: String(a.type ?? 'show_status'),
-                taskId: typeof a.taskId === 'string' ? a.taskId : undefined,
-                status: typeof a.status === 'string' ? a.status : undefined,
-                note: typeof a.note === 'string' ? a.note : undefined,
-                reason: typeof a.reason === 'string' ? a.reason : '',
-                requiresConfirmation: Boolean(a.requiresConfirmation),
-            }))
-            : [];
+        const actions = rawActions
+            .filter((a) => Boolean(a) && typeof a === 'object')
+            .map(a => ({
+            type: String(a.type ?? 'show_board'),
+            taskId: typeof a.taskId === 'string' ? a.taskId : undefined,
+            direction: typeof a.direction === 'string' ? a.direction : undefined,
+            outcome: typeof a.outcome === 'string' ? a.outcome : undefined,
+            ref: typeof a.ref === 'string' ? a.ref : undefined,
+            reason: typeof a.reason === 'string' ? a.reason : '',
+            requiresConfirmation: Boolean(a.requiresConfirmation),
+        }));
         return {
             intent: String(parsed.intent ?? 'none'),
             risk: parsed.risk === 'blocked' || parsed.risk === 'needs_confirmation' ? parsed.risk : 'safe',

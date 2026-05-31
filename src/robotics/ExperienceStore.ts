@@ -7,8 +7,18 @@ import { makeExperienceId } from './types.js'
 
 const EXPERIENCE_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'experiences')
 const INDEX_FILE = 'EXPERIENCE_INDEX.md'
+const MANIFEST_FILE = 'EXPERIENCE_MANIFEST.json'
 const MAX_INDEX_ENTRIES = 100   // hard cap on index entries shown
+const LOAD_CONCURRENCY = 32
 const EXPERIENCE_ID_RE = /^exp_[0-9a-z]+_[0-9a-f]{8}$/
+
+type ExperienceSearchEntry = Omit<ExperienceEntry, 'fullReport'>
+
+interface ExperienceManifest {
+  schemaVersion: '1.0'
+  updatedAt: number
+  entries: ExperienceSearchEntry[]
+}
 
 export function isExperienceId(id: string): boolean {
   return EXPERIENCE_ID_RE.test(id)
@@ -32,10 +42,12 @@ export function experienceRetrievalScore(entry: ExperienceEntry): number {
 export class ExperienceStore {
   private readonly dir: string
   private readonly indexPath: string
+  private readonly manifestPath: string
 
   constructor(dir?: string) {
     this.dir = dir ?? EXPERIENCE_ROOT
     this.indexPath = join(this.dir, INDEX_FILE)
+    this.manifestPath = join(this.dir, MANIFEST_FILE)
   }
 
   async ensureDir(): Promise<void> {
@@ -66,7 +78,7 @@ export class ExperienceStore {
 
   async search(query: ExperienceSearchQuery): Promise<ExperienceEntry[]> {
     const limit = Math.min(query.limit ?? 10, 20)
-    const entries = await this._loadAll()
+    const entries = await this._loadSearchEntries()
     const filtered = entries.filter(e => {
       if (query.domain && e.domain !== query.domain) return false
       if (query.robot && e.robot !== query.robot) return false
@@ -89,7 +101,7 @@ export class ExperienceStore {
       return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt
     })
     // strip fullReport from search results
-    return filtered.slice(0, limit).map(e => { const { fullReport: _, ...rest } = e; return rest as ExperienceEntry })
+    return filtered.slice(0, limit) as ExperienceEntry[]
   }
 
   // ── Load by ID ───────────────────────────────────────────────────────────────
@@ -99,8 +111,24 @@ export class ExperienceStore {
     return readJsonFile<ExperienceEntry>(join(this.dir, `${id}.json`))
   }
 
+  async appendPrincipleReference(experienceId: string, principleId: string): Promise<boolean> {
+    if (!isExperienceId(experienceId)) return false
+    const entry = await this.load(experienceId)
+    if (!entry) return false
+    const principleIds = entry.principleIds ?? []
+    if (principleIds.includes(principleId)) return true
+    const updated: ExperienceEntry = {
+      ...entry,
+      principleIds: [...principleIds, principleId],
+      updatedAt: Date.now(),
+    }
+    await atomicWriteJson(join(this.dir, `${experienceId}.json`), updated)
+    await this.rebuildIndex()
+    return true
+  }
+
   async getStats(): Promise<{ total: number; failures: number; domainCounts: Record<string, number> }> {
-    const entries = await this._loadAll()
+    const entries = await this._loadSearchEntries()
     const domainCounts: Record<string, number> = {}
     let failures = 0
     for (const e of entries) {
@@ -119,8 +147,9 @@ export class ExperienceStore {
   }
 
   async rebuildIndex(): Promise<void> {
-    const entries = await this._loadAll()
+    const entries = await this._loadAllFromFiles()
     entries.sort((a, b) => b.createdAt - a.createdAt)
+    await this._writeManifest(entries)
 
     // Group by domain
     const byDomain = new Map<RoboticsDomain, ExperienceEntry[]>()
@@ -166,8 +195,58 @@ export class ExperienceStore {
   // ── Internal ─────────────────────────────────────────────────────────────────
 
   private async _loadAll(): Promise<ExperienceEntry[]> {
-    const ids = await this.listIds()
-    const entries = await Promise.all(ids.map(id => this.load(id)))
-    return entries.filter((e): e is ExperienceEntry => e !== null)
+    return this._loadAllFromFiles()
   }
+
+  private async _loadAllFromFiles(): Promise<ExperienceEntry[]> {
+    const ids = await this.listIds()
+    return loadWithConcurrency(ids, id => this.load(id))
+  }
+
+  private async _loadSearchEntries(): Promise<ExperienceSearchEntry[]> {
+    const manifest = await readJsonFile<ExperienceManifest>(this.manifestPath)
+    if (isExperienceManifest(manifest)) return manifest.entries
+    const entries = await this._loadAllFromFiles()
+    await this._writeManifest(entries).catch(() => undefined)
+    return entries.map(stripFullReport)
+  }
+
+  private async _writeManifest(entries: ExperienceEntry[]): Promise<void> {
+    const manifest: ExperienceManifest = {
+      schemaVersion: '1.0',
+      updatedAt: Date.now(),
+      entries: entries.map(stripFullReport),
+    }
+    await atomicWriteJson(this.manifestPath, manifest)
+  }
+}
+
+function stripFullReport(entry: ExperienceEntry): ExperienceSearchEntry {
+  const { fullReport: _, ...rest } = entry
+  return rest
+}
+
+function isExperienceManifest(value: unknown): value is ExperienceManifest {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return record['schemaVersion'] === '1.0' &&
+    typeof record['updatedAt'] === 'number' &&
+    Array.isArray(record['entries'])
+}
+
+async function loadWithConcurrency<T>(
+  ids: string[],
+  load: (id: string) => Promise<T | null>,
+): Promise<T[]> {
+  const out: T[] = []
+  let next = 0
+  const workerCount = Math.min(LOAD_CONCURRENCY, ids.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next++]
+      const entry = await load(id)
+      if (entry) out.push(entry)
+    }
+  }))
+  return out
 }

@@ -122,6 +122,9 @@ export function resolveConfig(config) {
         model,
         flashModel,
         fallbackModel: resolvedFallbackModel,
+        // Default to adaptive so the primary LLM thinks before answering. Callers
+        // can opt out by passing `{ type: 'disabled' }`.
+        thinkingConfig: config.thinkingConfig ?? { type: 'adaptive' },
         fallbackThinkingConfig: config.fallbackThinkingConfig,
         fallbackBetas: config.fallbackBetas,
         fallbackIncludeDefaultBetas: config.fallbackIncludeDefaultBetas,

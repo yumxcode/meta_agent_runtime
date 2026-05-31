@@ -131,6 +131,11 @@ export declare class MetaAgentSession {
     /**
      * Release per-session resources. Call when a long-lived host is done with
      * this session; safe to call multiple times.
+     *
+     * S1 + S18: also forwards to the inner AgenticSession dispose (which clears
+     * the kernel message buffer + tool closures + RuntimeContext-pinning
+     * instrumentation), drops cached section results, and frees the static
+     * prompt cache.
      */
     dispose(): Promise<void>;
     /** Backward-compatible synchronous teardown alias. */

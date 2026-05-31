@@ -13,6 +13,35 @@
  *   await writer.writeRequest(reqParams)
  *   await writer.close()
  */
+/**
+ * S4: Best-effort cleanup of stale debug data.
+ *
+ * Two passes:
+ *   1. Age pass — any session directory whose newest file is older than
+ *      `ttlMs` (default 14 days) is removed in full.
+ *   2. Size pass — within each surviving session directory, if total size
+ *      exceeds `sessionSizeCapBytes`, the oldest `.jsonl` files are removed
+ *      until under cap.
+ *
+ * Both passes swallow every error: this runs from session shutdown paths
+ * where I/O failures must never block the host.  Returns a summary so
+ * callers can log it if desired.
+ */
+export interface DebugPurgeOptions {
+    /** Sessions whose newest file is older than this are deleted. */
+    ttlMs?: number;
+    /** Per-session-directory size cap (bytes). */
+    sessionSizeCapBytes?: number;
+    /** Override the debug root (mostly for tests). */
+    rootDir?: string;
+}
+export interface DebugPurgeSummary {
+    scannedSessions: number;
+    removedSessions: number;
+    trimmedFiles: number;
+    bytesFreed: number;
+}
+export declare function pruneStaleDebug(options?: DebugPurgeOptions): Promise<DebugPurgeSummary>;
 export declare class DebugWriter {
     private readonly fh;
     private constructor();

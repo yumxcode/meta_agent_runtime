@@ -38,6 +38,14 @@ export declare function readJsonFile<T = unknown>(filePath: string): Promise<T |
  */
 export declare function atomicWriteJson(filePath: string, data: unknown): Promise<void>;
 /**
+ * Atomically write a raw text payload to `filePath`.
+ *
+ * Same write-then-rename guarantees as atomicWriteJson, but for arbitrary
+ * text (e.g. markdown views).  Crashes mid-write leave an orphan .tmp file
+ * but never expose a half-written `filePath`.
+ */
+export declare function atomicWriteFile(filePath: string, contents: string): Promise<void>;
+/**
  * List IDs of all JSON records in `dir`.
  *
  * Returns base names of every `*.json` file (excluding `.tmp` files),

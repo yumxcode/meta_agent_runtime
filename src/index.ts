@@ -7,6 +7,9 @@ export { CampaignSession } from './modes/CampaignSession.js'
 /** @deprecated Use CampaignSession instead */
 export { CampaignSession as KernelBridge } from './modes/CampaignSession.js'
 export type { MetaAgentConfig, ResolvedConfig } from './core/config.js'
+// Re-export ThinkingConfig so callers can write `thinkingConfig: { type: 'disabled' }`
+// without reaching into the kernel subpath.
+export type { ThinkingConfig } from './kernel/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,
@@ -151,6 +154,32 @@ export {
 } from './core/contract/types.js'
 export { TaskContractStore } from './core/contract/TaskContractStore.js'
 
+// ── Robotics knowledge layers ────────────────────────────────────────────────
+export {
+  experienceRetrievalScore,
+  isExperienceId,
+} from './robotics/ExperienceStore.js'
+export { PhysicalAnchorStore, isPhysicalAnchorId } from './robotics/PhysicalAnchorStore.js'
+export {
+  PrincipleStore,
+  principleRetrievalScore,
+  isPrincipleId,
+} from './robotics/PrincipleStore.js'
+export { PrinciplePendingStore, validatePrincipleInput } from './robotics/PrinciplePendingStore.js'
+export {
+  PRINCIPLE_PROMOTION_SCORE_THRESHOLD,
+  shouldTriggerPrinciplePromotion,
+  proposePrincipleFromExperience,
+} from './robotics/PrinciplePromotion.js'
+export type {
+  KnowledgeConfidenceTier,
+  KnowledgeScope,
+  PrincipleAbstractionLevel,
+  PrincipleEntry,
+  PrincipleSearchQuery,
+  PhysicalAnchorEntry,
+} from './robotics/types.js'
+
 // ── Built-in tools ────────────────────────────────────────────────────────────
 // Each tool lives in src/tools/<name>/ with a prompt.md description file.
 export {
@@ -221,6 +250,9 @@ export {
   createExperienceSearchTool,
   createExperienceWriteTool,
   createExperienceLoadTool,
+  createPrincipleSearchTool,
+  createPrinciplePromoteTool,
+  createPrincipleLoadTool,
   createHardwareProfileReadTool,
   createHardwareProfileWriteTool,
   createExperimentDispatchTool,

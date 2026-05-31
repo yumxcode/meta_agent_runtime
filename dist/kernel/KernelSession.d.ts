@@ -27,6 +27,10 @@ export declare class KernelSession {
     private readonly _cwd;
     private _permissionDenials;
     private _submitInFlight;
+    /** S16: cap permission-denial buffer so a million-turn session can't grow it forever. */
+    private static readonly MAX_PERMISSION_DENIALS;
+    /** S1: guard against double dispose. */
+    private _disposed;
     constructor(config: KernelConfig);
     /**
      * Submit a new user message and run the agentic loop until completion.
@@ -55,6 +59,21 @@ export declare class KernelSession {
     /** Add or replace a tool by name */
     upsertTool(tool: KernelTool): void;
     getPermissionDenials(): readonly PermissionDenial[];
+    /**
+     * S1: Release all per-session state so the GC can reclaim the message buffer,
+     * file-state cache, tool list and config closures.  Idempotent and safe to
+     * call from finally blocks.
+     *
+     *   • Aborts any in-flight loop via the abort controller.
+     *   • Empties _messages / _permissionDenials in-place so any holder still
+     *     iterating sees a consistent empty view.
+     *   • Drops the FileStateCache and clears the tools array on the config copy
+     *     so wrapped/instrumented closures (which transitively pin
+     *     RuntimeContext, ProvenanceTracker, JobManager) become unreachable.
+     *   • Clears onMessagesUpdate so external owners don't pin this session
+     *     through their own closures.
+     */
+    dispose(): void;
     private _buildResultEvent;
 }
 //# sourceMappingURL=KernelSession.d.ts.map

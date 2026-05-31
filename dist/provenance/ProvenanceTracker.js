@@ -220,17 +220,8 @@ export class ProvenanceTracker {
         const tmp = `${target}.tmp`;
         await writeFile(tmp, JSON.stringify(rec, null, 2), 'utf-8');
         await rename(tmp, target);
-        // Evict oldest entries before inserting to keep the cache bounded.
-        // Disk is always the source of truth; eviction only drops hot-cache entries.
-        if (this.cache.size >= MAX_CACHE_ENTRIES) {
-            let evicted = 0;
-            for (const key of this.cache.keys()) {
-                this.cache.delete(key);
-                if (++evicted >= EVICT_BATCH)
-                    break;
-            }
-        }
         this.cache.set(rec.id, rec);
+        this._evictCacheIfNeeded();
     }
     async _ensureCacheLoaded() {
         if (this.cacheLoaded)
@@ -255,11 +246,21 @@ export class ProvenanceTracker {
                 const raw = await readFile(join(dir, entry), 'utf-8');
                 const rec = JSON.parse(raw);
                 this.cache.set(rec.id, rec);
+                this._evictCacheIfNeeded();
             }
             catch {
                 // skip corrupt files
             }
         }
+    }
+    _evictCacheIfNeeded() {
+        if (this.cache.size <= MAX_CACHE_ENTRIES)
+            return;
+        const records = [...this.cache.values()]
+            .sort((a, b) => a.timestamp - b.timestamp)
+            .slice(0, Math.max(EVICT_BATCH, this.cache.size - MAX_CACHE_ENTRIES));
+        for (const record of records)
+            this.cache.delete(record.id);
     }
     _matches(r, f) {
         if (f.agentId && r.agentId !== f.agentId)

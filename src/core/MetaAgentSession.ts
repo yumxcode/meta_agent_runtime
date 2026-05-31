@@ -375,11 +375,24 @@ export class MetaAgentSession {
   /**
    * Release per-session resources. Call when a long-lived host is done with
    * this session; safe to call multiple times.
+   *
+   * S1 + S18: also forwards to the inner AgenticSession dispose (which clears
+   * the kernel message buffer + tool closures + RuntimeContext-pinning
+   * instrumentation), drops cached section results, and frees the static
+   * prompt cache.
    */
   async dispose(): Promise<void> {
     const handles = [...this._sandboxHandles.values()]
     this._sandboxHandles.clear()
     await Promise.allSettled(handles.map(handle => handle.destroy()))
+    try { this._inner.dispose() } catch { /* best-effort */ }
+    this.toolRegistry.clear()
+    this._staticPromptCache.clear()
+    this.sectionRegistry.clear()
+    this._lastSystemPrompt = null
+    this._lastStableSystemPrompt = null
+    this._subAgentBridge = undefined
+    this._taskContract = undefined
   }
 
   /** Backward-compatible synchronous teardown alias. */

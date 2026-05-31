@@ -5,7 +5,9 @@ import { atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.
 import { makeExperienceId } from './types.js';
 const EXPERIENCE_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'experiences');
 const INDEX_FILE = 'EXPERIENCE_INDEX.md';
+const MANIFEST_FILE = 'EXPERIENCE_MANIFEST.json';
 const MAX_INDEX_ENTRIES = 100; // hard cap on index entries shown
+const LOAD_CONCURRENCY = 32;
 const EXPERIENCE_ID_RE = /^exp_[0-9a-z]+_[0-9a-f]{8}$/;
 export function isExperienceId(id) {
     return EXPERIENCE_ID_RE.test(id);
@@ -26,9 +28,11 @@ export function experienceRetrievalScore(entry) {
 export class ExperienceStore {
     dir;
     indexPath;
+    manifestPath;
     constructor(dir) {
         this.dir = dir ?? EXPERIENCE_ROOT;
         this.indexPath = join(this.dir, INDEX_FILE);
+        this.manifestPath = join(this.dir, MANIFEST_FILE);
     }
     async ensureDir() {
         await ensureDir(this.dir);
@@ -52,7 +56,7 @@ export class ExperienceStore {
     // ── Search ──────────────────────────────────────────────────────────────────
     async search(query) {
         const limit = Math.min(query.limit ?? 10, 20);
-        const entries = await this._loadAll();
+        const entries = await this._loadSearchEntries();
         const filtered = entries.filter(e => {
             if (query.domain && e.domain !== query.domain)
                 return false;
@@ -81,7 +85,7 @@ export class ExperienceStore {
             return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt;
         });
         // strip fullReport from search results
-        return filtered.slice(0, limit).map(e => { const { fullReport: _, ...rest } = e; return rest; });
+        return filtered.slice(0, limit);
     }
     // ── Load by ID ───────────────────────────────────────────────────────────────
     async load(id) {
@@ -89,8 +93,26 @@ export class ExperienceStore {
             return null;
         return readJsonFile(join(this.dir, `${id}.json`));
     }
+    async appendPrincipleReference(experienceId, principleId) {
+        if (!isExperienceId(experienceId))
+            return false;
+        const entry = await this.load(experienceId);
+        if (!entry)
+            return false;
+        const principleIds = entry.principleIds ?? [];
+        if (principleIds.includes(principleId))
+            return true;
+        const updated = {
+            ...entry,
+            principleIds: [...principleIds, principleId],
+            updatedAt: Date.now(),
+        };
+        await atomicWriteJson(join(this.dir, `${experienceId}.json`), updated);
+        await this.rebuildIndex();
+        return true;
+    }
     async getStats() {
-        const entries = await this._loadAll();
+        const entries = await this._loadSearchEntries();
         const domainCounts = {};
         let failures = 0;
         for (const e of entries) {
@@ -110,8 +132,9 @@ export class ExperienceStore {
         }
     }
     async rebuildIndex() {
-        const entries = await this._loadAll();
+        const entries = await this._loadAllFromFiles();
         entries.sort((a, b) => b.createdAt - a.createdAt);
+        await this._writeManifest(entries);
         // Group by domain
         const byDomain = new Map();
         for (const e of entries.slice(0, MAX_INDEX_ENTRIES)) {
@@ -154,9 +177,53 @@ export class ExperienceStore {
     }
     // ── Internal ─────────────────────────────────────────────────────────────────
     async _loadAll() {
-        const ids = await this.listIds();
-        const entries = await Promise.all(ids.map(id => this.load(id)));
-        return entries.filter((e) => e !== null);
+        return this._loadAllFromFiles();
     }
+    async _loadAllFromFiles() {
+        const ids = await this.listIds();
+        return loadWithConcurrency(ids, id => this.load(id));
+    }
+    async _loadSearchEntries() {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (isExperienceManifest(manifest))
+            return manifest.entries;
+        const entries = await this._loadAllFromFiles();
+        await this._writeManifest(entries).catch(() => undefined);
+        return entries.map(stripFullReport);
+    }
+    async _writeManifest(entries) {
+        const manifest = {
+            schemaVersion: '1.0',
+            updatedAt: Date.now(),
+            entries: entries.map(stripFullReport),
+        };
+        await atomicWriteJson(this.manifestPath, manifest);
+    }
+}
+function stripFullReport(entry) {
+    const { fullReport: _, ...rest } = entry;
+    return rest;
+}
+function isExperienceManifest(value) {
+    if (!value || typeof value !== 'object')
+        return false;
+    const record = value;
+    return record['schemaVersion'] === '1.0' &&
+        typeof record['updatedAt'] === 'number' &&
+        Array.isArray(record['entries']);
+}
+async function loadWithConcurrency(ids, load) {
+    const out = [];
+    let next = 0;
+    const workerCount = Math.min(LOAD_CONCURRENCY, ids.length);
+    await Promise.all(Array.from({ length: workerCount }, async () => {
+        while (next < ids.length) {
+            const id = ids[next++];
+            const entry = await load(id);
+            if (entry)
+                out.push(entry);
+        }
+    }));
+    return out;
 }
 //# sourceMappingURL=ExperienceStore.js.map

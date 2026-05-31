@@ -42,6 +42,11 @@ import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js';
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js';
 import { deleteJobsForSession } from '../tools/system/cronStore.js';
 import { ModeDetector } from './ModeDetector.js';
+import { SubAgentBridge } from '../subagent/SubAgentBridge.js';
+import { clearWebFetchCache } from '../tools/network/web_fetch/index.js';
+import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js';
+import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js';
+import { pruneStaleDebug } from '../kernel/api/DebugWriter.js';
 import { MODE_WEIGHT } from './types.js';
 // ── SessionRouter ─────────────────────────────────────────────────────────────
 export class SessionRouter {
@@ -243,7 +248,37 @@ export class SessionRouter {
                 deleteJobsForSession(sessionId);
             }
             catch { /* best-effort */ }
+            // S6: kill any SubAgentBridge that was created for this session but
+            // whose owner forgot to call destroy() (e.g. CampaignSession callers
+            // who never dispose).  Idempotent — does nothing when already destroyed.
+            try {
+                SubAgentBridge.getBridge(sessionId)?.destroy();
+            }
+            catch { /* best-effort */ }
         }
+        // Drop the impl reference so the GC can reclaim the whole session graph.
+        this._impl = null;
+        this._pendingTools = [];
+        this._currentMode = null;
+        // S10: scrub module-level caches that were populated during this session.
+        // These are static singletons so we only clear (rather than per-session
+        // partition) — for hosts running multiple SessionRouters concurrently the
+        // caches will simply re-warm on the next call.
+        try {
+            clearWebFetchCache();
+        }
+        catch { /* best-effort */ }
+        try {
+            clearAnthropicClientCache();
+        }
+        catch { /* best-effort */ }
+        try {
+            clearDeepSeekClientCache();
+        }
+        catch { /* best-effort */ }
+        // S4: best-effort debug log purge.  Quick (one readdir over the global
+        // debug dir) and only deletes age- or size-eligible files.
+        void pruneStaleDebug().catch(() => undefined);
     }
     /**
      * Return the robotics session's pending experience buffer (if mode=robotics).
@@ -266,6 +301,24 @@ export class SessionRouter {
         const impl = this._impl;
         if (impl && typeof impl.pendingPhysicalAnchors === 'object' && impl.pendingPhysicalAnchors !== null) {
             return impl.pendingPhysicalAnchors;
+        }
+        return null;
+    }
+    /**
+     * Return the robotics session's pending principle buffer (if mode=robotics).
+     * Returns null in all other modes or before the first submit().
+     */
+    getPendingPrinciples() {
+        const impl = this._impl;
+        if (impl && typeof impl.pendingPrinciples === 'object' && impl.pendingPrinciples !== null) {
+            return impl.pendingPrinciples;
+        }
+        return null;
+    }
+    async proposePrincipleForExperience(experienceId, reason) {
+        const impl = this._impl;
+        if (impl && typeof impl.proposePrincipleForExperience === 'function') {
+            return impl.proposePrincipleForExperience(experienceId, reason);
         }
         return null;
     }

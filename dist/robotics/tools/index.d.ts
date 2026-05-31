@@ -8,6 +8,9 @@
  *     experience_search   — search the experience store (isConcurrencySafe)
  *     experience_write    — propose a new pending experience entry
  *     experience_load     — load full experience by ID (isConcurrencySafe)
+ *     principle_search    — search reviewed transferable principles
+ *     principle_promote   — queue a principle candidate from an experience
+ *     principle_load      — load full principle by ID
  *
  *   Hardware:
  *     hardware_profile_read   — read hardware profile (isConcurrencySafe)
@@ -36,11 +39,16 @@ import { ExperienceStore } from '../ExperienceStore.js';
 import { ExperiencePendingStore } from '../ExperiencePendingStore.js';
 import { PhysicalAnchorStore } from '../PhysicalAnchorStore.js';
 import { PhysicalAnchorPendingStore } from '../PhysicalAnchorPendingStore.js';
+import { PrincipleStore } from '../PrincipleStore.js';
+import { PrinciplePendingStore } from '../PrinciplePendingStore.js';
 import { HardwareProfile } from '../HardwareProfile.js';
 import { GitWorkspaceManager } from '../git/GitWorkspaceManager.js';
 import { createExperienceSearchTool } from './experience_search/index.js';
 import { createExperienceWriteTool } from './experience_write/index.js';
 import { createExperienceLoadTool } from './experience_load/index.js';
+import { createPrincipleSearchTool } from './principle_search/index.js';
+import { createPrinciplePromoteTool } from './principle_promote/index.js';
+import { createPrincipleLoadTool } from './principle_load/index.js';
 import { createHardwareProfileReadTool } from './hardware_profile_read/index.js';
 import { createHardwareProfileWriteTool } from './hardware_profile_write/index.js';
 import { createPhysicalAnchorSearchTool } from './physical_anchor_search/index.js';
@@ -55,7 +63,8 @@ import { createGitDiffSubAgentTool } from './git_diff_subagent/index.js';
 import { createGitDiscardSubAgentTool } from './git_discard_subagent/index.js';
 export { ExperiencePendingStore };
 export { PhysicalAnchorPendingStore };
-export { createExperienceSearchTool, createExperienceWriteTool, createExperienceLoadTool, createHardwareProfileReadTool, createHardwareProfileWriteTool, createPhysicalAnchorSearchTool, createPhysicalAnchorWriteTool, createPhysicalAnchorLoadTool, createExperimentDispatchTool, createPaperSearchTool, createProgressNoteTool, createGitSyncToSubAgentTool, createGitMergeSubAgentTool, createGitDiffSubAgentTool, createGitDiscardSubAgentTool, };
+export { PrinciplePendingStore };
+export { createExperienceSearchTool, createExperienceWriteTool, createExperienceLoadTool, createPrincipleSearchTool, createPrinciplePromoteTool, createPrincipleLoadTool, createHardwareProfileReadTool, createHardwareProfileWriteTool, createPhysicalAnchorSearchTool, createPhysicalAnchorWriteTool, createPhysicalAnchorLoadTool, createExperimentDispatchTool, createPaperSearchTool, createProgressNoteTool, createGitSyncToSubAgentTool, createGitMergeSubAgentTool, createGitDiffSubAgentTool, createGitDiscardSubAgentTool, };
 export interface RoboticsToolsOptions {
     /** Sub-agent bridge (required for experiment_dispatch, paper_search) */
     bridge: SubAgentBridge;
@@ -85,6 +94,10 @@ export interface RoboticsToolsOptions {
     physicalAnchorStore?: PhysicalAnchorStore;
     /** Optional session-scoped pending physical anchor buffer. */
     physicalAnchorPendingStore?: PhysicalAnchorPendingStore;
+    /** Optional reviewed PrincipleStore instance. */
+    principleStore?: PrincipleStore;
+    /** Optional session-scoped pending principle buffer. */
+    principlePendingStore?: PrinciplePendingStore;
     /** Optional custom GitWorkspaceManager instance */
     gitManager?: GitWorkspaceManager;
     /**

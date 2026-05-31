@@ -13,8 +13,8 @@ export class FileStateCache {
     constructor(maxEntries = 200) {
         this._maxEntries = maxEntries;
     }
-    record(path, sizeBytes) {
-        this._entries.set(path, { path, readAt: Date.now(), sizeBytes });
+    record(path, sizeBytes, mtimeMs) {
+        this._entries.set(path, { path, readAt: Date.now(), sizeBytes, mtimeMs });
         // LRU eviction: drop oldest entries if over limit
         if (this._entries.size > this._maxEntries) {
             const oldest = this._entries.keys().next().value;

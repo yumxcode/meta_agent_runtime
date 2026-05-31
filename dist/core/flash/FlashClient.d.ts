@@ -34,6 +34,7 @@ export declare class FlashClient {
     private readonly openaiClient;
     private readonly model;
     private readonly cache;
+    private static readonly MAX_CACHE_ENTRIES;
     constructor(config: Pick<MetaAgentConfig, 'apiKey' | 'baseURL' | 'model'>);
     /**
      * Send a one-shot flash-model query.
@@ -48,6 +49,7 @@ export declare class FlashClient {
     query(opts: FlashQueryOpts): Promise<string | null>;
     /** Flush all cached results (call at session start or project switch). */
     clearCache(): void;
+    private setCached;
     /** Current flash model identifier (useful for logging/debugging). */
     get modelId(): string;
 }

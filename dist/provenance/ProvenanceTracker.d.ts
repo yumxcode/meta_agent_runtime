@@ -75,6 +75,7 @@ export declare class ProvenanceTracker {
     summary(id: ProvenanceId): Promise<string>;
     private _save;
     private _ensureCacheLoaded;
+    private _evictCacheIfNeeded;
     private _matches;
 }
 //# sourceMappingURL=ProvenanceTracker.d.ts.map

@@ -12,6 +12,8 @@ export interface DeepSeekStreamParams {
     maxOutputTokens?: number;
     abortSignal: AbortSignal;
 }
+/** Test/dispose hook — drop all cached DeepSeek clients. */
+export declare function clearDeepSeekClientCache(): void;
 /**
  * Stream messages from the DeepSeek API.
  * Yields Anthropic-compatible StreamEvents; caller processes them identically

@@ -43,6 +43,10 @@ export class KernelSession {
     _cwd;
     _permissionDenials = [];
     _submitInFlight = false;
+    /** S16: cap permission-denial buffer so a million-turn session can't grow it forever. */
+    static MAX_PERMISSION_DENIALS = 1_000;
+    /** S1: guard against double dispose. */
+    _disposed = false;
     constructor(config) {
         this._config = { ...config };
         this._messages = [...(config.initialMessages ?? [])];
@@ -112,6 +116,11 @@ export class KernelSession {
                 this._totalCostUsd = loopResult.costUsd;
                 this._autoCompactTracking = loopResult.autoCompactTracking;
                 this._permissionDenials.push(...loopResult.permissionDenials);
+                // S16: cap the denial buffer so a long-running session that gets
+                // repeatedly denied tools doesn't grow this array indefinitely.
+                const overflow = this._permissionDenials.length - KernelSession.MAX_PERMISSION_DENIALS;
+                if (overflow > 0)
+                    this._permissionDenials.splice(0, overflow);
                 if (loopResult.fallbackTriggered) {
                     this._config = { ...this._config, model: loopResult.finalModel };
                 }
@@ -170,6 +179,36 @@ export class KernelSession {
     }
     getPermissionDenials() {
         return this._permissionDenials;
+    }
+    /**
+     * S1: Release all per-session state so the GC can reclaim the message buffer,
+     * file-state cache, tool list and config closures.  Idempotent and safe to
+     * call from finally blocks.
+     *
+     *   • Aborts any in-flight loop via the abort controller.
+     *   • Empties _messages / _permissionDenials in-place so any holder still
+     *     iterating sees a consistent empty view.
+     *   • Drops the FileStateCache and clears the tools array on the config copy
+     *     so wrapped/instrumented closures (which transitively pin
+     *     RuntimeContext, ProvenanceTracker, JobManager) become unreachable.
+     *   • Clears onMessagesUpdate so external owners don't pin this session
+     *     through their own closures.
+     */
+    dispose() {
+        if (this._disposed)
+            return;
+        this._disposed = true;
+        try {
+            this._abortController.abort('dispose');
+        }
+        catch { /* ignore */ }
+        this._messages.length = 0;
+        this._permissionDenials.length = 0;
+        this._fileCache.clear();
+        // Detach external callback so the consumer's closure (UI, DB writer) no
+        // longer keeps this session alive via the callback.
+        this._config = { ...this._config, tools: [], onMessagesUpdate: undefined };
+        this._autoCompactTracking = undefined;
     }
     // ── Private helpers ────────────────────────────────────────────────────────
     _buildResultEvent(loopResult, loopError) {

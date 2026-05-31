@@ -49,11 +49,67 @@ function validateValue(value, schema, path) {
     if (Array.isArray(schema['enum']) && !schema['enum'].includes(value)) {
         return `${path} must be one of ${schema['enum'].map(String).join(', ')}`;
     }
-    if (schema['type'] === 'array' && Array.isArray(value) && schema['items'] !== undefined) {
-        for (let i = 0; i < value.length; i++) {
-            const error = validateValue(value[i], schema['items'], `${path}[${i}]`);
-            if (error)
-                return error;
+    // ── M3: numeric range constraints ──────────────────────────────────────────
+    if (typeof value === 'number' && Number.isFinite(value)) {
+        const min = schema['minimum'];
+        const max = schema['maximum'];
+        const exMin = schema['exclusiveMinimum'];
+        const exMax = schema['exclusiveMaximum'];
+        const mul = schema['multipleOf'];
+        if (typeof min === 'number' && value < min)
+            return `${path} must be >= ${min}`;
+        if (typeof max === 'number' && value > max)
+            return `${path} must be <= ${max}`;
+        if (typeof exMin === 'number' && value <= exMin)
+            return `${path} must be > ${exMin}`;
+        if (typeof exMax === 'number' && value >= exMax)
+            return `${path} must be < ${exMax}`;
+        if (typeof mul === 'number' && mul > 0) {
+            const ratio = value / mul;
+            if (Math.abs(ratio - Math.round(ratio)) > 1e-9)
+                return `${path} must be a multiple of ${mul}`;
+        }
+    }
+    // ── M3: string length / pattern constraints ───────────────────────────────
+    if (typeof value === 'string') {
+        const minL = schema['minLength'];
+        const maxL = schema['maxLength'];
+        const pat = schema['pattern'];
+        if (typeof minL === 'number' && value.length < minL)
+            return `${path} must be at least ${minL} chars`;
+        if (typeof maxL === 'number' && value.length > maxL)
+            return `${path} must be at most ${maxL} chars`;
+        if (typeof pat === 'string') {
+            try {
+                if (!new RegExp(pat).test(value))
+                    return `${path} does not match pattern ${pat}`;
+            }
+            catch { /* invalid pattern — treat as no constraint */ }
+        }
+    }
+    // ── M3: array length constraints ──────────────────────────────────────────
+    if (schema['type'] === 'array' && Array.isArray(value)) {
+        const minI = schema['minItems'];
+        const maxI = schema['maxItems'];
+        if (typeof minI === 'number' && value.length < minI)
+            return `${path} must have at least ${minI} items`;
+        if (typeof maxI === 'number' && value.length > maxI)
+            return `${path} must have at most ${maxI} items`;
+        if (schema['uniqueItems'] === true) {
+            const seen = new Set();
+            for (let i = 0; i < value.length; i++) {
+                const key = JSON.stringify(value[i]);
+                if (seen.has(key))
+                    return `${path}[${i}] is a duplicate (uniqueItems)`;
+                seen.add(key);
+            }
+        }
+        if (schema['items'] !== undefined) {
+            for (let i = 0; i < value.length; i++) {
+                const error = validateValue(value[i], schema['items'], `${path}[${i}]`);
+                if (error)
+                    return error;
+            }
         }
     }
     if (schema['type'] === 'object' && isRecord(value)) {

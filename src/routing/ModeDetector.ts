@@ -1,11 +1,13 @@
 /**
- * ModeDetector — three-layer heuristic mode classification.
+ * ModeDetector — two-layer mode classification.
  *
  * Layer 1: Explicit hint (zero cost)
  *   If the caller passed mode !== 'auto', return immediately.
  *
- * Layer 2: Prompt heuristics (zero cost, synchronous)
- *   Priority order (highest → lowest):
+ * Layer 2: Prompt classification
+ *   Preferred: one-shot flash-model call when an Anthropic client is provided
+ *   (handles every edge case the heuristics can't).
+ *   Fallback: prompt-pattern heuristics, in this priority order:
  *     0. ROBOTICS_ALWAYS — robotics-domain imperative patterns (ROS, SLAM,
  *        gait, manipulation, sim-to-real, RL-for-robots). Override everything.
  *     A. CAMPAIGN_ALWAYS — inherent action patterns that are unambiguously
@@ -15,9 +17,10 @@
  *     D. CAMPAIGN_VOCAB — campaign vocabulary without any action verb.
  *     F. Default → AGENTIC.
  *
- * Layer 3: Environment signals (one async disk read, ~0.1 ms)
- *   Active campaigns on disk → minimum AGENTIC so campaign context is
- *   injected when the user asks about campaign status mid-conversation.
+ * (An earlier draft also looked at CampaignStateStore on disk as a Layer 3
+ *  signal — see git history. It was removed because the on-disk store is not
+ *  authoritative for mode selection, and the LLM/heuristic path already
+ *  defaults to AGENTIC.)
  *
  * Note on Chinese text:
  *   \b word-boundary anchors do NOT work for CJK characters (all CJK chars
@@ -34,7 +37,6 @@ import type {
   SessionModeHint,
 } from './types.js'
 import { MODE_WEIGHT } from './types.js'
-import { CampaignStateStore } from '../campaign/index.js'
 
 // ── Shared timeout utility (Fix #6) ──────────────────────────────────────────
 
@@ -424,29 +426,4 @@ export class ModeDetector {
     }
   }
 
-  // ── Internal ────────────────────────────────────────────────────────────────
-
-  /**
-   * Check for genuinely active campaigns by reading disk state directly.
-   *
-   * Intentionally bypasses MetaAgentContextStore (the context file cache)
-   * because that file is only refreshed when CampaignMonitor completes a
-   * phase — it can lag hours behind reality for abandoned campaigns.
-   *
-   * Calling CampaignStateStore.listActive() instead:
-   *   • Triggers zombie auto-expiry for stale campaigns (marks them FAILED)
-   *   • Returns accurate count without relying on a potentially stale file
-   *   • Cost: one readdir + N small JSON reads — acceptable for the once-per-
-   *     session first-submit path; ~1–5 ms for typical campaign counts
-   */
-  private static async _hasActiveCampaigns(): Promise<boolean> {
-    try {
-      const active = await CampaignStateStore.listActive()
-      return active.length > 0
-    } catch {
-      // Campaign store unavailable (missing dir, corrupt index) — assume no active
-      // campaigns so mode detection falls through to heuristics.
-      return false
-    }
-  }
 }

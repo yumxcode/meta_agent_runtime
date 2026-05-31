@@ -49,6 +49,9 @@ import { ExperiencePendingStore } from './ExperiencePendingStore.js';
 import { PhysicalAnchorStore } from './PhysicalAnchorStore.js';
 import { PhysicalAnchorPendingStore } from './PhysicalAnchorPendingStore.js';
 import { PhysicalAnchorSource } from '../context/sources/PhysicalAnchorSource.js';
+import { PrincipleStore } from './PrincipleStore.js';
+import { PrinciplePendingStore } from './PrinciplePendingStore.js';
+import { proposePrincipleFromExperience } from './PrinciplePromotion.js';
 import { HardwareProfile } from './HardwareProfile.js';
 import { GitWorkspaceManager } from './git/GitWorkspaceManager.js';
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js';
@@ -83,6 +86,9 @@ export class RoboticsSession {
     physicalAnchors;
     /** Session-scoped pending physical anchor buffer. Exposed for CLI /anchor review. */
     pendingPhysicalAnchors;
+    principles;
+    /** Session-scoped pending principle buffer. Exposed for CLI /principle review. */
+    pendingPrinciples;
     anchorSource;
     hwProfile;
     gitMgr;
@@ -167,6 +173,8 @@ export class RoboticsSession {
         this.pendingExperiences = new ExperiencePendingStore(this.projectDir);
         this.physicalAnchors = new PhysicalAnchorStore();
         this.pendingPhysicalAnchors = new PhysicalAnchorPendingStore(this.projectDir);
+        this.principles = new PrincipleStore();
+        this.pendingPrinciples = new PrinciplePendingStore(this.projectDir);
         this.anchorSource = new PhysicalAnchorSource(this.physicalAnchors);
         this.hwProfile = new HardwareProfile(undefined, this.robot);
         this.gitMgr = new GitWorkspaceManager(this.projectDir);
@@ -216,6 +224,7 @@ export class RoboticsSession {
         await Promise.all([
             this.pendingExperiences.load(),
             this.pendingPhysicalAnchors.load(),
+            this.pendingPrinciples.load(),
         ]);
         // ── 1. Persistence: try to restore project state ─────────────────────
         //
@@ -314,6 +323,8 @@ export class RoboticsSession {
             hardwareProfile: this.hwProfile,
             physicalAnchorStore: this.physicalAnchors,
             physicalAnchorPendingStore: this.pendingPhysicalAnchors,
+            principleStore: this.principles,
+            principlePendingStore: this.pendingPrinciples,
             gitManager: this.gitMgr,
             flashClient: this._flashClient ?? undefined,
         });
@@ -378,6 +389,16 @@ export class RoboticsSession {
             resumed: Boolean(existing),
             sessionAgeMs: existing ? Date.now() - existing.lastActiveAt : undefined,
         };
+    }
+    async proposePrincipleForExperience(experienceId, reason) {
+        return proposePrincipleFromExperience({
+            experienceId,
+            experienceStore: this.store,
+            anchorStore: this.physicalAnchors,
+            pendingStore: this.pendingPrinciples,
+            flash: this._flashClient,
+            reason,
+        });
     }
     // ── Lifecycle: dispose ────────────────────────────────────────────────────
     /**
@@ -647,7 +668,6 @@ export class RoboticsSession {
     async teamInit(github) {
         this.sectionRegistry.invalidate('robotics_team_mode');
         const state = await this.teamStore.init(github);
-        // team.json now exists — activate the watcher if it hasn't been started yet.
         this.teamWatcher.start();
         await this.teamWatcher.forceSync(false);
         return state;
@@ -655,27 +675,44 @@ export class RoboticsSession {
     async teamJoin(github, human) {
         this.sectionRegistry.invalidate('robotics_team_mode');
         const state = await this.teamStore.join(github, human);
-        // team.json now exists — activate the watcher if it hasn't been started yet.
         this.teamWatcher.start();
         await this.teamWatcher.forceSync(false);
         return state;
     }
-    async teamClaim(taskId) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.claim(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    /** Transition a claimed/backlog task to in_progress (begin active work). */
-    async teamStart(taskId) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.startTask(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
+    async teamStatus() {
+        return this.teamStore.status();
     }
     async teamTaskAdd(input) {
         this.sectionRegistry.invalidate('robotics_team_mode');
         const result = await this.teamStore.addTask(input);
+        await this.teamWatcher.forceSync(false);
+        return result;
+    }
+    /** Exclusively take a task; throws if owned by another unit. */
+    async teamTake(taskId) {
+        this.sectionRegistry.invalidate('robotics_team_mode');
+        const result = await this.teamStore.take(taskId);
+        await this.teamWatcher.forceSync(false);
+        return result;
+    }
+    /** Release a task you own (no-op if you don't own it). */
+    async teamDrop(taskId) {
+        this.sectionRegistry.invalidate('robotics_team_mode');
+        const result = await this.teamStore.drop(taskId);
+        await this.teamWatcher.forceSync(false);
+        return result;
+    }
+    /** Force-take a task currently owned by someone else; records audit attempt. */
+    async teamSteal(taskId, reason) {
+        this.sectionRegistry.invalidate('robotics_team_mode');
+        const result = await this.teamStore.steal(taskId, reason);
+        await this.teamWatcher.forceSync(false);
+        return result;
+    }
+    /** Append a single direction+outcome attempt to a task you own. */
+    async teamNote(input) {
+        this.sectionRegistry.invalidate('robotics_team_mode');
+        const result = await this.teamStore.note(input);
         await this.teamWatcher.forceSync(false);
         return result;
     }
@@ -685,60 +722,10 @@ export class RoboticsSession {
         await this.teamWatcher.forceSync(false);
         return result;
     }
-    async teamModuleAdd(input) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.addModule(input);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    async teamModuleOwner(name, ownerUnit) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.setModuleOwner(name, ownerUnit);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    async teamCheck() {
-        return this.teamStore.checkWorkspaceConflicts();
-    }
-    async teamCheckPaths(paths) {
-        return this.teamStore.checkPathsConflicts(paths);
-    }
-    async teamBranch(taskId) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.branchForTask(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    async teamPush() {
-        return this.teamStore.pushCurrentBranch();
-    }
-    async teamPr(taskId) {
-        return this.teamStore.createPrDraft(taskId);
-    }
-    async teamHandoff(taskId, note) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.createHandoff(taskId, note);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    async teamOnboarding() {
-        return this.teamStore.onboardingSummary();
-    }
-    async teamGitHubIssuesSync(taskId) {
-        this.sectionRegistry.invalidate('robotics_team_mode');
-        const result = await this.teamStore.syncGitHubIssues(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-    }
-    async teamGitHubProjectAdd(projectNumber, owner) {
-        return this.teamStore.addGitHubIssuesToProject(projectNumber, owner);
-    }
-    async teamStatus() {
-        return this.teamStore.status();
-    }
     async teamSync() {
         this.sectionRegistry.invalidate('robotics_team_mode');
-        const summary = await this.teamStore.sync();
+        // /team sync is an explicit user request — bypass the fetch cooldown.
+        const summary = await this.teamStore.sync({ forceFetch: true });
         await this.teamWatcher.forceSync(false);
         return summary;
     }
@@ -773,6 +760,9 @@ export class RoboticsSession {
         this.sectionRegistry.invalidate('team_context_boundary');
     }
     async teamWatcherPoll() {
+        // Background poll: let the TeamStore fetch cooldown decide whether a real
+        // `git fetch` runs.  Passing fetch=true here only means "attempt", not
+        // "force" — TeamStore.sync({fetch:true}) will no-op inside the cooldown.
         await this.teamWatcher.forceSync(true);
         return this.teamWatcher.getRecentEvents();
     }

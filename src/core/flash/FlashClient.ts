@@ -49,6 +49,7 @@ export class FlashClient {
   private readonly openaiClient: OpenAI | null
   private readonly model: string
   private readonly cache = new Map<string, string>()
+  private static readonly MAX_CACHE_ENTRIES = 512
 
   constructor(config: Pick<MetaAgentConfig, 'apiKey' | 'baseURL' | 'model'>) {
     const { provider, apiKey, baseURL, flashModel } = detectProvider(config)
@@ -75,7 +76,10 @@ export class FlashClient {
   async query(opts: FlashQueryOpts): Promise<string | null> {
     // Cache hit
     if (opts.cacheKey && this.cache.has(opts.cacheKey)) {
-      return this.cache.get(opts.cacheKey)!
+      const cached = this.cache.get(opts.cacheKey)!
+      this.cache.delete(opts.cacheKey)
+      this.cache.set(opts.cacheKey, cached)
+      return cached
     }
 
     try {
@@ -110,7 +114,7 @@ export class FlashClient {
       }
       if (!text) return null
 
-      if (opts.cacheKey) this.cache.set(opts.cacheKey, text)
+      if (opts.cacheKey) this.setCached(opts.cacheKey, text)
       return text
     } catch {
       // Timeout, network error, or API failure — caller handles fallback
@@ -121,6 +125,16 @@ export class FlashClient {
   /** Flush all cached results (call at session start or project switch). */
   clearCache(): void {
     this.cache.clear()
+  }
+
+  private setCached(key: string, value: string): void {
+    if (this.cache.has(key)) this.cache.delete(key)
+    this.cache.set(key, value)
+    while (this.cache.size > FlashClient.MAX_CACHE_ENTRIES) {
+      const oldest = this.cache.keys().next().value
+      if (typeof oldest !== 'string') break
+      this.cache.delete(oldest)
+    }
   }
 
   /** Current flash model identifier (useful for logging/debugging). */

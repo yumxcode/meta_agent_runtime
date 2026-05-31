@@ -17,8 +17,25 @@ export async function createSleepTool(): Promise<MetaAgentTool> {
       const ms = Math.min(typeof input['duration_ms'] === 'number' ? input['duration_ms'] : 1000, 60000)
       if (ms <= 0) return { content: 'Error: duration_ms must be positive', isError: true }
       await new Promise<void>((resolve, reject) => {
-        const timer = setTimeout(resolve, ms)
-        ctx.abortSignal.addEventListener('abort', () => { clearTimeout(timer); reject(new Error('Sleep aborted')) }, { once: true })
+        let settled = false
+        let timer: ReturnType<typeof setTimeout>
+        const onAbort = () => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          reject(new Error('Sleep aborted'))
+        }
+        timer = setTimeout(() => {
+          if (settled) return
+          settled = true
+          ctx.abortSignal.removeEventListener('abort', onAbort)
+          resolve()
+        }, ms)
+        if (ctx.abortSignal.aborted) {
+          onAbort()
+          return
+        }
+        ctx.abortSignal.addEventListener('abort', onAbort, { once: true })
       })
       return { content: `Slept for ${ms}ms`, isError: false }
     },

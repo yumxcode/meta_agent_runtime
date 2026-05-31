@@ -5,6 +5,42 @@ export type KnowledgeConfidenceTier = 'observed' | 'reproduced' | 'derived' | 'r
 export declare const KNOWLEDGE_CONFIDENCE_TIERS: KnowledgeConfidenceTier[];
 export type KnowledgeScope = 'global' | 'robot' | 'code';
 export declare const KNOWLEDGE_SCOPES: KnowledgeScope[];
+export type PrincipleAbstractionLevel = 'physical' | 'system' | 'algorithmic' | 'statistical' | 'operational';
+export declare const PRINCIPLE_ABSTRACTION_LEVELS: PrincipleAbstractionLevel[];
+export interface PrincipleEntry {
+    id: string;
+    schemaVersion: '1.0';
+    createdAt: number;
+    updatedAt: number;
+    title: string;
+    statement: string;
+    mechanism: string;
+    firstPrinciplesSupport: string[];
+    domains: RoboticsDomain[];
+    abstractionLevel: PrincipleAbstractionLevel;
+    preconditions: string[];
+    applicabilityBounds: string[];
+    nonApplicableWhen: string[];
+    derivedFromExperienceIds: string[];
+    anchoredByPhysicalAnchorIds: string[];
+    evidenceRefs: string[];
+    invalidatedAssumptions: string[];
+    counterExamples: string[];
+    confidenceTier: KnowledgeConfidenceTier;
+    observationCount: number;
+    contradictionCount: number;
+    promotionReason: 'confidence_threshold' | 'explicit_user_request';
+    sourceExperienceId?: string;
+    lastVerifiedAt?: number;
+}
+export interface PrincipleSearchQuery {
+    domain?: RoboticsDomain;
+    abstractionLevel?: PrincipleAbstractionLevel;
+    experienceId?: string;
+    anchorId?: string;
+    keyword?: string;
+    limit?: number;
+}
 export interface ExperienceOutcome {
     success: boolean;
     summary: string;
@@ -46,6 +82,8 @@ export interface ExperienceEntry {
     metrics?: Record<string, number | string>;
     sourceTaskId?: string;
     sourceSessionId?: string;
+    /** Reviewed principles promoted from or linked to this concrete experience. */
+    principleIds?: string[];
     relatedPapers?: string[];
     fullReport?: string;
 }
@@ -59,6 +97,7 @@ export interface ExperienceSearchQuery {
     limit?: number;
 }
 export declare function makeExperienceId(): string;
+export declare function makePrincipleId(): string;
 export interface PhysicalAnchorEntry {
     id: string;
     schemaVersion: '1.0';

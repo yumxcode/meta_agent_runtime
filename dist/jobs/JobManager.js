@@ -30,10 +30,84 @@ export class JobManager {
     executor;
     sessionId;
     jobs = new Map();
+    /**
+     * S2: LRU cap on terminal jobs held in memory.  Active (queued / running)
+     * jobs are NEVER evicted regardless of this cap — only completed / failed /
+     * cancelled records count toward the limit.  Default keeps the most recent
+     * 200 completed records for `list()` / `await()` re-attach; tune via
+     * `META_AGENT_KEEP_TERMINAL_JOBS` env var or `setTerminalJobCap()`.
+     */
+    _terminalJobCap;
+    static DEFAULT_TERMINAL_JOB_CAP = 200;
+    /**
+     * S2: insertion-ordered list of terminal job IDs (oldest first) used by the
+     * LRU eviction pass.  We can't rely on `jobs.keys()` order because jobs may
+     * transition from active → terminal arbitrarily.
+     */
+    _terminalOrder = [];
     constructor(sessionId, executor) {
         this.sessionId = sessionId;
         this.store = new JobStore(sessionId);
         this.executor = executor ?? new LocalExecutor();
+        const envCap = Number.parseInt(process.env['META_AGENT_KEEP_TERMINAL_JOBS'] ?? '', 10);
+        this._terminalJobCap = Number.isFinite(envCap) && envCap >= 0
+            ? envCap
+            : JobManager.DEFAULT_TERMINAL_JOB_CAP;
+    }
+    /**
+     * Override the LRU cap on terminal jobs.  Pass `Infinity` to disable
+     * eviction (useful for tests that want to inspect every job afterwards).
+     */
+    setTerminalJobCap(cap) {
+        if (!Number.isFinite(cap) || cap < 0)
+            return;
+        this._terminalJobCap = cap;
+        this._evictTerminalIfOverCap();
+    }
+    /**
+     * S2: Forget a single terminal job.  No-op for active jobs (returns false)
+     * so callers can't accidentally drop work in flight.
+     */
+    forgetJob(jobId) {
+        const rt = this.jobs.get(jobId);
+        if (!rt)
+            return false;
+        if (!TERMINAL_STATUSES.has(rt.job.status))
+            return false;
+        this._dropFromTerminalOrder(jobId);
+        this.jobs.delete(jobId);
+        return true;
+    }
+    /**
+     * S2: Forget every terminal job whose completion time is older than `ts`.
+     * Returns the number evicted.  Falls back to submittedAt when completedAt
+     * is unavailable.
+     */
+    forgetCompletedBefore(ts) {
+        let n = 0;
+        for (const [id, rt] of this.jobs) {
+            if (!TERMINAL_STATUSES.has(rt.job.status))
+                continue;
+            const t = rt.job.metrics.completedAt ?? rt.job.metrics.submittedAt;
+            if (t < ts) {
+                this._dropFromTerminalOrder(id);
+                this.jobs.delete(id);
+                n++;
+            }
+        }
+        return n;
+    }
+    /** S2: drop in-memory state for every terminal job. Used by host shutdown. */
+    forgetAllCompleted() {
+        let n = 0;
+        for (const [id, rt] of this.jobs) {
+            if (TERMINAL_STATUSES.has(rt.job.status)) {
+                this.jobs.delete(id);
+                n++;
+            }
+        }
+        this._terminalOrder.length = 0;
+        return n;
     }
     // ── submit ───────────────────────────────────────────────────────────────
     /**
@@ -294,6 +368,36 @@ export class JobManager {
         // Fire-and-forget persist with exponential back-off.
         // Don't await — we're inside an executor callback.
         void this._persistWithRetry(jobId, { ...rt.job });
+        // S2: When a job enters a terminal status, drop progress / completion
+        // closures (they're already drained by the executor callback) and put the
+        // job at the back of the LRU queue.  This is the only place jobs become
+        // eligible for eviction — active jobs stay in the Map regardless of cap.
+        if (TERMINAL_STATUSES.has(status)) {
+            rt.progressListeners.length = 0;
+            rt.completionResolvers.length = 0;
+            this._dropFromTerminalOrder(jobId);
+            this._terminalOrder.push(jobId);
+            this._evictTerminalIfOverCap();
+        }
+    }
+    /** S2: drop oldest terminal jobs until size ≤ _terminalJobCap. */
+    _evictTerminalIfOverCap() {
+        if (!Number.isFinite(this._terminalJobCap))
+            return;
+        while (this._terminalOrder.length > this._terminalJobCap) {
+            const id = this._terminalOrder.shift();
+            if (id === undefined)
+                break;
+            const rt = this.jobs.get(id);
+            if (rt && TERMINAL_STATUSES.has(rt.job.status)) {
+                this.jobs.delete(id);
+            }
+        }
+    }
+    _dropFromTerminalOrder(jobId) {
+        const idx = this._terminalOrder.indexOf(jobId);
+        if (idx >= 0)
+            this._terminalOrder.splice(idx, 1);
     }
     /**
      * Persist a job record with up to MAX_PERSIST_RETRIES attempts, using

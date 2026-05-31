@@ -20,6 +20,7 @@ import { homedir } from 'os';
 import { dirname, join } from 'path';
 import { KNOWLEDGE_CONFIDENCE_TIERS, ROBOTICS_DOMAINS } from './types.js';
 const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pending-experiences');
+const MAX_PENDING_ENTRIES = 500;
 // ── ExperiencePendingStore ────────────────────────────────────────────────────
 export class ExperiencePendingStore {
     _pending = [];
@@ -45,6 +46,7 @@ export class ExperiencePendingStore {
                     continue;
                 this._pending.push(item);
             }
+            this._trimToLimit();
         }
         catch {
             // Missing or malformed pending file: start with an empty queue.
@@ -52,6 +54,9 @@ export class ExperiencePendingStore {
     }
     /** Queue an experience for later review. Returns the temporary pending ID. */
     add(input) {
+        if (this._pending.length >= MAX_PENDING_ENTRIES) {
+            throw new Error(`Pending experience queue limit reached (${MAX_PENDING_ENTRIES}); run /experience review before adding more.`);
+        }
         const pendingId = `pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
         this._pending.push({ pendingId, proposedAt: Date.now(), input });
         this._persistSoon();
@@ -142,6 +147,12 @@ export class ExperiencePendingStore {
             .catch(() => { })
             .then(() => this._persist(snapshot))
             .catch(() => { });
+    }
+    _trimToLimit() {
+        if (this._pending.length <= MAX_PENDING_ENTRIES)
+            return;
+        this._pending.splice(0, this._pending.length - MAX_PENDING_ENTRIES);
+        this._persistSoon();
     }
     async _persist(snapshot) {
         if (!this._filePath)

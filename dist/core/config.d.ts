@@ -71,6 +71,22 @@ export interface MetaAgentConfig {
     model?: string;
     /** Fallback model used when the primary model cannot satisfy request features. */
     fallbackModel?: string;
+    /**
+     * Thinking ("extended thinking" / "reasoning") config for the primary model.
+     *
+     *   { type: 'disabled' }                            — no thinking blocks
+     *   { type: 'adaptive' }                            — let the kernel pick a
+     *                                                     budget (16 000 tokens
+     *                                                     for Anthropic;
+     *                                                     reasoning_effort='max'
+     *                                                     for DeepSeek / Qwen)
+     *   { type: 'enabled', budgetTokens: 32_000 }       — fixed Anthropic budget
+     *
+     * Default: `{ type: 'adaptive' }`. Thinking is ON by default so the model
+     * can deliberate before responding; explicitly set `{ type: 'disabled' }` to
+     * opt out (e.g. on cost-sensitive or latency-critical paths).
+     */
+    thinkingConfig?: ThinkingConfig;
     /** Thinking config to use after model fallback. Defaults to disabled. */
     fallbackThinkingConfig?: ThinkingConfig;
     /** Beta flags to use after model fallback. Defaults to none. */
@@ -177,7 +193,7 @@ export interface MetaAgentConfig {
      */
     debugMode?: boolean;
 }
-export type ResolvedConfig = Required<Omit<MetaAgentConfig, 'sessionId' | 'runtimeContext' | 'language' | 'outputStyle' | 'mcpServers' | 'beforeToolCall' | 'planModeRef' | 'askUser' | 'permissionConfig' | 'initialMessages' | 'debugMode' | 'fallbackModel' | 'fallbackThinkingConfig' | 'fallbackBetas' | 'fallbackIncludeDefaultBetas'>> & {
+export type ResolvedConfig = Required<Omit<MetaAgentConfig, 'sessionId' | 'runtimeContext' | 'language' | 'outputStyle' | 'mcpServers' | 'beforeToolCall' | 'planModeRef' | 'askUser' | 'permissionConfig' | 'initialMessages' | 'debugMode' | 'fallbackModel' | 'fallbackThinkingConfig' | 'fallbackBetas' | 'fallbackIncludeDefaultBetas' | 'thinkingConfig'>> & {
     runtimeContext?: RuntimeContext;
     language?: string;
     outputStyle?: OutputStyle;
@@ -189,6 +205,12 @@ export type ResolvedConfig = Required<Omit<MetaAgentConfig, 'sessionId' | 'runti
     initialMessages?: MetaAgentConfig['initialMessages'];
     debugMode?: boolean;
     fallbackModel?: string;
+    /**
+     * Resolved primary-model thinking config.  Always populated by
+     * resolveConfig() — defaults to `{ type: 'adaptive' }` when the caller did
+     * not specify it.
+     */
+    thinkingConfig: ThinkingConfig;
     fallbackThinkingConfig?: ThinkingConfig;
     fallbackBetas?: string[];
     fallbackIncludeDefaultBetas?: boolean;

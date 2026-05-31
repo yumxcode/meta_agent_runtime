@@ -62,7 +62,32 @@ export class CampaignStateStore {
     // evaluations.jsonl is append-only; tracking the byte offset avoids re-reading
     // the entire file on every 5 s poll tick (O(N) → O(new_bytes)).
     // Keyed by campaignId — survives across load() calls (new instances per tick).
+    //
+    // S5: capped LRU.  Without the cap, listing many historical campaigns would
+    // keep their EvaluationResult arrays in memory forever even after the
+    // monitors stopped.  Most-recently-touched campaigns stay in cache; cold
+    // campaigns are evicted automatically.  Configurable via
+    // META_AGENT_CAMPAIGN_EVAL_CACHE env var (default 32).
     static _evalCache = new Map();
+    static _EVAL_CACHE_MAX = (() => {
+        const raw = Number.parseInt(process.env['META_AGENT_CAMPAIGN_EVAL_CACHE'] ?? '', 10);
+        return Number.isFinite(raw) && raw > 0 ? raw : 32;
+    })();
+    /**
+     * S5: read with LRU touch — caller passes the cached entry to indicate it was
+     * just used.  Re-inserting in a Map moves the key to the back of insertion
+     * order, which gives us O(1) LRU semantics for free.
+     */
+    static _touchEvalCache(campaignId, entry) {
+        CampaignStateStore._evalCache.delete(campaignId);
+        CampaignStateStore._evalCache.set(campaignId, entry);
+        while (CampaignStateStore._evalCache.size > CampaignStateStore._EVAL_CACHE_MAX) {
+            const oldest = CampaignStateStore._evalCache.keys().next().value;
+            if (oldest === undefined)
+                break;
+            CampaignStateStore._evalCache.delete(oldest);
+        }
+    }
     // ── Global reference-counted lock pool ───────────────────────────────────────
     //
     // Problem (P0): the original implementation used a plain Map<string, Promise>.
@@ -215,9 +240,11 @@ export class CampaignStateStore {
      *   User checkpoint phases  (PARETO_READY_*)
      *     → 7-day threshold. The user may be reviewing Pareto results.
      *
-     * This is the *only* place zombie expiry fires — calling it from
-     * ModeDetector._hasActiveCampaigns() (once per session) is enough to keep
-     * the disk clean without a dedicated background sweeper.
+     * This is the *only* place zombie expiry fires — historically it was
+     * invoked from ModeDetector once per session; that hook has been removed
+     * but `listActive()` is still called by CampaignSession bootstrap and by
+     * CLI status commands, which is sufficient to keep the disk clean without
+     * a dedicated background sweeper.
      */
     static async listActive() {
         const all = await CampaignStateStore._loadAll();
@@ -441,10 +468,15 @@ export class CampaignStateStore {
             ? [...cached.results, ...newResults]
             : cached.results;
         if (newResults.length > 0) {
-            CampaignStateStore._evalCache.set(this.campaignId, {
+            CampaignStateStore._touchEvalCache(this.campaignId, {
                 offset: newOffset,
                 results: allResults,
             });
+        }
+        else if (cached.results.length > 0) {
+            // S5: even a "cache hit, no new results" path touches the LRU so the
+            // entry is promoted to most-recently-used and survives eviction.
+            CampaignStateStore._touchEvalCache(this.campaignId, cached);
         }
         // Apply caller filters at query time
         if (!filter)

@@ -6,21 +6,15 @@ export interface TeamWatcherEvent {
 }
 
 function taskKey(task: TeamTask): string {
-  return `${task.id}:${task.status}:${task.ownerUnit ?? ''}:${task.branch ?? ''}:${task.updatedAt}`
+  return `${task.id}:${task.status}:${task.ownerUnit ?? ''}:${task.attempts.length}:${task.updatedAt}`
 }
 
 function stateSignature(state: TeamState | null): string {
   if (!state) return 'null'
   return JSON.stringify({
     goals: state.goals,
-    modules: state.modules.map(m => ({
-      name: m.name,
-      ownerUnit: m.ownerUnit ?? '',
-      paths: m.paths,
-    })),
     tasks: state.tasks.map(taskKey),
     units: state.units.map(u => `${u.id}:${u.status}:${u.currentTask ?? ''}:${u.lastSeen}`),
-    decisions: state.decisions,
   })
 }
 
@@ -59,7 +53,15 @@ export class TeamWatcher {
     this.timer = null
   }
 
-  async forceSync(fetch = true): Promise<TeamSyncSummary> {
+  /**
+   * Run a single sync tick now, returning the latest TeamSyncSummary.
+   *
+   * `fetch` defaults to `false`: the background timer and post-operation
+   * refreshes should be cheap.  Callers responding to an explicit user action
+   * (e.g. `/team sync`, `/team pull`) should set it to `true`; even then the
+   * cooldown inside TeamStore.sync() may skip the actual `git fetch`.
+   */
+  async forceSync(fetch = false): Promise<TeamSyncSummary> {
     // If a tick is already in progress, wait for it to finish (up to 5 s)
     // before starting a new one, so we never return stale data.
     let waited = 0
@@ -115,7 +117,6 @@ export class TeamWatcher {
       this.lastSync = await this.store.sync({
         fetch: forceFetch,
         updatePresence: false,
-        writeActivity: false,
       })
       this.lastSyncAt = new Date().toISOString()
       this.recordRemoteDiff(this.lastSync)
@@ -135,8 +136,10 @@ export class TeamWatcher {
   }
 
   private record(message: string): void {
+    // S13: in-place shift instead of slice() so we don't allocate a fresh
+    // array on every tick when the buffer is at capacity.
     this.events.push({ at: new Date().toISOString(), message })
-    if (this.events.length > 20) this.events = this.events.slice(-20)
+    while (this.events.length > 20) this.events.shift()
   }
 
   private recordRemoteDiff(sync: TeamSyncSummary): void {
@@ -177,22 +180,14 @@ export class TeamWatcher {
       if ((old.ownerUnit ?? '') !== (task.ownerUnit ?? '')) {
         this.record(`${task.id} owner changed ${old.ownerUnit ?? 'unclaimed'} -> ${task.ownerUnit ?? 'unclaimed'}`)
       }
-      if ((old.branch ?? '') !== (task.branch ?? '')) {
-        this.record(`${task.id} branch changed ${old.branch ?? 'none'} -> ${task.branch ?? 'none'}`)
+      if (task.attempts.length > old.attempts.length) {
+        const delta = task.attempts.length - old.attempts.length
+        const last = task.attempts[task.attempts.length - 1]
+        this.record(`${task.id} +${delta} attempt(s)${last ? ` — ${last.unit}: ${last.direction}` : ''}`)
       }
     }
     for (const task of prev.tasks) {
       if (!nextTasks.has(task.id)) this.record(`task removed: ${task.id}`)
-    }
-
-    const prevModules = new Map(prev.modules.map(m => [m.name, m]))
-    for (const mod of next.modules) {
-      const old = prevModules.get(mod.name)
-      if (!old) {
-        this.record(`new module boundary: ${mod.name}`)
-      } else if ((old.ownerUnit ?? '') !== (mod.ownerUnit ?? '')) {
-        this.record(`module ${mod.name} owner changed ${old.ownerUnit ?? 'unclaimed'} -> ${mod.ownerUnit ?? 'unclaimed'}`)
-      }
     }
 
     const prevUnits = byId(prev.units)

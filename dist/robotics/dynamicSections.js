@@ -53,6 +53,11 @@ The experience store (\`experience_search\` / \`experience_write\`) is for:
 Propose an experience entry **after you have solved the problem**, not before; it will wait for user review before becoming shared knowledge.
 A blank experience store means this is unexplored territory — proceed with direct analysis.
 
+### Principle Layer
+- Use \`principle_search\` when the task calls for transferable mechanisms, first-principles constraints, or explicit applicability boundaries
+- Use \`principle_promote\` only when the user explicitly asks to extract/promote/generalize a principle from an approved experience
+- Principles are reviewed abstractions; experiences remain concrete cases and physical anchors remain world facts
+
 ### Task Completion
 You are done only when you have delivered a complete answer to the user.
 Searching tools and reading files is progress, not completion.
@@ -89,6 +94,11 @@ The experience store (\`experience_search\` / \`experience_write\`) is for:
 
 To get results from a completed sub-agent: call **\`get_sub_agent_status task_id="<id>"\`**.
 The ExperimentSummary in that call IS the result — do not wait for it to appear in the experience store.
+
+### Principle Layer
+- \`principle_search\` retrieves reviewed transferable principles with first-principles support and applicability / non-applicability boundaries
+- \`principle_promote\` queues a new principle candidate only when the user explicitly asks to abstract an approved experience into a principle
+- Confidence-threshold promotion is handled after human approval of experiences; do not bypass review by writing principles directly
 
 ### Agent Roles Available
 - **PaperSearchAgent** (\`paper_search\`): Literature survey and synthesis

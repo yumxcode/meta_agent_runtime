@@ -68,8 +68,24 @@ function mapFinishReason(reason) {
         default: return reason ?? null;
     }
 }
-function sleep(ms) {
-    return new Promise(resolve => setTimeout(resolve, ms));
+/**
+ * H8: Sleep that resolves early when the abort signal fires.  Returns true if
+ * the sleep elapsed naturally, false when interrupted.
+ */
+function abortableSleep(ms, signal) {
+    if (signal.aborted)
+        return Promise.resolve(false);
+    return new Promise(resolve => {
+        const timer = setTimeout(() => {
+            signal.removeEventListener('abort', onAbort);
+            resolve(true);
+        }, ms);
+        const onAbort = () => {
+            clearTimeout(timer);
+            resolve(false);
+        };
+        signal.addEventListener('abort', onAbort, { once: true });
+    });
 }
 function getErrorStatus(e) {
     if (e && typeof e === 'object' && 'status' in e) {
@@ -78,6 +94,34 @@ function getErrorStatus(e) {
             return s;
     }
     return null;
+}
+/**
+ * H7: Cache OpenAI SDK clients used to talk to DeepSeek so a multi-turn loop
+ * reuses a single keep-alive pool instead of constructing a fresh client on
+ * every API call.
+ */
+const DEEPSEEK_CLIENT_CACHE_MAX = 16;
+const _deepseekClientCache = new Map();
+function getDeepSeekClient(apiKey, baseURL) {
+    const key = `${apiKey ?? ''} ${baseURL}`;
+    const cached = _deepseekClientCache.get(key);
+    if (cached) {
+        _deepseekClientCache.delete(key);
+        _deepseekClientCache.set(key, cached);
+        return cached;
+    }
+    const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
+    _deepseekClientCache.set(key, client);
+    if (_deepseekClientCache.size > DEEPSEEK_CLIENT_CACHE_MAX) {
+        const oldest = _deepseekClientCache.keys().next().value;
+        if (oldest !== undefined)
+            _deepseekClientCache.delete(oldest);
+    }
+    return client;
+}
+/** Test/dispose hook — drop all cached DeepSeek clients. */
+export function clearDeepSeekClientCache() {
+    _deepseekClientCache.clear();
 }
 // ── Main export ───────────────────────────────────────────────────────────────
 /**
@@ -88,15 +132,12 @@ function getErrorStatus(e) {
  * Retries on 429/5xx. Propagates PromptTooLongError on context overflow.
  */
 export async function* streamDeepSeekMessages(params, config, onRetry) {
-    const apiKey = config.apiKey
-        ?? process.env['DEEPSEEK_API_KEY']
-        ?? process.env['ANTHROPIC_API_KEY'];
+    // H6: never fall back to ANTHROPIC_API_KEY for DeepSeek — Anthropic keys
+    // fail with 401 at DeepSeek's endpoint and make the failure mode opaque to
+    // operators ("DeepSeek down?" rather than "wrong key").
+    const apiKey = config.apiKey ?? process.env['DEEPSEEK_API_KEY'];
     const baseURL = config.baseURL ?? DEEPSEEK_BASE_URL;
-    const client = new OpenAI({
-        apiKey,
-        baseURL,
-        maxRetries: 0, // We handle retries ourselves
-    });
+    const client = getDeepSeekClient(apiKey, baseURL);
     const toolsParam = await buildDeepSeekTools(params.tools, params.sessionId ?? '', params.model);
     const reasoningEffort = buildReasoningEffort(params.thinkingConfig);
     const thinkingEnabled = reasoningEffort !== undefined;
@@ -136,7 +177,11 @@ export async function* streamDeepSeekMessages(params, config, onRetry) {
             const jitter = Math.random() * 0.25 * base;
             const delayMs = Math.floor(base + jitter);
             onRetry?.(attempt, config.maxRetries ?? DEFAULT_MAX_RETRIES, delayMs, getErrorStatus(error));
-            await sleep(delayMs);
+            const completed = await abortableSleep(delayMs, params.abortSignal);
+            if (!completed) {
+                // Aborted during retry backoff — bail with the original error.
+                throw error;
+            }
         }
     }
 }

@@ -55,6 +55,12 @@ export declare class SectionRegistry {
      */
     invalidateAll(): void;
     /**
+     * S18: dispose-time alias for invalidateAll().
+     * Provided so call sites that release the whole session can express intent
+     * ("drop everything") rather than "invalidate".  Behaviourally identical.
+     */
+    clear(): void;
+    /**
      * Resolve all sections in parallel, returning their string values in order.
      * Memoized sections are read from cache when available.
      * Volatile sections are always recomputed.

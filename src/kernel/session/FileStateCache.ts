@@ -14,6 +14,12 @@ export interface FileEntry {
   readAt: number
   /** File size at read time (bytes), used for compact re-attach size estimate */
   sizeBytes: number
+  /**
+   * Last-known mtime (ms) of the file at read time.
+   * Used by edit_file to detect concurrent modifications between read and edit
+   * (TOCTOU defence). Undefined for legacy callers that don't supply it.
+   */
+  mtimeMs?: number
 }
 
 export class FileStateCache {
@@ -24,8 +30,8 @@ export class FileStateCache {
     this._maxEntries = maxEntries
   }
 
-  record(path: string, sizeBytes: number): void {
-    this._entries.set(path, { path, readAt: Date.now(), sizeBytes })
+  record(path: string, sizeBytes: number, mtimeMs?: number): void {
+    this._entries.set(path, { path, readAt: Date.now(), sizeBytes, mtimeMs })
     // LRU eviction: drop oldest entries if over limit
     if (this._entries.size > this._maxEntries) {
       const oldest = this._entries.keys().next().value

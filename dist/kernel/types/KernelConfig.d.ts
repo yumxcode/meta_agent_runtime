@@ -69,11 +69,21 @@ export interface KernelConfig {
     cwd?: string;
     /** Optional message history to preload when resuming a session. */
     initialMessages?: KernelMessage[];
-    /** System prompt text */
+    /**
+     * Static system prompt text.
+     *
+     * The kernel assembles the effective system prompt via
+     * `assembleSystemPrompt(systemPrompt, appendSystemPrompt)` (see
+     * utils/AssembleSystemPrompt.ts) — empty / undefined / null parts are
+     * elided so callers that build the whole prompt out of `appendSystemPrompt`
+     * (e.g. MetaAgentSession) can pass `systemPrompt: ''` without producing
+     * stray leading whitespace.
+     */
     systemPrompt?: string;
     /**
-     * Suffix appended to systemPrompt on every submitMessage call.
+     * Suffix joined to systemPrompt on every submitMessage call.
      * Useful for Campaign/mode-specific dynamic context.
+     * See `assembleSystemPrompt` for the precise join semantics.
      */
     appendSystemPrompt?: string;
     /** Tools available to the model */

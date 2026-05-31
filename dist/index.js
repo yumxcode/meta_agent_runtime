@@ -24,6 +24,12 @@ DOESampler, makeDesignPoint, FidelityLadder, DEFAULT_FIDELITY_LADDER, WorkerCoor
 export { saveRunStateSnapshot, loadRunStateSnapshot, cleanupRunStateSnapshot, getRunStateSnapshotPath, } from './core/compact/runStateSnapshot.js';
 export { makeContractId, createTaskContract, } from './core/contract/types.js';
 export { TaskContractStore } from './core/contract/TaskContractStore.js';
+// ── Robotics knowledge layers ────────────────────────────────────────────────
+export { experienceRetrievalScore, isExperienceId, } from './robotics/ExperienceStore.js';
+export { PhysicalAnchorStore, isPhysicalAnchorId } from './robotics/PhysicalAnchorStore.js';
+export { PrincipleStore, principleRetrievalScore, isPrincipleId, } from './robotics/PrincipleStore.js';
+export { PrinciplePendingStore, validatePrincipleInput } from './robotics/PrinciplePendingStore.js';
+export { PRINCIPLE_PROMOTION_SCORE_THRESHOLD, shouldTriggerPrinciplePromotion, proposePrincipleFromExperience, } from './robotics/PrinciplePromotion.js';
 // ── Built-in tools ────────────────────────────────────────────────────────────
 // Each tool lives in src/tools/<name>/ with a prompt.md description file.
 export { createEchoTool, loadToolPrompt, 
@@ -45,7 +51,7 @@ export { ExperienceStore } from './robotics/ExperienceStore.js';
 export { HardwareProfile } from './robotics/HardwareProfile.js';
 export { GitWorkspaceManager } from './robotics/git/GitWorkspaceManager.js';
 export { RoboticsProjectStore } from './robotics/persistence/RoboticsProjectStore.js';
-export { createRoboticsTools, createExperienceSearchTool, createExperienceWriteTool, createExperienceLoadTool, createHardwareProfileReadTool, createHardwareProfileWriteTool, createExperimentDispatchTool, createPaperSearchTool, createProgressNoteTool, createGitSyncToSubAgentTool, createGitMergeSubAgentTool, createGitDiffSubAgentTool, createGitDiscardSubAgentTool, } from './robotics/tools/index.js';
+export { createRoboticsTools, createExperienceSearchTool, createExperienceWriteTool, createExperienceLoadTool, createPrincipleSearchTool, createPrinciplePromoteTool, createPrincipleLoadTool, createHardwareProfileReadTool, createHardwareProfileWriteTool, createExperimentDispatchTool, createPaperSearchTool, createProgressNoteTool, createGitSyncToSubAgentTool, createGitMergeSubAgentTool, createGitDiffSubAgentTool, createGitDiscardSubAgentTool, } from './robotics/tools/index.js';
 export { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, } from './robotics/dynamicSections.js';
 export { makeExperienceId } from './robotics/types.js';
 //# sourceMappingURL=index.js.map

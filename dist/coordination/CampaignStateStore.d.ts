@@ -21,6 +21,13 @@ export declare const CAMPAIGNS_ROOT: string;
 export declare function makeCampaignId(projectName: string): string;
 export declare class CampaignStateStore {
     private static readonly _evalCache;
+    private static readonly _EVAL_CACHE_MAX;
+    /**
+     * S5: read with LRU touch — caller passes the cached entry to indicate it was
+     * just used.  Re-inserting in a Map moves the key to the back of insertion
+     * order, which gives us O(1) LRU semantics for free.
+     */
+    private static _touchEvalCache;
     private static readonly _mutationLock;
     /**
      * Release all per-campaign runtime state (eval cache + mutation lock).
@@ -91,9 +98,11 @@ export declare class CampaignStateStore {
      *   User checkpoint phases  (PARETO_READY_*)
      *     → 7-day threshold. The user may be reviewing Pareto results.
      *
-     * This is the *only* place zombie expiry fires — calling it from
-     * ModeDetector._hasActiveCampaigns() (once per session) is enough to keep
-     * the disk clean without a dedicated background sweeper.
+     * This is the *only* place zombie expiry fires — historically it was
+     * invoked from ModeDetector once per session; that hook has been removed
+     * but `listActive()` is still called by CampaignSession bootstrap and by
+     * CLI status commands, which is sufficient to keep the disk clean without
+     * a dedicated background sweeper.
      */
     static listActive(): Promise<CampaignStateStore[]>;
     /** List ALL campaigns (including DONE/FAILED), sorted by createdAt desc. */

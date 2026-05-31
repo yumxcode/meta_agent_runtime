@@ -31,6 +31,54 @@ export type KnowledgeScope = 'global' | 'robot' | 'code'
 
 export const KNOWLEDGE_SCOPES: KnowledgeScope[] = ['global', 'robot', 'code']
 
+// ── Principle Store ─────────────────────────────────────────────────────────
+export type PrincipleAbstractionLevel =
+  | 'physical'
+  | 'system'
+  | 'algorithmic'
+  | 'statistical'
+  | 'operational'
+
+export const PRINCIPLE_ABSTRACTION_LEVELS: PrincipleAbstractionLevel[] = [
+  'physical', 'system', 'algorithmic', 'statistical', 'operational',
+]
+
+export interface PrincipleEntry {
+  id: string             // 'pr_<timestamp>_<uuid8>'
+  schemaVersion: '1.0'
+  createdAt: number
+  updatedAt: number
+  title: string          // ≤ 100 chars
+  statement: string      // transferable mechanism / constraint
+  mechanism: string      // why the principle holds
+  firstPrinciplesSupport: string[]  // physics/math/CS/control-theory support
+  domains: RoboticsDomain[]
+  abstractionLevel: PrincipleAbstractionLevel
+  preconditions: string[]
+  applicabilityBounds: string[]
+  nonApplicableWhen: string[]
+  derivedFromExperienceIds: string[]
+  anchoredByPhysicalAnchorIds: string[]
+  evidenceRefs: string[]
+  invalidatedAssumptions: string[]
+  counterExamples: string[]
+  confidenceTier: KnowledgeConfidenceTier
+  observationCount: number
+  contradictionCount: number
+  promotionReason: 'confidence_threshold' | 'explicit_user_request'
+  sourceExperienceId?: string
+  lastVerifiedAt?: number
+}
+
+export interface PrincipleSearchQuery {
+  domain?: RoboticsDomain
+  abstractionLevel?: PrincipleAbstractionLevel
+  experienceId?: string
+  anchorId?: string
+  keyword?: string
+  limit?: number
+}
+
 // ── Experience Store ──────────────────────────────────────────────────────────
 export interface ExperienceOutcome {
   success: boolean
@@ -74,6 +122,8 @@ export interface ExperienceEntry {
   metrics?: Record<string, number | string>
   sourceTaskId?: string
   sourceSessionId?: string
+  /** Reviewed principles promoted from or linked to this concrete experience. */
+  principleIds?: string[]
   relatedPapers?: string[]
   fullReport?: string    // Markdown, loaded on demand only
 }
@@ -92,6 +142,12 @@ export function makeExperienceId(): string {
   const ts = Date.now().toString(36)
   const uuid8 = randomUUID().replace(/-/g, '').slice(0, 8)
   return `exp_${ts}_${uuid8}`
+}
+
+export function makePrincipleId(): string {
+  const ts = Date.now().toString(36)
+  const uuid8 = randomUUID().replace(/-/g, '').slice(0, 8)
+  return `pr_${ts}_${uuid8}`
 }
 
 // ── Physical Anchor Store ────────────────────────────────────────────────────

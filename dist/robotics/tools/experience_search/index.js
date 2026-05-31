@@ -73,6 +73,7 @@ export function createExperienceSearchTool(store) {
                         ...(e.outcome.failureReason ? [`**Failure reason**: ${e.outcome.failureReason}`] : []),
                         ...(e.outcome.workarounds?.length ? [`**Workarounds**: ${e.outcome.workarounds.join('; ')}`] : []),
                         ...(e.invalidatedAssumptions?.length ? [`**Invalidated assumptions**: ${e.invalidatedAssumptions.join('; ')}`] : []),
+                        ...(e.principleIds?.length ? [`**Principles**: ${e.principleIds.join('; ')}`] : []),
                         ...(e.evidenceRefs?.length ? [`**Evidence refs**: ${e.evidenceRefs.slice(0, 4).join('; ')}`] : []),
                         `> Use \`experience_load id="${e.id}"\` for the full report.`,
                         '',

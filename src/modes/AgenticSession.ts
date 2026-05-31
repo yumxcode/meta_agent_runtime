@@ -35,6 +35,8 @@ export class AgenticSession {
   private readonly _config: MetaAgentConfig
   private readonly _sessionId: string
   private readonly _registeredTools: MetaAgentTool[] = []
+  /** S1: guard against double dispose. */
+  private _disposed = false
   private _totalCostUsd = 0
   private _usage: TokenUsage = {
     inputTokens: 0,
@@ -80,11 +82,14 @@ export class AgenticSession {
         enabled: true,
         model: resolved.flashModel,
       },
-      // Thinking is OFF by default for all providers.
-      // Enable via MetaAgentConfig.thinkingConfig (or KernelConfig directly).
-      // When enabled on DeepSeek, KernelLoop routes to DeepSeekClient which maps
-      // any non-disabled ThinkingConfig → reasoning_effort:'max'.
-      thinkingConfig: { type: 'disabled' },
+      // Thinking on the primary model — sourced from resolved.thinkingConfig
+      // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the
+      // caller hasn't disabled it, the kernel:
+      //   • Anthropic → sends `thinking: { type: 'enabled', budget_tokens: 16k }`
+      //   • DeepSeek  → sends `reasoning_effort: 'max'`
+      //   • Qwen      → goes through Anthropic-compat endpoint, thinking enabled
+      // Fallback model still honours fallbackThinkingConfig (default disabled).
+      thinkingConfig: resolved.thinkingConfig,
       // Anthropic-only betas: token-efficient-tools + interleaved-thinking
       // Skip for third-party providers (DeepSeek, Qwen, etc.) — they return 400
       includeDefaultBetas: isAnthropic ? undefined : false,
@@ -167,6 +172,21 @@ export class AgenticSession {
   // ── Lifecycle ─────────────────────────────────────────────────────────────
 
   interrupt(): void { this._engine.interrupt() }
+
+  /**
+   * S1 + S9: Release all per-session resources.  Forwards to the inner
+   * KernelSession dispose (which clears messages / fileCache / tools closures),
+   * and empties our own _registeredTools array so any caller-supplied tools —
+   * with their potentially heavy closures — become unreachable.
+   *
+   * Safe to call multiple times.  Once called the session must not be reused.
+   */
+  dispose(): void {
+    if (this._disposed) return
+    this._disposed = true
+    try { this._engine.dispose() } catch { /* best-effort */ }
+    this._registeredTools.length = 0
+  }
 
   getMessages() { return this._engine.getMessages() }
   getSessionId() { return this._sessionId }

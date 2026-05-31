@@ -264,6 +264,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * are interrupted and no orphaned async work continues after the parent ends.
    */
   destroy(): void {
+    if (this.destroyed) return   // S6: idempotent — multiple owners may call destroy()
     this.destroyed = true
     CampaignEventBus.off('subagent:completed', this._onCompleted)
     CampaignEventBus.off('subagent:failed',    this._onFailed)
@@ -282,6 +283,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
     this.runners.clear()
     this.activeTaskIds.clear()
+    // S11: reset counters and pending notifications so a re-created bridge for
+    // the same session starts cleanly.
+    this._finishedCount = 0
+    this.pendingNotifications.length = 0
     SubAgentBridge._bridgesBySessionId.delete(this.parentSessionId)
   }
 
@@ -516,9 +521,11 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   // ── Internal helpers ────────────────────────────────────────────────────────
 
   private _enqueueNotification(text: string): void {
+    // S12: prefer shift() over splice() — V8's fast path keeps shift amortised
+    // O(1) for small arrays, while splice always re-allocates the storage.
     this.pendingNotifications.push(text)
-    if (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
-      this.pendingNotifications.splice(0, this.pendingNotifications.length - MAX_PENDING_NOTIFICATIONS)
+    while (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
+      this.pendingNotifications.shift()
     }
   }
 

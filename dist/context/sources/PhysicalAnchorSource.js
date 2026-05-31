@@ -18,26 +18,19 @@ export class PhysicalAnchorSource {
      */
     async getManifestLine() {
         try {
-            const all = await this.store.search({ limit: 100 });
-            if (all.length === 0)
+            const stats = await this.store.getStats();
+            if (stats.total === 0)
                 return 'Physical anchors: none yet';
-            // Scope breakdown
-            const scopeCounts = { global: 0, robot: 0, code: 0 };
-            const domainCounts = {};
-            for (const a of all) {
-                scopeCounts[a.scope] = (scopeCounts[a.scope] ?? 0) + 1;
-                domainCounts[a.domain] = (domainCounts[a.domain] ?? 0) + 1;
-            }
-            const scopeParts = Object.entries(scopeCounts)
+            const scopeParts = Object.entries(stats.scopeCounts)
                 .filter(([, n]) => n > 0)
                 .map(([s, n]) => `${s}:${n}`)
                 .join(' ');
-            const topDomains = Object.entries(domainCounts)
+            const topDomains = Object.entries(stats.domainCounts)
                 .sort((a, b) => b[1] - a[1])
                 .slice(0, 2)
                 .map(([d, n]) => `${d}:${n}`)
                 .join(', ');
-            return `Physical anchors: ${all.length} total | ${scopeParts}${topDomains ? ` | ${topDomains}` : ''}`;
+            return `Physical anchors: ${stats.total} total | ${scopeParts}${topDomains ? ` | ${topDomains}` : ''}`;
         }
         catch {
             return 'Physical anchors: (unavailable)';

@@ -9,7 +9,15 @@ import type {
 import { makePhysicalAnchorId } from './types.js'
 
 const PHYSICAL_ANCHOR_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'physical_anchors')
+const MANIFEST_FILE = 'PHYSICAL_ANCHOR_MANIFEST.json'
+const LOAD_CONCURRENCY = 32
 const PHYSICAL_ANCHOR_ID_RE = /^pa_[0-9a-z]+_[0-9a-f]{8}$/
+
+interface PhysicalAnchorManifest {
+  schemaVersion: '1.0'
+  updatedAt: number
+  entries: PhysicalAnchorEntry[]
+}
 
 const CONFIDENCE_WEIGHT: Record<KnowledgeConfidenceTier, number> = {
   reproduced: 500,
@@ -29,9 +37,11 @@ function anchorScore(anchor: PhysicalAnchorEntry): number {
 
 export class PhysicalAnchorStore {
   private readonly dir: string
+  private readonly manifestPath: string
 
   constructor(dir?: string) {
     this.dir = dir ?? PHYSICAL_ANCHOR_ROOT
+    this.manifestPath = join(this.dir, MANIFEST_FILE)
   }
 
   async ensureDir(): Promise<void> {
@@ -52,6 +62,7 @@ export class PhysicalAnchorStore {
       updatedAt: now,
     }
     await atomicWriteJson(join(this.dir, `${id}.json`), full)
+    await this._upsertManifest(full).catch(() => undefined)
     return id
   }
 
@@ -62,7 +73,7 @@ export class PhysicalAnchorStore {
 
   async search(query: PhysicalAnchorSearchQuery = {}): Promise<PhysicalAnchorEntry[]> {
     const limit = Math.min(query.limit ?? 10, 20)
-    const entries = await this._loadAll()
+    const entries = await this._loadManifestEntries()
     const filtered = entries.filter(anchor => {
       if (query.domain && anchor.domain !== query.domain) return false
       if (query.scope && anchor.scope !== query.scope) return false
@@ -91,13 +102,15 @@ export class PhysicalAnchorStore {
     return filtered.slice(0, limit)
   }
 
-  async getStats(): Promise<{ total: number; domainCounts: Record<string, number> }> {
-    const entries = await this._loadAll()
+  async getStats(): Promise<{ total: number; domainCounts: Record<string, number>; scopeCounts: Record<string, number> }> {
+    const entries = await this._loadManifestEntries()
     const domainCounts: Record<string, number> = {}
+    const scopeCounts: Record<string, number> = { global: 0, robot: 0, code: 0 }
     for (const entry of entries) {
       domainCounts[entry.domain] = (domainCounts[entry.domain] ?? 0) + 1
+      scopeCounts[entry.scope] = (scopeCounts[entry.scope] ?? 0) + 1
     }
-    return { total: entries.length, domainCounts }
+    return { total: entries.length, domainCounts, scopeCounts }
   }
 
   async formatForPrompt(opts: PhysicalAnchorSearchQuery = {}): Promise<string> {
@@ -123,8 +136,67 @@ export class PhysicalAnchorStore {
   }
 
   private async _loadAll(): Promise<PhysicalAnchorEntry[]> {
-    const ids = await this.listIds()
-    const entries = await Promise.all(ids.map(id => this.load(id)))
-    return entries.filter((entry): entry is PhysicalAnchorEntry => entry !== null)
+    return this._loadAllFromFiles()
   }
+
+  private async _loadAllFromFiles(): Promise<PhysicalAnchorEntry[]> {
+    const ids = await this.listIds()
+    return loadWithConcurrency(ids, id => this.load(id))
+  }
+
+  private async _loadManifestEntries(): Promise<PhysicalAnchorEntry[]> {
+    const manifest = await readJsonFile<PhysicalAnchorManifest>(this.manifestPath)
+    if (isPhysicalAnchorManifest(manifest)) return manifest.entries
+    return this._rebuildManifestFromFiles()
+  }
+
+  private async _rebuildManifestFromFiles(): Promise<PhysicalAnchorEntry[]> {
+    const entries = await this._loadAllFromFiles()
+    await this._writeManifest(entries).catch(() => undefined)
+    return entries
+  }
+
+  private async _upsertManifest(entry: PhysicalAnchorEntry): Promise<void> {
+    const manifest = await readJsonFile<PhysicalAnchorManifest>(this.manifestPath)
+    if (!isPhysicalAnchorManifest(manifest)) {
+      await this._rebuildManifestFromFiles()
+      return
+    }
+    const entries = manifest.entries.filter(existing => existing.id !== entry.id)
+    entries.push(entry)
+    await this._writeManifest(entries)
+  }
+
+  private async _writeManifest(entries: PhysicalAnchorEntry[]): Promise<void> {
+    await atomicWriteJson(this.manifestPath, {
+      schemaVersion: '1.0',
+      updatedAt: Date.now(),
+      entries,
+    } satisfies PhysicalAnchorManifest)
+  }
+}
+
+function isPhysicalAnchorManifest(value: unknown): value is PhysicalAnchorManifest {
+  if (!value || typeof value !== 'object') return false
+  const record = value as Record<string, unknown>
+  return record['schemaVersion'] === '1.0' &&
+    typeof record['updatedAt'] === 'number' &&
+    Array.isArray(record['entries'])
+}
+
+async function loadWithConcurrency<T>(
+  ids: string[],
+  load: (id: string) => Promise<T | null>,
+): Promise<T[]> {
+  const out: T[] = []
+  let next = 0
+  const workerCount = Math.min(LOAD_CONCURRENCY, ids.length)
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next++]
+      const entry = await load(id)
+      if (entry) out.push(entry)
+    }
+  }))
+  return out
 }

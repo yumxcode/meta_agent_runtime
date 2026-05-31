@@ -45,6 +45,11 @@ import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
+import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
+import { clearWebFetchCache } from '../tools/network/web_fetch/index.js'
+import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js'
+import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
+import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
 import type { RouterOptions, SessionMode, SessionModeHint } from './types.js'
 import { MODE_WEIGHT } from './types.js'
 
@@ -54,28 +59,26 @@ import { MODE_WEIGHT } from './types.js'
 // RoboticsSession has fully initialised.
 
 export interface RoboticsTeamController {
+  // Lifecycle
   teamInit?(github?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>
   teamJoin?(github?: string, human?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>
-  teamClaim?(taskId: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; warnings: string[] }>
-  teamStart?(taskId?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamTaskAdd?(input: import('../robotics/team/TeamStore.js').TeamTaskAddInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamTaskStatus?(taskId: string, status: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamModuleAdd?(input: import('../robotics/team/TeamStore.js').TeamModuleAddInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; module: import('../robotics/team/TeamStore.js').TeamModule }>
-  teamModuleOwner?(name: string, ownerUnit?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; module: import('../robotics/team/TeamStore.js').TeamModule }>
-  teamCheck?(): Promise<import('../robotics/team/TeamStore.js').TeamConflictReport>
-  teamCheckPaths?(paths: string[]): Promise<import('../robotics/team/TeamStore.js').TeamConflictReport>
-  teamBranch?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamBranchResult>
-  teamPush?(): Promise<import('../robotics/team/TeamStore.js').TeamPushResult>
-  teamPr?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamPrDraftResult>
-  teamHandoff?(taskId?: string, note?: string): Promise<import('../robotics/team/TeamStore.js').TeamHandoffResult>
-  teamOnboarding?(): Promise<import('../robotics/team/TeamStore.js').TeamOnboardingSummary>
-  teamGitHubIssuesSync?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamGitHubIssueSyncResult[]>
-  teamGitHubProjectAdd?(projectNumber: string, owner?: string): Promise<import('../robotics/team/TeamStore.js').TeamGitHubProjectResult>
   teamStatus?(): Promise<import('../robotics/team/TeamStore.js').TeamState | null>
+
+  // Task mutation (v2.0 collaboration log)
+  teamTaskAdd?(input: import('../robotics/team/TeamStore.js').TeamTaskAddInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
+  teamTake?(taskId: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
+  teamDrop?(taskId?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
+  teamSteal?(taskId: string, reason?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; previousOwner?: string }>
+  teamNote?(input: import('../robotics/team/TeamStore.js').TeamNoteInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; attempt: import('../robotics/team/TeamStore.js').TeamAttempt }>
+  teamTaskStatus?(taskId: string, status: import('../robotics/team/TeamStore.js').TeamTaskStatus): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
+
+  // Git transport
   teamSync?(): Promise<import('../robotics/team/TeamStore.js').TeamSyncSummary>
   teamPull?(): Promise<import('../robotics/team/TeamStore.js').TeamPullResult>
   teamConflicts?(): Promise<import('../robotics/team/TeamStore.js').MergeConflictReport>
   teamResolveTeamJson?(): Promise<import('../robotics/team/TeamStore.js').TeamJsonResolveResult>
+
+  // Prompt boundary + watcher
   teamSetContextBoundary?(mode: 'background' | 'unrelated', taskId: string): Promise<void>
   teamWatcherPoll?(): Promise<import('../robotics/team/TeamWatcher.js').TeamWatcherEvent[]>
   teamWatcherEvents?(): import('../robotics/team/TeamWatcher.js').TeamWatcherEvent[]
@@ -308,7 +311,25 @@ export class SessionRouter {
     if (sessionId) {
       try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
       try { deleteJobsForSession(sessionId) } catch { /* best-effort */ }
+      // S6: kill any SubAgentBridge that was created for this session but
+      // whose owner forgot to call destroy() (e.g. CampaignSession callers
+      // who never dispose).  Idempotent — does nothing when already destroyed.
+      try { SubAgentBridge.getBridge(sessionId)?.destroy() } catch { /* best-effort */ }
     }
+    // Drop the impl reference so the GC can reclaim the whole session graph.
+    this._impl = null
+    this._pendingTools = []
+    this._currentMode = null
+    // S10: scrub module-level caches that were populated during this session.
+    // These are static singletons so we only clear (rather than per-session
+    // partition) — for hosts running multiple SessionRouters concurrently the
+    // caches will simply re-warm on the next call.
+    try { clearWebFetchCache() } catch { /* best-effort */ }
+    try { clearAnthropicClientCache() } catch { /* best-effort */ }
+    try { clearDeepSeekClientCache() } catch { /* best-effort */ }
+    // S4: best-effort debug log purge.  Quick (one readdir over the global
+    // debug dir) and only deletes age- or size-eligible files.
+    void pruneStaleDebug().catch(() => undefined)
   }
 
   /**
@@ -333,6 +354,29 @@ export class SessionRouter {
     const impl = this._impl as any
     if (impl && typeof impl.pendingPhysicalAnchors === 'object' && impl.pendingPhysicalAnchors !== null) {
       return impl.pendingPhysicalAnchors
+    }
+    return null
+  }
+
+  /**
+   * Return the robotics session's pending principle buffer (if mode=robotics).
+   * Returns null in all other modes or before the first submit().
+   */
+  getPendingPrinciples(): import('../robotics/PrinciplePendingStore.js').PrinciplePendingStore | null {
+    const impl = this._impl as any
+    if (impl && typeof impl.pendingPrinciples === 'object' && impl.pendingPrinciples !== null) {
+      return impl.pendingPrinciples
+    }
+    return null
+  }
+
+  async proposePrincipleForExperience(
+    experienceId: string,
+    reason: 'confidence_threshold' | 'explicit_user_request',
+  ): Promise<unknown | null> {
+    const impl = this._impl as any
+    if (impl && typeof impl.proposePrincipleForExperience === 'function') {
+      return impl.proposePrincipleForExperience(experienceId, reason)
     }
     return null
   }

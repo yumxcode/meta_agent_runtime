@@ -4207,6 +4207,9 @@ function resolveConfig(config2) {
     model,
     flashModel,
     fallbackModel: resolvedFallbackModel,
+    // Default to adaptive so the primary LLM thinks before answering. Callers
+    // can opt out by passing `{ type: 'disabled' }`.
+    thinkingConfig: config2.thinkingConfig ?? { type: "adaptive" },
     fallbackThinkingConfig: config2.fallbackThinkingConfig,
     fallbackBetas: config2.fallbackBetas,
     fallbackIncludeDefaultBetas: config2.fallbackIncludeDefaultBetas,
@@ -4615,6 +4618,14 @@ var init_systemPromptSections = __esm({
        * Clear the entire section cache (e.g. on /clear or /compact equivalent).
        */
       invalidateAll() {
+        this.cache.clear();
+      }
+      /**
+       * S18: dispose-time alias for invalidateAll().
+       * Provided so call sites that release the whole session can express intent
+       * ("drop everything") rather than "invalidate".  Behaviourally identical.
+       */
+      clear() {
         this.cache.clear();
       }
       /**
@@ -5193,6 +5204,12 @@ async function atomicWriteJson(filePath, data) {
   await writeFile(tmp, JSON.stringify(data, null, 2), "utf-8");
   await rename(tmp, filePath);
 }
+async function atomicWriteFile(filePath, contents) {
+  await ensureParentDir(filePath);
+  const tmp = `${filePath}.${randomUUID().slice(0, 8)}.tmp`;
+  await writeFile(tmp, contents, "utf-8");
+  await rename(tmp, filePath);
+}
 async function listJsonIds(dir) {
   try {
     const entries = await readdir(dir);
@@ -5251,7 +5268,31 @@ var init_CampaignStateStore = __esm({
       // evaluations.jsonl is append-only; tracking the byte offset avoids re-reading
       // the entire file on every 5 s poll tick (O(N) → O(new_bytes)).
       // Keyed by campaignId — survives across load() calls (new instances per tick).
+      //
+      // S5: capped LRU.  Without the cap, listing many historical campaigns would
+      // keep their EvaluationResult arrays in memory forever even after the
+      // monitors stopped.  Most-recently-touched campaigns stay in cache; cold
+      // campaigns are evicted automatically.  Configurable via
+      // META_AGENT_CAMPAIGN_EVAL_CACHE env var (default 32).
       static _evalCache = /* @__PURE__ */ new Map();
+      static _EVAL_CACHE_MAX = (() => {
+        const raw = Number.parseInt(process.env["META_AGENT_CAMPAIGN_EVAL_CACHE"] ?? "", 10);
+        return Number.isFinite(raw) && raw > 0 ? raw : 32;
+      })();
+      /**
+       * S5: read with LRU touch — caller passes the cached entry to indicate it was
+       * just used.  Re-inserting in a Map moves the key to the back of insertion
+       * order, which gives us O(1) LRU semantics for free.
+       */
+      static _touchEvalCache(campaignId, entry) {
+        _CampaignStateStore._evalCache.delete(campaignId);
+        _CampaignStateStore._evalCache.set(campaignId, entry);
+        while (_CampaignStateStore._evalCache.size > _CampaignStateStore._EVAL_CACHE_MAX) {
+          const oldest = _CampaignStateStore._evalCache.keys().next().value;
+          if (oldest === void 0) break;
+          _CampaignStateStore._evalCache.delete(oldest);
+        }
+      }
       // ── Global reference-counted lock pool ───────────────────────────────────────
       //
       // Problem (P0): the original implementation used a plain Map<string, Promise>.
@@ -5405,9 +5446,11 @@ var init_CampaignStateStore = __esm({
        *   User checkpoint phases  (PARETO_READY_*)
        *     → 7-day threshold. The user may be reviewing Pareto results.
        *
-       * This is the *only* place zombie expiry fires — calling it from
-       * ModeDetector._hasActiveCampaigns() (once per session) is enough to keep
-       * the disk clean without a dedicated background sweeper.
+       * This is the *only* place zombie expiry fires — historically it was
+       * invoked from ModeDetector once per session; that hook has been removed
+       * but `listActive()` is still called by CampaignSession bootstrap and by
+       * CLI status commands, which is sufficient to keep the disk clean without
+       * a dedicated background sweeper.
        */
       static async listActive() {
         const all = await _CampaignStateStore._loadAll();
@@ -5615,10 +5658,12 @@ var init_CampaignStateStore = __esm({
         }
         const allResults = newResults.length > 0 ? [...cached2.results, ...newResults] : cached2.results;
         if (newResults.length > 0) {
-          _CampaignStateStore._evalCache.set(this.campaignId, {
+          _CampaignStateStore._touchEvalCache(this.campaignId, {
             offset: newOffset,
             results: allResults
           });
+        } else if (cached2.results.length > 0) {
+          _CampaignStateStore._touchEvalCache(this.campaignId, cached2);
         }
         if (!filter) return allResults;
         return allResults.filter((r) => {
@@ -6400,9 +6445,9 @@ async function releaseWriteChain(taskId) {
   _writeChains.delete(taskId);
 }
 async function listTasksForSession(parentSessionId) {
-  const { readdir: readdir11 } = await import("fs/promises");
+  const { readdir: readdir12 } = await import("fs/promises");
   try {
-    const entries = await readdir11(subtaskDir());
+    const entries = await readdir12(subtaskDir());
     const records = [];
     await Promise.allSettled(
       entries.filter((e) => e.endsWith(".json")).map(async (e) => {
@@ -6517,6 +6562,28 @@ function getMaxOut() {
   if (!Number.isFinite(parsed)) return DEFAULT_MAX_OUT;
   return Math.min(1024 * 1024, Math.max(1024, parsed));
 }
+function resolveTimeoutMs(raw) {
+  if (typeof raw !== "number" || !Number.isFinite(raw)) return DEFAULT_TIMEOUT_MS;
+  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, raw));
+}
+function buildShellEnv(policy) {
+  const src = process.env;
+  if (policy === "inherit") return { ...src };
+  if (policy === "empty") {
+    const out2 = {};
+    for (const key of MINIMAL_ENV_KEYS) {
+      if (src[key] !== void 0) out2[key] = src[key];
+    }
+    return out2;
+  }
+  const out = {};
+  for (const [key, value] of Object.entries(src)) {
+    if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue;
+    if (SENSITIVE_ENV_PATTERN.test(key)) continue;
+    out[key] = value;
+  }
+  return out;
+}
 function isInsideWorkspace(path4, workspaceRoot = process.cwd()) {
   const workspace = existsSync2(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot);
   const target = existsSync2(path4) ? realpathSync(path4) : resolve(workspace, path4);
@@ -6524,6 +6591,7 @@ function isInsideWorkspace(path4, workspaceRoot = process.cwd()) {
 }
 async function createBashTool(opts = {}) {
   const { sandboxHandle } = opts;
+  const envPolicy = opts.envPolicy ?? "filtered";
   const description = dynamicDescription("Execute a bash shell command. Returns stdout, stderr, and exit code.\n\nUsage:\n- command: the bash command to run\n- timeout_ms: max execution time in ms (default: 30000, max: 120000)\n- cwd: working directory (default: process.cwd())\n- Large outputs are truncated to 100KB\n- Avoid interactive commands requiring stdin", (base, ctx) => {
     const hints = [];
     if (ctx.toolNames.has("grep")) hints.push("- Search file contents: use `grep` tool (NOT rg/grep commands)");
@@ -6561,7 +6629,7 @@ ${hints.join("\n")}` : base;
     },
     async call(input, ctx) {
       const command = input["command"];
-      const timeoutMs = Math.min(typeof input["timeout_ms"] === "number" ? input["timeout_ms"] : 3e4, 12e4);
+      const timeoutMs = resolveTimeoutMs(input["timeout_ms"]);
       const cwd = input["cwd"] ?? process.cwd();
       if (!command) return { content: "Error: command is required", isError: true };
       if (!isInsideWorkspace(cwd, ctx.workspaceRoot)) return { content: `Error: cwd is outside workspace: ${cwd}`, isError: true };
@@ -6576,7 +6644,7 @@ ${hints.join("\n")}` : base;
           cwd,
           maxBuffer: limit2 * 2,
           signal: ctx.abortSignal,
-          env: process.env
+          env: buildShellEnv(envPolicy)
         });
         const parts = [];
         if (stdout) parts.push(trunc(stdout));
@@ -6585,24 +6653,47 @@ ${trunc(stderr)}`);
         return { content: parts.join("\n") || "(no output)", isError: false };
       } catch (err) {
         const e = err;
-        if (e.killed) return { content: `Command timed out after ${timeoutMs}ms`, isError: true };
+        if (e.killed) {
+          const parts2 = [`Command timed out after ${timeoutMs}ms`];
+          if (e.stdout) parts2.push(trunc(e.stdout));
+          if (e.stderr) parts2.push(`STDERR:
+${trunc(e.stderr)}`);
+          return { content: parts2.join("\n"), isError: true };
+        }
         const parts = [];
-        if (e.stdout) parts.push(e.stdout);
+        if (e.stdout) parts.push(trunc(e.stdout));
         if (e.stderr) parts.push(`STDERR:
-${e.stderr}`);
+${trunc(e.stderr)}`);
         if (e.code !== void 0) parts.push(`Exit code: ${e.code}`);
         return { content: parts.join("\n") || e.message || String(err), isError: true };
       }
     }
   };
 }
-var execFileAsync, DEFAULT_MAX_OUT;
+var execFileAsync, DEFAULT_MAX_OUT, DEFAULT_TIMEOUT_MS, MAX_TIMEOUT_MS, MIN_TIMEOUT_MS, SENSITIVE_ENV_PATTERN, EXPLICIT_ENV_BLOCKLIST, MINIMAL_ENV_KEYS;
 var init_bash = __esm({
   "src/tools/shell/bash/index.ts"() {
     "use strict";
     init_util();
     execFileAsync = promisify(execFile);
     DEFAULT_MAX_OUT = 100 * 1024;
+    DEFAULT_TIMEOUT_MS = 3e4;
+    MAX_TIMEOUT_MS = 12e4;
+    MIN_TIMEOUT_MS = 1e3;
+    SENSITIVE_ENV_PATTERN = /(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|SESSION_KEY|ACCESS_KEY|REFRESH_TOKEN|AUTH)$/i;
+    EXPLICIT_ENV_BLOCKLIST = /* @__PURE__ */ new Set([
+      "ANTHROPIC_API_KEY",
+      "DEEPSEEK_API_KEY",
+      "QWEN_API_KEY",
+      "OPENAI_API_KEY",
+      "GITHUB_TOKEN",
+      "GH_TOKEN",
+      "NPM_TOKEN",
+      "AWS_ACCESS_KEY_ID",
+      "AWS_SECRET_ACCESS_KEY",
+      "AWS_SESSION_TOKEN"
+    ]);
+    MINIMAL_ENV_KEYS = ["PATH", "HOME", "USER", "LOGNAME", "LANG", "LC_ALL", "TZ", "SHELL", "TMPDIR", "TEMP", "TMP"];
   }
 });
 
@@ -7113,6 +7204,7 @@ var init_SubAgentBridge = __esm({
        * are interrupted and no orphaned async work continues after the parent ends.
        */
       destroy() {
+        if (this.destroyed) return;
         this.destroyed = true;
         CampaignEventBus.off("subagent:completed", this._onCompleted);
         CampaignEventBus.off("subagent:failed", this._onFailed);
@@ -7130,6 +7222,8 @@ var init_SubAgentBridge = __esm({
         }
         this.runners.clear();
         this.activeTaskIds.clear();
+        this._finishedCount = 0;
+        this.pendingNotifications.length = 0;
         _SubAgentBridge._bridgesBySessionId.delete(this.parentSessionId);
       }
       // ── Spawn ───────────────────────────────────────────────────────────────────
@@ -7310,8 +7404,8 @@ var init_SubAgentBridge = __esm({
       // ── Internal helpers ────────────────────────────────────────────────────────
       _enqueueNotification(text) {
         this.pendingNotifications.push(text);
-        if (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
-          this.pendingNotifications.splice(0, this.pendingNotifications.length - MAX_PENDING_NOTIFICATIONS);
+        while (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
+          this.pendingNotifications.shift();
         }
       }
       _startPollTimer(taskId, intervalMs) {
@@ -8224,8 +8318,8 @@ var init_FileStateCache = __esm({
       constructor(maxEntries = 200) {
         this._maxEntries = maxEntries;
       }
-      record(path4, sizeBytes) {
-        this._entries.set(path4, { path: path4, readAt: Date.now(), sizeBytes });
+      record(path4, sizeBytes, mtimeMs) {
+        this._entries.set(path4, { path: path4, readAt: Date.now(), sizeBytes, mtimeMs });
         if (this._entries.size > this._maxEntries) {
           const oldest = this._entries.keys().next().value;
           if (oldest !== void 0) this._entries.delete(oldest);
@@ -19979,17 +20073,84 @@ var init_ThinkingConfig = __esm({
 // src/kernel/api/DebugWriter.ts
 import { homedir as homedir7 } from "os";
 import { join as join9 } from "path";
-import { mkdir as mkdir4, open as open3 } from "fs/promises";
+import { mkdir as mkdir4, open as open3, readdir as readdir5, rm, stat as stat4 } from "fs/promises";
+async function pruneStaleDebug(options = {}) {
+  const ttlMs = options.ttlMs ?? DEFAULT_DEBUG_TTL_MS;
+  const sessionCap = options.sessionSizeCapBytes ?? DEFAULT_SESSION_DIR_SIZE_CAP;
+  const root = options.rootDir ?? DEBUG_ROOT;
+  const summary = {
+    scannedSessions: 0,
+    removedSessions: 0,
+    trimmedFiles: 0,
+    bytesFreed: 0
+  };
+  let entries;
+  try {
+    entries = await readdir5(root);
+  } catch {
+    return summary;
+  }
+  const now = Date.now();
+  for (const sessionId of entries) {
+    summary.scannedSessions++;
+    const sessionDir3 = join9(root, sessionId);
+    let files;
+    try {
+      files = await readdir5(sessionDir3);
+    } catch {
+      continue;
+    }
+    const records = [];
+    let newestMtime = 0;
+    let totalSize = 0;
+    for (const name of files) {
+      try {
+        const s = await stat4(join9(sessionDir3, name));
+        if (!s.isFile()) continue;
+        records.push({ name, size: s.size, mtime: s.mtimeMs });
+        if (s.mtimeMs > newestMtime) newestMtime = s.mtimeMs;
+        totalSize += s.size;
+      } catch {
+      }
+    }
+    if (records.length === 0 || newestMtime > 0 && now - newestMtime > ttlMs) {
+      try {
+        await rm(sessionDir3, { recursive: true, force: true });
+        summary.removedSessions++;
+        summary.bytesFreed += totalSize;
+      } catch {
+      }
+      continue;
+    }
+    if (totalSize > sessionCap) {
+      records.sort((a, b) => a.mtime - b.mtime);
+      for (const rec of records) {
+        if (totalSize <= sessionCap) break;
+        try {
+          await rm(join9(sessionDir3, rec.name), { force: true });
+          totalSize -= rec.size;
+          summary.bytesFreed += rec.size;
+          summary.trimmedFiles++;
+        } catch {
+        }
+      }
+    }
+  }
+  return summary;
+}
 function isoNow() {
   return (/* @__PURE__ */ new Date()).toISOString();
 }
 function safeModel(model) {
   return model.replace(/[^a-zA-Z0-9._-]/g, "_").slice(0, 60);
 }
-var DebugWriter;
+var DEBUG_ROOT, DEFAULT_DEBUG_TTL_MS, DEFAULT_SESSION_DIR_SIZE_CAP, DebugWriter;
 var init_DebugWriter = __esm({
   "src/kernel/api/DebugWriter.ts"() {
     "use strict";
+    DEBUG_ROOT = join9(homedir7(), ".meta-agent", "debug");
+    DEFAULT_DEBUG_TTL_MS = 14 * 24 * 60 * 60 * 1e3;
+    DEFAULT_SESSION_DIR_SIZE_CAP = 200 * 1024 * 1024;
     DebugWriter = class _DebugWriter {
       constructor(fh) {
         this.fh = fh;
@@ -20117,8 +20278,19 @@ async function buildToolsParam(tools, model, sessionId = "") {
     input_schema: t.inputJSONSchema
   })));
 }
-function sleep3(ms) {
-  return new Promise((resolve8) => setTimeout(resolve8, ms));
+function abortableSleep(ms, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve8) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve8(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve8(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 function getErrorStatus(e) {
   if (e && typeof e === "object" && "status" in e) {
@@ -20127,16 +20299,35 @@ function getErrorStatus(e) {
   }
   return null;
 }
+function getAnthropicClient(apiKey, baseURL, betaHeader) {
+  const key = `${apiKey ?? ""}\0${baseURL ?? ""}\0${betaHeader}`;
+  const cached2 = _anthropicClientCache.get(key);
+  if (cached2) {
+    _anthropicClientCache.delete(key);
+    _anthropicClientCache.set(key, cached2);
+    return cached2;
+  }
+  const client = new Anthropic({
+    apiKey: apiKey ?? process.env["ANTHROPIC_API_KEY"],
+    baseURL,
+    maxRetries: 0,
+    // we own retries
+    ...betaHeader ? { defaultHeaders: { "anthropic-beta": betaHeader } } : {}
+  });
+  _anthropicClientCache.set(key, client);
+  if (_anthropicClientCache.size > ANTHROPIC_CLIENT_CACHE_MAX) {
+    const oldest = _anthropicClientCache.keys().next().value;
+    if (oldest !== void 0) _anthropicClientCache.delete(oldest);
+  }
+  return client;
+}
+function clearAnthropicClientCache() {
+  _anthropicClientCache.clear();
+}
 async function* streamMessages(params, config2, onRetry) {
   const allBetas = [.../* @__PURE__ */ new Set([...params.includeDefaultBetas === false ? [] : DEFAULT_BETAS, ...params.betas ?? []])];
   const betaHeader = allBetas.join(",");
-  const client = new Anthropic({
-    apiKey: config2.apiKey ?? process.env["ANTHROPIC_API_KEY"],
-    baseURL: config2.baseURL,
-    maxRetries: 0,
-    // We handle retries ourselves
-    ...betaHeader ? { defaultHeaders: { "anthropic-beta": betaHeader } } : {}
-  });
+  const client = getAnthropicClient(config2.apiKey, config2.baseURL, betaHeader);
   const thinkingParam = buildThinkingParam(params.thinkingConfig);
   const toolsParam = await buildToolsParam(params.tools, params.model, params.sessionId);
   const requestParams = {
@@ -20182,11 +20373,16 @@ async function* streamMessages(params, config2, onRetry) {
       const jitter = Math.random() * 0.25 * base;
       const delayMs = Math.floor(base + jitter);
       onRetry?.(attempt, config2.maxRetries ?? DEFAULT_MAX_RETRIES, delayMs, getErrorStatus(error51));
-      await sleep3(delayMs);
+      const completed = await abortableSleep(delayMs, params.abortSignal);
+      if (!completed) {
+        if (writer) await writer.close().catch(() => {
+        });
+        throw error51;
+      }
     }
   }
 }
-var DEFAULT_MAX_TOKENS, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS, DEFAULT_BETAS;
+var DEFAULT_MAX_TOKENS, DEFAULT_MAX_RETRIES, INITIAL_RETRY_DELAY_MS, MAX_RETRY_DELAY_MS, DEFAULT_BETAS, ANTHROPIC_CLIENT_CACHE_MAX, _anthropicClientCache;
 var init_AnthropicClient = __esm({
   "src/kernel/api/AnthropicClient.ts"() {
     "use strict";
@@ -20199,6 +20395,8 @@ var init_AnthropicClient = __esm({
     INITIAL_RETRY_DELAY_MS = 1e3;
     MAX_RETRY_DELAY_MS = 3e4;
     DEFAULT_BETAS = ["interleaved-thinking-2025-05-14"];
+    ANTHROPIC_CLIENT_CACHE_MAX = 16;
+    _anthropicClientCache = /* @__PURE__ */ new Map();
   }
 });
 
@@ -20233,8 +20431,19 @@ function mapFinishReason(reason) {
       return reason ?? null;
   }
 }
-function sleep4(ms) {
-  return new Promise((resolve8) => setTimeout(resolve8, ms));
+function abortableSleep2(ms, signal) {
+  if (signal.aborted) return Promise.resolve(false);
+  return new Promise((resolve8) => {
+    const timer = setTimeout(() => {
+      signal.removeEventListener("abort", onAbort);
+      resolve8(true);
+    }, ms);
+    const onAbort = () => {
+      clearTimeout(timer);
+      resolve8(false);
+    };
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
 }
 function getErrorStatus2(e) {
   if (e && typeof e === "object" && "status" in e) {
@@ -20243,15 +20452,29 @@ function getErrorStatus2(e) {
   }
   return null;
 }
+function getDeepSeekClient(apiKey, baseURL) {
+  const key = `${apiKey ?? ""} ${baseURL}`;
+  const cached2 = _deepseekClientCache.get(key);
+  if (cached2) {
+    _deepseekClientCache.delete(key);
+    _deepseekClientCache.set(key, cached2);
+    return cached2;
+  }
+  const client = new OpenAI({ apiKey, baseURL, maxRetries: 0 });
+  _deepseekClientCache.set(key, client);
+  if (_deepseekClientCache.size > DEEPSEEK_CLIENT_CACHE_MAX) {
+    const oldest = _deepseekClientCache.keys().next().value;
+    if (oldest !== void 0) _deepseekClientCache.delete(oldest);
+  }
+  return client;
+}
+function clearDeepSeekClientCache() {
+  _deepseekClientCache.clear();
+}
 async function* streamDeepSeekMessages(params, config2, onRetry) {
-  const apiKey = config2.apiKey ?? process.env["DEEPSEEK_API_KEY"] ?? process.env["ANTHROPIC_API_KEY"];
+  const apiKey = config2.apiKey ?? process.env["DEEPSEEK_API_KEY"];
   const baseURL = config2.baseURL ?? DEEPSEEK_BASE_URL;
-  const client = new OpenAI({
-    apiKey,
-    baseURL,
-    maxRetries: 0
-    // We handle retries ourselves
-  });
+  const client = getDeepSeekClient(apiKey, baseURL);
   const toolsParam = await buildDeepSeekTools(
     params.tools,
     params.sessionId ?? "",
@@ -20290,7 +20513,10 @@ async function* streamDeepSeekMessages(params, config2, onRetry) {
       const jitter = Math.random() * 0.25 * base;
       const delayMs = Math.floor(base + jitter);
       onRetry?.(attempt, config2.maxRetries ?? DEFAULT_MAX_RETRIES2, delayMs, getErrorStatus2(error51));
-      await sleep4(delayMs);
+      const completed = await abortableSleep2(delayMs, params.abortSignal);
+      if (!completed) {
+        throw error51;
+      }
     }
   }
 }
@@ -20394,7 +20620,7 @@ async function* processStream(stream, debug, sessionId, reqPayload) {
   yield { type: "message_stop" };
   if (writer) await writer.close();
 }
-var DEEPSEEK_BASE_URL, DEFAULT_MAX_TOKENS2, DEFAULT_MAX_RETRIES2, INITIAL_RETRY_DELAY_MS2, MAX_RETRY_DELAY_MS2;
+var DEEPSEEK_BASE_URL, DEFAULT_MAX_TOKENS2, DEFAULT_MAX_RETRIES2, INITIAL_RETRY_DELAY_MS2, MAX_RETRY_DELAY_MS2, DEEPSEEK_CLIENT_CACHE_MAX, _deepseekClientCache;
 var init_DeepSeekClient = __esm({
   "src/kernel/api/DeepSeekClient.ts"() {
     "use strict";
@@ -20406,6 +20632,8 @@ var init_DeepSeekClient = __esm({
     DEFAULT_MAX_RETRIES2 = 5;
     INITIAL_RETRY_DELAY_MS2 = 1e3;
     MAX_RETRY_DELAY_MS2 = 3e4;
+    DEEPSEEK_CLIENT_CACHE_MAX = 16;
+    _deepseekClientCache = /* @__PURE__ */ new Map();
   }
 });
 
@@ -20668,6 +20896,23 @@ var init_CostTracker = __esm({
   }
 });
 
+// src/kernel/utils/AssembleSystemPrompt.ts
+function assembleSystemPrompt(...parts) {
+  const kept = [];
+  for (const part of parts) {
+    if (typeof part !== "string") continue;
+    if (part.length === 0) continue;
+    kept.push(part);
+  }
+  if (kept.length === 0) return void 0;
+  return kept.join("\n\n");
+}
+var init_AssembleSystemPrompt = __esm({
+  "src/kernel/utils/AssembleSystemPrompt.ts"() {
+    "use strict";
+  }
+});
+
 // src/kernel/loop/KernelLoop.ts
 function newAccumulator() {
   return {
@@ -20723,7 +20968,7 @@ async function* runKernelLoop(ctx) {
   const signal = abortController.signal;
   const canUseTool = config2.canUseTool ?? defaultCanUseTool;
   const maxTurns = config2.maxTurns ?? 100;
-  let state = initialLoopState([...mutableMessages], config2.model, ctx.autoCompactTracking);
+  let state = initialLoopState(mutableMessages, config2.model, ctx.autoCompactTracking);
   let totalUsage = emptyUsage();
   let totalCost = ctx.cumulativeCostUsd;
   let allPermissionDenials = [];
@@ -20732,7 +20977,7 @@ async function* runKernelLoop(ctx) {
   let repeatedToolRequestCount = 0;
   function append(...msgs) {
     mutableMessages.push(...msgs);
-    state = { ...state, messages: [...mutableMessages] };
+    state = { ...state, messages: mutableMessages };
   }
   function done(reason) {
     return {
@@ -20751,7 +20996,7 @@ async function* runKernelLoop(ctx) {
   while (true) {
     const budgetedMessages = applyToolResultBudget(state.messages, config2.tools);
     const messagesForQuery = [...getMessagesAfterCompactBoundary(budgetedMessages)];
-    const effectiveSystemPrompt = [config2.systemPrompt, config2.appendSystemPrompt].filter(Boolean).join("\n\n");
+    const effectiveSystemPrompt = assembleSystemPrompt(config2.systemPrompt, config2.appendSystemPrompt) ?? "";
     const compactResult = config2.compact?.enabled === false ? {
       wasCompacted: false,
       tracking: state.autoCompactTracking ?? {
@@ -20782,7 +21027,7 @@ async function* runKernelLoop(ctx) {
     if (compactResult.wasCompacted && compactResult.postCompactMessages) {
       const compactMsgs = compactResult.postCompactMessages;
       mutableMessages.splice(0, mutableMessages.length, ...compactMsgs);
-      state = { ...state, messages: [...mutableMessages] };
+      state = { ...state, messages: mutableMessages };
       currentMessagesForQuery = [...getMessagesAfterCompactBoundary(state.messages)];
       yield {
         type: "compact_boundary",
@@ -21090,6 +21335,7 @@ var init_KernelLoop = __esm({
     init_TokenCount();
     init_Errors();
     init_CostTracker();
+    init_AssembleSystemPrompt();
     NO_PROGRESS_REPEAT_LIMIT = 3;
   }
 });
@@ -21126,7 +21372,7 @@ var init_KernelSession = __esm({
     init_KernelLoop();
     VOLATILE_CONTEXT_PREFIX_START = "<context>\n";
     VOLATILE_CONTEXT_PREFIX_END = "\n</context>\n\n---\n\n";
-    KernelSession = class {
+    KernelSession = class _KernelSession {
       _config;
       _messages = [];
       _abortController = new AbortController();
@@ -21138,6 +21384,10 @@ var init_KernelSession = __esm({
       _cwd;
       _permissionDenials = [];
       _submitInFlight = false;
+      /** S16: cap permission-denial buffer so a million-turn session can't grow it forever. */
+      static MAX_PERMISSION_DENIALS = 1e3;
+      /** S1: guard against double dispose. */
+      _disposed = false;
       constructor(config2) {
         this._config = { ...config2 };
         this._messages = [...config2.initialMessages ?? []];
@@ -21198,6 +21448,8 @@ var init_KernelSession = __esm({
             this._totalCostUsd = loopResult.costUsd;
             this._autoCompactTracking = loopResult.autoCompactTracking;
             this._permissionDenials.push(...loopResult.permissionDenials);
+            const overflow = this._permissionDenials.length - _KernelSession.MAX_PERMISSION_DENIALS;
+            if (overflow > 0) this._permissionDenials.splice(0, overflow);
             if (loopResult.fallbackTriggered) {
               this._config = { ...this._config, model: loopResult.finalModel };
             }
@@ -21253,6 +21505,33 @@ var init_KernelSession = __esm({
       }
       getPermissionDenials() {
         return this._permissionDenials;
+      }
+      /**
+       * S1: Release all per-session state so the GC can reclaim the message buffer,
+       * file-state cache, tool list and config closures.  Idempotent and safe to
+       * call from finally blocks.
+       *
+       *   • Aborts any in-flight loop via the abort controller.
+       *   • Empties _messages / _permissionDenials in-place so any holder still
+       *     iterating sees a consistent empty view.
+       *   • Drops the FileStateCache and clears the tools array on the config copy
+       *     so wrapped/instrumented closures (which transitively pin
+       *     RuntimeContext, ProvenanceTracker, JobManager) become unreachable.
+       *   • Clears onMessagesUpdate so external owners don't pin this session
+       *     through their own closures.
+       */
+      dispose() {
+        if (this._disposed) return;
+        this._disposed = true;
+        try {
+          this._abortController.abort("dispose");
+        } catch {
+        }
+        this._messages.length = 0;
+        this._permissionDenials.length = 0;
+        this._fileCache.clear();
+        this._config = { ...this._config, tools: [], onMessagesUpdate: void 0 };
+        this._autoCompactTracking = void 0;
       }
       // ── Private helpers ────────────────────────────────────────────────────────
       _buildResultEvent(loopResult, loopError) {
@@ -21791,10 +22070,52 @@ function validateValue(value, schema, path4) {
   if (Array.isArray(schema["enum"]) && !schema["enum"].includes(value)) {
     return `${path4} must be one of ${schema["enum"].map(String).join(", ")}`;
   }
-  if (schema["type"] === "array" && Array.isArray(value) && schema["items"] !== void 0) {
-    for (let i = 0; i < value.length; i++) {
-      const error51 = validateValue(value[i], schema["items"], `${path4}[${i}]`);
-      if (error51) return error51;
+  if (typeof value === "number" && Number.isFinite(value)) {
+    const min = schema["minimum"];
+    const max = schema["maximum"];
+    const exMin = schema["exclusiveMinimum"];
+    const exMax = schema["exclusiveMaximum"];
+    const mul = schema["multipleOf"];
+    if (typeof min === "number" && value < min) return `${path4} must be >= ${min}`;
+    if (typeof max === "number" && value > max) return `${path4} must be <= ${max}`;
+    if (typeof exMin === "number" && value <= exMin) return `${path4} must be > ${exMin}`;
+    if (typeof exMax === "number" && value >= exMax) return `${path4} must be < ${exMax}`;
+    if (typeof mul === "number" && mul > 0) {
+      const ratio = value / mul;
+      if (Math.abs(ratio - Math.round(ratio)) > 1e-9) return `${path4} must be a multiple of ${mul}`;
+    }
+  }
+  if (typeof value === "string") {
+    const minL = schema["minLength"];
+    const maxL = schema["maxLength"];
+    const pat = schema["pattern"];
+    if (typeof minL === "number" && value.length < minL) return `${path4} must be at least ${minL} chars`;
+    if (typeof maxL === "number" && value.length > maxL) return `${path4} must be at most ${maxL} chars`;
+    if (typeof pat === "string") {
+      try {
+        if (!new RegExp(pat).test(value)) return `${path4} does not match pattern ${pat}`;
+      } catch {
+      }
+    }
+  }
+  if (schema["type"] === "array" && Array.isArray(value)) {
+    const minI = schema["minItems"];
+    const maxI = schema["maxItems"];
+    if (typeof minI === "number" && value.length < minI) return `${path4} must have at least ${minI} items`;
+    if (typeof maxI === "number" && value.length > maxI) return `${path4} must have at most ${maxI} items`;
+    if (schema["uniqueItems"] === true) {
+      const seen = /* @__PURE__ */ new Set();
+      for (let i = 0; i < value.length; i++) {
+        const key = JSON.stringify(value[i]);
+        if (seen.has(key)) return `${path4}[${i}] is a duplicate (uniqueItems)`;
+        seen.add(key);
+      }
+    }
+    if (schema["items"] !== void 0) {
+      for (let i = 0; i < value.length; i++) {
+        const error51 = validateValue(value[i], schema["items"], `${path4}[${i}]`);
+        if (error51) return error51;
+      }
     }
   }
   if (schema["type"] === "object" && isRecord2(value)) {
@@ -21991,6 +22312,8 @@ var init_AgenticSession = __esm({
       _config;
       _sessionId;
       _registeredTools = [];
+      /** S1: guard against double dispose. */
+      _disposed = false;
       _totalCostUsd = 0;
       _usage = {
         inputTokens: 0,
@@ -22035,11 +22358,14 @@ var init_AgenticSession = __esm({
             enabled: true,
             model: resolved.flashModel
           },
-          // Thinking is OFF by default for all providers.
-          // Enable via MetaAgentConfig.thinkingConfig (or KernelConfig directly).
-          // When enabled on DeepSeek, KernelLoop routes to DeepSeekClient which maps
-          // any non-disabled ThinkingConfig → reasoning_effort:'max'.
-          thinkingConfig: { type: "disabled" },
+          // Thinking on the primary model — sourced from resolved.thinkingConfig
+          // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the
+          // caller hasn't disabled it, the kernel:
+          //   • Anthropic → sends `thinking: { type: 'enabled', budget_tokens: 16k }`
+          //   • DeepSeek  → sends `reasoning_effort: 'max'`
+          //   • Qwen      → goes through Anthropic-compat endpoint, thinking enabled
+          // Fallback model still honours fallbackThinkingConfig (default disabled).
+          thinkingConfig: resolved.thinkingConfig,
           // Anthropic-only betas: token-efficient-tools + interleaved-thinking
           // Skip for third-party providers (DeepSeek, Qwen, etc.) — they return 400
           includeDefaultBetas: isAnthropic ? void 0 : false,
@@ -22106,6 +22432,23 @@ var init_AgenticSession = __esm({
       // ── Lifecycle ─────────────────────────────────────────────────────────────
       interrupt() {
         this._engine.interrupt();
+      }
+      /**
+       * S1 + S9: Release all per-session resources.  Forwards to the inner
+       * KernelSession dispose (which clears messages / fileCache / tools closures),
+       * and empties our own _registeredTools array so any caller-supplied tools —
+       * with their potentially heavy closures — become unreachable.
+       *
+       * Safe to call multiple times.  Once called the session must not be reused.
+       */
+      dispose() {
+        if (this._disposed) return;
+        this._disposed = true;
+        try {
+          this._engine.dispose();
+        } catch {
+        }
+        this._registeredTools.length = 0;
       }
       getMessages() {
         return this._engine.getMessages();
@@ -22386,11 +22729,27 @@ ${prompt}` : prompt;
       /**
        * Release per-session resources. Call when a long-lived host is done with
        * this session; safe to call multiple times.
+       *
+       * S1 + S18: also forwards to the inner AgenticSession dispose (which clears
+       * the kernel message buffer + tool closures + RuntimeContext-pinning
+       * instrumentation), drops cached section results, and frees the static
+       * prompt cache.
        */
       async dispose() {
         const handles = [...this._sandboxHandles.values()];
         this._sandboxHandles.clear();
         await Promise.allSettled(handles.map((handle) => handle.destroy()));
+        try {
+          this._inner.dispose();
+        } catch {
+        }
+        this.toolRegistry.clear();
+        this._staticPromptCache.clear();
+        this.sectionRegistry.clear();
+        this._lastSystemPrompt = null;
+        this._lastStableSystemPrompt = null;
+        this._subAgentBridge = void 0;
+        this._taskContract = void 0;
       }
       /** Backward-compatible synchronous teardown alias. */
       destroy() {
@@ -22501,12 +22860,17 @@ function makeExperienceId() {
   const uuid8 = randomUUID3().replace(/-/g, "").slice(0, 8);
   return `exp_${ts}_${uuid8}`;
 }
+function makePrincipleId() {
+  const ts = Date.now().toString(36);
+  const uuid8 = randomUUID3().replace(/-/g, "").slice(0, 8);
+  return `pr_${ts}_${uuid8}`;
+}
 function makePhysicalAnchorId() {
   const ts = Date.now().toString(36);
   const uuid8 = randomUUID3().replace(/-/g, "").slice(0, 8);
   return `pa_${ts}_${uuid8}`;
 }
-var ROBOTICS_DOMAINS, KNOWLEDGE_CONFIDENCE_TIERS, KNOWLEDGE_SCOPES;
+var ROBOTICS_DOMAINS, KNOWLEDGE_CONFIDENCE_TIERS, KNOWLEDGE_SCOPES, PRINCIPLE_ABSTRACTION_LEVELS;
 var init_types6 = __esm({
   "src/robotics/types.ts"() {
     "use strict";
@@ -22530,11 +22894,18 @@ var init_types6 = __esm({
       "hypothesis"
     ];
     KNOWLEDGE_SCOPES = ["global", "robot", "code"];
+    PRINCIPLE_ABSTRACTION_LEVELS = [
+      "physical",
+      "system",
+      "algorithmic",
+      "statistical",
+      "operational"
+    ];
   }
 });
 
 // src/robotics/ExperienceStore.ts
-import { readFile as readFile10, readdir as readdir5, writeFile as writeFile7 } from "fs/promises";
+import { readFile as readFile10, readdir as readdir6, writeFile as writeFile7 } from "fs/promises";
 import { homedir as homedir11 } from "os";
 import { join as join14 } from "path";
 function isExperienceId(id) {
@@ -22546,7 +22917,29 @@ function experienceRetrievalScore(entry) {
   const contradictions = Math.max(0, entry.contradictionCount ?? 0);
   return CONFIDENCE_WEIGHT[tier] + Math.min(observations, 10) * 8 - contradictions * 40;
 }
-var EXPERIENCE_ROOT, INDEX_FILE, MAX_INDEX_ENTRIES, EXPERIENCE_ID_RE, CONFIDENCE_WEIGHT, ExperienceStore;
+function stripFullReport(entry) {
+  const { fullReport: _, ...rest } = entry;
+  return rest;
+}
+function isExperienceManifest(value) {
+  if (!value || typeof value !== "object") return false;
+  const record2 = value;
+  return record2["schemaVersion"] === "1.0" && typeof record2["updatedAt"] === "number" && Array.isArray(record2["entries"]);
+}
+async function loadWithConcurrency(ids, load) {
+  const out = [];
+  let next = 0;
+  const workerCount = Math.min(LOAD_CONCURRENCY, ids.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      const entry = await load(id);
+      if (entry) out.push(entry);
+    }
+  }));
+  return out;
+}
+var EXPERIENCE_ROOT, INDEX_FILE, MANIFEST_FILE, MAX_INDEX_ENTRIES, LOAD_CONCURRENCY, EXPERIENCE_ID_RE, CONFIDENCE_WEIGHT, ExperienceStore;
 var init_ExperienceStore = __esm({
   "src/robotics/ExperienceStore.ts"() {
     "use strict";
@@ -22554,7 +22947,9 @@ var init_ExperienceStore = __esm({
     init_types6();
     EXPERIENCE_ROOT = join14(homedir11(), ".claude", "meta-agent", "robotics", "experiences");
     INDEX_FILE = "EXPERIENCE_INDEX.md";
+    MANIFEST_FILE = "EXPERIENCE_MANIFEST.json";
     MAX_INDEX_ENTRIES = 100;
+    LOAD_CONCURRENCY = 32;
     EXPERIENCE_ID_RE = /^exp_[0-9a-z]+_[0-9a-f]{8}$/;
     CONFIDENCE_WEIGHT = {
       reproduced: 500,
@@ -22566,9 +22961,11 @@ var init_ExperienceStore = __esm({
     ExperienceStore = class {
       dir;
       indexPath;
+      manifestPath;
       constructor(dir) {
         this.dir = dir ?? EXPERIENCE_ROOT;
         this.indexPath = join14(this.dir, INDEX_FILE);
+        this.manifestPath = join14(this.dir, MANIFEST_FILE);
       }
       async ensureDir() {
         await ensureDir(this.dir);
@@ -22592,7 +22989,7 @@ var init_ExperienceStore = __esm({
       // ── Search ──────────────────────────────────────────────────────────────────
       async search(query) {
         const limit2 = Math.min(query.limit ?? 10, 20);
-        const entries = await this._loadAll();
+        const entries = await this._loadSearchEntries();
         const filtered = entries.filter((e) => {
           if (query.domain && e.domain !== query.domain) return false;
           if (query.robot && e.robot !== query.robot) return false;
@@ -22613,18 +23010,30 @@ var init_ExperienceStore = __esm({
           const scoreDelta = experienceRetrievalScore(b) - experienceRetrievalScore(a);
           return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt;
         });
-        return filtered.slice(0, limit2).map((e) => {
-          const { fullReport: _, ...rest } = e;
-          return rest;
-        });
+        return filtered.slice(0, limit2);
       }
       // ── Load by ID ───────────────────────────────────────────────────────────────
       async load(id) {
         if (!isExperienceId(id)) return null;
         return readJsonFile(join14(this.dir, `${id}.json`));
       }
+      async appendPrincipleReference(experienceId, principleId) {
+        if (!isExperienceId(experienceId)) return false;
+        const entry = await this.load(experienceId);
+        if (!entry) return false;
+        const principleIds = entry.principleIds ?? [];
+        if (principleIds.includes(principleId)) return true;
+        const updated = {
+          ...entry,
+          principleIds: [...principleIds, principleId],
+          updatedAt: Date.now()
+        };
+        await atomicWriteJson(join14(this.dir, `${experienceId}.json`), updated);
+        await this.rebuildIndex();
+        return true;
+      }
       async getStats() {
-        const entries = await this._loadAll();
+        const entries = await this._loadSearchEntries();
         const domainCounts = {};
         let failures2 = 0;
         for (const e of entries) {
@@ -22642,8 +23051,9 @@ var init_ExperienceStore = __esm({
         }
       }
       async rebuildIndex() {
-        const entries = await this._loadAll();
+        const entries = await this._loadAllFromFiles();
         entries.sort((a, b) => b.createdAt - a.createdAt);
+        await this._writeManifest(entries);
         const byDomain = /* @__PURE__ */ new Map();
         for (const e of entries.slice(0, MAX_INDEX_ENTRIES)) {
           const list = byDomain.get(e.domain) ?? [];
@@ -22672,7 +23082,7 @@ var init_ExperienceStore = __esm({
       }
       async listIds() {
         try {
-          const files = await readdir5(this.dir);
+          const files = await readdir6(this.dir);
           return files.filter((f) => f.endsWith(".json")).map((f) => f.replace(".json", "")).filter(isExperienceId);
         } catch {
           return [];
@@ -22680,9 +23090,26 @@ var init_ExperienceStore = __esm({
       }
       // ── Internal ─────────────────────────────────────────────────────────────────
       async _loadAll() {
+        return this._loadAllFromFiles();
+      }
+      async _loadAllFromFiles() {
         const ids = await this.listIds();
-        const entries = await Promise.all(ids.map((id) => this.load(id)));
-        return entries.filter((e) => e !== null);
+        return loadWithConcurrency(ids, (id) => this.load(id));
+      }
+      async _loadSearchEntries() {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (isExperienceManifest(manifest)) return manifest.entries;
+        const entries = await this._loadAllFromFiles();
+        await this._writeManifest(entries).catch(() => void 0);
+        return entries.map(stripFullReport);
+      }
+      async _writeManifest(entries) {
+        const manifest = {
+          schemaVersion: "1.0",
+          updatedAt: Date.now(),
+          entries: entries.map(stripFullReport)
+        };
+        await atomicWriteJson(this.manifestPath, manifest);
       }
     };
   }
@@ -22690,7 +23117,7 @@ var init_ExperienceStore = __esm({
 
 // src/robotics/ExperiencePendingStore.ts
 import { createHash as createHash3 } from "crypto";
-import { mkdir as mkdir8, readFile as readFile11, writeFile as writeFile8, rm } from "fs/promises";
+import { mkdir as mkdir8, readFile as readFile11, writeFile as writeFile8, rm as rm2 } from "fs/promises";
 import { homedir as homedir12 } from "os";
 import { dirname as dirname6, join as join15 } from "path";
 function isPendingExperience(value) {
@@ -22786,12 +23213,13 @@ function normalizeTimestamp(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return void 0;
   return Math.floor(value);
 }
-var PENDING_ROOT, ExperiencePendingStore;
+var PENDING_ROOT, MAX_PENDING_ENTRIES, ExperiencePendingStore;
 var init_ExperiencePendingStore = __esm({
   "src/robotics/ExperiencePendingStore.ts"() {
     "use strict";
     init_types6();
     PENDING_ROOT = join15(homedir12(), ".claude", "meta-agent", "robotics", "pending-experiences");
+    MAX_PENDING_ENTRIES = 500;
     ExperiencePendingStore = class {
       _pending = [];
       _filePath;
@@ -22811,11 +23239,15 @@ var init_ExperiencePendingStore = __esm({
             if (!isPendingExperience(item)) continue;
             this._pending.push(item);
           }
+          this._trimToLimit();
         } catch {
         }
       }
       /** Queue an experience for later review. Returns the temporary pending ID. */
       add(input) {
+        if (this._pending.length >= MAX_PENDING_ENTRIES) {
+          throw new Error(`Pending experience queue limit reached (${MAX_PENDING_ENTRIES}); run /experience review before adding more.`);
+        }
         const pendingId = `pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
         this._pending.push({ pendingId, proposedAt: Date.now(), input });
         this._persistSoon();
@@ -22900,10 +23332,15 @@ var init_ExperiencePendingStore = __esm({
         }).then(() => this._persist(snapshot)).catch(() => {
         });
       }
+      _trimToLimit() {
+        if (this._pending.length <= MAX_PENDING_ENTRIES) return;
+        this._pending.splice(0, this._pending.length - MAX_PENDING_ENTRIES);
+        this._persistSoon();
+      }
       async _persist(snapshot) {
         if (!this._filePath) return;
         if (snapshot.length === 0) {
-          await rm(this._filePath, { force: true }).catch(() => void 0);
+          await rm2(this._filePath, { force: true }).catch(() => void 0);
           return;
         }
         await mkdir8(dirname6(this._filePath), { recursive: true });
@@ -22922,13 +23359,33 @@ function isPhysicalAnchorId(id) {
 function anchorScore(anchor) {
   return CONFIDENCE_WEIGHT2[anchor.confidenceTier] + Math.min(anchor.evidenceRefs.length, 8) * 10;
 }
-var PHYSICAL_ANCHOR_ROOT, PHYSICAL_ANCHOR_ID_RE, CONFIDENCE_WEIGHT2, PhysicalAnchorStore;
+function isPhysicalAnchorManifest(value) {
+  if (!value || typeof value !== "object") return false;
+  const record2 = value;
+  return record2["schemaVersion"] === "1.0" && typeof record2["updatedAt"] === "number" && Array.isArray(record2["entries"]);
+}
+async function loadWithConcurrency2(ids, load) {
+  const out = [];
+  let next = 0;
+  const workerCount = Math.min(LOAD_CONCURRENCY2, ids.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      const entry = await load(id);
+      if (entry) out.push(entry);
+    }
+  }));
+  return out;
+}
+var PHYSICAL_ANCHOR_ROOT, MANIFEST_FILE2, LOAD_CONCURRENCY2, PHYSICAL_ANCHOR_ID_RE, CONFIDENCE_WEIGHT2, PhysicalAnchorStore;
 var init_PhysicalAnchorStore = __esm({
   "src/robotics/PhysicalAnchorStore.ts"() {
     "use strict";
     init_persist();
     init_types6();
     PHYSICAL_ANCHOR_ROOT = join16(homedir13(), ".claude", "meta-agent", "robotics", "physical_anchors");
+    MANIFEST_FILE2 = "PHYSICAL_ANCHOR_MANIFEST.json";
+    LOAD_CONCURRENCY2 = 32;
     PHYSICAL_ANCHOR_ID_RE = /^pa_[0-9a-z]+_[0-9a-f]{8}$/;
     CONFIDENCE_WEIGHT2 = {
       reproduced: 500,
@@ -22939,8 +23396,10 @@ var init_PhysicalAnchorStore = __esm({
     };
     PhysicalAnchorStore = class {
       dir;
+      manifestPath;
       constructor(dir) {
         this.dir = dir ?? PHYSICAL_ANCHOR_ROOT;
+        this.manifestPath = join16(this.dir, MANIFEST_FILE2);
       }
       async ensureDir() {
         await ensureDir(this.dir);
@@ -22957,6 +23416,7 @@ var init_PhysicalAnchorStore = __esm({
           updatedAt: now
         };
         await atomicWriteJson(join16(this.dir, `${id}.json`), full);
+        await this._upsertManifest(full).catch(() => void 0);
         return id;
       }
       async load(id) {
@@ -22965,7 +23425,7 @@ var init_PhysicalAnchorStore = __esm({
       }
       async search(query = {}) {
         const limit2 = Math.min(query.limit ?? 10, 20);
-        const entries = await this._loadAll();
+        const entries = await this._loadManifestEntries();
         const filtered = entries.filter((anchor) => {
           if (query.domain && anchor.domain !== query.domain) return false;
           if (query.scope && anchor.scope !== query.scope) return false;
@@ -22994,12 +23454,14 @@ var init_PhysicalAnchorStore = __esm({
         return filtered.slice(0, limit2);
       }
       async getStats() {
-        const entries = await this._loadAll();
+        const entries = await this._loadManifestEntries();
         const domainCounts = {};
+        const scopeCounts = { global: 0, robot: 0, code: 0 };
         for (const entry of entries) {
           domainCounts[entry.domain] = (domainCounts[entry.domain] ?? 0) + 1;
+          scopeCounts[entry.scope] = (scopeCounts[entry.scope] ?? 0) + 1;
         }
-        return { total: entries.length, domainCounts };
+        return { total: entries.length, domainCounts, scopeCounts };
       }
       async formatForPrompt(opts = {}) {
         const anchors = await this.search({ ...opts, limit: opts.limit ?? 8 });
@@ -23022,9 +23484,38 @@ var init_PhysicalAnchorStore = __esm({
         return ids.filter(isPhysicalAnchorId);
       }
       async _loadAll() {
+        return this._loadAllFromFiles();
+      }
+      async _loadAllFromFiles() {
         const ids = await this.listIds();
-        const entries = await Promise.all(ids.map((id) => this.load(id)));
-        return entries.filter((entry) => entry !== null);
+        return loadWithConcurrency2(ids, (id) => this.load(id));
+      }
+      async _loadManifestEntries() {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (isPhysicalAnchorManifest(manifest)) return manifest.entries;
+        return this._rebuildManifestFromFiles();
+      }
+      async _rebuildManifestFromFiles() {
+        const entries = await this._loadAllFromFiles();
+        await this._writeManifest(entries).catch(() => void 0);
+        return entries;
+      }
+      async _upsertManifest(entry) {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (!isPhysicalAnchorManifest(manifest)) {
+          await this._rebuildManifestFromFiles();
+          return;
+        }
+        const entries = manifest.entries.filter((existing) => existing.id !== entry.id);
+        entries.push(entry);
+        await this._writeManifest(entries);
+      }
+      async _writeManifest(entries) {
+        await atomicWriteJson(this.manifestPath, {
+          schemaVersion: "1.0",
+          updatedAt: Date.now(),
+          entries
+        });
       }
     };
   }
@@ -23032,7 +23523,7 @@ var init_PhysicalAnchorStore = __esm({
 
 // src/robotics/PhysicalAnchorPendingStore.ts
 import { createHash as createHash4 } from "crypto";
-import { mkdir as mkdir9, readFile as readFile12, rm as rm2, writeFile as writeFile9 } from "fs/promises";
+import { mkdir as mkdir9, readFile as readFile12, rm as rm3, writeFile as writeFile9 } from "fs/promises";
 import { homedir as homedir14 } from "os";
 import { dirname as dirname7, join as join17 } from "path";
 function validatePhysicalAnchorInput(input) {
@@ -23093,12 +23584,13 @@ function normalizeTimestamp2(value) {
   if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return void 0;
   return Math.floor(value);
 }
-var PENDING_ROOT2, PhysicalAnchorPendingStore;
+var PENDING_ROOT2, MAX_PENDING_ENTRIES2, PhysicalAnchorPendingStore;
 var init_PhysicalAnchorPendingStore = __esm({
   "src/robotics/PhysicalAnchorPendingStore.ts"() {
     "use strict";
     init_types6();
     PENDING_ROOT2 = join17(homedir14(), ".claude", "meta-agent", "robotics", "pending-physical-anchors");
+    MAX_PENDING_ENTRIES2 = 500;
     PhysicalAnchorPendingStore = class {
       _pending = [];
       _filePath;
@@ -23116,10 +23608,14 @@ var init_PhysicalAnchorPendingStore = __esm({
           for (const item of parsed) {
             if (isPendingPhysicalAnchor(item)) this._pending.push(item);
           }
+          this._trimToLimit();
         } catch {
         }
       }
       add(input) {
+        if (this._pending.length >= MAX_PENDING_ENTRIES2) {
+          throw new Error(`Pending physical anchor queue limit reached (${MAX_PENDING_ENTRIES2}); run /anchor review before adding more.`);
+        }
         const pendingId = `pa_pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
         this._pending.push({ pendingId, proposedAt: Date.now(), input });
         this._persistSoon();
@@ -23164,10 +23660,15 @@ var init_PhysicalAnchorPendingStore = __esm({
         }).then(() => this._persist(snapshot)).catch(() => {
         });
       }
+      _trimToLimit() {
+        if (this._pending.length <= MAX_PENDING_ENTRIES2) return;
+        this._pending.splice(0, this._pending.length - MAX_PENDING_ENTRIES2);
+        this._persistSoon();
+      }
       async _persist(snapshot) {
         if (!this._filePath) return;
         if (snapshot.length === 0) {
-          await rm2(this._filePath, { force: true }).catch(() => void 0);
+          await rm3(this._filePath, { force: true }).catch(() => void 0);
           return;
         }
         await mkdir9(dirname7(this._filePath), { recursive: true });
@@ -23194,17 +23695,11 @@ var init_PhysicalAnchorSource = __esm({
        */
       async getManifestLine() {
         try {
-          const all = await this.store.search({ limit: 100 });
-          if (all.length === 0) return "Physical anchors: none yet";
-          const scopeCounts = { global: 0, robot: 0, code: 0 };
-          const domainCounts = {};
-          for (const a of all) {
-            scopeCounts[a.scope] = (scopeCounts[a.scope] ?? 0) + 1;
-            domainCounts[a.domain] = (domainCounts[a.domain] ?? 0) + 1;
-          }
-          const scopeParts = Object.entries(scopeCounts).filter(([, n]) => n > 0).map(([s, n]) => `${s}:${n}`).join(" ");
-          const topDomains = Object.entries(domainCounts).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([d, n]) => `${d}:${n}`).join(", ");
-          return `Physical anchors: ${all.length} total | ${scopeParts}${topDomains ? ` | ${topDomains}` : ""}`;
+          const stats = await this.store.getStats();
+          if (stats.total === 0) return "Physical anchors: none yet";
+          const scopeParts = Object.entries(stats.scopeCounts).filter(([, n]) => n > 0).map(([s, n]) => `${s}:${n}`).join(" ");
+          const topDomains = Object.entries(stats.domainCounts).sort((a, b) => b[1] - a[1]).slice(0, 2).map(([d, n]) => `${d}:${n}`).join(", ");
+          return `Physical anchors: ${stats.total} total | ${scopeParts}${topDomains ? ` | ${topDomains}` : ""}`;
         } catch {
           return "Physical anchors: (unavailable)";
         }
@@ -23235,16 +23730,487 @@ var init_PhysicalAnchorSource = __esm({
   }
 });
 
-// src/robotics/HardwareProfile.ts
-import { readdir as readdir6 } from "fs/promises";
+// src/robotics/PrincipleStore.ts
 import { homedir as homedir15 } from "os";
 import { join as join18 } from "path";
+function isPrincipleId(id) {
+  return PRINCIPLE_ID_RE.test(id);
+}
+function principleRetrievalScore(principle) {
+  return CONFIDENCE_WEIGHT3[principle.confidenceTier] + Math.min(principle.observationCount, 10) * 10 - principle.contradictionCount * 50 + Math.min(principle.anchoredByPhysicalAnchorIds.length, 6) * 12;
+}
+function isPrincipleManifest(value) {
+  if (!value || typeof value !== "object") return false;
+  const record2 = value;
+  return record2["schemaVersion"] === "1.0" && typeof record2["updatedAt"] === "number" && Array.isArray(record2["entries"]);
+}
+async function loadWithConcurrency3(ids, load) {
+  const out = [];
+  let next = 0;
+  const workerCount = Math.min(LOAD_CONCURRENCY3, ids.length);
+  await Promise.all(Array.from({ length: workerCount }, async () => {
+    while (next < ids.length) {
+      const id = ids[next++];
+      const entry = await load(id);
+      if (entry) out.push(entry);
+    }
+  }));
+  return out;
+}
+var PRINCIPLE_ROOT, MANIFEST_FILE3, LOAD_CONCURRENCY3, PRINCIPLE_ID_RE, CONFIDENCE_WEIGHT3, PrincipleStore;
+var init_PrincipleStore = __esm({
+  "src/robotics/PrincipleStore.ts"() {
+    "use strict";
+    init_persist();
+    init_types6();
+    PRINCIPLE_ROOT = join18(homedir15(), ".claude", "meta-agent", "robotics", "principles");
+    MANIFEST_FILE3 = "PRINCIPLE_MANIFEST.json";
+    LOAD_CONCURRENCY3 = 32;
+    PRINCIPLE_ID_RE = /^pr_[0-9a-z]+_[0-9a-f]{8}$/;
+    CONFIDENCE_WEIGHT3 = {
+      reproduced: 500,
+      observed: 400,
+      derived: 350,
+      reported: 200,
+      hypothesis: 100
+    };
+    PrincipleStore = class {
+      dir;
+      manifestPath;
+      constructor(dir) {
+        this.dir = dir ?? PRINCIPLE_ROOT;
+        this.manifestPath = join18(this.dir, MANIFEST_FILE3);
+      }
+      async ensureDir() {
+        await ensureDir(this.dir);
+      }
+      async write(entry) {
+        await this.ensureDir();
+        const id = makePrincipleId();
+        const now = Date.now();
+        const full = {
+          ...entry,
+          id,
+          schemaVersion: "1.0",
+          createdAt: now,
+          updatedAt: now
+        };
+        await atomicWriteJson(join18(this.dir, `${id}.json`), full);
+        await this._upsertManifest(full).catch(() => void 0);
+        return id;
+      }
+      async load(id) {
+        if (!isPrincipleId(id)) return null;
+        return readJsonFile(join18(this.dir, `${id}.json`));
+      }
+      async search(query = {}) {
+        const limit2 = Math.min(query.limit ?? 10, 20);
+        const entries = await this._loadManifestEntries();
+        const filtered = entries.filter((principle) => {
+          if (query.domain && !principle.domains.includes(query.domain)) return false;
+          if (query.abstractionLevel && principle.abstractionLevel !== query.abstractionLevel) return false;
+          if (query.experienceId && !principle.derivedFromExperienceIds.includes(query.experienceId)) return false;
+          if (query.anchorId && !principle.anchoredByPhysicalAnchorIds.includes(query.anchorId)) return false;
+          if (query.keyword) {
+            const kw = query.keyword.toLowerCase();
+            const searchable = [
+              principle.title,
+              principle.statement,
+              principle.mechanism,
+              ...principle.firstPrinciplesSupport,
+              ...principle.preconditions,
+              ...principle.applicabilityBounds,
+              ...principle.nonApplicableWhen
+            ].join(" ").toLowerCase();
+            if (!searchable.includes(kw)) return false;
+          }
+          return true;
+        });
+        filtered.sort((a, b) => {
+          const scoreDelta = principleRetrievalScore(b) - principleRetrievalScore(a);
+          return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt;
+        });
+        return filtered.slice(0, limit2);
+      }
+      async listIds() {
+        const ids = await listJsonIds(this.dir);
+        return ids.filter(isPrincipleId);
+      }
+      async _loadAll() {
+        return this._loadAllFromFiles();
+      }
+      async _loadAllFromFiles() {
+        const ids = await this.listIds();
+        return loadWithConcurrency3(ids, (id) => this.load(id));
+      }
+      async _loadManifestEntries() {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (isPrincipleManifest(manifest)) return manifest.entries;
+        return this._rebuildManifestFromFiles();
+      }
+      async _rebuildManifestFromFiles() {
+        const entries = await this._loadAllFromFiles();
+        await this._writeManifest(entries).catch(() => void 0);
+        return entries;
+      }
+      async _upsertManifest(entry) {
+        const manifest = await readJsonFile(this.manifestPath);
+        if (!isPrincipleManifest(manifest)) {
+          await this._rebuildManifestFromFiles();
+          return;
+        }
+        const entries = manifest.entries.filter((existing) => existing.id !== entry.id);
+        entries.push(entry);
+        await this._writeManifest(entries);
+      }
+      async _writeManifest(entries) {
+        await atomicWriteJson(this.manifestPath, {
+          schemaVersion: "1.0",
+          updatedAt: Date.now(),
+          entries
+        });
+      }
+    };
+  }
+});
+
+// src/robotics/PrinciplePendingStore.ts
+import { createHash as createHash5 } from "crypto";
+import { mkdir as mkdir10, readFile as readFile13, rm as rm4, writeFile as writeFile10 } from "fs/promises";
+import { homedir as homedir16 } from "os";
+import { dirname as dirname8, join as join19 } from "path";
+function validatePrincipleInput(input) {
+  const title = requiredString3(input["title"], 100);
+  const statement = requiredString3(input["statement"], 800);
+  const mechanism = requiredString3(input["mechanism"], 800);
+  const firstPrinciplesSupport = normalizeStringArray3(input["first_principles_support"], 8, 300) ?? [];
+  const domains = normalizeDomains(input["domains"]);
+  const abstractionLevel = normalizeAbstractionLevel(input["abstraction_level"]) ?? "system";
+  const preconditions = normalizeStringArray3(input["preconditions"], 12, 240) ?? [];
+  const applicabilityBounds = normalizeStringArray3(input["applicability_bounds"], 12, 240) ?? [];
+  const nonApplicableWhen = normalizeStringArray3(input["non_applicable_when"], 12, 240) ?? [];
+  const promotionReason = input["promotion_reason"] === "explicit_user_request" ? "explicit_user_request" : input["promotion_reason"] === "confidence_threshold" ? "confidence_threshold" : null;
+  if (!title || !statement || !mechanism || domains.length === 0 || !promotionReason || firstPrinciplesSupport.length === 0 || preconditions.length + applicabilityBounds.length + nonApplicableWhen.length === 0) return { ok: false };
+  return {
+    ok: true,
+    value: {
+      title,
+      statement,
+      mechanism,
+      firstPrinciplesSupport,
+      domains,
+      abstractionLevel,
+      preconditions,
+      applicabilityBounds,
+      nonApplicableWhen,
+      derivedFromExperienceIds: normalizeStringArray3(input["derived_from_experience_ids"], 20, 120) ?? [],
+      anchoredByPhysicalAnchorIds: normalizeStringArray3(input["anchored_by_physical_anchor_ids"], 20, 120) ?? [],
+      evidenceRefs: normalizeStringArray3(input["evidence_refs"], 30, 300) ?? [],
+      invalidatedAssumptions: normalizeStringArray3(input["invalidated_assumptions"], 20, 240) ?? [],
+      counterExamples: normalizeStringArray3(input["counter_examples"], 20, 240) ?? [],
+      confidenceTier: normalizeConfidence2(input["confidence_tier"]) ?? "observed",
+      observationCount: normalizeNonNegativeInteger2(input["observation_count"], 1),
+      contradictionCount: normalizeNonNegativeInteger2(input["contradiction_count"], 0),
+      promotionReason,
+      sourceExperienceId: optionalString3(input["source_experience_id"], 120),
+      lastVerifiedAt: normalizeTimestamp3(input["last_verified_at"])
+    }
+  };
+}
+function isPendingPrinciple(value) {
+  if (!value || typeof value !== "object") return false;
+  const record2 = value;
+  return typeof record2["pendingId"] === "string" && typeof record2["proposedAt"] === "number" && Boolean(record2["input"]) && typeof record2["input"] === "object";
+}
+function requiredString3(value, max) {
+  const str2 = optionalString3(value, max);
+  return str2 && str2.trim() ? str2 : null;
+}
+function optionalString3(value, max) {
+  if (typeof value !== "string") return void 0;
+  const trimmed = value.trim();
+  return trimmed ? trimmed.slice(0, max) : void 0;
+}
+function normalizeDomains(value) {
+  if (!Array.isArray(value)) return [];
+  const out = value.filter((v) => typeof v === "string" && ROBOTICS_DOMAINS.includes(v));
+  return [...new Set(out)].slice(0, 6);
+}
+function normalizeAbstractionLevel(value) {
+  return typeof value === "string" && PRINCIPLE_ABSTRACTION_LEVELS.includes(value) ? value : void 0;
+}
+function normalizeConfidence2(value) {
+  return typeof value === "string" && KNOWLEDGE_CONFIDENCE_TIERS.includes(value) ? value : void 0;
+}
+function normalizeStringArray3(value, maxItems, maxLen) {
+  if (!Array.isArray(value)) return void 0;
+  const out = value.filter((v) => typeof v === "string").map((v) => v.trim().slice(0, maxLen)).filter(Boolean).slice(0, maxItems);
+  return out.length ? out : void 0;
+}
+function normalizeNonNegativeInteger2(value, fallback) {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(0, Math.floor(value));
+}
+function normalizeTimestamp3(value) {
+  if (typeof value !== "number" || !Number.isFinite(value) || value <= 0) return void 0;
+  return Math.floor(value);
+}
+var PENDING_ROOT3, MAX_PENDING_ENTRIES3, PrinciplePendingStore;
+var init_PrinciplePendingStore = __esm({
+  "src/robotics/PrinciplePendingStore.ts"() {
+    "use strict";
+    init_types6();
+    PENDING_ROOT3 = join19(homedir16(), ".claude", "meta-agent", "robotics", "pending-principles");
+    MAX_PENDING_ENTRIES3 = 500;
+    PrinciplePendingStore = class {
+      _pending = [];
+      _filePath;
+      _persistTail = Promise.resolve();
+      constructor(projectDir, root = PENDING_ROOT3) {
+        this._filePath = projectDir ? join19(root, `${createHash5("sha256").update(projectDir).digest("hex").slice(0, 16)}.json`) : null;
+      }
+      async load() {
+        if (!this._filePath) return;
+        try {
+          const raw = await readFile13(this._filePath, "utf-8");
+          const parsed = JSON.parse(raw);
+          if (!Array.isArray(parsed)) return;
+          this._pending.length = 0;
+          for (const item of parsed) {
+            if (isPendingPrinciple(item)) this._pending.push(item);
+          }
+          this._trimToLimit();
+        } catch {
+        }
+      }
+      add(input) {
+        if (this._pending.length >= MAX_PENDING_ENTRIES3) {
+          throw new Error(`Pending principle queue limit reached (${MAX_PENDING_ENTRIES3}); run /principle review before adding more.`);
+        }
+        const pendingId = `pr_pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`;
+        this._pending.push({ pendingId, proposedAt: Date.now(), input });
+        this._persistSoon();
+        return pendingId;
+      }
+      list() {
+        return this._pending;
+      }
+      get count() {
+        return this._pending.length;
+      }
+      remove(pendingId) {
+        const idx = this._pending.findIndex((p) => p.pendingId === pendingId);
+        if (idx < 0) return false;
+        this._pending.splice(idx, 1);
+        this._persistSoon();
+        return true;
+      }
+      async flush() {
+        await this._persistTail;
+      }
+      async commit(pendingId, store2, experienceStore) {
+        const entry = this._pending.find((p) => p.pendingId === pendingId);
+        if (!entry) return null;
+        try {
+          const normalized = validatePrincipleInput(entry.input);
+          if (!normalized.ok) return null;
+          const id = await store2.write(normalized.value);
+          if (experienceStore) {
+            const sourceIds = [
+              normalized.value.sourceExperienceId,
+              ...normalized.value.derivedFromExperienceIds
+            ].filter((value) => typeof value === "string" && value.length > 0);
+            await Promise.allSettled([...new Set(sourceIds)].map(
+              (sourceId) => experienceStore.appendPrincipleReference(sourceId, id)
+            ));
+          }
+          this.remove(pendingId);
+          return id;
+        } catch {
+          return null;
+        }
+      }
+      _persistSoon() {
+        const snapshot = this._pending.map((item) => ({
+          pendingId: item.pendingId,
+          proposedAt: item.proposedAt,
+          input: { ...item.input }
+        }));
+        this._persistTail = this._persistTail.catch(() => {
+        }).then(() => this._persist(snapshot)).catch(() => {
+        });
+      }
+      _trimToLimit() {
+        if (this._pending.length <= MAX_PENDING_ENTRIES3) return;
+        this._pending.splice(0, this._pending.length - MAX_PENDING_ENTRIES3);
+        this._persistSoon();
+      }
+      async _persist(snapshot) {
+        if (!this._filePath) return;
+        if (snapshot.length === 0) {
+          await rm4(this._filePath, { force: true }).catch(() => void 0);
+          return;
+        }
+        await mkdir10(dirname8(this._filePath), { recursive: true });
+        await writeFile10(this._filePath, JSON.stringify(snapshot, null, 2), "utf-8");
+      }
+    };
+  }
+});
+
+// src/robotics/PrinciplePromotion.ts
+function shouldTriggerPrinciplePromotion(experience, threshold = PRINCIPLE_PROMOTION_SCORE_THRESHOLD) {
+  if (!experience.abstractPrinciple?.trim()) return false;
+  if ((experience.contradictionCount ?? 0) > 0) return false;
+  return experienceRetrievalScore(experience) >= threshold;
+}
+async function proposePrincipleFromExperience(opts) {
+  const experience = await opts.experienceStore.load(opts.experienceId);
+  if (!experience) return { promoted: false, reason: "missing_experience" };
+  const score = experienceRetrievalScore(experience);
+  if (opts.reason === "confidence_threshold" && !shouldTriggerPrinciplePromotion(experience, opts.threshold)) {
+    return { promoted: false, reason: "below_threshold", score };
+  }
+  if (!opts.flash) return { promoted: false, reason: "missing_flash", score };
+  const related = await opts.experienceStore.search({
+    domain: experience.domain,
+    robot: experience.robot,
+    limit: 8
+  });
+  const anchors = await opts.anchorStore.search({
+    domain: experience.domain,
+    robot: experience.robot,
+    limit: 8
+  });
+  const raw = await opts.flash.query({
+    system: PRINCIPLE_PROMOTION_SYSTEM,
+    user: formatPromotionInput(experience, related, anchors, opts.reason),
+    maxTokens: 1e3,
+    timeoutMs: 8e3,
+    cacheKey: `principle-promotion:${opts.reason}:${experience.id}:${score}`
+  });
+  if (!raw) return { promoted: false, reason: "flash_failed", score };
+  const proposal = parsePrincipleProposal(raw);
+  if (!proposal) return { promoted: false, reason: "flash_failed", score };
+  const pendingId = opts.pendingStore.add({
+    ...proposal,
+    promotion_reason: opts.reason,
+    source_experience_id: experience.id,
+    derived_from_experience_ids: ensureIncludes(
+      proposal["derived_from_experience_ids"],
+      experience.id
+    ),
+    confidence_tier: proposal["confidence_tier"] ?? experience.confidenceTier ?? "observed",
+    observation_count: proposal["observation_count"] ?? experience.observationCount ?? 1,
+    contradiction_count: proposal["contradiction_count"] ?? experience.contradictionCount ?? 0,
+    last_verified_at: proposal["last_verified_at"] ?? experience.lastVerifiedAt
+  });
+  return { promoted: true, pendingId, reason: "queued", score };
+}
+function formatPromotionInput(target, related, anchors, reason) {
+  const relatedBlock = related.map((e) => [
+    `ID: ${e.id}`,
+    `Domain: ${e.domain}`,
+    e.robot ? `Robot: ${e.robot}` : "",
+    `Outcome: ${e.outcome.success ? "success" : "failure"}`,
+    `Confidence: ${e.confidenceTier ?? "observed"} obs=${e.observationCount ?? 1} contradictions=${e.contradictionCount ?? 0}`,
+    `Principle hint: ${e.abstractPrinciple ?? e.outcome.summary}`,
+    `Problem: ${e.problem}`,
+    `Solution: ${e.solution}`,
+    e.outcome.failureReason ? `Failure reason: ${e.outcome.failureReason}` : "",
+    e.invalidatedAssumptions?.length ? `Invalidated assumptions: ${e.invalidatedAssumptions.join("; ")}` : "",
+    e.evidenceRefs?.length ? `Evidence refs: ${e.evidenceRefs.join("; ")}` : ""
+  ].filter(Boolean).join("\n")).join("\n\n");
+  const anchorBlock = anchors.map((a) => [
+    `ID: ${a.id}`,
+    `Domain: ${a.domain}`,
+    `Scope: ${a.scope}`,
+    a.robot ? `Robot: ${a.robot}` : "",
+    `Confidence: ${a.confidenceTier}`,
+    `Fact: ${a.fact}`,
+    a.mechanism ? `Mechanism: ${a.mechanism}` : "",
+    `Implication: ${a.implication}`,
+    a.evidenceRefs.length ? `Evidence refs: ${a.evidenceRefs.join("; ")}` : ""
+  ].filter(Boolean).join("\n")).join("\n\n");
+  return [
+    `Promotion trigger: ${reason}`,
+    "",
+    "Target experience:",
+    relatedBlock || `ID: ${target.id}
+Principle hint: ${target.abstractPrinciple ?? target.outcome.summary}`,
+    "",
+    "Candidate physical anchors:",
+    anchorBlock || "(none)"
+  ].join("\n");
+}
+function parsePrincipleProposal(raw) {
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
+    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) return null;
+    const parsed = JSON.parse(jsonMatch[0]);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : null;
+  } catch {
+    return null;
+  }
+}
+function ensureIncludes(values, required2) {
+  const out = Array.isArray(values) ? values.filter((v) => typeof v === "string") : [];
+  if (!out.includes(required2)) out.unshift(required2);
+  return out;
+}
+var PRINCIPLE_PROMOTION_SCORE_THRESHOLD, PRINCIPLE_PROMOTION_SYSTEM;
+var init_PrinciplePromotion = __esm({
+  "src/robotics/PrinciplePromotion.ts"() {
+    "use strict";
+    init_ExperienceStore();
+    PRINCIPLE_PROMOTION_SCORE_THRESHOLD = 500;
+    PRINCIPLE_PROMOTION_SYSTEM = `You promote robotics experiences into a reusable Principle candidate.
+
+Return JSON only. The candidate will go to human review before it is committed.
+
+Principle means: a transferable causal or constraint structure, not a one-off fact and not an action recipe.
+It must explicitly state boundaries so future agents know when it applies and when it does not.
+
+Schema:
+{
+  "title": "short name",
+  "statement": "transferable principle",
+  "mechanism": "why it holds",
+  "first_principles_support": ["physics/math/control/signal/statistical reason"],
+  "domains": ["one or more valid robotics domains"],
+  "abstraction_level": "physical|system|algorithmic|statistical|operational",
+  "preconditions": ["conditions required for the principle to apply"],
+  "applicability_bounds": ["numeric, structural, or context bounds"],
+  "non_applicable_when": ["clear exclusions"],
+  "derived_from_experience_ids": ["experience ids"],
+  "anchored_by_physical_anchor_ids": ["physical anchor ids"],
+  "evidence_refs": ["logs, commits, reports, papers, datasheets"],
+  "invalidated_assumptions": ["assumptions this principle corrects"],
+  "counter_examples": ["known counterexamples or contradiction notes"],
+  "confidence_tier": "observed|reproduced|derived|reported|hypothesis",
+  "observation_count": 1,
+  "contradiction_count": 0
+}
+
+Rules:
+- Use physical anchors when they genuinely constrain the principle; otherwise leave the anchor list empty.
+- Use first_principles_support for foundational reasons, not citations.
+- Bound the principle narrowly enough to avoid overgeneralization.
+- Do not invent measurements; use only provided evidence.`;
+  }
+});
+
+// src/robotics/HardwareProfile.ts
+import { readdir as readdir7 } from "fs/promises";
+import { homedir as homedir17 } from "os";
+import { join as join20 } from "path";
 var PROFILES_ROOT, HardwareProfile;
 var init_HardwareProfile = __esm({
   "src/robotics/HardwareProfile.ts"() {
     "use strict";
     init_persist();
-    PROFILES_ROOT = join18(homedir15(), ".claude", "meta-agent", "robotics", "hardware_profiles");
+    PROFILES_ROOT = join20(homedir17(), ".claude", "meta-agent", "robotics", "hardware_profiles");
     HardwareProfile = class {
       dir;
       robot;
@@ -23253,7 +24219,7 @@ var init_HardwareProfile = __esm({
         this.robot = robot;
       }
       _profilePath(name) {
-        return join18(this.dir, `${name.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+        return join20(this.dir, `${name.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
       }
       async read(name) {
         const target = name ?? this.robot;
@@ -23266,7 +24232,7 @@ var init_HardwareProfile = __esm({
       }
       async list() {
         try {
-          const files = await readdir6(this.dir);
+          const files = await readdir7(this.dir);
           return files.filter((f) => f.endsWith(".json")).map((f) => f.replace(".json", ""));
         } catch {
           return [];
@@ -23302,16 +24268,16 @@ var init_HardwareProfile = __esm({
 // src/robotics/git/GitWorkspaceManager.ts
 import { execFile as execFile2 } from "child_process";
 import { promisify as promisify2 } from "util";
-import { stat as stat4, mkdir as mkdir10 } from "fs/promises";
+import { stat as stat5, mkdir as mkdir11 } from "fs/promises";
 import { existsSync as existsSync4 } from "fs";
-import { homedir as homedir16 } from "os";
-import { join as join19 } from "path";
+import { homedir as homedir18 } from "os";
+import { join as join21 } from "path";
 var execFileAsync2, WORKTREE_BASE, GitWorkspaceManager;
 var init_GitWorkspaceManager = __esm({
   "src/robotics/git/GitWorkspaceManager.ts"() {
     "use strict";
     execFileAsync2 = promisify2(execFile2);
-    WORKTREE_BASE = join19(homedir16(), ".cache", "meta-agent", "worktrees");
+    WORKTREE_BASE = join21(homedir18(), ".cache", "meta-agent", "worktrees");
     GitWorkspaceManager = class {
       projectDir;
       worktreeBaseDir;
@@ -23321,7 +24287,7 @@ var init_GitWorkspaceManager = __esm({
         this.worktreeBaseDir = worktreeBaseDir ?? WORKTREE_BASE;
       }
       get enabled() {
-        return existsSync4(join19(this.projectDir, ".git"));
+        return existsSync4(join21(this.projectDir, ".git"));
       }
       async detectGitState() {
         if (!this.enabled) return { enabled: false, mainBranch: "main", subAgentBranches: {}, forkPoints: {} };
@@ -23335,16 +24301,16 @@ var init_GitWorkspaceManager = __esm({
       async createWorktreeForTask(taskId, role) {
         return this._withGitMutationLock(async () => {
           const branchName = `sub/${taskId}/${role}`;
-          const worktreePath = join19(this.worktreeBaseDir, taskId);
+          const worktreePath = join21(this.worktreeBaseDir, taskId);
           const forkPoint = (await this._git(["rev-parse", "HEAD"])).trim();
-          await mkdir10(this.worktreeBaseDir, { recursive: true });
+          await mkdir11(this.worktreeBaseDir, { recursive: true });
           await this._git(["worktree", "add", "-b", branchName, worktreePath, forkPoint]);
           return { taskId, role, branchName, worktreePath, forkPoint, createdAt: Date.now() };
         });
       }
       async syncMainToTask(taskId, branchName) {
         return this._withGitMutationLock(async () => {
-          const worktreePath = join19(this.worktreeBaseDir, taskId);
+          const worktreePath = join21(this.worktreeBaseDir, taskId);
           if (!await this._worktreeExists(worktreePath)) {
             throw new Error(`Worktree not found for task ${taskId}`);
           }
@@ -23406,7 +24372,7 @@ var init_GitWorkspaceManager = __esm({
       }
       async removeWorktree(taskId, opts = {}) {
         return this._withGitMutationLock(async () => {
-          const worktreePath = join19(this.worktreeBaseDir, taskId);
+          const worktreePath = join21(this.worktreeBaseDir, taskId);
           await this._git(["worktree", "remove", "--force", worktreePath]).catch(() => void 0);
           if (opts.deleteBranch && opts.branchName) {
             await this._git(["branch", "-D", opts.branchName]).catch(() => void 0);
@@ -23441,16 +24407,16 @@ var init_GitWorkspaceManager = __esm({
           const pruned = [];
           let entries;
           try {
-            const { readdir: readdir11 } = await import("fs/promises");
-            entries = await readdir11(this.worktreeBaseDir);
+            const { readdir: readdir12 } = await import("fs/promises");
+            entries = await readdir12(this.worktreeBaseDir);
           } catch {
             return pruned;
           }
           const now = Date.now();
           for (const entry of entries) {
-            const worktreePath = join19(this.worktreeBaseDir, entry);
+            const worktreePath = join21(this.worktreeBaseDir, entry);
             try {
-              const s = await stat4(worktreePath);
+              const s = await stat5(worktreePath);
               if (!s.isDirectory()) continue;
               if (now - s.mtimeMs > ttlMs) {
                 await this._git(["worktree", "remove", "--force", worktreePath]).catch(() => void 0);
@@ -23478,9 +24444,9 @@ var init_GitWorkspaceManager = __esm({
         return this._withGitMutationLock(async () => {
           const staleTaskIds = [];
           for (const [taskId, branchName] of Object.entries(gitState.subAgentBranches)) {
-            const worktreePath = join19(this.worktreeBaseDir, taskId);
+            const worktreePath = join21(this.worktreeBaseDir, taskId);
             try {
-              await stat4(worktreePath);
+              await stat5(worktreePath);
               await this._gitIn(worktreePath, ["status"]);
             } catch {
               const restored = await this._git(["worktree", "add", worktreePath, branchName]).then(() => true).catch(() => false);
@@ -23501,7 +24467,7 @@ var init_GitWorkspaceManager = __esm({
       }
       async _worktreeExists(path4) {
         try {
-          await stat4(path4);
+          await stat5(path4);
           return true;
         } catch {
           return false;
@@ -23517,25 +24483,25 @@ var init_GitWorkspaceManager = __esm({
 });
 
 // src/robotics/persistence/RoboticsProjectStore.ts
-import { createHash as createHash5 } from "crypto";
-import { join as join20 } from "path";
-import { homedir as homedir17 } from "os";
-import { readdir as readdir7, rm as rm3 } from "fs/promises";
+import { createHash as createHash6 } from "crypto";
+import { join as join22 } from "path";
+import { homedir as homedir19 } from "os";
+import { readdir as readdir8, rm as rm5 } from "fs/promises";
 function projectHash(projectDir) {
-  return createHash5("sha1").update(projectDir).digest("hex").slice(0, 16);
+  return createHash6("sha1").update(projectDir).digest("hex").slice(0, 16);
 }
 function projectBucketDir(dir) {
-  return join20(PROJECTS_ROOT, projectHash(dir));
+  return join22(PROJECTS_ROOT, projectHash(dir));
 }
 function stateFile(dir, sessionId) {
-  return join20(projectBucketDir(dir), sessionId, "state.json");
+  return join22(projectBucketDir(dir), sessionId, "state.json");
 }
 var PROJECTS_ROOT, RESUME_WINDOW_MS, STALE_TTL_MS, MAX_PROGRESS_NOTES, RoboticsProjectStore;
 var init_RoboticsProjectStore = __esm({
   "src/robotics/persistence/RoboticsProjectStore.ts"() {
     "use strict";
     init_persist();
-    PROJECTS_ROOT = join20(homedir17(), ".claude", "meta-agent", "robotics", "projects");
+    PROJECTS_ROOT = join22(homedir19(), ".claude", "meta-agent", "robotics", "projects");
     RESUME_WINDOW_MS = 30 * 24 * 60 * 60 * 1e3;
     STALE_TTL_MS = 7 * 24 * 60 * 60 * 1e3;
     MAX_PROGRESS_NOTES = 15;
@@ -23552,13 +24518,13 @@ var init_RoboticsProjectStore = __esm({
         const bucket = projectBucketDir(dir);
         let sessionDirs;
         try {
-          sessionDirs = await readdir7(bucket);
+          sessionDirs = await readdir8(bucket);
         } catch {
           return null;
         }
         const states = await Promise.all(
           sessionDirs.map(async (sid) => {
-            const state = await readJsonFile(join20(bucket, sid, "state.json"));
+            const state = await readJsonFile(join22(bucket, sid, "state.json"));
             if (!state || state.schemaVersion !== "1.0") return null;
             if (Date.now() - state.lastActiveAt > RESUME_WINDOW_MS) return null;
             return state;
@@ -23657,24 +24623,24 @@ var init_RoboticsProjectStore = __esm({
       static async listAll() {
         let buckets;
         try {
-          buckets = await readdir7(PROJECTS_ROOT);
+          buckets = await readdir8(PROJECTS_ROOT);
         } catch {
           return [];
         }
         const results = [];
         await Promise.all(
           buckets.map(async (bucket) => {
-            const bucketPath = join20(PROJECTS_ROOT, bucket);
+            const bucketPath = join22(PROJECTS_ROOT, bucket);
             let sessionDirs;
             try {
-              sessionDirs = await readdir7(bucketPath);
+              sessionDirs = await readdir8(bucketPath);
             } catch {
               return;
             }
             await Promise.all(
               sessionDirs.map(async (sid) => {
                 const state = await readJsonFile(
-                  join20(bucketPath, sid, "state.json")
+                  join22(bucketPath, sid, "state.json")
                 );
                 if (!state || state.schemaVersion !== "1.0") return;
                 const idleDays = Math.floor((Date.now() - state.lastActiveAt) / 864e5);
@@ -23726,7 +24692,7 @@ var init_RoboticsProjectStore = __esm({
       static async purgeStale() {
         let buckets;
         try {
-          buckets = await readdir7(PROJECTS_ROOT);
+          buckets = await readdir8(PROJECTS_ROOT);
         } catch {
           return 0;
         }
@@ -23734,23 +24700,23 @@ var init_RoboticsProjectStore = __esm({
         let purged = 0;
         await Promise.allSettled(
           buckets.map(async (bucket) => {
-            const bucketPath = join20(PROJECTS_ROOT, bucket);
+            const bucketPath = join22(PROJECTS_ROOT, bucket);
             let sessionDirs;
             try {
-              sessionDirs = await readdir7(bucketPath);
+              sessionDirs = await readdir8(bucketPath);
             } catch {
               return;
             }
             await Promise.allSettled(
               sessionDirs.map(async (sid) => {
-                const sessionDir3 = join20(bucketPath, sid);
+                const sessionDir3 = join22(bucketPath, sid);
                 const state = await readJsonFile(
-                  join20(sessionDir3, "state.json")
+                  join22(sessionDir3, "state.json")
                 );
                 if (!state || state.schemaVersion !== "1.0") return;
                 if (state.starred) return;
                 if (now - state.lastActiveAt < STALE_TTL_MS) return;
-                await rm3(sessionDir3, { recursive: true, force: true });
+                await rm5(sessionDir3, { recursive: true, force: true });
                 purged++;
               })
             );
@@ -23989,11 +24955,12 @@ var init_FlashClient = __esm({
     init_openai();
     init_config();
     init_withTimeout();
-    FlashClient = class {
+    FlashClient = class _FlashClient {
       anthropicClient;
       openaiClient;
       model;
       cache = /* @__PURE__ */ new Map();
+      static MAX_CACHE_ENTRIES = 512;
       constructor(config2) {
         const { provider, apiKey, baseURL, flashModel } = detectProvider(config2);
         this.model = flashModel;
@@ -24017,7 +24984,10 @@ var init_FlashClient = __esm({
        */
       async query(opts) {
         if (opts.cacheKey && this.cache.has(opts.cacheKey)) {
-          return this.cache.get(opts.cacheKey);
+          const cached2 = this.cache.get(opts.cacheKey);
+          this.cache.delete(opts.cacheKey);
+          this.cache.set(opts.cacheKey, cached2);
+          return cached2;
         }
         try {
           let text = null;
@@ -24048,7 +25018,7 @@ var init_FlashClient = __esm({
             text = block?.type === "text" ? block.text.trim() : null;
           }
           if (!text) return null;
-          if (opts.cacheKey) this.cache.set(opts.cacheKey, text);
+          if (opts.cacheKey) this.setCached(opts.cacheKey, text);
           return text;
         } catch {
           return null;
@@ -24057,6 +25027,15 @@ var init_FlashClient = __esm({
       /** Flush all cached results (call at session start or project switch). */
       clearCache() {
         this.cache.clear();
+      }
+      setCached(key, value) {
+        if (this.cache.has(key)) this.cache.delete(key);
+        this.cache.set(key, value);
+        while (this.cache.size > _FlashClient.MAX_CACHE_ENTRIES) {
+          const oldest = this.cache.keys().next().value;
+          if (typeof oldest !== "string") break;
+          this.cache.delete(oldest);
+        }
       }
       /** Current flash model identifier (useful for logging/debugging). */
       get modelId() {
@@ -39162,6 +40141,63 @@ var init_zod = __esm({
 });
 
 // src/core/persist/schemas.ts
+function migrateTeamState(raw) {
+  if (!raw || typeof raw !== "object") return null;
+  const obj = raw;
+  if (obj.schemaVersion === "2.0") {
+    const parsed = TeamStateV20Schema.safeParse(raw);
+    return parsed.success ? parsed.data : null;
+  }
+  if (obj.schemaVersion === "1.0") {
+    const legacy = TeamStateV10Schema.safeParse(raw);
+    if (!legacy.success) return null;
+    const v10 = legacy.data;
+    const upgraded = {
+      schemaVersion: "2.0",
+      project: v10.project,
+      github: v10.github,
+      goals: v10.goals,
+      tasks: v10.tasks.map((t) => ({
+        id: t.id,
+        title: t.title,
+        status: mapLegacyStatus(t.status),
+        ownerUnit: t.ownerUnit,
+        attempts: [],
+        updatedAt: t.updatedAt
+      })),
+      units: v10.units.map((u) => ({
+        id: u.id,
+        human: u.human,
+        machine: u.machine,
+        // v1.0 had active|idle|offline; collapse the two non-active states.
+        status: u.status === "active" ? "active" : "away",
+        currentTask: u.currentTask,
+        lastSeen: u.lastSeen
+      })),
+      updatedAt: v10.updatedAt
+    };
+    const parsed = TeamStateV20Schema.safeParse(upgraded);
+    return parsed.success ? parsed.data : null;
+  }
+  return null;
+}
+function mapLegacyStatus(status) {
+  switch (status) {
+    case "done":
+    case "cancelled":
+      return "done";
+    case "paused":
+    case "blocked":
+    case "handoff":
+      return "paused";
+    case "backlog":
+    case "claimed":
+    case "in_progress":
+    case "review":
+    default:
+      return "open";
+  }
+}
 function parseOrNull(schema, value) {
   const result = schema.safeParse(value);
   return result.success ? result.data : null;
@@ -39176,12 +40212,45 @@ function parseArrayFiltered(schema, values) {
   }
   return { valid, dropped };
 }
-var TeamTaskStatusSchema, TeamTaskSchema, TeamUnitSchema, TeamModuleSchema, TeamStateSchema, JobStatusSchema, JobMetricsSchema, JobArtifactSchema, EngineeringJobSchema, SessionMetaSchema;
+var TeamTaskStatusSchema, TeamAttemptSchema, TeamTaskSchema, TeamUnitSchema, LegacyV10TaskStatusSchema, LegacyV10ModuleSchema, LegacyV10TaskSchema, LegacyV10UnitSchema, TeamStateV10Schema, TeamStateV20Schema, JobStatusSchema, JobMetricsSchema, JobArtifactSchema, EngineeringJobSchema, SessionMetaSchema;
 var init_schemas3 = __esm({
   "src/core/persist/schemas.ts"() {
     "use strict";
     init_zod();
-    TeamTaskStatusSchema = external_exports.enum([
+    TeamTaskStatusSchema = external_exports.enum(["open", "paused", "done"]);
+    TeamAttemptSchema = external_exports.object({
+      /** ISO timestamp of when this attempt was recorded. */
+      at: external_exports.string(),
+      /** Which unit recorded this attempt. */
+      unit: external_exports.string(),
+      /** One-line description of what was tried. */
+      direction: external_exports.string(),
+      /** What happened — success/failure summary with brief reasoning. */
+      outcome: external_exports.string(),
+      /** Optional pointer: git sha, wandb URL, S3 path, rosbag, video, … */
+      ref: external_exports.string().optional()
+    });
+    TeamTaskSchema = external_exports.object({
+      id: external_exports.string(),
+      title: external_exports.string(),
+      status: TeamTaskStatusSchema,
+      /** Non-empty = claimed; only the owner can note/drop/done. */
+      ownerUnit: external_exports.string().optional(),
+      /** ISO of claim time — used for stale-claim visual warnings. */
+      claimedAt: external_exports.string().optional(),
+      /** Append-only log of directions tried and their outcomes. */
+      attempts: external_exports.array(TeamAttemptSchema),
+      updatedAt: external_exports.string()
+    });
+    TeamUnitSchema = external_exports.object({
+      id: external_exports.string(),
+      human: external_exports.string().optional(),
+      machine: external_exports.string(),
+      status: external_exports.enum(["active", "away"]),
+      currentTask: external_exports.string().optional(),
+      lastSeen: external_exports.string()
+    });
+    LegacyV10TaskStatusSchema = external_exports.enum([
       "backlog",
       "claimed",
       "in_progress",
@@ -39192,10 +40261,16 @@ var init_schemas3 = __esm({
       "handoff",
       "cancelled"
     ]);
-    TeamTaskSchema = external_exports.object({
+    LegacyV10ModuleSchema = external_exports.object({
+      name: external_exports.string(),
+      ownerUnit: external_exports.string().optional(),
+      paths: external_exports.array(external_exports.string()),
+      responsibilities: external_exports.array(external_exports.string())
+    });
+    LegacyV10TaskSchema = external_exports.object({
       id: external_exports.string(),
       title: external_exports.string(),
-      status: TeamTaskStatusSchema,
+      status: LegacyV10TaskStatusSchema,
       module: external_exports.string().optional(),
       ownerUnit: external_exports.string().optional(),
       branch: external_exports.string().optional(),
@@ -39204,7 +40279,7 @@ var init_schemas3 = __esm({
       paths: external_exports.array(external_exports.string()),
       updatedAt: external_exports.string()
     });
-    TeamUnitSchema = external_exports.object({
+    LegacyV10UnitSchema = external_exports.object({
       id: external_exports.string(),
       human: external_exports.string().optional(),
       machine: external_exports.string(),
@@ -39212,21 +40287,24 @@ var init_schemas3 = __esm({
       currentTask: external_exports.string().optional(),
       lastSeen: external_exports.string()
     });
-    TeamModuleSchema = external_exports.object({
-      name: external_exports.string(),
-      ownerUnit: external_exports.string().optional(),
-      paths: external_exports.array(external_exports.string()),
-      responsibilities: external_exports.array(external_exports.string())
-    });
-    TeamStateSchema = external_exports.object({
+    TeamStateV10Schema = external_exports.object({
       schemaVersion: external_exports.literal("1.0"),
       project: external_exports.string(),
       github: external_exports.string().optional(),
       goals: external_exports.array(external_exports.string()),
-      modules: external_exports.array(TeamModuleSchema),
+      modules: external_exports.array(LegacyV10ModuleSchema),
+      tasks: external_exports.array(LegacyV10TaskSchema),
+      units: external_exports.array(LegacyV10UnitSchema),
+      decisions: external_exports.array(external_exports.string()),
+      updatedAt: external_exports.string()
+    });
+    TeamStateV20Schema = external_exports.object({
+      schemaVersion: external_exports.literal("2.0"),
+      project: external_exports.string(),
+      github: external_exports.string().optional(),
+      goals: external_exports.array(external_exports.string()),
       tasks: external_exports.array(TeamTaskSchema),
       units: external_exports.array(TeamUnitSchema),
-      decisions: external_exports.array(external_exports.string()),
       updatedAt: external_exports.string()
     });
     JobStatusSchema = external_exports.enum([
@@ -39277,16 +40355,16 @@ var init_schemas3 = __esm({
 });
 
 // src/jobs/JobStore.ts
-import { join as join21 } from "path";
-import { homedir as homedir18 } from "os";
+import { join as join23 } from "path";
+import { homedir as homedir20 } from "os";
 function jobsRoot() {
-  return join21(homedir18(), ".meta-agent", "jobs");
+  return join23(homedir20(), ".meta-agent", "jobs");
 }
 function sessionDir(sessionId) {
-  return join21(jobsRoot(), sessionId);
+  return join23(jobsRoot(), sessionId);
 }
 function jobPath(sessionId, jobId) {
-  return join21(sessionDir(sessionId), `${jobId}.json`);
+  return join23(sessionDir(sessionId), `${jobId}.json`);
 }
 var JobStore;
 var init_JobStore = __esm({
@@ -39427,15 +40505,83 @@ var init_JobManager = __esm({
     init_types7();
     init_JobStore();
     init_JobExecutor();
-    JobManager = class {
+    JobManager = class _JobManager {
       store;
       executor;
       sessionId;
       jobs = /* @__PURE__ */ new Map();
+      /**
+       * S2: LRU cap on terminal jobs held in memory.  Active (queued / running)
+       * jobs are NEVER evicted regardless of this cap — only completed / failed /
+       * cancelled records count toward the limit.  Default keeps the most recent
+       * 200 completed records for `list()` / `await()` re-attach; tune via
+       * `META_AGENT_KEEP_TERMINAL_JOBS` env var or `setTerminalJobCap()`.
+       */
+      _terminalJobCap;
+      static DEFAULT_TERMINAL_JOB_CAP = 200;
+      /**
+       * S2: insertion-ordered list of terminal job IDs (oldest first) used by the
+       * LRU eviction pass.  We can't rely on `jobs.keys()` order because jobs may
+       * transition from active → terminal arbitrarily.
+       */
+      _terminalOrder = [];
       constructor(sessionId, executor) {
         this.sessionId = sessionId;
         this.store = new JobStore(sessionId);
         this.executor = executor ?? new LocalExecutor();
+        const envCap = Number.parseInt(process.env["META_AGENT_KEEP_TERMINAL_JOBS"] ?? "", 10);
+        this._terminalJobCap = Number.isFinite(envCap) && envCap >= 0 ? envCap : _JobManager.DEFAULT_TERMINAL_JOB_CAP;
+      }
+      /**
+       * Override the LRU cap on terminal jobs.  Pass `Infinity` to disable
+       * eviction (useful for tests that want to inspect every job afterwards).
+       */
+      setTerminalJobCap(cap) {
+        if (!Number.isFinite(cap) || cap < 0) return;
+        this._terminalJobCap = cap;
+        this._evictTerminalIfOverCap();
+      }
+      /**
+       * S2: Forget a single terminal job.  No-op for active jobs (returns false)
+       * so callers can't accidentally drop work in flight.
+       */
+      forgetJob(jobId) {
+        const rt = this.jobs.get(jobId);
+        if (!rt) return false;
+        if (!TERMINAL_STATUSES2.has(rt.job.status)) return false;
+        this._dropFromTerminalOrder(jobId);
+        this.jobs.delete(jobId);
+        return true;
+      }
+      /**
+       * S2: Forget every terminal job whose completion time is older than `ts`.
+       * Returns the number evicted.  Falls back to submittedAt when completedAt
+       * is unavailable.
+       */
+      forgetCompletedBefore(ts) {
+        let n = 0;
+        for (const [id, rt] of this.jobs) {
+          if (!TERMINAL_STATUSES2.has(rt.job.status)) continue;
+          const t = rt.job.metrics.completedAt ?? rt.job.metrics.submittedAt;
+          if (t < ts) {
+            this._dropFromTerminalOrder(id);
+            this.jobs.delete(id);
+            n++;
+          }
+        }
+        return n;
+      }
+      /** S2: drop in-memory state for every terminal job. Used by host shutdown. */
+      forgetAllCompleted() {
+        let n = 0;
+        for (const [id, rt] of this.jobs) {
+          if (TERMINAL_STATUSES2.has(rt.job.status)) {
+            this.jobs.delete(id);
+            n++;
+          }
+        }
+        this._terminalOrder.length = 0;
+        return n;
       }
       // ── submit ───────────────────────────────────────────────────────────────
       /**
@@ -39665,6 +40811,29 @@ var init_JobManager = __esm({
         if (!rt) return;
         rt.job.status = status;
         void this._persistWithRetry(jobId, { ...rt.job });
+        if (TERMINAL_STATUSES2.has(status)) {
+          rt.progressListeners.length = 0;
+          rt.completionResolvers.length = 0;
+          this._dropFromTerminalOrder(jobId);
+          this._terminalOrder.push(jobId);
+          this._evictTerminalIfOverCap();
+        }
+      }
+      /** S2: drop oldest terminal jobs until size ≤ _terminalJobCap. */
+      _evictTerminalIfOverCap() {
+        if (!Number.isFinite(this._terminalJobCap)) return;
+        while (this._terminalOrder.length > this._terminalJobCap) {
+          const id = this._terminalOrder.shift();
+          if (id === void 0) break;
+          const rt = this.jobs.get(id);
+          if (rt && TERMINAL_STATUSES2.has(rt.job.status)) {
+            this.jobs.delete(id);
+          }
+        }
+      }
+      _dropFromTerminalOrder(jobId) {
+        const idx = this._terminalOrder.indexOf(jobId);
+        if (idx >= 0) this._terminalOrder.splice(idx, 1);
       }
       /**
        * Persist a job record with up to MAX_PERSIST_RETRIES attempts, using
@@ -40885,21 +42054,21 @@ var init_types9 = __esm({
 });
 
 // src/provenance/ProvenanceTracker.ts
-import { createHash as createHash6 } from "crypto";
-import { readFile as readFile13, writeFile as writeFile10, readdir as readdir8, mkdir as mkdir11, rename as rename3 } from "fs/promises";
-import { join as join22 } from "path";
-import { homedir as homedir19 } from "os";
+import { createHash as createHash7 } from "crypto";
+import { readFile as readFile14, writeFile as writeFile11, readdir as readdir9, mkdir as mkdir12, rename as rename3 } from "fs/promises";
+import { join as join24 } from "path";
+import { homedir as homedir21 } from "os";
 function provenanceDir(sessionId) {
-  return join22(homedir19(), ".claude", "meta-agent", "sessions", sessionId, "provenance");
+  return join24(homedir21(), ".claude", "meta-agent", "sessions", sessionId, "provenance");
 }
 function recordPath(sessionId, id) {
-  return join22(provenanceDir(sessionId), `${id}.json`);
+  return join24(provenanceDir(sessionId), `${id}.json`);
 }
 async function ensureDir2(dir) {
-  await mkdir11(dir, { recursive: true });
+  await mkdir12(dir, { recursive: true });
 }
 function sha2562(data) {
-  return createHash6("sha256").update(data, "utf-8").digest("hex");
+  return createHash7("sha256").update(data, "utf-8").digest("hex");
 }
 function hashRecord(input) {
   try {
@@ -40954,7 +42123,7 @@ var init_ProvenanceTracker = __esm({
         if (this.cache.has(id)) return this.cache.get(id);
         const path4 = recordPath(this.sessionId, id);
         try {
-          const raw = await readFile13(path4, "utf-8");
+          const raw = await readFile14(path4, "utf-8");
           const rec = JSON.parse(raw);
           this.cache.set(id, rec);
           return rec;
@@ -41054,16 +42223,10 @@ var init_ProvenanceTracker = __esm({
         await ensureDir2(dir);
         const target = recordPath(this.sessionId, rec.id);
         const tmp = `${target}.tmp`;
-        await writeFile10(tmp, JSON.stringify(rec, null, 2), "utf-8");
+        await writeFile11(tmp, JSON.stringify(rec, null, 2), "utf-8");
         await rename3(tmp, target);
-        if (this.cache.size >= MAX_CACHE_ENTRIES) {
-          let evicted = 0;
-          for (const key of this.cache.keys()) {
-            this.cache.delete(key);
-            if (++evicted >= EVICT_BATCH) break;
-          }
-        }
         this.cache.set(rec.id, rec);
+        this._evictCacheIfNeeded();
       }
       async _ensureCacheLoaded() {
         if (this.cacheLoaded) return;
@@ -41071,7 +42234,7 @@ var init_ProvenanceTracker = __esm({
         const dir = provenanceDir(this.sessionId);
         let entries;
         try {
-          entries = await readdir8(dir);
+          entries = await readdir9(dir);
         } catch {
           return;
         }
@@ -41080,12 +42243,18 @@ var init_ProvenanceTracker = __esm({
           const id = entry.replace(/\.json$/, "");
           if (this.cache.has(id)) continue;
           try {
-            const raw = await readFile13(join22(dir, entry), "utf-8");
+            const raw = await readFile14(join24(dir, entry), "utf-8");
             const rec = JSON.parse(raw);
             this.cache.set(rec.id, rec);
+            this._evictCacheIfNeeded();
           } catch {
           }
         }
+      }
+      _evictCacheIfNeeded() {
+        if (this.cache.size <= MAX_CACHE_ENTRIES) return;
+        const records = [...this.cache.values()].sort((a, b) => a.timestamp - b.timestamp).slice(0, Math.max(EVICT_BATCH, this.cache.size - MAX_CACHE_ENTRIES));
+        for (const record2 of records) this.cache.delete(record2.id);
       }
       _matches(r, f) {
         if (f.agentId && r.agentId !== f.agentId) return false;
@@ -41367,6 +42536,11 @@ The experience store (\`experience_search\` / \`experience_write\`) is for:
 Propose an experience entry **after you have solved the problem**, not before; it will wait for user review before becoming shared knowledge.
 A blank experience store means this is unexplored territory \u2014 proceed with direct analysis.
 
+### Principle Layer
+- Use \`principle_search\` when the task calls for transferable mechanisms, first-principles constraints, or explicit applicability boundaries
+- Use \`principle_promote\` only when the user explicitly asks to extract/promote/generalize a principle from an approved experience
+- Principles are reviewed abstractions; experiences remain concrete cases and physical anchors remain world facts
+
 ### Task Completion
 You are done only when you have delivered a complete answer to the user.
 Searching tools and reading files is progress, not completion.
@@ -41402,6 +42576,11 @@ The experience store (\`experience_search\` / \`experience_write\`) is for:
 
 To get results from a completed sub-agent: call **\`get_sub_agent_status task_id="<id>"\`**.
 The ExperimentSummary in that call IS the result \u2014 do not wait for it to appear in the experience store.
+
+### Principle Layer
+- \`principle_search\` retrieves reviewed transferable principles with first-principles support and applicability / non-applicability boundaries
+- \`principle_promote\` queues a new principle candidate only when the user explicitly asks to abstract an approved experience into a principle
+- Confidence-threshold promotion is handled after human approval of experiences; do not bypass review by writing principles directly
 
 ### Agent Roles Available
 - **PaperSearchAgent** (\`paper_search\`): Literature survey and synthesis
@@ -41785,6 +42964,7 @@ function createExperienceSearchTool(store2) {
             ...e.outcome.failureReason ? [`**Failure reason**: ${e.outcome.failureReason}`] : [],
             ...e.outcome.workarounds?.length ? [`**Workarounds**: ${e.outcome.workarounds.join("; ")}`] : [],
             ...e.invalidatedAssumptions?.length ? [`**Invalidated assumptions**: ${e.invalidatedAssumptions.join("; ")}`] : [],
+            ...e.principleIds?.length ? [`**Principles**: ${e.principleIds.join("; ")}`] : [],
             ...e.evidenceRefs?.length ? [`**Evidence refs**: ${e.evidenceRefs.slice(0, 4).join("; ")}`] : [],
             `> Use \`experience_load id="${e.id}"\` for the full report.`,
             ""
@@ -42055,6 +43235,7 @@ function createExperienceLoadTool(store2) {
           ...entry.metrics ? ["## Metrics", ...Object.entries(entry.metrics).map(([k, v]) => `- **${k}**: ${v}`), ""] : [],
           ...entry.relatedPapers?.length ? ["## Related Papers", ...entry.relatedPapers.map((p) => `- ${p}`), ""] : [],
           ...entry.evidenceRefs?.length ? ["## Evidence References", ...entry.evidenceRefs.map((ref) => `- ${ref}`), ""] : [],
+          ...entry.principleIds?.length ? ["## Linked Principles", ...entry.principleIds.map((id2) => `- ${id2}`), ""] : [],
           ...entry.sourceTaskId ? [`**Source task**: ${entry.sourceTaskId}`, ""] : [],
           ...entry.fullReport ? ["---", "## Full Report", entry.fullReport] : []
         ];
@@ -42069,6 +43250,175 @@ var init_experience_load = __esm({
   "src/robotics/tools/experience_load/index.ts"() {
     "use strict";
     init_ExperienceStore();
+  }
+});
+
+// src/robotics/tools/principle_search/index.ts
+function createPrincipleSearchTool(store2) {
+  return {
+    name: "principle_search",
+    isConcurrencySafe: true,
+    description: "Search reviewed robotics principles: transferable mechanisms derived from experiences and physical anchors, including applicability and non-applicability boundaries.",
+    inputSchema: {
+      type: "object",
+      properties: {
+        domain: {
+          type: "string",
+          enum: [
+            "motion_planning",
+            "perception",
+            "manipulation",
+            "locomotion",
+            "navigation",
+            "simulation",
+            "hardware_interface",
+            "deployment",
+            "calibration",
+            "general"
+          ]
+        },
+        abstraction_level: {
+          type: "string",
+          enum: ["physical", "system", "algorithmic", "statistical", "operational"]
+        },
+        keyword: { type: "string" },
+        limit: { type: "number" }
+      }
+    },
+    async call(input) {
+      const results = await store2.search({
+        domain: input["domain"],
+        abstractionLevel: input["abstraction_level"],
+        keyword: input["keyword"],
+        limit: input["limit"]
+      });
+      if (results.length === 0) {
+        return { content: "No reviewed principles found matching the query.", isError: false };
+      }
+      const lines = results.map((p) => [
+        `### [${p.id}] ${p.title}`,
+        `**Domains**: ${p.domains.join(", ")} | **Level**: ${p.abstractionLevel} | **Confidence**: ${p.confidenceTier}`,
+        `**Statement**: ${p.statement}`,
+        `**Mechanism**: ${p.mechanism}`,
+        p.firstPrinciplesSupport.length ? `**First-principles support**: ${p.firstPrinciplesSupport.join("; ")}` : "",
+        p.applicabilityBounds.length ? `**Bounds**: ${p.applicabilityBounds.join("; ")}` : "",
+        p.nonApplicableWhen.length ? `**Not applicable when**: ${p.nonApplicableWhen.join("; ")}` : "",
+        `> Use \`principle_load id="${p.id}"\` for full boundaries and evidence.`
+      ].filter(Boolean).join("\n")).join("\n\n");
+      return { content: `Found ${results.length} principle(s):
+
+${lines}`, isError: false };
+    }
+  };
+}
+var init_principle_search = __esm({
+  "src/robotics/tools/principle_search/index.ts"() {
+    "use strict";
+  }
+});
+
+// src/robotics/tools/principle_promote/index.ts
+function createPrinciplePromoteTool(experienceStore, anchorStore, pendingStore, flash) {
+  return {
+    name: "principle_promote",
+    description: "Promote an approved experience into a reusable Principle candidate when the user explicitly asks to extract, promote, generalize, or abstract a principle. The generated principle is queued for human review and is NOT committed until `/principle review` approves it. Use this only for explicit user requests; confidence-threshold promotion is handled automatically after experience review.",
+    inputSchema: {
+      type: "object",
+      required: ["experience_id"],
+      properties: {
+        experience_id: {
+          type: "string",
+          description: "Approved ExperienceStore ID to promote into a principle candidate."
+        }
+      }
+    },
+    async call(input) {
+      const experienceId = String(input["experience_id"] ?? "").trim();
+      if (!experienceId) return { content: "experience_id is required", isError: true };
+      const result = await proposePrincipleFromExperience({
+        experienceId,
+        experienceStore,
+        anchorStore,
+        pendingStore,
+        flash,
+        reason: "explicit_user_request"
+      });
+      if (!result.promoted) {
+        return {
+          content: `principle_promote did not queue a proposal: ${result.reason}`,
+          isError: result.reason !== "below_threshold"
+        };
+      }
+      return {
+        content: `Principle candidate queued for review: ${result.pendingId}
+Trigger: explicit_user_request
+Score: ${result.score ?? "n/a"}
+
+Run /principle review to approve, edit externally, or discard it.`,
+        isError: false
+      };
+    }
+  };
+}
+var init_principle_promote = __esm({
+  "src/robotics/tools/principle_promote/index.ts"() {
+    "use strict";
+    init_PrinciplePromotion();
+  }
+});
+
+// src/robotics/tools/principle_load/index.ts
+function createPrincipleLoadTool(store2) {
+  return {
+    name: "principle_load",
+    isConcurrencySafe: true,
+    description: "Load a reviewed robotics principle by ID, including first-principles support, boundaries, source experiences, physical anchors, and counterexamples.",
+    inputSchema: {
+      type: "object",
+      required: ["id"],
+      properties: {
+        id: { type: "string", description: "Principle ID (format: pr_<timestamp>_<uuid8>)" }
+      }
+    },
+    async call(input) {
+      const id = String(input["id"] ?? "");
+      if (!isPrincipleId(id)) return { content: `Invalid principle id: ${id}`, isError: true };
+      const principle = await store2.load(id);
+      if (!principle) return { content: `Principle not found: ${id}`, isError: true };
+      const lines = [
+        `# ${principle.title}`,
+        `**ID**: ${principle.id}`,
+        `**Domains**: ${principle.domains.join(", ")} | **Level**: ${principle.abstractionLevel}`,
+        `**Confidence**: ${principle.confidenceTier} | **Observations**: ${principle.observationCount} | **Contradictions**: ${principle.contradictionCount}`,
+        "",
+        "## Statement",
+        principle.statement,
+        "",
+        "## Mechanism",
+        principle.mechanism,
+        "",
+        "## First-Principles Support",
+        ...principle.firstPrinciplesSupport.length ? principle.firstPrinciplesSupport.map((item) => `- ${item}`) : ["- (none recorded)"],
+        "",
+        "## Applicability",
+        ...principle.preconditions.length ? principle.preconditions.map((item) => `- Preconditions: ${item}`) : [],
+        ...principle.applicabilityBounds.length ? principle.applicabilityBounds.map((item) => `- Bound: ${item}`) : [],
+        ...principle.nonApplicableWhen.length ? principle.nonApplicableWhen.map((item) => `- Not applicable: ${item}`) : [],
+        "",
+        ...principle.derivedFromExperienceIds.length ? ["## Source Experiences", ...principle.derivedFromExperienceIds.map((id2) => `- ${id2}`), ""] : [],
+        ...principle.anchoredByPhysicalAnchorIds.length ? ["## Physical Anchors", ...principle.anchoredByPhysicalAnchorIds.map((id2) => `- ${id2}`), ""] : [],
+        ...principle.invalidatedAssumptions.length ? ["## Invalidated Assumptions", ...principle.invalidatedAssumptions.map((item) => `- ${item}`), ""] : [],
+        ...principle.counterExamples.length ? ["## Counterexamples", ...principle.counterExamples.map((item) => `- ${item}`), ""] : [],
+        ...principle.evidenceRefs.length ? ["## Evidence References", ...principle.evidenceRefs.map((ref) => `- ${ref}`), ""] : []
+      ];
+      return { content: lines.join("\n"), isError: false };
+    }
+  };
+}
+var init_principle_load = __esm({
+  "src/robotics/tools/principle_load/index.ts"() {
+    "use strict";
+    init_PrincipleStore();
   }
 });
 
@@ -43205,12 +44555,17 @@ function createRoboticsTools(opts) {
   const hwProfile = opts.hardwareProfile ?? new HardwareProfile(void 0, opts.robot);
   const physicalAnchors = opts.physicalAnchorStore ?? new PhysicalAnchorStore();
   const pendingPhysicalAnchors = opts.physicalAnchorPendingStore ?? new PhysicalAnchorPendingStore();
+  const principles = opts.principleStore ?? new PrincipleStore();
+  const pendingPrinciples = opts.principlePendingStore ?? new PrinciplePendingStore();
   const gitMgr = opts.gitManager ?? new GitWorkspaceManager(opts.projectDir);
   return [
     // ── Experience tools ─────────────────────────────────────────────────────
     createExperienceSearchTool(store2),
     createExperienceWriteTool(store2, pendingStore, opts.flashClient),
     createExperienceLoadTool(store2),
+    createPrincipleSearchTool(principles),
+    createPrinciplePromoteTool(store2, physicalAnchors, pendingPrinciples, opts.flashClient),
+    createPrincipleLoadTool(principles),
     // ── Hardware profile tools ───────────────────────────────────────────────
     createHardwareProfileReadTool(hwProfile),
     createHardwareProfileWriteTool(hwProfile),
@@ -43240,11 +44595,16 @@ var init_tools = __esm({
     init_ExperiencePendingStore();
     init_PhysicalAnchorStore();
     init_PhysicalAnchorPendingStore();
+    init_PrincipleStore();
+    init_PrinciplePendingStore();
     init_HardwareProfile();
     init_GitWorkspaceManager();
     init_experience_search();
     init_experience_write();
     init_experience_load();
+    init_principle_search();
+    init_principle_promote();
+    init_principle_load();
     init_hardware_profile_read();
     init_hardware_profile_write();
     init_physical_anchor_search();
@@ -43262,7 +44622,7 @@ var init_tools = __esm({
 });
 
 // src/tools/fs/read_file/index.ts
-import { readFile as readFile14, stat as stat5 } from "fs/promises";
+import { readFile as readFile15, stat as stat6 } from "fs/promises";
 import { extname } from "path";
 async function createReadFileTool() {
   const description = dynamicDescription('Read a file from the local filesystem. Returns file contents with line numbers.\n\nUsage:\n- file_path must be an absolute path\n- Reads up to 2000 lines by default; use offset + limit for large files\n- Supports text files, and Jupyter notebooks (.ipynb)\n- Returns content in cat -n format: "   1	<line content>"', (base, ctx) => {
@@ -43293,7 +44653,7 @@ ${hints.join("\n")}` : base;
       const limit2 = typeof input["limit"] === "number" ? input["limit"] : MAX_LINES;
       if (!filePath) return { content: "Error: file_path is required", isError: true };
       try {
-        const fileStat = await stat5(filePath);
+        const fileStat = await stat6(filePath);
         if (fileStat.isDirectory()) return { content: `Error: ${filePath} is a directory. Use bash to list directories.`, isError: true };
         if (fileStat.size > MAX_READ_BYTES) {
           return {
@@ -43303,8 +44663,8 @@ ${hints.join("\n")}` : base;
         }
         const ext = extname(filePath).toLowerCase();
         if (ext === ".ipynb") {
-          const raw2 = await readFile14(filePath, "utf-8");
-          _ctx.readFileState?.record(filePath, fileStat.size);
+          const raw2 = await readFile15(filePath, "utf-8");
+          _ctx.readFileState?.record(filePath, fileStat.size, fileStat.mtimeMs);
           const nb = JSON.parse(raw2);
           const cells = nb.cells ?? [];
           const lines = [];
@@ -43314,8 +44674,8 @@ ${hints.join("\n")}` : base;
           });
           return { content: lines.join("\n"), isError: false };
         }
-        const raw = await readFile14(filePath, "utf-8");
-        _ctx.readFileState?.record(filePath, fileStat.size);
+        const raw = await readFile15(filePath, "utf-8");
+        _ctx.readFileState?.record(filePath, fileStat.size, fileStat.mtimeMs);
         const allLines = raw.split("\n");
         const startIdx = offset - 1;
         const sliced = allLines.slice(startIdx, startIdx + limit2);
@@ -43344,11 +44704,11 @@ var init_read_file = __esm({
 
 // src/tools/fs/workspaceGuard.ts
 import { existsSync as existsSync5, realpathSync as realpathSync3 } from "fs";
-import { dirname as dirname8, isAbsolute as isAbsolute2, relative as relative2, resolve as resolve4, sep as sep4 } from "path";
+import { dirname as dirname9, isAbsolute as isAbsolute2, relative as relative2, resolve as resolve4, sep as sep4 } from "path";
 function findExistingAncestor2(path4) {
   let current = path4;
   while (!existsSync5(current)) {
-    const parent = dirname8(current);
+    const parent = dirname9(current);
     if (parent === current) break;
     current = parent;
   }
@@ -43374,8 +44734,8 @@ var init_workspaceGuard = __esm({
 });
 
 // src/tools/fs/write_file/index.ts
-import { mkdir as mkdir12, writeFile as writeFile11 } from "fs/promises";
-import { dirname as dirname9 } from "path";
+import { mkdir as mkdir13, writeFile as writeFile12 } from "fs/promises";
+import { dirname as dirname10 } from "path";
 async function createWriteFileTool() {
   const description = "Write content to a file. Creates the file (and parent directories) if it does not exist; overwrites if it does.\n\nUsage:\n- file_path must be an absolute path\n- Prefer edit_file for modifying existing files\n- Parent directories are created automatically";
   return {
@@ -43401,8 +44761,8 @@ async function createWriteFileTool() {
         return { content: `Error: content is too large to write safely (${Buffer.byteLength(content, "utf-8")} bytes).`, isError: true };
       }
       try {
-        await mkdir12(dirname9(filePath), { recursive: true });
-        await writeFile11(filePath, content, "utf-8");
+        await mkdir13(dirname10(filePath), { recursive: true });
+        await writeFile12(filePath, content, "utf-8");
         const lines = content.split("\n").length;
         return { content: `Successfully wrote ${lines} lines to ${filePath}`, isError: false };
       } catch (err) {
@@ -43421,7 +44781,7 @@ var init_write_file = __esm({
 });
 
 // src/tools/fs/edit_file/index.ts
-import { readFile as readFile15, stat as stat6, writeFile as writeFile12 } from "fs/promises";
+import { readFile as readFile16, stat as stat7, writeFile as writeFile13 } from "fs/promises";
 async function createEditFileTool() {
   const description = "Perform exact string replacement in a file.\n\nUsage:\n- old_string must appear exactly once in the file (unless replace_all: true)\n- Preserve exact indentation from the file\n- Use replace_all: true to rename a string across the entire file";
   return {
@@ -43438,25 +44798,48 @@ async function createEditFileTool() {
       },
       required: ["file_path", "old_string", "new_string"]
     },
-    async call(input, _ctx) {
+    async call(input, ctx) {
       const filePath = input["file_path"];
       const oldStr = input["old_string"];
       const newStr = input["new_string"];
       const replaceAll = input["replace_all"] === true;
       if (!filePath) return { content: "Error: file_path is required", isError: true };
-      const workspaceError = assertInsideWorkspace(filePath, _ctx.workspaceRoot);
+      if (typeof oldStr !== "string" || oldStr.length === 0) {
+        return { content: "Error: old_string must be a non-empty string", isError: true };
+      }
+      if (typeof newStr !== "string") {
+        return { content: "Error: new_string must be a string", isError: true };
+      }
+      const workspaceError = assertInsideWorkspace(filePath, ctx.workspaceRoot);
       if (workspaceError) return { content: workspaceError, isError: true };
       try {
-        const fileStat = await stat6(filePath);
+        const fileStat = await stat7(filePath);
         if (fileStat.size > MAX_EDIT_BYTES) {
           return { content: `Error: file is too large to edit safely (${fileStat.size} bytes). Use a targeted patch workflow.`, isError: true };
         }
-        const content = await readFile15(filePath, "utf-8");
-        const occurrences = content.split(oldStr).length - 1;
+        const cacheEntry = ctx.readFileState?.get?.(filePath);
+        if (cacheEntry) {
+          const sizeChanged = cacheEntry.sizeBytes !== fileStat.size;
+          const mtimeChanged = cacheEntry.mtimeMs !== void 0 && Number.isFinite(fileStat.mtimeMs) && Math.abs(fileStat.mtimeMs - cacheEntry.mtimeMs) > 1;
+          if (sizeChanged || mtimeChanged) {
+            return {
+              content: `Error: ${filePath} changed on disk since it was last read (size or mtime drifted). Re-read the file (read_file) before editing.`,
+              isError: true
+            };
+          }
+        }
+        const content = await readFile16(filePath, "utf-8");
+        const pieces = content.split(oldStr);
+        const occurrences = pieces.length - 1;
         if (occurrences === 0) return { content: `Error: old_string not found in ${filePath}`, isError: true };
         if (!replaceAll && occurrences > 1) return { content: `Error: old_string appears ${occurrences} times. Use replace_all: true or add more context.`, isError: true };
-        const updated = replaceAll ? content.split(oldStr).join(newStr) : content.replace(oldStr, newStr);
-        await writeFile12(filePath, updated, "utf-8");
+        const updated = replaceAll ? pieces.join(newStr) : pieces[0] + newStr + pieces.slice(1).join(oldStr);
+        await writeFile13(filePath, updated, "utf-8");
+        try {
+          const after = await stat7(filePath);
+          ctx.readFileState?.record?.(filePath, after.size, after.mtimeMs);
+        } catch {
+        }
         return { content: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${filePath}`, isError: false };
       } catch (err) {
         return { content: `Error editing file: ${err instanceof Error ? err.message : String(err)}`, isError: true };
@@ -43474,8 +44857,8 @@ var init_edit_file = __esm({
 });
 
 // src/tools/fs/glob/index.ts
-import { readdir as readdir9, stat as stat7 } from "fs/promises";
-import { join as join23, relative as relative3, basename } from "path";
+import { readdir as readdir10, stat as stat8 } from "fs/promises";
+import { join as join25, relative as relative3, basename } from "path";
 function matchGlob(pattern, filePath) {
   let out = "";
   for (let i = 0; i < pattern.length; i++) {
@@ -43513,14 +44896,14 @@ function matchGlob(pattern, filePath) {
 async function walkDir(dir, results, max, signal) {
   if (results.length >= max) return;
   try {
-    for (const entry of await readdir9(dir, { withFileTypes: true })) {
+    for (const entry of await readdir10(dir, { withFileTypes: true })) {
       if (results.length >= max || signal?.aborted) break;
-      const full = join23(dir, entry.name);
+      const full = join25(dir, entry.name);
       if (entry.isDirectory()) {
         if (!SKIP_DIRS.has(entry.name)) await walkDir(full, results, max, signal);
       } else {
         try {
-          results.push({ path: full, mtime: (await stat7(full)).mtimeMs });
+          results.push({ path: full, mtime: (await stat8(full)).mtimeMs });
         } catch {
         }
       }
@@ -43584,8 +44967,8 @@ var init_glob = __esm({
 
 // src/tools/fs/grep/index.ts
 import { execFile as execFile3 } from "child_process";
-import { readdir as readdir10, readFile as readFile16, stat as stat8 } from "fs/promises";
-import { join as join24 } from "path";
+import { readdir as readdir11, readFile as readFile17, stat as stat9 } from "fs/promises";
+import { join as join26 } from "path";
 import { promisify as promisify3 } from "util";
 async function isRgAvailable() {
   if (_rgAvailable !== null) return _rgAvailable;
@@ -43666,24 +45049,24 @@ async function createGrepTool() {
       async function scanDir(dir) {
         if (stoppedEarly || _ctx.abortSignal.aborted) return;
         try {
-          for (const entry of await readdir10(dir, { withFileTypes: true })) {
+          for (const entry of await readdir11(dir, { withFileTypes: true })) {
             if (_ctx.abortSignal.aborted || Date.now() - startedAt > FALLBACK_MAX_MS || filesScanned >= FALLBACK_MAX_FILES || bytesScanned >= FALLBACK_MAX_BYTES) {
               stoppedEarly = true;
               break;
             }
-            const full = join24(dir, entry.name);
+            const full = join26(dir, entry.name);
             if (entry.isDirectory()) {
               if (!["node_modules", ".git", "dist"].includes(entry.name)) await scanDir(full);
             } else {
               try {
-                const fileStat = await stat8(full);
+                const fileStat = await stat9(full);
                 filesScanned++;
                 bytesScanned += fileStat.size;
                 if (bytesScanned > FALLBACK_MAX_BYTES) {
                   stoppedEarly = true;
                   break;
                 }
-                if (regex2.test(await readFile16(full, "utf-8"))) matchedFiles.push(full);
+                if (regex2.test(await readFile17(full, "utf-8"))) matchedFiles.push(full);
               } catch {
               }
             }
@@ -43692,10 +45075,10 @@ async function createGrepTool() {
         }
       }
       try {
-        const searchStat = await stat8(searchPath);
+        const searchStat = await stat9(searchPath);
         if (searchStat.isFile()) {
           if (searchStat.size > FALLBACK_MAX_BYTES) return { content: `Error: file too large to search safely (${searchStat.size} bytes)`, isError: true };
-          if (regex2.test(await readFile16(searchPath, "utf-8"))) matchedFiles.push(searchPath);
+          if (regex2.test(await readFile17(searchPath, "utf-8"))) matchedFiles.push(searchPath);
         } else await scanDir(searchPath);
       } catch (e) {
         return { content: `Error: ${e instanceof Error ? e.message : String(e)}`, isError: true };
@@ -43721,7 +45104,7 @@ var init_grep = __esm({
 });
 
 // src/tools/fs/notebook_edit/index.ts
-import { readFile as readFile17, stat as stat9, writeFile as writeFile13 } from "fs/promises";
+import { readFile as readFile18, stat as stat10, writeFile as writeFile14 } from "fs/promises";
 async function createNotebookEditTool() {
   const description = 'Replace, insert, or delete a cell in a Jupyter notebook (.ipynb file).\n\nUsage:\n- notebook_path: absolute path to the .ipynb file\n- cell_number: 0-indexed cell position\n- new_source: new cell content (required for replace/insert)\n- cell_type: "code" or "markdown" (default: "code")\n- edit_mode: "replace" (default), "insert" (add new cell at index), "delete"';
   return {
@@ -43750,11 +45133,11 @@ async function createNotebookEditTool() {
       if (workspaceError) return { content: workspaceError, isError: true };
       if (mode !== "delete" && src === void 0) return { content: "Error: new_source required", isError: true };
       try {
-        const fileStat = await stat9(p);
+        const fileStat = await stat10(p);
         if (fileStat.size > MAX_NOTEBOOK_BYTES) {
           return { content: `Error: notebook is too large to edit safely (${fileStat.size} bytes).`, isError: true };
         }
-        const nb = JSON.parse(await readFile17(p, "utf-8"));
+        const nb = JSON.parse(await readFile18(p, "utf-8"));
         if (!Array.isArray(nb.cells)) return { content: "Error: invalid notebook", isError: true };
         const toLines = (s) => s.split("\n").map((l, i, arr) => i < arr.length - 1 ? l + "\n" : l);
         if (mode === "delete") {
@@ -43772,7 +45155,7 @@ async function createNotebookEditTool() {
             cell.execution_count = null;
           }
         }
-        await writeFile13(p, JSON.stringify(nb, null, 1), "utf-8");
+        await writeFile14(p, JSON.stringify(nb, null, 1), "utf-8");
         return { content: `Cell ${n} ${mode}d in ${p}`, isError: false };
       } catch (err) {
         return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
@@ -43896,7 +45279,7 @@ var init_get_sub_agent_status = __esm({
 });
 
 // src/workflow/WorkflowStateStore.ts
-import { join as join25 } from "path";
+import { join as join27 } from "path";
 var WorkflowStateStore;
 var init_WorkflowStateStore = __esm({
   "src/workflow/WorkflowStateStore.ts"() {
@@ -43904,7 +45287,7 @@ var init_WorkflowStateStore = __esm({
     init_persist();
     WorkflowStateStore = class _WorkflowStateStore {
       static stateFile(projectDir) {
-        return join25(projectDir, ".meta-agent", "workflow-state.json");
+        return join27(projectDir, ".meta-agent", "workflow-state.json");
       }
       static async read(projectDir) {
         const s = await readJsonFile(_WorkflowStateStore.stateFile(projectDir));
@@ -44248,58 +45631,190 @@ var init_tools2 = __esm({
   }
 });
 
+// src/robotics/team/types.ts
+function isActiveTask(task) {
+  return Boolean(task.ownerUnit) && task.status !== "done";
+}
+function isStaleClaim(task) {
+  if (task.status === "done") return false;
+  if (!task.claimedAt) return false;
+  const claimed = Date.parse(task.claimedAt);
+  if (Number.isNaN(claimed)) return false;
+  return Date.now() - claimed > STALE_CLAIM_MS;
+}
+var STALE_CLAIM_MS, VALID_TASK_STATUSES;
+var init_types10 = __esm({
+  "src/robotics/team/types.ts"() {
+    "use strict";
+    STALE_CLAIM_MS = 7 * 24 * 60 * 60 * 1e3;
+    VALID_TASK_STATUSES = ["open", "paused", "done"];
+  }
+});
+
+// src/robotics/team/render.ts
+function attemptsCount(task) {
+  return `${task.attempts.length} \u6B21\u5C1D\u8BD5`;
+}
+function relTime(iso) {
+  if (!iso) return "";
+  const ms = Date.now() - Date.parse(iso);
+  if (Number.isNaN(ms) || ms < 0) return "";
+  const m = Math.floor(ms / 6e4);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  const d = Math.floor(h / 24);
+  return `${d}d ago`;
+}
+function renderBoard(state) {
+  const owned = state.tasks.filter((t) => t.ownerUnit && t.status !== "done");
+  const paused = state.tasks.filter((t) => t.status === "paused");
+  const open5 = state.tasks.filter((t) => !t.ownerUnit && t.status === "open");
+  const done = state.tasks.filter((t) => t.status === "done");
+  const lines = ["# Team Board", ""];
+  lines.push("## \u8FDB\u884C\u4E2D\uFF08\u9501\u5B9A\uFF09");
+  if (owned.length === 0) {
+    lines.push("- _none_", "");
+  } else {
+    for (const t of owned) {
+      const marker = isStaleClaim(t) ? "\u26A0" : "\u{1F512}";
+      const claim = t.claimedAt ? ` \xB7 claimed ${relTime(t.claimedAt)}` : "";
+      lines.push(`- ${marker} ${t.id} ${t.title} \xB7 ${t.ownerUnit}${claim} \xB7 ${attemptsCount(t)}`);
+    }
+    lines.push("");
+  }
+  if (paused.length > 0) {
+    lines.push("## \u6682\u505C");
+    for (const t of paused) {
+      const owner = t.ownerUnit ? ` \xB7 ${t.ownerUnit}` : "";
+      lines.push(`- ${t.id} ${t.title}${owner} \xB7 ${attemptsCount(t)}`);
+    }
+    lines.push("");
+  }
+  lines.push("## \u5F85\u9886");
+  if (open5.length === 0) {
+    lines.push("- _none_", "");
+  } else {
+    for (const t of open5) lines.push(`- ${t.id} ${t.title}`);
+    lines.push("");
+  }
+  if (done.length > 0) {
+    lines.push("## \u5DF2\u5B8C\u6210");
+    for (const t of done.slice(-10)) {
+      lines.push(`- ${t.id} ${t.title} \xB7 ${attemptsCount(t)}`);
+    }
+    lines.push("");
+  }
+  if (state.units.length > 0) {
+    lines.push("## Units");
+    for (const u of state.units) {
+      const cur = u.currentTask ? ` task=${u.currentTask}` : "";
+      lines.push(`- ${u.id} \xB7 ${u.status} \xB7 last seen ${relTime(u.lastSeen)}${cur}`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}
+`;
+}
+function renderLog(state, limit2 = 30) {
+  const rows = [];
+  for (const t of state.tasks) {
+    for (const a of t.attempts) {
+      rows.push({ at: a.at, taskId: t.id, title: t.title, unit: a.unit, direction: a.direction, outcome: a.outcome, ref: a.ref });
+    }
+  }
+  rows.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  const lines = ["# Team Log", "", `_\u6700\u8FD1 ${Math.min(limit2, rows.length)} \u6761\u5C1D\u8BD5_`, ""];
+  if (rows.length === 0) {
+    lines.push("_\u5C1A\u65E0\u4EFB\u4F55 attempt \u8BB0\u5F55\u3002\u4F7F\u7528 `/team note` \u8FFD\u52A0\u3002_", "");
+  } else {
+    for (const r of rows.slice(0, limit2)) {
+      lines.push(`- [${r.at}] ${r.unit} / ${r.taskId} _${r.title}_`);
+      lines.push(`  \u65B9\u5411\uFF1A${r.direction}`);
+      lines.push(`  \u7ED3\u679C\uFF1A${r.outcome}`);
+      if (r.ref) lines.push(`  ref: ${r.ref}`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n").trimEnd()}
+`;
+}
+function renderGoals(state) {
+  const lines = ["# Team Goals", ""];
+  if (state.goals.length === 0) {
+    lines.push("_\u5C1A\u65E0 goals\u3002\u7F16\u8F91 team.json \u7684 `goals` \u5B57\u6BB5\u8BB0\u5F55\u9879\u76EE\u7EA7\u76EE\u6807\u3002_");
+  } else {
+    for (const g of state.goals) lines.push(`- ${g}`);
+  }
+  lines.push("");
+  return `${lines.join("\n").trimEnd()}
+`;
+}
+function renderReadme() {
+  return [
+    "# Team Mode files (v2.0)",
+    "",
+    "Team mode is a **shared lab notebook**, not a project manager.  Three",
+    "concepts only: unit, task, and attempt (direction + outcome).",
+    "",
+    "## Source of truth \u2014 commit these",
+    "",
+    "- `team.json` \u2014 single shared state.  Every other file is derived.",
+    "",
+    "## Derived views \u2014 regenerated on every team write",
+    "",
+    "These files are convenience renderings of `team.json` and are rewritten",
+    "atomically each time the state changes.  Commit them only if you want",
+    "GitHub viewers to see the rendered output without the CLI;",
+    "they will be overwritten on the next team action.",
+    "",
+    "- `board.md`  \u2014 \u5F53\u524D\u8C01\u5728\u505A\u4EC0\u4E48\uFF08\u{1F512} \u6807\u8BB0\u9501\u5B9A\uFF0C\u26A0 \u6807\u8BB0 \u22657d \u9648\u65E7\uFF09",
+    "- `log.md`    \u2014 \u6700\u8FD1\u7684 attempts\uFF08\u65B9\u5411 + \u7ED3\u679C\uFF0C\u542B\u5931\u8D25\uFF09",
+    "- `goals.md`  \u2014 \u9879\u76EE\u76EE\u6807",
+    "",
+    "## Commands",
+    "",
+    "- `/team`                \u2014 board + log",
+    "- `/team take <task-id>` \u2014 \u6392\u4ED6\u9886\u53D6\uFF08\u5DF2\u88AB\u9886\u5219\u5931\u8D25\u5E76\u6253\u5370 owner\uFF09",
+    '- `/team note <id> "<direction>" :: "<outcome>" [@ref]` \u2014 \u8FFD\u52A0\u4E00\u6761\u5C1D\u8BD5',
+    "- `/team drop [id]`      \u2014 \u91CA\u653E\uFF08\u4EC5 owner\uFF09",
+    "- `/team done [id]`      \u2014 \u6807\u5B8C\u6210\uFF08\u4EC5 owner\uFF09",
+    '- `/team add "<title>"`  \u2014 \u65B0\u589E\u4EFB\u52A1',
+    "- `/team steal <id> [reason]` \u2014 \u5F3A\u5236\u63A5\u624B\u4ED6\u4EBA\u4EFB\u52A1\uFF08\u81EA\u52A8\u5199 audit attempt\uFF09",
+    "",
+    "## Migration",
+    "",
+    "Older v1.0 files (with modules/decisions/paths) are migrated forward",
+    "on read: 9-state status collapses into open|paused|done, ownership",
+    "is preserved, and attempts[] is initialised empty.",
+    "",
+    "## Concurrency",
+    "",
+    "Two units writing `team.json` at the same time: the optimistic check",
+    "(`updatedAt` comparison) rejects the second writer with a",
+    '"Concurrent modification" error.  Re-read and retry.',
+    "",
+    "Git merge conflicts on `team.json` should normally be resolved with",
+    "`git checkout --theirs`; `/team conflicts resolve` automates this.",
+    ""
+  ].join("\n");
+}
+var init_render = __esm({
+  "src/robotics/team/render.ts"() {
+    "use strict";
+    init_types10();
+  }
+});
+
 // src/robotics/team/TeamStore.ts
 import { execFile as execFile4 } from "node:child_process";
 import { hostname as hostname3 } from "node:os";
-import { basename as basename2, isAbsolute as isAbsolute3, join as join26, relative as relative4 } from "node:path";
+import { basename as basename2, join as join28 } from "node:path";
 import { promisify as promisify4 } from "node:util";
-import { mkdir as mkdir13, readFile as readFile18, writeFile as writeFile14 } from "node:fs/promises";
-function isActiveTask(task) {
-  return ACTIVE_TASK_STATUSES.has(task.status);
-}
-function normalizeRepoPath(value) {
-  return value.trim().replace(/\\/g, "/").replace(/^\.\//, "").replace(/^\/+/, "");
-}
-function patternBase(pattern) {
-  const normalized = normalizeRepoPath(pattern);
-  const wildcard = normalized.search(/[*?[\]{}]/);
-  if (wildcard < 0) {
-    return normalized.endsWith("/") ? normalized : `${normalized}/`;
-  }
-  const prefix = normalized.slice(0, wildcard);
-  const slash = prefix.lastIndexOf("/");
-  return slash >= 0 ? prefix.slice(0, slash + 1) : "";
-}
-function pathMatchesPattern(path4, pattern) {
-  const p = normalizeRepoPath(path4);
-  const pat = normalizeRepoPath(pattern);
-  if (!pat || pat === "TBD") return false;
-  if (pat === "**" || pat === "*") return true;
-  if (!/[*?[\]{}]/.test(pat)) {
-    return p === pat || p.startsWith(`${pat.replace(/\/$/, "")}/`);
-  }
-  const base = patternBase(pat);
-  return base ? p.startsWith(base) : true;
-}
-function patternsOverlap(a, b) {
-  const left = normalizeRepoPath(a);
-  const right = normalizeRepoPath(b);
-  if (!left || !right || left === "TBD" || right === "TBD") return false;
-  if (pathMatchesPattern(left, right) || pathMatchesPattern(right, left)) return true;
-  const leftBase = patternBase(left);
-  const rightBase = patternBase(right);
-  if (!leftBase || !rightBase) return true;
-  return leftBase.startsWith(rightBase) || rightBase.startsWith(leftBase);
-}
+import { mkdir as mkdir14, readFile as readFile19 } from "node:fs/promises";
 function nowIso() {
   return (/* @__PURE__ */ new Date()).toISOString();
-}
-function parseIssueNumber(url2) {
-  const match = url2.match(/\/issues\/(\d+)(?:$|[/?#])/);
-  return match ? Number.parseInt(match[1], 10) : void 0;
-}
-function githubLabelValue(value) {
-  return value.toLowerCase().replace(/[^a-z0-9._:-]+/g, "-").replace(/^-|-$/g, "").slice(0, 50);
 }
 function defaultUnitId() {
   const user = process.env.USER || process.env.USERNAME || "user";
@@ -44308,118 +45823,37 @@ function defaultUnitId() {
 function defaultState(projectDir, github) {
   const ts = nowIso();
   return {
-    schemaVersion: "1.0",
+    schemaVersion: "2.0",
     project: basename2(projectDir) || "robotics-project",
     github,
     goals: [
-      "Define the shared robotics development target.",
-      "Split work by module boundaries before implementation."
+      "Describe what this team is trying to achieve.",
+      "Replace this with one to three concrete project-level goals."
     ],
-    modules: [
-      {
-        name: "robot-runtime",
-        paths: ["src/**"],
-        responsibilities: ["Core robot mode implementation and integration points."]
-      }
-    ],
-    tasks: [
-      {
-        id: "TASK-001",
-        title: "Create the first team-scoped development task",
-        status: "backlog",
-        module: "robot-runtime",
-        paths: ["src/**"],
-        updatedAt: ts
-      }
-    ],
+    tasks: [],
     units: [],
-    decisions: [
-      "GitHub repository files under team/ are the shared source of truth for team mode MVP."
-    ],
     updatedAt: ts
   };
 }
-function renderBoard(state) {
-  const groups = ["backlog", "claimed", "in_progress", "blocked", "review", "done", "paused", "handoff", "cancelled"];
-  const lines = ["# Team Board", ""];
-  for (const status of groups) {
-    const tasks = state.tasks.filter((t) => t.status === status);
-    lines.push(`## ${status}`);
-    if (tasks.length === 0) {
-      lines.push("");
-      continue;
-    }
-    for (const task of tasks) {
-      const owner = task.ownerUnit ? ` | Unit: ${task.ownerUnit}` : "";
-      const mod = task.module ? ` | Module: ${task.module}` : "";
-      const branch = task.branch ? ` | Branch: ${task.branch}` : "";
-      const issue2 = task.githubIssueUrl ? ` | Issue: ${task.githubIssueUrl}` : "";
-      lines.push(`- [${task.status === "done" ? "x" : " "}] ${task.id} ${task.title}${owner}${mod}${branch}${issue2}`);
-    }
-    lines.push("");
-  }
-  return `${lines.join("\n").trimEnd()}
-`;
-}
-function renderGoals(state) {
-  return `# Team Goals
-
-${state.goals.map((g) => `- ${g}`).join("\n")}
-`;
-}
-function renderModules(state) {
-  const lines = ["# Team Modules", ""];
-  for (const mod of state.modules) {
-    lines.push(`## ${mod.name}`);
-    lines.push(`Owner: ${mod.ownerUnit ?? "unclaimed"}`);
-    lines.push("Paths:");
-    mod.paths.forEach((p) => lines.push(`- ${p}`));
-    lines.push("Responsibilities:");
-    mod.responsibilities.forEach((r) => lines.push(`- ${r}`));
-    lines.push("");
-  }
-  return `${lines.join("\n").trimEnd()}
-`;
-}
-function renderUnits(state) {
-  const lines = ["# Team Units", ""];
-  for (const unit of state.units) {
-    lines.push(`## ${unit.id}`);
-    if (unit.human) lines.push(`Human: ${unit.human}`);
-    lines.push(`Machine: ${unit.machine}`);
-    lines.push(`Status: ${unit.status}`);
-    lines.push(`Current task: ${unit.currentTask ?? "none"}`);
-    lines.push(`Last seen: ${unit.lastSeen}`);
-    lines.push("");
-  }
-  if (state.units.length === 0) lines.push("No units joined yet.", "");
-  return `${lines.join("\n").trimEnd()}
-`;
-}
-function renderDecisions(state) {
-  return `# Team Decisions
-
-${state.decisions.map((d) => `- ${d}`).join("\n")}
-`;
-}
 async function fileText(path4) {
   try {
-    return await readFile18(path4, "utf8");
+    return await readFile19(path4, "utf8");
   } catch {
     return null;
   }
 }
-var execFileAsync4, TEAM_DIR, STATE_FILE, VALID_TASK_STATUSES, ACTIVE_TASK_STATUSES, TeamStore;
+var execFileAsync4, TEAM_DIR, STATE_FILE, FETCH_COOLDOWN_MS, TeamStore;
 var init_TeamStore = __esm({
   "src/robotics/team/TeamStore.ts"() {
     "use strict";
     init_persist();
     init_schemas3();
+    init_types10();
+    init_render();
     execFileAsync4 = promisify4(execFile4);
     TEAM_DIR = "team";
     STATE_FILE = "team.json";
-    VALID_TASK_STATUSES = ["backlog", "claimed", "in_progress", "blocked", "review", "done", "paused", "handoff", "cancelled"];
-    ACTIVE_TASK_STATUSES = /* @__PURE__ */ new Set(["claimed", "in_progress", "blocked", "review"]);
+    FETCH_COOLDOWN_MS = 10 * 60 * 1e3;
     TeamStore = class {
       constructor(projectDir, unitId = defaultUnitId()) {
         this.projectDir = projectDir;
@@ -44427,17 +45861,29 @@ var init_TeamStore = __esm({
       }
       projectDir;
       unitId;
+      _lastFetchAt = 0;
       get teamDir() {
-        return join26(this.projectDir, TEAM_DIR);
+        return join28(this.projectDir, TEAM_DIR);
       }
       get statePath() {
-        return join26(this.teamDir, STATE_FILE);
+        return join28(this.teamDir, STATE_FILE);
       }
+      msSinceLastFetch() {
+        return this._lastFetchAt === 0 ? Number.POSITIVE_INFINITY : Date.now() - this._lastFetchAt;
+      }
+      /** Returns true when team.json exists for this project. */
+      async exists() {
+        return await fileText(this.statePath) !== null;
+      }
+      async status() {
+        return this.read();
+      }
+      // ── Lifecycle ──────────────────────────────────────────────────────────────
       async init(github) {
         const existing = await this.read();
         if (existing) return existing;
         const state = defaultState(this.projectDir, github);
-        await this.writeAll(state, `team initialized by ${this.unitId}`);
+        await this.writeAll(state);
         return state;
       }
       async join(github, human) {
@@ -44455,67 +45901,10 @@ var init_TeamStore = __esm({
         state.units = [...state.units.filter((u) => u.id !== this.unitId), unit];
         if (github) state.github = github;
         state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} joined team mode`, originalUpdatedAt);
+        await this.writeAll(state, originalUpdatedAt);
         return state;
       }
-      async claim(taskId) {
-        const state = await this.ensure();
-        const task = state.tasks.find((t) => t.id.toLowerCase() === taskId.toLowerCase());
-        if (!task) throw new Error(`Unknown team task: ${taskId}`);
-        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
-          throw new Error(`${task.id} is already owned by ${task.ownerUnit}`);
-        }
-        const advancedStatuses = ["in_progress", "review", "blocked", "handoff"];
-        if (advancedStatuses.includes(task.status) && task.ownerUnit === this.unitId) {
-          throw new Error(
-            `${task.id} is already at status '${task.status}'. Use /team task status ${task.id} <status> to change it explicitly.`
-          );
-        }
-        const warnings = this.detectPathConflicts(state, task);
-        const branch = this.makeBranchName(task);
-        const originalUpdatedAt = state.updatedAt;
-        task.ownerUnit = this.unitId;
-        task.status = "claimed";
-        task.branch = task.branch ?? branch;
-        task.updatedAt = nowIso();
-        const unit = this.ensureUnit(state);
-        unit.status = "active";
-        unit.currentTask = task.id;
-        unit.lastSeen = nowIso();
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} claimed ${task.id}`, originalUpdatedAt);
-        return { state, task, warnings };
-      }
-      /**
-       * Transition a task from `claimed` (or `backlog`) → `in_progress`.
-       * Call this when the unit actually begins making changes to the codebase,
-       * as opposed to `claim()` which merely reserves the task.
-       */
-      async startTask(taskId) {
-        const state = await this.ensure();
-        const id = taskId || state.units.find((u) => u.id === this.unitId)?.currentTask;
-        if (!id) throw new Error("No task specified and this unit has no current task.");
-        const task = state.tasks.find((t) => t.id.toLowerCase() === id.toLowerCase());
-        if (!task) throw new Error(`Unknown team task: ${id}`);
-        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
-          throw new Error(`${task.id} is owned by ${task.ownerUnit}`);
-        }
-        if (!["claimed", "backlog", "paused"].includes(task.status)) {
-          throw new Error(
-            `${task.id} is at status '${task.status}'; use /team task status ${task.id} in_progress to advance it explicitly.`
-          );
-        }
-        const originalUpdatedAt = state.updatedAt;
-        task.status = "in_progress";
-        task.updatedAt = nowIso();
-        const unit = this.ensureUnit(state);
-        unit.currentTask = task.id;
-        unit.status = "active";
-        unit.lastSeen = nowIso();
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} started ${task.id}`, originalUpdatedAt);
-        return { state, task };
-      }
+      // ── Task mutations ────────────────────────────────────────────────────────
       async addTask(input) {
         const state = await this.ensure();
         const id = input.id.trim().toUpperCase();
@@ -44525,32 +45914,173 @@ var init_TeamStore = __esm({
         if (state.tasks.some((t) => t.id.toLowerCase() === id.toLowerCase())) {
           throw new Error(`${id} already exists`);
         }
+        if (!input.title.trim()) throw new Error("Task title is required");
         const task = {
           id,
           title: input.title.trim(),
-          status: "backlog",
-          module: input.module?.trim() || void 0,
-          paths: input.paths?.map((p) => p.trim()).filter(Boolean) ?? ["TBD"],
+          status: "open",
+          attempts: [],
           updatedAt: nowIso()
         };
-        if (!task.title) throw new Error("Task title is required");
         const originalUpdatedAt = state.updatedAt;
         state.tasks.push(task);
         state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} added ${task.id}`, originalUpdatedAt);
+        await this.writeAll(state, originalUpdatedAt);
         return { state, task };
       }
+      /**
+       * Exclusively claim a task.  Fails fast if another unit already owns it.
+       * Re-taking your own claim is a no-op (returns the same task).
+       */
+      async take(taskId) {
+        const state = await this.ensure();
+        const task = this.requireTask(state, taskId);
+        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
+          throw new Error(this.formatOwnedError(task));
+        }
+        if (task.status === "done") {
+          throw new Error(`${task.id} \u5DF2 done\uFF0C\u65E0\u6CD5\u9886\u53D6\u3002`);
+        }
+        if (task.ownerUnit === this.unitId) {
+          const unit2 = this.ensureUnit(state);
+          const wasPaused = task.status === "paused";
+          if (unit2.currentTask !== task.id || wasPaused) {
+            const originalUpdatedAt2 = state.updatedAt;
+            if (wasPaused) {
+              task.status = "open";
+              task.updatedAt = nowIso();
+            }
+            unit2.currentTask = task.id;
+            unit2.lastSeen = nowIso();
+            state.updatedAt = nowIso();
+            await this.writeAll(state, originalUpdatedAt2);
+          }
+          return { state, task };
+        }
+        const originalUpdatedAt = state.updatedAt;
+        task.ownerUnit = this.unitId;
+        task.status = task.status === "paused" ? "open" : task.status;
+        task.claimedAt = nowIso();
+        task.updatedAt = nowIso();
+        const unit = this.ensureUnit(state);
+        unit.currentTask = task.id;
+        unit.status = "active";
+        unit.lastSeen = nowIso();
+        state.updatedAt = nowIso();
+        await this.writeAll(state, originalUpdatedAt);
+        return { state, task };
+      }
+      /**
+       * Release a task.  Only the current owner can drop.  Sets ownerUnit=null
+       * and clears the recorded claimedAt.
+       */
+      async drop(taskId) {
+        const state = await this.ensure();
+        const id = taskId || state.units.find((u) => u.id === this.unitId)?.currentTask;
+        if (!id) throw new Error("No task specified and this unit has no current task.");
+        const task = this.requireTask(state, id);
+        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
+          throw new Error(`${task.id} \u88AB ${task.ownerUnit} \u6301\u6709\uFF0C\u65E0\u6CD5 drop\u3002\u9700\u8981\u4EA4\u63A5\u8BF7\u7528 /team steal\u3002`);
+        }
+        if (!task.ownerUnit) return { state, task };
+        const originalUpdatedAt = state.updatedAt;
+        task.ownerUnit = void 0;
+        task.claimedAt = void 0;
+        task.updatedAt = nowIso();
+        const unit = this.ensureUnit(state);
+        if (unit.currentTask === task.id) {
+          unit.currentTask = void 0;
+          unit.lastSeen = nowIso();
+        }
+        state.updatedAt = nowIso();
+        await this.writeAll(state, originalUpdatedAt);
+        return { state, task };
+      }
+      /**
+       * Forcibly take a task already owned by someone else.  Writes an audit
+       * entry to attempts[] so the prior owner can see why.
+       */
+      async steal(taskId, reason) {
+        const state = await this.ensure();
+        const task = this.requireTask(state, taskId);
+        const previousOwner = task.ownerUnit;
+        if (!previousOwner) {
+          return { ...await this.take(taskId), previousOwner: void 0 };
+        }
+        if (previousOwner === this.unitId) {
+          return { state, task, previousOwner: void 0 };
+        }
+        const originalUpdatedAt = state.updatedAt;
+        const claimedAgo = task.claimedAt ? `${Math.round((Date.now() - Date.parse(task.claimedAt)) / 864e5)}d ago` : "unknown";
+        task.attempts.push({
+          at: nowIso(),
+          unit: this.unitId,
+          direction: `stolen from ${previousOwner}`,
+          outcome: reason?.trim() || `previously claimed ${claimedAgo}; no reason given`
+        });
+        task.ownerUnit = this.unitId;
+        task.claimedAt = nowIso();
+        task.updatedAt = nowIso();
+        const unit = this.ensureUnit(state);
+        unit.currentTask = task.id;
+        unit.status = "active";
+        unit.lastSeen = nowIso();
+        state.updatedAt = nowIso();
+        await this.writeAll(state, originalUpdatedAt);
+        return { state, task, previousOwner };
+      }
+      /**
+       * Append a single attempt entry to a task's log.  Only the owner can
+       * record attempts (forces "if you want to write here, take it first").
+       */
+      async note(input) {
+        const direction = input.direction.trim();
+        const outcome = input.outcome.trim();
+        if (!direction) throw new Error("note direction is required");
+        if (!outcome) throw new Error("note outcome is required");
+        const state = await this.ensure();
+        const task = this.requireTask(state, input.taskId);
+        if (!task.ownerUnit) {
+          throw new Error(`${task.id} \u5F53\u524D\u65E0\u4EBA\u6301\u6709\uFF1B\u5148 /team take ${task.id} \u518D\u8BB0\u5F55\u3002`);
+        }
+        if (task.ownerUnit !== this.unitId) {
+          throw new Error(`${task.id} \u5C5E\u4E8E ${task.ownerUnit}\uFF0C\u4F60\u4E0D\u662F owner\uFF0C\u65E0\u6CD5 note\u3002`);
+        }
+        const originalUpdatedAt = state.updatedAt;
+        const attempt = {
+          at: nowIso(),
+          unit: this.unitId,
+          direction,
+          outcome,
+          ref: input.ref?.trim() || void 0
+        };
+        task.attempts.push(attempt);
+        task.updatedAt = nowIso();
+        const unit = this.ensureUnit(state);
+        unit.lastSeen = nowIso();
+        state.updatedAt = nowIso();
+        await this.writeAll(state, originalUpdatedAt);
+        return { state, task, attempt };
+      }
+      /**
+       * Transition a task's status (open ⇄ paused, or → done).
+       * Only the owner can change status; clears ownership when marking done.
+       */
       async updateTaskStatus(taskId, status) {
         if (!VALID_TASK_STATUSES.includes(status)) {
           throw new Error(`Invalid task status: ${status}`);
         }
         const state = await this.ensure();
-        const task = state.tasks.find((t) => t.id.toLowerCase() === taskId.toLowerCase());
-        if (!task) throw new Error(`Unknown team task: ${taskId}`);
+        const task = this.requireTask(state, taskId);
+        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
+          throw new Error(`${task.id} \u5C5E\u4E8E ${task.ownerUnit}\uFF0C\u65E0\u6CD5\u66F4\u6539\u72B6\u6001\u3002`);
+        }
         const originalUpdatedAt = state.updatedAt;
         task.status = status;
         task.updatedAt = nowIso();
-        if (status === "done" || status === "cancelled") {
+        if (status === "done") {
+          task.ownerUnit = void 0;
+          task.claimedAt = void 0;
           for (const unit of state.units) {
             if (unit.currentTask === task.id) {
               unit.currentTask = void 0;
@@ -44559,351 +46089,14 @@ var init_TeamStore = __esm({
           }
         }
         state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} moved ${task.id} to ${status}`, originalUpdatedAt);
+        await this.writeAll(state, originalUpdatedAt);
         return { state, task };
       }
-      async checkWorkspaceConflicts() {
-        const state = await this.ensure();
-        const changedFiles = await this.changedWorkspaceFiles();
-        return this.checkPaths(changedFiles, state);
-      }
-      async checkPathsConflicts(paths) {
-        const state = await this.ensure();
-        const files = paths.map((path4) => this.toRepoPath(path4)).filter(Boolean).map(normalizeRepoPath);
-        return this.checkPaths(files, state);
-      }
-      /**
-       * Return the files actually changed on `task.branch` relative to the base branch.
-       *
-       * Uses `git diff --name-only <base>...<branch>` which includes all commits
-       * reachable from branch but not from base.  Falls back to an empty list when
-       * the branch doesn't exist locally, git isn't available, or the task has no
-       * recorded branch.
-       */
-      async actualChangedFilesForTask(task) {
-        if (!task.branch) return [];
-        try {
-          const baseBranch = await this.defaultBaseBranch();
-          const output = await this.gitOne(["diff", "--name-only", `${baseBranch}...${task.branch}`]).catch(() => "");
-          return output.split("\n").map((l) => normalizeRepoPath(l.trim())).filter(Boolean);
-        } catch {
-          return [];
-        }
-      }
-      async branchForTask(taskId) {
-        const state = await this.ensure();
-        const task = this.resolveTaskForUnit(state, taskId);
-        if (task.ownerUnit && task.ownerUnit !== this.unitId) {
-          throw new Error(`${task.id} is owned by ${task.ownerUnit}; cannot switch this unit to its branch.`);
-        }
-        const branch = task.branch ?? this.makeBranchName(task);
-        if (!/^[a-zA-Z0-9][a-zA-Z0-9/_.-]*$/.test(branch)) {
-          throw new Error(`Invalid branch name: "${branch}". Must contain only [a-zA-Z0-9/_.-] and must not start with a dash.`);
-        }
-        const previousBranch = await this.currentGitBranch();
-        const branches = await this.gitLines(["branch", "--list", branch]);
-        const created = branches.length === 0;
-        if (created) {
-          await execFileAsync4("git", ["checkout", "-b", branch], { cwd: this.projectDir, timeout: 3e4 });
-        } else {
-          await execFileAsync4("git", ["checkout", branch], { cwd: this.projectDir, timeout: 3e4 });
-        }
-        const originalUpdatedAt = state.updatedAt;
-        task.ownerUnit = this.unitId;
-        task.status = ["backlog", "claimed"].includes(task.status) ? "in_progress" : task.status;
-        task.branch = branch;
-        task.updatedAt = nowIso();
-        const unit = this.ensureUnit(state);
-        unit.currentTask = task.id;
-        unit.status = "active";
-        unit.lastSeen = nowIso();
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} switched to ${task.id} branch ${branch}`, originalUpdatedAt);
-        return { state, task, branch, previousBranch, created };
-      }
-      async pushCurrentBranch() {
-        const branch = await this.currentGitBranch();
-        if (!branch) throw new Error("No current git branch to push.");
-        let output = "";
-        try {
-          const result = await execFileAsync4("git", ["push", "-u", "origin", branch], { cwd: this.projectDir, timeout: 12e4 });
-          output = `${result.stdout}${result.stderr}`.trim();
-        } catch (err) {
-          const e = err;
-          throw new Error(`git push failed: ${(e.stderr || e.stdout || e.message || String(err)).trim()}`);
-        }
-        const upstream = await this.gitOne(["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]).catch(() => void 0);
-        return { branch, upstream, pushed: true, output };
-      }
-      async createPrDraft(taskId) {
-        const state = await this.ensure();
-        const task = this.resolveTaskForUnit(state, taskId);
-        const branch = task.branch ?? await this.currentGitBranch();
-        if (!branch) throw new Error(`No branch recorded for ${task.id}. Run /team branch ${task.id} first.`);
-        const baseBranch = await this.defaultBaseBranch();
-        const changedFiles = await this.changedFilesAgainst(baseBranch, branch);
-        const title = `${task.id}: ${task.title}`;
-        const body = [
-          `Task: ${task.id}`,
-          `Unit: ${this.unitId}`,
-          `Module: ${task.module ?? "n/a"}`,
-          `Branch: ${branch}`,
-          `Base: ${baseBranch}`,
-          "",
-          "## Summary",
-          "- ",
-          "",
-          "## Touched paths",
-          ...changedFiles.length > 0 ? changedFiles.map((file2) => `- ${file2}`) : task.paths.map((path4) => `- ${path4}`),
-          "",
-          "## Coordination notes",
-          "- ",
-          "",
-          "## Risk",
-          "- "
-        ].join("\n");
-        await mkdir13(join26(this.teamDir, "tasks"), { recursive: true });
-        const filePath = join26(this.teamDir, "tasks", `${task.id}-pr.md`);
-        await writeFile14(filePath, `# ${title}
-
-${body}
-`, "utf8");
-        return { task, branch, baseBranch, title, body, filePath };
-      }
-      async createHandoff(taskId, note) {
-        const state = await this.ensure();
-        const task = this.resolveTaskForUnit(state, taskId);
-        const branch = task.branch ?? await this.currentGitBranch() ?? "unknown";
-        const changedFiles = await this.changedWorkspaceFiles();
-        const diffStat = await this.gitOne(["diff", "--stat"]).catch(() => "");
-        const nextSteps = note?.trim() || "TBD";
-        const content = [
-          `# Handoff: ${task.id} ${task.title}`,
-          "",
-          `Unit: ${this.unitId}`,
-          `Task: ${task.id}`,
-          `Status: ${task.status}`,
-          `Module: ${task.module ?? "n/a"}`,
-          `Branch: ${branch}`,
-          `Created: ${nowIso()}`,
-          "",
-          "## Current State",
-          "- ",
-          "",
-          "## Changed Files",
-          ...changedFiles.length > 0 ? changedFiles.map((file2) => `- ${file2}`) : ["- none"],
-          "",
-          "## Diff Stat",
-          diffStat.trim() ? `\`\`\`
-${diffStat.trim()}
-\`\`\`` : "none",
-          "",
-          "## Next Steps",
-          `- ${nextSteps}`,
-          "",
-          "## Risks / Blockers",
-          "- ",
-          "",
-          "## Verification",
-          "- "
-        ].join("\n");
-        await mkdir13(join26(this.teamDir, "handoffs"), { recursive: true });
-        const filePath = join26(this.teamDir, "handoffs", `${task.id}-${this.unitId}-${Date.now().toString(36)}.md`);
-        await writeFile14(filePath, `${content}
-`, "utf8");
-        const originalUpdatedAt = state.updatedAt;
-        task.status = "handoff";
-        task.updatedAt = nowIso();
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} created handoff for ${task.id}`, originalUpdatedAt);
-        return { state, task, filePath, content };
-      }
-      /** Returns true when team.json exists for this project. */
-      async exists() {
-        return await fileText(this.statePath) !== null;
-      }
-      async onboardingSummary() {
-        const state = await this.ensure();
-        const activeTasks = state.tasks.filter(isActiveTask);
-        const activeUnits = state.units.filter((u) => u.status === "active");
-        const recommendedTasks = state.tasks.filter((t) => !t.ownerUnit && t.status === "backlog").filter((t) => !activeTasks.some((active) => active.paths.some((p) => t.paths.some((tp) => patternsOverlap(p, tp))))).slice(0, 5);
-        return {
-          project: state.project,
-          github: state.github,
-          goals: state.goals.slice(0, 5),
-          activeUnits,
-          modules: state.modules,
-          recommendedTasks,
-          activeTasks
-        };
-      }
-      async syncGitHubIssues(taskId) {
-        const state = await this.ensure();
-        const repo = await this.githubRepo();
-        const tasks = taskId ? state.tasks.filter((t) => t.id.toLowerCase() === taskId.toLowerCase()) : state.tasks;
-        if (taskId && tasks.length === 0) throw new Error(`Unknown team task: ${taskId}`);
-        const results = [];
-        for (const task of tasks) {
-          const body = this.githubIssueBody(task);
-          const labels = ["team-mode", `status:${githubLabelValue(task.status)}`];
-          if (task.module) labels.push(`module:${githubLabelValue(task.module)}`);
-          await this.ensureGitHubLabels(repo, labels);
-          const existingIssueNumber = task.githubIssueNumber ?? (task.githubIssueUrl ? parseIssueNumber(task.githubIssueUrl) : void 0);
-          if (existingIssueNumber) {
-            await this.gh([
-              "issue",
-              "edit",
-              String(existingIssueNumber),
-              "--repo",
-              repo,
-              "--title",
-              `${task.id}: ${task.title}`,
-              "--body",
-              body,
-              "--add-label",
-              labels.join(",")
-            ]);
-            if (task.status === "done" || task.status === "cancelled") {
-              await this.gh(["issue", "close", String(existingIssueNumber), "--repo", repo, "--comment", `Team task moved to ${task.status}.`]).catch(() => "");
-            } else {
-              await this.gh(["issue", "reopen", String(existingIssueNumber), "--repo", repo]).catch(() => "");
-            }
-            task.githubIssueNumber = existingIssueNumber;
-            task.updatedAt = nowIso();
-            results.push({ taskId: task.id, issueNumber: existingIssueNumber, issueUrl: task.githubIssueUrl, action: "updated" });
-          } else {
-            const url2 = (await this.gh([
-              "issue",
-              "create",
-              "--repo",
-              repo,
-              "--title",
-              `${task.id}: ${task.title}`,
-              "--body",
-              body,
-              ...labels.flatMap((label) => ["--label", label])
-            ])).trim();
-            const issueNumber = parseIssueNumber(url2);
-            task.githubIssueNumber = issueNumber;
-            task.githubIssueUrl = url2;
-            task.updatedAt = nowIso();
-            results.push({ taskId: task.id, issueNumber, issueUrl: url2, action: "created" });
-          }
-        }
-        const originalUpdatedAt = state.updatedAt;
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} synced ${results.length} GitHub issue(s)`, originalUpdatedAt);
-        return results;
-      }
-      async addGitHubIssuesToProject(projectNumber, owner) {
-        const state = await this.ensure();
-        const repo = await this.githubRepo();
-        const resolvedOwner = owner?.trim() || repo.split("/")[0];
-        const added = [];
-        const skipped = [];
-        for (const task of state.tasks) {
-          if (!task.githubIssueUrl) {
-            skipped.push({ taskId: task.id, reason: "task has no githubIssueUrl; run /team github issues sync first" });
-            continue;
-          }
-          try {
-            const output = await this.gh(["project", "item-add", projectNumber, "--owner", resolvedOwner, "--url", task.githubIssueUrl]);
-            added.push({ taskId: task.id, issueUrl: task.githubIssueUrl, output: output.trim() });
-          } catch (err) {
-            skipped.push({ taskId: task.id, reason: err instanceof Error ? err.message : String(err) });
-          }
-        }
-        return { projectNumber, owner: resolvedOwner, added, skipped };
-      }
-      async checkPaths(changedFiles, state) {
-        const currentTaskId = state.units.find((u) => u.id === this.unitId)?.currentTask;
-        const currentTask = currentTaskId ? state.tasks.find((t) => t.id === currentTaskId) : void 0;
-        const issues = [];
-        if (!currentTask && changedFiles.some((p) => !p.startsWith(`${TEAM_DIR}/`))) {
-          issues.push({
-            severity: "warning",
-            kind: "no_current_task",
-            message: "Workspace has non-team file changes but this unit has no current team task."
-          });
-        }
-        for (const file2 of changedFiles) {
-          if (file2.startsWith(`${TEAM_DIR}/`)) continue;
-          if (currentTask && !currentTask.paths.some((pattern) => pathMatchesPattern(file2, pattern))) {
-            issues.push({
-              severity: "warning",
-              kind: "task_scope",
-              message: `${file2} is outside current task ${currentTask.id} paths.`,
-              path: file2,
-              taskId: currentTask.id
-            });
-          }
-          for (const mod of state.modules) {
-            if (!mod.ownerUnit || mod.ownerUnit === this.unitId) continue;
-            if (mod.paths.some((pattern) => pathMatchesPattern(file2, pattern))) {
-              issues.push({
-                severity: "error",
-                kind: "module_owner",
-                message: `${file2} belongs to module ${mod.name}, owned by ${mod.ownerUnit}.`,
-                path: file2,
-                module: mod.name,
-                ownerUnit: mod.ownerUnit
-              });
-            }
-          }
-        }
-        const otherActive = state.tasks.filter(
-          (t) => t.id !== currentTask?.id && t.ownerUnit && t.ownerUnit !== this.unitId && ACTIVE_TASK_STATUSES.has(t.status)
-        );
-        const actualFilesMap = /* @__PURE__ */ new Map();
-        await Promise.all(
-          otherActive.filter((t) => !!t.branch).map(async (t) => {
-            const files = await this.actualChangedFilesForTask(t);
-            if (files.length > 0) actualFilesMap.set(t.id, files);
-          })
-        );
-        for (const issue2 of await this.detectTaskOverlapIssues(state, currentTask, changedFiles, actualFilesMap)) {
-          issues.push(issue2);
-        }
-        return { unitId: this.unitId, currentTask, changedFiles, issues };
-      }
-      async addModule(input) {
-        const state = await this.ensure();
-        const name = input.name.trim();
-        if (!name) throw new Error("Module name is required");
-        if (state.modules.some((m) => m.name.toLowerCase() === name.toLowerCase())) {
-          throw new Error(`Module already exists: ${name}`);
-        }
-        const mod = {
-          name,
-          ownerUnit: input.ownerUnit?.trim() || void 0,
-          paths: input.paths.map((p) => p.trim()).filter(Boolean),
-          responsibilities: input.responsibilities?.map((r) => r.trim()).filter(Boolean) ?? []
-        };
-        if (mod.paths.length === 0) throw new Error("Module paths are required");
-        if (mod.responsibilities.length === 0) mod.responsibilities = ["TBD"];
-        const originalUpdatedAt = state.updatedAt;
-        state.modules.push(mod);
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} added module ${mod.name}`, originalUpdatedAt);
-        return { state, module: mod };
-      }
-      async setModuleOwner(name, ownerUnit) {
-        const state = await this.ensure();
-        const mod = state.modules.find((m) => m.name.toLowerCase() === name.toLowerCase());
-        if (!mod) throw new Error(`Unknown team module: ${name}`);
-        const originalUpdatedAt = state.updatedAt;
-        mod.ownerUnit = ownerUnit?.trim() || void 0;
-        state.updatedAt = nowIso();
-        await this.writeAll(state, `${this.unitId} set module ${mod.name} owner to ${mod.ownerUnit ?? "unclaimed"}`, originalUpdatedAt);
-        return { state, module: mod };
-      }
-      async status() {
-        return this.read();
-      }
+      // ── Git transport (sync / pull / conflict guidance) ───────────────────────
       async sync(options = {}) {
         const fetch2 = options.fetch ?? true;
         const updatePresence = options.updatePresence ?? true;
-        const writeActivity = options.writeActivity ?? true;
+        const force = options.forceFetch === true;
         let gitFetched = false;
         let currentBranch;
         let upstreamBranch;
@@ -44911,9 +46104,11 @@ ${diffStat.trim()}
         let behind;
         let remoteSummary;
         let remoteTeamChanges = [];
-        if (fetch2) {
+        const cooldownActive = !force && this.msSinceLastFetch() < FETCH_COOLDOWN_MS;
+        if (fetch2 && !cooldownActive) {
           try {
             await execFileAsync4("git", ["fetch", "--all", "--prune"], { cwd: this.projectDir, timeout: 3e4 });
+            this._lastFetchAt = Date.now();
             gitFetched = true;
           } catch {
             gitFetched = false;
@@ -44944,7 +46139,7 @@ ${diffStat.trim()}
           }
           try {
             const { stdout } = await execFileAsync4("git", ["diff", "--name-status", `HEAD..${upstreamBranch}`, "--", TEAM_DIR], { cwd: this.projectDir, timeout: 5e3 });
-            remoteTeamChanges = stdout.split("\n").map((line) => line.trim()).filter(Boolean);
+            remoteTeamChanges = stdout.split("\n").map((l) => l.trim()).filter(Boolean);
           } catch {
           }
         }
@@ -44955,7 +46150,7 @@ ${diffStat.trim()}
           unit.status = "active";
           unit.lastSeen = nowIso();
           state.updatedAt = nowIso();
-          await this.writeAll(state, writeActivity ? `${this.unitId} synced team state` : null, originalUpdatedAt);
+          await this.writeAll(state, originalUpdatedAt);
         }
         return {
           gitFetched,
@@ -44968,25 +46163,11 @@ ${diffStat.trim()}
           state
         };
       }
-      /**
-       * Restore the `team/` directory from the upstream branch.
-       *
-       * ⚠️  After a successful pull the restored files are STAGED but NOT committed.
-       * Always follow up with `git add team/ && git commit -m "chore: sync team state"`
-       * (or the equivalent) to record the update on the current branch.
-       */
       async pullRemoteTeam() {
-        const before = await this.sync({ fetch: true, updatePresence: false, writeActivity: false });
+        const before = await this.sync({ fetch: true, forceFetch: true, updatePresence: false });
         const upstreamBranch = before.upstreamBranch;
         if (!upstreamBranch) {
-          return {
-            applied: false,
-            reason: "Current branch has no upstream branch.",
-            upstreamBranch,
-            changedFiles: [],
-            sync: before,
-            state: before.state
-          };
+          return { applied: false, reason: "Current branch has no upstream branch.", upstreamBranch, changedFiles: [], sync: before, state: before.state };
         }
         const localDirty = await this.localTeamChanges();
         if (localDirty.length > 0) {
@@ -45000,13 +46181,7 @@ ${diffStat.trim()}
           };
         }
         if (before.remoteTeamChanges.length === 0) {
-          return {
-            applied: true,
-            upstreamBranch,
-            changedFiles: [],
-            sync: before,
-            state: before.state
-          };
+          return { applied: true, upstreamBranch, changedFiles: [], sync: before, state: before.state };
         }
         try {
           await execFileAsync4("git", ["restore", "--source", upstreamBranch, "--", TEAM_DIR], { cwd: this.projectDir, timeout: 3e4 });
@@ -45014,22 +46189,9 @@ ${diffStat.trim()}
           await execFileAsync4("git", ["checkout", upstreamBranch, "--", TEAM_DIR], { cwd: this.projectDir, timeout: 3e4 });
         }
         const state = await this.read();
-        const after = await this.sync({ fetch: false, updatePresence: false, writeActivity: false });
-        return {
-          applied: true,
-          upstreamBranch,
-          changedFiles: before.remoteTeamChanges,
-          sync: after,
-          state
-        };
+        const after = await this.sync({ fetch: false, updatePresence: false });
+        return { applied: true, upstreamBranch, changedFiles: before.remoteTeamChanges, sync: after, state };
       }
-      /**
-       * Detect git merge conflicts in the working tree.
-       *
-       * Uses `git ls-files -u` which lists each unmerged (stage 1/2/3) entry.
-       * Returns a structured report with categorised conflicts and step-by-step
-       * guidance text ready to display in the REPL.
-       */
       async detectMergeConflicts() {
         let conflictedPaths = [];
         try {
@@ -45041,7 +46203,7 @@ ${diffStat.trim()}
             const path4 = tabIdx >= 0 ? entry.slice(tabIdx + 1) : entry.split(/\s+/).slice(3).join(" ");
             if (path4 && !seen.has(path4)) {
               seen.add(path4);
-              conflictedPaths.push(normalizeRepoPath(path4));
+              conflictedPaths.push(path4.replace(/\\/g, "/"));
             }
           }
         } catch {
@@ -45090,41 +46252,18 @@ ${diffStat.trim()}
           guidance.push("  3. git add <resolved-file>");
           guidance.push("  4. \u6240\u6709\u51B2\u7A81\u89E3\u51B3\u540E\u6267\u884C\uFF1Agit commit");
           guidance.push("");
-          guidance.push("  \u5FEB\u901F\u9009\u8FB9\u547D\u4EE4\uFF1A");
-          guidance.push("  $ git checkout --ours   -- <file>   # \u4FDD\u7559\u672C\u5730\u7248\u672C");
-          guidance.push("  $ git checkout --theirs -- <file>   # \u4F7F\u7528\u8FDC\u7AEF\u7248\u672C");
-          guidance.push("");
         }
         guidance.push('\u89E3\u51B3\u5168\u90E8\u51B2\u7A81\u540E\uFF1Agit add . && git commit -m "merge: resolve conflicts"');
         return { hasConflicts, conflicts, teamJsonConflicted, guidance };
       }
-      /**
-       * Auto-resolve a conflicted team.json by accepting the remote ("theirs") version.
-       *
-       * Since team/team.json is the shared source of truth, "theirs" (the remote's version)
-       * is almost always the correct choice.  After applying, the file is staged so the
-       * caller only needs to `git commit`.
-       */
       async resolveTeamJsonConflict() {
         const report = await this.detectMergeConflicts();
         if (!report.teamJsonConflicted) {
-          return {
-            resolved: false,
-            strategy: "none",
-            message: "team.json \u6CA1\u6709\u5408\u5E76\u51B2\u7A81\uFF0C\u65E0\u9700\u89E3\u51B3\u3002"
-          };
+          return { resolved: false, strategy: "none", message: "team.json \u6CA1\u6709\u5408\u5E76\u51B2\u7A81\uFF0C\u65E0\u9700\u89E3\u51B3\u3002" };
         }
         try {
-          await execFileAsync4(
-            "git",
-            ["checkout", "--theirs", "--", `${TEAM_DIR}/${STATE_FILE}`],
-            { cwd: this.projectDir, timeout: 1e4 }
-          );
-          await execFileAsync4(
-            "git",
-            ["add", "--", `${TEAM_DIR}/${STATE_FILE}`],
-            { cwd: this.projectDir, timeout: 5e3 }
-          );
+          await execFileAsync4("git", ["checkout", "--theirs", "--", `${TEAM_DIR}/${STATE_FILE}`], { cwd: this.projectDir, timeout: 1e4 });
+          await execFileAsync4("git", ["add", "--", `${TEAM_DIR}/${STATE_FILE}`], { cwd: this.projectDir, timeout: 5e3 });
           return {
             resolved: true,
             strategy: "theirs",
@@ -45141,15 +46280,21 @@ ${diffStat.trim()}
           };
         }
       }
+      // ── Prompt context for the AI ─────────────────────────────────────────────
       async formatPromptContext() {
         const state = await this.read();
         if (!state) return null;
         const active = state.tasks.filter(isActiveTask);
         const mine = active.filter((t) => t.ownerUnit === this.unitId);
         const others = active.filter((t) => t.ownerUnit && t.ownerUnit !== this.unitId);
-        const unclaimed = active.filter((t) => !t.ownerUnit).slice(0, 8);
+        const open5 = state.tasks.filter((t) => !t.ownerUnit && t.status !== "done").slice(0, 8);
+        const recentAttempts = [];
+        for (const t of state.tasks) {
+          for (const a of t.attempts.slice(-3)) recentAttempts.push({ task: t, attempt: a });
+        }
+        recentAttempts.sort((a, b) => Date.parse(b.attempt.at) - Date.parse(a.attempt.at));
         return [
-          "## Robotics Team Mode",
+          "## Robotics Team Mode (collaboration log)",
           "",
           `Unit: ${this.unitId}`,
           state.github ? `GitHub: ${state.github}` : null,
@@ -45158,21 +46303,30 @@ ${diffStat.trim()}
           "### Goals",
           ...state.goals.slice(0, 5).map((g) => `- ${g}`),
           "",
-          "### Current Unit Tasks",
-          ...mine.length ? mine.map((t) => `- ${t.id}: ${t.title} [${t.status}] ${t.branch ? `branch=${t.branch}` : ""}${t.githubIssueUrl ? ` issue=${t.githubIssueUrl}` : ""}`) : ["- none"],
+          "### Your tasks",
+          ...mine.length ? mine.map((t) => `- ${t.id}: ${t.title} [${t.status}] attempts=${t.attempts.length}`) : ["- none"],
           "",
-          "### Other Active Work",
-          ...others.length ? others.slice(0, 12).map((t) => `- ${t.id}: ${t.title} owner=${t.ownerUnit} module=${t.module ?? "n/a"} paths=${t.paths.join(", ")}`) : ["- none"],
+          "### Others working",
+          ...others.length ? others.slice(0, 12).map((t) => `- ${t.id}: ${t.title} owner=${t.ownerUnit} attempts=${t.attempts.length}${isStaleClaim(t) ? " (claim stale)" : ""}`) : ["- none"],
           "",
-          "### Available Tasks",
-          ...unclaimed.length ? unclaimed.map((t) => `- ${t.id}: ${t.title} module=${t.module ?? "n/a"} paths=${t.paths.join(", ")}`) : ["- none"],
+          "### Open tasks (unclaimed)",
+          ...open5.length ? open5.map((t) => `- ${t.id}: ${t.title}`) : ["- none"],
           "",
-          "### Module Boundaries",
-          ...state.modules.slice(0, 12).map((m) => `- ${m.name}: owner=${m.ownerUnit ?? "unclaimed"} paths=${m.paths.join(", ")}`),
+          "### Recent attempts (latest 8 across team)",
+          ...recentAttempts.length ? recentAttempts.slice(0, 8).map((e) => `- [${e.attempt.at}] ${e.task.id} ${e.attempt.unit}: ${e.attempt.direction} \u2192 ${e.attempt.outcome}${e.attempt.ref ? ` (${e.attempt.ref})` : ""}`) : ["- none"],
           "",
-          "Team mode rules: respect task ownership and module boundaries; before editing paths owned by another unit, surface the conflict and ask for coordination. Treat team/team.json and team/*.md as the shared GitHub-backed source of truth.",
-          "After the /team entry guide selects work, continue normal robot development with this team context. If the user asks naturally to finish, hand off, sync, create a PR draft, or switch work, map that intent to the corresponding team action/CLI command such as /team done, /team handoff, /team pr, /team github issues sync, or /team use TASK-ID, asking for confirmation before status-changing or remote-affecting actions."
+          "Team mode rules: tasks are exclusively owned once taken; only the owner can note/drop/done. When the user describes work, surface useful collaboration cues \u2014 what others tried, what failed, who has the lock. Do NOT mutate team state without explicit instruction; surface intent and let the user run /team take, /team note, /team drop, /team done, /team steal."
         ].filter((s) => s !== null).join("\n");
+      }
+      // ── Internals ─────────────────────────────────────────────────────────────
+      formatOwnedError(task) {
+        const ago = task.claimedAt ? `${Math.round((Date.now() - Date.parse(task.claimedAt)) / 36e5)}h \u524D` : "\u65F6\u95F4\u672A\u77E5";
+        return `${task.id} \u5DF2\u88AB ${task.ownerUnit} \u9886\u53D6\uFF08${ago}\uFF09\u3002 \u5982\u9700\u63A5\u624B\u7528 /team steal ${task.id} [reason]\u3002`;
+      }
+      requireTask(state, taskId) {
+        const task = state.tasks.find((t) => t.id.toLowerCase() === taskId.toLowerCase());
+        if (!task) throw new Error(`Unknown team task: ${taskId}`);
+        return task;
       }
       async ensure(github) {
         return await this.read() ?? await this.init(github);
@@ -45182,7 +46336,7 @@ ${diffStat.trim()}
         if (!raw) return null;
         try {
           const json2 = JSON.parse(raw);
-          return parseOrNull(TeamStateSchema, json2);
+          return migrateTeamState(json2);
         } catch {
           return null;
         }
@@ -45190,151 +46344,7 @@ ${diffStat.trim()}
       async localTeamChanges() {
         try {
           const { stdout } = await execFileAsync4("git", ["status", "--porcelain", "--", TEAM_DIR], { cwd: this.projectDir, timeout: 5e3 });
-          return stdout.split("\n").map((line) => line.trim()).filter(Boolean);
-        } catch {
-          return [];
-        }
-      }
-      /**
-       * Persist team state atomically.
-       *
-       * Optimistic concurrency guard (P1-B): when `checkUpdatedAt` is provided the
-       * current disk state is re-read immediately before writing.  If the on-disk
-       * `updatedAt` differs from the expected value another process wrote between
-       * our read and our write — we reject the write so the caller can retry.
-       *
-       * Only pass `checkUpdatedAt` for state-mutating operations (claim, start,
-       * updateStatus, …).  Creation paths (init) leave it undefined.
-       */
-      async writeAll(state, activity, checkUpdatedAt) {
-        if (checkUpdatedAt !== void 0) {
-          const diskRaw = await fileText(this.statePath);
-          if (diskRaw) {
-            let diskUpdatedAt;
-            try {
-              diskUpdatedAt = JSON.parse(diskRaw).updatedAt;
-            } catch {
-            }
-            if (diskUpdatedAt !== void 0 && diskUpdatedAt !== checkUpdatedAt) {
-              throw new Error(
-                `[TeamStore] Concurrent modification: team.json was updated by another process (expected updatedAt="${checkUpdatedAt}", found "${diskUpdatedAt}"). Re-read the team state and retry the operation.`
-              );
-            }
-          }
-        }
-        await mkdir13(join26(this.teamDir, "handoffs"), { recursive: true });
-        await mkdir13(join26(this.teamDir, "tasks"), { recursive: true });
-        await atomicWriteJson(this.statePath, state);
-        void Promise.all([
-          writeFile14(join26(this.teamDir, "board.md"), renderBoard(state), "utf8"),
-          writeFile14(join26(this.teamDir, "goals.md"), renderGoals(state), "utf8"),
-          writeFile14(join26(this.teamDir, "modules.md"), renderModules(state), "utf8"),
-          writeFile14(join26(this.teamDir, "units.md"), renderUnits(state), "utf8"),
-          writeFile14(join26(this.teamDir, "decisions.md"), renderDecisions(state), "utf8")
-        ]).catch(() => {
-        });
-        if (activity) {
-          const MAX_ACTIVITY_ENTRIES = 200;
-          const activityPath = join26(this.teamDir, "activity.md");
-          void (async () => {
-            const existing = await fileText(activityPath);
-            const newEntry = `- [${nowIso()}] ${activity}`;
-            let content;
-            if (!existing) {
-              content = `# Team Activity
-
-${newEntry}
-`;
-            } else {
-              const entryLines = existing.split("\n").filter((l) => l.startsWith("- "));
-              const trimmed = entryLines.slice(-(MAX_ACTIVITY_ENTRIES - 1));
-              content = `# Team Activity
-
-${[...trimmed, newEntry].join("\n")}
-`;
-            }
-            await writeFile14(activityPath, content, "utf8");
-          })().catch(() => {
-          });
-        }
-      }
-      detectPathConflicts(state, task) {
-        return this.detectTaskOverlapIssuesByPattern(state, task).map((issue2) => issue2.message);
-      }
-      /**
-       * Async variant with actual-git-change awareness.
-       *
-       * Conflict detection strategy (per other task):
-       *   1. If `actualFilesMap` contains real changed files for the other task AND
-       *      we also have real changed files (`ourChangedFiles`): compare file sets
-       *      directly.  This is the most precise check — only real overlaps fire.
-       *   2. If only the other task has real files (we don't have ours, e.g. at claim
-       *      time): check if any of the other task's actual files match our task.paths
-       *      patterns.  More precise than pure pattern overlap.
-       *   3. Fallback: pure pattern-to-pattern overlap (existing behaviour).
-       */
-      async detectTaskOverlapIssues(state, task, ourChangedFiles = [], actualFilesMap = /* @__PURE__ */ new Map()) {
-        if (!task) return [];
-        const issues = [];
-        const otherActive = state.tasks.filter(
-          (t) => t.id !== task.id && t.ownerUnit && t.ownerUnit !== this.unitId && ACTIVE_TASK_STATUSES.has(t.status)
-        );
-        const ourFiles = ourChangedFiles.filter((f) => !f.startsWith(`${TEAM_DIR}/`));
-        for (const other of otherActive) {
-          const otherActual = actualFilesMap.get(other.id);
-          let overlapping = false;
-          let detailSuffix = "";
-          if (otherActual && otherActual.length > 0 && ourFiles.length > 0) {
-            const ourSet = new Set(ourFiles);
-            const shared = otherActual.filter((f) => ourSet.has(f));
-            overlapping = shared.length > 0;
-            if (overlapping) {
-              const examples = shared.slice(0, 3).join(", ");
-              detailSuffix = ` (shared files: ${examples}${shared.length > 3 ? ", \u2026" : ""})`;
-            }
-          } else if (otherActual && otherActual.length > 0) {
-            overlapping = otherActual.some((f) => task.paths.some((p) => pathMatchesPattern(f, p)));
-            if (overlapping) detailSuffix = " (actual branch files match task scope)";
-          } else {
-            overlapping = task.paths.some((p) => other.paths.some((otherPath) => patternsOverlap(p, otherPath)));
-          }
-          if (overlapping) {
-            issues.push({
-              severity: "warning",
-              kind: "task_overlap",
-              message: `${task.id} path scope overlaps ${other.id} owned by ${other.ownerUnit}${detailSuffix}.`,
-              taskId: other.id,
-              ownerUnit: other.ownerUnit
-            });
-          }
-        }
-        return issues;
-      }
-      /** Synchronous pattern-only variant used at claim time before git data is available. */
-      detectTaskOverlapIssuesByPattern(state, task) {
-        if (!task) return [];
-        const issues = [];
-        const claimed = state.tasks.filter(
-          (t) => t.id !== task.id && t.ownerUnit && t.ownerUnit !== this.unitId && ACTIVE_TASK_STATUSES.has(t.status)
-        );
-        for (const other of claimed) {
-          const overlapping = task.paths.some((p) => other.paths.some((otherPath) => patternsOverlap(p, otherPath)));
-          if (overlapping) {
-            issues.push({
-              severity: "warning",
-              kind: "task_overlap",
-              message: `${task.id} path scope overlaps ${other.id} owned by ${other.ownerUnit}.`,
-              taskId: other.id,
-              ownerUnit: other.ownerUnit
-            });
-          }
-        }
-        return issues;
-      }
-      async changedWorkspaceFiles() {
-        try {
-          const { stdout } = await execFileAsync4("git", ["status", "--porcelain"], { cwd: this.projectDir, timeout: 5e3 });
-          return stdout.split("\n").map((line) => line.trim()).filter(Boolean).map((line) => normalizeRepoPath(line.slice(2).trim().split(" -> ").pop() ?? "")).filter(Boolean);
+          return stdout.split("\n").map((l) => l.trim()).filter(Boolean);
         } catch {
           return [];
         }
@@ -45352,89 +46362,34 @@ ${[...trimmed, newEntry].join("\n")}
         }
         return unit;
       }
-      resolveTaskForUnit(state, taskId) {
-        const id = taskId || state.units.find((u) => u.id === this.unitId)?.currentTask;
-        if (!id) throw new Error("No task specified and this unit has no current task.");
-        const task = state.tasks.find((t) => t.id.toLowerCase() === id.toLowerCase());
-        if (!task) throw new Error(`Unknown team task: ${id}`);
-        return task;
-      }
-      makeBranchName(task) {
-        const slug = task.title.toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 48);
-        const suffix = slug.length >= 3 ? slug : task.id.toLowerCase();
-        return `${this.unitId}/${suffix}`;
-      }
-      async currentGitBranch() {
-        return this.gitOne(["branch", "--show-current"]).catch(() => void 0);
-      }
-      async defaultBaseBranch() {
-        const originHead = await this.gitOne(["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]).catch(() => void 0);
-        if (originHead?.startsWith("origin/")) return originHead.slice("origin/".length);
-        const candidates = ["main", "master"];
-        for (const candidate of candidates) {
-          const exists = await execFileAsync4("git", ["rev-parse", "--verify", candidate], { cwd: this.projectDir, timeout: 5e3 }).then(() => true).catch(() => false);
-          if (exists) return candidate;
+      /**
+       * Atomically write team.json with an optional optimistic-concurrency check,
+       * then regenerate the derived markdown views.
+       */
+      async writeAll(state, checkUpdatedAt) {
+        if (checkUpdatedAt !== void 0) {
+          const diskRaw = await fileText(this.statePath);
+          if (diskRaw) {
+            let diskUpdatedAt;
+            try {
+              diskUpdatedAt = JSON.parse(diskRaw).updatedAt;
+            } catch {
+            }
+            if (diskUpdatedAt !== void 0 && diskUpdatedAt !== checkUpdatedAt) {
+              throw new Error(
+                `[TeamStore] Concurrent modification: team.json was updated by another process (expected updatedAt="${checkUpdatedAt}", found "${diskUpdatedAt}"). Re-read the team state and retry the operation.`
+              );
+            }
+          }
         }
-        return "main";
-      }
-      async changedFilesAgainst(baseBranch, branch) {
-        const output = await this.gitOne(["diff", "--name-only", `${baseBranch}...${branch}`]).catch(() => "");
-        return output.split("\n").map((line) => line.trim()).filter(Boolean);
-      }
-      async gitOne(args) {
-        const { stdout } = await execFileAsync4("git", args, { cwd: this.projectDir, timeout: 3e4 });
-        return stdout.trim();
-      }
-      async gitLines(args) {
-        const out = await this.gitOne(args);
-        return out.split("\n").map((line) => line.trim()).filter(Boolean);
-      }
-      githubIssueBody(task) {
-        return [
-          `Task: ${task.id}`,
-          `Status: ${task.status}`,
-          `Unit: ${task.ownerUnit ?? "unclaimed"}`,
-          `Module: ${task.module ?? "n/a"}`,
-          `Branch: ${task.branch ?? "n/a"}`,
-          "",
-          "## Scope",
-          ...task.paths.map((path4) => `- ${path4}`),
-          "",
-          "## Coordination",
-          `This issue is managed by meta-agent team mode from \`team/team.json\`.`
-        ].join("\n");
-      }
-      async githubRepo() {
-        if (this.projectDir) {
-          const repo = await this.gh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"]).catch(() => "");
-          if (repo.trim()) return repo.trim();
-        }
-        const state = await this.read();
-        const url2 = state?.github;
-        const match = url2?.match(/github\.com[:/](.+?\/.+?)(?:\.git)?$/);
-        if (match) return match[1];
-        throw new Error("Could not resolve GitHub repo. Install/authenticate gh or set team.github to a GitHub repository URL.");
-      }
-      async ensureGitHubLabels(repo, labels) {
-        await Promise.allSettled(labels.map(
-          (label) => this.gh(["label", "create", label, "--repo", repo, "--color", "6f42c1"]).catch(() => "")
-        ));
-      }
-      async gh(args) {
-        try {
-          const { stdout } = await execFileAsync4("gh", args, { cwd: this.projectDir, timeout: 12e4 });
-          return stdout;
-        } catch (err) {
-          const e = err;
-          throw new Error((e.stderr || e.stdout || e.message || String(err)).trim());
-        }
-      }
-      toRepoPath(path4) {
-        const normalized = normalizeRepoPath(path4);
-        if (!isAbsolute3(path4)) return normalized;
-        const rel = relative4(this.projectDir, path4).replace(/\\/g, "/");
-        if (rel && !rel.startsWith("..") && rel !== ".") return normalizeRepoPath(rel);
-        return normalized;
+        await mkdir14(this.teamDir, { recursive: true });
+        await atomicWriteJson(this.statePath, state);
+        await Promise.allSettled([
+          atomicWriteFile(join28(this.teamDir, "board.md"), renderBoard(state)),
+          atomicWriteFile(join28(this.teamDir, "log.md"), renderLog(state)),
+          atomicWriteFile(join28(this.teamDir, "goals.md"), renderGoals(state)),
+          atomicWriteFile(join28(this.teamDir, "README.md"), renderReadme())
+        ]);
       }
     };
   }
@@ -45442,20 +46397,14 @@ ${[...trimmed, newEntry].join("\n")}
 
 // src/robotics/team/TeamWatcher.ts
 function taskKey(task) {
-  return `${task.id}:${task.status}:${task.ownerUnit ?? ""}:${task.branch ?? ""}:${task.updatedAt}`;
+  return `${task.id}:${task.status}:${task.ownerUnit ?? ""}:${task.attempts.length}:${task.updatedAt}`;
 }
 function stateSignature(state) {
   if (!state) return "null";
   return JSON.stringify({
     goals: state.goals,
-    modules: state.modules.map((m) => ({
-      name: m.name,
-      ownerUnit: m.ownerUnit ?? "",
-      paths: m.paths
-    })),
     tasks: state.tasks.map(taskKey),
-    units: state.units.map((u) => `${u.id}:${u.status}:${u.currentTask ?? ""}:${u.lastSeen}`),
-    decisions: state.decisions
+    units: state.units.map((u) => `${u.id}:${u.status}:${u.currentTask ?? ""}:${u.lastSeen}`)
   });
 }
 function byId(items) {
@@ -45494,7 +46443,15 @@ var init_TeamWatcher = __esm({
         clearInterval(this.timer);
         this.timer = null;
       }
-      async forceSync(fetch2 = true) {
+      /**
+       * Run a single sync tick now, returning the latest TeamSyncSummary.
+       *
+       * `fetch` defaults to `false`: the background timer and post-operation
+       * refreshes should be cheap.  Callers responding to an explicit user action
+       * (e.g. `/team sync`, `/team pull`) should set it to `true`; even then the
+       * cooldown inside TeamStore.sync() may skip the actual `git fetch`.
+       */
+      async forceSync(fetch2 = false) {
         let waited = 0;
         while (this.running && waited < 5e3) {
           await new Promise((r) => setTimeout(r, 50));
@@ -45543,8 +46500,7 @@ var init_TeamWatcher = __esm({
           }
           this.lastSync = await this.store.sync({
             fetch: forceFetch,
-            updatePresence: false,
-            writeActivity: false
+            updatePresence: false
           });
           this.lastSyncAt = (/* @__PURE__ */ new Date()).toISOString();
           this.recordRemoteDiff(this.lastSync);
@@ -45562,7 +46518,7 @@ var init_TeamWatcher = __esm({
       }
       record(message) {
         this.events.push({ at: (/* @__PURE__ */ new Date()).toISOString(), message });
-        if (this.events.length > 20) this.events = this.events.slice(-20);
+        while (this.events.length > 20) this.events.shift();
       }
       recordRemoteDiff(sync) {
         const signature = JSON.stringify({
@@ -45600,21 +46556,14 @@ var init_TeamWatcher = __esm({
           if ((old.ownerUnit ?? "") !== (task.ownerUnit ?? "")) {
             this.record(`${task.id} owner changed ${old.ownerUnit ?? "unclaimed"} -> ${task.ownerUnit ?? "unclaimed"}`);
           }
-          if ((old.branch ?? "") !== (task.branch ?? "")) {
-            this.record(`${task.id} branch changed ${old.branch ?? "none"} -> ${task.branch ?? "none"}`);
+          if (task.attempts.length > old.attempts.length) {
+            const delta = task.attempts.length - old.attempts.length;
+            const last = task.attempts[task.attempts.length - 1];
+            this.record(`${task.id} +${delta} attempt(s)${last ? ` \u2014 ${last.unit}: ${last.direction}` : ""}`);
           }
         }
         for (const task of prev.tasks) {
           if (!nextTasks.has(task.id)) this.record(`task removed: ${task.id}`);
-        }
-        const prevModules = new Map(prev.modules.map((m) => [m.name, m]));
-        for (const mod of next.modules) {
-          const old = prevModules.get(mod.name);
-          if (!old) {
-            this.record(`new module boundary: ${mod.name}`);
-          } else if ((old.ownerUnit ?? "") !== (mod.ownerUnit ?? "")) {
-            this.record(`module ${mod.name} owner changed ${old.ownerUnit ?? "unclaimed"} -> ${mod.ownerUnit ?? "unclaimed"}`);
-          }
         }
         const prevUnits = byId(prev.units);
         for (const unit of next.units) {
@@ -45658,7 +46607,7 @@ var RoboticsSession_exports = {};
 __export(RoboticsSession_exports, {
   RoboticsSession: () => RoboticsSession
 });
-import { createHash as createHash7, randomUUID as randomUUID4 } from "crypto";
+import { createHash as createHash8, randomUUID as randomUUID4 } from "crypto";
 var RoboticsSession;
 var init_RoboticsSession = __esm({
   "src/robotics/RoboticsSession.ts"() {
@@ -45672,6 +46621,9 @@ var init_RoboticsSession = __esm({
     init_PhysicalAnchorStore();
     init_PhysicalAnchorPendingStore();
     init_PhysicalAnchorSource();
+    init_PrincipleStore();
+    init_PrinciplePendingStore();
+    init_PrinciplePromotion();
     init_HardwareProfile();
     init_GitWorkspaceManager();
     init_RoboticsProjectStore();
@@ -45705,6 +46657,9 @@ var init_RoboticsSession = __esm({
       physicalAnchors;
       /** Session-scoped pending physical anchor buffer. Exposed for CLI /anchor review. */
       pendingPhysicalAnchors;
+      principles;
+      /** Session-scoped pending principle buffer. Exposed for CLI /principle review. */
+      pendingPrinciples;
       anchorSource;
       hwProfile;
       gitMgr;
@@ -45785,6 +46740,8 @@ var init_RoboticsSession = __esm({
         this.pendingExperiences = new ExperiencePendingStore(this.projectDir);
         this.physicalAnchors = new PhysicalAnchorStore();
         this.pendingPhysicalAnchors = new PhysicalAnchorPendingStore(this.projectDir);
+        this.principles = new PrincipleStore();
+        this.pendingPrinciples = new PrinciplePendingStore(this.projectDir);
         this.anchorSource = new PhysicalAnchorSource(this.physicalAnchors);
         this.hwProfile = new HardwareProfile(void 0, this.robot);
         this.gitMgr = new GitWorkspaceManager(this.projectDir);
@@ -45825,7 +46782,8 @@ var init_RoboticsSession = __esm({
       async init() {
         await Promise.all([
           this.pendingExperiences.load(),
-          this.pendingPhysicalAnchors.load()
+          this.pendingPhysicalAnchors.load(),
+          this.pendingPrinciples.load()
         ]);
         const existing = this._explicitResume ? await RoboticsProjectStore.findLatestByProjectDir(this.projectDir) : null;
         if (existing) {
@@ -45906,6 +46864,8 @@ var init_RoboticsSession = __esm({
           hardwareProfile: this.hwProfile,
           physicalAnchorStore: this.physicalAnchors,
           physicalAnchorPendingStore: this.pendingPhysicalAnchors,
+          principleStore: this.principles,
+          principlePendingStore: this.pendingPrinciples,
           gitManager: this.gitMgr,
           flashClient: this._flashClient ?? void 0
         });
@@ -45946,6 +46906,16 @@ var init_RoboticsSession = __esm({
           resumed: Boolean(existing),
           sessionAgeMs: existing ? Date.now() - existing.lastActiveAt : void 0
         };
+      }
+      async proposePrincipleForExperience(experienceId, reason) {
+        return proposePrincipleFromExperience({
+          experienceId,
+          experienceStore: this.store,
+          anchorStore: this.physicalAnchors,
+          pendingStore: this.pendingPrinciples,
+          flash: this._flashClient,
+          reason
+        });
       }
       // ── Lifecycle: dispose ────────────────────────────────────────────────────
       /**
@@ -46158,22 +47128,40 @@ ${prompt}` : prompt;
         await this.teamWatcher.forceSync(false);
         return state;
       }
-      async teamClaim(taskId) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.claim(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      /** Transition a claimed/backlog task to in_progress (begin active work). */
-      async teamStart(taskId) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.startTask(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
+      async teamStatus() {
+        return this.teamStore.status();
       }
       async teamTaskAdd(input) {
         this.sectionRegistry.invalidate("robotics_team_mode");
         const result = await this.teamStore.addTask(input);
+        await this.teamWatcher.forceSync(false);
+        return result;
+      }
+      /** Exclusively take a task; throws if owned by another unit. */
+      async teamTake(taskId) {
+        this.sectionRegistry.invalidate("robotics_team_mode");
+        const result = await this.teamStore.take(taskId);
+        await this.teamWatcher.forceSync(false);
+        return result;
+      }
+      /** Release a task you own (no-op if you don't own it). */
+      async teamDrop(taskId) {
+        this.sectionRegistry.invalidate("robotics_team_mode");
+        const result = await this.teamStore.drop(taskId);
+        await this.teamWatcher.forceSync(false);
+        return result;
+      }
+      /** Force-take a task currently owned by someone else; records audit attempt. */
+      async teamSteal(taskId, reason) {
+        this.sectionRegistry.invalidate("robotics_team_mode");
+        const result = await this.teamStore.steal(taskId, reason);
+        await this.teamWatcher.forceSync(false);
+        return result;
+      }
+      /** Append a single direction+outcome attempt to a task you own. */
+      async teamNote(input) {
+        this.sectionRegistry.invalidate("robotics_team_mode");
+        const result = await this.teamStore.note(input);
         await this.teamWatcher.forceSync(false);
         return result;
       }
@@ -46183,60 +47171,9 @@ ${prompt}` : prompt;
         await this.teamWatcher.forceSync(false);
         return result;
       }
-      async teamModuleAdd(input) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.addModule(input);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      async teamModuleOwner(name, ownerUnit) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.setModuleOwner(name, ownerUnit);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      async teamCheck() {
-        return this.teamStore.checkWorkspaceConflicts();
-      }
-      async teamCheckPaths(paths) {
-        return this.teamStore.checkPathsConflicts(paths);
-      }
-      async teamBranch(taskId) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.branchForTask(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      async teamPush() {
-        return this.teamStore.pushCurrentBranch();
-      }
-      async teamPr(taskId) {
-        return this.teamStore.createPrDraft(taskId);
-      }
-      async teamHandoff(taskId, note) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.createHandoff(taskId, note);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      async teamOnboarding() {
-        return this.teamStore.onboardingSummary();
-      }
-      async teamGitHubIssuesSync(taskId) {
-        this.sectionRegistry.invalidate("robotics_team_mode");
-        const result = await this.teamStore.syncGitHubIssues(taskId);
-        await this.teamWatcher.forceSync(false);
-        return result;
-      }
-      async teamGitHubProjectAdd(projectNumber, owner) {
-        return this.teamStore.addGitHubIssuesToProject(projectNumber, owner);
-      }
-      async teamStatus() {
-        return this.teamStore.status();
-      }
       async teamSync() {
         this.sectionRegistry.invalidate("robotics_team_mode");
-        const summary = await this.teamStore.sync();
+        const summary = await this.teamStore.sync({ forceFetch: true });
         await this.teamWatcher.forceSync(false);
         return summary;
       }
@@ -46376,7 +47313,7 @@ ${prompt}` : prompt;
       }
       async _repairWorkflowDefinition(input) {
         if (!this._flashClient) return null;
-        const contentHash = createHash7("sha256").update(input.content).digest("hex");
+        const contentHash = createHash8("sha256").update(input.content).digest("hex");
         return this._flashClient.query({
           system: `You convert user-authored META-WORKFLOW content into valid meta-agent workflow markdown.
 
@@ -46498,9 +47435,9 @@ ${firstPrompt.slice(0, 600)}`
 import { parseArgs } from "node:util";
 import { createInterface } from "node:readline";
 import { once } from "node:events";
-import { isAbsolute as isAbsolute4, resolve as resolve7, join as join30 } from "node:path";
+import { resolve as resolve7, join as join32 } from "node:path";
 import { existsSync as existsSync9, statSync } from "node:fs";
-import { homedir as homedir22 } from "node:os";
+import { homedir as homedir24 } from "node:os";
 
 // src/routing/SessionRouter.ts
 init_sdk();
@@ -46945,6 +47882,8 @@ var CampaignSession = class {
   _totalCostUsd = 0;
   /** #11: Guard against concurrent submit() calls on the same session. */
   _submitInFlight = false;
+  /** S1: guard against double dispose. */
+  _disposed = false;
   _usage = {
     inputTokens: 0,
     outputTokens: 0,
@@ -46986,7 +47925,10 @@ var CampaignSession = class {
         model: resolved.flashModel
         // ## Compact Instructions injected via appendSystemPrompt each submit()
       },
-      thinkingConfig: { type: "adaptive" },
+      // Thinking on the primary model — honours resolved.thinkingConfig so
+      // callers can opt out via `{ type: 'disabled' }`.  Defaults to adaptive,
+      // matching the previous campaign-mode behaviour.
+      thinkingConfig: resolved.thinkingConfig,
       querySource: "main",
       debug: resolved.debugMode,
       // token-efficient-tools reduces schema token overhead for multi-tool sessions
@@ -47080,6 +48022,22 @@ ${prompt}` : prompt;
   interrupt() {
     this._engine.interrupt();
     void cleanupStateSnapshot(this._sessionId).catch(() => {
+    });
+  }
+  /**
+   * S1 + S9: Release per-session resources.  Forwards to the inner KernelSession
+   * dispose (clears messages / fileCache / tools closures), drops our own
+   * registered-tools array, and removes the on-disk state snapshot. Idempotent.
+   */
+  async dispose() {
+    if (this._disposed) return;
+    this._disposed = true;
+    try {
+      this._engine.dispose();
+    } catch {
+    }
+    this._registeredTools.length = 0;
+    await cleanupStateSnapshot(this._sessionId).catch(() => {
     });
   }
   getMessages() {
@@ -47518,7 +48476,6 @@ function publicView(e) {
 }
 
 // src/routing/ModeDetector.ts
-init_campaign();
 function withTimeout3(promise2, ms) {
   let timer;
   const timeout = new Promise((_, reject) => {
@@ -47798,29 +48755,172 @@ var ModeDetector = class _ModeDetector {
       ]
     };
   }
-  // ── Internal ────────────────────────────────────────────────────────────────
-  /**
-   * Check for genuinely active campaigns by reading disk state directly.
-   *
-   * Intentionally bypasses MetaAgentContextStore (the context file cache)
-   * because that file is only refreshed when CampaignMonitor completes a
-   * phase — it can lag hours behind reality for abandoned campaigns.
-   *
-   * Calling CampaignStateStore.listActive() instead:
-   *   • Triggers zombie auto-expiry for stale campaigns (marks them FAILED)
-   *   • Returns accurate count without relying on a potentially stale file
-   *   • Cost: one readdir + N small JSON reads — acceptable for the once-per-
-   *     session first-submit path; ~1–5 ms for typical campaign counts
-   */
-  static async _hasActiveCampaigns() {
-    try {
-      const active = await CampaignStateStore.listActive();
-      return active.length > 0;
-    } catch {
-      return false;
-    }
-  }
 };
+
+// src/routing/SessionRouter.ts
+init_SubAgentBridge();
+
+// src/tools/network/web_fetch/index.ts
+import { lookup } from "node:dns/promises";
+var MAX_CONTENT = 100 * 1024;
+var CACHE_MAX = 50;
+var MAX_REDIRECTS = 5;
+var cache = /* @__PURE__ */ new Map();
+function evictExpired() {
+  const now = Date.now();
+  for (const [k, v] of cache) if (v.expiresAt < now) cache.delete(k);
+}
+function clearWebFetchCache() {
+  cache.clear();
+}
+function stripHtml(html) {
+  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&quot;/g, '"').replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
+}
+var ALLOWED_PROTOCOLS = /* @__PURE__ */ new Set(["http:", "https:"]);
+function classifyIp(ip) {
+  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/);
+  if (v4) {
+    const a = Number(v4[1]);
+    const b = Number(v4[2]);
+    if (a === 10) return "private 10/8";
+    if (a === 127) return "loopback 127/8";
+    if (a === 0) return "this-network 0/8";
+    if (a === 169 && b === 254) return "link-local / metadata 169.254/16";
+    if (a === 172 && b >= 16 && b <= 31) return "private 172.16/12";
+    if (a === 192 && b === 168) return "private 192.168/16";
+    if (a === 192 && b === 0) return "IETF / IANA reserved 192.0/16";
+    if (a === 198 && (b === 18 || b === 19)) return "benchmark 198.18/15";
+    if (a === 100 && b >= 64 && b <= 127) return "CG-NAT 100.64/10";
+    if (a >= 224 && a <= 239) return "multicast 224/4";
+    if (a >= 240) return "reserved 240/4";
+    return null;
+  }
+  const lower = ip.toLowerCase();
+  if (lower === "::1" || lower === "::") return "loopback ::1";
+  if (lower.startsWith("fe80:") || lower.startsWith("fe80::")) return "IPv6 link-local fe80::/10";
+  if (/^f[cd][0-9a-f]{2}:/.test(lower)) return "IPv6 ULA fc00::/7";
+  if (lower.startsWith("::ffff:")) {
+    const mapped = lower.slice(7);
+    return classifyIp(mapped);
+  }
+  if (lower.startsWith("ff")) return "IPv6 multicast ff00::/8";
+  return null;
+}
+async function validateUrl(rawUrl) {
+  let parsed;
+  try {
+    parsed = new URL(rawUrl);
+  } catch {
+    return { ok: false, reason: "invalid URL" };
+  }
+  if (!ALLOWED_PROTOCOLS.has(parsed.protocol)) {
+    return { ok: false, reason: `scheme ${parsed.protocol} is not allowed` };
+  }
+  const host = parsed.hostname;
+  if (!host) return { ok: false, reason: "URL has no hostname" };
+  if (host.toLowerCase() === "localhost") {
+    return { ok: false, reason: "localhost is not allowed" };
+  }
+  try {
+    const results = await lookup(host, { all: true });
+    for (const { address } of results) {
+      const reason = classifyIp(address);
+      if (reason !== null) {
+        return { ok: false, reason: `host ${host} resolved to ${address} (${reason})` };
+      }
+    }
+    if (results.length === 0) return { ok: false, reason: `host ${host} did not resolve` };
+    return { ok: true, value: { url: parsed, resolvedHost: host } };
+  } catch (err) {
+    return { ok: false, reason: `DNS lookup failed for ${host}: ${err instanceof Error ? err.message : String(err)}` };
+  }
+}
+async function fetchWithSafeRedirects(startUrl, signal) {
+  let currentUrl = startUrl;
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const check2 = await validateUrl(currentUrl);
+    if (!check2.ok) return { ok: false, reason: check2.reason };
+    const res = await fetch(check2.value.url, {
+      signal,
+      headers: { "User-Agent": "MetaAgentRuntime/1.0" },
+      redirect: "manual"
+    });
+    if (res.status >= 300 && res.status < 400 && res.headers.get("location")) {
+      const next = new URL(res.headers.get("location"), currentUrl).toString();
+      currentUrl = next;
+      continue;
+    }
+    return { ok: true, res, finalUrl: currentUrl };
+  }
+  return { ok: false, reason: `too many redirects (>${MAX_REDIRECTS})` };
+}
+async function createWebFetchTool() {
+  const description = "Fetch content from a URL and return it as text.\n\nUsage:\n- url: must be a valid HTTPS URL (HTTP is upgraded to HTTPS automatically)\n- prompt: describe what information you want to extract\n- HTML is stripped to plain text\n- Content is cached for 15 minutes\n- Large responses are truncated to 100KB";
+  return {
+    name: "web_fetch",
+    description,
+    isConcurrencySafe: true,
+    permission: { category: "network", planMode: "allow" },
+    inputSchema: {
+      type: "object",
+      properties: {
+        url: { type: "string", description: "URL to fetch" },
+        prompt: { type: "string", description: "What to extract from the page" }
+      },
+      required: ["url", "prompt"]
+    },
+    async call(input, ctx) {
+      const rawUrl = input["url"];
+      const prompt = input["prompt"];
+      if (!rawUrl) return { content: "Error: url is required", isError: true };
+      const url2 = rawUrl.startsWith("http://") ? rawUrl.replace("http://", "https://") : rawUrl;
+      evictExpired();
+      const cached2 = cache.get(url2);
+      if (cached2 && cached2.expiresAt > Date.now()) return { content: cached2.content, isError: false };
+      if (cached2) cache.delete(url2);
+      try {
+        const fetchOutcome = await fetchWithSafeRedirects(url2, ctx.abortSignal);
+        if (!fetchOutcome.ok) {
+          return { content: `Refused: ${fetchOutcome.reason}`, isError: true };
+        }
+        const { res, finalUrl } = fetchOutcome;
+        if (!res.ok) return { content: `HTTP ${res.status}: ${res.statusText}`, isError: true };
+        const ct = res.headers.get("content-type") ?? "";
+        let text;
+        if (ct.includes("application/json")) {
+          text = JSON.stringify(await res.json(), null, 2);
+        } else {
+          const raw = await res.text();
+          text = ct.includes("html") ? stripHtml(raw) : raw;
+        }
+        if (text.length > MAX_CONTENT) text = text.slice(0, MAX_CONTENT) + `
+[Truncated \u2014 ${text.length} chars total]`;
+        const result = `URL: ${finalUrl}
+Prompt: ${prompt}
+
+---
+
+${text}`;
+        cache.set(url2, { content: result, expiresAt: Date.now() + 15 * 60 * 1e3 });
+        if (cache.size > CACHE_MAX) {
+          evictExpired();
+          for (const k of cache.keys()) {
+            if (cache.size <= CACHE_MAX) break;
+            cache.delete(k);
+          }
+        }
+        return { content: result, isError: false };
+      } catch (err) {
+        return { content: `Fetch error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
+      }
+    }
+  };
+}
+
+// src/routing/SessionRouter.ts
+init_AnthropicClient();
+init_DeepSeekClient();
+init_DebugWriter();
 
 // src/routing/types.ts
 var MODE_WEIGHT = {
@@ -48016,7 +49116,27 @@ var SessionRouter = class {
         deleteJobsForSession(sessionId);
       } catch {
       }
+      try {
+        SubAgentBridge.getBridge(sessionId)?.destroy();
+      } catch {
+      }
     }
+    this._impl = null;
+    this._pendingTools = [];
+    this._currentMode = null;
+    try {
+      clearWebFetchCache();
+    } catch {
+    }
+    try {
+      clearAnthropicClientCache();
+    } catch {
+    }
+    try {
+      clearDeepSeekClientCache();
+    } catch {
+    }
+    void pruneStaleDebug().catch(() => void 0);
   }
   /**
    * Return the robotics session's pending experience buffer (if mode=robotics).
@@ -48039,6 +49159,24 @@ var SessionRouter = class {
     const impl = this._impl;
     if (impl && typeof impl.pendingPhysicalAnchors === "object" && impl.pendingPhysicalAnchors !== null) {
       return impl.pendingPhysicalAnchors;
+    }
+    return null;
+  }
+  /**
+   * Return the robotics session's pending principle buffer (if mode=robotics).
+   * Returns null in all other modes or before the first submit().
+   */
+  getPendingPrinciples() {
+    const impl = this._impl;
+    if (impl && typeof impl.pendingPrinciples === "object" && impl.pendingPrinciples !== null) {
+      return impl.pendingPrinciples;
+    }
+    return null;
+  }
+  async proposePrincipleForExperience(experienceId, reason) {
+    const impl = this._impl;
+    if (impl && typeof impl.proposePrincipleForExperience === "function") {
+      return impl.proposePrincipleForExperience(experienceId, reason);
     }
     return null;
   }
@@ -48144,34 +49282,38 @@ var SessionRouter = class {
 init_HardwareProfile();
 init_ExperienceStore();
 init_PhysicalAnchorStore();
+init_PrincipleStore();
 
 // src/robotics/team/TeamPlanner.ts
-var TEAM_PLANNER_SYSTEM = `\u4F60\u662F meta-agent robot mode \u7684 TeamPlanner\u3002
+var TEAM_PLANNER_SYSTEM = `\u4F60\u662F meta-agent robot mode \u7684 TeamPlanner\uFF08v2.0 \u534F\u4F5C\u65E5\u5FD7\u6A21\u578B\uFF09\u3002
 
-\u4F60\u53EA\u8D1F\u8D23\u5728\u7528\u6237\u5DF2\u7ECF\u663E\u5F0F\u8FDB\u5165 /team \u5F15\u5BFC\u6A21\u5F0F\u540E\uFF0C\u6839\u636E team board\u3001\u6A21\u5757\u8FB9\u754C\u3001\u5F53\u524D unit\u3001\u5DE5\u4F5C\u533A\u51B2\u7A81\u548C\u7528\u6237\u81EA\u7136\u8BED\u8A00\u610F\u56FE\uFF0C\u89C4\u5212\u534F\u4F5C\u52A8\u4F5C\u3002
+\u6A21\u578B\u53EA\u6709\u4E09\u7C7B\u5BF9\u8C61\uFF1Aunit / task / attempt\u3002task \u6709 owner\uFF08\u6392\u4ED6\uFF09\uFF0Cattempts[] \u662F append-only \u7684\u65B9\u5411+\u7ED3\u679C\u8BB0\u5F55\u3002
+
+\u4F60\u7684\u5DE5\u4F5C\uFF1A\u5728\u7528\u6237\u8FDB\u5165 /team \u6216\u81EA\u7136\u63CF\u8FF0\u534F\u4F5C\u610F\u56FE\u65F6\uFF0C\u7ED9\u51FA\u4E00\u6BB5\u7B80\u77ED\u4E2D\u6587\u5EFA\u8BAE\uFF0C\u5E76\u9644 0 \u5230 N \u4E2A\u673A\u5668\u53EF\u6267\u884C\u52A8\u4F5C\u3002
 
 \u786C\u89C4\u5219\uFF1A
-1. \u53EA\u8F93\u51FA JSON\uFF0C\u4E0D\u8981\u8F93\u51FA markdown\uFF0C\u4E0D\u8981\u89E3\u91CA JSON \u5916\u7684\u6587\u672C\u3002
-2. \u4E0D\u8981\u53D1\u660E\u4E0D\u5B58\u5728\u7684 taskId\u3002\u53EA\u6709 snapshot.state.tasks \u91CC\u5B58\u5728\u7684\u4EFB\u52A1\u624D\u80FD claim\u3001branch\u3001done\u3001handoff\u3001pr\u3002
-3. \u6D89\u53CA\u5199\u5165\u5171\u4EAB team \u6587\u4EF6\u3001\u5207\u5206\u652F\u3001push/pull\u3001GitHub\u3001\u4EFB\u52A1\u72B6\u6001\u53D8\u66F4\u3001handoff \u7684\u52A8\u4F5C\u5FC5\u987B requiresConfirmation=true\uFF0C\u9664\u975E\u7528\u6237\u521A\u624D\u660E\u786E\u8BF4\u201C\u7EE7\u7EED/\u786E\u8BA4/\u6267\u884C\u201D\u5E76\u4E14\u4E0A\u4E0B\u6587\u5DF2\u7ECF\u7ED9\u51FA\u540C\u4E00\u52A8\u4F5C\u3002
-4. \u8BFB\u53D6\u72B6\u6001\u3001\u5C55\u793A onboarding\u3001\u5C55\u793A\u5EFA\u8BAE\u53EF\u4EE5 requiresConfirmation=false\u3002
-5. \u5982\u679C\u7528\u6237\u53EA\u662F\u63D0\u51FA\u666E\u901A\u5F00\u53D1\u9700\u6C42\uFF0C\u7ED9\u51FA team \u534F\u4F5C\u5EFA\u8BAE\u540E continueToAgent=true\uFF0C\u8BA9\u4E3B agent \u7EE7\u7EED\u5DE5\u4F5C\u3002
-6. \u5982\u679C\u7528\u6237\u7684\u610F\u56FE\u4E3B\u8981\u662F team \u64CD\u4F5C\uFF08\u4F8B\u5982\u201C\u63A5\u4E2A\u4EFB\u52A1\u201D\u201C\u4EFB\u52A1\u5B8C\u6210\u4E86\u201D\u201C\u5E2E\u6211\u4EA4\u63A5\u201D\u201C\u770B\u770B\u56E2\u961F\u72B6\u6001\u201D\uFF09\uFF0CcontinueToAgent=false\u3002
-7. \u5982\u679C\u51B2\u7A81\u91CC\u5B58\u5728 error\uFF0Crisk \u5FC5\u987B\u662F blocked\uFF0C\u4E0D\u8981\u5EFA\u8BAE\u76F4\u63A5\u4FEE\u6539\uFF1B\u5E94\u8BE5\u5EFA\u8BAE\u534F\u8C03\u3001\u6362\u4EFB\u52A1\u6216\u4EA4\u63A5\u3002
-8. \u8F93\u51FA\u5E94\u7B80\u77ED\uFF0C\u9762\u5411\u5DE5\u7A0B\u534F\u4F5C\uFF0C\u4E0D\u8981\u8981\u6C42\u7528\u6237\u8BB0\u5FC6\u5E95\u5C42 /team xxx \u547D\u4EE4\u3002
+1. \u53EA\u8F93\u51FA JSON\uFF0C\u4E0D\u8981 markdown\u3001\u4E0D\u8981 JSON \u5916\u6587\u672C\u3002
+2. \u4E0D\u8981\u53D1\u660E\u4E0D\u5B58\u5728\u7684 taskId\u3002
+3. \u4EFB\u4F55\u4F1A\u4FEE\u6539 team.json \u7684\u52A8\u4F5C\uFF08take_task/add_note/drop_task/mark_done/mark_paused/steal_task/sync_team/pull_team\uFF09\u9ED8\u8BA4 requiresConfirmation=true\u3002\u4EC5 show_board \u53EF false\u3002
+4. steal_task \u53EA\u6709\u5728 task.ownerUnit \u662F\u4ED6\u4EBA\u65F6\u624D\u5141\u8BB8\u3002reason \u5FC5\u586B\u3002
+5. add_note \u5FC5\u987B\u6307\u5B9A taskId\u3001direction\u3001outcome\uFF1Bref \u53EF\u9009\u3002\u53EA\u5BF9\u81EA\u5DF1\u6301\u6709\u7684 task \u63D0\u8BAE note\u3002
+6. \u82E5\u7528\u6237\u610F\u56FE\u662F\u666E\u901A\u5F00\u53D1\u63A8\u8FDB\u800C\u4E0D\u662F team \u534F\u4F5C\uFF0CcontinueToAgent=true\u3001actions=[]\uFF0C\u8BA9\u4E3B agent \u7EE7\u7EED\u3002
+7. \u82E5\u7528\u6237\u610F\u56FE\u662F team \u534F\u4F5C\uFF08\u770B board\u3001\u9886\u3001\u8BB0\u5F55\u3001\u91CA\u653E\u3001\u5B8C\u6210\uFF09\uFF0CcontinueToAgent=false\u3002
+8. \u7B80\u77ED\uFF0C\u9762\u5411\u5DE5\u7A0B\u534F\u4F5C\u3002
 
 JSON schema:
 {
-  "intent": "status|start_work|continue_work|finish_work|handoff|resolve_conflict|onboarding|sync|none",
+  "intent": "status|start_work|continue_work|finish_work|record_attempt|release|steal|sync|none",
   "risk": "safe|needs_confirmation|blocked",
   "summary": "\u4E00\u53E5\u8BDD\u6982\u62EC\u5224\u65AD",
   "guidance": "\u7ED9\u7528\u6237\u7684\u7B80\u77ED\u4E2D\u6587\u5F15\u5BFC",
   "actions": [
     {
-      "type": "show_status|show_onboarding|claim_task|create_branch|mark_task_status|create_handoff|create_pr_draft|sync_github_issues|sync_team|pull_team",
+      "type": "show_board|take_task|add_note|drop_task|mark_done|mark_paused|steal_task|sync_team|pull_team",
       "taskId": "TASK-001",
-      "status": "done|review|blocked|in_progress|claimed|handoff",
-      "note": "\u53EF\u9009\u4EA4\u63A5\u8BF4\u660E",
+      "direction": "\u8BD5\u7528 ResNet50 \u66FF\u6362 backbone",
+      "outcome": "\u5931\u8D25\uFF1Asim +0.3%\uFF0Creal -2%",
+      "ref": "wandb.ai/.../run-3f2",
       "reason": "\u4E3A\u4EC0\u4E48\u8981\u505A",
       "requiresConfirmation": true
     }
@@ -48194,14 +49336,15 @@ function parseTeamPlannerPlan(text) {
     const parsed = JSON.parse(raw);
     if (!parsed || typeof parsed !== "object") return null;
     const rawActions = Array.isArray(parsed.actions) ? parsed.actions : [];
-    const actions = rawActions.length > 0 ? rawActions.filter((a) => Boolean(a) && typeof a === "object").map((a) => ({
-      type: String(a.type ?? "show_status"),
+    const actions = rawActions.filter((a) => Boolean(a) && typeof a === "object").map((a) => ({
+      type: String(a.type ?? "show_board"),
       taskId: typeof a.taskId === "string" ? a.taskId : void 0,
-      status: typeof a.status === "string" ? a.status : void 0,
-      note: typeof a.note === "string" ? a.note : void 0,
+      direction: typeof a.direction === "string" ? a.direction : void 0,
+      outcome: typeof a.outcome === "string" ? a.outcome : void 0,
+      ref: typeof a.ref === "string" ? a.ref : void 0,
       reason: typeof a.reason === "string" ? a.reason : "",
       requiresConfirmation: Boolean(a.requiresConfirmation)
-    })) : [];
+    }));
     return {
       intent: String(parsed.intent ?? "none"),
       risk: parsed.risk === "blocked" || parsed.risk === "needs_confirmation" ? parsed.risk : "safe",
@@ -48223,30 +49366,33 @@ function extractJsonObject(text) {
   return trimmed.slice(start, end + 1);
 }
 
+// src/cli/index.ts
+init_TeamStore();
+
 // src/core/SessionStore.ts
 init_persist();
 init_schemas3();
-import { readFile as readFile19, appendFile as appendFile3, mkdir as mkdir14, open as open4, stat as stat10, rm as rm4 } from "node:fs/promises";
+import { readFile as readFile20, appendFile as appendFile3, mkdir as mkdir15, open as open4, stat as stat11, rm as rm6 } from "node:fs/promises";
 import { existsSync as existsSync6 } from "node:fs";
-import { join as join27 } from "node:path";
-import { homedir as homedir20 } from "node:os";
-var SESSIONS_ROOT = join27(homedir20(), ".meta-agent", "sessions");
-var INDEX_FILE2 = join27(SESSIONS_ROOT, "index.json");
+import { join as join29 } from "node:path";
+import { homedir as homedir22 } from "node:os";
+var SESSIONS_ROOT = join29(homedir22(), ".meta-agent", "sessions");
+var INDEX_FILE2 = join29(SESSIONS_ROOT, "index.json");
 var MAX_INDEX_ENTRIES2 = 50;
 var MAX_RESUME_BYTES = 5 * 1024 * 1024;
 var MAX_RESUME_MESSAGES = 200;
 function sessionDir2(sessionId) {
-  return join27(SESSIONS_ROOT, sessionId);
+  return join29(SESSIONS_ROOT, sessionId);
 }
 function historyPath(sessionId) {
-  return join27(sessionDir2(sessionId), "history.jsonl");
+  return join29(sessionDir2(sessionId), "history.jsonl");
 }
 async function ensureDir3(dir) {
-  await mkdir14(dir, { recursive: true });
+  await mkdir15(dir, { recursive: true });
 }
 async function readIndex() {
   try {
-    const raw = await readFile19(INDEX_FILE2, "utf-8");
+    const raw = await readFile20(INDEX_FILE2, "utf-8");
     const parsed = JSON.parse(raw);
     if (!Array.isArray(parsed)) return [];
     const { valid, dropped } = parseArrayFiltered(SessionMetaSchema, parsed);
@@ -48289,7 +49435,7 @@ var SessionStore = class _SessionStore {
   static async loadHistory(sessionId) {
     try {
       const path4 = historyPath(sessionId);
-      const info = await stat10(path4);
+      const info = await stat11(path4);
       let raw;
       if (info.size > MAX_RESUME_BYTES) {
         const fh = await open4(path4, "r");
@@ -48303,7 +49449,7 @@ var SessionStore = class _SessionStore {
           await fh.close();
         }
       } else {
-        raw = await readFile19(path4, "utf-8");
+        raw = await readFile20(path4, "utf-8");
       }
       return raw.split("\n").filter(Boolean).slice(-MAX_RESUME_MESSAGES).map((line) => JSON.parse(line));
     } catch {
@@ -48341,7 +49487,7 @@ var SessionStore = class _SessionStore {
       const entries = await readIndex();
       const filtered = entries.filter((e) => e.sessionId !== sessionId);
       await writeIndex(filtered);
-      await rm4(sessionDir2(sessionId), { recursive: true, force: true });
+      await rm6(sessionDir2(sessionId), { recursive: true, force: true });
     } catch {
     }
   }
@@ -48353,7 +49499,7 @@ var SessionStore = class _SessionStore {
       const entries = await readIndex();
       await writeIndex([]);
       await Promise.all(
-        entries.map((e) => rm4(sessionDir2(e.sessionId), { recursive: true, force: true }))
+        entries.map((e) => rm6(sessionDir2(e.sessionId), { recursive: true, force: true }))
       );
     } catch {
     }
@@ -48376,11 +49522,108 @@ var SessionStore = class _SessionStore {
 init_config();
 init_SensitiveCommandPatterns();
 
+// src/cli/teamPlannerExecutor.ts
+function describeAction(a) {
+  switch (a.type) {
+    case "show_board":
+      return "show team board";
+    case "take_task":
+      return `take ${a.taskId ?? "<unspecified>"}`;
+    case "add_note":
+      return `note on ${a.taskId ?? "<unspecified>"}: ${a.direction ?? "?"} \u2192 ${a.outcome ?? "?"}`;
+    case "drop_task":
+      return `drop ${a.taskId ?? "current"}`;
+    case "mark_done":
+      return `mark ${a.taskId ?? "current"} done`;
+    case "mark_paused":
+      return `mark ${a.taskId ?? "current"} paused`;
+    case "steal_task":
+      return `steal ${a.taskId ?? "<unspecified>"}${a.reason ? ` (${a.reason})` : ""}`;
+    case "sync_team":
+      return "fetch + sync team state";
+    case "pull_team":
+      return "pull remote team/ files";
+    default:
+      return a.type;
+  }
+}
+async function runAction(controller, a) {
+  switch (a.type) {
+    case "show_board":
+      await controller.teamStatus?.();
+      return;
+    case "take_task":
+      if (!a.taskId) throw new Error("take_task missing taskId");
+      await controller.teamTake?.(a.taskId);
+      return;
+    case "add_note":
+      if (!a.taskId) throw new Error("add_note missing taskId");
+      if (!a.direction) throw new Error("add_note missing direction");
+      if (!a.outcome) throw new Error("add_note missing outcome");
+      await controller.teamNote?.({ taskId: a.taskId, direction: a.direction, outcome: a.outcome, ref: a.ref });
+      return;
+    case "drop_task":
+      await controller.teamDrop?.(a.taskId);
+      return;
+    case "mark_done":
+      if (!a.taskId) throw new Error("mark_done missing taskId");
+      await controller.teamTaskStatus?.(a.taskId, "done");
+      return;
+    case "mark_paused":
+      if (!a.taskId) throw new Error("mark_paused missing taskId");
+      await controller.teamTaskStatus?.(a.taskId, "paused");
+      return;
+    case "steal_task":
+      if (!a.taskId) throw new Error("steal_task missing taskId");
+      if (!a.reason?.trim()) throw new Error("steal_task missing reason");
+      await controller.teamSteal?.(a.taskId, a.reason);
+      return;
+    case "sync_team":
+      await controller.teamSync?.();
+      return;
+    case "pull_team":
+      await controller.teamPull?.();
+      return;
+    default:
+      throw new Error(`unknown action type "${a.type}"`);
+  }
+}
+async function executePlan(controller, plan, ask, options = {}) {
+  const report = { executed: [], skipped: [], failed: [], aborted: false };
+  if (plan.risk === "blocked") {
+    report.aborted = true;
+    return report;
+  }
+  if (plan.actions.length === 0) return report;
+  for (const action of plan.actions) {
+    if (action.requiresConfirmation && !options.autoApprove) {
+      const reasonNote = action.reason ? ` (${action.reason})` : "";
+      const answer = (await ask(`  \u6267\u884C "${describeAction(action)}"?${reasonNote} [y/N] `)).trim().toLowerCase();
+      if (!/^(y|yes|是|确认)$/.test(answer)) {
+        options.onAction?.(action, "skipped", "user declined");
+        report.skipped.push({ action, reason: "user declined" });
+        continue;
+      }
+    }
+    options.onAction?.(action, "starting");
+    try {
+      await runAction(controller, action);
+      options.onAction?.(action, "done");
+      report.executed.push(action);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      options.onAction?.(action, "failed", msg);
+      report.failed.push({ action, error: msg });
+    }
+  }
+  return report;
+}
+
 // src/cli/hardwareTemplate.ts
-import { readFile as readFile20 } from "node:fs/promises";
+import { readFile as readFile21 } from "node:fs/promises";
 import { existsSync as existsSync7 } from "node:fs";
-import { join as join28 } from "node:path";
-import { homedir as homedir21 } from "node:os";
+import { join as join30 } from "node:path";
+import { homedir as homedir23 } from "node:os";
 var DEFAULT_TEMPLATE = {
   presets: [
     {
@@ -48483,7 +49726,7 @@ var DEFAULT_TEMPLATE = {
 async function loadTemplateFile(path4) {
   if (!existsSync7(path4)) return null;
   try {
-    const raw = await readFile20(path4, "utf-8");
+    const raw = await readFile21(path4, "utf-8");
     const parsed = JSON.parse(raw);
     return {
       presets: parsed.presets ?? DEFAULT_TEMPLATE.presets,
@@ -48499,10 +49742,10 @@ async function loadTemplateFile(path4) {
 async function resolveTemplate(projectDir) {
   const candidates = [];
   if (projectDir) {
-    candidates.push(join28(projectDir, ".meta-agent", "hardware-template.json"));
+    candidates.push(join30(projectDir, ".meta-agent", "hardware-template.json"));
   }
   candidates.push(
-    join28(homedir21(), ".claude", "meta-agent", "robotics", "profile-template.json")
+    join30(homedir23(), ".claude", "meta-agent", "robotics", "profile-template.json")
   );
   for (const p of candidates) {
     const t = await loadTemplateFile(p);
@@ -48737,76 +49980,6 @@ ${e.stderr}`, `Exit: ${e.code}`].filter(Boolean).join("\n") || String(err), isEr
 init_bash();
 async function createShellTools() {
   return Promise.all([createBashTool(), createPowerShellTool()]);
-}
-
-// src/tools/network/web_fetch/index.ts
-var MAX_CONTENT = 100 * 1024;
-var CACHE_MAX = 50;
-var cache = /* @__PURE__ */ new Map();
-function evictExpired() {
-  const now = Date.now();
-  for (const [k, v] of cache) if (v.expiresAt < now) cache.delete(k);
-}
-function stripHtml(html) {
-  return html.replace(/<script[\s\S]*?<\/script>/gi, "").replace(/<style[\s\S]*?<\/style>/gi, "").replace(/<[^>]+>/g, " ").replace(/&amp;/g, "&").replace(/&lt;/g, "<").replace(/&gt;/g, ">").replace(/&nbsp;/g, " ").replace(/&quot;/g, '"').replace(/[ \t]{2,}/g, " ").replace(/\n{3,}/g, "\n\n").trim();
-}
-async function createWebFetchTool() {
-  const description = "Fetch content from a URL and return it as text.\n\nUsage:\n- url: must be a valid HTTPS URL (HTTP is upgraded to HTTPS automatically)\n- prompt: describe what information you want to extract\n- HTML is stripped to plain text\n- Content is cached for 15 minutes\n- Large responses are truncated to 100KB";
-  return {
-    name: "web_fetch",
-    description,
-    isConcurrencySafe: true,
-    permission: { category: "network", planMode: "allow" },
-    inputSchema: {
-      type: "object",
-      properties: {
-        url: { type: "string", description: "URL to fetch" },
-        prompt: { type: "string", description: "What to extract from the page" }
-      },
-      required: ["url", "prompt"]
-    },
-    async call(input, ctx) {
-      const rawUrl = input["url"];
-      const prompt = input["prompt"];
-      if (!rawUrl) return { content: "Error: url is required", isError: true };
-      const url2 = rawUrl.startsWith("http://") ? rawUrl.replace("http://", "https://") : rawUrl;
-      evictExpired();
-      const cached2 = cache.get(url2);
-      if (cached2 && cached2.expiresAt > Date.now()) return { content: cached2.content, isError: false };
-      if (cached2) cache.delete(url2);
-      try {
-        const res = await fetch(url2, { signal: ctx.abortSignal, headers: { "User-Agent": "MetaAgentRuntime/1.0" }, redirect: "follow" });
-        if (!res.ok) return { content: `HTTP ${res.status}: ${res.statusText}`, isError: true };
-        const ct = res.headers.get("content-type") ?? "";
-        let text;
-        if (ct.includes("application/json")) {
-          text = JSON.stringify(await res.json(), null, 2);
-        } else {
-          const raw = await res.text();
-          text = ct.includes("html") ? stripHtml(raw) : raw;
-        }
-        if (text.length > MAX_CONTENT) text = text.slice(0, MAX_CONTENT) + `
-[Truncated \u2014 ${text.length} chars total]`;
-        const result = `URL: ${url2}
-Prompt: ${prompt}
-
----
-
-${text}`;
-        cache.set(url2, { content: result, expiresAt: Date.now() + 15 * 60 * 1e3 });
-        if (cache.size > CACHE_MAX) {
-          evictExpired();
-          for (const k of cache.keys()) {
-            if (cache.size <= CACHE_MAX) break;
-            cache.delete(k);
-          }
-        }
-        return { content: result, isError: false };
-      } catch (err) {
-        return { content: `Fetch error: ${err instanceof Error ? err.message : String(err)}`, isError: true };
-      }
-    }
-  };
 }
 
 // src/tools/network/web_search/index.ts
@@ -49063,11 +50236,25 @@ async function createSleepTool() {
       const ms = Math.min(typeof input["duration_ms"] === "number" ? input["duration_ms"] : 1e3, 6e4);
       if (ms <= 0) return { content: "Error: duration_ms must be positive", isError: true };
       await new Promise((resolve8, reject) => {
-        const timer = setTimeout(resolve8, ms);
-        ctx.abortSignal.addEventListener("abort", () => {
+        let settled = false;
+        let timer;
+        const onAbort = () => {
+          if (settled) return;
+          settled = true;
           clearTimeout(timer);
           reject(new Error("Sleep aborted"));
-        }, { once: true });
+        };
+        timer = setTimeout(() => {
+          if (settled) return;
+          settled = true;
+          ctx.abortSignal.removeEventListener("abort", onAbort);
+          resolve8();
+        }, ms);
+        if (ctx.abortSignal.aborted) {
+          onAbort();
+          return;
+        }
+        ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
       });
       return { content: `Slept for ${ms}ms`, isError: false };
     }
@@ -49271,21 +50458,21 @@ async function createExitPlanModeTool(planModeRef) {
 init_skill();
 
 // src/tools/system/config/index.ts
-import { mkdir as mkdir15, readFile as readFile21, writeFile as writeFile15 } from "fs/promises";
-import { dirname as dirname10, join as join29, resolve as resolve6 } from "path";
-var SETTINGS_FILE = join29(".claude", "settings.json");
+import { mkdir as mkdir16, readFile as readFile22, writeFile as writeFile15 } from "fs/promises";
+import { dirname as dirname11, join as join31, resolve as resolve6 } from "path";
+var SETTINGS_FILE = join31(".claude", "settings.json");
 function settingsPath(cwd) {
-  return join29(resolve6(cwd ?? process.cwd()), SETTINGS_FILE);
+  return join31(resolve6(cwd ?? process.cwd()), SETTINGS_FILE);
 }
 async function readSettings(path4) {
   try {
-    return JSON.parse(await readFile21(path4, "utf-8"));
+    return JSON.parse(await readFile22(path4, "utf-8"));
   } catch {
     return {};
   }
 }
 async function writeSettings(path4, data) {
-  await mkdir15(dirname10(path4), { recursive: true });
+  await mkdir16(dirname11(path4), { recursive: true });
   await writeFile15(path4, JSON.stringify(data, null, 2) + "\n", "utf-8");
 }
 function getNestedValue(obj, key) {
@@ -49450,12 +50637,26 @@ async function createRunAgentTool(bridge) {
           },
           abortSignal: ctx.abortSignal
         });
-        const abortableSleep = (ms) => new Promise((resolve8) => {
-          const timer = setTimeout(resolve8, ms);
-          ctx.abortSignal.addEventListener("abort", () => {
+        const abortableSleep3 = (ms) => new Promise((resolve8) => {
+          let settled = false;
+          let timer;
+          const onAbort = () => {
+            if (settled) return;
+            settled = true;
             clearTimeout(timer);
             resolve8();
-          }, { once: true });
+          };
+          timer = setTimeout(() => {
+            if (settled) return;
+            settled = true;
+            ctx.abortSignal.removeEventListener("abort", onAbort);
+            resolve8();
+          }, ms);
+          if (ctx.abortSignal.aborted) {
+            onAbort();
+            return;
+          }
+          ctx.abortSignal.addEventListener("abort", onAbort, { once: true });
         });
         const startMs = Date.now();
         while (Date.now() - startMs < MAX_WAIT_MS) {
@@ -49464,7 +50665,7 @@ async function createRunAgentTool(bridge) {
             });
             return { content: "Sub-agent cancelled (aborted by caller)", isError: true };
           }
-          await abortableSleep(500);
+          await abortableSleep3(500);
           if (ctx.abortSignal.aborted) {
             await bridge.cancelTask(record2.taskId, "run_agent aborted").catch(() => {
             });
@@ -49576,25 +50777,16 @@ ${bold("INTERACTIVE COMMANDS")}
   /workspace            Show current workspace directory
   /hardware             Show bound hardware profile (robotics mode)
   /hardware select      Re-run hardware profile selection wizard
-  /team                 Enter team mode and run the one-shot work guide
-  /team off             Exit the one-shot team entry guide
+  /team                 Show board + recent attempts (entry guide)
   /team init [github]   Create team/ collaboration template
-  /team join [github|task]  Join this unit, or select a TASK-* work item
-  /team use <task>      Select a team work item and switch to its branch
-  /team done [task]     Mark current/selected team task done
-  /team claim <task>    Claim a team task
-  /team task add <id> <title> [--module name] [--paths a,b]
-  /team task done|block|review|status <id>
-  /team module add <name> --paths a,b [--owner unit] [--resp text]
-  /team module owner <name> [unit|unclaimed]
-  /team check           Check workspace changes against task/module boundaries
-  /team branch [task]   Create/switch to the task branch
-  /team push            Push current branch and set upstream
-  /team pr [task]       Generate PR title/body draft under team/tasks/
-  /team handoff [task] [note]  Generate handoff document
-  /team onboarding      Show newcomer summary and recommended tasks
-  /team github issues sync [task]  Sync team tasks to GitHub Issues via gh
-  /team github project add <number> [owner]  Add issue-linked tasks to a GitHub Project
+  /team join [github]   Join this unit to the team
+  /team add "<title>"   Create a new task
+  /team take <task>     Exclusively claim a task (fails if owned by another)
+  /team note <id> "<direction>" :: "<outcome>" [@ref]   Append an attempt
+  /team drop [task]     Release a task you own
+  /team steal <task> [reason]   Forcibly take a task; records audit attempt
+  /team done [task]     Mark task done (only owner)
+  /team status / board  Show current board
   /team sync            Fetch remotes and refresh team status
   /team pull            Apply remote team/ files only when local team/ is clean
   /team conflicts       Show merge conflict guidance for the current workspace
@@ -49604,6 +50796,8 @@ ${bold("INTERACTIVE COMMANDS")}
   /sessions clear       Delete sessions (pick one or delete all)
   /experience           Show pending experience queue (robotics mode)
   /experience review    Interactively review & commit pending experiences
+  /principle            Show pending principle queue (robotics mode)
+  /principle review     Interactively review & commit pending principles
   /anchor               Show pending physical anchor queue (robotics mode)
   /anchor review        Interactively review & commit pending physical anchors
   /clear                Start a new session (same workspace/hardware)
@@ -50039,50 +51233,6 @@ function detectSensitiveOp(toolName, input, workspace) {
   }
   return null;
 }
-function extractWriteTargetPaths(toolName, input, workspace) {
-  const fromField = (field) => {
-    const value = input[field];
-    return typeof value === "string" && value ? [value] : [];
-  };
-  if (toolName === "write_file" || toolName === "edit_file") return fromField("file_path");
-  if (toolName === "notebook_edit") return fromField("notebook_path");
-  if (toolName !== "bash") return [];
-  const cmd = String(input["command"] ?? "");
-  const cwd = typeof input["cwd"] === "string" && input["cwd"] ? input["cwd"] : workspace;
-  const out = [];
-  const add = (raw) => {
-    if (!raw) return;
-    const cleaned = raw.trim().replace(/^['"]|['"]$/g, "");
-    if (!cleaned || cleaned.startsWith("&")) return;
-    out.push(isAbsolute4(cleaned) || !cwd ? cleaned : join30(cwd, cleaned));
-  };
-  for (const match of cmd.matchAll(/(?:^|[^>])>>?\s*(['"]?)([^'"\s;&|]+)\1/g)) add(match[2]);
-  for (const match of cmd.matchAll(/\btee\s+(?:-[a-zA-Z]+\s+)*(['"]?)([^'"\s;&|]+)\1/g)) add(match[2]);
-  for (const match of cmd.matchAll(/\b(?:sed|perl)\s+.*\s-i(?:\s+\S+)?\s+(['"]?)([^'"\s;&|]+)\1/g)) add(match[2]);
-  return [...new Set(out)];
-}
-async function runTeamWriteGuard(router, toolName, input, workspace) {
-  if (router?.mode !== "robotics") return null;
-  const controller = router.getRoboticsTeamController();
-  if (!controller?.teamCheckPaths) return null;
-  const targetPaths = extractWriteTargetPaths(toolName, input, workspace);
-  if (targetPaths.length === 0) return null;
-  const report = await controller.teamCheckPaths?.(targetPaths);
-  const issues = Array.isArray(report?.issues) ? report.issues : [];
-  if (issues.length === 0) return null;
-  const errors = issues.filter((issue2) => issue2.severity === "error");
-  if (errors.length > 0) {
-    const preview = errors.slice(0, 6).map((issue2) => `- error: ${String(issue2.message ?? issue2)}`).join("\n");
-    return {
-      action: "deny",
-      reason: `Team \u8FB9\u754C\u68C0\u67E5\u963B\u6B62\u4E86\u6B64\u6B21\u5199\u5165\uFF1A
-${preview}
-
-\u8BF7\u4F7F\u7528 /team check \u67E5\u770B\u51B2\u7A81\u8BE6\u60C5\uFF0C\u8BA4\u9886\u6B63\u786E\u7684\u4EFB\u52A1\uFF0C\u66F4\u65B0\u6A21\u5757\u6240\u6709\u8005\uFF0C\u6216\u4E0E\u5BF9\u5E94 unit \u534F\u8C03\u540E\u518D\u7EE7\u7EED\u3002`
-    };
-  }
-  return null;
-}
 async function confirmToolCall(rl, toolName, input, opLabel) {
   const cmd = String(input["command"] ?? JSON.stringify(input)).slice(0, 240);
   process.stdout.write(
@@ -50190,8 +51340,6 @@ ${yellow("\u26A1 Multi-Agent \u5347\u7EA7\u8BF7\u6C42")}
   if (!opts.yes && rl && !opts.json && isTTY) {
     const workspace = opts.workspace;
     cfg.beforeToolCall = async (toolName, input) => {
-      const teamGuard = await runTeamWriteGuard(getRouter?.(), toolName, input, workspace);
-      if (teamGuard) return teamGuard;
       const opLabel = toolName === "bash" || toolName === "powershell" ? detectSensitiveOp(toolName, input, workspace) ?? "shell command" : detectSensitiveOp(toolName, input, workspace);
       if (!opLabel) return { action: "allow" };
       return confirmToolCall(rl, toolName, input, opLabel);
@@ -50477,7 +51625,7 @@ function formatAge2(ms) {
   if (h < 24) return `${h}\u5C0F\u65F6\u524D`;
   return `${Math.floor(h / 24)}\u5929\u524D`;
 }
-async function reviewPendingExperiences(rl, pending, store2) {
+async function reviewPendingExperiences(rl, pending, store2, onCommitted) {
   const entries = [...pending.list()];
   if (entries.length === 0) {
     console.log(dim("\n\u6682\u65E0\u5F85\u5BA1\u7ECF\u9A8C\u6761\u76EE\u3002\n"));
@@ -50513,6 +51661,7 @@ ${dim("\u65B9\u6848:")} ${solution}
       const id = await pending.commit(entry.pendingId, store2);
       if (id) {
         console.log(green(`  \u2713 \u5DF2\u63D0\u4EA4 (ID: ${id})`));
+        await onCommitted?.(id);
         committed++;
       } else {
         console.log(red("  \u2717 \u63D0\u4EA4\u5931\u8D25"));
@@ -50529,6 +51678,67 @@ ${dim("\u65B9\u6848:")} ${solution}
     console.log(
       `
 ${green(`\u2713 \u5DF2\u63D0\u4EA4 ${committed} \u6761`)}` + (remaining > 0 ? `  ${yellow(`\u5269\u4F59 ${remaining} \u6761\u5F85\u5BA1`)}` : "") + "\n"
+    );
+  }
+  return committed;
+}
+async function reviewPendingPrinciples(rl, pending, store2, experienceStore) {
+  const entries = [...pending.list()];
+  if (entries.length === 0) {
+    console.log(dim("\n\u6682\u65E0\u5F85\u5BA1\u539F\u5219\u3002\n"));
+    return 0;
+  }
+  console.log(
+    `
+${bold("\u539F\u5219\u5BA1\u6838")} ${dim(`(${entries.length} \u6761\u5F85\u5BA1)`)}
+${dim("Principle \u662F\u7531\u7ECF\u9A8C\u548C\u7269\u7406\u951A\u70B9\u62BD\u8C61\u51FA\u7684\u53EF\u8FC1\u79FB\u673A\u5236\uFF1B\u63D0\u4EA4\u524D\u9700\u8981\u4F60\u5BA1\u6838\u8FB9\u754C\u662F\u5426\u660E\u786E\u3002")}
+`
+  );
+  let committed = 0;
+  for (const entry of entries) {
+    const input = entry.input;
+    const title = String(input["title"] ?? "(\u65E0\u6807\u9898)");
+    const statement = String(input["statement"] ?? "").slice(0, 300);
+    const mechanism = String(input["mechanism"] ?? "").slice(0, 220);
+    const domains = input["domains"]?.join(", ") ?? "general";
+    const confidence = String(input["confidence_tier"] ?? "observed");
+    const reason = String(input["promotion_reason"] ?? "unknown");
+    const firstPrinciples = input["first_principles_support"]?.slice(0, 3).join("; ") ?? "";
+    const bounds = input["applicability_bounds"]?.slice(0, 3).join("; ") ?? "";
+    const exclusions = input["non_applicable_when"]?.slice(0, 3).join("; ") ?? "";
+    console.log(
+      `
+${"\u2500".repeat(60)}
+${bold(title)} ${dim(`[${domains}]`)} ${dim(`conf:${confidence}`)} ${dim(`trigger:${reason}`)}
+${dim("\u539F\u5219:")} ${statement}
+${dim("\u673A\u5236:")} ${mechanism}
+` + (firstPrinciples ? `${dim("\u7B2C\u4E00\u6027\u539F\u7406\u652F\u6491:")} ${firstPrinciples}
+` : "") + (bounds ? `${dim("\u9002\u7528\u8FB9\u754C:")} ${bounds}
+` : "") + (exclusions ? `${dim("\u4E0D\u9002\u7528:")} ${exclusions}
+` : "") + `${"\u2500".repeat(60)}
+`
+    );
+    const choice = await askQuestion(rl, `\u63D0\u4EA4 [y=\u662F / n=\u4E22\u5F03 / s=\u8DF3\u8FC7]: `);
+    if (choice.toLowerCase() === "y" || choice.toLowerCase() === "yes") {
+      const id = await pending.commit(entry.pendingId, store2, experienceStore);
+      if (id) {
+        console.log(green(`  \u2713 \u5DF2\u63D0\u4EA4 (ID: ${id})`));
+        committed++;
+      } else {
+        console.log(red("  \u2717 \u63D0\u4EA4\u5931\u8D25\uFF08\u5B57\u6BB5\u6821\u9A8C\u672A\u901A\u8FC7\uFF09"));
+      }
+    } else if (choice.toLowerCase() === "n") {
+      pending.remove(entry.pendingId);
+      console.log(dim("  \u5DF2\u4E22\u5F03"));
+    } else {
+      console.log(dim("  \u5DF2\u8DF3\u8FC7 (\u4FDD\u7559\u5728\u5F85\u5BA1\u961F\u5217)"));
+    }
+  }
+  const remaining = pending.count;
+  if (committed > 0 || remaining > 0) {
+    console.log(
+      `
+${green(`\u2713 \u5DF2\u63D0\u4EA4 ${committed} \u6761\u539F\u5219`)}` + (remaining > 0 ? `  ${yellow(`\u5269\u4F59 ${remaining} \u6761\u5F85\u5BA1`)}` : "") + "\n"
     );
   }
   return committed;
@@ -50593,128 +51803,118 @@ ${green(`\u2713 \u5DF2\u63D0\u4EA4 ${committed} \u6761\u7269\u7406\u951A\u70B9`)
   }
   return committed;
 }
+function relAgo(iso) {
+  if (!iso) return "";
+  const ms = Date.now() - Date.parse(iso);
+  if (Number.isNaN(ms) || ms < 0) return "";
+  const m = Math.floor(ms / 6e4);
+  if (m < 1) return "just now";
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h / 24)}d ago`;
+}
 function formatTeamState(state) {
   if (!state) return `
 ${dim("Team mode \u5C1A\u672A\u521D\u59CB\u5316\u3002\u4F7F\u7528 /team init \u521B\u5EFA\u6A21\u677F\u3002")}
 `;
-  const tasks = Array.isArray(state.tasks) ? state.tasks : [];
-  const units = Array.isArray(state.units) ? state.units : [];
-  const modules = Array.isArray(state.modules) ? state.modules : [];
-  const STATUS_ORDER = ["in_progress", "claimed", "review", "blocked", "backlog", "paused", "handoff", "done", "cancelled"];
-  const tasksByStatus = /* @__PURE__ */ new Map();
-  for (const t of tasks) {
-    const s = String(t.status ?? "backlog");
-    if (!tasksByStatus.has(s)) tasksByStatus.set(s, []);
-    tasksByStatus.get(s).push(t);
-  }
-  const taskLines = [];
-  for (const status of STATUS_ORDER) {
-    const group = tasksByStatus.get(status);
-    if (!group?.length) continue;
-    const label = status === "done" ? dim(status) : status === "cancelled" ? dim(status) : bold(status);
-    taskLines.push(`  ${label}`);
-    for (const t of group) {
-      const owner = t.ownerUnit ? ` ${dim(`owner=${t.ownerUnit}`)}` : "";
-      taskLines.push(`    - ${cyan(String(t.id))} ${String(t.title)}${owner}`);
+  const owned = state.tasks.filter((t) => t.ownerUnit && t.status !== "done");
+  const paused = state.tasks.filter((t) => t.status === "paused");
+  const open5 = state.tasks.filter((t) => !t.ownerUnit && t.status === "open");
+  const done = state.tasks.filter((t) => t.status === "done");
+  const lines = ["", bold("Team Mode (v2.0 \u2014 \u534F\u4F5C\u65E5\u5FD7)")];
+  lines.push(state.github ? `${dim("GitHub:")} ${cyan(state.github)}` : `${dim("GitHub:")} ${dim("(not set)")}`);
+  lines.push(`${dim("Updated:")} ${state.updatedAt}`);
+  lines.push("");
+  lines.push(bold("Goals"));
+  if (state.goals.length === 0) lines.push(`  ${dim("none")}`);
+  else state.goals.forEach((g) => lines.push(`  - ${g}`));
+  lines.push("");
+  lines.push(bold("\u8FDB\u884C\u4E2D\uFF08\u9501\u5B9A\uFF09"));
+  if (owned.length === 0) {
+    lines.push(`  ${dim("none")}`);
+  } else {
+    for (const t of owned) {
+      const stale = isStaleClaim(t);
+      const marker = stale ? yellow("\u26A0") : "\u{1F512}";
+      const claim = t.claimedAt ? ` ${dim(`claimed ${relAgo(t.claimedAt)}`)}` : "";
+      lines.push(`  ${marker} ${cyan(t.id)} ${t.title} \xB7 ${t.ownerUnit}${claim} \xB7 ${dim(`${t.attempts.length} attempts`)}`);
     }
   }
-  if (taskLines.length === 0) taskLines.push(`  ${dim("none")}`);
-  const lines = [
-    "",
-    bold("Team Mode"),
-    state.github ? `${dim("GitHub:")} ${cyan(String(state.github))}` : `${dim("GitHub:")} ${dim("(not set)")}`,
-    `${dim("Updated:")} ${String(state.updatedAt ?? "unknown")}`,
-    "",
-    bold("Units"),
-    ...units.length ? units.map((u) => `  - ${cyan(String(u.id))} ${dim(String(u.status ?? "unknown"))} task=${String(u.currentTask ?? "none")}`) : [`  ${dim("none")}`],
-    "",
-    bold("Tasks"),
-    ...taskLines,
-    "",
-    bold("Modules"),
-    ...modules.length ? modules.slice(0, 8).map((m) => `  - ${cyan(String(m.name))} ${dim(`owner=${String(m.ownerUnit ?? "unclaimed")}`)} paths=${Array.isArray(m.paths) ? m.paths.join(",") : ""}`) : [`  ${dim("none")}`],
-    ""
-  ];
+  lines.push("");
+  if (paused.length > 0) {
+    lines.push(bold("\u6682\u505C"));
+    for (const t of paused) {
+      const owner = t.ownerUnit ? ` \xB7 ${t.ownerUnit}` : "";
+      lines.push(`  - ${cyan(t.id)} ${t.title}${owner} \xB7 ${dim(`${t.attempts.length} attempts`)}`);
+    }
+    lines.push("");
+  }
+  lines.push(bold("\u5F85\u9886"));
+  if (open5.length === 0) lines.push(`  ${dim("none")}`);
+  else open5.forEach((t) => lines.push(`  - ${cyan(t.id)} ${t.title}`));
+  lines.push("");
+  if (done.length > 0) {
+    lines.push(bold("\u5DF2\u5B8C\u6210"));
+    for (const t of done.slice(-5)) {
+      lines.push(`  - ${dim(t.id)} ${dim(t.title)} ${dim(`(${t.attempts.length} attempts)`)}`);
+    }
+    lines.push("");
+  }
+  if (state.units.length > 0) {
+    lines.push(bold("Units"));
+    for (const u of state.units) {
+      const cur = u.currentTask ? ` task=${u.currentTask}` : "";
+      lines.push(`  - ${cyan(u.id)} ${dim(u.status)} last=${relAgo(u.lastSeen)}${cur}`);
+    }
+    lines.push("");
+  }
+  return `${lines.join("\n")}
+`;
+}
+function formatTeamLog(state, limit2 = 8) {
+  if (!state) return "";
+  const rows = [];
+  for (const t of state.tasks) {
+    for (const a of t.attempts) rows.push({ at: a.at, taskId: t.id, title: t.title, unit: a.unit, direction: a.direction, outcome: a.outcome, ref: a.ref });
+  }
+  rows.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+  if (rows.length === 0) return `${bold("Recent attempts")}
+  ${dim("none \u2014 \u4F7F\u7528 /team note \u8FFD\u52A0")}
+`;
+  const lines = [bold(`Recent attempts (latest ${Math.min(limit2, rows.length)})`)];
+  for (const r of rows.slice(0, limit2)) {
+    lines.push(`  - ${dim(relAgo(r.at))} ${cyan(r.taskId)} ${r.unit}`);
+    lines.push(`      ${dim("\u65B9\u5411:")} ${r.direction}`);
+    lines.push(`      ${dim("\u7ED3\u679C:")} ${r.outcome}`);
+    if (r.ref) lines.push(`      ${dim("ref:")} ${r.ref}`);
+  }
   return `${lines.join("\n")}
 `;
 }
 function formatTeamWatcherEvents(events) {
   if (!events || events.length === 0) return "";
-  const lines = ["", bold("Watcher"), ...events.slice(-5).map((e) => `  - ${dim(String(e.at ?? ""))} ${String(e.message ?? e)}`), ""];
+  const lines = ["", bold("Watcher"), ...events.slice(-5).map((e) => `  - ${dim(e.at)} ${e.message}`), ""];
   return `${lines.join("\n")}
 `;
 }
 function teamEventKey(event) {
-  return `${String(event?.at ?? "")}|${String(event?.message ?? event)}`;
-}
-function formatTeamConflictReport(report) {
-  const changed = Array.isArray(report?.changedFiles) ? report.changedFiles : [];
-  const issues = Array.isArray(report?.issues) ? report.issues : [];
-  const lines = [
-    "",
-    bold("Team Boundary Check"),
-    `${dim("Unit:")} ${String(report?.unitId ?? "unknown")}`,
-    `${dim("Current task:")} ${report?.currentTask?.id ? `${cyan(String(report.currentTask.id))} ${String(report.currentTask.title ?? "")}` : dim("none")}`,
-    `${dim("Changed files:")} ${changed.length}`
-  ];
-  changed.slice(0, 12).forEach((file2) => lines.push(`  - ${file2}`));
-  lines.push("", bold("Issues"));
-  if (issues.length === 0) {
-    lines.push(`  ${green("none")}`);
-  } else {
-    issues.slice(0, 20).forEach((issue2) => {
-      const color = issue2.severity === "error" ? red : yellow;
-      lines.push(`  - ${color(String(issue2.severity ?? "warning"))} ${String(issue2.message ?? issue2)}`);
-    });
-  }
-  lines.push("");
-  return `${lines.join("\n")}
-`;
-}
-function formatOnboardingSummary(summary) {
-  if (!summary) return `
-${dim("No onboarding summary available.")}
-`;
-  const goals = Array.isArray(summary.goals) ? summary.goals : [];
-  const units = Array.isArray(summary.activeUnits) ? summary.activeUnits : [];
-  const modules = Array.isArray(summary.modules) ? summary.modules : [];
-  const activeTasks = Array.isArray(summary.activeTasks) ? summary.activeTasks : [];
-  const recommended = Array.isArray(summary.recommendedTasks) ? summary.recommendedTasks : [];
-  const lines = [
-    "",
-    bold("Team Onboarding"),
-    `${dim("Project:")} ${cyan(String(summary.project ?? "unknown"))}`,
-    summary.github ? `${dim("GitHub:")} ${cyan(String(summary.github))}` : "",
-    "",
-    bold("Goals"),
-    ...goals.length ? goals.map((g) => `  - ${g}`) : [`  ${dim("none")}`],
-    "",
-    bold("Active Units"),
-    ...units.length ? units.map((u) => `  - ${cyan(String(u.id))} task=${String(u.currentTask ?? "none")}`) : [`  ${dim("none")}`],
-    "",
-    bold("Active Tasks"),
-    ...activeTasks.length ? activeTasks.map((t) => `  - ${cyan(String(t.id))} [${String(t.status)}] ${String(t.title)} owner=${String(t.ownerUnit ?? "unclaimed")}`) : [`  ${dim("none")}`],
-    "",
-    bold("Recommended Tasks"),
-    ...recommended.length ? recommended.map((t) => `  - ${cyan(String(t.id))} ${String(t.title)} module=${String(t.module ?? "n/a")} paths=${Array.isArray(t.paths) ? t.paths.join(",") : ""}`) : [`  ${dim("none")}`],
-    "",
-    bold("Modules"),
-    ...modules.length ? modules.slice(0, 12).map((m) => `  - ${cyan(String(m.name))} owner=${String(m.ownerUnit ?? "unclaimed")} paths=${Array.isArray(m.paths) ? m.paths.join(",") : ""}`) : [`  ${dim("none")}`],
-    ""
-  ].filter(Boolean);
-  return `${lines.join("\n")}
-`;
+  return `${event.at}|${event.message}`;
 }
 async function buildTeamPlannerSnapshot(controller) {
-  const [state, conflicts, onboarding] = await Promise.all([
-    controller.teamStatus?.().catch(() => null),
-    controller.teamCheck?.().catch(() => null),
-    controller.teamOnboarding?.().catch(() => null)
-  ]);
+  const state = await controller.teamStatus?.().catch(() => null) ?? null;
+  const recentAttempts = [];
+  if (state) {
+    const rows = [];
+    for (const t of state.tasks) {
+      for (const a of t.attempts) rows.push({ at: a.at, taskId: t.id, unit: a.unit, direction: a.direction, outcome: a.outcome, ref: a.ref });
+    }
+    rows.sort((a, b) => Date.parse(b.at) - Date.parse(a.at));
+    recentAttempts.push(...rows.slice(0, 12));
+  }
   return {
     state,
-    conflicts,
-    onboarding,
+    recentAttempts,
     events: controller.teamWatcherEvents?.() ?? []
   };
 }
@@ -50766,182 +51966,87 @@ async function runTeamEntryGuide(router, opts, rl, setInteractiveActive) {
     setInteractiveActive?.(false);
   }
 }
-async function _runTeamEntryGuideInner(controller, router, opts, rl) {
+async function _runTeamEntryGuideInner(controller, router, _opts, rl) {
   let state = await controller.teamStatus?.();
   if (!state) {
-    const answer = await askQuestion(rl, `\u5C1A\u672A\u521D\u59CB\u5316 team/ \u6A21\u677F\u3002\u73B0\u5728\u521D\u59CB\u5316\u5E76\u52A0\u5165 team\uFF1F[Y/n] `);
+    const answer = await askQuestion(rl, `\u5C1A\u672A\u521D\u59CB\u5316 team/ \u6A21\u677F\u3002\u73B0\u5728\u521D\u59CB\u5316\u5E76\u52A0\u5165\uFF1F[Y/n] `);
     if (/^(n|no|否)$/i.test(answer.trim())) return;
     state = await controller.teamJoin?.();
     console.log(green("\n\u2713 team \u5DF2\u521D\u59CB\u5316\u5E76\u52A0\u5165\u3002"));
   } else {
-    const check2 = await controller.teamCheck?.();
-    const unitId2 = String(check2?.unitId ?? "");
-    const alreadyJoined = Array.isArray(state.units) && state.units.some((u) => String(u.id) === unitId2);
-    if (!alreadyJoined) {
-      const answer = await askQuestion(rl, `\u5F53\u524D unit \u5C1A\u672A\u52A0\u5165 team\u3002\u73B0\u5728\u52A0\u5165\uFF1F[Y/n] `);
+    if (state.units.length === 0) {
+      const answer = await askQuestion(rl, `\u5F53\u524D\u8FD8\u6CA1\u6709 unit\u3002\u73B0\u5728\u52A0\u5165\uFF1F[Y/n] `);
       if (!/^(n|no|否)$/i.test(answer.trim())) {
         state = await controller.teamJoin?.(state.github);
         console.log(green("\n\u2713 \u5DF2\u52A0\u5165 team\u3002"));
       }
     }
   }
+  console.log(formatTeamState(state));
+  console.log(formatTeamLog(state));
   const snapshot = await buildTeamPlannerSnapshot(controller);
-  const plan = await callTeamPlanner(router, "\u7528\u6237\u8F93\u5165 /team\uFF0C\u8FDB\u5165\u4E00\u6B21\u6027 team \u5165\u53E3\u5F15\u5BFC\u3002\u8BF7\u53EA\u7ED9\u51FA\u9009\u5DE5\u4F5C\u524D\u7684\u7B80\u77ED\u4E2D\u6587\u5EFA\u8BAE\uFF0C\u4E0D\u8981\u8981\u6C42\u6267\u884C\u52A8\u4F5C\u3002", snapshot);
+  const plan = await callTeamPlanner(
+    router,
+    "\u7528\u6237\u8F93\u5165 /team\uFF0C\u8FDB\u5165\u534F\u4F5C\u5165\u53E3\u3002\u8BF7\u53EA\u7ED9\u51FA\u5F53\u524D\u53EF\u505A\u4E4B\u4E8B\u7684\u7B80\u77ED\u4E2D\u6587\u5EFA\u8BAE\uFF0830 \u5B57\u5185\uFF09\uFF0C\u53EF\u9009\u5730\u63D0\u8BAE\u8BFB\u53D6\u7C7B\u52A8\u4F5C\uFF1B\u4EFB\u4F55\u4FEE\u6539 team \u72B6\u6001\u7684\u52A8\u4F5C\u5FC5\u987B requiresConfirmation=true\u3002",
+    snapshot
+  );
   if (plan?.guidance || plan?.summary) {
     console.log(`
 ${bold("Team Guide")}`);
     if (plan.summary) console.log(`${dim("\u5224\u65AD:")} ${plan.summary}`);
     if (plan.guidance) console.log(`${dim("\u5EFA\u8BAE:")} ${plan.guidance}`);
   }
-  state = await controller.teamStatus?.();
-  const report = await controller.teamCheck?.();
-  const unitId = String(report?.unitId ?? "");
-  const tasks = Array.isArray(state?.tasks) ? state.tasks : [];
-  const activeMine = tasks.filter(
-    (task) => String(task.ownerUnit ?? "") === unitId && !["done", "cancelled"].includes(String(task.status))
-  );
-  console.log(formatTeamState(state));
-  console.log(`${bold("\u9009\u62E9\u672C\u8F6E team \u5DE5\u4F5C")}`);
-  const options = [];
-  activeMine.forEach((task, index) => {
-    options.push(String(task.id));
-    console.log(`  ${cyan(String(index + 1))}. \u7EE7\u7EED ${cyan(String(task.id))} [${String(task.status)}] ${String(task.title)}`);
-  });
-  const createIndex = activeMine.length + 1;
-  const statusIndex = activeMine.length + 2;
-  const exitIndex = activeMine.length + 3;
-  console.log(`  ${cyan(String(createIndex))}. \u521B\u5EFA\u65B0\u7684 team \u5DE5\u4F5C`);
-  console.log(`  ${cyan(String(statusIndex))}. \u53EA\u67E5\u770B board\uFF0C\u6682\u4E0D\u9009\u62E9`);
-  console.log(`  ${cyan(String(exitIndex))}. \u9000\u51FA\u5F15\u5BFC`);
-  const choice = await askQuestion(rl, `\u8BF7\u9009\u62E9 [1-${exitIndex}\uFF0C\u56DE\u8F66=${activeMine.length > 0 ? "1" : createIndex}]: `);
-  const selected = choice.trim() ? Number.parseInt(choice.trim(), 10) : activeMine.length > 0 ? 1 : createIndex;
-  let claimedTaskId = null;
-  if (selected >= 1 && selected <= activeMine.length) {
-    claimedTaskId = await selectTeamWork(controller, String(activeMine[selected - 1].id));
-  } else if (selected === createIndex) {
-    claimedTaskId = await createTeamWorkGuide(controller, rl, state);
-  } else if (selected === statusIndex) {
-    console.log(formatTeamState(await controller.teamStatus?.()));
-  } else {
-    console.log(dim("\n\u5DF2\u9000\u51FA team \u5F15\u5BFC\u3002"));
+  if (plan?.risk === "blocked") {
+    console.log(red(`
+\u26A0 Planner \u5224\u65AD\u5B58\u5728\u963B\u585E\uFF0C\u5DF2\u8DF3\u8FC7\u4EFB\u4F55\u5199\u5165\u5EFA\u8BAE\u3002`));
+  } else if (plan && plan.actions.length > 0) {
+    await executePlan(controller, plan, (q) => askQuestion(rl, q), {
+      onAction: (action, status, detail) => {
+        const tag = status === "done" ? green("\u2713") : status === "failed" ? red("\u2717") : status === "skipped" ? yellow("-") : dim("\u2192");
+        const note = detail ? ` ${dim(detail)}` : "";
+        console.log(`  ${tag} ${action.type}${action.taskId ? ` ${cyan(action.taskId)}` : ""}${note}`);
+      }
+    });
   }
+  const afterState = await controller.teamStatus?.();
+  const claimedTaskId = afterState?.tasks.find((t) => t.ownerUnit && t.status !== "done")?.id ?? null;
   if (claimedTaskId && router.getMessages().length > 0) {
     const msgCount = router.getMessages().length;
     console.log(`
 ${bold("\u68C0\u6D4B\u5230\u5386\u53F2\u5BF9\u8BDD")} ${dim(`\uFF08\u672C session \u5171 ${msgCount} \u6761\u6D88\u606F\uFF09`)}`);
     console.log(`\u8FD9\u4E9B\u5BF9\u8BDD\u4E0E ${cyan(claimedTaskId)} \u662F\u4EC0\u4E48\u5173\u7CFB\uFF1F`);
-    console.log(`  ${cyan("1")}. \u662F\u8BE5\u4EFB\u52A1\u7684\u8D77\u6E90\u80CC\u666F ${dim("\uFF08\u5206\u6790\u53D1\u73B0\u5927\u95EE\u9898\u540E\u8F6C\u5165\u56E2\u961F\u534F\u4F5C\uFF09")}`);
-    console.log(`  ${cyan("2")}. \u4E0E\u8BE5\u4EFB\u52A1\u65E0\u5173 ${dim("\uFF08\u5207\u6362\u8BDD\u9898\u8FDB\u5165\u56E2\u961F\u6A21\u5F0F\uFF09")}`);
+    console.log(`  ${cyan("1")}. \u662F\u8BE5\u4EFB\u52A1\u7684\u8D77\u6E90\u80CC\u666F`);
+    console.log(`  ${cyan("2")}. \u4E0E\u8BE5\u4EFB\u52A1\u65E0\u5173`);
     const bChoice = await askQuestion(rl, `\u8BF7\u9009\u62E9 [1/2\uFF0C\u56DE\u8F66=1]: `);
     const bMode = bChoice.trim() === "2" ? "unrelated" : "background";
     await controller.teamSetContextBoundary?.(bMode, claimedTaskId);
-    if (bMode === "background") {
-      console.log(dim(`  \u2713 \u5DF2\u6807\u8BB0\u4E3A\u4EFB\u52A1\u80CC\u666F\uFF0CAI \u5C06\u53C2\u8003\u4F46\u4E0D\u5C06\u5176\u6DF7\u6DC6\u4E3A\u5DE5\u4F5C\u8FDB\u5C55\u3002`));
-    } else {
-      console.log(dim(`  \u2713 \u5DF2\u8BBE\u7F6E\u8FB9\u754C\uFF0CAI \u5C06\u4ECE ${claimedTaskId} \u521B\u5EFA\u65F6\u523B\u8D77\u91CD\u65B0\u5F00\u59CB\u3002`));
-    }
+    console.log(dim(`  \u2713 ${bMode === "background" ? "\u5DF2\u6807\u8BB0\u4E3A\u4EFB\u52A1\u80CC\u666F" : "\u5DF2\u8BBE\u7F6E\u8FB9\u754C"}\u3002`));
   }
-  console.log(dim("\n\u5DF2\u8FDB\u5165\u6B63\u5E38 robot mode + team context\u3002\u540E\u7EED\u53EF\u4EE5\u81EA\u7136\u8BED\u8A00\u63A8\u8FDB\u4EFB\u52A1\uFF0C\u4E5F\u53EF\u4EE5\u624B\u52A8\u4F7F\u7528 /team done\u3001/team handoff\u3001/team pr \u7B49\u547D\u4EE4\u3002\n"));
-}
-async function selectTeamWork(controller, taskId) {
-  const claimed = await controller.teamClaim?.(taskId);
-  const resolvedId = claimed?.task?.id ?? taskId;
-  console.log(green(`
-\u2713 \u5DF2\u9009\u62E9 ${resolvedId}\u3002`));
-  const warnings = Array.isArray(claimed?.warnings) ? claimed.warnings : [];
-  warnings.forEach((w) => console.log(yellow(`  \u26A0 ${w}`)));
-  try {
-    const branch = await controller.teamBranch?.(taskId);
-    if (branch?.branch) console.log(green(`\u2713 \u5DF2\u5207\u6362\u5230\u5DE5\u4F5C\u5206\u652F ${branch.branch}\u3002`));
-  } catch (err) {
-    console.log(yellow(`\u26A0 \u5206\u652F\u5207\u6362\u672A\u5B8C\u6210: ${err instanceof Error ? err.message : String(err)}`));
-  }
-  return resolvedId;
-}
-function normalizePathInput(raw) {
-  const trimmed = raw.trim();
-  if (!trimmed) return void 0;
-  if (/^(all|全部|所有|本\s*workspace|this\s*workspace|all\s*files?|\.|\.\/?\*{0,2}|\*{1,2})$/i.test(trimmed)) {
-    return ["**"];
-  }
-  const parts = trimmed.split(",").map((p) => p.trim()).filter(Boolean);
-  return parts.length > 0 ? parts : void 0;
-}
-async function createTeamWorkGuide(controller, rl, state) {
-  const suggestedId = nextTeamTaskId(Array.isArray(state?.tasks) ? state.tasks : []);
-  const rawId = await askQuestion(rl, `\u4EFB\u52A1 ID [${suggestedId}]: `);
-  const id = (rawId.trim() || suggestedId).toUpperCase();
-  const title = await askQuestion(rl, `\u4EFB\u52A1\u6807\u9898: `);
-  if (!title.trim()) {
-    console.log(yellow("\n\u4EFB\u52A1\u6807\u9898\u4E3A\u7A7A\uFF0C\u5DF2\u53D6\u6D88\u521B\u5EFA\u3002"));
-    return null;
-  }
-  const module = await askQuestion(rl, `\u6A21\u5757\u540D [\u53EF\u7A7A]: `);
-  const rawPaths = await askQuestion(rl, `\u8DEF\u5F84\u8303\u56F4\uFF0C\u9017\u53F7\u5206\u9694 [TBD]\uFF08\u793A\u4F8B\uFF1Asrc/**, tests/**\uFF0C\u6216\u8F93\u5165 ** \u8868\u793A\u5168\u90E8\uFF09: `);
-  const paths = normalizePathInput(rawPaths);
-  if (rawPaths.trim() && !paths) {
-    console.log(dim(`  \u8DEF\u5F84\u8F93\u5165\u4E3A\u7A7A\uFF0C\u5C06\u4F7F\u7528\u9ED8\u8BA4\u503C TBD\u3002`));
-  }
-  const result = await controller.teamTaskAdd?.({
-    id,
-    title: title.trim(),
-    module: module.trim() || void 0,
-    paths
-  });
-  console.log(green(`
-\u2713 \u5DF2\u521B\u5EFA ${result?.task?.id ?? id}\u3002`));
-  return await selectTeamWork(controller, id);
+  console.log(dim("\n\u534F\u4F5C\u547D\u4EE4\uFF1A/team take <id>\u3001/team note <id> ... \u3001/team drop\u3001/team done\u3001/team steal <id> [reason]\u3002\n"));
 }
 function nextTeamTaskId(tasks) {
-  const nums = tasks.map((task) => String(task?.id ?? "").match(/^TASK-(\d+)$/)?.[1]).filter((n) => Boolean(n)).map((n) => Number.parseInt(n, 10)).filter(Number.isFinite);
+  const nums = tasks.map((task) => task.id.match(/^TASK-(\d+)$/)?.[1]).filter((n) => Boolean(n)).map((n) => Number.parseInt(n, 10)).filter(Number.isFinite);
   const next = nums.length > 0 ? Math.max(...nums) + 1 : 1;
   return `TASK-${String(next).padStart(3, "0")}`;
 }
-function parseTeamTaskAddArgs(text) {
-  const parts = text.trim().split(/\s+/);
-  const id = parts.shift() ?? "";
-  const titleParts = [];
-  let module;
-  let paths;
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part === "--module") {
-      module = parts[++i];
-    } else if (part === "--paths") {
-      paths = (parts[++i] ?? "").split(",").map((p) => p.trim()).filter(Boolean);
-    } else {
-      titleParts.push(part);
-    }
+function parseTeamNoteArgs(text) {
+  const trimmed = text.trim();
+  const taskMatch = trimmed.match(/^(TASK-[A-Z0-9._-]+)\s+(.+)$/i);
+  if (!taskMatch) return null;
+  const taskId = taskMatch[1].toUpperCase();
+  let body = (taskMatch[2] ?? "").trim();
+  let ref;
+  const refMatch = body.match(/\s+@\s*(\S+(?:\s+\S+)*)$/);
+  if (refMatch) {
+    ref = refMatch[1].trim();
+    body = body.slice(0, refMatch.index).trim();
   }
-  return { id, title: titleParts.join(" "), module, paths };
-}
-function parseTeamModuleAddArgs(text) {
-  const parts = text.trim().split(/\s+/).filter(Boolean);
-  const name = parts.shift() ?? "";
-  let ownerUnit;
-  let paths = [];
-  const responsibilities = [];
-  const freeText = [];
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i];
-    if (part === "--paths") {
-      paths = (parts[++i] ?? "").split(",").map((p) => p.trim()).filter(Boolean);
-    } else if (part === "--owner") {
-      ownerUnit = parts[++i];
-    } else if (part === "--resp" || part === "--responsibility") {
-      const respParts = [];
-      while (i + 1 < parts.length && !parts[i + 1].startsWith("--")) {
-        respParts.push(parts[++i]);
-      }
-      if (respParts.length > 0) responsibilities.push(respParts.join(" "));
-    } else {
-      freeText.push(part);
-    }
-  }
-  if (responsibilities.length === 0 && freeText.length > 0) {
-    responsibilities.push(freeText.join(" "));
-  }
-  return { name, paths, ownerUnit, responsibilities };
+  const sepIdx = body.indexOf("::");
+  if (sepIdx < 0) return null;
+  const direction = body.slice(0, sepIdx).trim().replace(/^['"]|['"]$/g, "");
+  const outcome = body.slice(sepIdx + 2).trim().replace(/^['"]|['"]$/g, "");
+  if (!direction || !outcome) return null;
+  return { taskId, direction, outcome, ref };
 }
 async function getTeamController(router, opts) {
   if (opts.mode !== "robotics" && router.mode !== "robotics") {
@@ -50967,9 +52072,15 @@ async function handleTeamCommand(input, router, opts, rl, setInteractiveActive) 
   if (!rawSub) {
     if (!opts.json && isTTY) {
       if (rl) await runTeamEntryGuide(router, opts, rl, setInteractiveActive);
-      else console.log(formatTeamState(await controller.teamStatus?.()));
+      else {
+        const state = await controller.teamStatus?.();
+        console.log(formatTeamState(state));
+        console.log(formatTeamLog(state));
+      }
     } else {
-      console.log(formatTeamState(await controller.teamStatus?.()));
+      const state = await controller.teamStatus?.();
+      console.log(formatTeamState(state));
+      console.log(formatTeamLog(state));
     }
     return;
   }
@@ -50979,245 +52090,118 @@ async function handleTeamCommand(input, router, opts, rl, setInteractiveActive) 
     switch (sub) {
       case "init": {
         const state = await controller.teamInit?.(arg);
-        console.log(green("\n\u2713 team \u6A21\u677F\u5DF2\u521D\u59CB\u5316\u3002") + dim("  \u6587\u4EF6\u4F4D\u4E8E team/\uFF0C\u8BF7\u63D0\u4EA4\u5230 GitHub \u4F5C\u4E3A\u5171\u4EAB\u4E8B\u5B9E\u6E90\u3002"));
+        console.log(green("\n\u2713 team \u6A21\u677F\u5DF2\u521D\u59CB\u5316\u3002") + dim("  \u6587\u4EF6\u4F4D\u4E8E team/\uFF0C\u8BF7\u63D0\u4EA4 team.json \u5230 GitHub\u3002"));
         console.log(formatTeamState(state));
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
         break;
       }
       case "join": {
-        if (arg?.toUpperCase().startsWith("TASK-")) {
-          await selectTeamWork(controller, arg);
-          console.log(formatTeamState(await controller.teamStatus?.()));
-          break;
-        }
         const state = await controller.teamJoin?.(arg);
-        console.log(green("\n\u2713 \u5DF2\u52A0\u5165 team mode\u3002"));
+        console.log(green("\n\u2713 \u5DF2\u52A0\u5165 team\u3002"));
         console.log(formatTeamState(state));
-        const onboarding = await controller.teamOnboarding?.();
-        console.log(formatOnboardingSummary(onboarding));
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
         break;
       }
-      case "use": {
+      case "add": {
         if (!arg) {
           console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team use TASK-001")}
+${yellow("\u7528\u6CD5:")} ${cyan('/team add "<task title>"')}
 `);
           break;
         }
-        await selectTeamWork(controller, arg);
-        console.log(formatTeamState(await controller.teamStatus?.()));
+        const state = await controller.teamStatus?.();
+        const id = nextTeamTaskId(state?.tasks ?? []);
+        const title = arg.replace(/^['"]|['"]$/g, "").trim();
+        const result = await controller.teamTaskAdd?.({ id, title });
+        console.log(green(`
+\u2713 \u5DF2\u65B0\u589E ${result?.task.id ?? id}: ${title}\u3002`));
+        console.log(formatTeamState(result?.state));
+        break;
+      }
+      case "take": {
+        if (!arg) {
+          console.log(`
+${yellow("\u7528\u6CD5:")} ${cyan("/team take TASK-001")}
+`);
+          break;
+        }
+        const result = await controller.teamTake?.(arg);
+        console.log(green(`
+\u2713 \u5DF2\u9886\u53D6 ${result?.task.id ?? arg}\u3002`));
+        console.log(formatTeamState(result?.state));
+        break;
+      }
+      case "drop": {
+        const result = await controller.teamDrop?.(arg);
+        console.log(green(`
+\u2713 \u5DF2\u91CA\u653E ${result?.task.id ?? "(\u5F53\u524D\u4EFB\u52A1)"}\u3002`));
+        console.log(formatTeamState(result?.state));
+        break;
+      }
+      case "steal": {
+        const [taskIdArg, ...reasonParts] = rest;
+        if (!taskIdArg) {
+          console.log(`
+${yellow("\u7528\u6CD5:")} ${cyan("/team steal TASK-001 [reason]")}
+`);
+          break;
+        }
+        const reason = reasonParts.join(" ").trim() || void 0;
+        const result = await controller.teamSteal?.(taskIdArg, reason);
+        const from = result?.previousOwner ? ` (from ${result.previousOwner})` : "";
+        console.log(green(`
+\u2713 \u5DF2 steal ${result?.task.id ?? taskIdArg}${from}\u3002`));
+        if (result?.task.attempts.length) {
+          const last = result.task.attempts[result.task.attempts.length - 1];
+          console.log(dim(`  audit: ${last.direction} \u2014 ${last.outcome}`));
+        }
+        console.log(formatTeamState(result?.state));
+        break;
+      }
+      case "note": {
+        const parsed = parseTeamNoteArgs(rest.join(" "));
+        if (!parsed) {
+          console.log(
+            `
+${yellow("\u7528\u6CD5:")} ${cyan('/team note TASK-001 "<direction>" :: "<outcome>" [@ref]')}
+${dim("\u793A\u4F8B:")} ${cyan("/team note TASK-001 \u8BD5 ResNet :: \u5931\u8D25 real -2% @ wandb.ai/run-3f2")}
+`
+          );
+          break;
+        }
+        const result = await controller.teamNote?.(parsed);
+        console.log(green(`
+\u2713 \u5DF2\u8BB0\u5F55 ${result?.task.id ?? parsed.taskId} \u7684\u4E00\u6761\u5C1D\u8BD5\u3002`));
+        console.log(dim(`  \u65B9\u5411: ${parsed.direction}`));
+        console.log(dim(`  \u7ED3\u679C: ${parsed.outcome}`));
+        if (parsed.ref) console.log(dim(`  ref: ${parsed.ref}`));
         break;
       }
       case "done": {
-        const taskId = arg || String((await controller.teamCheck?.())?.currentTask?.id ?? "");
+        const state = await controller.teamStatus?.();
+        const myTask = state?.tasks.find((t) => t.ownerUnit && t.status !== "done");
+        const taskId = arg || myTask?.id || "";
         if (!taskId) {
           console.log(`
-${yellow("\u6CA1\u6709\u5F53\u524D team task\u3002")} \u4F7F\u7528 ${cyan("/team")} \u9009\u62E9\u4E00\u4E2A\u4EFB\u52A1\uFF0C\u6216 ${cyan("/team done TASK-001")}\u3002
+${yellow("\u6CA1\u6709\u5F53\u524D\u4EFB\u52A1\u3002")} \u4F7F\u7528 ${cyan("/team done TASK-001")}\u3002
 `);
           break;
         }
         const result = await controller.teamTaskStatus?.(taskId, "done");
         console.log(green(`
-\u2713 ${result?.task?.id ?? taskId} -> done\u3002`));
+\u2713 ${result?.task.id ?? taskId} -> done\u3002`));
         console.log(formatTeamState(result?.state));
         break;
       }
-      case "claim": {
+      case "pause": {
         if (!arg) {
           console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team claim TASK-001")}
+${yellow("\u7528\u6CD5:")} ${cyan("/team pause TASK-001")}
 `);
           break;
         }
-        const result = await controller.teamClaim?.(arg);
+        const result = await controller.teamTaskStatus?.(arg, "paused");
         console.log(green(`
-\u2713 \u5DF2\u9886\u53D6 ${result?.task?.id ?? arg}\u3002`) + (result?.task?.branch ? ` ${dim(`branch=${result.task.branch}`)}` : ""));
-        const warnings = Array.isArray(result?.warnings) ? result.warnings : [];
-        warnings.forEach((w) => console.log(yellow(`  \u26A0 ${w}`)));
+\u2713 ${result?.task.id ?? arg} -> paused\u3002`));
         console.log(formatTeamState(result?.state));
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-        break;
-      }
-      case "task": {
-        const [action = "", taskId = "", ...taskRest] = rest;
-        const normalized = action.toLowerCase();
-        if (normalized === "add") {
-          const parsed = parseTeamTaskAddArgs(rest.slice(1).join(" "));
-          if (!parsed.id || !parsed.title) {
-            console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team task add TASK-002 Implement team status --module cli --paths src/cli/**,src/robotics/team/**")}
-`);
-            break;
-          }
-          const result2 = await controller.teamTaskAdd?.(parsed);
-          console.log(green(`
-\u2713 \u5DF2\u65B0\u589E ${result2?.task?.id ?? parsed.id}\u3002`));
-          console.log(formatTeamState(result2?.state));
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-          break;
-        }
-        const statusMap = {
-          done: "done",
-          block: "blocked",
-          blocked: "blocked",
-          review: "review",
-          pause: "paused",
-          paused: "paused",
-          cancel: "cancelled",
-          cancelled: "cancelled",
-          backlog: "backlog",
-          claim: "claimed",
-          claimed: "claimed",
-          start: "in_progress",
-          "in_progress": "in_progress",
-          handoff: "handoff",
-          status: taskRest[0] ?? ""
-        };
-        const nextStatus = statusMap[normalized];
-        if (!taskId || !nextStatus) {
-          console.log(
-            `
-${yellow("\u7528\u6CD5:")} ${cyan("/team task <verb> TASK-002")}
-${dim("Verbs:")} start, done, block, review, pause, cancel, claim, backlog, handoff
-${dim("Generic:")} ${cyan("/team task status TASK-002 <status>")}
-`
-          );
-          break;
-        }
-        const result = await controller.teamTaskStatus?.(taskId, nextStatus);
-        console.log(green(`
-\u2713 ${result?.task?.id ?? taskId} -> ${nextStatus}\u3002`));
-        console.log(formatTeamState(result?.state));
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-        break;
-      }
-      case "module": {
-        const [action = "", moduleName = "", ...moduleRest] = rest;
-        const normalized = action.toLowerCase();
-        if (normalized === "add") {
-          const parsed = parseTeamModuleAddArgs(rest.slice(1).join(" "));
-          if (!parsed.name || parsed.paths.length === 0) {
-            console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team module add team-cli --paths src/cli/**,src/robotics/team/** --owner alice-unit --resp Team CLI and board commands")}
-`);
-            break;
-          }
-          const result = await controller.teamModuleAdd?.(parsed);
-          console.log(green(`
-\u2713 \u5DF2\u65B0\u589E\u6A21\u5757 ${result?.module?.name ?? parsed.name}\u3002`));
-          console.log(formatTeamState(result?.state));
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-          break;
-        }
-        if (normalized === "owner") {
-          if (!moduleName) {
-            console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team module owner team-cli alice-unit")} ${dim("\u6216")} ${cyan("/team module owner team-cli unclaimed")}
-`);
-            break;
-          }
-          const owner = moduleRest.join(" ").trim();
-          const ownerUnit = !owner || owner.toLowerCase() === "unclaimed" || owner.toLowerCase() === "none" ? void 0 : owner;
-          const result = await controller.teamModuleOwner?.(moduleName, ownerUnit);
-          console.log(green(`
-\u2713 \u6A21\u5757 ${result?.module?.name ?? moduleName} owner -> ${ownerUnit ?? "unclaimed"}\u3002`));
-          console.log(formatTeamState(result?.state));
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-          break;
-        }
-        console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team module add <name> --paths a,b")} ${dim("\u6216")} ${cyan("/team module owner <name> <unit|unclaimed>")}
-`);
-        break;
-      }
-      case "check": {
-        const report = await controller.teamCheck?.();
-        console.log(formatTeamConflictReport(report));
-        break;
-      }
-      case "branch": {
-        const result = await controller.teamBranch?.(arg);
-        console.log(
-          green(`
-\u2713 \u5DF2\u5207\u6362\u5230\u4EFB\u52A1\u5206\u652F ${result?.branch ?? ""}\u3002`) + ` ${dim(result?.created ? "created" : "existing")}`
-        );
-        if (result?.task?.id) console.log(`${dim("Task:")} ${cyan(result.task.id)} ${String(result.task.title ?? "")}`);
-        console.log(formatTeamState(result?.state));
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-        break;
-      }
-      case "push": {
-        const result = await controller.teamPush?.();
-        console.log(green(`
-\u2713 \u5DF2\u63A8\u9001 ${result?.branch ?? "current branch"}\u3002`));
-        if (result?.upstream) console.log(`${dim("Upstream:")} ${cyan(String(result.upstream))}`);
-        if (result?.output) console.log(dim(String(result.output).split("\n").slice(-3).join("\n")));
-        break;
-      }
-      case "pr": {
-        const result = await controller.teamPr?.(arg);
-        console.log(green(`
-\u2713 PR \u8349\u7A3F\u5DF2\u751F\u6210\u3002`) + ` ${dim(String(result?.filePath ?? ""))}`);
-        console.log(`${dim("Title:")} ${cyan(String(result?.title ?? ""))}`);
-        console.log(`
-${String(result?.body ?? "")}
-`);
-        break;
-      }
-      case "handoff": {
-        const [maybeTask = "", ...noteParts] = rest;
-        const taskId = maybeTask.toUpperCase().startsWith("TASK-") ? maybeTask : void 0;
-        const note = (taskId ? noteParts.join(" ") : rest.join(" ")).trim();
-        if (!note) {
-          console.log(
-            `
-${yellow("\u63D0\u793A:")} \u672A\u63D0\u4F9B\u4EA4\u63A5\u8BF4\u660E\u3002\u5EFA\u8BAE\u63CF\u8FF0\u5F53\u524D\u8FDB\u5C55\u3001\u5269\u4F59\u5DE5\u4F5C\u548C\u98CE\u9669\u70B9\u3002
-${dim("\u793A\u4F8B:")} ${cyan("/team handoff TASK-001 \u5DF2\u5B8C\u6210 API \u5C42\uFF0C\u5269\u4F59\u524D\u7AEF\u5BF9\u63A5")}
-${dim('\u5C06\u4EE5 "TBD" \u586B\u5145 Next Steps \u6BB5\u843D\u3002')}
-`
-          );
-        }
-        const result = await controller.teamHandoff?.(taskId, note || void 0);
-        console.log(green(`
-\u2713 Handoff \u5DF2\u751F\u6210\u3002`) + ` ${dim(String(result?.filePath ?? ""))}`);
-        if (result?.task?.id) console.log(`${dim("Task:")} ${cyan(String(result.task.id))} -> ${String(result.task.status)}`);
-        break;
-      }
-      case "onboarding": {
-        const summary = await controller.teamOnboarding?.();
-        console.log(formatOnboardingSummary(summary));
-        break;
-      }
-      case "github": {
-        const [area = "", action = "", maybeArg = "", maybeOwner = ""] = rest;
-        if (area === "issues" && action === "sync") {
-          const taskId = maybeArg?.toUpperCase().startsWith("TASK-") ? maybeArg : void 0;
-          const results = await controller.teamGitHubIssuesSync?.(taskId);
-          console.log(green(`
-\u2713 GitHub Issues sync \u5B8C\u6210\u3002`) + ` ${dim(`count=${results?.length ?? 0}`)}`);
-          (results ?? []).forEach((result) => {
-            console.log(`  - ${cyan(String(result.taskId))} ${String(result.action)} ${result.issueUrl ? dim(String(result.issueUrl)) : ""}`);
-          });
-          break;
-        }
-        if (area === "project" && action === "add") {
-          if (!maybeArg) {
-            console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team github project add <project-number> [owner]")}
-`);
-            break;
-          }
-          const result = await controller.teamGitHubProjectAdd?.(maybeArg, maybeOwner || void 0);
-          console.log(green(`
-\u2713 GitHub Project add \u5B8C\u6210\u3002`) + ` ${dim(`added=${result?.added?.length ?? 0} skipped=${result?.skipped?.length ?? 0}`)}`);
-          (result?.added ?? []).slice(0, 10).forEach((item) => console.log(`  - ${cyan(String(item.taskId))} ${dim(String(item.issueUrl))}`));
-          (result?.skipped ?? []).slice(0, 10).forEach((item) => console.log(`  - ${yellow(String(item.taskId))} ${String(item.reason)}`));
-          break;
-        }
-        console.log(`
-${yellow("\u7528\u6CD5:")} ${cyan("/team github issues sync [TASK-ID]")} ${dim("\u6216")} ${cyan("/team github project add <number> [owner]")}
-`);
         break;
       }
       case "sync": {
@@ -51230,7 +52214,7 @@ ${yellow("\u7528\u6CD5:")} ${cyan("/team github issues sync [TASK-ID]")} ${dim("
         if (summary?.currentBranch) console.log(`${dim("Branch:")} ${cyan(summary.currentBranch)}`);
         if (summary?.upstreamBranch) console.log(`${dim("Upstream:")} ${cyan(summary.upstreamBranch)} ${dim(`behind=${summary.behind ?? 0} ahead=${summary.ahead ?? 0}`)}`);
         if (summary?.remoteSummary) console.log(`${dim("Git:")} ${summary.remoteSummary.split("\n")[0]}`);
-        if (Array.isArray(summary?.remoteTeamChanges) && summary.remoteTeamChanges.length > 0) {
+        if (summary?.remoteTeamChanges.length) {
           console.log(`${yellow("Remote team changes:")}`);
           summary.remoteTeamChanges.slice(0, 8).forEach((change) => console.log(`  - ${change}`));
         }
@@ -51241,15 +52225,14 @@ ${yellow("\u7528\u6CD5:")} ${cyan("/team github issues sync [TASK-ID]")} ${dim("
       case "pull": {
         const result = await controller.teamPull?.();
         if (result?.applied) {
-          const count = Array.isArray(result.changedFiles) ? result.changedFiles.length : 0;
+          const count = result.changedFiles.length;
           console.log(green("\n\u2713 remote team/ \u5DF2\u5E94\u7528\u5230\u672C\u5730\u3002") + ` ${dim(`files=${count}`)}`);
           if (count > 0) result.changedFiles.slice(0, 8).forEach((change) => console.log(`  - ${change}`));
         } else {
-          console.log(yellow("\n/team pull \u5DF2\u963B\u6B62\u3002") + ` ${String(result?.reason ?? "unknown reason")}`);
-          const files = Array.isArray(result?.changedFiles) ? result.changedFiles : [];
-          files.slice(0, 8).forEach((change) => console.log(`  - ${change}`));
+          console.log(yellow("\n/team pull \u5DF2\u963B\u6B62\u3002") + ` ${result?.reason ?? "unknown reason"}`);
+          (result?.changedFiles ?? []).slice(0, 8).forEach((change) => console.log(`  - ${change}`));
         }
-        if (result?.sync?.upstreamBranch) console.log(`${dim("Upstream:")} ${cyan(result.sync.upstreamBranch)} ${dim(`behind=${result.sync.behind ?? 0} ahead=${result.sync.ahead ?? 0}`)}`);
+        if (result?.sync.upstreamBranch) console.log(`${dim("Upstream:")} ${cyan(result.sync.upstreamBranch)} ${dim(`behind=${result.sync.behind ?? 0} ahead=${result.sync.ahead ?? 0}`)}`);
         const pullConflictReport = await controller.teamConflicts?.();
         if (pullConflictReport?.hasConflicts) {
           console.log(`
@@ -51265,12 +52248,12 @@ ${yellow("\u26A0 \u68C0\u6D4B\u5230\u5408\u5E76\u51B2\u7A81")} \u2014 \u8FD0\u88
           const resolveResult = await controller.teamResolveTeamJson?.();
           if (resolveResult?.resolved) {
             console.log(green("\n\u2713 team.json \u51B2\u7A81\u5DF2\u81EA\u52A8\u89E3\u51B3\u3002"));
-            console.log(dim(String(resolveResult.message ?? "")));
+            console.log(dim(resolveResult.message));
           } else if (resolveResult?.strategy === "none") {
-            console.log(dim("\n" + String(resolveResult.message ?? "team.json \u65E0\u51B2\u7A81\u3002")));
+            console.log(dim("\n" + (resolveResult.message ?? "team.json \u65E0\u51B2\u7A81\u3002")));
           } else {
             console.log(red("\n\u2717 \u81EA\u52A8\u89E3\u51B3\u5931\u8D25\u3002"));
-            console.log(yellow(String(resolveResult?.message ?? "\u8BF7\u624B\u52A8\u89E3\u51B3\u51B2\u7A81\u3002")));
+            console.log(yellow(resolveResult?.message ?? "\u8BF7\u624B\u52A8\u89E3\u51B3\u51B2\u7A81\u3002"));
           }
           const afterReport = await controller.teamConflicts?.();
           if (afterReport?.hasConflicts) {
@@ -51308,12 +52291,18 @@ ${dim("\u63D0\u793A\uFF1A\u8FD0\u884C")} ${cyan("/team conflicts resolve")} ${di
       }
       case "status":
       case "board":
+      case "log":
       default: {
         const state = await controller.teamStatus?.();
         console.log(formatTeamState(state));
+        if (sub === "log") {
+          console.log(formatTeamLog(state, 30));
+        } else {
+          console.log(formatTeamLog(state));
+        }
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()));
-        if (!["status", "board"].includes(sub)) {
-          console.log(dim(`\u672A\u77E5 team \u5B50\u547D\u4EE4 "${sub}"\u3002\u53EF\u7528: init, join, use, done, status, board, claim, task, module, check, branch, push, pr, handoff, onboarding, github, sync, pull, conflicts.
+        if (!["status", "board", "log"].includes(sub)) {
+          console.log(dim(`\u672A\u77E5 team \u5B50\u547D\u4EE4 "${sub}"\u3002\u53EF\u7528: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, pull, conflicts.
 `));
         }
         break;
@@ -51344,7 +52333,7 @@ async function runRepl(opts) {
     hardwareProfileText = selected.profileText;
   }
   if (!opts.json) {
-    const debugDir = opts.debug ? join30(homedir22(), ".meta-agent", "debug", "<sessionId>") : "";
+    const debugDir = opts.debug ? join32(homedir24(), ".meta-agent", "debug", "<sessionId>") : "";
     console.log(
       `${bold("meta-agent")}  ${dim(`v${VERSION3}`)}
 Mode: ${cyan(opts.mode === "auto" ? "auto-detect" : opts.mode)}` + (opts.hardwareId ? `  ${dim("hw:")} ${cyan(opts.hardwareId)}` : "") + (opts.yes ? `  ${yellow("[AUTO-APPROVE]")}` : "") + (opts.debug ? `  ${yellow("[DEBUG]")}` : "") + `  ${dim("(type /help for commands, Ctrl+D to quit)")}
@@ -51480,7 +52469,7 @@ ${bold(cyan("you"))} \u203A `,
 ${yellow("Team \u52A8\u6001")}
 `);
           fresh.slice(-5).forEach((event) => {
-            process.stdout.write(`  - ${String(event?.message ?? event)}
+            process.stdout.write(`  - ${event.message}
 `);
           });
           process.stdout.write(`${dim("\u4F7F\u7528 /team status\u3001/team sync \u6216 /team pull \u67E5\u770B\u8BE6\u60C5\u3002")}
@@ -51608,6 +52597,14 @@ ${yellow("Interrupted")} ${dim("(press Ctrl+C again to exit)")}
           if (anchorCount > 0) {
             console.log(
               `${yellow(`\u2693  ${anchorCount} \u6761\u7269\u7406\u951A\u70B9\u5F85\u5BA1\u6838`)} \u2014 ${dim("\u4E0B\u6B21\u5728\u540C\u4E00\u9879\u76EE\u542F\u52A8 robotics \u6A21\u5F0F\u540E\uFF0C\u53EF\u7528 /anchor review \u5BA1\u6838\u63D0\u4EA4\u3002")}
+`
+            );
+          }
+          const pendingPrinciples = router.getPendingPrinciples();
+          const principleCount = pendingPrinciples?.count ?? 0;
+          if (principleCount > 0) {
+            console.log(
+              `${yellow(`\u23F8  ${principleCount} \u6761\u539F\u5219\u5F85\u5BA1\u6838`)} \u2014 ${dim("\u4E0B\u6B21\u5728\u540C\u4E00\u9879\u76EE\u542F\u52A8 robotics \u6A21\u5F0F\u540E\uFF0C\u53EF\u7528 /principle review \u5BA1\u6838\u63D0\u4EA4\u3002")}
 `
             );
           }
@@ -51814,7 +52811,13 @@ ${bold("\u5386\u53F2\u4F1A\u8BDD:")} ${dim("(\u4EC5\u5F53\u524D workspace\uFF1B\
               console.log(yellow("\n/experience review \u4EC5\u5728 robotics \u6A21\u5F0F\u4E0B\u53EF\u7528\u3002\n"));
             } else {
               const store2 = new ExperienceStore();
-              await reviewPendingExperiences(rl, pending, store2);
+              await reviewPendingExperiences(rl, pending, store2, async (id) => {
+                const result = await router.proposePrincipleForExperience(id, "confidence_threshold");
+                if (result?.promoted) {
+                  console.log(yellow(`  \u23F8 \u5DF2\u751F\u6210\u5F85\u5BA1\u539F\u5219 (pending ID: ${result.pendingId}, score: ${result.score ?? "n/a"})`));
+                  console.log(dim(`  \u4F7F\u7528 /principle review \u5BA1\u6838\u662F\u5426\u63D0\u4EA4\u3002`));
+                }
+              });
             }
           } else {
             const count = pending?.count ?? 0;
@@ -51825,6 +52828,30 @@ ${yellow(`\u23F8  ${count} \u6761\u7ECF\u9A8C\u5F85\u5BA1\u6838`)} \u2014 \u4F7F
             } else {
               console.log(`
 ${dim("\u6682\u65E0\u5F85\u5BA1\u7ECF\u9A8C\u3002")}
+`);
+            }
+          }
+          break;
+        }
+        case "/principle": {
+          const subCmd = input.split(/\s+/).slice(1).join(" ").toLowerCase();
+          const pendingPrinciples = router.getPendingPrinciples();
+          if (subCmd === "review") {
+            if (!pendingPrinciples) {
+              console.log(yellow("\n/principle review \u4EC5\u5728 robotics \u6A21\u5F0F\u4E0B\u53EF\u7528\u3002\n"));
+            } else {
+              const store2 = new PrincipleStore();
+              await reviewPendingPrinciples(rl, pendingPrinciples, store2, new ExperienceStore());
+            }
+          } else {
+            const count = pendingPrinciples?.count ?? 0;
+            if (count > 0) {
+              console.log(`
+${yellow(`\u23F8  ${count} \u6761\u539F\u5219\u5F85\u5BA1\u6838`)} \u2014 \u4F7F\u7528 ${cyan("/principle review")} \u5BA1\u6838\u63D0\u4EA4
+`);
+            } else {
+              console.log(`
+${dim("\u6682\u65E0\u5F85\u5BA1\u539F\u5219\u3002")}
 `);
             }
           }
@@ -51934,7 +52961,7 @@ ${yellow(`\u2693  ${newAnchors} \u6761\u65B0\u7269\u7406\u951A\u70B9\u5F85\u5BA1
     if (opts.debug && !debugDirShown) {
       const sid = router.getSessionId();
       if (sid) {
-        const realDir = join30(homedir22(), ".meta-agent", "debug", sid);
+        const realDir = join32(homedir24(), ".meta-agent", "debug", sid);
         console.log(`
 ${dim("\u8C03\u8BD5\u65E5\u5FD7\u76EE\u5F55:")} ${cyan(realDir)}
 `);

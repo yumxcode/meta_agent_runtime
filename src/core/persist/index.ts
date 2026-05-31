@@ -68,6 +68,20 @@ export async function atomicWriteJson(filePath: string, data: unknown): Promise<
   await rename(tmp, filePath)
 }
 
+/**
+ * Atomically write a raw text payload to `filePath`.
+ *
+ * Same write-then-rename guarantees as atomicWriteJson, but for arbitrary
+ * text (e.g. markdown views).  Crashes mid-write leave an orphan .tmp file
+ * but never expose a half-written `filePath`.
+ */
+export async function atomicWriteFile(filePath: string, contents: string): Promise<void> {
+  await ensureParentDir(filePath)
+  const tmp = `${filePath}.${randomUUID().slice(0, 8)}.tmp`
+  await writeFile(tmp, contents, 'utf-8')
+  await rename(tmp, filePath)
+}
+
 // ── Directory listing ─────────────────────────────────────────────────────────
 
 /**

@@ -36,6 +36,8 @@ import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
 import { PhysicalAnchorPendingStore } from '../robotics/PhysicalAnchorPendingStore.js'
 import { PhysicalAnchorStore } from '../robotics/PhysicalAnchorStore.js'
+import { PrinciplePendingStore } from '../robotics/PrinciplePendingStore.js'
+import { PrincipleStore } from '../robotics/PrincipleStore.js'
 import {
   TEAM_PLANNER_SYSTEM,
   buildTeamPlannerUserMessage,
@@ -43,9 +45,16 @@ import {
   type TeamPlannerPlan,
   type TeamPlannerSnapshot,
 } from '../robotics/team/TeamPlanner.js'
+import type { TeamWatcherEvent } from '../robotics/team/TeamWatcher.js'
+import type {
+  TeamState,
+  TeamTask,
+} from '../robotics/team/TeamStore.js'
+import { isStaleClaim } from '../robotics/team/TeamStore.js'
 import { SessionStore } from '../core/SessionStore.js'
 import { detectProvider } from '../core/config.js'
 import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveCommandPatterns.js'
+import { executePlan } from './teamPlannerExecutor.js'
 import { resolveTemplate } from './hardwareTemplate.js'
 import type { ProfileTemplate, ProfilePreset } from './hardwareTemplate.js'
 import type { SessionModeHint } from '../routing/types.js'
@@ -121,25 +130,16 @@ ${bold('INTERACTIVE COMMANDS')}
   /workspace            Show current workspace directory
   /hardware             Show bound hardware profile (robotics mode)
   /hardware select      Re-run hardware profile selection wizard
-  /team                 Enter team mode and run the one-shot work guide
-  /team off             Exit the one-shot team entry guide
+  /team                 Show board + recent attempts (entry guide)
   /team init [github]   Create team/ collaboration template
-  /team join [github|task]  Join this unit, or select a TASK-* work item
-  /team use <task>      Select a team work item and switch to its branch
-  /team done [task]     Mark current/selected team task done
-  /team claim <task>    Claim a team task
-  /team task add <id> <title> [--module name] [--paths a,b]
-  /team task done|block|review|status <id>
-  /team module add <name> --paths a,b [--owner unit] [--resp text]
-  /team module owner <name> [unit|unclaimed]
-  /team check           Check workspace changes against task/module boundaries
-  /team branch [task]   Create/switch to the task branch
-  /team push            Push current branch and set upstream
-  /team pr [task]       Generate PR title/body draft under team/tasks/
-  /team handoff [task] [note]  Generate handoff document
-  /team onboarding      Show newcomer summary and recommended tasks
-  /team github issues sync [task]  Sync team tasks to GitHub Issues via gh
-  /team github project add <number> [owner]  Add issue-linked tasks to a GitHub Project
+  /team join [github]   Join this unit to the team
+  /team add "<title>"   Create a new task
+  /team take <task>     Exclusively claim a task (fails if owned by another)
+  /team note <id> "<direction>" :: "<outcome>" [@ref]   Append an attempt
+  /team drop [task]     Release a task you own
+  /team steal <task> [reason]   Forcibly take a task; records audit attempt
+  /team done [task]     Mark task done (only owner)
+  /team status / board  Show current board
   /team sync            Fetch remotes and refresh team status
   /team pull            Apply remote team/ files only when local team/ is clean
   /team conflicts       Show merge conflict guidance for the current workspace
@@ -149,6 +149,8 @@ ${bold('INTERACTIVE COMMANDS')}
   /sessions clear       Delete sessions (pick one or delete all)
   /experience           Show pending experience queue (robotics mode)
   /experience review    Interactively review & commit pending experiences
+  /principle            Show pending principle queue (robotics mode)
+  /principle review     Interactively review & commit pending principles
   /anchor               Show pending physical anchor queue (robotics mode)
   /anchor review        Interactively review & commit pending physical anchors
   /clear                Start a new session (same workspace/hardware)
@@ -712,69 +714,9 @@ function detectSensitiveOp(
   return null
 }
 
-function extractWriteTargetPaths(
-  toolName: string,
-  input: Record<string, unknown>,
-  workspace?: string,
-): string[] {
-  const fromField = (field: string): string[] => {
-    const value = input[field]
-    return typeof value === 'string' && value ? [value] : []
-  }
-  if (toolName === 'write_file' || toolName === 'edit_file') return fromField('file_path')
-  if (toolName === 'notebook_edit') return fromField('notebook_path')
-  if (toolName !== 'bash') return []
-
-  const cmd = String(input['command'] ?? '')
-  const cwd = typeof input['cwd'] === 'string' && input['cwd']
-    ? input['cwd']
-    : workspace
-  const out: string[] = []
-  const add = (raw: string | undefined) => {
-    if (!raw) return
-    const cleaned = raw.trim().replace(/^['"]|['"]$/g, '')
-    if (!cleaned || cleaned.startsWith('&')) return
-    out.push(isAbsolute(cleaned) || !cwd ? cleaned : join(cwd, cleaned))
-  }
-
-  for (const match of cmd.matchAll(/(?:^|[^>])>>?\s*(['"]?)([^'"\s;&|]+)\1/g)) add(match[2])
-  for (const match of cmd.matchAll(/\btee\s+(?:-[a-zA-Z]+\s+)*(['"]?)([^'"\s;&|]+)\1/g)) add(match[2])
-  for (const match of cmd.matchAll(/\b(?:sed|perl)\s+.*\s-i(?:\s+\S+)?\s+(['"]?)([^'"\s;&|]+)\1/g)) add(match[2])
-  return [...new Set(out)]
-}
-
-async function runTeamWriteGuard(
-  router: SessionRouter | undefined,
-  toolName: string,
-  input: Record<string, unknown>,
-  workspace?: string,
-): Promise<BeforeToolCallResult | null> {
-  if (router?.mode !== 'robotics') return null
-  const controller = router.getRoboticsTeamController()
-  if (!controller?.teamCheckPaths) return null
-
-  // Only guard when there are concrete write targets.
-  // Falling back to a full workspace check (teamCheck) for every read/execute
-  // tool generates constant "no_current_task" noise for normal usage.
-  const targetPaths = extractWriteTargetPaths(toolName, input, workspace)
-  if (targetPaths.length === 0) return null
-
-  const report = await controller.teamCheckPaths?.(targetPaths) as any
-  const issues = Array.isArray(report?.issues) ? report.issues : []
-  if (issues.length === 0) return null
-
-  const errors = issues.filter((issue: any) => issue.severity === 'error')
-  if (errors.length > 0) {
-    const preview = errors.slice(0, 6).map((issue: any) => `- error: ${String(issue.message ?? issue)}`).join('\n')
-    return {
-      action: 'deny',
-      reason: `Team 边界检查阻止了此次写入：\n${preview}\n\n请使用 /team check 查看冲突详情，认领正确的任务，更新模块所有者，或与对应 unit 协调后再继续。`,
-    }
-  }
-  // Non-fatal warnings are silently dropped — they don't block the operation,
-  // and printing them causes noise for users who aren't actively using team mode.
-  return null
-}
+// Note: v2.0 team mode removed the path-based write guard entirely.
+// Collaboration is signalled via the board (🔒 markers) rather than enforced
+// by denying tool calls — see src/robotics/team/README design notes.
 
 /**
  * Interactive three-option dialog for sensitive tool calls.
@@ -921,11 +863,10 @@ function makeRouter(
 
   // Register interactive tool guard — only in interactive TTY sessions.
   // Uses the REPL's existing readline interface so stdin is never double-owned.
+  // v2.0 team mode no longer denies writes; coordination is observed on the board.
   if (!opts.yes && rl && !opts.json && isTTY) {
     const workspace = opts.workspace
     cfg.beforeToolCall = async (toolName, input) => {
-      const teamGuard = await runTeamWriteGuard(getRouter?.(), toolName, input, workspace)
-      if (teamGuard) return teamGuard
       const opLabel = toolName === 'bash' || toolName === 'powershell'
         ? (detectSensitiveOp(toolName, input, workspace) ?? 'shell command')
         : detectSensitiveOp(toolName, input, workspace)
@@ -1267,6 +1208,7 @@ async function reviewPendingExperiences(
   rl: readline.Interface,
   pending: ExperiencePendingStore,
   store: ExperienceStore,
+  onCommitted?: (experienceId: string) => Promise<void>,
 ): Promise<number> {
   const entries = [...pending.list()]
   if (entries.length === 0) {
@@ -1303,6 +1245,7 @@ async function reviewPendingExperiences(
       const id = await pending.commit(entry.pendingId, store)
       if (id) {
         console.log(green(`  ✓ 已提交 (ID: ${id})`))
+        await onCommitted?.(id)
         committed++
       } else {
         console.log(red('  ✗ 提交失败'))
@@ -1319,6 +1262,77 @@ async function reviewPendingExperiences(
   if (committed > 0 || remaining > 0) {
     console.log(
       `\n${green(`✓ 已提交 ${committed} 条`)}` +
+      (remaining > 0 ? `  ${yellow(`剩余 ${remaining} 条待审`)}` : '') +
+      '\n',
+    )
+  }
+  return committed
+}
+
+// ── Principle review ─────────────────────────────────────────────────────────
+
+async function reviewPendingPrinciples(
+  rl: readline.Interface,
+  pending: PrinciplePendingStore,
+  store: PrincipleStore,
+  experienceStore?: ExperienceStore,
+): Promise<number> {
+  const entries = [...pending.list()]
+  if (entries.length === 0) {
+    console.log(dim('\n暂无待审原则。\n'))
+    return 0
+  }
+
+  console.log(
+    `\n${bold('原则审核')} ${dim(`(${entries.length} 条待审)`)}\n` +
+    `${dim('Principle 是由经验和物理锚点抽象出的可迁移机制；提交前需要你审核边界是否明确。')}\n`,
+  )
+
+  let committed = 0
+  for (const entry of entries) {
+    const input = entry.input
+    const title = String(input['title'] ?? '(无标题)')
+    const statement = String(input['statement'] ?? '').slice(0, 300)
+    const mechanism = String(input['mechanism'] ?? '').slice(0, 220)
+    const domains = (input['domains'] as string[] | undefined)?.join(', ') ?? 'general'
+    const confidence = String(input['confidence_tier'] ?? 'observed')
+    const reason = String(input['promotion_reason'] ?? 'unknown')
+    const firstPrinciples = (input['first_principles_support'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
+    const bounds = (input['applicability_bounds'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
+    const exclusions = (input['non_applicable_when'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
+
+    console.log(
+      `\n${'─'.repeat(60)}\n` +
+      `${bold(title)} ${dim(`[${domains}]`)} ${dim(`conf:${confidence}`)} ${dim(`trigger:${reason}`)}\n` +
+      `${dim('原则:')} ${statement}\n` +
+      `${dim('机制:')} ${mechanism}\n` +
+      (firstPrinciples ? `${dim('第一性原理支撑:')} ${firstPrinciples}\n` : '') +
+      (bounds ? `${dim('适用边界:')} ${bounds}\n` : '') +
+      (exclusions ? `${dim('不适用:')} ${exclusions}\n` : '') +
+      `${'─'.repeat(60)}\n`,
+    )
+
+    const choice = await askQuestion(rl, `提交 [y=是 / n=丢弃 / s=跳过]: `)
+    if (choice.toLowerCase() === 'y' || choice.toLowerCase() === 'yes') {
+      const id = await pending.commit(entry.pendingId, store, experienceStore)
+      if (id) {
+        console.log(green(`  ✓ 已提交 (ID: ${id})`))
+        committed++
+      } else {
+        console.log(red('  ✗ 提交失败（字段校验未通过）'))
+      }
+    } else if (choice.toLowerCase() === 'n') {
+      pending.remove(entry.pendingId)
+      console.log(dim('  已丢弃'))
+    } else {
+      console.log(dim('  已跳过 (保留在待审队列)'))
+    }
+  }
+
+  const remaining = pending.count
+  if (committed > 0 || remaining > 0) {
+    console.log(
+      `\n${green(`✓ 已提交 ${committed} 条原则`)}` +
       (remaining > 0 ? `  ${yellow(`剩余 ${remaining} 条待审`)}` : '') +
       '\n',
     )
@@ -1405,134 +1419,127 @@ async function reviewPendingPhysicalAnchors(
 
 type TeamCliController = NonNullable<ReturnType<SessionRouter['getRoboticsTeamController']>>
 
-function formatTeamState(state: any): string {
+function relAgo(iso?: string): string {
+  if (!iso) return ''
+  const ms = Date.now() - Date.parse(iso)
+  if (Number.isNaN(ms) || ms < 0) return ''
+  const m = Math.floor(ms / 60_000)
+  if (m < 1) return 'just now'
+  if (m < 60) return `${m}m ago`
+  const h = Math.floor(m / 60)
+  if (h < 24) return `${h}h ago`
+  return `${Math.floor(h / 24)}d ago`
+}
+
+function formatTeamState(state: TeamState | null | undefined): string {
   if (!state) return `\n${dim('Team mode 尚未初始化。使用 /team init 创建模板。')}\n`
 
-  const tasks = Array.isArray(state.tasks) ? state.tasks : []
-  const units = Array.isArray(state.units) ? state.units : []
-  const modules = Array.isArray(state.modules) ? state.modules : []
+  const owned = state.tasks.filter(t => t.ownerUnit && t.status !== 'done')
+  const paused = state.tasks.filter(t => t.status === 'paused')
+  const open = state.tasks.filter(t => !t.ownerUnit && t.status === 'open')
+  const done = state.tasks.filter(t => t.status === 'done')
 
-  // Group tasks by status for a full board view
-  const STATUS_ORDER = ['in_progress', 'claimed', 'review', 'blocked', 'backlog', 'paused', 'handoff', 'done', 'cancelled']
-  const tasksByStatus = new Map<string, any[]>()
-  for (const t of tasks) {
-    const s = String(t.status ?? 'backlog')
-    if (!tasksByStatus.has(s)) tasksByStatus.set(s, [])
-    tasksByStatus.get(s)!.push(t)
-  }
+  const lines: string[] = ['', bold('Team Mode (v2.0 — 协作日志)')]
+  lines.push(state.github ? `${dim('GitHub:')} ${cyan(state.github)}` : `${dim('GitHub:')} ${dim('(not set)')}`)
+  lines.push(`${dim('Updated:')} ${state.updatedAt}`)
+  lines.push('')
 
-  const taskLines: string[] = []
-  for (const status of STATUS_ORDER) {
-    const group = tasksByStatus.get(status)
-    if (!group?.length) continue
-    const label = status === 'done' ? dim(status) : status === 'cancelled' ? dim(status) : bold(status)
-    taskLines.push(`  ${label}`)
-    for (const t of group) {
-      const owner = t.ownerUnit ? ` ${dim(`owner=${t.ownerUnit}`)}` : ''
-      taskLines.push(`    - ${cyan(String(t.id))} ${String(t.title)}${owner}`)
+  lines.push(bold('Goals'))
+  if (state.goals.length === 0) lines.push(`  ${dim('none')}`)
+  else state.goals.forEach(g => lines.push(`  - ${g}`))
+  lines.push('')
+
+  lines.push(bold('进行中（锁定）'))
+  if (owned.length === 0) {
+    lines.push(`  ${dim('none')}`)
+  } else {
+    for (const t of owned) {
+      const stale = isStaleClaim(t)
+      const marker = stale ? yellow('⚠') : '🔒'
+      const claim = t.claimedAt ? ` ${dim(`claimed ${relAgo(t.claimedAt)}`)}` : ''
+      lines.push(`  ${marker} ${cyan(t.id)} ${t.title} · ${t.ownerUnit}${claim} · ${dim(`${t.attempts.length} attempts`)}`)
     }
   }
-  if (taskLines.length === 0) taskLines.push(`  ${dim('none')}`)
-
-  const lines = [
-    '',
-    bold('Team Mode'),
-    state.github ? `${dim('GitHub:')} ${cyan(String(state.github))}` : `${dim('GitHub:')} ${dim('(not set)')}`,
-    `${dim('Updated:')} ${String(state.updatedAt ?? 'unknown')}`,
-    '',
-    bold('Units'),
-    ...(units.length
-      ? units.map((u: any) => `  - ${cyan(String(u.id))} ${dim(String(u.status ?? 'unknown'))} task=${String(u.currentTask ?? 'none')}`)
-      : [`  ${dim('none')}`]),
-    '',
-    bold('Tasks'),
-    ...taskLines,
-    '',
-    bold('Modules'),
-    ...(modules.length
-      ? modules.slice(0, 8).map((m: any) => `  - ${cyan(String(m.name))} ${dim(`owner=${String(m.ownerUnit ?? 'unclaimed')}`)} paths=${Array.isArray(m.paths) ? m.paths.join(',') : ''}`)
-      : [`  ${dim('none')}`]),
-    '',
-  ]
-  return `${lines.join('\n')}\n`
-}
-
-function formatTeamWatcherEvents(events: unknown[] | undefined): string {
-  if (!events || events.length === 0) return ''
-  const lines = ['', bold('Watcher'), ...events.slice(-5).map((e: any) => `  - ${dim(String(e.at ?? ''))} ${String(e.message ?? e)}`), '']
-  return `${lines.join('\n')}\n`
-}
-
-function teamEventKey(event: any): string {
-  return `${String(event?.at ?? '')}|${String(event?.message ?? event)}`
-}
-
-function formatTeamConflictReport(report: any): string {
-  const changed = Array.isArray(report?.changedFiles) ? report.changedFiles : []
-  const issues = Array.isArray(report?.issues) ? report.issues : []
-  const lines = [
-    '',
-    bold('Team Boundary Check'),
-    `${dim('Unit:')} ${String(report?.unitId ?? 'unknown')}`,
-    `${dim('Current task:')} ${report?.currentTask?.id ? `${cyan(String(report.currentTask.id))} ${String(report.currentTask.title ?? '')}` : dim('none')}`,
-    `${dim('Changed files:')} ${changed.length}`,
-  ]
-  changed.slice(0, 12).forEach((file: string) => lines.push(`  - ${file}`))
-  lines.push('', bold('Issues'))
-  if (issues.length === 0) {
-    lines.push(`  ${green('none')}`)
-  } else {
-    issues.slice(0, 20).forEach((issue: any) => {
-      const color = issue.severity === 'error' ? red : yellow
-      lines.push(`  - ${color(String(issue.severity ?? 'warning'))} ${String(issue.message ?? issue)}`)
-    })
-  }
   lines.push('')
+
+  if (paused.length > 0) {
+    lines.push(bold('暂停'))
+    for (const t of paused) {
+      const owner = t.ownerUnit ? ` · ${t.ownerUnit}` : ''
+      lines.push(`  - ${cyan(t.id)} ${t.title}${owner} · ${dim(`${t.attempts.length} attempts`)}`)
+    }
+    lines.push('')
+  }
+
+  lines.push(bold('待领'))
+  if (open.length === 0) lines.push(`  ${dim('none')}`)
+  else open.forEach(t => lines.push(`  - ${cyan(t.id)} ${t.title}`))
+  lines.push('')
+
+  if (done.length > 0) {
+    lines.push(bold('已完成'))
+    for (const t of done.slice(-5)) {
+      lines.push(`  - ${dim(t.id)} ${dim(t.title)} ${dim(`(${t.attempts.length} attempts)`)}`)
+    }
+    lines.push('')
+  }
+
+  if (state.units.length > 0) {
+    lines.push(bold('Units'))
+    for (const u of state.units) {
+      const cur = u.currentTask ? ` task=${u.currentTask}` : ''
+      lines.push(`  - ${cyan(u.id)} ${dim(u.status)} last=${relAgo(u.lastSeen)}${cur}`)
+    }
+    lines.push('')
+  }
+
   return `${lines.join('\n')}\n`
 }
 
-function formatOnboardingSummary(summary: any): string {
-  if (!summary) return `\n${dim('No onboarding summary available.')}\n`
-  const goals = Array.isArray(summary.goals) ? summary.goals : []
-  const units = Array.isArray(summary.activeUnits) ? summary.activeUnits : []
-  const modules = Array.isArray(summary.modules) ? summary.modules : []
-  const activeTasks = Array.isArray(summary.activeTasks) ? summary.activeTasks : []
-  const recommended = Array.isArray(summary.recommendedTasks) ? summary.recommendedTasks : []
-  const lines = [
-    '',
-    bold('Team Onboarding'),
-    `${dim('Project:')} ${cyan(String(summary.project ?? 'unknown'))}`,
-    summary.github ? `${dim('GitHub:')} ${cyan(String(summary.github))}` : '',
-    '',
-    bold('Goals'),
-    ...(goals.length ? goals.map((g: string) => `  - ${g}`) : [`  ${dim('none')}`]),
-    '',
-    bold('Active Units'),
-    ...(units.length ? units.map((u: any) => `  - ${cyan(String(u.id))} task=${String(u.currentTask ?? 'none')}`) : [`  ${dim('none')}`]),
-    '',
-    bold('Active Tasks'),
-    ...(activeTasks.length ? activeTasks.map((t: any) => `  - ${cyan(String(t.id))} [${String(t.status)}] ${String(t.title)} owner=${String(t.ownerUnit ?? 'unclaimed')}`) : [`  ${dim('none')}`]),
-    '',
-    bold('Recommended Tasks'),
-    ...(recommended.length ? recommended.map((t: any) => `  - ${cyan(String(t.id))} ${String(t.title)} module=${String(t.module ?? 'n/a')} paths=${Array.isArray(t.paths) ? t.paths.join(',') : ''}`) : [`  ${dim('none')}`]),
-    '',
-    bold('Modules'),
-    ...(modules.length ? modules.slice(0, 12).map((m: any) => `  - ${cyan(String(m.name))} owner=${String(m.ownerUnit ?? 'unclaimed')} paths=${Array.isArray(m.paths) ? m.paths.join(',') : ''}`) : [`  ${dim('none')}`]),
-    '',
-  ].filter(Boolean)
+function formatTeamLog(state: TeamState | null | undefined, limit = 8): string {
+  if (!state) return ''
+  type Row = { at: string; taskId: string; title: string; unit: string; direction: string; outcome: string; ref?: string }
+  const rows: Row[] = []
+  for (const t of state.tasks) {
+    for (const a of t.attempts) rows.push({ at: a.at, taskId: t.id, title: t.title, unit: a.unit, direction: a.direction, outcome: a.outcome, ref: a.ref })
+  }
+  rows.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+  if (rows.length === 0) return `${bold('Recent attempts')}\n  ${dim('none — 使用 /team note 追加')}\n`
+  const lines: string[] = [bold(`Recent attempts (latest ${Math.min(limit, rows.length)})`)]
+  for (const r of rows.slice(0, limit)) {
+    lines.push(`  - ${dim(relAgo(r.at))} ${cyan(r.taskId)} ${r.unit}`)
+    lines.push(`      ${dim('方向:')} ${r.direction}`)
+    lines.push(`      ${dim('结果:')} ${r.outcome}`)
+    if (r.ref) lines.push(`      ${dim('ref:')} ${r.ref}`)
+  }
   return `${lines.join('\n')}\n`
+}
+
+function formatTeamWatcherEvents(events: TeamWatcherEvent[] | undefined): string {
+  if (!events || events.length === 0) return ''
+  const lines = ['', bold('Watcher'), ...events.slice(-5).map(e => `  - ${dim(e.at)} ${e.message}`), '']
+  return `${lines.join('\n')}\n`
+}
+
+function teamEventKey(event: TeamWatcherEvent): string {
+  return `${event.at}|${event.message}`
 }
 
 async function buildTeamPlannerSnapshot(controller: TeamCliController): Promise<TeamPlannerSnapshot> {
-  const [state, conflicts, onboarding] = await Promise.all([
-    controller.teamStatus?.().catch(() => null),
-    controller.teamCheck?.().catch(() => null),
-    controller.teamOnboarding?.().catch(() => null),
-  ])
+  const state = await controller.teamStatus?.().catch(() => null) ?? null
+  const recentAttempts: unknown[] = []
+  if (state) {
+    type R = { at: string; taskId: string; unit: string; direction: string; outcome: string; ref?: string }
+    const rows: R[] = []
+    for (const t of state.tasks) {
+      for (const a of t.attempts) rows.push({ at: a.at, taskId: t.id, unit: a.unit, direction: a.direction, outcome: a.outcome, ref: a.ref })
+    }
+    rows.sort((a, b) => Date.parse(b.at) - Date.parse(a.at))
+    recentAttempts.push(...rows.slice(0, 12))
+  }
   return {
     state,
-    conflicts,
-    onboarding,
+    recentAttempts,
     events: controller.teamWatcherEvents?.() ?? [],
   }
 }
@@ -1606,158 +1613,80 @@ async function runTeamEntryGuide(
 async function _runTeamEntryGuideInner(
   controller: TeamCliController,
   router: SessionRouter,
-  opts: CliOptions,
+  _opts: CliOptions,
   rl: readline.Interface,
 ): Promise<void> {
-  let state = await controller.teamStatus?.() as any
+  // Initialise / join — no path-based guidance, just basic onboarding.
+  let state: TeamState | null | undefined = await controller.teamStatus?.()
   if (!state) {
-    const answer = await askQuestion(rl, `尚未初始化 team/ 模板。现在初始化并加入 team？[Y/n] `)
+    const answer = await askQuestion(rl, `尚未初始化 team/ 模板。现在初始化并加入？[Y/n] `)
     if (/^(n|no|否)$/i.test(answer.trim())) return
-    state = await controller.teamJoin?.() as any
+    state = await controller.teamJoin?.()
     console.log(green('\n✓ team 已初始化并加入。'))
   } else {
-    const check = await controller.teamCheck?.() as any
-    const unitId = String(check?.unitId ?? '')
-    const alreadyJoined = Array.isArray(state.units) && state.units.some((u: any) => String(u.id) === unitId)
-    if (!alreadyJoined) {
-      const answer = await askQuestion(rl, `当前 unit 尚未加入 team。现在加入？[Y/n] `)
+    // unitId is exposed via controller indirectly; for simplicity treat absence
+    // as "not joined" only when there are zero units (otherwise the watcher's
+    // sync will refresh presence on the next tick anyway).
+    if (state.units.length === 0) {
+      const answer = await askQuestion(rl, `当前还没有 unit。现在加入？[Y/n] `)
       if (!/^(n|no|否)$/i.test(answer.trim())) {
-        state = await controller.teamJoin?.(state.github) as any
+        state = await controller.teamJoin?.(state.github)
         console.log(green('\n✓ 已加入 team。'))
       }
     }
   }
 
+  // Show the board + recent attempts — the primary collaboration view.
+  console.log(formatTeamState(state))
+  console.log(formatTeamLog(state))
+
+  // Ask the planner for natural-language guidance.  Any concrete actions it
+  // proposes go through executePlan() which prompts for confirmation.
   const snapshot = await buildTeamPlannerSnapshot(controller)
-  const plan = await callTeamPlanner(router, '用户输入 /team，进入一次性 team 入口引导。请只给出选工作前的简短中文建议，不要要求执行动作。', snapshot)
+  const plan = await callTeamPlanner(
+    router,
+    '用户输入 /team，进入协作入口。请只给出当前可做之事的简短中文建议（30 字内），可选地提议读取类动作；任何修改 team 状态的动作必须 requiresConfirmation=true。',
+    snapshot,
+  )
   if (plan?.guidance || plan?.summary) {
     console.log(`\n${bold('Team Guide')}`)
     if (plan.summary) console.log(`${dim('判断:')} ${plan.summary}`)
     if (plan.guidance) console.log(`${dim('建议:')} ${plan.guidance}`)
   }
-
-  state = await controller.teamStatus?.() as any
-  const report = await controller.teamCheck?.() as any
-  const unitId = String(report?.unitId ?? '')
-  const tasks = Array.isArray(state?.tasks) ? state.tasks : []
-  const activeMine = tasks.filter((task: any) =>
-    String(task.ownerUnit ?? '') === unitId &&
-    !['done', 'cancelled'].includes(String(task.status)),
-  )
-
-  console.log(formatTeamState(state))
-  console.log(`${bold('选择本轮 team 工作')}`)
-  const options: string[] = []
-  activeMine.forEach((task: any, index: number) => {
-    options.push(String(task.id))
-    console.log(`  ${cyan(String(index + 1))}. 继续 ${cyan(String(task.id))} [${String(task.status)}] ${String(task.title)}`)
-  })
-  const createIndex = activeMine.length + 1
-  const statusIndex = activeMine.length + 2
-  const exitIndex = activeMine.length + 3
-  console.log(`  ${cyan(String(createIndex))}. 创建新的 team 工作`)
-  console.log(`  ${cyan(String(statusIndex))}. 只查看 board，暂不选择`)
-  console.log(`  ${cyan(String(exitIndex))}. 退出引导`)
-
-  const choice = await askQuestion(rl, `请选择 [1-${exitIndex}，回车=${activeMine.length > 0 ? '1' : createIndex}]: `)
-  const selected = choice.trim() ? Number.parseInt(choice.trim(), 10) : (activeMine.length > 0 ? 1 : createIndex)
-  let claimedTaskId: string | null = null
-  if (selected >= 1 && selected <= activeMine.length) {
-    claimedTaskId = await selectTeamWork(controller, String(activeMine[selected - 1]!.id))
-  } else if (selected === createIndex) {
-    claimedTaskId = await createTeamWorkGuide(controller, rl, state)
-  } else if (selected === statusIndex) {
-    console.log(formatTeamState(await controller.teamStatus?.()))
-  } else {
-    console.log(dim('\n已退出 team 引导。'))
+  if (plan?.risk === 'blocked') {
+    console.log(red(`\n⚠ Planner 判断存在阻塞，已跳过任何写入建议。`))
+  } else if (plan && plan.actions.length > 0) {
+    await executePlan(controller, plan, q => askQuestion(rl, q), {
+      onAction: (action, status, detail) => {
+        const tag = status === 'done' ? green('✓') : status === 'failed' ? red('✗') : status === 'skipped' ? yellow('-') : dim('→')
+        const note = detail ? ` ${dim(detail)}` : ''
+        console.log(`  ${tag} ${action.type}${action.taskId ? ` ${cyan(action.taskId)}` : ''}${note}`)
+      },
+    })
   }
 
-  // Plan B: context boundary dialog.
-  // If this session already has conversation history, ask the user whether the prior
-  // exchanges are the origin of this task or are unrelated — then inject a boundary
-  // annotation into the system prompt so the AI never misattributes old chat as
-  // work-in-progress for the newly claimed task.
+  // Optional context boundary if there's prior conversation in this session
+  // and the user has just taken a task during this entry guide.
+  const afterState = await controller.teamStatus?.()
+  const claimedTaskId = afterState?.tasks.find(t => t.ownerUnit && t.status !== 'done')?.id ?? null
   if (claimedTaskId && router.getMessages().length > 0) {
     const msgCount = router.getMessages().length
     console.log(`\n${bold('检测到历史对话')} ${dim(`（本 session 共 ${msgCount} 条消息）`)}`)
     console.log(`这些对话与 ${cyan(claimedTaskId)} 是什么关系？`)
-    console.log(`  ${cyan('1')}. 是该任务的起源背景 ${dim('（分析发现大问题后转入团队协作）')}`)
-    console.log(`  ${cyan('2')}. 与该任务无关 ${dim('（切换话题进入团队模式）')}`)
+    console.log(`  ${cyan('1')}. 是该任务的起源背景`)
+    console.log(`  ${cyan('2')}. 与该任务无关`)
     const bChoice = await askQuestion(rl, `请选择 [1/2，回车=1]: `)
     const bMode: 'background' | 'unrelated' = bChoice.trim() === '2' ? 'unrelated' : 'background'
     await controller.teamSetContextBoundary?.(bMode, claimedTaskId)
-    if (bMode === 'background') {
-      console.log(dim(`  ✓ 已标记为任务背景，AI 将参考但不将其混淆为工作进展。`))
-    } else {
-      console.log(dim(`  ✓ 已设置边界，AI 将从 ${claimedTaskId} 创建时刻起重新开始。`))
-    }
+    console.log(dim(`  ✓ ${bMode === 'background' ? '已标记为任务背景' : '已设置边界'}。`))
   }
 
-  console.log(dim('\n已进入正常 robot mode + team context。后续可以自然语言推进任务，也可以手动使用 /team done、/team handoff、/team pr 等命令。\n'))
+  console.log(dim('\n协作命令：/team take <id>、/team note <id> ... 、/team drop、/team done、/team steal <id> [reason]。\n'))
 }
 
-async function selectTeamWork(controller: TeamCliController, taskId: string): Promise<string> {
-  const claimed = await controller.teamClaim?.(taskId) as any
-  const resolvedId: string = claimed?.task?.id ?? taskId
-  console.log(green(`\n✓ 已选择 ${resolvedId}。`))
-  const warnings = Array.isArray(claimed?.warnings) ? claimed.warnings : []
-  warnings.forEach((w: string) => console.log(yellow(`  ⚠ ${w}`)))
-  try {
-    const branch = await controller.teamBranch?.(taskId) as any
-    if (branch?.branch) console.log(green(`✓ 已切换到工作分支 ${branch.branch}。`))
-  } catch (err) {
-    console.log(yellow(`⚠ 分支切换未完成: ${err instanceof Error ? err.message : String(err)}`))
-  }
-  return resolvedId
-}
-
-/**
- * Normalize a raw path-range string entered by the user.
- *
- * Accepts glob patterns (`src/**, tests/**`) as well as natural-language
- * "all files" expressions in Chinese or English, converting them to `**`.
- * Filters out empty tokens and returns `undefined` when nothing usable remains
- * (so the caller can fall through to the default `['TBD']`).
- */
-function normalizePathInput(raw: string): string[] | undefined {
-  const trimmed = raw.trim()
-  if (!trimmed) return undefined
-  // Natural-language "everything" expressions → **
-  if (/^(all|全部|所有|本\s*workspace|this\s*workspace|all\s*files?|\.|\.\/?\*{0,2}|\*{1,2})$/i.test(trimmed)) {
-    return ['**']
-  }
-  const parts = trimmed.split(',').map(p => p.trim()).filter(Boolean)
-  return parts.length > 0 ? parts : undefined
-}
-
-async function createTeamWorkGuide(controller: TeamCliController, rl: readline.Interface, state: any): Promise<string | null> {
-  const suggestedId = nextTeamTaskId(Array.isArray(state?.tasks) ? state.tasks : [])
-  const rawId = await askQuestion(rl, `任务 ID [${suggestedId}]: `)
-  const id = (rawId.trim() || suggestedId).toUpperCase()
-  const title = await askQuestion(rl, `任务标题: `)
-  if (!title.trim()) {
-    console.log(yellow('\n任务标题为空，已取消创建。'))
-    return null
-  }
-  const module = await askQuestion(rl, `模块名 [可空]: `)
-  const rawPaths = await askQuestion(rl, `路径范围，逗号分隔 [TBD]（示例：src/**, tests/**，或输入 ** 表示全部）: `)
-  const paths = normalizePathInput(rawPaths)
-  if (rawPaths.trim() && !paths) {
-    console.log(dim(`  路径输入为空，将使用默认值 TBD。`))
-  }
-  const result = await controller.teamTaskAdd?.({
-    id,
-    title: title.trim(),
-    module: module.trim() || undefined,
-    paths,
-  }) as any
-  console.log(green(`\n✓ 已创建 ${result?.task?.id ?? id}。`))
-  return await selectTeamWork(controller, id)
-}
-
-function nextTeamTaskId(tasks: any[]): string {
+function nextTeamTaskId(tasks: TeamTask[]): string {
   const nums = tasks
-    .map(task => String(task?.id ?? '').match(/^TASK-(\d+)$/)?.[1])
+    .map(task => task.id.match(/^TASK-(\d+)$/)?.[1])
     .filter((n): n is string => Boolean(n))
     .map(n => Number.parseInt(n, 10))
     .filter(Number.isFinite)
@@ -1765,55 +1694,39 @@ function nextTeamTaskId(tasks: any[]): string {
   return `TASK-${String(next).padStart(3, '0')}`
 }
 
-function parseTeamTaskAddArgs(text: string): { id: string; title: string; module?: string; paths?: string[] } {
-  const parts = text.trim().split(/\s+/)
-  const id = parts.shift() ?? ''
-  const titleParts: string[] = []
-  let module: string | undefined
-  let paths: string[] | undefined
+/**
+ * Parse `/team note <task-id> "<direction>" :: "<outcome>" [@ref]`.
+ *
+ * Accepts both with and without quotes.  The `::` separator distinguishes
+ * direction from outcome.  An optional trailing `@ref` becomes the artifact
+ * pointer.
+ *
+ * Examples:
+ *   note TASK-001 "试 ResNet" :: "失败，real -2%"
+ *   note TASK-001 试用更大学习率 :: 成功 step 稳定性 +12% @ wandb.ai/run-3f2
+ */
+function parseTeamNoteArgs(text: string): { taskId: string; direction: string; outcome: string; ref?: string } | null {
+  const trimmed = text.trim()
+  const taskMatch = trimmed.match(/^(TASK-[A-Z0-9._-]+)\s+(.+)$/i)
+  if (!taskMatch) return null
+  const taskId = taskMatch[1]!.toUpperCase()
+  let body = (taskMatch[2] ?? '').trim()
 
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i]!
-    if (part === '--module') {
-      module = parts[++i]
-    } else if (part === '--paths') {
-      paths = (parts[++i] ?? '').split(',').map(p => p.trim()).filter(Boolean)
-    } else {
-      titleParts.push(part)
-    }
+  // Strip trailing "@ref"
+  let ref: string | undefined
+  const refMatch = body.match(/\s+@\s*(\S+(?:\s+\S+)*)$/)
+  if (refMatch) {
+    ref = refMatch[1]!.trim()
+    body = body.slice(0, refMatch.index).trim()
   }
 
-  return { id, title: titleParts.join(' '), module, paths }
-}
-
-function parseTeamModuleAddArgs(text: string): { name: string; paths: string[]; ownerUnit?: string; responsibilities?: string[] } {
-  const parts = text.trim().split(/\s+/).filter(Boolean)
-  const name = parts.shift() ?? ''
-  let ownerUnit: string | undefined
-  let paths: string[] = []
-  const responsibilities: string[] = []
-  const freeText: string[] = []
-
-  for (let i = 0; i < parts.length; i++) {
-    const part = parts[i]!
-    if (part === '--paths') {
-      paths = (parts[++i] ?? '').split(',').map(p => p.trim()).filter(Boolean)
-    } else if (part === '--owner') {
-      ownerUnit = parts[++i]
-    } else if (part === '--resp' || part === '--responsibility') {
-      const respParts: string[] = []
-      while (i + 1 < parts.length && !parts[i + 1]!.startsWith('--')) {
-        respParts.push(parts[++i]!)
-      }
-      if (respParts.length > 0) responsibilities.push(respParts.join(' '))
-    } else {
-      freeText.push(part)
-    }
-  }
-  if (responsibilities.length === 0 && freeText.length > 0) {
-    responsibilities.push(freeText.join(' '))
-  }
-  return { name, paths, ownerUnit, responsibilities }
+  // Split on "::" separator
+  const sepIdx = body.indexOf('::')
+  if (sepIdx < 0) return null
+  const direction = body.slice(0, sepIdx).trim().replace(/^['"]|['"]$/g, '')
+  const outcome   = body.slice(sepIdx + 2).trim().replace(/^['"]|['"]$/g, '')
+  if (!direction || !outcome) return null
+  return { taskId, direction, outcome, ref }
 }
 
 async function getTeamController(router: SessionRouter, opts: CliOptions): Promise<TeamCliController | null> {
@@ -1844,9 +1757,15 @@ async function handleTeamCommand(
   if (!rawSub) {
     if (!opts.json && isTTY) {
       if (rl) await runTeamEntryGuide(router, opts, rl, setInteractiveActive)
-      else console.log(formatTeamState(await controller.teamStatus?.()))
+      else {
+        const state = await controller.teamStatus?.()
+        console.log(formatTeamState(state))
+        console.log(formatTeamLog(state))
+      }
     } else {
-      console.log(formatTeamState(await controller.teamStatus?.()))
+      const state = await controller.teamStatus?.()
+      console.log(formatTeamState(state))
+      console.log(formatTeamLog(state))
     }
     return
   }
@@ -1857,247 +1776,132 @@ async function handleTeamCommand(
     switch (sub) {
       case 'init': {
         const state = await controller.teamInit?.(arg)
-        console.log(green('\n✓ team 模板已初始化。') + dim('  文件位于 team/，请提交到 GitHub 作为共享事实源。'))
+        console.log(green('\n✓ team 模板已初始化。') + dim('  文件位于 team/，请提交 team.json 到 GitHub。'))
         console.log(formatTeamState(state))
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         break
       }
       case 'join': {
-        if (arg?.toUpperCase().startsWith('TASK-')) {
-          await selectTeamWork(controller, arg)
-          console.log(formatTeamState(await controller.teamStatus?.()))
-          break
-        }
         const state = await controller.teamJoin?.(arg)
-        console.log(green('\n✓ 已加入 team mode。'))
+        console.log(green('\n✓ 已加入 team。'))
         console.log(formatTeamState(state))
-        const onboarding = await controller.teamOnboarding?.()
-        console.log(formatOnboardingSummary(onboarding))
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         break
       }
-      case 'use': {
+      case 'add': {
         if (!arg) {
-          console.log(`\n${yellow('用法:')} ${cyan('/team use TASK-001')}\n`)
+          console.log(`\n${yellow('用法:')} ${cyan('/team add "<task title>"')}\n`)
           break
         }
-        await selectTeamWork(controller, arg)
-        console.log(formatTeamState(await controller.teamStatus?.()))
+        const state = await controller.teamStatus?.()
+        const id = nextTeamTaskId(state?.tasks ?? [])
+        const title = arg.replace(/^['"]|['"]$/g, '').trim()
+        const result = await controller.teamTaskAdd?.({ id, title })
+        console.log(green(`\n✓ 已新增 ${result?.task.id ?? id}: ${title}。`))
+        console.log(formatTeamState(result?.state))
+        break
+      }
+      case 'take': {
+        if (!arg) {
+          console.log(`\n${yellow('用法:')} ${cyan('/team take TASK-001')}\n`)
+          break
+        }
+        const result = await controller.teamTake?.(arg)
+        console.log(green(`\n✓ 已领取 ${result?.task.id ?? arg}。`))
+        console.log(formatTeamState(result?.state))
+        break
+      }
+      case 'drop': {
+        const result = await controller.teamDrop?.(arg)
+        console.log(green(`\n✓ 已释放 ${result?.task.id ?? '(当前任务)'}。`))
+        console.log(formatTeamState(result?.state))
+        break
+      }
+      case 'steal': {
+        const [taskIdArg, ...reasonParts] = rest
+        if (!taskIdArg) {
+          console.log(`\n${yellow('用法:')} ${cyan('/team steal TASK-001 [reason]')}\n`)
+          break
+        }
+        const reason = reasonParts.join(' ').trim() || undefined
+        const result = await controller.teamSteal?.(taskIdArg, reason)
+        const from = result?.previousOwner ? ` (from ${result.previousOwner})` : ''
+        console.log(green(`\n✓ 已 steal ${result?.task.id ?? taskIdArg}${from}。`))
+        if (result?.task.attempts.length) {
+          const last = result.task.attempts[result.task.attempts.length - 1]!
+          console.log(dim(`  audit: ${last.direction} — ${last.outcome}`))
+        }
+        console.log(formatTeamState(result?.state))
+        break
+      }
+      case 'note': {
+        const parsed = parseTeamNoteArgs(rest.join(' '))
+        if (!parsed) {
+          console.log(
+            `\n${yellow('用法:')} ${cyan('/team note TASK-001 "<direction>" :: "<outcome>" [@ref]')}\n` +
+            `${dim('示例:')} ${cyan('/team note TASK-001 试 ResNet :: 失败 real -2% @ wandb.ai/run-3f2')}\n`,
+          )
+          break
+        }
+        const result = await controller.teamNote?.(parsed)
+        console.log(green(`\n✓ 已记录 ${result?.task.id ?? parsed.taskId} 的一条尝试。`))
+        console.log(dim(`  方向: ${parsed.direction}`))
+        console.log(dim(`  结果: ${parsed.outcome}`))
+        if (parsed.ref) console.log(dim(`  ref: ${parsed.ref}`))
         break
       }
       case 'done': {
-        const taskId = arg || String((await controller.teamCheck?.() as any)?.currentTask?.id ?? '')
+        const state = await controller.teamStatus?.()
+        const myTask = state?.tasks.find(t => t.ownerUnit && t.status !== 'done')
+        const taskId = arg || myTask?.id || ''
         if (!taskId) {
-          console.log(`\n${yellow('没有当前 team task。')} 使用 ${cyan('/team')} 选择一个任务，或 ${cyan('/team done TASK-001')}。\n`)
+          console.log(`\n${yellow('没有当前任务。')} 使用 ${cyan('/team done TASK-001')}。\n`)
           break
         }
-        const result = await controller.teamTaskStatus?.(taskId, 'done') as any
-        console.log(green(`\n✓ ${result?.task?.id ?? taskId} -> done。`))
+        const result = await controller.teamTaskStatus?.(taskId, 'done')
+        console.log(green(`\n✓ ${result?.task.id ?? taskId} -> done。`))
         console.log(formatTeamState(result?.state))
         break
       }
-      case 'claim': {
+      case 'pause': {
         if (!arg) {
-          console.log(`\n${yellow('用法:')} ${cyan('/team claim TASK-001')}\n`)
+          console.log(`\n${yellow('用法:')} ${cyan('/team pause TASK-001')}\n`)
           break
         }
-        const result = await controller.teamClaim?.(arg) as any
-        console.log(green(`\n✓ 已领取 ${result?.task?.id ?? arg}。`) + (result?.task?.branch ? ` ${dim(`branch=${result.task.branch}`)}` : ''))
-        const warnings = Array.isArray(result?.warnings) ? result.warnings : []
-        warnings.forEach((w: string) => console.log(yellow(`  ⚠ ${w}`)))
+        const result = await controller.teamTaskStatus?.(arg, 'paused')
+        console.log(green(`\n✓ ${result?.task.id ?? arg} -> paused。`))
         console.log(formatTeamState(result?.state))
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-        break
-      }
-      case 'task': {
-        const [action = '', taskId = '', ...taskRest] = rest
-        const normalized = action.toLowerCase()
-        if (normalized === 'add') {
-          const parsed = parseTeamTaskAddArgs(rest.slice(1).join(' '))
-          if (!parsed.id || !parsed.title) {
-            console.log(`\n${yellow('用法:')} ${cyan('/team task add TASK-002 Implement team status --module cli --paths src/cli/**,src/robotics/team/**')}\n`)
-            break
-          }
-          const result = await controller.teamTaskAdd?.(parsed) as any
-          console.log(green(`\n✓ 已新增 ${result?.task?.id ?? parsed.id}。`))
-          console.log(formatTeamState(result?.state))
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-          break
-        }
-
-        const statusMap: Record<string, string> = {
-          done: 'done',
-          block: 'blocked',
-          blocked: 'blocked',
-          review: 'review',
-          pause: 'paused',
-          paused: 'paused',
-          cancel: 'cancelled',
-          cancelled: 'cancelled',
-          backlog: 'backlog',
-          claim: 'claimed',
-          claimed: 'claimed',
-          start: 'in_progress',
-          'in_progress': 'in_progress',
-          handoff: 'handoff',
-          status: taskRest[0] ?? '',
-        }
-        const nextStatus = statusMap[normalized]
-        if (!taskId || !nextStatus) {
-          console.log(
-            `\n${yellow('用法:')} ${cyan('/team task <verb> TASK-002')}\n` +
-            `${dim('Verbs:')} start, done, block, review, pause, cancel, claim, backlog, handoff\n` +
-            `${dim('Generic:')} ${cyan('/team task status TASK-002 <status>')}\n`,
-          )
-          break
-        }
-        const result = await controller.teamTaskStatus?.(taskId, nextStatus) as any
-        console.log(green(`\n✓ ${result?.task?.id ?? taskId} -> ${nextStatus}。`))
-        console.log(formatTeamState(result?.state))
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-        break
-      }
-      case 'module': {
-        const [action = '', moduleName = '', ...moduleRest] = rest
-        const normalized = action.toLowerCase()
-        if (normalized === 'add') {
-          const parsed = parseTeamModuleAddArgs(rest.slice(1).join(' '))
-          if (!parsed.name || parsed.paths.length === 0) {
-            console.log(`\n${yellow('用法:')} ${cyan('/team module add team-cli --paths src/cli/**,src/robotics/team/** --owner alice-unit --resp Team CLI and board commands')}\n`)
-            break
-          }
-          const result = await controller.teamModuleAdd?.(parsed) as any
-          console.log(green(`\n✓ 已新增模块 ${result?.module?.name ?? parsed.name}。`))
-          console.log(formatTeamState(result?.state))
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-          break
-        }
-        if (normalized === 'owner') {
-          if (!moduleName) {
-            console.log(`\n${yellow('用法:')} ${cyan('/team module owner team-cli alice-unit')} ${dim('或')} ${cyan('/team module owner team-cli unclaimed')}\n`)
-            break
-          }
-          const owner = moduleRest.join(' ').trim()
-          const ownerUnit = !owner || owner.toLowerCase() === 'unclaimed' || owner.toLowerCase() === 'none'
-            ? undefined
-            : owner
-          const result = await controller.teamModuleOwner?.(moduleName, ownerUnit) as any
-          console.log(green(`\n✓ 模块 ${result?.module?.name ?? moduleName} owner -> ${ownerUnit ?? 'unclaimed'}。`))
-          console.log(formatTeamState(result?.state))
-          console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-          break
-        }
-        console.log(`\n${yellow('用法:')} ${cyan('/team module add <name> --paths a,b')} ${dim('或')} ${cyan('/team module owner <name> <unit|unclaimed>')}\n`)
-        break
-      }
-      case 'check': {
-        const report = await controller.teamCheck?.()
-        console.log(formatTeamConflictReport(report))
-        break
-      }
-      case 'branch': {
-        const result = await controller.teamBranch?.(arg) as any
-        console.log(
-          green(`\n✓ 已切换到任务分支 ${result?.branch ?? ''}。`) +
-          ` ${dim(result?.created ? 'created' : 'existing')}`,
-        )
-        if (result?.task?.id) console.log(`${dim('Task:')} ${cyan(result.task.id)} ${String(result.task.title ?? '')}`)
-        console.log(formatTeamState(result?.state))
-        console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-        break
-      }
-      case 'push': {
-        const result = await controller.teamPush?.() as any
-        console.log(green(`\n✓ 已推送 ${result?.branch ?? 'current branch'}。`))
-        if (result?.upstream) console.log(`${dim('Upstream:')} ${cyan(String(result.upstream))}`)
-        if (result?.output) console.log(dim(String(result.output).split('\n').slice(-3).join('\n')))
-        break
-      }
-      case 'pr': {
-        const result = await controller.teamPr?.(arg) as any
-        console.log(green(`\n✓ PR 草稿已生成。`) + ` ${dim(String(result?.filePath ?? ''))}`)
-        console.log(`${dim('Title:')} ${cyan(String(result?.title ?? ''))}`)
-        console.log(`\n${String(result?.body ?? '')}\n`)
-        break
-      }
-      case 'handoff': {
-        const [maybeTask = '', ...noteParts] = rest
-        const taskId = maybeTask.toUpperCase().startsWith('TASK-') ? maybeTask : undefined
-        const note = (taskId ? noteParts.join(' ') : rest.join(' ')).trim()
-        if (!note) {
-          console.log(
-            `\n${yellow('提示:')} 未提供交接说明。建议描述当前进展、剩余工作和风险点。\n` +
-            `${dim('示例:')} ${cyan('/team handoff TASK-001 已完成 API 层，剩余前端对接')}\n` +
-            `${dim('将以 "TBD" 填充 Next Steps 段落。')}\n`,
-          )
-        }
-        const result = await controller.teamHandoff?.(taskId, note || undefined) as any
-        console.log(green(`\n✓ Handoff 已生成。`) + ` ${dim(String(result?.filePath ?? ''))}`)
-        if (result?.task?.id) console.log(`${dim('Task:')} ${cyan(String(result.task.id))} -> ${String(result.task.status)}`)
-        break
-      }
-      case 'onboarding': {
-        const summary = await controller.teamOnboarding?.()
-        console.log(formatOnboardingSummary(summary))
-        break
-      }
-      case 'github': {
-        const [area = '', action = '', maybeArg = '', maybeOwner = ''] = rest
-        if (area === 'issues' && action === 'sync') {
-          const taskId = maybeArg?.toUpperCase().startsWith('TASK-') ? maybeArg : undefined
-          const results = await controller.teamGitHubIssuesSync?.(taskId) as any[]
-          console.log(green(`\n✓ GitHub Issues sync 完成。`) + ` ${dim(`count=${results?.length ?? 0}`)}`)
-          ;(results ?? []).forEach(result => {
-            console.log(`  - ${cyan(String(result.taskId))} ${String(result.action)} ${result.issueUrl ? dim(String(result.issueUrl)) : ''}`)
-          })
-          break
-        }
-        if (area === 'project' && action === 'add') {
-          if (!maybeArg) {
-            console.log(`\n${yellow('用法:')} ${cyan('/team github project add <project-number> [owner]')}\n`)
-            break
-          }
-          const result = await controller.teamGitHubProjectAdd?.(maybeArg, maybeOwner || undefined) as any
-          console.log(green(`\n✓ GitHub Project add 完成。`) + ` ${dim(`added=${result?.added?.length ?? 0} skipped=${result?.skipped?.length ?? 0}`)}`)
-          ;(result?.added ?? []).slice(0, 10).forEach((item: any) => console.log(`  - ${cyan(String(item.taskId))} ${dim(String(item.issueUrl))}`))
-          ;(result?.skipped ?? []).slice(0, 10).forEach((item: any) => console.log(`  - ${yellow(String(item.taskId))} ${String(item.reason)}`))
-          break
-        }
-        console.log(`\n${yellow('用法:')} ${cyan('/team github issues sync [TASK-ID]')} ${dim('或')} ${cyan('/team github project add <number> [owner]')}\n`)
         break
       }
       case 'sync': {
         process.stdout.write(dim('正在同步 team 状态并拉取远端…'))
         const _syncStart = Date.now()
-        const summary = await controller.teamSync?.() as any
+        const summary = await controller.teamSync?.()
         const _elapsed = Date.now() - _syncStart
         process.stdout.write('\r')
         console.log(green('✓ team sync 完成。') + ` ${dim(`git fetch=${summary?.gitFetched ? 'ok' : 'skipped/failed'} (${_elapsed}ms)`)}`)
         if (summary?.currentBranch) console.log(`${dim('Branch:')} ${cyan(summary.currentBranch)}`)
         if (summary?.upstreamBranch) console.log(`${dim('Upstream:')} ${cyan(summary.upstreamBranch)} ${dim(`behind=${summary.behind ?? 0} ahead=${summary.ahead ?? 0}`)}`)
         if (summary?.remoteSummary) console.log(`${dim('Git:')} ${summary.remoteSummary.split('\n')[0]}`)
-        if (Array.isArray(summary?.remoteTeamChanges) && summary.remoteTeamChanges.length > 0) {
+        if (summary?.remoteTeamChanges.length) {
           console.log(`${yellow('Remote team changes:')}`)
-          summary.remoteTeamChanges.slice(0, 8).forEach((change: string) => console.log(`  - ${change}`))
+          summary.remoteTeamChanges.slice(0, 8).forEach(change => console.log(`  - ${change}`))
         }
         console.log(formatTeamState(summary?.state))
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         break
       }
       case 'pull': {
-        const result = await controller.teamPull?.() as any
+        const result = await controller.teamPull?.()
         if (result?.applied) {
-          const count = Array.isArray(result.changedFiles) ? result.changedFiles.length : 0
+          const count = result.changedFiles.length
           console.log(green('\n✓ remote team/ 已应用到本地。') + ` ${dim(`files=${count}`)}`)
-          if (count > 0) result.changedFiles.slice(0, 8).forEach((change: string) => console.log(`  - ${change}`))
+          if (count > 0) result.changedFiles.slice(0, 8).forEach(change => console.log(`  - ${change}`))
         } else {
-          console.log(yellow('\n/team pull 已阻止。') + ` ${String(result?.reason ?? 'unknown reason')}`)
-          const files = Array.isArray(result?.changedFiles) ? result.changedFiles : []
-          files.slice(0, 8).forEach((change: string) => console.log(`  - ${change}`))
+          console.log(yellow('\n/team pull 已阻止。') + ` ${result?.reason ?? 'unknown reason'}`)
+          ;(result?.changedFiles ?? []).slice(0, 8).forEach(change => console.log(`  - ${change}`))
         }
-        if (result?.sync?.upstreamBranch) console.log(`${dim('Upstream:')} ${cyan(result.sync.upstreamBranch)} ${dim(`behind=${result.sync.behind ?? 0} ahead=${result.sync.ahead ?? 0}`)}`)
+        if (result?.sync.upstreamBranch) console.log(`${dim('Upstream:')} ${cyan(result.sync.upstreamBranch)} ${dim(`behind=${result.sync.behind ?? 0} ahead=${result.sync.ahead ?? 0}`)}`)
         // Auto-detect merge conflicts after pull and show guidance if any
-        const pullConflictReport = await controller.teamConflicts?.() as any
+        const pullConflictReport = await controller.teamConflicts?.()
         if (pullConflictReport?.hasConflicts) {
           console.log(`\n${yellow('⚠ 检测到合并冲突')} — 运行 ${cyan('/team conflicts')} 查看详细引导。`)
         }
@@ -2109,27 +1913,27 @@ async function handleTeamCommand(
         const resolveMode = arg === 'resolve'
         if (resolveMode) {
           // Auto-resolve team.json conflict using --theirs strategy
-          const resolveResult = await controller.teamResolveTeamJson?.() as any
+          const resolveResult = await controller.teamResolveTeamJson?.()
           if (resolveResult?.resolved) {
             console.log(green('\n✓ team.json 冲突已自动解决。'))
-            console.log(dim(String(resolveResult.message ?? '')))
+            console.log(dim(resolveResult.message))
           } else if (resolveResult?.strategy === 'none') {
-            console.log(dim('\n' + String(resolveResult.message ?? 'team.json 无冲突。')))
+            console.log(dim('\n' + (resolveResult.message ?? 'team.json 无冲突。')))
           } else {
             console.log(red('\n✗ 自动解决失败。'))
-            console.log(yellow(String(resolveResult?.message ?? '请手动解决冲突。')))
+            console.log(yellow(resolveResult?.message ?? '请手动解决冲突。'))
           }
           // Show remaining conflicts after resolution attempt
-          const afterReport = await controller.teamConflicts?.() as any
+          const afterReport = await controller.teamConflicts?.()
           if (afterReport?.hasConflicts) {
             console.log(`\n${yellow('仍有未解决冲突：')}`)
-            ;(afterReport.guidance as string[]).forEach(line => console.log(line))
+            afterReport.guidance.forEach(line => console.log(line))
           } else {
             console.log(green('\n✓ 所有合并冲突已解决。'))
           }
         } else {
           // Show conflict report with guidance
-          const report = await controller.teamConflicts?.() as any
+          const report = await controller.teamConflicts?.()
           if (!report) {
             console.log(dim('\n无法获取冲突信息。'))
             break
@@ -2138,7 +1942,7 @@ async function handleTeamCommand(
             console.log(green('\n✓ 工作区无 git 合并冲突。'))
           } else {
             console.log(`\n${red('⚠ 合并冲突引导')}`)
-            ;(report.guidance as string[]).forEach((line: string) => {
+            report.guidance.forEach(line => {
               if (line.startsWith('▶')) console.log(`\n${yellow(line)}`)
               else if (line.startsWith('  $')) console.log(cyan(line))
               else if (line.startsWith('  ')) console.log(dim(line))
@@ -2153,12 +1957,18 @@ async function handleTeamCommand(
       }
       case 'status':
       case 'board':
+      case 'log':
       default: {
         const state = await controller.teamStatus?.()
         console.log(formatTeamState(state))
+        if (sub === 'log') {
+          console.log(formatTeamLog(state, 30))
+        } else {
+          console.log(formatTeamLog(state))
+        }
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
-        if (!['status', 'board'].includes(sub)) {
-          console.log(dim(`未知 team 子命令 "${sub}"。可用: init, join, use, done, status, board, claim, task, module, check, branch, push, pr, handoff, onboarding, github, sync, pull, conflicts.\n`))
+        if (!['status', 'board', 'log'].includes(sub)) {
+          console.log(dim(`未知 team 子命令 "${sub}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, pull, conflicts.\n`))
         }
         break
       }
@@ -2343,7 +2153,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
         void (async () => {
           try {
             const events = await controller.teamWatcherPoll?.() ?? []
-            const fresh = events.filter((event: any) => {
+            const fresh = events.filter(event => {
               const key = teamEventKey(event)
               const seen = seenTeamReminderEvents.has(key)
               seenTeamReminderEvents.add(key)
@@ -2355,8 +2165,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
             }
             if (fresh.length > 0 && teamModeUsed) {
               process.stdout.write(`\n${yellow('Team 动态')}\n`)
-              fresh.slice(-5).forEach((event: any) => {
-                process.stdout.write(`  - ${String(event?.message ?? event)}\n`)
+              fresh.slice(-5).forEach(event => {
+                process.stdout.write(`  - ${event.message}\n`)
               })
               process.stdout.write(`${dim('使用 /team status、/team sync 或 /team pull 查看详情。')}\n`)
               rl.prompt(true)
@@ -2549,6 +2359,14 @@ async function runRepl(opts: CliOptions): Promise<void> {
               `${dim('下次在同一项目启动 robotics 模式后，可用 /anchor review 审核提交。')}\n`,
             )
           }
+          const pendingPrinciples = router.getPendingPrinciples()
+          const principleCount = pendingPrinciples?.count ?? 0
+          if (principleCount > 0) {
+            console.log(
+              `${yellow(`⏸  ${principleCount} 条原则待审核`)} — ` +
+              `${dim('下次在同一项目启动 robotics 模式后，可用 /principle review 审核提交。')}\n`,
+            )
+          }
           console.log(`\n${dim('Goodbye.')}\n`)
         }
       } catch { /* best-effort — close-path errors must not block process exit */ }
@@ -2731,7 +2549,15 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(yellow('\n/experience review 仅在 robotics 模式下可用。\n'))
             } else {
               const store = new ExperienceStore()
-              await reviewPendingExperiences(rl, pending, store)
+              await reviewPendingExperiences(rl, pending, store, async id => {
+                const result = await router.proposePrincipleForExperience(id, 'confidence_threshold') as
+                  | { promoted?: boolean; pendingId?: string; reason?: string; score?: number }
+                  | null
+                if (result?.promoted) {
+                  console.log(yellow(`  ⏸ 已生成待审原则 (pending ID: ${result.pendingId}, score: ${result.score ?? 'n/a'})`))
+                  console.log(dim(`  使用 /principle review 审核是否提交。`))
+                }
+              })
             }
           } else {
             const count = pending?.count ?? 0
@@ -2739,6 +2565,26 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(`\n${yellow(`⏸  ${count} 条经验待审核`)} — 使用 ${cyan('/experience review')} 审核提交\n`)
             } else {
               console.log(`\n${dim('暂无待审经验。')}\n`)
+            }
+          }
+          break
+        }
+        case '/principle': {
+          const subCmd = input.split(/\s+/).slice(1).join(' ').toLowerCase()
+          const pendingPrinciples = router.getPendingPrinciples()
+          if (subCmd === 'review') {
+            if (!pendingPrinciples) {
+              console.log(yellow('\n/principle review 仅在 robotics 模式下可用。\n'))
+            } else {
+              const store = new PrincipleStore()
+              await reviewPendingPrinciples(rl, pendingPrinciples, store, new ExperienceStore())
+            }
+          } else {
+            const count = pendingPrinciples?.count ?? 0
+            if (count > 0) {
+              console.log(`\n${yellow(`⏸  ${count} 条原则待审核`)} — 使用 ${cyan('/principle review')} 审核提交\n`)
+            } else {
+              console.log(`\n${dim('暂无待审原则。')}\n`)
             }
           }
           break

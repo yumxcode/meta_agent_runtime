@@ -40,41 +40,33 @@ import type { RouterOptions, SessionMode } from './types.js';
 export interface RoboticsTeamController {
     teamInit?(github?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>;
     teamJoin?(github?: string, human?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>;
-    teamClaim?(taskId: string): Promise<{
-        state: import('../robotics/team/TeamStore.js').TeamState;
-        task: import('../robotics/team/TeamStore.js').TeamTask;
-        warnings: string[];
-    }>;
-    teamStart?(taskId?: string): Promise<{
-        state: import('../robotics/team/TeamStore.js').TeamState;
-        task: import('../robotics/team/TeamStore.js').TeamTask;
-    }>;
+    teamStatus?(): Promise<import('../robotics/team/TeamStore.js').TeamState | null>;
     teamTaskAdd?(input: import('../robotics/team/TeamStore.js').TeamTaskAddInput): Promise<{
         state: import('../robotics/team/TeamStore.js').TeamState;
         task: import('../robotics/team/TeamStore.js').TeamTask;
     }>;
-    teamTaskStatus?(taskId: string, status: string): Promise<{
+    teamTake?(taskId: string): Promise<{
         state: import('../robotics/team/TeamStore.js').TeamState;
         task: import('../robotics/team/TeamStore.js').TeamTask;
     }>;
-    teamModuleAdd?(input: import('../robotics/team/TeamStore.js').TeamModuleAddInput): Promise<{
+    teamDrop?(taskId?: string): Promise<{
         state: import('../robotics/team/TeamStore.js').TeamState;
-        module: import('../robotics/team/TeamStore.js').TeamModule;
+        task: import('../robotics/team/TeamStore.js').TeamTask;
     }>;
-    teamModuleOwner?(name: string, ownerUnit?: string): Promise<{
+    teamSteal?(taskId: string, reason?: string): Promise<{
         state: import('../robotics/team/TeamStore.js').TeamState;
-        module: import('../robotics/team/TeamStore.js').TeamModule;
+        task: import('../robotics/team/TeamStore.js').TeamTask;
+        previousOwner?: string;
     }>;
-    teamCheck?(): Promise<import('../robotics/team/TeamStore.js').TeamConflictReport>;
-    teamCheckPaths?(paths: string[]): Promise<import('../robotics/team/TeamStore.js').TeamConflictReport>;
-    teamBranch?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamBranchResult>;
-    teamPush?(): Promise<import('../robotics/team/TeamStore.js').TeamPushResult>;
-    teamPr?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamPrDraftResult>;
-    teamHandoff?(taskId?: string, note?: string): Promise<import('../robotics/team/TeamStore.js').TeamHandoffResult>;
-    teamOnboarding?(): Promise<import('../robotics/team/TeamStore.js').TeamOnboardingSummary>;
-    teamGitHubIssuesSync?(taskId?: string): Promise<import('../robotics/team/TeamStore.js').TeamGitHubIssueSyncResult[]>;
-    teamGitHubProjectAdd?(projectNumber: string, owner?: string): Promise<import('../robotics/team/TeamStore.js').TeamGitHubProjectResult>;
-    teamStatus?(): Promise<import('../robotics/team/TeamStore.js').TeamState | null>;
+    teamNote?(input: import('../robotics/team/TeamStore.js').TeamNoteInput): Promise<{
+        state: import('../robotics/team/TeamStore.js').TeamState;
+        task: import('../robotics/team/TeamStore.js').TeamTask;
+        attempt: import('../robotics/team/TeamStore.js').TeamAttempt;
+    }>;
+    teamTaskStatus?(taskId: string, status: import('../robotics/team/TeamStore.js').TeamTaskStatus): Promise<{
+        state: import('../robotics/team/TeamStore.js').TeamState;
+        task: import('../robotics/team/TeamStore.js').TeamTask;
+    }>;
     teamSync?(): Promise<import('../robotics/team/TeamStore.js').TeamSyncSummary>;
     teamPull?(): Promise<import('../robotics/team/TeamStore.js').TeamPullResult>;
     teamConflicts?(): Promise<import('../robotics/team/TeamStore.js').MergeConflictReport>;
@@ -189,6 +181,12 @@ export declare class SessionRouter {
      * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
      */
     getPendingPhysicalAnchors(): import('../robotics/PhysicalAnchorPendingStore.js').PhysicalAnchorPendingStore | null;
+    /**
+     * Return the robotics session's pending principle buffer (if mode=robotics).
+     * Returns null in all other modes or before the first submit().
+     */
+    getPendingPrinciples(): import('../robotics/PrinciplePendingStore.js').PrinciplePendingStore | null;
+    proposePrincipleForExperience(experienceId: string, reason: 'confidence_threshold' | 'explicit_user_request'): Promise<unknown | null>;
     getRoboticsTeamController(): RoboticsTeamController | null;
     /**
      * Lazily initialise the backend on the first submit().

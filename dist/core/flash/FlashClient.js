@@ -27,6 +27,7 @@ export class FlashClient {
     openaiClient;
     model;
     cache = new Map();
+    static MAX_CACHE_ENTRIES = 512;
     constructor(config) {
         const { provider, apiKey, baseURL, flashModel } = detectProvider(config);
         this.model = flashModel;
@@ -52,7 +53,10 @@ export class FlashClient {
     async query(opts) {
         // Cache hit
         if (opts.cacheKey && this.cache.has(opts.cacheKey)) {
-            return this.cache.get(opts.cacheKey);
+            const cached = this.cache.get(opts.cacheKey);
+            this.cache.delete(opts.cacheKey);
+            this.cache.set(opts.cacheKey, cached);
+            return cached;
         }
         try {
             let text = null;
@@ -80,7 +84,7 @@ export class FlashClient {
             if (!text)
                 return null;
             if (opts.cacheKey)
-                this.cache.set(opts.cacheKey, text);
+                this.setCached(opts.cacheKey, text);
             return text;
         }
         catch {
@@ -91,6 +95,17 @@ export class FlashClient {
     /** Flush all cached results (call at session start or project switch). */
     clearCache() {
         this.cache.clear();
+    }
+    setCached(key, value) {
+        if (this.cache.has(key))
+            this.cache.delete(key);
+        this.cache.set(key, value);
+        while (this.cache.size > FlashClient.MAX_CACHE_ENTRIES) {
+            const oldest = this.cache.keys().next().value;
+            if (typeof oldest !== 'string')
+                break;
+            this.cache.delete(oldest);
+        }
     }
     /** Current flash model identifier (useful for logging/debugging). */
     get modelId() {
