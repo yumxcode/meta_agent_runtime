@@ -323,6 +323,7 @@ npm run pack
 ## 项目结构
 
 ```text
+docs/           # 架构、设计、报告和评审文档
 src/
 ├── kernel/       # 流式模型调用、工具循环、compact、权限和成本统计
 ├── core/         # 高层 Session、配置、系统提示、记忆、任务契约
@@ -339,6 +340,8 @@ src/
 ├── units/        # 单位与量纲系统
 └── cli/          # 命令行入口
 ```
+
+文档入口见 [docs/README.md](docs/README.md)。
 
 ## 导出入口
 

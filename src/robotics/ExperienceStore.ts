@@ -1,7 +1,7 @@
-import { readFile, readdir, writeFile } from 'fs/promises'
+import { readFile, readdir } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
-import { atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
+import { atomicWriteFile, atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
 import type { ExperienceEntry, ExperienceSearchQuery, KnowledgeConfidenceTier, RoboticsDomain } from './types.js'
 import { makeExperienceId } from './types.js'
 
@@ -178,8 +178,9 @@ export class ExperienceStore {
     lines.push('`experience_search domain=<domain> tags=<tag1,tag2> keyword=<word>`')
     lines.push('`experience_load id=<id>` — load full entry with report')
 
-    // Index is Markdown not JSON — use writeFile directly (not atomicWriteJson)
-    await writeFile(this.indexPath, lines.join('\n'), 'utf-8')
+    // Index is Markdown not JSON — atomicWriteFile gives crash-safe rename
+    // without JSON.stringify wrapping.
+    await atomicWriteFile(this.indexPath, lines.join('\n'))
   }
 
   async listIds(): Promise<string[]> {

@@ -21,9 +21,10 @@
  */
 
 import { createHash } from 'crypto'
-import { readFile, writeFile, readdir, mkdir, rename } from 'fs/promises'
+import { readFile, readdir, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
+import { atomicWriteJson } from '../core/persist/index.js'
 
 import type {
   ProvenanceId,
@@ -258,9 +259,9 @@ export class ProvenanceTracker {
     await ensureDir(dir)
 
     const target = recordPath(this.sessionId, rec.id)
-    const tmp    = `${target}.tmp`
-    await writeFile(tmp, JSON.stringify(rec, null, 2), 'utf-8')
-    await rename(tmp, target)
+    // M3: random-suffix tmp + rename (shared helper) avoids the fixed-`.tmp`
+    // collision two concurrent _save() calls would otherwise hit.
+    await atomicWriteJson(target, rec)
 
     this.cache.set(rec.id, rec)
     this._evictCacheIfNeeded()

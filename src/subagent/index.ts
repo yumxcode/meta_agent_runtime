@@ -25,7 +25,7 @@
  *   cancel_sub_agent      — abort a running sub-agent
  *   list_sub_agents       — list all tasks this session
  *
- * See meta-agent-architecture.md §9 for full design documentation.
+ * See docs/architecture/meta-agent-architecture.md §9 for full design documentation.
  */
 
 // ── Core types ─────────────────────────────────────────────────────────────

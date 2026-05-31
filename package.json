@@ -39,7 +39,6 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
-    "@meta-agent/runtime": "file:",
     "esbuild": "^0.28.0",
     "openai": "^6.39.0",
     "zod": "^4.4.3"

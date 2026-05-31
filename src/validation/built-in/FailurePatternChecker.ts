@@ -16,8 +16,8 @@
  *
   * Design principles:
  *   • passed=true always — this hook never blocks execution (no abort)
- *   • severity='warning' — surfaces findings without interrupting workflow
- *   • Short notice in tool result + full details in ContextPager (next turn)
+ *   • applicable experiences are silently checked out into ContextPager
+ *   • if the flash applicability judgment is unavailable, do not inject
  *
  * Applies to: experiment_dispatch
  * Phase: pre_call
@@ -199,8 +199,9 @@ export class ExperiencePatternChecker implements VVHook {
       cacheKey,
     })
 
-    // Fallback: use all candidates (conservative)
-    const applicableIds = raw ? parseApplicableIds(raw, candidates) : candidates.map(c => c.id)
+    // No flash judgment means no quality gate; skip injection rather than
+    // treating broad candidates as applicable.
+    const applicableIds = raw ? parseApplicableIds(raw, candidates) : []
     const applicable = candidates.filter(c => applicableIds.includes(c.id))
 
     if (applicable.length === 0) return this._pass()
@@ -221,19 +222,12 @@ export class ExperiencePatternChecker implements VVHook {
       }
     }
 
-    // ── Brief notice for current turn ─────────────────────────────────────
-    const notice = applicable
-      .map(e => `• [${e.domain}] ${e.title} (${e.outcome}): ${e.abstractPrinciple.slice(0, 100)}`)
-      .join('\n')
-
     return {
       hookName: this.name,
       passed: true,
-      severity: 'warning',
-      message:
-        `⚠️ ${applicable.length} applicable experience principle(s):\n${notice}\n` +
-        (this.pager ? `Full details available in next turn context.` : ''),
-      suggestedAction: 'warn_user',
+      severity: 'info',
+      message: '',
+      suggestedAction: 'continue',
     }
   }
 

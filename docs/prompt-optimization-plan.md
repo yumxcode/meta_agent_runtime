@@ -2,7 +2,7 @@
 
 > **状态：📦 归档（原优化计划已落地）**  
 > 本文档记录 prompt 系统的演进历程，取代原始的"优化计划"规划文档。  
-> 当前 prompt 架构的完整参考见：[meta-agent-architecture.md](../meta-agent-architecture.md) §2-3
+> 当前 prompt 架构的完整参考见：[meta-agent-architecture.md](architecture/meta-agent-architecture.md) §2-3
 
 ---
 
@@ -125,4 +125,4 @@ buildDynamicSections({
 
 ---
 
-*文档状态：归档。不再更新。当前 prompt 架构见 `meta-agent-architecture.md`。*
+*文档状态：归档。不再更新。当前 prompt 架构见 `docs/architecture/meta-agent-architecture.md`。*

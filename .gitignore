@@ -1,0 +1,20 @@
+# Dependencies
+node_modules/
+
+# Build output (produced by `npm run build`; published via npm, not git)
+dist/
+
+# Packaged tarballs
+*.tgz
+
+# Logs / debug
+*.log
+.DS_Store
+
+# Editor / tooling
+.vscode/
+.idea/
+
+# Local runtime state
+.meta-agent/
+permissions.json

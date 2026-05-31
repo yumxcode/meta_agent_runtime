@@ -2,7 +2,7 @@
 
 > **状态：📦 归档**  
 > 本文档覆盖 SessionRouter 扩展、会话持久化、Git 分支协同三个议题的增量设计。  
-> 三者均已实现，当前 as-built 参考：[meta-agent-architecture.md](../meta-agent-architecture.md) §6.4
+> 三者均已实现，当前 as-built 参考：[meta-agent-architecture.md](architecture/meta-agent-architecture.md) §6.4
 
 ---
 
@@ -63,4 +63,4 @@ v2 设计的 R3 包含 git branch status 表格（`±commits`、`last commit`）
 
 ---
 
-*文档状态：归档。不再更新。如需了解当前实现，请查阅 `meta-agent-architecture.md`。*
+*文档状态：归档。不再更新。如需了解当前实现，请查阅 `docs/architecture/meta-agent-architecture.md`。*

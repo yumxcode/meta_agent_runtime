@@ -24,7 +24,7 @@ import { hostname } from 'node:os'
 import { basename, join } from 'node:path'
 import { promisify } from 'node:util'
 import { mkdir, readFile } from 'node:fs/promises'
-import { atomicWriteFile, atomicWriteJson } from '../../core/persist/index.js'
+import { atomicWriteFile, atomicWriteJson, withFileLock } from '../../core/persist/index.js'
 import { migrateTeamState } from '../../core/persist/schemas.js'
 import {
   STALE_CLAIM_MS,
@@ -724,24 +724,30 @@ export class TeamStore {
    * then regenerate the derived markdown views.
    */
   private async writeAll(state: TeamState, checkUpdatedAt?: string): Promise<void> {
-    if (checkUpdatedAt !== undefined) {
-      const diskRaw = await fileText(this.statePath)
-      if (diskRaw) {
-        let diskUpdatedAt: string | undefined
-        try {
-          diskUpdatedAt = (JSON.parse(diskRaw) as { updatedAt?: string }).updatedAt
-        } catch { /* corrupt → allow */ }
-        if (diskUpdatedAt !== undefined && diskUpdatedAt !== checkUpdatedAt) {
-          throw new Error(
-            `[TeamStore] Concurrent modification: team.json was updated by another process ` +
-            `(expected updatedAt="${checkUpdatedAt}", found "${diskUpdatedAt}"). ` +
-            `Re-read the team state and retry the operation.`,
-          )
+    await mkdir(this.teamDir, { recursive: true })
+    // M2: hold a cross-process lock around the read-check → write so two
+    // processes sharing team.json can't both pass the optimistic check and
+    // clobber each other (lost update). The optimistic check stays as the
+    // correctness mechanism; the lock just makes check-then-rename atomic.
+    await withFileLock(this.statePath, async () => {
+      if (checkUpdatedAt !== undefined) {
+        const diskRaw = await fileText(this.statePath)
+        if (diskRaw) {
+          let diskUpdatedAt: string | undefined
+          try {
+            diskUpdatedAt = (JSON.parse(diskRaw) as { updatedAt?: string }).updatedAt
+          } catch { /* corrupt → allow */ }
+          if (diskUpdatedAt !== undefined && diskUpdatedAt !== checkUpdatedAt) {
+            throw new Error(
+              `[TeamStore] Concurrent modification: team.json was updated by another process ` +
+              `(expected updatedAt="${checkUpdatedAt}", found "${diskUpdatedAt}"). ` +
+              `Re-read the team state and retry the operation.`,
+            )
+          }
         }
       }
-    }
-    await mkdir(this.teamDir, { recursive: true })
-    await atomicWriteJson(this.statePath, state)
+      await atomicWriteJson(this.statePath, state)
+    })
     // Derived views are best-effort, but the writes must drain before callers
     // treat the mutation as complete; otherwise tests and cleanup can race with
     // background writes that recreate files inside the team directory.

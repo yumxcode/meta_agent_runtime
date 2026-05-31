@@ -1,1 +1,0 @@
-{"version":3,"file":"dynamicSection.d.ts","sourceRoot":"","sources":["../../../src/robotics/team/dynamicSection.ts"],"names":[],"mappings":"AAAA,OAAO,EAEL,KAAK,mBAAmB,EACzB,MAAM,oCAAoC,CAAA;AAC3C,OAAO,KAAK,EAAE,SAAS,EAAE,MAAM,gBAAgB,CAAA;AAC/C,OAAO,KAAK,EAAE,WAAW,EAAE,MAAM,kBAAkB,CAAA;AAEnD,wBAAgB,gBAAgB,CAAC,SAAS,EAAE,SAAS,EAAE,WAAW,CAAC,EAAE,WAAW,GAAG,mBAAmB,CAcrG"}

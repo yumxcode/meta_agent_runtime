@@ -19,9 +19,20 @@ function resolvePathForGuard(path: string, workspaceRoot: string): string {
   return resolve(realAncestor, relative(ancestor, absolute))
 }
 
-export function assertInsideWorkspace(path: string, workspaceRoot = process.cwd()): string | null {
+/**
+ * Single source of truth for "is this path inside the workspace?".
+ *
+ * Both the kernel PermissionPolicy and the bash tool import THIS function so
+ * the symlink-escape handling (resolve real path of the nearest existing
+ * ancestor, then re-attach the non-existent tail) cannot drift between the
+ * three call sites that historically each had their own copy.
+ */
+export function isInsideWorkspace(path: string, workspaceRoot = process.cwd()): boolean {
   const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
   const target = resolvePathForGuard(path, workspace)
-  const inside = target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
-  return inside ? null : `Error: path is outside workspace: ${path}`
+  return target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
+}
+
+export function assertInsideWorkspace(path: string, workspaceRoot = process.cwd()): string | null {
+  return isInsideWorkspace(path, workspaceRoot) ? null : `Error: path is outside workspace: ${path}`
 }

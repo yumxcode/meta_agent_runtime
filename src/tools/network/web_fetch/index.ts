@@ -1,4 +1,7 @@
 import { lookup } from 'node:dns/promises'
+import { request as httpRequest } from 'node:http'
+import { request as httpsRequest } from 'node:https'
+import type { LookupAddress } from 'node:dns'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 
@@ -81,6 +84,8 @@ function classifyIp(ip: string): string | null {
 interface ValidatedTarget {
   url: URL
   resolvedHost: string
+  /** The DNS results that PASSED classification, captured at validation time. */
+  addresses: LookupAddress[]
 }
 
 async function validateUrl(rawUrl: string): Promise<{ ok: true; value: ValidatedTarget } | { ok: false; reason: string }> {
@@ -112,29 +117,121 @@ async function validateUrl(rawUrl: string): Promise<{ ok: true; value: Validated
       }
     }
     if (results.length === 0) return { ok: false, reason: `host ${host} did not resolve` }
-    return { ok: true, value: { url: parsed, resolvedHost: host } }
+    // H1: capture the validated addresses so the connection can be PINNED to
+    // them. The previous implementation handed the URL to fetch(), which did
+    // its OWN second DNS resolution — opening a DNS-rebinding window where a
+    // malicious resolver returns a public IP at validation time (T1) and a
+    // private/metadata IP at connect time (T2). Pinning closes that gap.
+    return { ok: true, value: { url: parsed, resolvedHost: host, addresses: results } }
   } catch (err) {
     return { ok: false, reason: `DNS lookup failed for ${host}: ${err instanceof Error ? err.message : String(err)}` }
   }
 }
 
+interface PinnedResponse {
+  status: number
+  statusText: string
+  headers: Map<string, string>
+  text(): Promise<string>
+}
+
+/**
+ * Perform a single HTTP(S) request PINNED to a set of pre-validated IPs.
+ *
+ * The custom `lookup` short-circuits Node's DNS so the socket connects to an
+ * address that already passed classifyIp() — there is no second, independent
+ * resolution that a rebinding attacker could swing to a private IP. The
+ * original hostname is preserved on the request, so the Host header and TLS
+ * SNI/certificate validation remain correct.
+ */
+function requestPinned(
+  target: ValidatedTarget,
+  signal: AbortSignal,
+): Promise<PinnedResponse> {
+  return new Promise<PinnedResponse>((resolvePromise, reject) => {
+    const isHttps = target.url.protocol === 'https:'
+    const requestFn = isHttps ? httpsRequest : httpRequest
+    const pinned = target.addresses[0]!
+
+    // Custom lookup: ignore the queried hostname and return a validated IP.
+    // Re-classify defensively in case a future caller widens the address set.
+    const pinnedLookup = (
+      _hostname: string,
+      _opts: unknown,
+      cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
+    ): void => {
+      if (classifyIp(pinned.address) !== null) {
+        cb(new Error('pinned address failed re-validation'), '', 0)
+        return
+      }
+      cb(null, pinned.address, pinned.family)
+    }
+
+    const req = requestFn(
+      target.url,
+      {
+        method: 'GET',
+        headers: { 'User-Agent': 'MetaAgentRuntime/1.0', Accept: '*/*' },
+        signal,
+        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        lookup: pinnedLookup as any,
+        servername: isHttps ? target.resolvedHost : undefined,
+      },
+      (res) => {
+        const headers = new Map<string, string>()
+        for (const [k, v] of Object.entries(res.headers)) {
+          if (typeof v === 'string') headers.set(k.toLowerCase(), v)
+          else if (Array.isArray(v)) headers.set(k.toLowerCase(), v.join(', '))
+        }
+        const status = res.statusCode ?? 0
+        // For redirects we don't need the body — drain and resolve immediately.
+        if (status >= 300 && status < 400 && headers.has('location')) {
+          res.resume()
+          resolvePromise({
+            status,
+            statusText: res.statusMessage ?? '',
+            headers,
+            text: async () => '',
+          })
+          return
+        }
+        const chunks: Buffer[] = []
+        let total = 0
+        res.on('data', (chunk: Buffer) => {
+          total += chunk.length
+          // Read a little past MAX_CONTENT so the caller's truncation message
+          // is accurate; then stop to bound memory.
+          if (total <= MAX_CONTENT * 2) chunks.push(chunk)
+        })
+        res.on('end', () => {
+          resolvePromise({
+            status,
+            statusText: res.statusMessage ?? '',
+            headers,
+            text: async () => Buffer.concat(chunks).toString('utf-8'),
+          })
+        })
+        res.on('error', reject)
+      },
+    )
+    req.on('error', reject)
+    req.end()
+  })
+}
+
 async function fetchWithSafeRedirects(
   startUrl: string,
   signal: AbortSignal,
-): Promise<{ ok: true; res: Response; finalUrl: string } | { ok: false; reason: string }> {
+): Promise<{ ok: true; res: PinnedResponse; finalUrl: string } | { ok: false; reason: string }> {
   let currentUrl = startUrl
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const check = await validateUrl(currentUrl)
     if (!check.ok) return { ok: false, reason: check.reason }
-    const res = await fetch(check.value.url, {
-      signal,
-      headers: { 'User-Agent': 'MetaAgentRuntime/1.0' },
-      redirect: 'manual',
-    })
-    // Treat 3xx with Location as a redirect we control.
+    const res = await requestPinned(check.value, signal)
+    // Treat 3xx with Location as a redirect we control — every hop is
+    // re-validated AND re-pinned by the next loop iteration.
     if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
-      const next = new URL(res.headers.get('location')!, currentUrl).toString()
-      currentUrl = next
+      currentUrl = new URL(res.headers.get('location')!, currentUrl).toString()
       continue
     }
     return { ok: true, res, finalUrl: currentUrl }
@@ -167,7 +264,13 @@ export async function createWebFetchTool(): Promise<MetaAgentTool> {
       // entries don't linger when the 50-entry high-watermark is never hit.
       evictExpired()
       const cached = cache.get(url)
-      if (cached && cached.expiresAt > Date.now()) return { content: cached.content, isError: false }
+      if (cached && cached.expiresAt > Date.now()) {
+        // L3: touch-on-read so eviction is true LRU, not FIFO. Re-inserting
+        // moves this key to the most-recently-used end of the Map.
+        cache.delete(url)
+        cache.set(url, cached)
+        return { content: cached.content, isError: false }
+      }
       if (cached) cache.delete(url)  // expired entry found on direct lookup — remove it
 
       try {
@@ -176,14 +279,16 @@ export async function createWebFetchTool(): Promise<MetaAgentTool> {
           return { content: `Refused: ${fetchOutcome.reason}`, isError: true }
         }
         const { res, finalUrl } = fetchOutcome
-        if (!res.ok) return { content: `HTTP ${res.status}: ${res.statusText}`, isError: true }
+        if (res.status < 200 || res.status >= 300) {
+          return { content: `HTTP ${res.status}: ${res.statusText}`, isError: true }
+        }
 
         const ct = res.headers.get('content-type') ?? ''
+        const raw = await res.text()
         let text: string
         if (ct.includes('application/json')) {
-          text = JSON.stringify(await res.json(), null, 2)
+          try { text = JSON.stringify(JSON.parse(raw), null, 2) } catch { text = raw }
         } else {
-          const raw = await res.text()
           text = ct.includes('html') ? stripHtml(raw) : raw
         }
         if (text.length > MAX_CONTENT) text = text.slice(0, MAX_CONTENT) + `\n[Truncated — ${text.length} chars total]`

@@ -18,8 +18,9 @@
  *   - Reading returns null on any error so callers can degrade gracefully.
  */
 
-import { readFile, writeFile, unlink, mkdir } from 'fs/promises'
-import { join, dirname } from 'path'
+import { readFile, unlink } from 'fs/promises'
+import { atomicWriteJson } from '../persist/index.js'
+import { join } from 'path'
 import { homedir } from 'os'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 
@@ -177,8 +178,7 @@ export async function saveRunStateSnapshot(opts: {
     }
 
     const path = getRunStateSnapshotPath(sessionId, taskContractId)
-    await mkdir(dirname(path), { recursive: true })
-    await writeFile(path, JSON.stringify(snapshot, null, 2), 'utf-8')
+    await atomicWriteJson(path, snapshot)
   } catch {
     // Never propagate — snapshot is advisory
   }

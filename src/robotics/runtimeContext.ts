@@ -5,7 +5,7 @@
  * cohesive stack:
  *
  *   FlashClient              ← shared flash-model client (one Anthropic instance)
- *   ExperiencePatternChecker ← flash-ranked failure pattern awareness (warn only)
+ *   ExperiencePatternChecker ← flash-gated experience paging (never blocks)
  *   OOMChecker               ← order-of-magnitude sanity check
  *   PhysicsConstraintChecker ← hard physics bounds
  *   NoopProvenanceTracker    ← VV hooks run, but NO provenance recording or annotation
@@ -114,7 +114,7 @@ export function createRoboticsRuntimeContext(
 
   // Build the VV hook chain.
   // Hook registration ORDER matters — hooks run sequentially:
-  //   1. FailurePatternChecker: advisory warning (never aborts)
+  //   1. ExperiencePatternChecker: advisory context paging (never aborts)
   //   2. OOMChecker + PhysicsConstraintChecker: output validation
   const chain = new VVHookChain()
   chain.register(new ExperiencePatternChecker(experienceSource, flashClient, opts.contextPager))

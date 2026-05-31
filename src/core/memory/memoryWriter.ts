@@ -9,8 +9,9 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
-import { appendFile, mkdir, readFile, writeFile } from 'fs/promises'
+import { appendFile, mkdir, readFile } from 'fs/promises'
 import { join } from 'path'
+import { atomicWriteFile } from '../persist/index.js'
 import type { ConversationMessage, ContentBlock } from '../types.js'
 import type { AgentMode } from '../dynamicPrompt.js'
 import { ensureMemoryDirExists, loadMemoryIndex } from './memdir.js'
@@ -330,7 +331,7 @@ export async function runPostSessionMemoryWriter(
       // File does not exist; proceed.
     }
 
-    await writeFile(target, renderMemoryFile(proposal), 'utf-8')
+    await atomicWriteFile(target, renderMemoryFile(proposal))
     const indexLine = proposal.index_line.replace(/\r?\n/g, ' ').trim()
     await appendFile(join(memoryDir, MEMORY_ENTRYPOINT_NAME), `${indexToCheck.trim() ? '\n' : ''}${indexLine}\n`, 'utf-8')
     indexToCheck += `\n${indexLine}`

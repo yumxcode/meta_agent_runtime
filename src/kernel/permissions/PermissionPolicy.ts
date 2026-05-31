@@ -1,10 +1,11 @@
-import { existsSync, readFileSync, realpathSync } from 'fs'
+import { existsSync, readFileSync } from 'fs'
 import { homedir } from 'os'
-import { dirname, isAbsolute, join, relative, resolve, sep } from 'path'
+import { join, resolve } from 'path'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
 import type { ToolPermissionDeclaration } from '../../core/types.js'
 import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
+import { isInsideWorkspace } from '../../tools/fs/workspaceGuard.js'
 
 type BeforeToolCallResult =
   | { action: 'allow' }
@@ -90,30 +91,6 @@ function loadPermissionConfig(workspaceRoot?: string, explicit: PermissionConfig
     ? readPermissionConfig(join(workspaceRoot, '.meta-agent', 'permissions.json'))
     : {}
   return mergePermissionConfig(mergePermissionConfig(globalConfig, projectConfig), explicit)
-}
-
-function findExistingAncestor(path: string): string {
-  let current = path
-  while (!existsSync(current)) {
-    const parent = dirname(current)
-    if (parent === current) break
-    current = parent
-  }
-  return current
-}
-
-function resolveForPolicy(path: string, workspaceRoot: string): string {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(workspaceRoot, path)
-  if (existsSync(absolute)) return realpathSync(absolute)
-  const ancestor = findExistingAncestor(absolute)
-  const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor)
-  return resolve(realAncestor, relative(ancestor, absolute))
-}
-
-function isInsideWorkspace(path: string, workspaceRoot: string): boolean {
-  const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
-  const target = resolveForPolicy(path, workspace)
-  return target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
 }
 
 /**

@@ -1,3 +1,22 @@
+/**
+ * Sensitive-shell-command detection — BEST-EFFORT defense-in-depth ONLY.
+ *
+ * L4: these regexes flag commands worth a human confirmation prompt; they are
+ * NOT a security boundary and must never be relied on as one. A determined
+ * model or user can trivially evade every pattern here — e.g. `r''m -rf`,
+ * `${HOME:0:0}rm`, base64-decode-then-pipe, aliases, `eval "$(...)"`, invoking
+ * a script that runs the command, or any of a thousand other shell tricks.
+ *
+ * The real containment guarantees come from the layers BELOW this one:
+ *   - the OS sandbox (bwrap / sandbox-exec) with a read-only root and a
+ *     writable-workspace jail, and
+ *   - the workspace-boundary path guard (isInsideWorkspace).
+ *
+ * Treat a match as "ask the user first," and treat a non-match as "no signal,"
+ * never as "this command is safe." Add patterns freely to widen the prompt
+ * surface, but do not delete a security control on the assumption this list
+ * covers it.
+ */
 export interface SensitivePattern {
   pattern: RegExp
   label: string

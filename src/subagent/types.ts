@@ -6,7 +6,7 @@
  * with it only through this type-safe status/result layer — never through
  * shared conversation history.
  *
- * Design invariants (§9 of meta-agent-architecture.md):
+ * Design invariants (§9 of docs/architecture/meta-agent-architecture.md):
  *   1. Sub-agent context is fully isolated (empty mutableMessages on start).
  *   2. Main agent only sees the terminal result by default.
  *   3. Circuit breakers (maxTurns, maxBudgetUsd) are enforced in code, not prompt.

@@ -7,45 +7,117 @@
  */
 
 import type { ExperienceStore } from '../../robotics/ExperienceStore.js'
+import { experienceRetrievalScore } from '../../robotics/ExperienceStore.js'
 import type { IKnowledgeSource, ExperienceMatch, ExperienceListOpts } from './IKnowledgeSource.js'
+import type { ExperienceEntry } from '../../robotics/types.js'
+
+const MAX_CANDIDATE_POOL = 60
+
+function normalizeKeyword(keyword: string): string | null {
+  const normalized = keyword.trim().toLowerCase()
+  if (normalized.length < 3) return null
+  return normalized
+}
+
+function keywordHitCount(entry: ExperienceEntry, keywords: string[]): number {
+  if (keywords.length === 0) return 0
+  const searchable = [
+    entry.title,
+    entry.problem,
+    entry.solution,
+    entry.outcome.summary,
+    entry.outcome.failureReason ?? '',
+    entry.abstractPrinciple ?? '',
+    entry.algorithm ?? '',
+    entry.tags.join(' '),
+  ].join(' ').toLowerCase()
+
+  return keywords.filter(kw => searchable.includes(kw)).length
+}
+
+function toMatch(e: ExperienceEntry): ExperienceMatch {
+  return {
+    id: e.id,
+    title: e.title,
+    domain: e.domain,
+    outcome: e.outcome.success ? 'success' : 'failure',
+    // abstractPrinciple is the same-domain transfer vehicle.
+    // Fall back to outcome summary if not yet extracted (older entries).
+    abstractPrinciple: e.abstractPrinciple ?? e.outcome.summary,
+    failureReason: !e.outcome.success ? e.outcome.failureReason : undefined,
+    workarounds: e.outcome.workarounds,
+    confidenceTier: e.confidenceTier ?? 'observed',
+    evidenceRefs: e.evidenceRefs,
+    observationCount: e.observationCount ?? 1,
+    contradictionCount: e.contradictionCount ?? 0,
+  } satisfies ExperienceMatch
+}
 
 export class ExperienceSource implements IKnowledgeSource {
   constructor(private readonly store: ExperienceStore) {}
 
   async listExperiences(opts: ExperienceListOpts = {}): Promise<ExperienceMatch[]> {
     const limit = opts.limit ?? 12
+    const domains = [...new Set(opts.domains?.filter(Boolean) ?? [])]
+    const keywords = [...new Set((opts.keywords ?? [])
+      .map(normalizeKeyword)
+      .filter((kw): kw is string => Boolean(kw)))]
 
-    // Load all entries, apply domain filter if provided
-    const all = await this.store.search({
-      domain: (opts.domains?.length === 1 ? opts.domains[0] : undefined) as any,
-      successOnly: false,
-      limit: Math.min(limit * 3, 60),  // over-fetch before domain filter
+    const pool = new Map<string, ExperienceEntry>()
+    const add = (entries: ExperienceEntry[]) => {
+      for (const entry of entries) pool.set(entry.id, entry)
+    }
+
+    const perQueryLimit = Math.min(20, Math.max(limit * 2, 8))
+    if (domains.length > 0) {
+      for (const domain of domains) {
+        add(await this.store.search({
+          domain: domain as any,
+          successOnly: false,
+          limit: perQueryLimit,
+        }))
+      }
+    } else {
+      add(await this.store.search({
+        successOnly: false,
+        limit: Math.min(MAX_CANDIDATE_POOL, Math.max(limit * 3, 20)),
+      }))
+    }
+
+    for (const keyword of keywords.slice(0, 8)) {
+      if (domains.length > 0) {
+        for (const domain of domains) {
+          add(await this.store.search({
+            domain: domain as any,
+            keyword,
+            successOnly: false,
+            limit: perQueryLimit,
+          }))
+        }
+      } else {
+        add(await this.store.search({
+          keyword,
+          successOnly: false,
+          limit: perQueryLimit,
+        }))
+      }
+    }
+
+    const domainSet = new Set(domains)
+    const ranked = [...pool.values()].sort((a, b) => {
+      const domainDelta = Number(domainSet.has(b.domain)) - Number(domainSet.has(a.domain))
+      if (domainDelta !== 0) return domainDelta
+
+      const keywordDelta = keywordHitCount(b, keywords) - keywordHitCount(a, keywords)
+      if (keywordDelta !== 0) return keywordDelta
+
+      const scoreDelta = experienceRetrievalScore(b) - experienceRetrievalScore(a)
+      return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt
     })
 
-    // Multi-domain filter (store.search only supports single domain)
-    const filtered = opts.domains?.length
-      ? all.filter(e => opts.domains!.includes(e.domain))
-      : all
-
-    // ExperienceStore.search already applies confidence-aware ranking with
-    // recency as the tiebreaker. Preserve that order here.
-    return filtered
+    return ranked
       .slice(0, limit)
-      .map(e => ({
-        id: e.id,
-        title: e.title,
-        domain: e.domain,
-        outcome: e.outcome.success ? 'success' : 'failure',
-        // abstractPrinciple is the same-domain transfer vehicle.
-        // Fall back to outcome summary if not yet extracted (older entries).
-        abstractPrinciple: (e as any).abstractPrinciple ?? e.outcome.summary,
-        failureReason: !e.outcome.success ? e.outcome.failureReason : undefined,
-        workarounds: e.outcome.workarounds,
-        confidenceTier: e.confidenceTier ?? 'observed',
-        evidenceRefs: e.evidenceRefs,
-        observationCount: e.observationCount ?? 1,
-        contradictionCount: e.contradictionCount ?? 0,
-      } satisfies ExperienceMatch))
+      .map(toMatch)
   }
 
   async getManifestLine(): Promise<string> {

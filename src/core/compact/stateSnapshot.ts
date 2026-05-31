@@ -22,7 +22,8 @@
  *   buildCompactInstructions — snapshot parameter for merge
  */
 
-import { readFile, writeFile, unlink, mkdir } from 'fs/promises'
+import { readFile, unlink, mkdir } from 'fs/promises'
+import { atomicWriteJson } from '../persist/index.js'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
@@ -211,7 +212,7 @@ export function saveStateSnapshot(
         }
         return
       }
-      await writeFile(path, JSON.stringify(snapshot, null, 2), 'utf-8')
+      await atomicWriteJson(path, snapshot)
     } catch {
       // Never propagate — snapshot is advisory
     }

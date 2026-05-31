@@ -121,6 +121,40 @@ describe('ExperienceSource — includes both successes and failures', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
+// listExperiences — keyword candidate expansion
+// ─────────────────────────────────────────────────────────────────────────────
+
+describe('ExperienceSource — keyword candidate expansion', () => {
+  it('can retrieve keyword-relevant entries within a broad domain candidate pool', async () => {
+    const dir = await tempDir()
+    const store = new ExperienceStore(dir)
+    for (let i = 0; i < 20; i++) {
+      await writeEntry(store, 'perception', `Generic camera lesson ${i}`, true)
+    }
+    await store.write({
+      domain: 'perception',
+      title: 'Voxel grid OOM in dense lidar mapping',
+      tags: ['voxel', 'lidar'],
+      difficulty: 'high',
+      problem: 'Dense point cloud voxelisation exhausted memory.',
+      solution: 'Estimate voxel count from map extent before allocation.',
+      outcome: { success: false, summary: 'Voxel memory exceeded budget.' },
+      abstractPrinciple: 'Voxel resolution and map extent determine peak memory.',
+      confidenceTier: 'observed',
+    })
+
+    const source = new ExperienceSource(store)
+    const results = await source.listExperiences({
+      domains: ['perception'],
+      keywords: ['voxel', 'lidar'],
+      limit: 5,
+    })
+
+    expect(results.map(r => r.title)).toContain('Voxel grid OOM in dense lidar mapping')
+  })
+})
+
+// ─────────────────────────────────────────────────────────────────────────────
 // abstractPrinciple fallback
 // ─────────────────────────────────────────────────────────────────────────────
 

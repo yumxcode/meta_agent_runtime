@@ -3,7 +3,7 @@
 > **状态：📦 归档**  
 > 本文档是 robotics mode 的早期设计方案（v1），已按实际情况落地实现。  
 > 当前实现的完整参考请查阅：
-> - [meta-agent-architecture.md](../meta-agent-architecture.md) — 整体架构 as-built 参考（§6 Robotics Mode）
+> - [meta-agent-architecture.md](architecture/meta-agent-architecture.md) — 整体架构 as-built 参考（§6 Robotics Mode）
 > - [robotics-mode-design-v2.md](./robotics-mode-design-v2.md) — 持久化与 Git 协同设计（同样已归档，见下方变更说明）
 
 ---
@@ -49,4 +49,4 @@ v1 设计在 prompt 中保留了 D1a（memory_guidance）和 D4a（engineering_s
 
 ---
 
-*文档状态：归档。不再更新。如需了解当前实现，请查阅 `meta-agent-architecture.md`。*
+*文档状态：归档。不再更新。如需了解当前实现，请查阅 `docs/architecture/meta-agent-architecture.md`。*

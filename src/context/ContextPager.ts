@@ -51,20 +51,17 @@ export class ContextPager {
    * If the budget would be exceeded after adding this slot, lower-priority
    * pages are evicted to make room (LRU within priority tier).
    * If the slot already exists it is refreshed (content + TTL updated).
+   * Returns false when a non-sticky slot cannot fit even after eviction.
    */
-  checkout(slot: Omit<PageSlot, 'remainingTurns' | 'checkedOutAt'>): void {
+  checkout(slot: Omit<PageSlot, 'remainingTurns' | 'checkedOutAt'>): boolean {
     const existing = this.slots.get(slot.id)
-    if (existing) {
-      // Refresh existing slot
-      existing.content      = slot.content
-      existing.tokenEst     = slot.tokenEst
-      existing.priority     = slot.priority
-      existing.ttlTurns     = slot.ttlTurns
-      existing.remainingTurns = slot.ttlTurns
-      existing.tag          = slot.tag
-      existing.checkedOutAt = Date.now()
-      return
+
+    if (slot.priority !== 'sticky') {
+      const nonStickyCapacity = this.maxBudget - this._stickyTokens(slot.id)
+      if (slot.tokenEst > nonStickyCapacity) return false
     }
+
+    if (existing) this.slots.delete(slot.id)
 
     // Evict if needed before adding
     this._evictToFit(slot.tokenEst)
@@ -74,6 +71,7 @@ export class ContextPager {
       remainingTurns: slot.ttlTurns,
       checkedOutAt: Date.now(),
     })
+    return true
   }
 
   /**
@@ -218,5 +216,13 @@ export class ContextPager {
         this.slots.delete(slot.id)
       }
     }
+  }
+
+  private _stickyTokens(excludeId?: string): number {
+    let total = 0
+    for (const slot of this.slots.values()) {
+      if (slot.id !== excludeId && slot.priority === 'sticky') total += slot.tokenEst
+    }
+    return total
   }
 }

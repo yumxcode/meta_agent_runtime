@@ -5,7 +5,7 @@
  * SYSTEM_PROMPT_DYNAMIC_BOUNDARY 之前的内容在所有会话中稳定，
  * 可在 Anthropic 提示词缓存层进行缓存。
  *
- * 节映射（与 meta-agent-architecture.md §4.1 静态区一致）：
+ * 节映射（与 docs/architecture/meta-agent-architecture.md §4.1 静态区一致）：
  *   S1  identity_definition        — Meta-Agent 的身份与职责
  *   S2  system_rules               — 溯源 ID、会话作用域、运行规则
  *   S3  task_execution_rules       — 执行纪律、工程专用规则

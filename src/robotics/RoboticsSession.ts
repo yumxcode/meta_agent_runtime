@@ -62,7 +62,8 @@ import { ContextPager } from '../context/ContextPager.js'
 import { estimateTokens } from '../context/TokenEstimator.js'
 import { ExperienceSource } from '../context/sources/ExperienceSource.js'
 import { createRoboticsRuntimeContext } from './runtimeContext.js'
-import type { QueryAnalyzer } from '../context/QueryAnalyzer.js'
+import type { QueryAnalyzer, QueryIntent } from '../context/QueryAnalyzer.js'
+import type { ExperienceMatch } from '../context/sources/IKnowledgeSource.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, buildR6Section } from './dynamicSections.js'
 import { buildRoboticsCompactInstructions } from './compactInstructions.js'
@@ -86,6 +87,82 @@ import { TeamWatcher, type TeamWatcherEvent } from './team/TeamWatcher.js'
 import { buildTeamSection } from './team/dynamicSection.js'
 
 // ── Options ───────────────────────────────────────────────────────────────────
+
+const EXPERIENCE_SLOT_REF_RE = /\bexperience:([A-Za-z0-9_-]+)\b/g
+const EXPERIENCE_ID_REF_RE = /\b(exp_[0-9a-z]+_[0-9a-f]{8})\b/g
+const EXPERIENCE_TASK_SWITCH_RE = /\b(new task|switch task|different task|another task|unrelated)\b|换个|另一个|另外一个|新任务|重新开始/
+
+const EXPERIENCE_RELEVANCE_SYSTEM = `\
+You select stored robotics experiences that should be injected into the current task context.
+
+Judge applicability by mechanism and abstract principle, not surface word overlap.
+Return JSON only: {"applicable":["id1","id2"]}
+
+Rules:
+- Include only experiences that materially constrain, warn, or guide this task.
+- Prefer same robot/domain/algorithm/mechanism, but allow cross-domain transfer only when the principle clearly applies.
+- Exclude weakly related memories; noisy context is worse than no context.
+- Return at most 6 IDs.
+- If none apply, return {"applicable":[]}.`
+
+function assistantText(message: ConversationMessage): string {
+  if (message.role !== 'assistant') return ''
+  return message.content
+    .filter(block => block.type === 'text')
+    .map(block => block.text)
+    .join('\n')
+}
+
+function extractReferencedExperienceSlotIds(messages: readonly ConversationMessage[]): Set<string> {
+  const latestAssistant = [...messages].reverse().find(m => m.role === 'assistant')
+  const text = latestAssistant ? assistantText(latestAssistant) : ''
+  const ids = new Set<string>()
+
+  for (const match of text.matchAll(EXPERIENCE_SLOT_REF_RE)) {
+    const id = match[1]
+    if (id) ids.add(`experience:${id}`)
+  }
+  for (const match of text.matchAll(EXPERIENCE_ID_REF_RE)) {
+    const id = match[1]
+    if (id) ids.add(`experience:${id}`)
+  }
+
+  return ids
+}
+
+function normalizeExperienceKeyword(keyword: string): string | null {
+  const normalized = keyword.trim().toLowerCase()
+  if (normalized.length < 3) return null
+  return normalized
+}
+
+function formatExperienceCandidate(e: ExperienceMatch): string {
+  return [
+    `ID: ${e.id}`,
+    `Domain: ${e.domain}`,
+    `Outcome: ${e.outcome}`,
+    `Confidence: ${e.confidenceTier ?? 'observed'} (${e.observationCount ?? 1} obs, ${e.contradictionCount ?? 0} contradictions)`,
+    `Title: ${e.title}`,
+    `Principle: ${e.abstractPrinciple}`,
+    ...(e.failureReason ? [`Failure: ${e.failureReason.slice(0, 160)}`] : []),
+    ...(e.workarounds?.length ? [`Workaround: ${e.workarounds[0]}`] : []),
+  ].join('\n')
+}
+
+function parseApplicableExperienceIds(raw: string, candidates: ExperienceMatch[]): Set<string> {
+  try {
+    const jsonMatch = raw.match(/\{[\s\S]*\}/)
+    if (!jsonMatch) return new Set()
+    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>
+    const validIds = new Set(candidates.map(c => c.id))
+    const ids = Array.isArray(parsed['applicable'])
+      ? parsed['applicable'].filter((id): id is string => typeof id === 'string' && validIds.has(id))
+      : []
+    return new Set(ids.slice(0, 6))
+  } catch {
+    return new Set()
+  }
+}
 
 export interface RoboticsSessionOptions extends MetaAgentConfig {
   /** Robot/platform name (e.g. 'go2', 'franka_panda'). Injected into R1 & R4. */
@@ -170,6 +247,9 @@ export class RoboticsSession {
   private _resumedAt: number | null = null
   private _workflowDef: WorkflowDefinition | null = null
   private _workflowState: WorkflowState | null = null
+  private _experienceWorkingSet: ExperienceMatch[] = []
+  private _experienceWorkingSetDomains = new Set<string>()
+  private _experienceWorkingSetKeywords = new Set<string>()
   /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
   private _agentMode: RoboticsAgentMode = 'single'
   /** True once mode has been classified or overridden; prevents re-classification. */
@@ -691,47 +771,7 @@ export class RoboticsSession {
     // volatile section build so any pre-loaded pager slots appear in R2 this turn.
     const intent = await queryIntentPromise
 
-    // ── Proactive experience pre-loading for reasoning phase ─────────────────
-    // Load domain-relevant experiences (both successes + failures) and stage
-    // them in the pager so the agent has principle context while reasoning —
-    // before deciding whether to dispatch an experiment.
-    //
-    // Design: domain filter from QueryAnalyzer intent (fast, no extra flash call).
-    // Precise principle judgment happens later in ExperiencePatternChecker (pre_call).
-    // Slot ID uses the canonical `experience:${e.id}` (same as ExperiencePatternChecker).
-    // ContextPager.checkout() refreshes on collision — when VV hook later checks out
-    // the same ID with higher priority, it upgrades the slot instead of duplicating it.
-    if (intent && intent.domains.length > 0) {
-      try {
-        const experiences = await this.experienceSource.listExperiences({
-          domains: intent.domains,
-          limit:   6,
-        })
-        for (const e of experiences) {
-          const icon = e.outcome === 'success' ? '✓' : '⚠️'
-          const lines = [
-            `### ${icon} Past Experience: ${e.title}`,
-            `**Domain:** ${e.domain}  **Outcome:** ${e.outcome}`,
-            `**Confidence:** ${e.confidenceTier ?? 'observed'}${e.observationCount ? ` (${e.observationCount} observation${e.observationCount === 1 ? '' : 's'})` : ''}`,
-            `**Principle:** ${e.abstractPrinciple}`,
-            ...(e.failureReason ? [`**Failure detail:** ${e.failureReason}`] : []),
-            ...(e.workarounds?.length ? [`**Workarounds:** ${e.workarounds.join(' / ')}`] : []),
-          ]
-          const content = lines.join('\n')
-          this.contextPager.checkout({
-            id:       `experience:${e.id}`,   // canonical ID — matches ExperiencePatternChecker
-            tag:      `${icon} [EXP] ${e.title.slice(0, 40)}`,
-            content,
-            tokenEst: estimateTokens(content),
-            priority: 'medium',
-            ttlTurns: 2,
-            source:   'experience',
-          })
-        }
-      } catch {
-        // Experience preload is opportunistic; failures should not block the turn.
-      }
-    }
+    await this._preloadExperienceWorkingSet(prompt, intent)
 
     // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
     // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
@@ -757,7 +797,7 @@ export class RoboticsSession {
     } finally {
       this._submitInFlight = false
       // Age TTL counters and evict expired context slots after each completed turn
-      this.contextPager.tick()
+      this.contextPager.tick(extractReferencedExperienceSlotIds(this.getMessages()))
     }
   }
 
@@ -788,6 +828,124 @@ export class RoboticsSession {
 
   getSessionId(): string {
     return this.sessionId
+  }
+
+  private async _preloadExperienceWorkingSet(prompt: string, intent: QueryIntent | null): Promise<void> {
+    if (!intent) return
+
+    const domains = intent.domains.filter(d => d !== 'general')
+    const keywords = intent.searchKeywords
+      .map(normalizeExperienceKeyword)
+      .filter((kw): kw is string => Boolean(kw))
+      .slice(0, 8)
+
+    if (domains.length === 0 && keywords.length === 0) return
+
+    const shouldRefresh = this._shouldRefreshExperienceWorkingSet(prompt, domains, keywords)
+    if (!shouldRefresh) {
+      this._refreshExperienceSlots(this._experienceWorkingSet)
+      return
+    }
+
+    try {
+      const candidates = await this.experienceSource.listExperiences({
+        domains: domains.length > 0 ? domains : undefined,
+        keywords,
+        limit: 18,
+      })
+      const selected = await this._selectApplicableExperiences(prompt, intent, candidates)
+      this._experienceWorkingSet = selected
+      this._experienceWorkingSetDomains = new Set(domains)
+      this._experienceWorkingSetKeywords = new Set(keywords)
+      this._refreshExperienceSlots(selected)
+    } catch {
+      // Experience preload is opportunistic; failures should not block the turn.
+    }
+  }
+
+  private _shouldRefreshExperienceWorkingSet(
+    prompt: string,
+    domains: string[],
+    keywords: string[],
+  ): boolean {
+    if (this._experienceWorkingSetDomains.size === 0 && this._experienceWorkingSetKeywords.size === 0) {
+      return true
+    }
+
+    const domainOverlap = domains.some(d => this._experienceWorkingSetDomains.has(d))
+    if (domains.length > 0 && this._experienceWorkingSetDomains.size > 0 && !domainOverlap) {
+      return true
+    }
+
+    const taskSwitch = EXPERIENCE_TASK_SWITCH_RE.test(prompt.toLowerCase())
+    if (!taskSwitch) return false
+
+    const keywordOverlap = keywords.some(kw => this._experienceWorkingSetKeywords.has(kw))
+    return keywords.length > 0 && this._experienceWorkingSetKeywords.size > 0 && !keywordOverlap
+  }
+
+  private async _selectApplicableExperiences(
+    prompt: string,
+    intent: QueryIntent,
+    candidates: ExperienceMatch[],
+  ): Promise<ExperienceMatch[]> {
+    if (candidates.length === 0) return []
+
+    if (!this._flashClient) {
+      return candidates
+        .filter(e => e.confidenceTier !== 'hypothesis')
+        .slice(0, 4)
+    }
+
+    const raw = await this._flashClient.query({
+      system: EXPERIENCE_RELEVANCE_SYSTEM,
+      user: [
+        `User task:\n${prompt.slice(0, 800)}`,
+        `Intent: ${intent.intent}; risk=${intent.riskLevel}; domains=${intent.domains.join(', ')}`,
+        `Search keywords: ${intent.searchKeywords.join(', ')}`,
+        `Candidate experiences:\n${candidates.map(formatExperienceCandidate).join('\n\n')}`,
+      ].join('\n\n'),
+      maxTokens: 220,
+      timeoutMs: 4_000,
+      cacheKey: `experience-working-set:${createHash('sha256')
+        .update([
+          prompt.slice(0, 800),
+          intent.intent,
+          intent.riskLevel,
+          intent.domains.join(','),
+          intent.searchKeywords.join(','),
+          candidates.map(c => c.id).join(','),
+        ].join('\n'))
+        .digest('hex')}`,
+    })
+
+    if (!raw) return []
+    const ids = parseApplicableExperienceIds(raw, candidates)
+    return candidates.filter(c => ids.has(c.id)).slice(0, 6)
+  }
+
+  private _refreshExperienceSlots(experiences: ExperienceMatch[]): void {
+    for (const e of experiences) {
+      const icon = e.outcome === 'success' ? '✓' : '⚠️'
+      const lines = [
+        `### ${icon} Past Experience: ${e.title}`,
+        `**Domain:** ${e.domain}  **Outcome:** ${e.outcome}`,
+        `**Confidence:** ${e.confidenceTier ?? 'observed'}${e.observationCount ? ` (${e.observationCount} observation${e.observationCount === 1 ? '' : 's'})` : ''}`,
+        `**Principle:** ${e.abstractPrinciple}`,
+        ...(e.failureReason ? [`**Failure detail:** ${e.failureReason}`] : []),
+        ...(e.workarounds?.length ? [`**Workarounds:** ${e.workarounds.join(' / ')}`] : []),
+      ]
+      const content = lines.join('\n')
+      this.contextPager.checkout({
+        id:       `experience:${e.id}`,
+        tag:      `${icon} [EXP] ${e.title.slice(0, 40)}`,
+        content,
+        tokenEst: estimateTokens(content),
+        priority: 'medium',
+        ttlTurns: 4,
+        source:   'experience',
+      })
+    }
   }
 
   async teamInit(github?: string) {

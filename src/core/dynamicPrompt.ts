@@ -1,7 +1,7 @@
 /**
  * Meta-Agent Dynamic System Prompt — D1 through D10
  *
- * Two groups of sections (mirrors meta-agent-architecture.md §4.1 Dynamic Zone):
+ * Two groups of sections (mirrors docs/architecture/meta-agent-architecture.md §4.1 Dynamic Zone):
  *
  * PUBLIC BASE (all modes):
  *   D1c agent_directives [memoized] — AGENT.md: workflow procedures, project rules, caveats

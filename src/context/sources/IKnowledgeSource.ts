@@ -57,6 +57,11 @@ export interface ExperienceListOpts {
    * If omitted or empty, all domains are included.
    */
   domains?: string[]
+  /**
+   * Technical terms from the current task. Used to build a candidate pool
+   * before LLM applicability judgment; not treated as a hard AND filter.
+   */
+  keywords?: string[]
   /** Maximum entries to return. Default: 12 */
   limit?: number
 }

@@ -16,9 +16,10 @@
  */
 
 import { createHash } from 'crypto'
-import { mkdir, readFile, writeFile, rm } from 'fs/promises'
+import { readFile, rm } from 'fs/promises'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { join } from 'path'
+import { atomicWriteJson } from '../core/persist/index.js'
 import type { ExperienceStore } from './ExperienceStore.js'
 import { KNOWLEDGE_CONFIDENCE_TIERS, ROBOTICS_DOMAINS, type KnowledgeConfidenceTier, type RoboticsDomain } from './types.js'
 
@@ -179,8 +180,7 @@ export class ExperiencePendingStore {
       await rm(this._filePath, { force: true }).catch(() => undefined)
       return
     }
-    await mkdir(dirname(this._filePath), { recursive: true })
-    await writeFile(this._filePath, JSON.stringify(snapshot, null, 2), 'utf-8')
+    await atomicWriteJson(this._filePath, snapshot)
   }
 }
 

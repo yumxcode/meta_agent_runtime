@@ -146,10 +146,12 @@ describe('ExperiencePatternChecker — pager slot canonical ID (P0)', () => {
     const pager  = new ContextPager({ maxBudget: 2000 })
     const checker = new ExperiencePatternChecker(source, flash, pager)
 
-    await checker.run(makeCtx({ procedure: 'optimise point cloud localisation pipeline' }))
+    const result = await checker.run(makeCtx({ procedure: 'optimise point cloud localisation pipeline' }))
 
     const rendered = pager.renderForTurn()
     expect(rendered).toContain('OOM in point cloud voxelisation')
+    expect(result.severity).toBe('info')
+    expect(result.message).toBe('')
     // No :pre: in the IDs
     expect(rendered).not.toMatch(/experience:pre:/)
   })
@@ -203,7 +205,7 @@ describe('ExperiencePatternChecker — pager slot canonical ID (P0)', () => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 describe('ExperiencePatternChecker — flash failure graceful fallback', () => {
-  it('uses all candidates when flash returns null (timeout / network error)', async () => {
+  it('does not inject candidates when flash returns null (timeout / network error)', async () => {
     const experiences = [
       makeExperience({ id: 'exp-001', title: 'Map OOM' }),
       makeExperience({ id: 'exp-002', title: 'SLAM divergence', outcome: 'failure' }),
@@ -216,12 +218,10 @@ describe('ExperiencePatternChecker — flash failure graceful fallback', () => {
     const result = await checker.run(makeCtx({
       procedure: 'run dense lidar point cloud slam pipeline',
     }))
-    // Conservative fallback: all candidates shown
     expect(result.passed).toBe(true)
-    expect(result.message).toContain('applicable experience')
+    expect(result.message).toBe('')
     const rendered = pager.renderForTurn()
-    expect(rendered).toContain('Map OOM')
-    expect(rendered).toContain('SLAM divergence')
+    expect(rendered).toBe('')
   })
 })
 

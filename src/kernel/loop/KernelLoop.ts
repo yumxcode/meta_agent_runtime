@@ -567,7 +567,14 @@ export async function* runKernelLoop(
     const toolRequestSignature = toolUseRequests
       .map(req => `${req.toolName}:${stableStringify(req.input)}`)
       .join('\n')
-    if (toolRequestSignature === lastToolRequestSignature && assistantText.trim().length === 0) {
+    // L5: a model stuck in a loop often narrates ("let me try again…") while
+    // re-issuing the *exact* same tool call. The old guard only counted repeats
+    // when assistantText was empty, so any accompanying text disabled the
+    // safety net and the loop could spin until the turn/budget cap. We now count
+    // an identical tool signature as no-progress regardless of narration —
+    // differing tool inputs still reset the counter, so genuine progress is
+    // unaffected.
+    if (toolRequestSignature === lastToolRequestSignature) {
       repeatedToolRequestCount++
     } else {
       lastToolRequestSignature = toolRequestSignature

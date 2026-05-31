@@ -2,7 +2,7 @@
  * assembleSystemPrompt — combine the static and dynamic halves of the system
  * prompt into a single string the model sees.
  *
- * Contract (L1 in CODE_REVIEW_2026-05-29):
+ * Contract (L1 in docs/reviews/CODE_REVIEW_2026-05-29.md):
  *   • Parts that are `undefined`, `null`, or the empty string are elided.
  *     This makes `''` a deliberate, documented sentinel for callers like
  *     MetaAgentSession that build their whole prompt out of the suffix.

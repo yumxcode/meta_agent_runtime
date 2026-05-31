@@ -15,9 +15,10 @@
  * are < 500 tokens each — injecting them costs O(1) regardless of campaign size.
  */
 
-import { mkdir, readFile, rename, unlink, writeFile } from 'fs/promises'
+import { readFile, unlink } from 'fs/promises'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { join } from 'path'
+import { atomicWriteJson } from '../core/persist/index.js'
 import type { CampaignSummary, MetaAgentSessionContext } from './types.js'
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -92,13 +93,12 @@ export class MetaAgentContextStore {
    * hit disk and read the stale file while the new file is being written.
    */
   static async write(ctx: MetaAgentSessionContext): Promise<void> {
-    await mkdir(dirname(ACTIVE_CONTEXT_FILE), { recursive: true })
-    // Atomic write via temp-file rename
-    const tmp = ACTIVE_CONTEXT_FILE + '.tmp'
-    await writeFile(tmp, JSON.stringify(ctx, null, 2), 'utf-8')
-    // rename is atomic on POSIX — invalidate cache only AFTER the new file is live
-    await rename(tmp, ACTIVE_CONTEXT_FILE)
-    MetaAgentContextStore._cache = null  // invalidate after atomic write
+    // M3: route through the shared helper. It uses a RANDOM tmp suffix, so two
+    // concurrent writers no longer collide on a single fixed `.tmp` file (the
+    // previous bug). rename() stays atomic on POSIX; invalidate cache only
+    // AFTER the new file is live so concurrent readers never see a torn file.
+    await atomicWriteJson(ACTIVE_CONTEXT_FILE, ctx)
+    MetaAgentContextStore._cache = null
   }
 
   /**

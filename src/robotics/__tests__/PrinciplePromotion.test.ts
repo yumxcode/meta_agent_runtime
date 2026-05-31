@@ -150,5 +150,8 @@ describe('Principle promotion', () => {
     expect(result.promoted).toBe(true)
     expect(pending.count).toBe(1)
     expect(pending.list()[0]!.input['promotion_reason']).toBe('explicit_user_request')
+    // Drain the fire-and-forget persist before afterEach removes the temp dir;
+    // otherwise the background atomic write races the recursive rm (ENOTEMPTY).
+    await pending.flush()
   })
 })

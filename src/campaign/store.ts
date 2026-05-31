@@ -21,6 +21,7 @@ import fs from 'node:fs/promises'
 import path from 'node:path'
 import os from 'node:os'
 
+import { atomicWriteJson } from '../core/persist/index.js'
 import type { ICampaignStore, GenericPersistedState } from './types.js'
 import { GENERIC_SCHEMA_VERSION } from './types.js'
 import { campaignRegistry } from './registry.js'
@@ -288,9 +289,8 @@ export class GenericCampaignStore<TPhase extends string, TState extends object>
 
   private async _writeAtomic(state: GenericPersistedState<TPhase, TState>): Promise<void> {
     const stateFile = path.join(this.campaignDir, STATE_FILE)
-    const tmpFile   = stateFile + '.tmp'
-    await fs.writeFile(tmpFile, JSON.stringify(state, null, 2), 'utf8')
-    await fs.rename(tmpFile, stateFile)
+    // M3: random-suffix tmp + rename via shared helper (no fixed-`.tmp` clash).
+    await atomicWriteJson(stateFile, state)
   }
 }
 

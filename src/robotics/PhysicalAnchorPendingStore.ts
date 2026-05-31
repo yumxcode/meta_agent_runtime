@@ -1,7 +1,8 @@
 import { createHash } from 'crypto'
-import { mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { readFile, rm } from 'fs/promises'
 import { homedir } from 'os'
-import { dirname, join } from 'path'
+import { join } from 'path'
+import { atomicWriteJson } from '../core/persist/index.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import {
   KNOWLEDGE_CONFIDENCE_TIERS,
@@ -117,8 +118,7 @@ export class PhysicalAnchorPendingStore {
       await rm(this._filePath, { force: true }).catch(() => undefined)
       return
     }
-    await mkdir(dirname(this._filePath), { recursive: true })
-    await writeFile(this._filePath, JSON.stringify(snapshot, null, 2), 'utf-8')
+    await atomicWriteJson(this._filePath, snapshot)
   }
 }
 

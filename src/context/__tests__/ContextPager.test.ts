@@ -118,6 +118,26 @@ describe('ContextPager — budget enforcement', () => {
     expect(rendered).not.toContain('Content of low:1')
   })
 
+  it('rejects oversized non-sticky slots instead of listing unrenderable active pages', () => {
+    const pager = new ContextPager({ maxBudget: 100 })
+    const loaded = pager.checkout(slot('huge:1', 'high', 150))
+
+    expect(loaded).toBe(false)
+    expect(pager.renderForTurn()).toBe('')
+    expect(pager.renderManifest()).not.toContain('huge:1')
+  })
+
+  it('keeps the previous slot when an oversized refresh cannot fit', () => {
+    const pager = new ContextPager({ maxBudget: 100 })
+    pager.checkout({ ...slot('exp:1', 'medium', 80), content: 'small content' })
+    const refreshed = pager.checkout({ ...slot('exp:1', 'medium', 150), content: 'oversized content' })
+
+    const rendered = pager.renderForTurn()
+    expect(refreshed).toBe(false)
+    expect(rendered).toContain('small content')
+    expect(rendered).not.toContain('oversized content')
+  })
+
   it('renders slots in priority order: sticky → high → medium → low', () => {
     const pager = new ContextPager({ maxBudget: 2000 })
     pager.checkout(slot('low:1',    'low',    10))
