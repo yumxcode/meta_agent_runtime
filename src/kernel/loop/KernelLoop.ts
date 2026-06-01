@@ -25,6 +25,7 @@ import {
   makeAssistantMessage,
   makeInterruptionMessage,
   makeMaxOutputTokensRecoveryMessage,
+  makeTextUserMessage,
 } from '../messages/MessageFactory.js'
 import {
   runTools,
@@ -84,6 +85,24 @@ export interface KernelLoopContext {
   cwd: string
   cumulativeCostUsd: number
   autoCompactTracking?: AutoCompactTrackingState
+  /**
+   * Drain any pending mid-turn user corrections ("steering"). Called at the top
+   * of every loop iteration. Returns the queued correction strings (and clears
+   * the queue). Each is appended as a user message BEFORE the next API request,
+   * so the model incorporates the correction at the next natural boundary —
+   * without aborting the in-flight stream. Undefined / empty when no steering is
+   * wired or queued.
+   */
+  drainSteering?: () => string[]
+}
+
+/**
+ * Wrap a raw user correction so the model reads it as live supplemental guidance
+ * rather than a brand-new task. Mirrors the redirect-message phrasing used by
+ * the permission policy's option 3.
+ */
+export function formatSteeringMessage(text: string): string {
+  return `[用户实时补充指导]\n${text}\n\n请将上述指导纳入考虑，并据此调整接下来的规划与执行。`
 }
 
 // ── Streaming accumulator for one assistant message ───────────────────────────
@@ -212,6 +231,20 @@ export async function* runKernelLoop(
   }
 
   while (true) {
+    // ── Step 0: inject mid-turn user steering ────────────────────────────────
+    // The user can submit a correction at any point during a turn (e.g. via a
+    // CLI hotkey). We never abort the model; instead we drain the queue here, at
+    // the loop boundary, and append each correction as a user message so the
+    // NEXT API request sees it. normalizeMessagesForAPI coalesces it with any
+    // trailing tool_result (user-role) message, preserving role alternation; for
+    // DeepSeek it becomes a plain user message after the tool messages.
+    const steers = ctx.drainSteering?.() ?? []
+    for (const steerText of steers) {
+      const trimmed = steerText.trim()
+      if (!trimmed) continue
+      append(makeTextUserMessage(formatSteeringMessage(trimmed), { isMeta: false }))
+    }
+
     // ── Step 1: applyToolResultBudget ────────────────────────────────────────
     const budgetedMessages = applyToolResultBudget(state.messages, config.tools)
 

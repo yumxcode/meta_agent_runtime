@@ -59,6 +59,11 @@ export class KernelSession {
   private readonly _cwd: string
   private _permissionDenials: PermissionDenial[] = []
   private _submitInFlight = false
+  /**
+   * Queue of mid-turn user corrections ("steering"). Pushed by steer() while a
+   * turn is in flight; drained by the kernel loop at each iteration boundary.
+   */
+  private _steerQueue: string[] = []
   /** S16: cap permission-denial buffer so a million-turn session can't grow it forever. */
   private static readonly MAX_PERMISSION_DENIALS = 1_000
   /** S1: guard against double dispose. */
@@ -89,6 +94,9 @@ export class KernelSession {
       )
     }
     this._submitInFlight = true
+    // Drop any steering queued while idle — it would otherwise be injected
+    // before the model has even seen this submit's prompt.
+    this._steerQueue.length = 0
 
     try {
       // Fresh abort controller for this submitMessage call
@@ -123,6 +131,7 @@ export class KernelSession {
           cwd: this._cwd,
           cumulativeCostUsd: this._totalCostUsd,
           autoCompactTracking: this._autoCompactTracking,
+          drainSteering: () => this._steerQueue.splice(0),
         })
 
         let step = await gen.next()
@@ -165,6 +174,20 @@ export class KernelSession {
   /** Interrupt the currently-running loop */
   interrupt(): void {
     this._abortController.abort('interrupt')
+  }
+
+  /**
+   * Inject a mid-turn user correction ("steering"). The text is queued and the
+   * running loop appends it as a user message at its next iteration boundary —
+   * the in-flight stream is NOT aborted. Returns true if the correction was
+   * accepted (a turn is in flight), false otherwise (nothing is running, so the
+   * caller should submit it as a normal message instead).
+   */
+  steer(text: string): boolean {
+    const trimmed = text.trim()
+    if (!trimmed || !this._submitInFlight) return false
+    this._steerQueue.push(trimmed)
+    return true
   }
 
   /** Read-only view of the full message history */
@@ -239,6 +262,7 @@ export class KernelSession {
     try { this._abortController.abort('dispose') } catch { /* ignore */ }
     this._messages.length = 0
     this._permissionDenials.length = 0
+    this._steerQueue.length = 0
     this._fileCache.clear()
     // Detach external callback so the consumer's closure (UI, DB writer) no
     // longer keeps this session alive via the callback.

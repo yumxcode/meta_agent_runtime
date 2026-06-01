@@ -319,6 +319,11 @@ export class MetaAgentSession {
     this._inner.interrupt()
   }
 
+  /** Inject a mid-turn user correction. See KernelSession.steer(). */
+  steer(text: string): boolean {
+    return this._inner.steer(text)
+  }
+
   /** All messages in the current conversation. */
   getMessages(): readonly ConversationMessage[] {
     // KernelMessage is structurally compatible with ConversationMessage

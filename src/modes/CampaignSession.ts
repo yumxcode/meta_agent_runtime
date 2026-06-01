@@ -212,6 +212,9 @@ export class CampaignSession {
     void cleanupStateSnapshot(this._sessionId).catch(() => {})
   }
 
+  /** Inject a mid-turn user correction. See KernelSession.steer(). */
+  steer(text: string): boolean { return this._engine.steer(text) }
+
   /**
    * S1 + S9: Release per-session resources.  Forwards to the inner KernelSession
    * dispose (clears messages / fileCache / tools closures), drops our own

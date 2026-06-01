@@ -136,6 +136,17 @@ export function normalizeMessagesForDeepSeek(
         }
       }
 
+      // OpenAI/DeepSeek require an assistant message to carry `content` or
+      // `tool_calls`; a turn with neither is rejected with
+      //   400 Invalid assistant message: content or tool_calls must be set
+      // This happens when a turn is interrupted (Ctrl+C) mid-thinking: the
+      // committed assistant message holds ONLY a thinking block, so text is ''
+      // and there are no tool_calls. Per DeepSeek's contract reasoning_content
+      // is ignored on echo-back unless tool_calls are present, so such a turn
+      // carries nothing actionable — skip it instead of emitting an invalid
+      // (content: null, no tool_calls) message that poisons every later turn.
+      if (!text && toolCalls.length === 0) continue
+
       const assistantMsg: DeepSeekAssistantMessage = {
         role: 'assistant',
         content: text || null,

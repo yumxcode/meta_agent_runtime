@@ -300,6 +300,69 @@ describe('KernelSession — concurrency guard', () => {
   })
 })
 
+describe('KernelSession — mid-turn steering', () => {
+  it('returns false when no turn is in flight', () => {
+    const session = new KernelSession(makeConfig())
+    expect(session.steer('later')).toBe(false)
+    expect(session.steer('   ')).toBe(false)
+  })
+
+  it('injects a queued correction as a user message at the next loop boundary', async () => {
+    // A tool that simulates the user pressing Ctrl+G + typing a correction
+    // WHILE the turn is in flight (steer() is valid only mid-submit).
+    let theSession: KernelSession | undefined
+    let steerAccepted: boolean | undefined
+    const noopTool: KernelTool = {
+      name: 'noop',
+      description: 'noop',
+      inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+      inputJSONSchema: { type: 'object' as const },
+      call: async () => {
+        steerAccepted = theSession!.steer('改用方案B')
+        return { data: 'done' }
+      },
+      isConcurrencySafe: () => false,
+    }
+
+    let calls = 0
+    mockStream.mockImplementation(async function* () {
+      calls++
+      if (calls === 1) yield* toolUseStream('t1', 'noop', {})
+      else yield* textStream('ok')
+    })
+
+    theSession = new KernelSession(makeConfig({ tools: [noopTool] }))
+    const events = await collectEvents(theSession, 'go')
+
+    expect(steerAccepted).toBe(true)
+    expect(events.find(e => e.type === 'result')?.subtype).toBe('success')
+    // A second API call must have happened (the loop continued after the tool).
+    expect(mockStream).toHaveBeenCalledTimes(2)
+
+    const userTexts = theSession.getMessages()
+      .filter(m => m.role === 'user')
+      .flatMap(m => m.content)
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text as string)
+    expect(userTexts.some(t => t.includes('改用方案B'))).toBe(true)
+    expect(userTexts.some(t => t.includes('[用户实时补充指导]'))).toBe(true)
+  })
+
+  it('drops steering queued while idle so it does not leak into the next turn', async () => {
+    mockStream.mockImplementation(() => textStream('ok'))
+    const session = new KernelSession(makeConfig())
+    // Not in flight → ignored.
+    expect(session.steer('stale correction')).toBe(false)
+    await collectEvents(session, 'hello')
+    const userTexts = session.getMessages()
+      .filter(m => m.role === 'user')
+      .flatMap(m => m.content)
+      .filter((b: any) => b.type === 'text')
+      .map((b: any) => b.text as string)
+    expect(userTexts.some(t => t.includes('stale correction'))).toBe(false)
+  })
+})
+
 describe('KernelSession — appendSystemPrompt', () => {
   it('setAppendSystemPrompt updates config for next submit', async () => {
     mockStream.mockImplementation(() => textStream('ok'))

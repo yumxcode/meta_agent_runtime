@@ -809,6 +809,11 @@ export class RoboticsSession {
     this.inner.interrupt()
   }
 
+  /** Inject a mid-turn user correction. See KernelSession.steer(). */
+  steer(text: string): boolean {
+    return this.inner.steer(text)
+  }
+
   getMessages(): readonly ConversationMessage[] {
     // KernelMessage is structurally compatible with ConversationMessage
     return this.inner.getMessages() as unknown as readonly ConversationMessage[]

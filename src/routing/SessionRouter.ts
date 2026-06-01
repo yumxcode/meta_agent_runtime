@@ -90,6 +90,7 @@ interface SessionImpl {
   submit(prompt: string): AsyncGenerator<MetaAgentEvent>
   registerTool(tool: MetaAgentTool): void
   interrupt(): void
+  steer?(text: string): boolean
   getMessages(): readonly ConversationMessage[]
   getUsage(): TokenUsage
   getEstimatedCost(): number
@@ -236,6 +237,17 @@ export class SessionRouter {
 
   interrupt(): void {
     this._impl?.interrupt()
+  }
+
+  /**
+   * Inject a mid-turn user correction ("steering") into the running turn.
+   * The correction is appended as a user message at the next loop boundary; the
+   * model is NOT interrupted. Returns true if accepted (a turn is in flight and
+   * the backend supports steering), false otherwise — in which case the caller
+   * should fall back to submit() as a fresh message.
+   */
+  steer(text: string): boolean {
+    return this._impl?.steer?.(text) ?? false
   }
 
   getMessages(): readonly ConversationMessage[] {

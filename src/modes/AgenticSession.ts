@@ -173,6 +173,9 @@ export class AgenticSession {
 
   interrupt(): void { this._engine.interrupt() }
 
+  /** Inject a mid-turn user correction. See KernelSession.steer(). */
+  steer(text: string): boolean { return this._engine.steer(text) }
+
   /**
    * S1 + S9: Release all per-session resources.  Forwards to the inner
    * KernelSession dispose (which clears messages / fileCache / tools closures),

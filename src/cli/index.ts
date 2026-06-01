@@ -32,6 +32,7 @@ import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
+import { ThinkingMeter } from './thinkingMeter.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
 import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
@@ -156,6 +157,11 @@ ${bold('INTERACTIVE COMMANDS')}
   /anchor review        Interactively review & commit pending physical anchors
   /clear                Start a new session (same workspace/hardware)
   /exit  or  Ctrl+D     Quit
+
+${bold('DURING A TURN')}
+  Ctrl+G                Pause output and inject a correction (steers the model
+                        at the next step boundary — does NOT abort generation)
+  Ctrl+C                Interrupt the current turn (press twice to quit)
 
 ${bold('ENVIRONMENT VARIABLES')}
   DEEPSEEK_API_KEY      DeepSeek API key  ${dim('← default provider')}
@@ -1012,18 +1018,58 @@ async function safeStdoutWrite(text: string): Promise<void> {
   await once(process.stdout, 'drain')
 }
 
+/**
+ * Hooks that let the REPL steer the model mid-turn (Ctrl+G). The CLI's stdin
+ * listener arms a correction; streamPrompt pauses output (without aborting the
+ * stream), reads one line of guidance, and forwards it to router.steer().
+ */
+interface SteerHooks {
+  /** Resolves when a steer has been armed (Ctrl+G); immediate if already armed. */
+  waitArmed: () => Promise<void>
+  /** Clear the armed flag after servicing a steer prompt. */
+  consume: () => void
+  /**
+   * Hand the input line over to readline with a `steer ›` prompt and render it.
+   * Required so readline owns the prompt — otherwise its own `you ›` prompt
+   * redraws over a manually printed one the moment the user types.
+   */
+  beginInput: () => void
+  /** Read one line of correction text (null on EOF). */
+  read: () => Promise<string | null>
+  /** Restore the normal `you ›` prompt after the correction line is read. */
+  endInput: () => void
+}
+
 async function streamPrompt(
   router: SessionRouter,
   prompt: string,
   jsonMode: boolean,
   showThinking = false,
+  steerHooks?: SteerHooks,
 ): Promise<void> {
   const gen = router.submit(prompt)
+  const steering = steerHooks ?? null
   let hasText = false
   let thinkingOpen = false   // whether we're currently inside a thinking block
   let visibleChars = 0
   let visibleTruncated = false
   const visibleLimit = getCliMaxVisibleChars()
+
+  // ── Live reasoning indicator ──────────────────────────────────────────────
+  // Reasoning models stream their chain of thought before any visible answer.
+  // When that text is hidden the terminal would otherwise look frozen during a
+  // long reasoning phase, so we draw a single in-place status line (spinner +
+  // elapsed time + estimated reasoning tokens). A timer advances the spinner so
+  // it stays alive even while waiting for the first token. Disabled outside an
+  // interactive TTY (and in --json mode) so it never pollutes piped output.
+  const meterEnabled = isTTY && !jsonMode
+  const meter = new ThinkingMeter({ enabled: meterEnabled })
+  let meterTimer: ReturnType<typeof setInterval> | null = null
+  if (meterEnabled) {
+    meter.show()
+    meterTimer = setInterval(() => meter.tick(), 120)
+    if (typeof meterTimer.unref === 'function') meterTimer.unref()
+  }
 
   async function writeVisible(text: string): Promise<void> {
     if (!text || visibleTruncated) return
@@ -1059,20 +1105,71 @@ async function streamPrompt(
   }
 
   try {
-    for await (const event of gen) {
+    // Manual drive (instead of `for await`) so a Ctrl+G steer can be serviced
+    // even while we're blocked waiting for the next event during a long
+    // reasoning phase. We race the pending event against the steer signal; if
+    // steering wins we pause, collect a correction, inject it, then re-race the
+    // SAME pending event — so the model is never aborted, only back-pressured.
+    let pending = gen.next()
+    while (true) {
+      const raced = steering
+        ? await Promise.race([pending, steering.waitArmed().then(() => '__steer__' as const)])
+        : await pending
+
+      if (raced === '__steer__') {
+        steering!.consume()
+        meter.hide()
+        await safeStdoutWrite(
+          `\n${yellow('⏸ 已暂停输出')} ${dim('输入纠正指令并回车注入（直接回车取消）:')}\n`,
+        )
+        // Hand the line to readline with a `steer ›` prompt so it renders and
+        // owns the input — otherwise readline's own `you ›` prompt redraws over
+        // a manually printed one the instant the user types.
+        steering!.beginInput()
+        let correction: string | null
+        try {
+          correction = await steering!.read()
+        } finally {
+          steering!.endInput()
+        }
+        const trimmed = (correction ?? '').trim()
+        if (trimmed) {
+          const ok = router.steer(trimmed)
+          await safeStdoutWrite(
+            ok
+              ? `${green('✓')} ${dim('纠正已加入队列，将在下个步骤边界注入，不中断当前生成。')}\n`
+              : `${yellow('·')} ${dim('当前没有进行中的回合，已忽略该纠正。')}\n`,
+          )
+        } else {
+          await safeStdoutWrite(`${dim('已取消，继续。')}\n`)
+        }
+        if (meterEnabled) meter.show()
+        continue
+      }
+
+      const step = raced
+      if (step.done) break
+      const event = step.value
+      pending = gen.next()
       if (jsonMode) {
         console.log(JSON.stringify(event))
         continue
       }
       switch (event.type) {
         case 'thinking_delta': {
+          meter.note(event.delta)
           if (showThinking) {
+            meter.hide()
             await openThinkingBlock()
             await writeVisible(dim(event.delta))
+          } else {
+            // Keep the compact live indicator visible (it now shows a token count).
+            meter.show()
           }
           break
         }
         case 'text': {
+          meter.hide()
           // Close any open thinking block before the first reply text
           await closeThinkingBlock()
           if (!hasText) {
@@ -1083,12 +1180,14 @@ async function streamPrompt(
           break
         }
         case 'tool_use': {
+          meter.hide()
           await safeStdoutWrite(
             `\n${dim('⚙')}  ${cyan(event.toolName)} ${gray(JSON.stringify(event.toolInput).slice(0, 80))}\n`,
           )
           break
         }
         case 'tool_result': {
+          meter.hide()
           const preview = String(event.content ?? '').slice(0, 120)
           await safeStdoutWrite(
             `   ${dim('→')} ${gray(preview)}${preview.length >= 120 ? gray('…') : ''}\n`,
@@ -1096,12 +1195,14 @@ async function streamPrompt(
           break
         }
         case 'api_retry': {
+          meter.hide()
           await safeStdoutWrite(
             `\n${yellow('⚠')}  retrying (attempt ${event.attempt}/${event.maxRetries}, delay ${event.retryDelayMs}ms)\n`,
           )
           break
         }
         case 'result': {
+          meter.hide()
           await closeThinkingBlock()
           if (hasText) await safeStdoutWrite('\n')
           // Show explicit warnings for non-success result subtypes so the user
@@ -1131,10 +1232,13 @@ async function streamPrompt(
                         : mode === 'agentic'  ? green(mode)
                         : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
                         : gray(mode)
+          const thinkTag = meter.charCount > 0
+            ? `  ${gray(`think:~${meter.tokenEstimate}`)}`
+            : ''
           await safeStdoutWrite(
             `\n${gray('─'.repeat(56))}\n` +
             `${modeTag}  ` +
-            `${gray(`in:${usage.inputTokens} out:${usage.outputTokens}`)}  ` +
+            `${gray(`in:${usage.inputTokens} out:${usage.outputTokens}`)}${thinkTag}  ` +
             `${gray(`$${cost.toFixed(4)}`)}\n`,
           )
           break
@@ -1144,6 +1248,11 @@ async function streamPrompt(
   } catch (err) {
     if ((err as NodeJS.ErrnoException)?.code === 'ERR_STREAM_PREMATURE_CLOSE') return
     throw err
+  } finally {
+    // Always tear down the spinner timer and wipe any lingering status line —
+    // including on interrupt/error paths — so it never bleeds into the prompt.
+    if (meterTimer) clearInterval(meterTimer)
+    meter.hide()
   }
 }
 
@@ -2250,6 +2359,37 @@ async function runRepl(opts: CliOptions): Promise<void> {
   const _inputResolvers: Array<(v: string | null) => void> = []
   let _rlClosed = false
 
+  // ── Mid-turn steering (Ctrl+G) ────────────────────────────────────────────
+  // While a turn is streaming, Ctrl+G (BEL, 0x07) arms a one-shot "correction"
+  // prompt. The byte is delivered immediately because readline keeps the TTY in
+  // raw mode, so the stdin 'data' listener below sees it the instant it's typed.
+  // We never abort the model — the correction is injected at the next kernel
+  // loop boundary via router.steer().
+  let _isStreaming = false
+  let _steerArmed = false
+  let _steerNotify: (() => void) | null = null
+  const _armSteer = (): void => {
+    _steerArmed = true
+    const notify = _steerNotify
+    _steerNotify = null
+    notify?.()
+  }
+  const _youPrompt = `\n${bold(cyan('you'))} › `
+  const _steerPrompt = `${bold(cyan('steer'))} › `
+  const steerHooks = {
+    waitArmed: (): Promise<void> =>
+      _steerArmed ? Promise.resolve() : new Promise<void>(resolve => { _steerNotify = resolve }),
+    consume: (): void => { _steerArmed = false; _steerNotify = null },
+    beginInput: (): void => {
+      // readline now renders + redraws THIS prompt as the user types, so the
+      // line stays a `steer ›` line instead of reverting to `you ›`.
+      rl.setPrompt(_steerPrompt)
+      rl.prompt()
+    },
+    read: (): Promise<string | null> => _nextInput(),
+    endInput: (): void => { rl.setPrompt(_youPrompt) },
+  }
+
   function _enqueueInput(combined: string): void {
     if (_inputResolvers.length > 0) {
       _inputResolvers.shift()!(combined)
@@ -2267,6 +2407,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // Must be prepended so it fires BEFORE readline's own 'data' handler — this
   // guarantees the chunk is recorded before any resulting 'line' event fires.
   process.stdin.prependListener('data', (buf: Buffer) => {
+    // Ctrl+G during a streaming turn arms a steering correction (handled by
+    // streamPrompt). Outside a turn it's ignored. We still feed the chunk to the
+    // paste accumulator below — readline does not insert a BEL into the buffer.
+    if (_isStreaming && buf.includes(0x07)) _armSteer()
     if (Date.now() < ignoreInputUntil) {
       _paste.resetChunk()   // SIGINT drain — don't classify against this chunk
       return
@@ -2647,13 +2791,28 @@ async function runRepl(opts: CliOptions): Promise<void> {
     const pendingCountBefore = router.getPendingExperiences()?.count ?? 0
     const anchorCountBefore = router.getPendingPhysicalAnchors()?.count ?? 0
 
+    // Enable Ctrl+G steering only in an interactive TTY (and not in --json mode).
+    const _steerEnabled = isTTY && !opts.json
+    if (_steerEnabled) {
+      _steerArmed = false
+      _steerNotify = null
+      _isStreaming = true
+    }
     try {
-      await streamPrompt(router, input, opts.json, opts.showThinking)
+      await streamPrompt(
+        router, input, opts.json, opts.showThinking,
+        _steerEnabled ? steerHooks : undefined,
+      )
     } catch (err) {
       if (!interrupted) {
         const msg = err instanceof Error ? err.message : String(err)
         console.error(`\n${red('Error:')} ${msg}\n`)
       }
+    } finally {
+      // Disarm steering so a stray Ctrl+G at the idle prompt does nothing.
+      _isStreaming = false
+      _steerArmed = false
+      _steerNotify = null
     }
 
     // ── Post-turn: nudge for newly queued physical anchors ───────────────────
