@@ -31,6 +31,7 @@ import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
 import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
@@ -2202,44 +2203,52 @@ async function runRepl(opts: CliOptions): Promise<void> {
   let ignoreInputUntil = 0
   // ── Multi-line paste accumulator ─────────────────────────────────────────
   //
-  // Core insight: we can reliably distinguish "user pressed Enter to submit"
-  // from "newline embedded in pasted text" by inspecting the raw stdin data
-  // chunk that triggers each readline 'line' event:
+  // A terminal delivers pasted text to stdin with its internal \n bytes intact,
+  // and readline cannot tell those apart from the \n produced by pressing
+  // Enter — so it fires a 'line' event for every embedded newline.  We
+  // distinguish the two by inspecting the raw stdin chunk that triggered each
+  // 'line' event:
   //
-  //   • Bare Enter     — the data chunk contains ONLY \r / \n characters.
-  //                      The user explicitly hit Enter → submit immediately.
-  //   • Paste chunk    — the data chunk contains actual text.  Two sub-cases:
-  //       a) chunk ends with \n (no buffered tail)  → use a 300 ms debounce
-  //          so all same-chunk lines are flushed together.
-  //       b) chunk has text after the last \n       → readline buffered that
-  //          tail; it will only emit a 'line' event for it when the user
-  //          eventually presses Enter.  Set NO timer — wait indefinitely.
-  //          When Enter arrives (even minutes later) it comes as a bare Enter
-  //          chunk and flushes everything accumulated so far.
+  //   • Bare Enter  — the chunk is ONLY \r / \n.  Can only come from the user
+  //                   pressing Enter → submit everything accumulated so far.
+  //   • Paste line  — the chunk also contains text, so its newline was pasted,
+  //                   not typed → accumulate and keep waiting for a real Enter.
   //
-  // We use process.stdin.prependListener so our 'data' handler runs BEFORE
-  // readline's own 'data' handler — ensuring _lastStdinData is set before any
-  // 'line' events fire within the same call stack.
+  // This replaces an earlier 300 ms debounce that auto-submitted a paste ending
+  // in \n.  That timer raced the user: pausing >300 ms after a paste and then
+  // typing more caused the paste to submit on its own and the typed tail to
+  // submit as a second message (the "auto-replied before I pressed Enter /
+  // replied twice" bug).  Waiting for an explicit bare Enter removes the race
+  // entirely; normal typing is unaffected because its Enter is always its own
+  // bare-newline chunk.
   //
-  // The SIGINT drain window (ignoreInputUntil) is checked in both handlers.
+  // We prepend the stdin 'data' listener so onData() records the chunk BEFORE
+  // readline emits the resulting 'line' event(s) in the same call stack.
+  // The SIGINT drain window (ignoreInputUntil) is honored in both handlers.
 
-  const PASTE_FLUSH_MS = 300   // debounce for paste-with-trailing-newline
+  const _paste = new PasteAccumulator()
 
-  const _pasteLines: string[] = []
-  let _pasteTimer: ReturnType<typeof setTimeout> | null = null
-  let _lastStdinData = ''
-  let _hasBufferedTail = false   // true when paste chunk has content after last \n
+  // Ask the terminal to wrap pastes in ESC[200~ / ESC[201~ markers so pasted
+  // newlines can be told apart from a typed Enter with certainty. Restore the
+  // terminal's default on every exit path so we never leave the mode dangling.
+  let _bracketedPasteOn = false
+  const enableBracketedPaste = (): void => {
+    if (isTTY && !_bracketedPasteOn) {
+      process.stdout.write(BRACKETED_PASTE_ENABLE)
+      _bracketedPasteOn = true
+    }
+  }
+  const disableBracketedPaste = (): void => {
+    if (_bracketedPasteOn) {
+      process.stdout.write(BRACKETED_PASTE_DISABLE)
+      _bracketedPasteOn = false
+    }
+  }
+  enableBracketedPaste()
 
   const _inputQueue: string[] = []
   const _inputResolvers: Array<(v: string | null) => void> = []
   let _rlClosed = false
-
-  function _flushPaste(): void {
-    if (_pasteTimer) { clearTimeout(_pasteTimer); _pasteTimer = null }
-    const combined = _pasteLines.join('\n')
-    _pasteLines.length = 0
-    _enqueueInput(combined)
-  }
 
   function _enqueueInput(combined: string): void {
     if (_inputResolvers.length > 0) {
@@ -2255,50 +2264,22 @@ async function runRepl(opts: CliOptions): Promise<void> {
     return new Promise<string | null>(resolve => _inputResolvers.push(resolve))
   }
 
-  // Must be prepended so it fires BEFORE readline's own 'data' handler.
+  // Must be prepended so it fires BEFORE readline's own 'data' handler — this
+  // guarantees the chunk is recorded before any resulting 'line' event fires.
   process.stdin.prependListener('data', (buf: Buffer) => {
     if (Date.now() < ignoreInputUntil) {
-      _lastStdinData = ''
-      _hasBufferedTail = false
+      _paste.resetChunk()   // SIGINT drain — don't classify against this chunk
       return
     }
-    const s = buf.toString()
-    _lastStdinData = s
-    // Does the chunk leave content buffered in readline (text after last \n)?
-    const lastNl = s.lastIndexOf('\n')
-    _hasBufferedTail = lastNl >= 0 && lastNl < s.length - 1
-
-    // If a paste-flush timer is pending and this looks like a keyboard keystroke
-    // (no newlines, ≤4 bytes — covers ASCII keys, UTF-8 multi-byte chars, arrow
-    // key escape sequences), cancel the timer so we don't flush mid-word.
-    // The flush will happen naturally when the user presses Enter.
-    if (_pasteTimer && !s.includes('\n') && buf.length <= 4) {
-      clearTimeout(_pasteTimer)
-      _pasteTimer = null
-    }
+    _paste.onData(buf.toString())
   })
 
   rl.on('line', (rawLine) => {
     if (Date.now() < ignoreInputUntil) return   // SIGINT drain — silently discard
-
-    // "Bare Enter": stdin chunk was purely \r / \n → user explicitly submitted.
-    const isBareEnter = /^[\r\n]+$/.test(_lastStdinData)
-
-    _pasteLines.push(rawLine)
-    if (_pasteTimer) clearTimeout(_pasteTimer)
-
-    if (isBareEnter) {
-      // Explicit submit — flush immediately regardless of wait time.
-      _flushPaste()
-    } else if (_hasBufferedTail) {
-      // Paste chunk still has content buffered in readline waiting for Enter.
-      // Do not start any timer — wait indefinitely for the user's Enter.
-      _pasteTimer = null
-    } else {
-      // Paste chunk with trailing \n (no buffered tail) — short debounce so
-      // all lines from the same chunk are flushed together.
-      _pasteTimer = setTimeout(_flushPaste, PASTE_FLUSH_MS)
-    }
+    // Returns a complete message only on a bare Enter; null means "still a
+    // paste in progress — accumulate and wait for the user's explicit Enter".
+    const submit = _paste.onLine(rawLine)
+    if (submit !== null) _enqueueInput(submit)
   })
 
   rl.on('SIGINT', () => {
@@ -2311,24 +2292,19 @@ async function runRepl(opts: CliOptions): Promise<void> {
     ignoreInputUntil = Date.now() + 300
     // Clear any paste accumulator state so buffered content before the
     // interrupt is not submitted after the drain window expires.
-    _pasteLines.length = 0
-    if (_pasteTimer) { clearTimeout(_pasteTimer); _pasteTimer = null }
+    _paste.clear()
     process.stdout.write(`\n${yellow('Interrupted')} ${dim('(press Ctrl+C again to exit)')}\n`)
     setTimeout(() => { ctrlCPressed = false }, 2000)
     rl.prompt()
   })
 
   rl.on('close', () => {
+    disableBracketedPaste()
     // Signal EOF to the accumulator queue so _nextInput() unblocks
     _rlClosed = true
-    if (_pasteTimer) {
-      clearTimeout(_pasteTimer)
-      _pasteTimer = null
-      if (_pasteLines.length > 0) {
-        _enqueueInput(_pasteLines.join('\n'))
-        _pasteLines.length = 0
-      }
-    }
+    // Recover any paste left in the buffer at EOF (e.g. Ctrl+D after a paste).
+    const _pasteTail = _paste.drain()
+    if (_pasteTail !== null) _enqueueInput(_pasteTail)
     for (const resolve of _inputResolvers) resolve(null)
     _inputResolvers.length = 0
 
@@ -2385,6 +2361,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     if (exiting) return
     exiting = true
     if (teamReminderTimer) clearInterval(teamReminderTimer)
+    disableBracketedPaste()
     if (err) console.error(`\n${red('Fatal:')} ${err instanceof Error ? err.message : String(err)}\n`)
     try { await router.dispose() } catch { /* best-effort */ }
     try { rl.close() } catch { /* best-effort */ }
