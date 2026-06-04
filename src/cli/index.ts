@@ -404,27 +404,28 @@ function assertApiKeyConfigured(opts: CliOptions): void {
 // ── Workspace helpers ─────────────────────────────────────────────────────────
 
 /** Prompt the user to confirm or enter a working directory (interactive only) */
-async function confirmWorkspace(suggested: string): Promise<string> {
-  const rl = createInterface({ input: process.stdin, output: process.stdout })
-  return new Promise(resolveP => {
+async function confirmWorkspace(suggested: string, existingRl?: readline.Interface): Promise<string> {
+  const ownRl = existingRl == null
+  if (ownRl) process.stdin.resume()
+  const rl = existingRl ?? createInterface({ input: process.stdin, output: process.stdout, terminal: isTTY })
+  try {
     process.stdout.write(
       `\n${yellow('⚠  工作目录未指定')}\n` +
       `Agent 将只能在指定目录内读写文件。\n\n` +
-      `${dim('当前目录:')} ${cyan(suggested)}\n` +
-      `直接回车确认，或输入其他路径: `,
+      `${dim('当前目录:')} ${cyan(suggested)}\n`,
     )
-    rl.once('line', line => {
-      rl.close()
-      const input = line.trim()
-      if (!input) { resolveP(suggested); return }
-      const abs = resolve(input)
-      if (!existsSync(abs) || !statSync(abs).isDirectory()) {
-        console.error(red(`路径不存在或不是目录: ${abs}`))
-        process.exit(1)
-      }
-      resolveP(abs)
-    })
-  })
+    const line = await askQuestion(rl, `直接回车确认，或输入其他路径: `)
+    const input = line.trim()
+    if (!input) return suggested
+    const abs = resolve(input)
+    if (!existsSync(abs) || !statSync(abs).isDirectory()) {
+      console.error(red(`路径不存在或不是目录: ${abs}`))
+      process.exit(1)
+    }
+    return abs
+  } finally {
+    if (ownRl) rl.close()
+  }
 }
 
 /** Build the workspace constraint block injected into system prompt */
@@ -457,6 +458,7 @@ function isNativeQuestionActive(rl: readline.Interface): boolean {
 
 async function askQuestion(rl: readline.Interface, question: string): Promise<string> {
   return new Promise(resolve => {
+    process.stdin.resume()
     nativeQuestionInterfaces.add(rl)
     rl.question(question, answer => {
       queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
@@ -488,7 +490,8 @@ async function selectHardwareProfile(
   // on the same stdin while one is already active causes both to fight over input and
   // the wizard exits immediately without reading any keystrokes.
   const ownRl = existingRl == null
-  const rl = existingRl ?? createInterface({ input: process.stdin, output: process.stdout })
+  if (ownRl) process.stdin.resume()
+  const rl = existingRl ?? createInterface({ input: process.stdin, output: process.stdout, terminal: isTTY })
 
   try {
     if (profiles.length === 0) {
@@ -2238,24 +2241,33 @@ async function handleTeamCommand(
 // ── Interactive REPL ──────────────────────────────────────────────────────────
 
 async function runRepl(opts: CliOptions): Promise<void> {
+  let hardwareProfileText = ''
+
   // ── Workspace confirmation (REPL only, single-turn skips for scripting) ──
   if (!opts.json && isTTY) {
-    if (!opts.workspace) {
-      opts.workspace = await confirmWorkspace(process.cwd())
+    const needsStartupPrompt = !opts.workspace || opts.mode === 'robotics'
+    const startupRl = needsStartupPrompt
+      ? createInterface({ input: process.stdin, output: process.stdout, terminal: isTTY })
+      : undefined
+    try {
+      if (!opts.workspace) {
+        opts.workspace = await confirmWorkspace(process.cwd(), startupRl)
+      }
+      console.log(green(`✓ 工作目录: ${opts.workspace}\n`))
+
+      // ── Hardware profile selection (robotics mode only) ───────────────────
+      if (opts.mode === 'robotics') {
+        const hp = new HardwareProfile()
+        const selected = await selectHardwareProfile(hp, opts.workspace, startupRl)
+        opts.hardwareId      = selected.name || undefined
+        hardwareProfileText  = selected.profileText
+      }
+    } finally {
+      startupRl?.close()
     }
-    console.log(green(`✓ 工作目录: ${opts.workspace}\n`))
   } else if (!opts.workspace) {
     // Non-TTY / json mode: default to cwd silently
     opts.workspace = process.cwd()
-  }
-
-  // ── Hardware profile selection (robotics mode only) ───────────────────────
-  let hardwareProfileText = ''
-  if (opts.mode === 'robotics' && !opts.json && isTTY) {
-    const hp = new HardwareProfile()
-    const selected = await selectHardwareProfile(hp, opts.workspace)
-    opts.hardwareId      = selected.name || undefined
-    hardwareProfileText  = selected.profileText
   }
 
   if (!opts.json) {
