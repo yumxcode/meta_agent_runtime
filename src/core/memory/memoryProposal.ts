@@ -13,7 +13,8 @@
  * engineering experience lives in ExperienceStore, never here.
  */
 
-import { appendFile, mkdir, readFile } from 'fs/promises'
+import { appendFile, mkdir, readFile, writeFile } from 'fs/promises'
+import { createHash } from 'crypto'
 import { join } from 'path'
 import { atomicWriteFile } from '../persist/index.js'
 import { ensureMemoryDirExists } from './memdir.js'
@@ -81,7 +82,12 @@ export function sanitizeFilename(value: unknown, fallbackName: string): string {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 80)
-  return `${base || 'memory'}.md`
+  if (base) return `${base}.md`
+  // Non-Latin names (e.g. Chinese) produce an empty base after ASCII-only sanitization.
+  // Use a stable short hash of the original name so every entry gets a unique filename
+  // instead of all colliding on the generic 'memory.md' fallback.
+  const hash = createHash('sha1').update(raw).digest('hex').slice(0, 8)
+  return `mem_${hash}.md`
 }
 
 function stripUnsupportedFrontmatter(text: string): string {
@@ -165,19 +171,35 @@ export type CommitMemoryResult =
   | { ok: false; reason: 'duplicate' | 'exists' | 'error'; detail?: string }
 
 /**
+ * Returns true when the MEMORY.md index already references this proposal —
+ * checked by exact link anchor `](filename)` OR exact name match on a line
+ * boundary, to avoid false positives from substring occurrences.
+ */
+function isDuplicateInIndex(index: string, proposal: NormalizedMemoryProposal): boolean {
+  if (index.includes(`](${proposal.filename})`)) return true
+  // Exact name match: must be surrounded by non-word chars / line boundaries
+  const escapedName = proposal.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+  return new RegExp(`(?:^|[^\\w])${escapedName}(?:[^\\w]|$)`, 'm').test(index)
+}
+
+/**
  * Write one approved proposal to disk: render the topic file and append a
  * pointer line to MEMORY.md.  Skips writing when an entry with the same
  * filename or name already exists in the index, or when the target file is
- * already present.
+ * already present — unless `overwrite` is true, in which case the existing
+ * file and index line are replaced.
  *
  * @param existingIndex  Optional snapshot of the current MEMORY.md content used
  *                       for the duplicate check.  When omitted it is loaded from
  *                       disk.
+ * @param overwrite      When true, replace an existing same-named entry instead
+ *                       of returning a duplicate error.
  */
 export async function commitMemoryProposal(
   proposal: NormalizedMemoryProposal,
   memoryDir: string = MEMORY_DIR,
   existingIndex?: string,
+  overwrite?: boolean,
 ): Promise<CommitMemoryResult> {
   if (memoryDir === MEMORY_DIR) await ensureMemoryDirExists()
   else await mkdir(memoryDir, { recursive: true })
@@ -191,26 +213,52 @@ export async function commitMemoryProposal(
     }
   }
 
-  if (index.includes(`](${proposal.filename})`) || index.includes(proposal.name)) {
-    return { ok: false, reason: 'duplicate', detail: proposal.filename }
-  }
+  const isDup = isDuplicateInIndex(index, proposal)
 
+  // Check physical file existence (may exist even if not indexed)
   const target = join(memoryDir, proposal.filename)
+  let fileExists = false
   try {
     await readFile(target, 'utf-8')
-    return { ok: false, reason: 'exists', detail: proposal.filename }
+    fileExists = true
   } catch {
-    // File does not exist; proceed.
+    // File does not exist.
+  }
+
+  if ((isDup || fileExists) && !overwrite) {
+    return { ok: false, reason: isDup ? 'duplicate' : 'exists', detail: proposal.filename }
   }
 
   try {
+    // Write (or overwrite) the topic file.
     await atomicWriteFile(target, renderMemoryFile(proposal))
+
     const indexLine = proposal.index_line.replace(/\r?\n/g, ' ').trim()
-    await appendFile(
-      join(memoryDir, MEMORY_ENTRYPOINT_NAME),
-      `${index.trim() ? '\n' : ''}${indexLine}\n`,
-      'utf-8',
-    )
+
+    if (overwrite && isDup) {
+      // Replace the old index line with the new one.
+      const escapedFilename = proposal.filename.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const escapedName = proposal.name.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')
+      const updatedIndex = index
+        .split('\n')
+        .map(line => {
+          if (line.includes(`](${proposal.filename})`) ||
+              new RegExp(`(?:^|[^\\w])${escapedName}(?:[^\\w]|$)`).test(line)) {
+            return indexLine
+          }
+          return line
+        })
+        .join('\n')
+      await writeFile(join(memoryDir, MEMORY_ENTRYPOINT_NAME), updatedIndex, 'utf-8')
+    } else {
+      // Append new index line.
+      await appendFile(
+        join(memoryDir, MEMORY_ENTRYPOINT_NAME),
+        `${index.trim() ? '\n' : ''}${indexLine}\n`,
+        'utf-8',
+      )
+    }
+
     return { ok: true, filename: proposal.filename }
   } catch (err) {
     return { ok: false, reason: 'error', detail: String(err) }

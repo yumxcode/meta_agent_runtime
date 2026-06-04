@@ -90,6 +90,16 @@ export function translateKernelEvent(
         sessionId: state.sessionId,
       }]
 
+    case 'compact_failed':
+      return [{
+        type: 'compact_failed',
+        attempt: event.attempt,
+        querySource: event.querySource,
+        error: event.error,
+        consecutiveFailures: event.consecutiveFailures,
+        sessionId: state.sessionId,
+      }]
+
     // compact_boundary, system_message, tool_use_summary — not surfaced upstream
     default:
       return []

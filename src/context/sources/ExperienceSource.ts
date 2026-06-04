@@ -48,9 +48,22 @@ function toMatch(e: ExperienceEntry): ExperienceMatch {
     workarounds: e.outcome.workarounds,
     confidenceTier: e.confidenceTier ?? 'observed',
     evidenceRefs: e.evidenceRefs,
+    algorithm: e.algorithm,
+    robot: e.robot,
     observationCount: e.observationCount ?? 1,
     contradictionCount: e.contradictionCount ?? 0,
   } satisfies ExperienceMatch
+}
+
+function algorithmMatches(entry: ExperienceEntry, queryText: string): boolean {
+  const algorithm = entry.algorithm?.trim().toLowerCase()
+  return Boolean(algorithm && queryText.includes(algorithm))
+}
+
+function evidenceScore(entry: ExperienceEntry): number {
+  const refs = entry.evidenceRefs?.length ?? 0
+  if (refs === 0) return 0
+  return 60 + Math.min(refs, 5) * 12
 }
 
 export class ExperienceSource implements IKnowledgeSource {
@@ -62,6 +75,8 @@ export class ExperienceSource implements IKnowledgeSource {
     const keywords = [...new Set((opts.keywords ?? [])
       .map(normalizeKeyword)
       .filter((kw): kw is string => Boolean(kw)))]
+    const robot = opts.robot?.trim().toLowerCase()
+    const queryText = [opts.currentQuery ?? '', ...keywords].join(' ').toLowerCase()
 
     const pool = new Map<string, ExperienceEntry>()
     const add = (entries: ExperienceEntry[]) => {
@@ -105,13 +120,16 @@ export class ExperienceSource implements IKnowledgeSource {
 
     const domainSet = new Set(domains)
     const ranked = [...pool.values()].sort((a, b) => {
-      const domainDelta = Number(domainSet.has(b.domain)) - Number(domainSet.has(a.domain))
-      if (domainDelta !== 0) return domainDelta
+      const score = (entry: ExperienceEntry) => {
+        const sameDomain = domainSet.has(entry.domain) ? 700 : 0
+        const sameRobot = robot && entry.robot?.toLowerCase() === robot ? 500 : 0
+        const sameAlgorithm = algorithmMatches(entry, queryText) ? 450 : 0
+        const keywordScore = keywordHitCount(entry, keywords) * 120
+        return sameDomain + sameRobot + sameAlgorithm + keywordScore +
+          experienceRetrievalScore(entry) + evidenceScore(entry)
+      }
 
-      const keywordDelta = keywordHitCount(b, keywords) - keywordHitCount(a, keywords)
-      if (keywordDelta !== 0) return keywordDelta
-
-      const scoreDelta = experienceRetrievalScore(b) - experienceRetrievalScore(a)
+      const scoreDelta = score(b) - score(a)
       return scoreDelta !== 0 ? scoreDelta : b.createdAt - a.createdAt
     })
 

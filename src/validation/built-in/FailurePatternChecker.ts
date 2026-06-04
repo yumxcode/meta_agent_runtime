@@ -127,6 +127,7 @@ function formatSlotContent(e: ExperienceMatch): string {
     `### ${icon} Past Experience: ${e.title}`,
     `**Domain:** ${e.domain}  **Outcome:** ${e.outcome}`,
     `**Confidence:** ${e.confidenceTier ?? 'observed'}${e.observationCount ? ` (${e.observationCount} observation${e.observationCount === 1 ? '' : 's'})` : ''}`,
+    `**Applies because:** flash judged the stored principle applicable to the planned operation`,
     `**Principle:** ${e.abstractPrinciple}`,
   ]
   if (e.failureReason) lines.push(`**Failure detail:** ${e.failureReason}`)

@@ -448,9 +448,19 @@ function buildWorkspaceSystemPrompt(workspace: string): string {
 // ── Hardware profile helpers ──────────────────────────────────────────────────
 
 /** Ask the user a question and return their answer */
+const nativeQuestionInterfaces = new WeakSet<readline.Interface>()
+
+function isNativeQuestionActive(rl: readline.Interface): boolean {
+  return nativeQuestionInterfaces.has(rl)
+}
+
 async function askQuestion(rl: readline.Interface, question: string): Promise<string> {
   return new Promise(resolve => {
-    rl.question(question, answer => resolve(answer.trim()))
+    nativeQuestionInterfaces.add(rl)
+    rl.question(question, answer => {
+      queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
+      resolve(answer.trim())
+    })
   })
 }
 
@@ -1476,8 +1486,21 @@ async function reviewPendingMemories(
         console.log(green(`  ✓ 已写入记忆 (${result.filename})`))
         committed++
       } else if (result.reason === 'duplicate' || result.reason === 'exists') {
-        console.log(yellow(`  ⚠ 已存在同名记忆，已跳过 (${result.detail ?? p.filename})`))
-        pending.remove(entry.pendingId)
+        console.log(yellow(`  ⚠ 已存在同名记忆 (${result.detail ?? p.filename})，是否覆盖更新？`))
+        const overwriteChoice = await askQuestion(rl, `  覆盖 [y=覆盖 / n=丢弃]: `)
+        const oc = overwriteChoice.trim().toLowerCase()
+        if (oc === 'y' || oc === 'yes') {
+          const overwriteResult = await pending.commit(entry.pendingId, undefined, true)
+          if (overwriteResult.ok) {
+            console.log(green(`  ✓ 已覆盖更新记忆 (${overwriteResult.filename})`))
+            committed++
+          } else {
+            console.log(red(`  ✗ 覆盖失败${overwriteResult.detail ? `: ${overwriteResult.detail}` : ''}`))
+          }
+        } else {
+          pending.remove(entry.pendingId)
+          console.log(dim('  已丢弃'))
+        }
       } else {
         console.log(red(`  ✗ 写入失败${result.detail ? `: ${result.detail}` : ''}`))
       }
@@ -2525,11 +2548,16 @@ async function runRepl(opts: CliOptions): Promise<void> {
       // readline now renders + redraws THIS prompt as the user types, so the
       // line stays a `steer ›` line instead of reverting to `you ›`.
       _steerInputActive = true
+      setInteractiveActive(true)
       rl.setPrompt(_steerPrompt)
       rl.prompt()
     },
     read: (): Promise<string | null> => _nextInput(),
-    endInput: (): void => { _steerInputActive = false; rl.setPrompt(PROMPT_YOU) },
+    endInput: (): void => {
+      _steerInputActive = false
+      setInteractiveActive(false)
+      rl.setPrompt(PROMPT_YOU)
+    },
   }
 
   function _enqueueInput(combined: string): void {
@@ -2590,32 +2618,35 @@ async function runRepl(opts: CliOptions): Promise<void> {
       _paste.resetChunk()   // SIGINT drain — don't classify against this chunk
       return
     }
-    // A wizard (rl.question) owns the line: let readline render and read it
+    // A native readline question owns the line: let readline render and read it
     // natively. Touching the paste state or prompt here would overwrite the
-    // wizard's question prompt with `you ›` and corrupt the accumulator.
-    if (_wizardActive) return
+    // question prompt with `you ›` and corrupt the accumulator.
+    if (_wizardActive || isNativeQuestionActive(rl)) return
     _paste.onData(buf.toString())
     // While a multi-line paste is still being collected, blank readline's prompt
     // so the trailing partial line isn't redrawn with a second `you ›` prefix on
-    // the next keystroke. Restored to PROMPT_YOU once the buffer flushes. Skipped
-    // during a steer input so it doesn't clobber the `steer ›` prompt.
-    if (isTTY && !_steerInputActive) {
+    // the next keystroke. Restored to PROMPT_YOU once the buffer flushes.
+    if (isTTY && _steerInputActive) {
+      // Some editing keys force readline to refresh the current line. Keep the
+      // active prompt locked to `steer ›` for the whole correction input.
+      rl.setPrompt(_steerPrompt)
+    } else if (isTTY && !interactiveInputActive) {
       rl.setPrompt(_paste.buffering ? '' : PROMPT_YOU)
     }
   })
 
   rl.on('line', (rawLine) => {
     if (Date.now() < ignoreInputUntil) return   // SIGINT drain — silently discard
-    // A wizard's rl.question consumes lines via its own callback; this listener
+    // Native rl.question consumers handle the line via their own callback; this listener
     // must stay out of the way so it doesn't double-handle or enqueue them.
-    if (_wizardActive) return
+    if (_wizardActive || isNativeQuestionActive(rl)) return
     // Returns a complete message only on a bare Enter; null means "still a
     // paste in progress — accumulate and wait for the user's explicit Enter".
     const submit = _paste.onLine(rawLine)
     if (submit !== null) {
       // Buffer flushed — restore the normal prompt for the next turn (the data
       // handler blanked it while the paste was being collected).
-      if (isTTY && !_steerInputActive) rl.setPrompt(PROMPT_YOU)
+      if (isTTY && !_steerInputActive && !interactiveInputActive) rl.setPrompt(PROMPT_YOU)
       _enqueueInput(submit)
     }
   })

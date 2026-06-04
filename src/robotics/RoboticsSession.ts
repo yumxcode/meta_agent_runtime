@@ -92,6 +92,9 @@ import { buildTeamSection } from './team/dynamicSection.js'
 const EXPERIENCE_SLOT_REF_RE = /\bexperience:([A-Za-z0-9_-]+)\b/g
 const EXPERIENCE_ID_REF_RE = /\b(exp_[0-9a-z]+_[0-9a-f]{8})\b/g
 const EXPERIENCE_TASK_SWITCH_RE = /\b(new task|switch task|different task|another task|unrelated)\b|换个|另一个|另外一个|新任务|重新开始/
+const EXPERIENCE_INJECTION_LIMIT = 4
+const EXPERIENCE_CANDIDATE_LIMIT = 18
+const EXPERIENCE_STRONG_APPLICABILITY_SCORE = 100
 
 const EXPERIENCE_RELEVANCE_SYSTEM = `\
 You select stored robotics experiences that should be injected into the current task context.
@@ -103,8 +106,24 @@ Rules:
 - Include only experiences that materially constrain, warn, or guide this task.
 - Prefer same robot/domain/algorithm/mechanism, but allow cross-domain transfer only when the principle clearly applies.
 - Exclude weakly related memories; noisy context is worse than no context.
-- Return at most 6 IDs.
+- Return at most ${EXPERIENCE_INJECTION_LIMIT} IDs.
 - If none apply, return {"applicable":[]}.`
+
+interface SelectedExperience {
+  experience: ExperienceMatch
+  appliesBecause: string
+  localScore: number
+  hasApplicabilitySignal: boolean
+}
+
+interface ExperiencePreloadTrace {
+  queryHash: string
+  domains: string[]
+  keywords: string[]
+  candidateSource: 'store' | 'cache' | 'none'
+  candidateCount: number
+  injectedIds: string[]
+}
 
 function assistantText(message: ConversationMessage): string {
   if (message.role !== 'assistant') return ''
@@ -159,7 +178,7 @@ function parseApplicableExperienceIds(raw: string, candidates: ExperienceMatch[]
     const ids = Array.isArray(parsed['applicable'])
       ? parsed['applicable'].filter((id): id is string => typeof id === 'string' && validIds.has(id))
       : []
-    return new Set(ids.slice(0, 6))
+    return new Set(ids.slice(0, EXPERIENCE_INJECTION_LIMIT))
   } catch {
     return new Set()
   }
@@ -257,9 +276,12 @@ export class RoboticsSession {
   private _resumedAt: number | null = null
   private _workflowDef: WorkflowDefinition | null = null
   private _workflowState: WorkflowState | null = null
-  private _experienceWorkingSet: ExperienceMatch[] = []
+  private _experienceCandidatePool: ExperienceMatch[] = []
+  private _experienceWorkingSet: SelectedExperience[] = []
   private _experienceWorkingSetDomains = new Set<string>()
   private _experienceWorkingSetKeywords = new Set<string>()
+  private _forceExperienceCandidateLoad = true
+  private _lastExperiencePreloadTrace: ExperiencePreloadTrace | null = null
   /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
   private _agentMode: RoboticsAgentMode = 'single'
   /** True once mode has been classified or overridden; prevents re-classification. */
@@ -670,6 +692,12 @@ export class RoboticsSession {
     return buildRoboticsCompactInstructions({
       state: this._state,
       hardwareSummary: this._hwSummary,
+      experienceWorkingSet: this._experienceWorkingSet.map(selection => ({
+        id: selection.experience.id,
+        title: selection.experience.title,
+        appliesBecause: selection.appliesBecause,
+        principle: selection.experience.abstractPrinciple,
+      })),
     })
   }
 
@@ -846,7 +874,7 @@ export class RoboticsSession {
     }
 
     // ── QueryAnalyzer: fire in parallel with stable section building ──────────
-    // Heuristic + flash-model intent analysis (3 s timeout built in). Result
+    // Heuristic + flash-model intent analysis (2 min timeout built in). Result
     // drives proactive context pre-loading before the first tool call this turn.
     const queryIntentPromise = this.queryAnalyzer
       ? this.queryAnalyzer.analyze(prompt).catch(() => null)
@@ -910,6 +938,7 @@ export class RoboticsSession {
         if (ev.type === 'compact_start') {
           this._refreshR5Snapshot()
           await this._refreshR4Snapshot()
+          this._forceExperienceCandidateLoad = true
         }
         yield ev
       }
@@ -957,7 +986,17 @@ export class RoboticsSession {
   }
 
   private async _preloadExperienceWorkingSet(prompt: string, intent: QueryIntent | null): Promise<void> {
-    if (!intent) return
+    if (!intent) {
+      this._lastExperiencePreloadTrace = {
+        queryHash: this._experienceQueryHash(prompt),
+        domains: [],
+        keywords: [],
+        candidateSource: 'none',
+        candidateCount: 0,
+        injectedIds: [],
+      }
+      return
+    }
 
     const domains = intent.domains.filter(d => d !== 'general')
     const keywords = intent.searchKeywords
@@ -965,35 +1004,59 @@ export class RoboticsSession {
       .filter((kw): kw is string => Boolean(kw))
       .slice(0, 8)
 
-    if (domains.length === 0 && keywords.length === 0) return
-
-    const shouldRefresh = this._shouldRefreshExperienceWorkingSet(prompt, domains, keywords)
-    if (!shouldRefresh) {
-      this._refreshExperienceSlots(this._experienceWorkingSet)
-      return
-    }
+    const shouldLoad = this._shouldLoadExperienceCandidates(prompt, domains, keywords)
+    let candidateSource: ExperiencePreloadTrace['candidateSource'] = 'cache'
 
     try {
-      const candidates = await this.experienceSource.listExperiences({
-        domains: domains.length > 0 ? domains : undefined,
-        keywords,
-        limit: 18,
-      })
+      let candidates = this._experienceCandidatePool
+      if (shouldLoad) {
+        candidates = await this.experienceSource.listExperiences({
+          domains: domains.length > 0 ? domains : undefined,
+          keywords,
+          robot: this.robot,
+          currentQuery: prompt,
+          limit: EXPERIENCE_CANDIDATE_LIMIT,
+        })
+        this._experienceCandidatePool = candidates
+        this._experienceWorkingSetDomains = new Set(domains)
+        this._experienceWorkingSetKeywords = new Set(keywords)
+        this._forceExperienceCandidateLoad = false
+        candidateSource = 'store'
+      }
+
       const selected = await this._selectApplicableExperiences(prompt, intent, candidates)
       this._experienceWorkingSet = selected
-      this._experienceWorkingSetDomains = new Set(domains)
-      this._experienceWorkingSetKeywords = new Set(keywords)
       this._refreshExperienceSlots(selected)
+      this._lastExperiencePreloadTrace = {
+        queryHash: this._experienceQueryHash(prompt),
+        domains,
+        keywords,
+        candidateSource,
+        candidateCount: candidates.length,
+        injectedIds: selected.map(s => s.experience.id),
+      }
     } catch {
-      // Experience preload is opportunistic; failures should not block the turn.
+      this._lastExperiencePreloadTrace = {
+        queryHash: this._experienceQueryHash(prompt),
+        domains,
+        keywords,
+        candidateSource: 'none',
+        candidateCount: 0,
+        injectedIds: [],
+      }
+      // Experience preload is mandatory in shape but opportunistic in effect;
+      // failures must not block the user turn.
     }
   }
 
-  private _shouldRefreshExperienceWorkingSet(
+  private _shouldLoadExperienceCandidates(
     prompt: string,
     domains: string[],
     keywords: string[],
   ): boolean {
+    if (this._forceExperienceCandidateLoad) return true
+    if (this._experienceCandidatePool.length === 0) return true
+
     if (this._experienceWorkingSetDomains.size === 0 && this._experienceWorkingSetKeywords.size === 0) {
       return true
     }
@@ -1014,13 +1077,16 @@ export class RoboticsSession {
     prompt: string,
     intent: QueryIntent,
     candidates: ExperienceMatch[],
-  ): Promise<ExperienceMatch[]> {
+  ): Promise<SelectedExperience[]> {
     if (candidates.length === 0) return []
 
+    const locallyRanked = this._rankExperienceCandidates(prompt, intent, candidates)
+    const localFallback = locallyRanked
+      .filter(s => s.hasApplicabilitySignal && s.localScore >= EXPERIENCE_STRONG_APPLICABILITY_SCORE)
+      .slice(0, EXPERIENCE_INJECTION_LIMIT)
+
     if (!this._flashClient) {
-      return candidates
-        .filter(e => e.confidenceTier !== 'hypothesis')
-        .slice(0, 4)
+      return localFallback
     }
 
     const raw = await this._flashClient.query({
@@ -1045,18 +1111,94 @@ export class RoboticsSession {
         .digest('hex')}`,
     })
 
-    if (!raw) return []
+    if (!raw) return localFallback
     const ids = parseApplicableExperienceIds(raw, candidates)
-    return candidates.filter(c => ids.has(c.id)).slice(0, 6)
+    if (ids.size === 0) return localFallback
+
+    const byId = new Map(locallyRanked.map(s => [s.experience.id, s]))
+    return [...ids]
+      .map(id => byId.get(id))
+      .filter((s): s is SelectedExperience => Boolean(s))
+      .slice(0, EXPERIENCE_INJECTION_LIMIT)
   }
 
-  private _refreshExperienceSlots(experiences: ExperienceMatch[]): void {
-    for (const e of experiences) {
+  private _rankExperienceCandidates(
+    prompt: string,
+    intent: QueryIntent,
+    candidates: ExperienceMatch[],
+  ): SelectedExperience[] {
+    const queryText = [
+      prompt,
+      ...intent.searchKeywords,
+      ...intent.domains,
+      this.robot ?? '',
+    ].join(' ').toLowerCase()
+    const domainSet = new Set<string>(intent.domains.filter(d => d !== 'general'))
+    const keywords = intent.searchKeywords
+      .map(normalizeExperienceKeyword)
+      .filter((kw): kw is string => Boolean(kw))
+
+    return candidates.map(experience => {
+      const searchable = [
+        experience.title,
+        experience.abstractPrinciple,
+        experience.failureReason ?? '',
+        experience.workarounds?.join(' ') ?? '',
+        experience.algorithm ?? '',
+        experience.robot ?? '',
+      ].join(' ').toLowerCase()
+
+      const matchingKeywords = keywords.filter(kw => searchable.includes(kw)).slice(0, 3)
+      const sameDomain = domainSet.has(experience.domain)
+      const sameRobot = Boolean(this.robot && experience.robot?.toLowerCase() === this.robot.toLowerCase())
+      const sameAlgorithm = Boolean(experience.algorithm && queryText.includes(experience.algorithm.toLowerCase()))
+      const hardwareMechanism = intent.hasHardware || intent.domains.includes('hardware_interface') || intent.domains.includes('deployment')
+        ? /\b(torque|force|velocity|joint|motor|actuator|sensor|limit|thermal|driver|can|gpio|gripper)\b/i.test(searchable)
+        : false
+
+      const confidence = experience.confidenceTier ?? 'observed'
+      const confidenceScore = confidence === 'reproduced' ? 90 :
+        confidence === 'observed' ? 70 :
+        confidence === 'derived' ? 60 :
+        confidence === 'reported' ? 30 :
+        confidence === 'hypothesis' ? -40 : 40
+      const evidenceBoost = experience.evidenceRefs?.length ? 30 : 0
+      const contradictionPenalty = Math.max(0, experience.contradictionCount ?? 0) * 45
+      const observationBoost = Math.min(Math.max(1, experience.observationCount ?? 1), 5) * 8
+
+      const applicabilityScore =
+        (sameDomain ? 120 : 0) +
+        (sameRobot ? 100 : 0) +
+        (sameAlgorithm ? 110 : 0) +
+        matchingKeywords.length * 55 +
+        (hardwareMechanism ? 75 : 0)
+
+      const reasons: string[] = []
+      if (sameDomain) reasons.push(`same ${experience.domain} domain`)
+      if (sameRobot) reasons.push(`same robot platform (${this.robot})`)
+      if (sameAlgorithm && experience.algorithm) reasons.push(`same algorithm (${experience.algorithm})`)
+      if (hardwareMechanism) reasons.push('same hardware constraint')
+      if (matchingKeywords.length > 0) reasons.push(`matching task terms (${matchingKeywords.join(', ')})`)
+      const hasApplicabilitySignal = reasons.length > 0
+
+      return {
+        experience,
+        appliesBecause: reasons.slice(0, 2).join('; ') || 'flash judged the stored principle applicable',
+        localScore: applicabilityScore + confidenceScore + evidenceBoost + observationBoost - contradictionPenalty,
+        hasApplicabilitySignal,
+      }
+    }).sort((a, b) => b.localScore - a.localScore)
+  }
+
+  private _refreshExperienceSlots(selections: SelectedExperience[]): void {
+    for (const selection of selections) {
+      const e = selection.experience
       const icon = e.outcome === 'success' ? '✓' : '⚠️'
       const lines = [
         `### ${icon} Past Experience: ${e.title}`,
         `**Domain:** ${e.domain}  **Outcome:** ${e.outcome}`,
         `**Confidence:** ${e.confidenceTier ?? 'observed'}${e.observationCount ? ` (${e.observationCount} observation${e.observationCount === 1 ? '' : 's'})` : ''}`,
+        `**Applies because:** ${selection.appliesBecause}`,
         `**Principle:** ${e.abstractPrinciple}`,
         ...(e.failureReason ? [`**Failure detail:** ${e.failureReason}`] : []),
         ...(e.workarounds?.length ? [`**Workarounds:** ${e.workarounds.join(' / ')}`] : []),
@@ -1072,6 +1214,10 @@ export class RoboticsSession {
         source:   'experience',
       })
     }
+  }
+
+  private _experienceQueryHash(prompt: string): string {
+    return createHash('sha256').update(prompt.slice(0, 800)).digest('hex').slice(0, 12)
   }
 
   async teamInit(github?: string) {

@@ -72,6 +72,16 @@ export interface MetaAgentCompactStartEvent {
   sessionId: string
 }
 
+/** Conversation compaction failed but the session continued. */
+export interface MetaAgentCompactFailedEvent {
+  type: 'compact_failed'
+  attempt: number
+  querySource?: string
+  error: string
+  consecutiveFailures: number
+  sessionId: string
+}
+
 /** Retry notification when API returns a retryable error */
 export interface MetaAgentRetryEvent {
   type: 'api_retry'
@@ -90,6 +100,7 @@ export type MetaAgentEvent =
   | MetaAgentStreamEvent
   | MetaAgentRetryEvent
   | MetaAgentCompactStartEvent
+  | MetaAgentCompactFailedEvent
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool interface — every capability registered in the ToolRegistry implements this

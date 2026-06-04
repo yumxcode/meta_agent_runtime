@@ -28,6 +28,7 @@ export interface CompactionResult {
 export function buildPostCompactMessages(
   rawSummary: string,
   fileCache: FileStateCache,
+  messagesToKeep: readonly KernelMessage[] = [],
 ): CompactionResult {
   // 1. Boundary marker
   const boundaryMarker = makeCompactBoundaryMessage()
@@ -65,6 +66,7 @@ export function buildPostCompactMessages(
   const postCompactMessages: KernelMessage[] = [
     boundaryMarker,
     summaryMessage,
+    ...messagesToKeep,
     ...(fileReminder ? [fileReminder] : []),
   ]
 

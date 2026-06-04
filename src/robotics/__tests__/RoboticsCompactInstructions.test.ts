@@ -101,6 +101,26 @@ describe('buildRoboticsCompactInstructions', () => {
     expect(result).toContain('Emergency stop')
   })
 
+  it('includes current experience working set with applicability reasons', () => {
+    const result = buildRoboticsCompactInstructions({
+      state: null,
+      experienceWorkingSet: [
+        {
+          id: 'exp_mabc_1234abcd',
+          title: 'Go2 MPC torque saturation',
+          appliesBecause: 'same robot platform (go2); same algorithm (MPC)',
+          principle: 'Torque saturation often comes from gain and actuator limit mismatch.',
+        },
+      ],
+    })
+
+    expect(result).not.toBeNull()
+    expect(result).toContain('Current Experience Working Set')
+    expect(result).toContain('exp_mabc_1234abcd')
+    expect(result).toContain('same robot platform (go2); same algorithm (MPC)')
+    expect(result).toContain('Torque saturation often comes from gain')
+  })
+
   it('truncates hardware summary to 400 chars to avoid bloating compact', () => {
     const longSummary = 'Z'.repeat(600)   // use Z — no collision with other result text
     const result = buildRoboticsCompactInstructions({

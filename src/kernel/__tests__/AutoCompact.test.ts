@@ -232,6 +232,12 @@ describe('autoCompactIfNeeded — failure path', () => {
     )
     expect(result.wasCompacted).toBe(false)
     expect(result.tracking.consecutiveFailures).toBe(1)
+    expect(result.failure).toMatchObject({
+      attempt: 1,
+      querySource: 'main',
+      error: 'API error',
+      consecutiveFailures: 1,
+    })
   })
 
   it('accumulates consecutiveFailures across multiple failures', async () => {

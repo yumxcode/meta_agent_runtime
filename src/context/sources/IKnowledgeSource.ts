@@ -41,6 +41,10 @@ export interface ExperienceMatch {
   confidenceTier?: string
   /** Supporting references such as logs, commits, reports, papers, or datasheets. */
   evidenceRefs?: string[]
+  /** Algorithm or method name, when the entry is algorithm-specific. */
+  algorithm?: string
+  /** Robot platform or project name, when the entry is platform-specific. */
+  robot?: string
   /** Number of independent observations supporting the lesson. */
   observationCount?: number
   /** Number of later observations that contradicted the lesson. */
@@ -62,6 +66,10 @@ export interface ExperienceListOpts {
    * before LLM applicability judgment; not treated as a hard AND filter.
    */
   keywords?: string[]
+  /** Prefer experiences from this robot/platform when available. */
+  robot?: string
+  /** Current user/task text, used only for ranking hints such as algorithm match. */
+  currentQuery?: string
   /** Maximum entries to return. Default: 12 */
   limit?: number
 }

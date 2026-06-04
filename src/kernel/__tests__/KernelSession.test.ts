@@ -401,16 +401,21 @@ describe('KernelSession — compact integration', () => {
       if (calls === 1) throw new PromptTooLongError()
       yield* textStream('recovered')
     })
-    mockCompact.mockResolvedValue({
-      postCompactMessages: compactedMessages(),
+    mockCompact.mockImplementation(async (_messages, _fileCache, options) => ({
+      postCompactMessages: [
+        ...compactedMessages(),
+        ...((options?.messagesToKeep ?? []) as ReturnType<typeof compactedMessages>),
+      ],
       summaryTokenEstimate: 77,
-    })
+    }))
 
     const session = new KernelSession(makeConfig({ compact: { enabled: true } }))
-    const events = await collectEvents(session, 'large prompt')
+    const events = await collectEvents(session, 'large prompt with exact constraints')
 
     expect(mockCompact).toHaveBeenCalledOnce()
     expect(mockStream).toHaveBeenCalledTimes(2)
+    const retryMessages = mockStream.mock.calls[1]?.[0]?.messages ?? []
+    expect(JSON.stringify(retryMessages)).toContain('large prompt with exact constraints')
     const boundary = events.find(e => e.type === 'compact_boundary')
     expect(boundary?.compactMetadata.summaryTokens).toBe(77)
     const result = events.find(e => e.type === 'result')
@@ -427,6 +432,10 @@ describe('KernelSession — compact integration', () => {
 
     for (let i = 0; i < 4; i++) {
       const events = await collectEvents(session, `large prompt ${i}`)
+      if (i < 3) {
+        const failed = events.find(e => e.type === 'compact_failed')
+        expect(failed?.error).toContain('compact failed')
+      }
       const result = events.find(e => e.type === 'result')
       expect(result?.subtype).toBe('error_blocking_limit')
     }

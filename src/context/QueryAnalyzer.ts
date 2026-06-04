@@ -8,7 +8,7 @@
  *   - Keywords to pre-fetch failure records from ExperienceStore
  *   - Broad intent classification (debug / deploy / experiment / etc.)
  *
- * Uses a FlashModel side-call (3 s timeout) for semantic understanding.
+ * Uses a FlashModel side-call (2 min timeout) for semantic understanding.
  * Falls back to heuristic keyword analysis on timeout/failure.
  *
  * Results are cached by query content hash, so identical follow-up prompts
@@ -61,6 +61,8 @@ Field rules:
 - riskLevel: "high" if hasHardware=true OR query mentions joint motion, velocity/torque/force commands, gripper, power on/off; "medium" if experiment with unknown outcome; "low" otherwise.
 - searchKeywords: 3-6 specific technical terms (algorithm names, component names, error types). NOT generic words like "robot", "test", "run", "check".
 - intent: "debug" = diagnosing existing issue; "deploy" = running on real hardware; "experiment" = running new sim or algorithm test; "calibrate" = tuning parameters; "query" = asking a question; "plan" = planning future steps.`
+
+const QUERY_ANALYSIS_TIMEOUT_MS = 120_000
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Heuristic fallback
@@ -194,7 +196,7 @@ export class QueryAnalyzer {
       system: ANALYSIS_SYSTEM,
       user: trimmed.slice(0, 800),
       maxTokens: 250,
-      timeoutMs: 3_000,
+      timeoutMs: QUERY_ANALYSIS_TIMEOUT_MS,
       cacheKey,
     })
 

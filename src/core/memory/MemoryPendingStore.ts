@@ -109,12 +109,13 @@ export class MemoryPendingStore {
   /**
    * Commit one pending entry to the global memory directory.
    * On success the entry is removed from the queue.
+   * Pass `overwrite: true` to replace an existing same-named memory.
    */
-  async commit(pendingId: string, memoryDir: string = MEMORY_DIR): Promise<CommitMemoryResult> {
+  async commit(pendingId: string, memoryDir: string = MEMORY_DIR, overwrite?: boolean): Promise<CommitMemoryResult> {
     const entry = this._pending.find(p => p.pendingId === pendingId)
     if (!entry) return { ok: false, reason: 'error', detail: 'pending entry not found' }
 
-    const result = await commitMemoryProposal(entry.proposal, memoryDir)
+    const result = await commitMemoryProposal(entry.proposal, memoryDir, undefined, overwrite)
     if (result.ok) this.remove(pendingId)
     return result
   }

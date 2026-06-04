@@ -55,6 +55,15 @@ export interface CompactBoundaryEvent {
   sessionId: string
 }
 
+export interface CompactFailedEvent {
+  type: 'compact_failed'
+  attempt: number
+  querySource?: string
+  error: string
+  consecutiveFailures: number
+  sessionId: string
+}
+
 export interface ApiRetryEvent {
   type: 'api_retry'
   attempt: number
@@ -116,6 +125,7 @@ export type KernelEvent =
   | ToolResultEvent
   | CompactStartEvent
   | CompactBoundaryEvent
+  | CompactFailedEvent
   | ApiRetryEvent
   | ToolUseSummaryEvent
   | SystemMessageEvent

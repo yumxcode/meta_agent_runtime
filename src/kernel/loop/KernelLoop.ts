@@ -50,6 +50,9 @@ import { getModelProtocol } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 
+const VOLATILE_CONTEXT_PREFIX_START = '<context>\n'
+const VOLATILE_CONTEXT_PREFIX_END = '\n</context>\n\n---\n\n'
+
 // ── Return type ───────────────────────────────────────────────────────────────
 
 export type LoopTerminationReason =
@@ -96,6 +99,44 @@ export interface KernelLoopContext {
    * wired or queued.
    */
   drainSteering?: () => string[]
+}
+
+function stripVolatileContextPrefix(text: string): string {
+  if (!text.startsWith(VOLATILE_CONTEXT_PREFIX_START)) return text
+  const end = text.lastIndexOf(VOLATILE_CONTEXT_PREFIX_END)
+  if (end < 0) return text
+  return text.slice(end + VOLATILE_CONTEXT_PREFIX_END.length)
+}
+
+function isRealUserMessage(message: KernelMessage): boolean {
+  return message.role === 'user' &&
+    !message.isMeta &&
+    !message.isCompactSummary &&
+    !message.isCompactBoundary &&
+    !message.sourceToolAssistantUUID
+}
+
+function cloneLastRealUserTextMessage(messages: readonly KernelMessage[]): KernelMessage[] {
+  const message = [...messages].reverse().find(isRealUserMessage)
+  if (!message) return []
+
+  const textBlocks = message.content
+    .filter((block): block is ContentBlock & { type: 'text'; text: string } =>
+      block.type === 'text' && typeof (block as { text?: unknown }).text === 'string',
+    )
+    .map(block => ({
+      ...block,
+      text: stripVolatileContextPrefix(block.text),
+    }))
+    .filter(block => block.text.trim().length > 0)
+
+  if (textBlocks.length === 0) return []
+
+  return [{
+    uuid: crypto.randomUUID(),
+    role: 'user',
+    content: textBlocks,
+  }]
 }
 
 /**
@@ -256,6 +297,7 @@ export async function* runKernelLoop(
     // identically and there's one canonical place to change the join rule.
     const effectiveSystemPrompt =
       assembleSystemPrompt(config.systemPrompt, config.appendSystemPrompt) ?? ''
+    const messagesToKeepAfterCompact = cloneLastRealUserTextMessage(messagesForQuery)
 
     // Surface a "compacting…" indicator before the slow LLM-backed summarization
     // begins. We probe the same gates autoCompactIfNeeded uses so the event only
@@ -296,12 +338,23 @@ export async function* runKernelLoop(
             baseURL: config.baseURL,
             systemPrompt: effectiveSystemPrompt,
             customInstructions: config.compact?.customInstructions,
+            messagesToKeep: messagesToKeepAfterCompact,
             abortSignal: signal,
             maxRetries: config.maxRetries,
           },
         )
 
     state = { ...state, autoCompactTracking: compactResult.tracking }
+    if (compactResult.failure) {
+      yield {
+        type: 'compact_failed',
+        attempt: compactResult.failure.attempt,
+        querySource: compactResult.failure.querySource,
+        error: compactResult.failure.error,
+        consecutiveFailures: compactResult.failure.consecutiveFailures,
+        sessionId,
+      }
+    }
 
     let currentMessagesForQuery: KernelMessage[]
 
@@ -512,6 +565,7 @@ export async function* runKernelLoop(
               baseURL: config.baseURL,
               systemPrompt: effectiveSystemPrompt,
               customInstructions: config.compact?.customInstructions,
+              messagesToKeep: cloneLastRealUserTextMessage(currentMessagesForQuery),
               abortSignal: signal,
               maxRetries: config.maxRetries,
             },
@@ -521,6 +575,16 @@ export async function* runKernelLoop(
             ...state,
             autoCompactTracking: reactiveCompactResult.tracking,
             hasAttemptedReactiveCompact: true,
+          }
+          if (reactiveCompactResult.failure) {
+            yield {
+              type: 'compact_failed',
+              attempt: reactiveCompactResult.failure.attempt,
+              querySource: reactiveCompactResult.failure.querySource,
+              error: reactiveCompactResult.failure.error,
+              consecutiveFailures: reactiveCompactResult.failure.consecutiveFailures,
+              sessionId,
+            }
           }
           if (reactiveCompactResult.wasCompacted && reactiveCompactResult.postCompactMessages) {
             mutableMessages.splice(0, mutableMessages.length, ...reactiveCompactResult.postCompactMessages)

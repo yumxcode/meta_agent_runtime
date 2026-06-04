@@ -243,6 +243,84 @@ describe('ExperienceSource — confidence metadata', () => {
 
     expect(results[0].title).toBe('Older reproduced lesson')
   })
+
+  it('prioritizes same robot and same algorithm when ranking candidates', async () => {
+    const dir = await tempDir()
+    const store = new ExperienceStore(dir)
+    await store.write({
+      domain: 'locomotion',
+      title: 'Generic newer controller lesson',
+      tags: [],
+      difficulty: 'medium',
+      problem: 'Problem',
+      solution: 'Solution',
+      outcome: { success: true, summary: 'Generic controller tuning worked.' },
+      confidenceTier: 'observed',
+    })
+    await new Promise(r => setTimeout(r, 10))
+    await store.write({
+      domain: 'locomotion',
+      title: 'Go2 MPC torque saturation lesson',
+      tags: ['mpc'],
+      robot: 'go2',
+      algorithm: 'MPC',
+      difficulty: 'high',
+      problem: 'MPC torque commands saturated on Go2.',
+      solution: 'Clamp commands against measured actuator limits.',
+      outcome: { success: true, summary: 'MPC remained stable after clamping.' },
+      confidenceTier: 'observed',
+    })
+
+    const source = new ExperienceSource(store)
+    const results = await source.listExperiences({
+      domains: ['locomotion'],
+      robot: 'go2',
+      currentQuery: 'Tune the MPC controller on Go2',
+      limit: 2,
+    })
+
+    expect(results[0].title).toBe('Go2 MPC torque saturation lesson')
+    expect(results[0].algorithm).toBe('MPC')
+    expect(results[0].robot).toBe('go2')
+  })
+
+  it('prioritizes evidence-backed low-contradiction lessons over contradicted ones', async () => {
+    const dir = await tempDir()
+    const store = new ExperienceStore(dir)
+    await store.write({
+      domain: 'perception',
+      title: 'Contradicted lidar lesson',
+      tags: ['lidar'],
+      difficulty: 'medium',
+      problem: 'Problem',
+      solution: 'Solution',
+      outcome: { success: true, summary: 'Initially appeared to work.' },
+      confidenceTier: 'observed',
+      contradictionCount: 4,
+    })
+    await new Promise(r => setTimeout(r, 10))
+    await store.write({
+      domain: 'perception',
+      title: 'Evidence-backed lidar lesson',
+      tags: ['lidar'],
+      difficulty: 'medium',
+      problem: 'Lidar timestamps drifted under load.',
+      solution: 'Pin capture threads and verify monotonic timestamps.',
+      outcome: { success: true, summary: 'Timestamp check prevented drift.' },
+      confidenceTier: 'observed',
+      evidenceRefs: ['logs/lidar-timestamps.txt'],
+      contradictionCount: 0,
+    })
+
+    const source = new ExperienceSource(store)
+    const results = await source.listExperiences({
+      domains: ['perception'],
+      keywords: ['lidar'],
+      limit: 2,
+    })
+
+    expect(results[0].title).toBe('Evidence-backed lidar lesson')
+  })
 })
 
 // ─────────────────────────────────────────────────────────────────────────────

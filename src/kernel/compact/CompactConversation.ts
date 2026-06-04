@@ -27,6 +27,7 @@ import type { CompactionResult } from './PostCompact.js'
 const COMPACT_MAX_PTL_RETRIES = 3
 const COMPACT_MODEL_DEFAULT = 'deepseek-v4-flash'
 const COMPACT_MAX_TOKENS = 65_536
+const RECENT_USER_ANCHOR_COUNT = 6
 
 export interface CompactOptions {
   model?: string
@@ -41,6 +42,8 @@ export interface CompactOptions {
   thinkingConfig?: ThinkingConfig
   abortSignal?: AbortSignal
   maxRetries?: number
+  /** Messages that must remain visible after compact, outside the summary. */
+  messagesToKeep?: readonly KernelMessage[]
 }
 
 /**
@@ -86,12 +89,12 @@ export async function compactConversation(
       )
 
       const formatted = formatCompactSummary(summary)
-      return buildPostCompactMessages(formatted, fileCache)
+      return buildPostCompactMessages(formatted, fileCache, options.messagesToKeep)
     } catch (error: unknown) {
       if (isPromptTooLong(error) && messagesToSummarise.length > 2) {
-        // Drop the oldest 20% of messages and retry
-        const dropCount = Math.max(1, Math.floor(messagesToSummarise.length * 0.2))
-        messagesToSummarise = messagesToSummarise.slice(dropCount)
+        // Drop old non-anchor messages first. Keep durable anchors such as the
+        // first user request, compact summaries, and recent user messages.
+        messagesToSummarise = trimPromptTooLongMessages(messagesToSummarise)
         lastError = error
         continue
       }
@@ -103,6 +106,45 @@ export async function compactConversation(
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+function isRealUserMessage(message: KernelMessage): boolean {
+  return message.role === 'user' &&
+    !message.isMeta &&
+    !message.isCompactSummary &&
+    !message.isCompactBoundary &&
+    !message.sourceToolAssistantUUID
+}
+
+function selectAnchorMessageIds(messages: readonly KernelMessage[]): Set<string> {
+  const ids = new Set<string>()
+
+  const firstUser = messages.find(isRealUserMessage)
+  if (firstUser) ids.add(firstUser.uuid)
+
+  for (const message of messages) {
+    if (message.isCompactSummary) ids.add(message.uuid)
+  }
+
+  const recentUsers = messages
+    .filter(isRealUserMessage)
+    .slice(-RECENT_USER_ANCHOR_COUNT)
+  for (const message of recentUsers) ids.add(message.uuid)
+
+  return ids
+}
+
+function trimPromptTooLongMessages(messages: readonly KernelMessage[]): KernelMessage[] {
+  const anchors = selectAnchorMessageIds(messages)
+  const removable = messages.filter(message => !anchors.has(message.uuid))
+
+  if (removable.length === 0) {
+    return messages.slice(1)
+  }
+
+  const dropCount = Math.max(1, Math.floor(messages.length * 0.2))
+  const toDrop = new Set(removable.slice(0, dropCount).map(message => message.uuid))
+  return messages.filter(message => !toDrop.has(message.uuid))
+}
 
 async function callCompactModel(
   messages: KernelMessage[],

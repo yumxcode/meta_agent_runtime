@@ -11,12 +11,11 @@
  *   • Active sub-agent task IDs — required for get_sub_agent_status calls
  *   • Hardware safety limits — must not be silently lost after compaction
  *   • Current development phase — orientation anchor for long sessions
- *   • Any experience IDs referenced — avoid duplicate lookups next turn
+ *   • Current experience working set — preserve why selected experience applies
  *
- * Injected every turn as part of the volatile user-message prefix, just like the
- * campaign compact block.  The KernelSession auto-compact runs against whatever is
- * in the current context, so these instructions are always visible to the compact
- * agent when it fires.
+ * Resolved lazily through config.compact.customInstructions when KernelSession
+ * starts the compact side-call, so these instructions reflect the live robotics
+ * state at the exact compaction moment.
  *
  * Returns null when there is no state that warrants special preservation guidance
  * (e.g. a brand-new session with no tasks and no phase set).
@@ -32,6 +31,13 @@ export interface RoboticsCompactContext {
    * Optional — omitted for sessions without a hardware profile.
    */
   hardwareSummary?: string | null
+  /** Current injected/selected experience working set. */
+  experienceWorkingSet?: Array<{
+    id: string
+    title: string
+    appliesBecause: string
+    principle: string
+  }>
 }
 
 /**
@@ -73,6 +79,21 @@ export function buildRoboticsCompactInstructions(ctx: RoboticsCompactContext): s
     sections.push(
       '**Hardware Safety Constraints** — must not be dropped after compaction:',
       trimmed,
+    )
+  }
+
+  // ── Current experience working set ───────────────────────────────────────
+  const experienceWorkingSet = ctx.experienceWorkingSet ?? []
+  if (experienceWorkingSet.length > 0) {
+    const expLines = experienceWorkingSet.slice(0, 4).map(e => [
+      `  - exp_id: ${e.id}`,
+      `    title: ${e.title}`,
+      `    applies_because: ${e.appliesBecause}`,
+      `    principle: ${e.principle.slice(0, 220)}`,
+    ].join('\n'))
+    sections.push(
+      '**Current Experience Working Set** — preserve these IDs and applicability reasons so the resumed agent knows why they mattered:',
+      expLines.join('\n'),
     )
   }
 

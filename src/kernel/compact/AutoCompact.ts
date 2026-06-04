@@ -33,6 +33,13 @@ export interface AutoCompactResult {
   postCompactMessages?: KernelMessage[]
   /** Estimated token count of the compact summary */
   summaryTokenEstimate?: number
+  /** Present when a compact attempt ran and failed. */
+  failure?: {
+    attempt: number
+    querySource?: string
+    error: string
+    consecutiveFailures: number
+  }
   /** Updated tracking state */
   tracking: AutoCompactTrackingState
 }
@@ -131,10 +138,30 @@ export async function autoCompactIfNeeded(
     }
   } catch (_error: unknown) {
     // Compact failed — increment circuit breaker, continue without compacting
+    const consecutiveFailures = currentTracking.consecutiveFailures + 1
     const newTracking: AutoCompactTrackingState = {
       ...currentTracking,
-      consecutiveFailures: currentTracking.consecutiveFailures + 1,
+      consecutiveFailures,
     }
-    return { wasCompacted: false, tracking: newTracking }
+    return {
+      wasCompacted: false,
+      tracking: newTracking,
+      failure: {
+        attempt: consecutiveFailures,
+        querySource,
+        error: compactErrorSummary(_error),
+        consecutiveFailures,
+      },
+    }
+  }
+}
+
+function compactErrorSummary(error: unknown): string {
+  if (error instanceof Error) return error.message
+  if (typeof error === 'string') return error
+  try {
+    return JSON.stringify(error)
+  } catch {
+    return String(error)
   }
 }
