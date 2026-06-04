@@ -270,6 +270,8 @@ export {
   buildR3Section,
   buildR4Section,
   buildR5Section,
+  renderR4Snapshot,
+  renderR5Snapshot,
 } from './robotics/dynamicSections.js'
 export { makeExperienceId } from './robotics/types.js'
 export type {

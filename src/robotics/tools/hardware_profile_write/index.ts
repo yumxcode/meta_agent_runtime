@@ -56,7 +56,7 @@ export function createHardwareProfileWriteTool(profile: HardwareProfile): MetaAg
           notes: input['notes'] as string | undefined,
         })
         return {
-          content: `✅ Hardware profile saved for "${input['name']}". It will be loaded into R4 on next session turn.`,
+          content: `✅ Hardware profile saved for "${input['name']}". R4 shows a snapshot captured at session start; this profile will be loaded into R4 at the next session-start moment (new session / resume / compact).`,
           isError: false,
         }
       } catch (err) {

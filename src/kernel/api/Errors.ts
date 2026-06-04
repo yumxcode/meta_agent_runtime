@@ -19,6 +19,14 @@ export class FallbackTriggeredError extends Error {
   }
 }
 
+/** Thrown when a provider stays unavailable after retries and a fallback model may help. */
+export class AvailabilityFallbackTriggeredError extends FallbackTriggeredError {
+  constructor(message = 'Provider unavailable after retries') {
+    super(message)
+    this.name = 'AvailabilityFallbackTriggeredError'
+  }
+}
+
 /** Thrown when the request is aborted via AbortSignal */
 export class AbortError extends Error {
   constructor(message = 'Request aborted') {

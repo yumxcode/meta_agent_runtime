@@ -218,6 +218,8 @@ export function toKernelTool(
     },
 
     maxResultSizeChars: tool.maxResultSizeChars ?? getMaxResultSizeChars(),
+
+    timeoutMs: tool.timeoutMs,
   }
 }
 

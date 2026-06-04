@@ -116,4 +116,16 @@ export interface KernelTool {
    * Undefined / Infinity → no limit (e.g. sub-agent calls).
    */
   maxResultSizeChars?: number
+
+  /**
+   * Per-tool execution timeout in milliseconds.
+   *   - undefined  → use the kernel default (META_AGENT_TOOL_TIMEOUT_MS, 3 min).
+   *   - 0 / Infinity → no per-tool timeout. Use for tools that legitimately block
+   *     longer than the default — e.g. sub-agent-dispatch tools that await
+   *     completion (those are bounded by the sub-agent's own wall-clock cap).
+   * On timeout the kernel aborts the tool's abortSignal and returns an error
+   * tool_result. Because the default lives in the kernel, it applies inside
+   * sub-agent kernel loops too (the timeout mechanism propagates downward).
+   */
+  timeoutMs?: number
 }

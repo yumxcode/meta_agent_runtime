@@ -85,7 +85,7 @@ export interface RouterOptions {
    * (e.g. 'go2', 'franka_panda', 'f1').
    *
    * When set, RoboticsSession uses this name to load the hardware profile
-   * from `~/.claude/meta-agent/robotics/hardware_profiles/<name>.json` and
+   * from `~/.meta-agent/robotics/hardware_profiles/<name>.json` and
    * inject it into the R4 prompt section.
    *
    * Typically sourced from the CLI `--robot` flag or interactive hardware
@@ -104,6 +104,14 @@ export interface RouterOptions {
    * stale progress from earlier sessions.
    */
   explicitResume?: boolean
+
+  /**
+   * The specific robotics session id the user picked to resume (from the
+   * session picker or `--resume <id>`).  When set, RoboticsSession binds R5 /
+   * project state to THIS session via findBySession() rather than the most
+   * recently active session in the workspace.  Ignored unless explicitResume.
+   */
+  resumeSessionId?: string
 
   /**
    * Called when the flash classifier suggests escalating from single-agent to

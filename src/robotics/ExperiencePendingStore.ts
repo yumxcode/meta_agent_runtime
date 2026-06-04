@@ -18,12 +18,13 @@
 import { createHash } from 'crypto'
 import { readFile, rm } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson } from '../core/persist/index.js'
 import type { ExperienceStore } from './ExperienceStore.js'
 import { KNOWLEDGE_CONFIDENCE_TIERS, ROBOTICS_DOMAINS, type KnowledgeConfidenceTier, type RoboticsDomain } from './types.js'
 
-const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pending-experiences')
+const PENDING_ROOT = join(META_AGENT_HOME, 'robotics', 'pending-experiences')
 const MAX_PENDING_ENTRIES = 500
 
 // ── Types ─────────────────────────────────────────────────────────────────────

@@ -22,7 +22,7 @@ import type Anthropic from '@anthropic-ai/sdk'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
 import { MEMORY_TYPES, type MemoryType } from './types.js'
 import type { AgentMode } from '../dynamicPrompt.js'
-import { withTimeout } from '../utils/withTimeout.js'
+import { withAbortableTimeout } from '../utils/withTimeout.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types
@@ -295,7 +295,7 @@ async function selectByFlashModel(
     // 3 s timeout: this is a pre-turn side-call; a hung flash model request would
     // stall every submit() for up to 600 s (SDK default).  On timeout the
     // catch block falls through to keyword-based selection (Fix #5).
-    const msg = await withTimeout(
+    const msg = await withAbortableTimeout(signal =>
       client.messages.create({
         model: flashModel,
         max_tokens: 256,
@@ -304,7 +304,7 @@ async function selectByFlashModel(
           role: 'user',
           content: `Query: ${query}\n\nAvailable memory files:\n${manifest}`,
         }],
-      }),
+      }, { signal }),
       3_000,
     )
 

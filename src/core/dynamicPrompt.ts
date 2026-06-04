@@ -1027,8 +1027,8 @@ export interface VolatileContextOptions {
    * Examples for robotics mode:
    *   buildR2Section(store)               — experience_index
    *   buildR3Section(bridge, git, state)  — subagent_tasks
-   *   buildR5Section(state, resumedAt)    — progress_notes
    *   buildTeamSection(store, watcher)    — team_status
+   * (R5 progress_notes is now a STABLE snapshot section — see RoboticsSession.)
    */
   volatileExtensions?: SystemPromptSection[]
   /** RuntimeContext — required for D9 session_provenance in campaign mode. */
@@ -1087,6 +1087,7 @@ export function buildVolatileContextSections(opts: VolatileContextOptions): Syst
 const VOLATILE_SECTION_TAGS: Record<string, string> = {
   memory_content:         'memory',
   experience_index:       'experience_index',
+  physical_anchors:       'physical_anchors',
   robotics_subagents:     'subagent_status',
   robotics_progress:      'progress',
   robotics_team_mode:     'team_status',

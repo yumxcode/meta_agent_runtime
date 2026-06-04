@@ -1,7 +1,7 @@
 /**
  * Meta-Agent Memory — path constants
  *
- * Single global memory directory: ~/.claude/meta-agent/memory/
+ * Single global memory directory: ~/.meta-agent/memory/
  *
  * Memory is global and intentionally limited to user profile / feedback entries.
  * Engineering knowledge lives in ExperienceStore, provenance, project docs, or
@@ -9,10 +9,11 @@
  */
 
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../metaAgentHome.js'
 import { join, sep } from 'path'
 
 /** Root directory for all meta-agent memory files. Created on first use. */
-export const MEMORY_DIR: string = join(homedir(), '.claude', 'meta-agent', 'memory') + sep
+export const MEMORY_DIR: string = join(META_AGENT_HOME, 'memory') + sep
 
 /** Filename of the index file that is always loaded into the system prompt. */
 export const MEMORY_ENTRYPOINT_NAME = 'MEMORY.md'

@@ -17,7 +17,6 @@ import {
   type SystemPromptSection,
 } from '../core/systemPromptSections.js'
 import type { ExperienceStore } from './ExperienceStore.js'
-import type { HardwareProfile } from './HardwareProfile.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import type { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
@@ -65,8 +64,10 @@ Before forming any hypothesis about why something isn't working:
 The experience store (\`experience_search\` / \`experience_write\`) is for:
 ✅ Proven, reusable algorithmic knowledge (what worked, why, under what conditions)
 ✅ Post-mortem of completed experiments (root cause, fix, outcome metrics)
-❌ NOT a message bus between agents — do not write to it to pass data to yourself
+❌ NOT a scratchpad — don't write transient state or data you just computed; use files for that
 ❌ NOT a substitute for reading files — always read actual data first
+
+**When to search first:** at the start of a new task, run \`experience_search\` whenever you face a familiar-looking failure mode, a tuning / parameter problem, or a class of bug you may have solved before. Treat a hit as a starting hypothesis to verify against the actual data — not as a finished answer.
 
 Propose an experience entry **after you have solved the problem**, not before; it will wait for user review before becoming shared knowledge.
 A blank experience store means this is unexplored territory — proceed with direct analysis.
@@ -75,6 +76,7 @@ A blank experience store means this is unexplored territory — proceed with dir
 - Use \`principle_search\` when the task calls for transferable mechanisms, first-principles constraints, or explicit applicability boundaries
 - Use \`principle_promote\` only when the user explicitly asks to extract/promote/generalize a principle from an approved experience
 - Principles are reviewed abstractions; experiences remain concrete cases and physical anchors remain world facts
+- Do not bypass review by writing principles directly — promotion goes through human approval of the source experience
 
 ### Task Completion
 You are done only when you have delivered a complete answer to the user.
@@ -271,49 +273,81 @@ export function buildR3Section(
   )
 }
 
-// ── R4 — Hardware Profile ─────────────────────────────────────────────────────
+// ── R4 — Hardware Profile (snapshot, session-start injection) ────────────────
+//
+// Like R5, R4 is now rendered into a frozen SNAPSHOT string that is refreshed
+// only at session-start moments (create / resume / compact).  This keeps R4 in
+// the STABLE system prompt (cache-friendly) and minimizes system-prompt churn.
+//
+// Source of the underlying profile (two write paths, both persisted to the same
+// HardwareProfile JSON store):
+//   1. LLM tool call  — `hardware_profile_write` (the agent collects specs and
+//      persists them mid-session).
+//   2. User command   — `/hardware select` wizard (rebuilds the session, so the
+//      snapshot refreshes on the new session's init).
+//
+// Because a mid-session `hardware_profile_write` does NOT refresh the snapshot,
+// the rendered section carries a staleness disclaimer (see renderR4Snapshot).
 
-export function buildR4Section(hwProfile: HardwareProfile, robot?: string): SystemPromptSection {
-  return systemPromptSection('hardware_profile', async () => {
-    try {
-      const formatted = await hwProfile.formatForPrompt()
-      if (!formatted) {
-        if (robot) {
-          return [
-            `## Hardware Profile — Onboarding Required`,
-            ``,
-            `No hardware profile found for **${robot}**.`,
-            ``,
-            `⚠️ **Action required**: Before starting any algorithm work, you MUST collect hardware`,
-            `information from the user and call \`hardware_profile_write\` to persist it.`,
-            ``,
-            `Ask the user for the following (one message, all fields):`,
-            `- **platform**: hardware platform / robot model (e.g. "Unitree Go2", "Franka Panda FR3")`,
-            `- **compute**: onboard compute (e.g. "NVIDIA Jetson Orin NX 16GB")`,
-            `- **os** *(optional)*: operating system (e.g. "Ubuntu 22.04 + ROS 2 Humble")`,
-            `- **actuators** *(optional)*: joint/motor description`,
-            `- **sensors** *(optional)*: sensor suite (cameras, LiDAR, IMU, etc.)`,
-            `- **safety_limits**: key safety parameters (e.g. max joint velocity, max payload, emergency stop)`,
-            `- **known_issues** *(optional)*: any known hardware quirks or failure modes`,
-            `- **notes** *(optional)*: anything else relevant`,
-            ``,
-            `Once the user replies, call \`hardware_profile_write\` immediately to save the profile.`,
-            `The profile will be available in R4 from the next turn onwards.`,
-          ].join('\n')
-        }
-        return [
-          `## Hardware Profile`,
-          ``,
-          `No hardware profile is loaded. If you are working with a specific robot platform,`,
-          `ask the user for its hardware specs and call \`hardware_profile_write\` to record them.`,
-          `A profile ensures safe operation limits and platform-specific guidance are always visible.`,
-        ].join('\n')
-      }
-      return formatted
-    } catch {
-      return null
-    }
-  })
+export function buildR4Section(getSnapshot: () => string | null): SystemPromptSection {
+  return systemPromptSection('hardware_profile', () => getSnapshot())
+}
+
+/**
+ * Render the R4 hardware-profile snapshot body.
+ *
+ * Called by RoboticsSession at session-start moments (create / resume / compact)
+ * with the already-fetched `formatted` profile text (from
+ * HardwareProfile.formatForPrompt()); pass null/empty when no profile exists.
+ *
+ * When a profile is present the snapshot is prefixed with a disclaimer: it was
+ * captured at a session-start moment and may have been updated later this
+ * session via `hardware_profile_write` or `/hardware`.
+ */
+export function renderR4Snapshot(formatted: string | null, robot?: string): string | null {
+  // ── Profile present → disclaimer + profile content ────────────────────────
+  if (formatted && formatted.trim().length > 0) {
+    return [
+      '> 注：该硬件画像为过去稍早期画像（在快照时刻记录），当前会话过程中画像可能已更新。',
+      '> Note: this hardware profile is a snapshot captured at a session-start moment (create / resume / compact); it may have been updated later this session via `hardware_profile_write` or `/hardware`.',
+      '',
+      formatted,
+    ].join('\n')
+  }
+
+  // ── No profile, robot bound → onboarding ──────────────────────────────────
+  if (robot) {
+    return [
+      `## Hardware Profile — Onboarding Required`,
+      ``,
+      `No hardware profile found for **${robot}** at session start.`,
+      ``,
+      `⚠️ **Action required**: Before starting any algorithm work, you MUST collect hardware`,
+      `information from the user and call \`hardware_profile_write\` to persist it.`,
+      ``,
+      `Ask the user for the following (one message, all fields):`,
+      `- **platform**: hardware platform / robot model (e.g. "Unitree Go2", "Franka Panda FR3")`,
+      `- **compute**: onboard compute (e.g. "NVIDIA Jetson Orin NX 16GB")`,
+      `- **os** *(optional)*: operating system (e.g. "Ubuntu 22.04 + ROS 2 Humble")`,
+      `- **actuators** *(optional)*: joint/motor description`,
+      `- **sensors** *(optional)*: sensor suite (cameras, LiDAR, IMU, etc.)`,
+      `- **safety_limits**: key safety parameters (e.g. max joint velocity, max payload, emergency stop)`,
+      `- **known_issues** *(optional)*: any known hardware quirks or failure modes`,
+      `- **notes** *(optional)*: anything else relevant`,
+      ``,
+      `Once the user replies, call \`hardware_profile_write\` immediately to save the profile.`,
+      `> 注：该提示为快照时刻状态；若你已在本会话中写入画像，它将在下一个 session 启动 / resume / compact 时刻加载到 R4。`,
+    ].join('\n')
+  }
+
+  // ── No profile, no robot → hint ───────────────────────────────────────────
+  return [
+    `## Hardware Profile`,
+    ``,
+    `No hardware profile is loaded. If you are working with a specific robot platform,`,
+    `ask the user for its hardware specs and call \`hardware_profile_write\` to record them.`,
+    `A profile ensures safe operation limits and platform-specific guidance are always visible.`,
+  ].join('\n')
 }
 
 // ── R6 — Physical Anchors (progressive disclosure) ───────────────────────────
@@ -425,57 +459,83 @@ export function formatPhysicalAnchorSlot(anchor: Awaited<ReturnType<PhysicalAnch
   return lines.join('\n')
 }
 
-// ── R5 — Session Resume / Progress Notes ─────────────────────────────────────
+// ── R5 — Session Milestone Progress (snapshot, session-level) ────────────────
 //
-// Guard: only injected when there is actually something to show.
-//   - Resumed session (resumedAt !== null): always show — compaction may have
-//     replaced conversation history, so structured project state is the only
-//     anchor for what was done before.
-//   - Fresh session: only show when progress notes have accumulated (i.e. the
-//     model has called `progress_note` at least once).  Before that, R5 is null
-//     and adds no prompt weight.
+// R5 is now a SESSION-LEVEL milestone record, not a project-level one. It is
+// bound to a specific session (via findBySession in RoboticsSession) and is
+// rendered into a frozen SNAPSHOT string only at session-start moments:
+//   1. session just created,
+//   2. resuming into an old session,
+//   3. when compaction executes.
+//
+// This keeps R5 in the STABLE system prompt (cache-friendly) and minimizes how
+// often the system prompt changes — the snapshot is recomputed only at those
+// moments, never every turn.  Milestone *generation* is still LLM-driven via
+// the `progress_note` tool; only the INJECTION TIMING is fixed here.
+//
+// buildR5Section reads the pre-rendered snapshot via getSnapshot(); rendering
+// (including the staleness disclaimer) lives in renderR5Snapshot below.
 
 export function buildR5Section(
-  getState: () => RoboticsProjectState | null,
-  resumedAt: number | null,
+  getSnapshot: () => string | null,
 ): SystemPromptSection {
-  return DANGEROUS_uncachedSystemPromptSection(
-    'robotics_progress',
-    () => {
-      const state = getState()
-      if (!state) return null
+  return systemPromptSection('robotics_progress', () => getSnapshot())
+}
 
-      const hasNotes = state.progressNotes.length > 0
-      const isResumed = resumedAt !== null
+/**
+ * Render the R5 milestone snapshot body for the current session state.
+ *
+ * Called by RoboticsSession at session-start moments (create / resume / compact)
+ * to refresh the frozen snapshot string. Returns null when there is nothing
+ * meaningful to surface (fresh session, no notes, not resumed).
+ *
+ * The snapshot always carries a disclaimer: these milestones are PAST progress
+ * captured at the snapshot moment; actual progress during the current session
+ * may have advanced since.
+ */
+export function renderR5Snapshot(
+  state: RoboticsProjectState | null,
+  resumedAt: number | null,
+): string | null {
+  if (!state) return null
 
-      // Suppress entirely when there is nothing meaningful to surface
-      if (!isResumed && !hasNotes) return null
+  const hasNotes = state.progressNotes.length > 0
+  const isResumed = resumedAt !== null
 
-      const lines: string[] = []
+  // Suppress entirely when there is nothing meaningful to surface
+  if (!isResumed && !hasNotes) return null
 
-      // Session resume banner
-      if (isResumed) {
-        const ageMs = Date.now() - resumedAt
-        const ageDays = Math.round(ageMs / 86_400_000)
-        const ageHrs = Math.round(ageMs / 3_600_000)
-        const ageStr = ageDays >= 1 ? `${ageDays} day(s) ago` : `${ageHrs} hour(s) ago`
-        lines.push(`## Session Resumed`, `*Last active: ${ageStr}*`, '')
-      }
+  const lines: string[] = []
 
-      // Current phase (only meaningful alongside notes or resume)
-      if (state.currentPhase) {
-        lines.push(`**Current Phase**: ${state.currentPhase}`, '')
-      }
-
-      // Progress notes
-      if (hasNotes) {
-        lines.push('## Development Progress')
-        state.progressNotes.forEach(note => lines.push(`- ${note}`))
-        lines.push('')
-      }
-
-      return lines.join('\n').trimEnd() || null
-    },
-    'Progress notes append every turn; resumption context must stay current.',
+  lines.push('## Session Milestone Progress (Snapshot)')
+  lines.push(
+    '> 注：该里程碑节点为过去进度（在快照时刻记录），当前会话过程中进度可能已更新。',
   )
+  lines.push(
+    '> Note: these milestones are PAST progress captured at the snapshot moment; actual progress during the current session may have advanced.',
+  )
+  lines.push('')
+
+  // Session resume banner
+  if (isResumed) {
+    const ageMs = Date.now() - resumedAt
+    const ageDays = Math.round(ageMs / 86_400_000)
+    const ageHrs = Math.round(ageMs / 3_600_000)
+    const ageStr = ageDays >= 1 ? `${ageDays} day(s) ago` : `${ageHrs} hour(s) ago`
+    lines.push(`**Session Resumed** — last active: ${ageStr}`, '')
+  }
+
+  // Current phase
+  if (state.currentPhase) {
+    lines.push(`**Current Phase**: ${state.currentPhase}`, '')
+  }
+
+  // Progress notes
+  if (hasNotes) {
+    lines.push('## Development Progress')
+    state.progressNotes.forEach(note => lines.push(`- ${note}`))
+    lines.push('')
+  }
+
+  return lines.join('\n').trimEnd() || null
 }

@@ -14,7 +14,7 @@
 import { KernelSession } from '../kernel/index.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import type { MetaAgentConfig } from '../core/config.js'
-import { resolveConfig, detectProvider } from '../core/config.js'
+import { resolveConfig } from '../core/config.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
 import { MetaAgentContextStore } from '../campaign/index.js'
 import { buildCompactInstructions } from '../core/compact/compactPrompt.js'
@@ -56,7 +56,12 @@ export class CampaignSession {
   constructor(config: MetaAgentConfig) {
     this._config = config
     const resolved = resolveConfig(config)
-    const { apiKey, baseURL } = detectProvider(config)
+    const apiKey = resolved.apiKey
+    const baseURL = resolved.baseURL
+    const caps = resolved.capabilities
+    const thinkingConfig = resolved.protocol === 'anthropic' && !caps.anthropicThinkingParam
+      ? { type: 'disabled' as const }
+      : resolved.thinkingConfig
 
     this._engine = new KernelSession({
       apiKey,
@@ -92,11 +97,13 @@ export class CampaignSession {
       // Thinking on the primary model — honours resolved.thinkingConfig so
       // callers can opt out via `{ type: 'disabled' }`.  Defaults to adaptive,
       // matching the previous campaign-mode behaviour.
-      thinkingConfig: resolved.thinkingConfig,
+      thinkingConfig,
       querySource: 'main',
       debug: resolved.debugMode,
-      // token-efficient-tools reduces schema token overhead for multi-tool sessions
-      betas: ['token-efficient-tools-2025-02-19'],
+      // Anthropic-only betas (token-efficient-tools + interleaved-thinking).
+      // Gated by provider capability — GLM/Zhipu, DeepSeek, Qwen 400 on these.
+      includeDefaultBetas: caps.anthropicBetas ? undefined : false,
+      betas: caps.anthropicBetas ? ['token-efficient-tools-2025-02-19'] : [],
     })
 
     this._sessionId = this._engine.getSessionId()

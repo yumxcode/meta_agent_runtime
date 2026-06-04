@@ -11,7 +11,7 @@
  * Solution:
  *   After every tool call (via the `wrapMetaAgentTool` hook) we fire a
  *   fire-and-forget save of the current session state to a JSON file at
- *   ~/.claude/meta-agent/compact-state-<sessionId>.json.
+ *   ~/.meta-agent/compact-state-<sessionId>.json.
  *   When `_buildEnrichedSuffix()` rebuilds compact instructions it loads
  *   the snapshot and merges any provenance IDs that don't yet appear in
  *   the live tracker.  The snapshot is deleted on interrupt().
@@ -26,6 +26,7 @@ import { readFile, unlink, mkdir } from 'fs/promises'
 import { atomicWriteJson } from '../persist/index.js'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../metaAgentHome.js'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 
 import { MetaAgentContextStore, CampaignStateStore } from '../../campaign/index.js'
@@ -81,7 +82,7 @@ export type CompactStateSnapshot = {
 // Paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SNAPSHOT_DIR = join(homedir(), '.claude', 'meta-agent')
+const SNAPSHOT_DIR = join(META_AGENT_HOME)
 
 export function getSnapshotPath(sessionId: string): string {
   return join(SNAPSHOT_DIR, `compact-state-${sessionId}.json`)

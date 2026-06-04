@@ -1,0 +1,341 @@
+/**
+ * GenericCampaignStore<TPhase, TState>
+ *
+ * A reusable, file-backed ICampaignStore for any campaign type EXCEPT DOE
+ * (which keeps its own CampaignStateStore to avoid migration risk).
+ *
+ * On-disk layout:
+ *   ~/.claude/meta-agent/campaigns/<campaignId>/state.json
+ *
+ * Concurrency model:
+ *   Identical to CampaignStateStore — a per-instance promise chain (_lock)
+ *   serialises all mutations.  Reads are non-locking but re-read from disk
+ *   to stay consistent after external modifications.
+ *
+ * Atomic writes:
+ *   state.json is written to a .tmp file first, then renamed — same pattern
+ *   as CampaignStateStore to survive process crashes.
+ */
+
+import fs from 'node:fs/promises'
+import path from 'node:path'
+import os from 'node:os'
+
+import { atomicWriteJson } from '../core/persist/index.js'
+import type { ICampaignStore, GenericPersistedState } from './types.js'
+import { GENERIC_SCHEMA_VERSION } from './types.js'
+import { campaignRegistry } from './registry.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Constants
+// ─────────────────────────────────────────────────────────────────────────────
+
+const CAMPAIGNS_DIR = path.join(os.homedir(), '.claude', 'meta-agent', 'campaigns')
+const STATE_FILE    = 'state.json'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// GenericCampaignStore
+// ─────────────────────────────────────────────────────────────────────────────
+
+export class GenericCampaignStore<TPhase extends string, TState extends object>
+  implements ICampaignStore<TPhase, TState>
+{
+  readonly campaignId:   string
+  readonly projectName:  string
+
+  private readonly campaignDir: string
+  private readonly pluginType:  string
+
+  /** Serialise all write operations — matches CampaignStateStore pattern */
+  private _lock: Promise<void> = Promise.resolve()
+
+  private constructor(
+    campaignId:  string,
+    projectName: string,
+    pluginType:  string,
+  ) {
+    this.campaignId  = campaignId
+    this.projectName = projectName
+    this.pluginType  = pluginType
+    this.campaignDir = path.join(CAMPAIGNS_DIR, campaignId)
+  }
+
+  // ── Factory methods ─────────────────────────────────────────────────────────
+
+  /**
+   * Create a brand-new campaign on disk and return its store.
+   * Throws if a campaign with the same ID already exists.
+   */
+  static async create<TPhase extends string, TState extends object>(
+    campaignId:   string,
+    projectName:  string,
+    pluginType:   string,
+    pluginVersion: string,
+    initialState: TState,
+    initialPhase: TPhase,
+  ): Promise<GenericCampaignStore<TPhase, TState>> {
+    const store = new GenericCampaignStore<TPhase, TState>(campaignId, projectName, pluginType)
+    await fs.mkdir(store.campaignDir, { recursive: true })
+
+    const stateFile = path.join(store.campaignDir, STATE_FILE)
+    // Guard against accidental overwrite
+    try {
+      await fs.access(stateFile)
+      throw new Error(`Campaign "${campaignId}" already exists at ${stateFile}`)
+    } catch (err: unknown) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+    }
+
+    const persisted: GenericPersistedState<TPhase, TState> = {
+      schemaVersion:   GENERIC_SCHEMA_VERSION,
+      pluginType,
+      pluginVersion,
+      campaignId,
+      projectName,
+      phase:           initialPhase,
+      createdAt:       new Date().toISOString(),
+      updatedAt:       new Date().toISOString(),
+      businessState:   initialState,
+      pendingTaskIds:   [],
+      completedTaskIds: [],
+      failedTaskIds:    [],
+    }
+
+    await store._writeAtomic(persisted)
+    return store
+  }
+
+  /**
+   * Open an existing campaign from disk.
+   * Runs validateState() and migrateState() if the plugin version changed.
+   */
+  static async open<TPhase extends string, TState extends object>(
+    campaignId: string,
+  ): Promise<GenericCampaignStore<TPhase, TState>> {
+    const stateFile = path.join(CAMPAIGNS_DIR, campaignId, STATE_FILE)
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const raw = JSON.parse(await fs.readFile(stateFile, 'utf8')) as GenericPersistedState<TPhase, any>
+
+    const plugin = campaignRegistry.get(raw.pluginType)
+    let businessState: TState
+
+    if (raw.pluginVersion !== plugin.version) {
+      // Version mismatch — migration is required.
+      // P1-3: If the plugin has no migrateState() we must throw, not silently
+      // fall through to validateState() on the old-schema data.
+      if (!plugin.migrateState) {
+        throw new Error(
+          `[GenericCampaignStore] Plugin "${raw.pluginType}" v${plugin.version} has no migrateState() — ` +
+          `cannot load persisted state from v${raw.pluginVersion}. ` +
+          `Delete or manually migrate: ${stateFile}`,
+        )
+      }
+      businessState = plugin.migrateState(raw.businessState, raw.pluginVersion) as TState
+      // P1-3: Always validate AFTER migration — a buggy migration must fail loudly,
+      // not silently corrupt state on the next write.
+      if (!plugin.validateState(businessState)) {
+        throw new Error(
+          `[GenericCampaignStore] Campaign "${campaignId}" state failed validation after ` +
+          `migration from v${raw.pluginVersion} → v${plugin.version} (plugin: "${raw.pluginType}").`,
+        )
+      }
+    } else {
+      // Same version — validate as-is
+      if (!plugin.validateState(raw.businessState)) {
+        throw new Error(
+          `[GenericCampaignStore] Campaign "${campaignId}" has invalid state for plugin "${raw.pluginType}".`,
+        )
+      }
+      businessState = raw.businessState as TState
+    }
+
+    const store = new GenericCampaignStore<TPhase, TState>(
+      campaignId, raw.projectName, raw.pluginType,
+    )
+    // Eagerly cache in memory — _read() will reload from disk on next write
+    void businessState  // state is on disk; reads come from disk for consistency
+    return store
+  }
+
+  // ── ICampaignStore implementation ───────────────────────────────────────────
+
+  async getPhase(): Promise<TPhase> {
+    const s = await this._read()
+    return s.phase
+  }
+
+  async getState(): Promise<TState> {
+    const s = await this._read()
+    return s.businessState as TState
+  }
+
+  async updateState(patch: Partial<TState>): Promise<void> {
+    await this._withLock(async () => {
+      const s = await this._read()
+      s.businessState = { ...s.businessState as TState, ...patch } as TState
+      s.updatedAt = new Date().toISOString()
+      await this._writeAtomic(s)
+    })
+  }
+
+  async transitionPhase(to: TPhase): Promise<void> {
+    await this._withLock(async () => {
+      const s = await this._read()
+      const plugin = campaignRegistry.get(this.pluginType)
+      const allowed = plugin.phases.transitions[s.phase as TPhase] ?? []
+
+      if (!(allowed as readonly string[]).includes(to)) {
+        throw new Error(
+          `[GenericCampaignStore] Invalid transition ${s.phase} → ${to} ` +
+          `for campaign "${this.campaignId}" (plugin: ${this.pluginType}). ` +
+          `Allowed: [${(allowed as readonly string[]).join(', ')}]`,
+        )
+      }
+
+      // Fire onPhaseExit — errors are caught and logged
+      try {
+        const exitHook = plugin.onPhaseExit
+        if (exitHook) {
+          await exitHook.call(plugin, s.phase as TPhase, s.businessState as TState)
+        }
+      } catch (err) {
+        console.error(`[GenericCampaignStore] onPhaseExit(${s.phase}) threw:`, err)
+      }
+
+      s.phase     = to
+      s.updatedAt = new Date().toISOString()
+      await this._writeAtomic(s)
+
+      // Fire onPhaseEnter — errors are caught and logged
+      try {
+        const enterHook = plugin.onPhaseEnter
+        if (enterHook) {
+          await enterHook.call(plugin, to, s.businessState as TState)
+        }
+      } catch (err) {
+        console.error(`[GenericCampaignStore] onPhaseEnter(${to}) threw:`, err)
+      }
+    })
+  }
+
+  async markFailed(reason: string): Promise<void> {
+    await this._withLock(async () => {
+      const s = await this._read()
+      const plugin = campaignRegistry.get(this.pluginType)
+      const terminal = plugin.phases.terminal as readonly string[]
+
+      // Find a FAILED/BLOCKED terminal phase
+      const failPhase = (plugin.phases.terminal as readonly string[]).find(
+        p => p === 'FAILED' || p === 'BLOCKED',
+      ) as TPhase | undefined
+
+      if (!failPhase) {
+        throw new Error(
+          `[GenericCampaignStore] Plugin "${this.pluginType}" has no FAILED/BLOCKED terminal phase. ` +
+          `Terminal phases: [${terminal.join(', ')}]`,
+        )
+      }
+
+      s.phase           = failPhase
+      s.failureReason   = reason
+      s.updatedAt       = new Date().toISOString()
+      await this._writeAtomic(s)
+    })
+  }
+
+  // ── Sub-agent task tracking helpers ────────────────────────────────────────
+
+  async addPendingTask(taskId: string): Promise<void> {
+    await this._withLock(async () => {
+      const s = await this._read()
+      if (!s.pendingTaskIds.includes(taskId)) s.pendingTaskIds.push(taskId)
+      s.updatedAt = new Date().toISOString()
+      await this._writeAtomic(s)
+    })
+  }
+
+  async completeTask(taskId: string): Promise<void> {
+    await this._withLock(async () => {
+      const s    = await this._read()
+      s.pendingTaskIds   = s.pendingTaskIds.filter(id => id !== taskId)
+      if (!s.completedTaskIds.includes(taskId)) s.completedTaskIds.push(taskId)
+      s.updatedAt = new Date().toISOString()
+      await this._writeAtomic(s)
+    })
+  }
+
+  async failTask(taskId: string): Promise<void> {
+    await this._withLock(async () => {
+      const s    = await this._read()
+      s.pendingTaskIds  = s.pendingTaskIds.filter(id => id !== taskId)
+      if (!s.failedTaskIds.includes(taskId)) s.failedTaskIds.push(taskId)
+      s.updatedAt = new Date().toISOString()
+      await this._writeAtomic(s)
+    })
+  }
+
+  // ── Private helpers ─────────────────────────────────────────────────────────
+
+  private _withLock(fn: () => Promise<void>): Promise<void> {
+    this._lock = this._lock.then(fn, fn)
+    return this._lock
+  }
+
+  private async _read(): Promise<GenericPersistedState<TPhase, TState>> {
+    const stateFile = path.join(this.campaignDir, STATE_FILE)
+    const text = await fs.readFile(stateFile, 'utf8')
+    return JSON.parse(text) as GenericPersistedState<TPhase, TState>
+  }
+
+  private async _writeAtomic(state: GenericPersistedState<TPhase, TState>): Promise<void> {
+    const stateFile = path.join(this.campaignDir, STATE_FILE)
+    // M3: random-suffix tmp + rename via shared helper (no fixed-`.tmp` clash).
+    await atomicWriteJson(stateFile, state)
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Utility: list all generic campaigns (for monitoring / UI)
+// ─────────────────────────────────────────────────────────────────────────────
+
+export interface GenericCampaignSummary {
+  campaignId:  string
+  projectName: string
+  pluginType:  string
+  phase:       string
+  updatedAt:   string
+  failureReason?: string
+}
+
+/**
+ * Scan CAMPAIGNS_DIR and return a lightweight summary of every persisted
+ * generic campaign.  Skips directories that don't contain a valid state.json.
+ */
+export async function listGenericCampaigns(): Promise<GenericCampaignSummary[]> {
+  let entries: string[]
+  try {
+    entries = await fs.readdir(CAMPAIGNS_DIR)
+  } catch {
+    // Campaigns directory does not exist yet — return empty list.
+    return []
+  }
+
+  const results: GenericCampaignSummary[] = []
+  for (const entry of entries) {
+    const stateFile = path.join(CAMPAIGNS_DIR, entry, STATE_FILE)
+    try {
+      const raw = JSON.parse(await fs.readFile(stateFile, 'utf8')) as GenericPersistedState<string, object>
+      results.push({
+        campaignId:   raw.campaignId,
+        projectName:  raw.projectName,
+        pluginType:   raw.pluginType,
+        phase:        raw.phase,
+        updatedAt:    raw.updatedAt,
+        failureReason: raw.failureReason,
+      })
+    } catch {
+      // Not a valid generic campaign directory — skip
+    }
+  }
+  return results
+}

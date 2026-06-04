@@ -65,7 +65,7 @@ import { createRoboticsRuntimeContext } from './runtimeContext.js'
 import type { QueryAnalyzer, QueryIntent } from '../context/QueryAnalyzer.js'
 import type { ExperienceMatch } from '../context/sources/IKnowledgeSource.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
-import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, buildR6Section } from './dynamicSections.js'
+import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, buildR6Section, renderR4Snapshot, renderR5Snapshot } from './dynamicSections.js'
 import { buildRoboticsCompactInstructions } from './compactInstructions.js'
 import {
   buildDynamicSections,
@@ -76,6 +76,7 @@ import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { createSkillTool } from '../tools/system/skill/index.js'
+import { createMemoryWriteTool } from '../tools/system/memory_write/index.js'
 import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
 import { WorkflowLoader } from '../workflow/WorkflowLoader.js'
 import { WorkflowStateStore } from '../workflow/WorkflowStateStore.js'
@@ -203,6 +204,14 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
    * a fresh conversation in the same workspace.
    */
   explicitResume?: boolean
+  /**
+   * The specific stored session to bind to when resuming. When provided (and
+   * explicitResume is true), R5 / project state are loaded from THIS session's
+   * bucket via findBySession() rather than the most-recently-active session in
+   * the workspace (findLatestByProjectDir).  This makes R5 a session-level
+   * milestone record bound to the exact session the user picked.
+   */
+  resumeSessionId?: string
 }
 
 // ── RoboticsSession ───────────────────────────────────────────────────────────
@@ -228,6 +237,7 @@ export class RoboticsSession {
   private readonly teamWatcher: TeamWatcher
   private readonly projectDir: string
   private readonly robot: string | undefined
+  private readonly _domain: string | undefined
   private readonly _userAppendPrompt: string
   private readonly sectionRegistry = new SectionRegistry()
   /** Demand-paged knowledge context manager */
@@ -286,6 +296,41 @@ export class RoboticsSession {
   /** Whether the caller explicitly resumed this session (controls R5 visibility). */
   private readonly _explicitResume: boolean
 
+  /** Specific stored session to bind to on resume (session-level R5 binding). */
+  private readonly _resumeSessionId?: string
+
+  /**
+   * Frozen R5 milestone snapshot string (or null when nothing to show).
+   *
+   * Refreshed ONLY at session-start moments — init (create/resume) and on
+   * compaction — by _refreshR5Snapshot().  Because R5 now lives in the STABLE
+   * system prompt and reads from this snapshot, the system prompt changes only
+   * at those moments, never every turn.
+   */
+  private _r5Snapshot: string | null = null
+
+  /**
+   * Frozen R4 hardware-profile snapshot string (or null).
+   *
+   * Refreshed ONLY at session-start moments — init (create/resume) and on
+   * compaction — by _refreshR4Snapshot(), mirroring R5.  The underlying profile
+   * may be written mid-session via `hardware_profile_write` (LLM) or `/hardware`
+   * (user); those updates surface at the next session-start moment, and the
+   * rendered section carries a staleness disclaimer.
+   */
+  private _r4Snapshot: string | null = null
+
+  /**
+   * Cached raw hardware summary (the unrendered `hwProfile.formatForPrompt()`
+   * output), refreshed alongside _r4Snapshot at session-start moments.
+   *
+   * Used by the compact-instructions thunk (config.compact.customInstructions),
+   * which must run synchronously inside compactConversation() and therefore
+   * cannot await the profile. Refreshing it on the compact_start interception
+   * guarantees it is current at the moment compaction fires.
+   */
+  private _hwSummary: string | null = null
+
   /**
    * The sessionId used for all RoboticsProjectStore reads/writes.
    *
@@ -301,8 +346,10 @@ export class RoboticsSession {
     this.sessionId = randomUUID()
     this.robot = config.robot
     this.projectDir = config.projectDir ?? process.cwd()
+    this._domain = config.domain
     this._userAppendPrompt = config.appendSystemPrompt ?? ''
     this._explicitResume = config.explicitResume ?? false
+    this._resumeSessionId = config.resumeSessionId
     this._onEscalationRequest = config.onEscalationRequest
     this._modeOverride = config.agentMode === 'auto' || config.agentMode == null
       ? undefined
@@ -355,6 +402,13 @@ export class RoboticsSession {
       projectDir:     this.projectDir,
       agentMode:      undefined,
       runtimeContext: rtxResult.runtimeContext,     // ← wire VV pipeline (HardwareSafety + FailurePattern + OOM + Physics)
+      // Route robotics compact guidance to the compaction side-call as a lazy
+      // thunk. Resolved only when auto-compact fires (inside compactConversation),
+      // so it lands at the front of the compact prompt ahead of the conversation
+      // being summarised — instead of riding in the every-turn volatile prefix
+      // (where extractCompactInstructions never saw it and the compact agent was
+      // told to discard the <context> block anyway).
+      compact: { customInstructions: () => this._buildCompactInstructions() ?? undefined },
     } as MetaAgentConfig)
   }
 
@@ -376,15 +430,20 @@ export class RoboticsSession {
 
     // ── 1. Persistence: try to restore project state ─────────────────────
     //
-    // Resume path: findLatestByProjectDir() locates the most recently active
-    // session for this workspace.  _storeSessionId is set to that session's
-    // original UUID so all subsequent store writes go to the same bucket —
-    // progress notes accumulate there and are never mixed with other sessions.
+    // Resume path: when a specific resumeSessionId was supplied, bind to THAT
+    // session via findBySession() so R5 is a session-level milestone record for
+    // the exact session the user picked.  Otherwise fall back to the most
+    // recently active session in this workspace (findLatestByProjectDir).
+    // _storeSessionId is set to the resolved session's original UUID so all
+    // subsequent store writes go to the same bucket — progress notes accumulate
+    // there and are never mixed with other sessions.
     //
     // Fresh path: a brand-new state file is created under this.sessionId,
     // ensuring complete isolation from any prior sessions in this workspace.
     const existing = this._explicitResume
-      ? await RoboticsProjectStore.findLatestByProjectDir(this.projectDir)
+      ? (this._resumeSessionId
+          ? await RoboticsProjectStore.findBySession(this.projectDir, this._resumeSessionId)
+          : await RoboticsProjectStore.findLatestByProjectDir(this.projectDir))
       : null
 
     if (existing) {
@@ -509,6 +568,9 @@ export class RoboticsSession {
     // Skill tool — gives the robotics agent access to user-defined skills under
     // ~/.meta-agent/skills/robotics/ and <projectDir>/.meta-agent/skills/
     this.inner.registerTool(await createSkillTool(this.projectDir, 'robotics'))
+    // Memory write tool — allows the robotics agent to propose user/feedback memories.
+    // Queued for human review; never auto-committed.
+    this.inner.registerTool(await createMemoryWriteTool({ mode: 'robotics', domain: this._domain }))
 
     // ── 4. Register workflow tools (if workflow found) ────────────────────
     if (this._workflowDef) {
@@ -530,6 +592,12 @@ export class RoboticsSession {
     // ── 5. Dynamic sections (R1-R5 + W1) ─────────────────────────────────
     // Sections are built lazily on first submit() via _getRoboticsExtensions().
     // No warm-up needed here — resolveToString() caches on first call.
+    //
+    // R4 hardware-profile + R5 milestone snapshots: capture once now (covers
+    // both fresh-create and resume).  Both are refreshed again only when
+    // compaction executes.
+    this._refreshR5Snapshot()
+    await this._refreshR4Snapshot()
 
     // ── 6. Start heartbeat ────────────────────────────────────────────────
     // Periodically touch lastActiveAt so crash-recovery on next startup
@@ -560,6 +628,49 @@ export class RoboticsSession {
       resumed: Boolean(existing),
       sessionAgeMs: existing ? Date.now() - existing.lastActiveAt : undefined,
     }
+  }
+
+  /**
+   * Refresh the frozen R5 milestone snapshot from current project state.
+   *
+   * Invoked ONLY at session-start moments: init() (covers fresh-create and
+   * resume) and when compaction executes (intercepted in submit()).  The new
+   * value is picked up by the next submit()'s stable system-prompt assembly,
+   * keeping system-prompt churn to those moments only.
+   */
+  private _refreshR5Snapshot(): void {
+    this._r5Snapshot = renderR5Snapshot(this._state, this._resumedAt)
+  }
+
+  /**
+   * Refresh the frozen R4 hardware-profile snapshot from the persisted profile.
+   *
+   * Invoked ONLY at session-start moments: init() (create/resume) and on
+   * compaction (intercepted in submit()), mirroring _refreshR5Snapshot().  The
+   * profile text is fetched once here so buildR4Section() can read it
+   * synchronously from the stable system prompt.
+   */
+  private async _refreshR4Snapshot(): Promise<void> {
+    const formatted = await this.hwProfile.formatForPrompt().catch(() => null)
+    this._r4Snapshot = renderR4Snapshot(formatted, this.robot)
+    // Cache the raw summary for the synchronous compact-instructions thunk.
+    this._hwSummary = formatted
+  }
+
+  /**
+   * Build the robotics compact instructions synchronously from live state.
+   *
+   * Wired into the kernel via config.compact.customInstructions as a thunk, so
+   * it is evaluated only when auto-compact fires — not on every turn. Reads the
+   * live this._state and the cached raw hardware summary (_hwSummary, refreshed
+   * on the compact_start interception just before compaction runs). Returns null
+   * when there is nothing worth preserving.
+   */
+  private _buildCompactInstructions(): string | null {
+    return buildRoboticsCompactInstructions({
+      state: this._state,
+      hardwareSummary: this._hwSummary,
+    })
   }
 
   async proposePrincipleForExperience(
@@ -622,7 +733,7 @@ export class RoboticsSession {
       )
     }
 
-    this.bridge.destroy()
+    await this.bridge.dispose().catch(() => undefined)
 
     // Post-session physical anchor extraction (best-effort, ≤8 s).
     // Use the flash model to scan the conversation for stable physical/device
@@ -791,7 +902,17 @@ export class RoboticsSession {
       : prompt
 
     try {
-      yield* this.inner.submit(effectivePrompt)
+      for await (const ev of this.inner.submit(effectivePrompt)) {
+        // Compaction is a session-start moment for R4 + R5: refresh both
+        // snapshots so the post-compact system prompt reflects current state.
+        // The refreshed snapshots are applied on the next submit's stable prompt
+        // assembly (config is captured at submit time).
+        if (ev.type === 'compact_start') {
+          this._refreshR5Snapshot()
+          await this._refreshR4Snapshot()
+        }
+        yield ev
+      }
       // Touch persistence so lastActiveAt is current
       await RoboticsProjectStore.touch(this.projectDir, this._storeSessionId).catch(() => undefined)
     } finally {
@@ -1096,13 +1217,22 @@ export class RoboticsSession {
    *   W1  workflow_phase     — memoized, invalidated on workflow_advance
    *   R1  robotics_domain    — memoized, invalidated on mode classification (once)
    *   team section           — memoized, invalidated on team operations
-   *   R4  hardware_profile   — memoized, rarely changes
+   *   R4  hardware_profile   — hardware snapshot; refreshed only at
+   *                            session-start moments (create / resume / compact)
+   *   R5  progress_notes     — session milestone snapshot; refreshed only at
+   *                            session-start moments (create / resume / compact)
    */
   private _getStableRoboticsExtensions() {
     const sections = [
       buildR1Section(this.robot, () => this._agentMode),
       buildTeamSection(this.teamStore, this.teamWatcher),
-      buildR4Section(this.hwProfile, this.robot),
+      // R4 — hardware-profile snapshot. Stable: reads a frozen snapshot that
+      // only changes at session-start moments (create / resume / compact).
+      buildR4Section(() => this._r4Snapshot),
+      // R5 — session milestone snapshot. Stable: reads a frozen snapshot that
+      // only changes at session-start moments (create / resume / compact), so
+      // it does not invalidate the KV cache every turn.
+      buildR5Section(() => this._r5Snapshot),
     ]
 
     // W1 goes first when a workflow is loaded (it provides the most critical context)
@@ -1121,42 +1251,32 @@ export class RoboticsSession {
    * These sections change frequently (every turn or on tool calls) and must
    * stay out of the system message to avoid invalidating the DeepSeek KV cache.
    *
-   * Contents:
-   *   R2  experience_index        — recomputed each turn (disk read)
-   *   R3  subagent_tasks          — recomputed each turn (bridge + git query)
-   *   R5  progress_notes          — recomputed each turn (state read)
-   *   R6  physical_anchors        — recomputed each turn (device/physics facts)
-   *   R7  compact_instructions    — preserves task IDs + hardware constraints for compact agent
-   *   team_context_boundary       — fixed content once set, but must appear every turn
+   * Ordering is deliberate — sections are read top-to-bottom, so they progress
+   * from the most framing/constraining to the most volatile/operational, which
+   * reduces the model's tendency to anchor on transient state:
+   *   team_context_boundary  — task scope / what NOT to touch (conditional; frames everything)
+   *   R6  physical_anchors    — immutable world facts + safety constraints (foundational)
+   *   R2  experience_index    — prior knowledge to draw on (reference)
+   *   R3  subagent_status     — live sub-agent / git task state (most volatile, read last)
+   *
+   * R7 (compact instructions) is intentionally NOT here. It is routed to the
+   * compaction side-call via config.compact.customInstructions (see
+   * _buildCompactInstructions), so it reaches the compact agent at the front of
+   * the compact prompt instead of riding in the discarded <context> block.
    */
   private _getVolatileRoboticsExtensions() {
     const sections = [
-      buildR2Section(this.store, this.contextPager, this.experienceSource),
-      buildR3Section(this.bridge, this.gitMgr, () => this._state),
-      buildR5Section(() => this._state, this._resumedAt),
+      // R6 — physical anchors: immutable world facts + safety constraints.
       buildR6Section(this.physicalAnchors, undefined, undefined, this.robot, this.anchorSource, this.pendingPhysicalAnchors.count),
-      // R7 — compact instructions: tells the KernelSession auto-compact agent what
-      // robotics-specific state must survive context compaction (task IDs, hardware
-      // safety constraints, current phase).  Analogous to CampaignSession's
-      // buildCompactInstructions() block.
-      DANGEROUS_uncachedSystemPromptSection(
-        'robotics_compact_instructions',
-        async () => {
-          let hardwareSummary: string | null = null
-          try {
-            hardwareSummary = await this.hwProfile.formatForPrompt()
-          } catch { /* best-effort */ }
-          return buildRoboticsCompactInstructions({
-            state: this._state,
-            hardwareSummary,
-          })
-        },
-        'Active task IDs and hardware constraints must stay current for the compact agent.',
-      ),
+      // R2 — experience index: prior knowledge to draw on.
+      buildR2Section(this.store, this.contextPager, this.experienceSource),
+      // R3 — sub-agent task state: most volatile, read last.
+      // R5 moved to stable extensions (snapshot-based) — see _getStableRoboticsExtensions.
+      buildR3Section(this.bridge, this.gitMgr, () => this._state),
     ]
 
-    // Plan B: context boundary — prepend before other volatile sections so
-    // the model reads the task scope immediately after <context>.
+    // Context boundary — prepend before other volatile sections so the model
+    // reads the task scope immediately after <context>.
     if (this._teamContextBoundary) {
       const boundary = this._teamContextBoundary
       sections.unshift(DANGEROUS_uncachedSystemPromptSection(

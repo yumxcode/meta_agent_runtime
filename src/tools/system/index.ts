@@ -6,6 +6,7 @@ export { createEnterPlanModeTool } from './enter_plan_mode/index.js'
 export { createExitPlanModeTool } from './exit_plan_mode/index.js'
 export { createSkillTool } from './skill/index.js'
 export { createConfigTool } from './config/index.js'
+export { createMemoryWriteTool } from './memory_write/index.js'
 export { listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession } from './cronStore.js'
 export type { CronJob } from './cronStore.js'
 
@@ -19,6 +20,7 @@ import { createEnterPlanModeTool } from './enter_plan_mode/index.js'
 import { createExitPlanModeTool } from './exit_plan_mode/index.js'
 import { createSkillTool } from './skill/index.js'
 import { createConfigTool } from './config/index.js'
+import { createMemoryWriteTool } from './memory_write/index.js'
 
 export interface SystemToolsOptions {
   /**
@@ -38,6 +40,8 @@ export interface SystemToolsOptions {
    * object as session._planModeRef).
    */
   planModeRef?: { active: boolean }
+  /** Engineering domain configured for the session — attached to memory proposals. */
+  domain?: string
 }
 
 export async function createSystemTools(options: SystemToolsOptions = {}): Promise<MetaAgentTool[]> {
@@ -51,5 +55,6 @@ export async function createSystemTools(options: SystemToolsOptions = {}): Promi
     createExitPlanModeTool(planModeRef),
     createSkillTool(options.cwd, options.mode ?? 'agentic'),
     createConfigTool(options.cwd),
+    createMemoryWriteTool({ mode: options.mode ?? 'agentic', domain: options.domain }),
   ])
 }

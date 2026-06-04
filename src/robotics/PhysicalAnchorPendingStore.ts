@@ -1,6 +1,7 @@
 import { createHash } from 'crypto'
 import { readFile, rm } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson } from '../core/persist/index.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
@@ -13,7 +14,7 @@ import {
   type RoboticsDomain,
 } from './types.js'
 
-const PENDING_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'pending-physical-anchors')
+const PENDING_ROOT = join(META_AGENT_HOME, 'robotics', 'pending-physical-anchors')
 const MAX_PENDING_ENTRIES = 500
 
 export interface PendingPhysicalAnchor {

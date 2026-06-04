@@ -5,7 +5,7 @@
  * (which keeps its own CampaignStateStore to avoid migration risk).
  *
  * On-disk layout:
- *   ~/.claude/meta-agent/campaigns/<campaignId>/state.json
+ *   ~/.meta-agent/campaigns/<campaignId>/state.json
  *
  * Concurrency model:
  *   Identical to CampaignStateStore — a per-instance promise chain (_lock)
@@ -18,6 +18,7 @@
  */
 
 import fs from 'node:fs/promises'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import path from 'node:path'
 import os from 'node:os'
 
@@ -30,7 +31,7 @@ import { campaignRegistry } from './registry.js'
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const CAMPAIGNS_DIR = path.join(os.homedir(), '.claude', 'meta-agent', 'campaigns')
+const CAMPAIGNS_DIR = path.join(META_AGENT_HOME, 'campaigns')
 const STATE_FILE    = 'state.json'
 
 // ─────────────────────────────────────────────────────────────────────────────

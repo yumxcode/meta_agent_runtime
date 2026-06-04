@@ -1,7 +1,7 @@
 /**
  * MetaAgentContextStore — session-level context injection store.
  *
- * Storage: ~/.claude/meta-agent/session/active-context.metaagent
+ * Storage: ~/.meta-agent/session/active-context.metaagent
  *
  * This file is entirely separate from CLAUDE.md. It uses a dedicated
  * .metaagent extension to signal "runtime-managed state, do not edit manually".
@@ -17,13 +17,14 @@
 
 import { readFile, unlink } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson } from '../core/persist/index.js'
 import type { CampaignSummary, MetaAgentSessionContext } from './types.js'
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 
-export const SESSION_DIR = join(homedir(), '.claude', 'meta-agent', 'session')
+export const SESSION_DIR = join(META_AGENT_HOME, 'session')
 export const ACTIVE_CONTEXT_FILE = join(SESSION_DIR, 'active-context.metaagent')
 
 // ── MetaAgentContextStore ─────────────────────────────────────────────────────

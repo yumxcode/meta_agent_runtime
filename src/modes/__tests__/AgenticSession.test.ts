@@ -3,7 +3,8 @@ import { AgenticSession } from '../AgenticSession.js'
 import { MetaAgentSession } from '../../core/MetaAgentSession.js'
 import type { MetaAgentTool } from '../../core/types.js'
 
-vi.mock('../../kernel/api/AnthropicClient.js', () => ({
+vi.mock('../../kernel/api/AnthropicClient.js', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../../kernel/api/AnthropicClient.js')>()),
   streamMessages: vi.fn(),
 }))
 

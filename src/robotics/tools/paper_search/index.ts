@@ -47,6 +47,9 @@ export function createPaperSearchTool(
 ): MetaAgentTool {
   return {
     name: 'paper_search',
+    // Opt out of the kernel's per-tool timeout: this tool blocks while awaiting
+    // the PaperSearchAgent sub-agent, which is bounded by its own 5-min cap.
+    timeoutMs: 0,
     description:
       'Dispatch a PaperSearchAgent sub-agent to survey academic literature on a robotics topic. ' +
       'The agent searches arXiv and Semantic Scholar, synthesizes findings, and returns a structured summary. ' +
@@ -119,6 +122,7 @@ export function createPaperSearchTool(
         if (awaitCompletion) {
           let status = record.status
           while (!['completed', 'failed', 'cancelled'].includes(status)) {
+            if (ctx.abortSignal?.aborted) { status = 'cancelled'; break }
             await new Promise(r => setTimeout(r, 2_000))
             const latest = await bridge.getStatus(record.taskId)
             status = latest?.status ?? 'failed'

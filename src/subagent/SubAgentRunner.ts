@@ -97,11 +97,16 @@ function extractProgressState(
 export class SubAgentRunner {
   private readonly record:          SubAgentRecord
   private readonly toolRegistry:    Map<string, MetaAgentTool>
+  private readonly parentAbortSignal: AbortSignal
   private readonly abortSignal:     AbortSignal
   private readonly _abortController: AbortController
   private readonly _forwardAbort:    () => void
   private readonly _interruptSessionOnAbort: () => void
   private session?: MetaAgentSession
+  private _done: Promise<void> | undefined
+  private _cancelReason: string | undefined
+  /** Set when the wall-clock cap (maxDurationMs) fired — distinguishes timeout from user cancel. */
+  private _timedOut = false
 
   constructor(
     record: SubAgentRecord,
@@ -111,12 +116,20 @@ export class SubAgentRunner {
   ) {
     this.record          = { ...record }   // local copy — mutated as status progresses
     this.toolRegistry    = toolRegistry
-    this.abortSignal     = abortSignal
+    this.parentAbortSignal = abortSignal
     this._abortController = new AbortController()
+    this.abortSignal     = this._abortController.signal
     // Forward parent abort signal into our internal controller
-    this._forwardAbort = () => this._abortController.abort()
+    this._forwardAbort = () => {
+      this._cancelReason = 'cancelled'
+      this._abortController.abort('parent-abort')
+    }
     this._interruptSessionOnAbort = () => this.session?.interrupt()
-    abortSignal.addEventListener('abort', this._forwardAbort, { once: true })
+    if (abortSignal.aborted) {
+      this._forwardAbort()
+    } else {
+      abortSignal.addEventListener('abort', this._forwardAbort, { once: true })
+    }
   }
 
   // ── Public API ──────────────────────────────────────────────────────────────
@@ -133,8 +146,9 @@ export class SubAgentRunner {
    * permanently stuck in 'running' state.
    */
   start(): Promise<void> {
+    if (this._done) return this._done
     const startMs = Date.now()
-    return this._run().catch(async (err) => {
+    this._done = this._run().catch(async (err) => {
       // Inner _run() already writes terminal state for expected errors.
       // This outer handler catches unexpected throws from _run()'s own
       // error-handling code (e.g., writeTask() threw inside the catch block).
@@ -156,6 +170,12 @@ export class SubAgentRunner {
         console.error(`[SubAgentRunner:${this.taskId}] Failed to write terminal state after crash:`, writeErr)
       }
     })
+    return this._done
+  }
+
+  /** Resolves when the runner has reached terminal state and released resources. */
+  wait(): Promise<void> {
+    return this._done ?? Promise.resolve()
   }
 
   /**
@@ -163,8 +183,9 @@ export class SubAgentRunner {
    * Called by SubAgentBridge.destroy() to cancel in-flight sub-agents when
    * the parent session ends.
    */
-  abort(): void {
-    this._abortController.abort()
+  abort(reason = 'cancelled'): void {
+    this._cancelReason = reason
+    this._abortController.abort(reason)
     this.session?.interrupt()
   }
 
@@ -231,6 +252,19 @@ export class SubAgentRunner {
 
     this.session = new MetaAgentSession(sessionConfig)
 
+    // Wall-clock cap (default 5 min): force-stop a sub-agent that runs too long
+    // — e.g. an inner web_fetch that never returns. Interrupting the session
+    // ends the submit() generator; _timedOut steers terminal handling below.
+    const maxDurationMs = cfg.maxDurationMs ?? 300_000
+    const durationTimer = maxDurationMs > 0
+      ? setTimeout(() => {
+          this._timedOut = true
+          this._cancelReason = 'timeout'
+          this._abortController.abort('timeout')
+          this.session?.interrupt()
+        }, maxDurationMs)
+      : undefined
+
     try { // ← outer try: ensures sandboxHandle.destroy() always runs
     try {
       // Abort signal forwarding
@@ -238,7 +272,7 @@ export class SubAgentRunner {
         await this._writeTerminal('cancelled', {
           success:      false,
           summary:      'Cancelled before start',
-          error:        'cancelled',
+          error:        this._cancelReason ?? 'cancelled',
           turnsUsed:    0,
           inputTokens:  0,
           outputTokens: 0,
@@ -278,12 +312,14 @@ export class SubAgentRunner {
           inputTokens  = event.usage.inputTokens
           outputTokens = event.usage.outputTokens
 
-          // Abort may have fired mid-stream — honour it as cancelled
-          if (this.abortSignal.aborted) {
-            await this._writeTerminal('cancelled', {
+          // Abort may have fired mid-stream — timeout → failed, user cancel → cancelled
+          if (this._timedOut || this.abortSignal.aborted) {
+            await this._writeTerminal(this._timedOut ? 'failed' : 'cancelled', {
               success:      false,
               summary:      truncate(lastText, SUMMARY_MAX_CHARS),
-              error:        'cancelled',
+              error:        this._timedOut
+                ? `Sub-agent exceeded ${maxDurationMs}ms wall-clock limit`
+                : (this._cancelReason ?? 'cancelled'),
               turnsUsed,
               inputTokens,
               outputTokens,
@@ -318,11 +354,14 @@ export class SubAgentRunner {
         }
       }
 
-      // Generator exhausted without a 'result' event — should not happen
+      // Generator exhausted without a 'result' event — either the wall-clock
+      // cap interrupted the session, or (unexpectedly) the loop ended early.
       await this._writeTerminal('failed', {
         success:      false,
         summary:      truncate(lastText, SUMMARY_MAX_CHARS),
-        error:        'Session ended without a result event',
+        error:        this._timedOut
+          ? `Sub-agent exceeded ${maxDurationMs}ms wall-clock limit`
+          : 'Session ended without a result event',
         turnsUsed,
         inputTokens,
         outputTokens,
@@ -349,8 +388,10 @@ export class SubAgentRunner {
       })
     }
     } finally {
-      this.abortSignal.removeEventListener('abort', this._forwardAbort)
+      if (durationTimer) clearTimeout(durationTimer)
+      this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
+      await this.session?.dispose().catch(() => undefined)
       // Always release the sandbox handle, even if _writeTerminal or the loop
       // threw an unexpected error.  destroy() is a no-op for Noop/macOS handles
       // and is safe to call multiple times.

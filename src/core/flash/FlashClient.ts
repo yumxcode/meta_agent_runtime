@@ -19,7 +19,9 @@
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
 import { detectProvider } from '../config.js'
-import { withTimeout } from '../utils/withTimeout.js'
+import { getModelProtocol } from '../../providers/registry.js'
+import { buildAnthropicAuth } from '../../kernel/api/AnthropicClient.js'
+import { withAbortableTimeout } from '../utils/withTimeout.js'
 import type { MetaAgentConfig } from '../config.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -52,13 +54,14 @@ export class FlashClient {
   private static readonly MAX_CACHE_ENTRIES = 512
 
   constructor(config: Pick<MetaAgentConfig, 'apiKey' | 'baseURL' | 'model'>) {
-    const { provider, apiKey, baseURL, flashModel } = detectProvider(config)
+    const { apiKey, baseURL, flashModel } = detectProvider(config)
     this.model = flashModel
-    if (provider === 'deepseek' || flashModel.startsWith('deepseek-')) {
+    if (getModelProtocol(flashModel, baseURL) === 'openai') {
       this.anthropicClient = null
       this.openaiClient = new OpenAI({ apiKey, baseURL })
     } else {
-      this.anthropicClient = new Anthropic({ apiKey, baseURL })
+      // Anthropic path (incl. Bearer-auth compat endpoints like Zhipu GLM)
+      this.anthropicClient = new Anthropic({ ...buildAnthropicAuth(apiKey, baseURL), baseURL })
       this.openaiClient = null
     }
   }
@@ -86,26 +89,26 @@ export class FlashClient {
       let text: string | null = null
 
       if (this.openaiClient) {
-        const msg = await withTimeout(
-          this.openaiClient.chat.completions.create({
+        const msg = await withAbortableTimeout(signal =>
+          this.openaiClient!.chat.completions.create({
             model: this.model,
             max_tokens: opts.maxTokens,
             messages: [
               { role: 'system', content: opts.system },
               { role: 'user', content: opts.user },
             ],
-          }),
+          }, { signal }),
           opts.timeoutMs ?? 4_000,
         )
         text = msg.choices[0]?.message?.content?.trim() || null
       } else if (this.anthropicClient) {
-        const msg = await withTimeout(
-          this.anthropicClient.messages.create({
+        const msg = await withAbortableTimeout(signal =>
+          this.anthropicClient!.messages.create({
             model: this.model,
             max_tokens: opts.maxTokens,
             system: opts.system,
             messages: [{ role: 'user', content: opts.user }],
-          }),
+          }, { signal }),
           opts.timeoutMs ?? 4_000,
         )
 

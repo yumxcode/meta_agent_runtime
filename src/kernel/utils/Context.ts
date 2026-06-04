@@ -1,31 +1,10 @@
 /**
  * Context — model context window sizes and threshold calculations.
- * Mirrors CC's models.ts context window table and compactThreshold logic.
+ *
+ * Window sizes come from the Provider Registry (single source of truth).
+ * Threshold logic mirrors CC's autocompact.ts.
  */
-
-// ── Model context windows (from CC source) ───────────────────────────────────
-
-const MODEL_CONTEXT_WINDOWS: Record<string, number> = {
-  'claude-opus-4-6':              200_000,
-  'claude-sonnet-4-6':            200_000,
-  'claude-haiku-4-5-20251001':    200_000,
-  'claude-opus-4-5':              200_000,
-  'claude-sonnet-4-5':            200_000,
-  'claude-haiku-4-5':             200_000,
-  'claude-3-7-sonnet-20250219':   200_000,
-  'claude-3-5-sonnet-20241022':   200_000,
-  'claude-3-5-haiku-20241022':    200_000,
-  'claude-3-opus-20240229':       200_000,
-  // DeepSeek — 1M context window (api.deepseek.com/anthropic)
-  'deepseek-v4-flash':          1_000_000,   // DeepSeek-V3-0324 (flash)
-  'deepseek-v4-pro':            1_000_000,   // DeepSeek-V3-0324 (pro)
-  'deepseek-v3':                1_000_000,   // DeepSeek-V3
-  'deepseek-r1':                1_000_000,   // DeepSeek-R1
-  'deepseek-chat':              1_000_000,   // api.deepseek.com default chat alias
-  'deepseek-reasoner':          1_000_000,   // api.deepseek.com default reasoner alias
-}
-
-const DEFAULT_CONTEXT_WINDOW = 200_000
+import { getModelContextWindow, DEFAULT_CONTEXT_WINDOW } from '../../providers/registry.js'
 
 export function getContextWindowSize(model: string): number {
   // Allow env override (CC: CLAUDE_CODE_AUTO_COMPACT_WINDOW)
@@ -34,12 +13,7 @@ export function getContextWindowSize(model: string): number {
     const n = parseInt(envOverride, 10)
     if (!isNaN(n) && n > 0) return n
   }
-
-  // Prefix match for versioned models
-  for (const [key, size] of Object.entries(MODEL_CONTEXT_WINDOWS)) {
-    if (model.startsWith(key)) return size
-  }
-  return DEFAULT_CONTEXT_WINDOW
+  return getModelContextWindow(model)
 }
 
 // ── Threshold calculations (mirroring CC's autocompact.ts) ───────────────────

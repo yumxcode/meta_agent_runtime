@@ -1,4 +1,5 @@
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile } from '../core/persist/index.js'
 import type {
@@ -8,7 +9,7 @@ import type {
 } from './types.js'
 import { makePhysicalAnchorId } from './types.js'
 
-const PHYSICAL_ANCHOR_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'physical_anchors')
+const PHYSICAL_ANCHOR_ROOT = join(META_AGENT_HOME, 'robotics', 'physical_anchors')
 const MANIFEST_FILE = 'PHYSICAL_ANCHOR_MANIFEST.json'
 const LOAD_CONCURRENCY = 32
 const PHYSICAL_ANCHOR_ID_RE = /^pa_[0-9a-z]+_[0-9a-f]{8}$/

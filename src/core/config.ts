@@ -5,9 +5,10 @@
  * Ref: claude-code-source-code-main/src/QueryEngine.ts → QueryEngineConfig
  *
  * Provider auto-detection:
- *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
+ *   ZHIPU_API_KEY      → https://open.bigmodel.cn/api/anthropic (GLM coding plan — glm-5.1, Anthropic-format, Bearer auth)
  *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash, native OpenAI format)
  *   QWEN_API_KEY       → https://dashscope.aliyuncs.com/apps/anthropic  (qwen-max / qwen-plus)
+ *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
  *
  * Explicit config.apiKey / config.baseURL always take precedence over env vars.
  */
@@ -17,100 +18,53 @@ import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js'
 import type { ThinkingConfig } from '../kernel/index.js'
 import type { OutputStyle } from './dynamicPrompt.js'
+import { loadModelConfigFile } from './modelConfigFile.js'
+import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
+import type { Capabilities, Protocol } from '../providers/registry.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider detection
+//
+// All provider knowledge now lives in the Provider Registry
+// (src/providers/registry.ts).  The thin wrappers below preserve the historical
+// `detectProvider` / `inferProviderFromURL` / `isAnthropicProvider` API so
+// existing call-sites keep working, while delegating the actual logic.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export type ModelProvider = 'anthropic' | 'deepseek' | 'qwen' | 'unknown'
-
-/** Provider-specific endpoint */
-const PROVIDER_BASE_URLS: Record<ModelProvider, string> = {
-  anthropic: 'https://api.anthropic.com',
-  deepseek:  'https://api.deepseek.com',          // native OpenAI-compat endpoint
-  qwen:      'https://dashscope.aliyuncs.com/apps/anthropic',
-  unknown:   'https://api.anthropic.com',
-}
-
-/** Default (primary interaction) model for each provider */
-const PROVIDER_DEFAULT_MODELS: Record<ModelProvider, string> = {
-  anthropic: 'claude-opus-4-6',
-  deepseek:  'deepseek-v4-flash',  // DeepSeek-V4 Flash — primary interaction model
-  qwen:      'qwen-plus',
-  unknown:   'claude-opus-4-6',
-}
-
-const PROVIDER_FALLBACK_MODELS: Record<ModelProvider, string | undefined> = {
-  anthropic: 'claude-sonnet-4-6',
-  deepseek:  'deepseek-v4-flash',  // DeepSeek-V4 Flash — lighter fallback
-  qwen:      'qwen-max',
-  unknown:   'claude-sonnet-4-6',
-}
+export type ModelProvider = 'anthropic' | 'deepseek' | 'qwen' | 'zhipu' | 'unknown'
 
 /**
- * Fast auxiliary (flash) model per provider.
- * Used for side-calls: compact summarisation, mode detection, memory relevance,
- * experience summarisation.  Replaces the formerly Anthropic-only "haiku" pattern.
- */
-const PROVIDER_FLASH_MODELS: Record<ModelProvider, string> = {
-  anthropic: 'claude-haiku-4-5-20251001',
-  deepseek:  'deepseek-v4-flash',
-  qwen:      'qwen-plus',
-  unknown:   'deepseek-v4-flash',
-}
-
-/**
- * Detect which provider to use based on available environment variables.
- * Priority: explicit config values → DEEPSEEK_API_KEY → QWEN_API_KEY → ANTHROPIC_API_KEY
+ * Detect which provider to use from explicit values + environment variables.
+ * Delegates to the registry's resolveProvider(); see its precedence rules.
+ * Notably fixes the case where an explicit apiKey with no baseURL but a
+ * provider-specific model name (e.g. `deepseek-…`) used to fall through to
+ * Anthropic.
  */
 export function detectProvider(config: {
   apiKey?: string
   baseURL?: string
   model?: string
 }): { provider: ModelProvider; apiKey: string; baseURL: string; defaultModel: string; fallbackModel?: string; flashModel: string } {
-  // If both apiKey and baseURL are explicit, trust the caller
-  if (config.apiKey && config.baseURL) {
-    const provider = inferProviderFromURL(config.baseURL)
-    return {
-      provider,
-      apiKey:        config.apiKey,
-      baseURL:       config.baseURL,
-      defaultModel:  PROVIDER_DEFAULT_MODELS[provider],
-      fallbackModel: PROVIDER_FALLBACK_MODELS[provider],
-      flashModel:    PROVIDER_FLASH_MODELS[provider],
-    }
+  const r = resolveProvider(config)
+  return {
+    provider:      r.provider,
+    apiKey:        r.apiKey,
+    baseURL:       r.baseURL,
+    defaultModel:  r.defaultModel,
+    fallbackModel: r.fallbackModel,
+    flashModel:    r.flashModel,
   }
-
-  // Auto-detect from environment
-  const deepseekKey  = process.env['DEEPSEEK_API_KEY']
-  const qwenKey      = process.env['QWEN_API_KEY']
-  const anthropicKey = process.env['ANTHROPIC_API_KEY']
-
-  if (deepseekKey && !config.apiKey) {
-    const baseURL = config.baseURL ?? PROVIDER_BASE_URLS['deepseek']
-    return { provider: 'deepseek', apiKey: deepseekKey, baseURL, defaultModel: PROVIDER_DEFAULT_MODELS['deepseek'], fallbackModel: PROVIDER_FALLBACK_MODELS['deepseek'], flashModel: PROVIDER_FLASH_MODELS['deepseek'] }
-  }
-  if (qwenKey && !config.apiKey) {
-    const baseURL = config.baseURL ?? PROVIDER_BASE_URLS['qwen']
-    return { provider: 'qwen', apiKey: qwenKey, baseURL, defaultModel: PROVIDER_DEFAULT_MODELS['qwen'], fallbackModel: PROVIDER_FALLBACK_MODELS['qwen'], flashModel: PROVIDER_FLASH_MODELS['qwen'] }
-  }
-
-  // Fallback: Anthropic
-  const apiKey  = config.apiKey ?? anthropicKey ?? ''
-  const baseURL = config.baseURL ?? PROVIDER_BASE_URLS['anthropic']
-  return { provider: 'anthropic', apiKey, baseURL, defaultModel: PROVIDER_DEFAULT_MODELS['anthropic'], fallbackModel: PROVIDER_FALLBACK_MODELS['anthropic'], flashModel: PROVIDER_FLASH_MODELS['anthropic'] }
 }
 
-function inferProviderFromURL(url: string): ModelProvider {
-  if (url.includes('deepseek.com'))    return 'deepseek'
-  if (url.includes('dashscope'))       return 'qwen'
-  if (url.includes('anthropic.com'))   return 'anthropic'
-  return 'unknown'
+/** Infer the provider id from a base URL (registry-backed). */
+export function inferProviderFromURL(url: string): ModelProvider {
+  return registryInferFromURL(url)
 }
 
 /**
  * Returns true when `baseURL` resolves to Anthropic's own API endpoint.
- * Used to gate Anthropic-only features (interleaved-thinking, token-efficient-tools beta).
+ * Kept for callers that only need the native-Anthropic distinction; prefer the
+ * capability flags from resolveConfig() for feature gating.
  *
  * Rules:
  *   • undefined/empty → true  (resolveConfig() fills in api.anthropic.com)
@@ -156,6 +110,27 @@ export interface MetaAgentConfig {
 
   /** Fallback model used when the primary model cannot satisfy request features. */
   fallbackModel?: string
+
+  /**
+   * Fast auxiliary (flash) model for side-calls: compact summarisation, mode
+   * detection, memory relevance, experience summarisation.  When omitted the
+   * provider's default flash model is used.  Overridable via the global config
+   * file (~/.meta-agent/config.json → flashModel).
+   */
+  flashModel?: string
+
+  /**
+   * Compaction overrides forwarded to the kernel's CompactConfig.
+   *
+   * `customInstructions` may be a thunk resolved lazily at compaction time —
+   * used by RoboticsSession to inject mode-specific compact guidance (active
+   * sub-agent task IDs, current phase, hardware constraints) into the compact
+   * side-call prompt only when compaction actually fires, instead of paying for
+   * it on every turn in the volatile context prefix.
+   */
+  compact?: {
+    customInstructions?: string | (() => string | null | undefined)
+  }
 
   /**
    * Thinking ("extended thinking" / "reasoning") config for the primary model.
@@ -345,8 +320,10 @@ export type ResolvedConfig = Required<
     | 'fallbackBetas'
     | 'fallbackIncludeDefaultBetas'
     | 'thinkingConfig'
+    | 'compact'
   >
 > & {
+  compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
   language?: string
   outputStyle?: OutputStyle
@@ -369,6 +346,10 @@ export type ResolvedConfig = Required<
   fallbackIncludeDefaultBetas?: boolean
   /** Fast auxiliary model for side-calls (compact, mode detection, memory, etc.) */
   flashModel: string
+  /** Wire protocol for the resolved provider ('anthropic' | 'openai'). */
+  protocol: Protocol
+  /** Effective capability flags (betas / thinking / prompt-cache) for the provider. */
+  capabilities: Capabilities
 }
 
 // `projectDir` is always present after resolveConfig() because we default to process.cwd().
@@ -387,14 +368,36 @@ When performing calculations:
 When uncertain, say so clearly and suggest how to verify the result.`
 
 export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
-  const { apiKey, baseURL, defaultModel, fallbackModel, flashModel } = detectProvider(config)
-  const model = config.model ?? defaultModel
-  const resolvedFallbackModel = config.fallbackModel ?? (fallbackModel !== model ? fallbackModel : undefined)
+  // Global config file takes precedence over caller/CLI values, which in turn
+  // take precedence over built-in provider defaults:  file > CLI > default.
+  const file = loadModelConfigFile()
+
+  // apiKey / baseURL / model fed into provider detection (file wins).
+  const detectInput = {
+    apiKey:  file.apiKey  ?? config.apiKey,
+    baseURL: file.baseURL ?? config.baseURL,
+    model:   file.mainModel ?? config.model,
+  }
+  const resolvedProvider = resolveProvider(detectInput)
+  const { apiKey, baseURL, defaultModel, fallbackModel, flashModel } = {
+    apiKey:        resolvedProvider.apiKey,
+    baseURL:       resolvedProvider.baseURL,
+    defaultModel:  resolvedProvider.defaultModel,
+    fallbackModel: resolvedProvider.fallbackModel,
+    flashModel:    resolvedProvider.flashModel,
+  }
+
+  const model = file.mainModel ?? config.model ?? defaultModel
+  const resolvedFallbackModel =
+    file.fallbackModel ?? config.fallbackModel ?? (fallbackModel !== model ? fallbackModel : undefined)
+  const resolvedFlashModel = file.flashModel ?? config.flashModel ?? flashModel
   return {
     apiKey,
     baseURL,
     model,
-    flashModel,
+    protocol: resolvedProvider.protocol,
+    capabilities: resolvedProvider.capabilities,
+    flashModel: resolvedFlashModel,
     fallbackModel: resolvedFallbackModel,
     // Default to adaptive so the primary LLM thinks before answering. Callers
     // can opt out by passing `{ type: 'disabled' }`.

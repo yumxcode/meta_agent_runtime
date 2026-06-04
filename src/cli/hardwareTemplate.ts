@@ -5,13 +5,14 @@
  *
  * Load order (highest priority first):
  *   1. <projectDir>/.meta-agent/hardware-template.json
- *   2. ~/.claude/meta-agent/robotics/profile-template.json
+ *   2. ~/.meta-agent/robotics/profile-template.json
  *   3. Built-in default template  (defined below)
  *
  * Template JSON schema: ProfileTemplate (see below)
  */
 
 import { readFile } from 'node:fs/promises'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
@@ -204,7 +205,7 @@ async function loadTemplateFile(path: string): Promise<ProfileTemplate | null> {
 /**
  * Resolve the active ProfileTemplate using the load order:
  *   1. <projectDir>/.meta-agent/hardware-template.json
- *   2. ~/.claude/meta-agent/robotics/profile-template.json
+ *   2. ~/.meta-agent/robotics/profile-template.json
  *   3. Built-in DEFAULT_TEMPLATE
  */
 export async function resolveTemplate(projectDir?: string): Promise<ProfileTemplate> {
@@ -214,7 +215,7 @@ export async function resolveTemplate(projectDir?: string): Promise<ProfileTempl
     candidates.push(join(projectDir, '.meta-agent', 'hardware-template.json'))
   }
   candidates.push(
-    join(homedir(), '.claude', 'meta-agent', 'robotics', 'profile-template.json'),
+    join(META_AGENT_HOME, 'robotics', 'profile-template.json'),
   )
 
   for (const p of candidates) {

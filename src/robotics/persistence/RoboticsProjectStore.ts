@@ -1,11 +1,12 @@
 import { createHash } from 'crypto'
 import { join } from 'path'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 import { readdir, rm } from 'fs/promises'
 import { atomicWriteJson, readJsonFile } from '../../core/persist/index.js'
 import type { RoboticsProjectState, RoboticsProjectSummary, ActiveSubAgentRecord, RoboticsGitState } from '../types.js'
 
-const PROJECTS_ROOT    = join(homedir(), '.claude', 'meta-agent', 'robotics', 'projects')
+const PROJECTS_ROOT    = join(META_AGENT_HOME, 'robotics', 'projects')
 const RESUME_WINDOW_MS = 30 * 24 * 60 * 60 * 1000   // 30 days — hard cap for resume
 const STALE_TTL_MS     =  7 * 24 * 60 * 60 * 1000   // 7 days  — auto-purge for non-starred
 const MAX_PROGRESS_NOTES = 15                         // rolling window, oldest evicted first

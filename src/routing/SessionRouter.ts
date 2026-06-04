@@ -42,6 +42,7 @@ import { EMPTY_USAGE } from '../core/types.js'
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import { CampaignSession } from '../modes/CampaignSession.js'
 import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
+import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
@@ -107,6 +108,7 @@ export class SessionRouter {
   private readonly _robot: string | undefined
   /** Whether user explicitly resumed a prior session — forwarded to RoboticsSession. */
   private readonly _explicitResume: boolean
+  private readonly _resumeSessionId?: string
   /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
   private readonly _onEscalationRequest: ((reason: string) => Promise<boolean>) | undefined
   /**
@@ -126,11 +128,12 @@ export class SessionRouter {
   private _memoryWriterDone = false
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
-    const { mode, debugMode, robot, explicitResume, onEscalationRequest, ...sessionConfig } = config
+    const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
     this._hint = mode ?? 'auto'
     this._debug = debugMode ?? false
     this._robot = robot
     this._explicitResume = explicitResume ?? false
+    this._resumeSessionId = resumeSessionId
     this._onEscalationRequest = onEscalationRequest
     // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
     // Without this, destructuring above strips debugMode from sessionConfig,
@@ -312,6 +315,9 @@ export class SessionRouter {
           apiKey: this._cfg.apiKey,
           baseURL: this._cfg.baseURL,
         })
+        // Drain the pending-memory persistence tail so auto-queued proposals
+        // survive shutdown and are visible to the next `/memory review`.
+        try { await getMemoryPendingStore().flush() } catch { /* best-effort */ }
       } catch {
         // Best-effort: memory extraction must never block shutdown.
       }
@@ -326,7 +332,7 @@ export class SessionRouter {
       // S6: kill any SubAgentBridge that was created for this session but
       // whose owner forgot to call destroy() (e.g. CampaignSession callers
       // who never dispose).  Idempotent — does nothing when already destroyed.
-      try { SubAgentBridge.getBridge(sessionId)?.destroy() } catch { /* best-effort */ }
+      try { await SubAgentBridge.getBridge(sessionId)?.dispose() } catch { /* best-effort */ }
     }
     // Drop the impl reference so the GC can reclaim the whole session graph.
     this._impl = null
@@ -491,6 +497,7 @@ export class SessionRouter {
           ...this._cfgAsConfig(),
           robot: this._robot,
           explicitResume: this._explicitResume,
+          resumeSessionId: this._resumeSessionId,
           onEscalationRequest: this._onEscalationRequest,
         })
         // init() restores or creates project state, registers tools, and primes

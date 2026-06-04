@@ -8,8 +8,8 @@
  * having to re-parse the conversation history.
  *
  * Storage:
- *   - When a TaskContract is active:  ~/.claude/meta-agent/tasks/<contractId>/run-state.json
- *   - Standalone (no contract):       ~/.claude/meta-agent/run-state-<sessionId>.json
+ *   - When a TaskContract is active:  ~/.meta-agent/tasks/<contractId>/run-state.json
+ *   - Standalone (no contract):       ~/.meta-agent/run-state-<sessionId>.json
  *
  * Design invariants:
  *   - Written fire-and-forget; never throws from the caller's perspective.
@@ -22,6 +22,7 @@ import { readFile, unlink } from 'fs/promises'
 import { atomicWriteJson } from '../persist/index.js'
 import { join } from 'path'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../metaAgentHome.js'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -81,7 +82,7 @@ export interface RunStateSnapshot {
 // Paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-const META_AGENT_DIR = join(homedir(), '.claude', 'meta-agent')
+const META_AGENT_DIR = join(META_AGENT_HOME)
 
 function _standaloneSnapshotPath(sessionId: string): string {
   return join(META_AGENT_DIR, `run-state-${sessionId}.json`)

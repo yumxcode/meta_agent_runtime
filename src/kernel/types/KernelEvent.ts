@@ -36,6 +36,16 @@ export interface ToolResultEvent {
   sessionId: string
 }
 
+/**
+ * Emitted right BEFORE the (slow, LLM-backed) conversation compaction begins,
+ * so a UI can show a "compacting…" indicator while it runs. The matching
+ * compact_boundary is emitted once compaction completes.
+ */
+export interface CompactStartEvent {
+  type: 'compact_start'
+  sessionId: string
+}
+
 export interface CompactBoundaryEvent {
   type: 'compact_boundary'
   compactMetadata: {
@@ -104,6 +114,7 @@ export type KernelEvent =
   | ThinkingDeltaEvent
   | ToolUseEvent
   | ToolResultEvent
+  | CompactStartEvent
   | CompactBoundaryEvent
   | ApiRetryEvent
   | ToolUseSummaryEvent

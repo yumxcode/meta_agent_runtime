@@ -1,7 +1,7 @@
 /**
  * CampaignStateStore — disk-backed state machine for a DOE campaign.
  *
- * Storage layout under ~/.claude/meta-agent/campaigns/<campaignId>/:
+ * Storage layout under ~/.meta-agent/campaigns/<campaignId>/:
  *   state.json          — phase + metadata (overwrite on each transition)
  *   evaluations.jsonl   — EvaluationResult lines (append-only, concurrent-safe)
  *   capsule.json        — pre-computed CampaignContextCapsule
@@ -25,6 +25,7 @@ import {
   writeFile,
 } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, ensureDir, readJsonFile } from '../core/persist/index.js'
 import type {
@@ -55,7 +56,7 @@ const ZOMBIE_CHECKPOINT_MS  = 7 * 24 * 60 * 60 * 1_000    // 7 days
 
 // ── Path helpers ──────────────────────────────────────────────────────────────
 
-export const META_AGENT_ROOT = join(homedir(), '.claude', 'meta-agent')
+export const META_AGENT_ROOT = join(META_AGENT_HOME)
 export const CAMPAIGNS_ROOT = join(META_AGENT_ROOT, 'campaigns')
 
 function campaignDir(id: string): string {

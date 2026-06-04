@@ -41,6 +41,9 @@ export function createExperimentDispatchTool(
 ): MetaAgentTool {
   return {
     name: 'experiment_dispatch',
+    // Opt out of the kernel's per-tool timeout: with await_completion=true this
+    // blocks on the ExperimentAgent sub-agent, bounded by its own 5-min cap.
+    timeoutMs: 0,
     description:
       'Dispatch an experiment to an isolated ExperimentAgent sub-agent. ' +
       'The sub-agent runs in its own git worktree (if git is enabled) so changes do not pollute main. ' +
@@ -203,6 +206,7 @@ Rules:
           // Wait for the sub-agent to finish
           let status = record.status
           while (!['completed', 'failed', 'cancelled'].includes(status)) {
+            if (ctx.abortSignal?.aborted) { status = 'cancelled'; break }
             await new Promise(r => setTimeout(r, 2_000))
             const latest = await bridge.getStatus(record.taskId)
             status = latest?.status ?? 'failed'

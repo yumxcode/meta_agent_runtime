@@ -9,14 +9,16 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
-import { appendFile, mkdir, readFile } from 'fs/promises'
+import { buildAnthropicAuth } from '../../kernel/api/AnthropicClient.js'
+import { getModelProtocol } from '../../providers/registry.js'
+import { mkdir, readFile } from 'fs/promises'
 import { join } from 'path'
-import { atomicWriteFile } from '../persist/index.js'
 import type { ConversationMessage, ContentBlock } from '../types.js'
 import type { AgentMode } from '../dynamicPrompt.js'
 import { ensureMemoryDirExists, loadMemoryIndex } from './memdir.js'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
-import { MEMORY_TYPES, type MemoryType } from './types.js'
+import { allowedTypesForMode, normalizeMemoryProposal, type RawMemoryProposal } from './memoryProposal.js'
+import { ensureMemoryPendingLoaded, getMemoryPendingStore, type MemoryPendingStore } from './MemoryPendingStore.js'
 
 /**
  * Default model for the post-session memory writer side-call.
@@ -32,35 +34,10 @@ const MAX_TRANSCRIPT_CHARS = 32_000
 const MAX_EXISTING_INDEX_CHARS = 8_000
 const MAX_MEMORIES_PER_RUN = 3
 
-type MemoryProposal = {
-  filename?: unknown
-  name?: unknown
-  description?: unknown
-  type?: unknown
-  domain?: unknown
-  source?: unknown
-  source_verified?: unknown
-  requires_revalidation?: unknown
-  body?: unknown
-  index_line?: unknown
-}
-
-type NormalizedMemoryProposal = {
-  filename: string
-  name: string
-  description: string
-  type: MemoryType
-  domain?: string
-  source?: string
-  source_verified?: boolean
-  requires_revalidation?: boolean
-  body: string
-  index_line: string
-}
-
 export type MemoryWriteResult = {
   attempted: boolean
-  written: string[]
+  /** Pending IDs queued for review (NOT written to disk directly). */
+  queued: string[]
   skipped: string[]
 }
 
@@ -82,6 +59,12 @@ export interface RunMemoryWriterOptions {
   /** API key/baseURL used when the memory writer must create its own side-call client. */
   apiKey?: string
   baseURL?: string
+  /**
+   * Pending-review queue the auto-writer enqueues proposals into.
+   * Defaults to the process-wide global store.  Proposals are NEVER written to
+   * disk here — the user commits them via `/memory review`.
+   */
+  pendingStore?: MemoryPendingStore
 }
 
 function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
@@ -115,64 +98,6 @@ function buildTranscript(messages: readonly ConversationMessage[]): string {
   const full = lines.join('\n\n')
   if (full.length <= MAX_TRANSCRIPT_CHARS) return full
   return full.slice(full.length - MAX_TRANSCRIPT_CHARS)
-}
-
-function allowedTypesForMode(_mode: string): ReadonlySet<MemoryType> {
-  // Memory is strictly limited to user profile and agent-behaviour feedback.
-  // All engineering experience (lessons, domain knowledge, references) lives in
-  // ExperienceStore or project docs — never in memory.
-  return new Set<MemoryType>(['user', 'feedback'])
-}
-
-function sanitizeScalar(value: unknown, max = 240): string | undefined {
-  if (typeof value !== 'string') return undefined
-  // Strip \r and \n to prevent YAML frontmatter injection (a multi-line value
-  // such as "name\ntype: injected" would add an extra key to the frontmatter).
-  const trimmed = value.replace(/[\r\n]/g, ' ').trim()
-  if (!trimmed) return undefined
-  return trimmed.slice(0, max)
-}
-
-function sanitizeFilename(value: unknown, fallbackName: string): string {
-  const raw = sanitizeScalar(value, 120) ?? fallbackName
-  const base = raw
-    .toLowerCase()
-    .replace(/\.md$/i, '')
-    .replace(/[^a-z0-9]+/g, '_')
-    .replace(/^_+|_+$/g, '')
-    .slice(0, 80)
-  return `${base || 'memory'}.md`
-}
-
-function stripUnsupportedFrontmatter(text: string): string {
-  return text
-    .replace(/^---[\s\S]*?---\s*/m, '')
-    .replace(/^\s*(campaign|valid_until|confidence)\s*:.*$/gmi, '')
-    .trim()
-}
-
-function renderMemoryFile(proposal: NormalizedMemoryProposal): string {
-  const lines = [
-    '---',
-    `name: ${sanitizeScalar(proposal.name, 160)}`,
-    `description: ${sanitizeScalar(proposal.description, 240)}`,
-    `type: ${sanitizeScalar(proposal.type, 80)}`,
-    `date: ${new Date().toISOString().slice(0, 10)}`,
-  ]
-  const domain = sanitizeScalar(proposal.domain, 80)
-  if (domain) {
-    lines.push('scope: domain', `domain: ${domain}`)
-  }
-  const source = sanitizeScalar(proposal.source, 240)
-  if (source) lines.push(`source: ${source}`)
-  if (typeof proposal.source_verified === 'boolean') {
-    lines.push(`source_verified: ${proposal.source_verified ? 'true' : 'false'}`)
-  }
-  if (typeof proposal.requires_revalidation === 'boolean') {
-    lines.push(`requires_revalidation: ${proposal.requires_revalidation ? 'true' : 'false'}`)
-  }
-  lines.push('---', '', stripUnsupportedFrontmatter(String(proposal.body)), '')
-  return lines.join('\n')
 }
 
 function extractJson(raw: string): unknown {
@@ -211,41 +136,6 @@ Return JSON only:
 If nothing is worth saving, return {"memories":[]}.`
 }
 
-function normalizeProposal(
-  raw: MemoryProposal,
-  mode: string,
-  domain?: string,
-): NormalizedMemoryProposal | null {
-  const name = sanitizeScalar(raw.name, 160)
-  const description = sanitizeScalar(raw.description, 240)
-  const body = sanitizeScalar(raw.body, 4000)
-  const type = sanitizeScalar(raw.type, 80) as MemoryType | undefined
-  if (!name || !description || !body || !type) return null
-  if (!MEMORY_TYPES.includes(type)) return null
-  if (!allowedTypesForMode(mode).has(type)) return null
-
-  const filename = sanitizeFilename(raw.filename, name)
-  const normalizedDomain = sanitizeScalar(raw.domain, 80) ?? domain
-  const indexLine =
-    sanitizeScalar(raw.index_line, 300) ??
-    `- [${name}](${filename}) - ${description}`
-
-  return {
-    filename,
-    name,
-    description,
-    type,
-    domain: normalizedDomain,
-    source: sanitizeScalar(raw.source, 240),
-    source_verified: typeof raw.source_verified === 'boolean' ? raw.source_verified : undefined,
-    requires_revalidation: typeof raw.requires_revalidation === 'boolean' ? raw.requires_revalidation : undefined,
-    body,
-    index_line: indexLine.includes(`](${filename})`)
-      ? indexLine
-      : `- [${name}](${filename}) - ${description}`,
-  }
-}
-
 export async function runPostSessionMemoryWriter(
   opts: RunMemoryWriterOptions,
 ): Promise<MemoryWriteResult> {
@@ -259,8 +149,13 @@ export async function runPostSessionMemoryWriter(
     apiKey,
     baseURL,
   } = opts
+  // When the caller doesn't supply a store, use the process-wide global one and
+  // make sure its persisted entries are loaded — otherwise an empty in-memory
+  // array would clobber pending entries already on disk on the next persist.
+  const pendingStore = opts.pendingStore ?? getMemoryPendingStore()
+  if (!opts.pendingStore) await ensureMemoryPendingLoaded()
   if (messages.length === 0) {
-    return { attempted: false, written: [], skipped: ['no_messages'] }
+    return { attempted: false, queued: [], skipped: ['no_messages'] }
   }
 
   if (memoryDir === MEMORY_DIR) await ensureMemoryDirExists()
@@ -277,7 +172,7 @@ export async function runPostSessionMemoryWriter(
   }
   const transcript = buildTranscript(messages)
   if (!transcript.trim()) {
-    return { attempted: false, written: [], skipped: ['empty_transcript'] }
+    return { attempted: false, queued: [], skipped: ['empty_transcript'] }
   }
 
   const userContent = [
@@ -300,28 +195,33 @@ export async function runPostSessionMemoryWriter(
     user: userContent,
   })
   if (!raw.trim()) {
-    return { attempted: true, written: [], skipped: ['empty_model_response'] }
+    return { attempted: true, queued: [], skipped: ['empty_model_response'] }
   }
   const parsed = extractJson(raw)
   const proposals = Array.isArray((parsed as { memories?: unknown } | null)?.memories)
-    ? ((parsed as { memories: unknown[] }).memories as MemoryProposal[])
+    ? ((parsed as { memories: unknown[] }).memories as RawMemoryProposal[])
     : []
 
-  const written: string[] = []
+  const queued: string[] = []
   const skipped: string[] = []
-  let indexToCheck = existingIndex
+  const indexToCheck = existingIndex
+
+  // Snapshot already-pending filenames so the auto-writer doesn't enqueue a
+  // near-duplicate of something awaiting review.
+  const pendingFilenames = new Set(pendingStore.list().map(p => p.proposal.filename))
 
   for (const rawProposal of proposals.slice(0, MAX_MEMORIES_PER_RUN)) {
-    const proposal = normalizeProposal(rawProposal, mode, domain)
+    const proposal = normalizeMemoryProposal(rawProposal, mode, domain)
     if (!proposal) {
       skipped.push('invalid_proposal')
       continue
     }
+    // Skip if already committed (present in MEMORY.md index) …
     if (indexToCheck.includes(`](${proposal.filename})`) || indexToCheck.includes(proposal.name)) {
       skipped.push(`duplicate:${proposal.filename}`)
       continue
     }
-
+    // … or if an on-disk file already exists …
     const target = join(memoryDir, proposal.filename)
     try {
       await readFile(target, 'utf-8')
@@ -330,15 +230,23 @@ export async function runPostSessionMemoryWriter(
     } catch {
       // File does not exist; proceed.
     }
+    // … or if an equivalent proposal is already pending review.
+    if (pendingFilenames.has(proposal.filename)) {
+      skipped.push(`pending:${proposal.filename}`)
+      continue
+    }
 
-    await atomicWriteFile(target, renderMemoryFile(proposal))
-    const indexLine = proposal.index_line.replace(/\r?\n/g, ' ').trim()
-    await appendFile(join(memoryDir, MEMORY_ENTRYPOINT_NAME), `${indexToCheck.trim() ? '\n' : ''}${indexLine}\n`, 'utf-8')
-    indexToCheck += `\n${indexLine}`
-    written.push(proposal.filename)
+    // Queue for human review instead of writing directly.
+    try {
+      const pendingId = pendingStore.add(proposal, 'auto')
+      pendingFilenames.add(proposal.filename)
+      queued.push(pendingId)
+    } catch {
+      skipped.push('queue_full')
+    }
   }
 
-  return { attempted: true, written, skipped }
+  return { attempted: true, queued, skipped }
 }
 
 async function callMemoryWriterModel(opts: {
@@ -349,7 +257,7 @@ async function callMemoryWriterModel(opts: {
   system: string
   user: string
 }): Promise<string> {
-  if (opts.model.startsWith('deepseek-')) {
+  if (getModelProtocol(opts.model, opts.baseURL) === 'openai') {
     const client = new OpenAI({
       apiKey: opts.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
       baseURL: opts.baseURL ?? 'https://api.deepseek.com',
@@ -372,7 +280,7 @@ async function callMemoryWriterModel(opts: {
   const anthropicClient = opts.client ?? (
     opts.apiKey
       ? new Anthropic({
-          apiKey: opts.apiKey,
+          ...buildAnthropicAuth(opts.apiKey, opts.baseURL),
           baseURL: opts.baseURL,
           maxRetries: 1,
         })

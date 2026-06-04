@@ -12,7 +12,7 @@ import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
 import { initialLoopState, type LoopState } from './LoopState.js'
 import { applyToolResultBudget } from '../tools/ToolResultBudget.js'
-import { autoCompactIfNeeded, type AutoCompactTrackingState } from '../compact/AutoCompact.js'
+import { autoCompactIfNeeded, shouldAutoCompact, type AutoCompactTrackingState } from '../compact/AutoCompact.js'
 import { streamMessages } from '../api/AnthropicClient.js'
 import { streamDeepSeekMessages } from '../api/DeepSeekClient.js'
 import {
@@ -45,6 +45,8 @@ import {
   FallbackTriggeredError,
 } from '../api/Errors.js'
 import { calcCostUsd } from '../utils/CostTracker.js'
+import { parseCacheUsage } from '../utils/parseCacheUsage.js'
+import { getModelProtocol } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 
@@ -255,6 +257,22 @@ export async function* runKernelLoop(
     const effectiveSystemPrompt =
       assembleSystemPrompt(config.systemPrompt, config.appendSystemPrompt) ?? ''
 
+    // Surface a "compacting…" indicator before the slow LLM-backed summarization
+    // begins. We probe the same gates autoCompactIfNeeded uses so the event only
+    // fires when a compaction will actually run.
+    if (
+      config.compact?.enabled !== false &&
+      shouldAutoCompact(
+        messagesForQuery,
+        state.currentModel,
+        config.compact?.querySource ?? config.querySource,
+        state.autoCompactTracking,
+        state.maxOutputTokensOverride ?? config.maxOutputTokens,
+      )
+    ) {
+      yield { type: 'compact_start', sessionId }
+    }
+
     const compactResult = config.compact?.enabled === false
       ? {
           wasCompacted: false,
@@ -335,8 +353,9 @@ export async function* runKernelLoop(
     const acc = newAccumulator()
     let streamError: unknown = null
 
-    // Route to DeepSeek or Anthropic based on model prefix
-    const isDeepSeek = state.currentModel.startsWith('deepseek-')
+    // Route to OpenAI-format (DeepSeek) or Anthropic-format wire protocol via
+    // the provider registry — baseURL wins, model name is the fallback signal.
+    const isDeepSeek = getModelProtocol(state.currentModel, config.baseURL) === 'openai'
 
     try {
       const retryEvents: KernelEvent[] = []
@@ -394,10 +413,15 @@ export async function* runKernelLoop(
 
         switch (event.type) {
           case 'message_start': {
-            // usage may be absent on non-Anthropic providers (DeepSeek, Qwen)
-            acc.inputTokens = event.usage?.input_tokens ?? 0
-            acc.cacheReadTokens = event.usage?.cache_read_input_tokens ?? 0
-            acc.cacheWriteTokens = event.usage?.cache_creation_input_tokens ?? 0
+            // Provider-tolerant parse: GLM/Zhipu rides the Anthropic wire format
+            // but may report cache hits in the OpenAI `prompt_tokens_details`
+            // shape; DeepSeek may use the `prompt_cache_hit/miss` pair. Reading
+            // only `cache_read_input_tokens` would record those as 0. Also covers
+            // the raw Anthropic `{ message: { usage } }` nesting.
+            const u = parseCacheUsage(event as unknown as Record<string, unknown>)
+            acc.inputTokens = u.inputTokens
+            acc.cacheReadTokens = u.cacheReadTokens
+            acc.cacheWriteTokens = u.cacheWriteTokens
             break
           }
 
@@ -443,6 +467,14 @@ export async function* runKernelLoop(
           case 'message_delta': {
             acc.stopReason = event.delta?.stop_reason ?? null
             acc.outputTokens = event.usage?.output_tokens ?? 0
+            // Anthropic (and GLM/Zhipu on the compat endpoint) report the
+            // authoritative final input / cache counts on message_delta, not
+            // message_start. Override with any non-zero values seen here so the
+            // footer doesn't show in:0 when the provider defers usage to the end.
+            const d = parseCacheUsage(event as unknown as Record<string, unknown>)
+            if (d.inputTokens > 0) acc.inputTokens = d.inputTokens
+            if (d.cacheReadTokens > 0) acc.cacheReadTokens = d.cacheReadTokens
+            if (d.cacheWriteTokens > 0) acc.cacheWriteTokens = d.cacheWriteTokens
             break
           }
 
@@ -464,6 +496,9 @@ export async function* runKernelLoop(
           config.compact?.enabled !== false &&
           !state.hasAttemptedReactiveCompact
         ) {
+          // Reactive compaction is forced (the request already overflowed), so a
+          // compaction is guaranteed to run here — announce it before the wait.
+          yield { type: 'compact_start', sessionId }
           const reactiveCompactResult = await autoCompactIfNeeded(
             currentMessagesForQuery,
             state.currentModel,

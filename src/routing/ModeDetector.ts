@@ -37,17 +37,7 @@ import type {
   SessionModeHint,
 } from './types.js'
 import { MODE_WEIGHT } from './types.js'
-
-// ── Shared timeout utility (Fix #6) ──────────────────────────────────────────
-
-/** Race a promise against a hard timeout; rejects if the timeout fires first. */
-function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
-  let timer: ReturnType<typeof setTimeout>
-  const timeout = new Promise<never>((_, reject) => {
-    timer = setTimeout(() => reject(new Error(`Timed out after ${ms} ms`)), ms)
-  })
-  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer))
-}
+import { withAbortableTimeout } from '../core/utils/withTimeout.js'
 
 // ── LLM classification ────────────────────────────────────────────────────────
 //
@@ -322,13 +312,13 @@ export class ModeDetector {
       // A network partition or rate-limit backoff should not stall session
       // start for 600 s (SDK default).  Falls back to heuristics on timeout
       // (Fix #6).
-      const msg = await withTimeout(
+      const msg = await withAbortableTimeout(signal =>
         client.messages.create({
           model,
           max_tokens: 10,
           system: LLM_SYSTEM_PROMPT,
           messages: [{ role: 'user', content: prompt }],
-        }),
+        }, { signal }),
         5_000,
       )
 

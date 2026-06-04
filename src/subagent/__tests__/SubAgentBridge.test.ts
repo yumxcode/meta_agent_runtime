@@ -20,6 +20,7 @@ vi.mock('../SubAgentTaskStore.js', () => ({
     mockState.tasks.set(record.taskId, { ...record })
   }),
   releaseWriteChain: vi.fn(async () => {}),
+  cleanupTerminalTasks: vi.fn(async () => 0),
   listTasksForSession: vi.fn(async (parentSessionId: string) =>
     [...mockState.tasks.values()].filter(record => record.parentSessionId === parentSessionId),
   ),
@@ -29,6 +30,7 @@ vi.mock('../SubAgentRunner.js', () => ({
   SubAgentRunner: class {
     private readonly record: SubAgentRecord
     readonly abort = vi.fn()
+    private promise: Promise<void> | undefined
 
     constructor(record: SubAgentRecord) {
       this.record = record
@@ -37,6 +39,7 @@ vi.mock('../SubAgentRunner.js', () => ({
     start(): Promise<void> {
       let resolve!: () => void
       const promise = new Promise<void>(r => { resolve = r })
+      this.promise = promise
       mockState.tasks.set(this.record.taskId, {
         ...this.record,
         status: 'running',
@@ -50,6 +53,10 @@ vi.mock('../SubAgentRunner.js', () => ({
         resolve,
       })
       return promise
+    }
+
+    wait(): Promise<void> {
+      return this.promise ?? Promise.resolve()
     }
   },
 }))

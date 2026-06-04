@@ -19,7 +19,7 @@
  */
 
 import { randomUUID } from 'crypto'
-import { readTask, writeTask, releaseWriteChain, listTasksForSession } from './SubAgentTaskStore.js'
+import { readTask, writeTask, releaseWriteChain, listTasksForSession, cleanupTerminalTasks } from './SubAgentTaskStore.js'
 import { SubAgentRunner } from './SubAgentRunner.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
@@ -39,6 +39,7 @@ const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
 const DEFAULT_SUB_AGENT_START_DELAY_MS = 250
 const MAX_PENDING_NOTIFICATIONS = 100
+const DEFAULT_DESTROY_WAIT_MS = 10_000
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]
@@ -144,6 +145,13 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
   }
 
+  /** Async variant for shutdown paths that can wait for runner cleanup. */
+  static async disposeAll(): Promise<void> {
+    await Promise.allSettled(
+      [...SubAgentBridge._bridgesBySessionId.values()].map(bridge => bridge.dispose()),
+    )
+  }
+
   private readonly parentSessionId: string
   /**
    * Tool registry for sub-agents — set via setToolRegistry() after the main
@@ -179,6 +187,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private destroyed = false
   /** Count of tasks that reached a terminal state (success or failure) since this bridge was created. */
   private _finishedCount = 0
+  private _disposePromise: Promise<void> | undefined
 
   /** Bound listeners — kept so we can off() them in destroy(). */
   private readonly _onCompleted: (e: SubAgentCompletedEvent) => void
@@ -244,6 +253,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     CampaignEventBus.on('subagent:failed',    this._onFailed)
 
     void this._failStaleActiveTasks()
+    void cleanupTerminalTasks().catch(() => undefined)
   }
 
   // ── Lifecycle ───────────────────────────────────────────────────────────────
@@ -263,7 +273,18 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * P1-8: Aborts every active SubAgentRunner so their internal sessions
    * are interrupted and no orphaned async work continues after the parent ends.
    */
+  async dispose(waitMs = DEFAULT_DESTROY_WAIT_MS): Promise<void> {
+    if (this._disposePromise) return this._disposePromise
+    this._disposePromise = this._dispose(waitMs)
+    return this._disposePromise
+  }
+
+  /** Backward-compatible fire-and-forget teardown. Prefer await dispose(). */
   destroy(): void {
+    void this.dispose()
+  }
+
+  private async _dispose(waitMs: number): Promise<void> {
     if (this.destroyed) return   // S6: idempotent — multiple owners may call destroy()
     this.destroyed = true
     CampaignEventBus.off('subagent:completed', this._onCompleted)
@@ -277,12 +298,19 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this.queuedStarts.clear()
     this.startQueue.length = 0
     // Abort all in-flight runners
+    const running = [...this.runners.entries()]
     for (const [taskId, runner] of this.runners) {
-      runner.abort()
+      runner.abort('Session disposed')
       this._clearParentAbortForwarder(taskId)
     }
-    this.runners.clear()
-    this.activeTaskIds.clear()
+    await Promise.race([
+      Promise.allSettled(running.map(([, runner]) => runner.wait())),
+      new Promise(resolve => setTimeout(resolve, Math.max(0, waitMs))),
+    ])
+    for (const [taskId] of running) {
+      this.runners.delete(taskId)
+      this.activeTaskIds.delete(taskId)
+    }
     // S11: reset counters and pending notifications so a re-created bridge for
     // the same session starts cleanly.
     this._finishedCount = 0
@@ -683,10 +711,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
             this._clearParentAbortForwarder(taskId)
             this._finishedCount++
             this._scheduleDrain()
-          })
+        })
 
         if (this.startDelayMs > 0 && this.startQueue.length > 0) {
-          await new Promise(resolve => setTimeout(resolve, this.startDelayMs))
+          await this._sleepStartDelay(this.startDelayMs)
         }
       }
     } finally {
@@ -699,6 +727,14 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         this._scheduleDrain()
       }
     }
+  }
+
+  private _sleepStartDelay(ms: number): Promise<void> {
+    if (ms <= 0 || this.destroyed) return Promise.resolve()
+    return new Promise(resolve => {
+      const timer = setTimeout(resolve, ms)
+      if (timer.unref) timer.unref()
+    })
   }
 }
 

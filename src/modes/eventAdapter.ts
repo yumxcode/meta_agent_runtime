@@ -84,6 +84,12 @@ export function translateKernelEvent(
       }]
     }
 
+    case 'compact_start':
+      return [{
+        type: 'compact_start',
+        sessionId: state.sessionId,
+      }]
+
     // compact_boundary, system_message, tool_use_summary — not surfaced upstream
     default:
       return []

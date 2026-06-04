@@ -1,11 +1,12 @@
 import { readFile, readdir } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteFile, atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
 import type { ExperienceEntry, ExperienceSearchQuery, KnowledgeConfidenceTier, RoboticsDomain } from './types.js'
 import { makeExperienceId } from './types.js'
 
-const EXPERIENCE_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'experiences')
+const EXPERIENCE_ROOT = join(META_AGENT_HOME, 'robotics', 'experiences')
 const INDEX_FILE = 'EXPERIENCE_INDEX.md'
 const MANIFEST_FILE = 'EXPERIENCE_MANIFEST.json'
 const MAX_INDEX_ENTRIES = 100   // hard cap on index entries shown

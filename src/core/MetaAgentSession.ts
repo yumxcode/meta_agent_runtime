@@ -30,9 +30,9 @@ import { randomUUID } from 'crypto'
 import { writeFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
+import { buildAnthropicAuth } from '../kernel/api/AnthropicClient.js'
 import {
   resolveConfig,
-  isAnthropicProvider,
   DEFAULT_SYSTEM_PROMPT,
   type MetaAgentConfig,
   type ResolvedConfig,
@@ -146,15 +146,18 @@ export class MetaAgentSession {
 
     if (!this.config.apiKey) {
       throw new Error(
-        'API key is required. Set DEEPSEEK_API_KEY (DeepSeek), ANTHROPIC_API_KEY (Anthropic), ' +
-        'or QWEN_API_KEY (Qwen) — the provider and endpoint are auto-detected from the key.\n' +
+        'API key is required. Set ZHIPU_API_KEY (GLM coding plan), DEEPSEEK_API_KEY (DeepSeek), ' +
+        'QWEN_API_KEY (Qwen), or ANTHROPIC_API_KEY (Anthropic) — the provider and endpoint are ' +
+        'auto-detected from the key.\n' +
         'You can also pass config.apiKey and optionally config.baseURL for custom endpoints.',
       )
     }
 
-    // Anthropic client for memory relevance side-calls (not used for the loop)
+    // Anthropic-format client for memory relevance side-calls (not used for the
+    // loop). buildAnthropicAuth picks Bearer vs x-api-key so Anthropic-compat
+    // providers like GLM/Zhipu authenticate correctly.
     this.client = new Anthropic({
-      apiKey: this.config.apiKey,
+      ...buildAnthropicAuth(this.config.apiKey, this.config.baseURL),
       baseURL: this.config.baseURL,
       maxRetries: this.config.maxRetries,
     })
@@ -282,7 +285,10 @@ export class MetaAgentSession {
     // per-turn state on every submission.
     const volatileSections = buildVolatileContextSections({
       currentQuery:   prompt,
-      client:         isAnthropicProvider(this.config.baseURL) ? this.client : undefined,
+      // Any Anthropic-format provider (native Anthropic, GLM/Zhipu, Qwen) can
+      // use the flash model for memory recall; OpenAI-protocol providers
+      // (DeepSeek) fall back to keyword matching since this client can't reach them.
+      client:         this.config.protocol === 'anthropic' ? this.client : undefined,
       mode,
       domain:         this.config.domain,
       subAgentBridge: this._subAgentBridge,

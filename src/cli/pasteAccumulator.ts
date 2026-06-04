@@ -121,6 +121,17 @@ export class PasteAccumulator {
     return this.flush()
   }
 
+  /**
+   * True while input is still being collected — either lines are buffered, a
+   * bracketed-paste region is open, or the chunk behind the pending line(s) is
+   * pasted content. The CLI uses this to blank readline's `you ›` prompt so the
+   * trailing partial line of a multi-line paste doesn't get the prompt
+   * re-prepended on redraw (a purely cosmetic "second prompt" artifact).
+   */
+  get buffering(): boolean {
+    return this.lines.length > 0 || this.pasteOpen || this.chunkIsPaste
+  }
+
   /** Discard all accumulated lines and paste state without submitting. */
   clear(): void {
     this.lines.length = 0

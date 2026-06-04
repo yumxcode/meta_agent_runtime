@@ -2,7 +2,7 @@
  * TaskContractStore — file-backed persistence for TaskContract objects.
  *
  * Storage layout:
- *   ~/.claude/meta-agent/tasks/<contractId>/contract.json
+ *   ~/.meta-agent/tasks/<contractId>/contract.json
  *
  * Design invariants:
  *   - Load/save are atomic (write to tmp then rename on POSIX; best-effort on Windows)
@@ -14,6 +14,7 @@
 import { readdir } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../metaAgentHome.js'
 import { atomicWriteJson, readJsonFile, deleteJsonFile } from '../persist/index.js'
 import type { TaskContract } from './types.js'
 
@@ -21,7 +22,7 @@ import type { TaskContract } from './types.js'
 // Paths
 // ─────────────────────────────────────────────────────────────────────────────
 
-const TASKS_DIR = join(homedir(), '.claude', 'meta-agent', 'tasks')
+const TASKS_DIR = join(META_AGENT_HOME, 'tasks')
 
 export function getContractDir(contractId: string): string {
   return join(TASKS_DIR, contractId)

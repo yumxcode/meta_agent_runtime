@@ -5,7 +5,7 @@
  * The tracker is the single source of truth for "why does this number exist?"
  *
  * Storage layout:
- *   ~/.claude/meta-agent/sessions/{sessionId}/provenance/{provenanceId}.json
+ *   ~/.meta-agent/sessions/{sessionId}/provenance/{provenanceId}.json
  *
  * Each record is one JSON file — no database, no index required for the
  * expected record counts.  loadAll() reads all files in the provenance dir;
@@ -24,6 +24,7 @@ import { createHash } from 'crypto'
 import { readFile, readdir, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { atomicWriteJson } from '../core/persist/index.js'
 
 import type {
@@ -41,7 +42,7 @@ import { failures } from '../validation/types.js'
 
 function provenanceDir(sessionId: string): string {
   // Unified root: matches CampaignStateStore and MetaAgentContextStore layout.
-  return join(homedir(), '.claude', 'meta-agent', 'sessions', sessionId, 'provenance')
+  return join(META_AGENT_HOME, 'sessions', sessionId, 'provenance')
 }
 
 function recordPath(sessionId: string, id: ProvenanceId): string {

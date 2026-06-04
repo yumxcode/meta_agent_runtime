@@ -31,6 +31,7 @@ import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { getModelProtocol } from '../providers/registry.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
@@ -40,6 +41,7 @@ import { PhysicalAnchorPendingStore } from '../robotics/PhysicalAnchorPendingSto
 import { PhysicalAnchorStore } from '../robotics/PhysicalAnchorStore.js'
 import { PrinciplePendingStore } from '../robotics/PrinciplePendingStore.js'
 import { PrincipleStore } from '../robotics/PrincipleStore.js'
+import { MemoryPendingStore, getMemoryPendingStore, ensureMemoryPendingLoaded } from '../core/memory/MemoryPendingStore.js'
 import {
   TEAM_PLANNER_SYSTEM,
   buildTeamPlannerUserMessage,
@@ -55,6 +57,7 @@ import type {
 import { isStaleClaim } from '../robotics/team/TeamStore.js'
 import { SessionStore } from '../core/SessionStore.js'
 import { detectProvider } from '../core/config.js'
+import { loadModelConfigFile } from '../core/modelConfigFile.js'
 import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveCommandPatterns.js'
 import { executePlan } from './teamPlannerExecutor.js'
 import { resolveTemplate } from './hardwareTemplate.js'
@@ -155,6 +158,8 @@ ${bold('INTERACTIVE COMMANDS')}
   /principle review     Interactively review & commit pending principles
   /anchor               Show pending physical anchor queue (robotics mode)
   /anchor review        Interactively review & commit pending physical anchors
+  /memory               Show pending memory queue (all modes)
+  /memory review        Interactively review & commit pending memories
   /clear                Start a new session (same workspace/hardware)
   /exit  or  Ctrl+D     Quit
 
@@ -164,11 +169,24 @@ ${bold('DURING A TURN')}
   Ctrl+C                Interrupt the current turn (press twice to quit)
 
 ${bold('ENVIRONMENT VARIABLES')}
-  DEEPSEEK_API_KEY      DeepSeek API key  ${dim('← default provider')}
+  ZHIPU_API_KEY         GLM coding plan key  ${dim('← default provider (glm-5.1)')}
+  DEEPSEEK_API_KEY      DeepSeek API key
   ANTHROPIC_API_KEY     Anthropic API key
   QWEN_API_KEY          Qwen API key
 
-  Priority: DEEPSEEK_API_KEY > QWEN_API_KEY > ANTHROPIC_API_KEY
+  Priority: ZHIPU_API_KEY > DEEPSEEK_API_KEY > QWEN_API_KEY > ANTHROPIC_API_KEY
+
+${bold('CONFIG FILE')}
+  ${cyan('~/.meta-agent/config.json')}  ${dim('(legacy: ~/.claude/meta-agent/config.json)')}
+  Pins model selection without env vars or flags. All fields optional:
+    {
+      "mainModel":     "glm-5.1",
+      "fallbackModel": "glm-4.6",
+      "flashModel":    "glm-4.5-air",
+      "apiKey":        "...",
+      "baseURL":       "https://open.bigmodel.cn/api/anthropic"
+    }
+  Precedence: config file > CLI flags > built-in defaults.
 
 ${bold('EXAMPLES')}
   ${gray('# Set key once, then use freely')}
@@ -339,7 +357,7 @@ function validateKey(raw: string, label: string): string {
  * Only an explicit --api-key flag is forwarded as cfg.apiKey.
  */
 function sanitizeEnvKeys(): void {
-  for (const k of ['DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'QWEN_API_KEY'] as const) {
+  for (const k of ['ZHIPU_API_KEY', 'ZAI_API_KEY', 'GLM_API_KEY', 'DEEPSEEK_API_KEY', 'ANTHROPIC_API_KEY', 'QWEN_API_KEY'] as const) {
     const raw = process.env[k]
     if (raw) process.env[k] = validateKey(raw, k)
   }
@@ -358,17 +376,23 @@ function resolveExplicitApiKey(opts: CliOptions): string | undefined {
 function assertApiKeyConfigured(opts: CliOptions): void {
   const explicitApiKey = resolveExplicitApiKey(opts)
   if (explicitApiKey) opts.apiKey = explicitApiKey
+  // Mirror resolveConfig()'s precedence (file > CLI/env): the global config file
+  // (~/.meta-agent/config.json) may supply apiKey / baseURL / model. Without
+  // folding it in here, a valid config-file key would be wrongly rejected at the
+  // startup gate even though the session would later resolve it fine.
+  const file = loadModelConfigFile()
   const detected = detectProvider({
-    apiKey: explicitApiKey,
-    baseURL: opts.baseUrl,
-    model: opts.model,
+    apiKey:  file.apiKey  ?? explicitApiKey,
+    baseURL: file.baseURL ?? opts.baseUrl,
+    model:   file.mainModel ?? opts.model,
   })
   if (detected.apiKey) return
 
   console.error(
     red('Error: API key is required before starting a session.') + '\n' +
     dim('Set one of these environment variables, or pass --api-key:') + '\n' +
-    `  ${cyan('export DEEPSEEK_API_KEY="sk-..."')} ${dim('(default provider)')}\n` +
+    `  ${cyan('export ZHIPU_API_KEY="..."')} ${dim('(default provider — glm-5.1)')}\n` +
+    `  ${cyan('export DEEPSEEK_API_KEY="sk-..."')}\n` +
     `  ${cyan('export QWEN_API_KEY="sk-..."')}\n` +
     `  ${cyan('export ANTHROPIC_API_KEY="sk-..."')}\n` +
     `  ${cyan('meta-agent --api-key sk-... "your prompt"')}\n`,
@@ -783,6 +807,18 @@ function makeRouter(
   rl?: readline.Interface,
   initialMessages?: ConversationMessage[],
   getRouter?: () => SessionRouter | undefined,
+  /**
+   * REPL-provided line reader that pulls the next user line from the REPL's
+   * shared input queue. Passed so mid-turn confirmations (e.g. the multi-agent
+   * escalation prompt) never read raw stdin behind readline's back — doing so
+   * loses the keystroke to readline's own 'line' handler and hangs the turn.
+   */
+  promptLine?: (question: string) => Promise<string | null>,
+  /**
+   * Id of the robotics session being resumed.  Forwarded so RoboticsSession
+   * binds R5 / project state to this exact session via findBySession().
+   */
+  resumeSessionId?: string,
 ): SessionRouter {
   const cfg: MetaAgentConfig & RouterOptions = {}
   // Only forward explicit --api-key; env-var keys are read by detectProvider() itself
@@ -814,6 +850,8 @@ function makeRouter(
     // Signal to RoboticsSession that this is an explicit resume so R5 shows
     // the resume banner and prior progress notes.
     cfg.explicitResume = true
+    // Bind R5 to the exact picked session (session-level milestone record).
+    if (resumeSessionId) cfg.resumeSessionId = resumeSessionId
   }
 
   // Multi-agent escalation confirmation — shown when flash classifier suggests 'multi'.
@@ -822,16 +860,27 @@ function makeRouter(
     if (opts.json) return false  // non-interactive mode: always deny
     if (opts.yes) return true    // auto-approve mode: always allow
 
-    process.stdout.write(
+    const banner =
       `\n${yellow('⚡ Multi-Agent 升级请求')}\n` +
       `   ${dim('理由：')}${reason}\n\n` +
       `   Multi-Agent 模式将启用并行子 Agent 编排、独立 Git 分支隔离和实验调度。\n` +
       `   单次任务费用和延迟会相应增加。\n\n` +
-      `   是否升级到 Multi-Agent 模式？ ${dim('[y/N]')} `,
-    )
+      `   是否升级到 Multi-Agent 模式？ ${dim('[y/N]')} `
 
+    // Preferred path: read through the REPL's shared input queue so the answer
+    // arrives via readline's normal 'line' event. Reading raw stdin here would
+    // race readline for the keystroke (the prompt would hang) and leave the TTY
+    // in raw mode so Ctrl-C bypasses the SIGINT handler and kills the process.
+    if (promptLine) {
+      const answer = await promptLine(banner)
+      const confirmed = (answer ?? '').trim().toLowerCase().startsWith('y')
+      process.stdout.write(confirmed ? `${green('  → 升级')}\n\n` : `${dim('  → 保持单 Agent')}\n\n`)
+      return confirmed
+    }
+
+    // Fallback (no REPL readline, e.g. piped/headless): raw stdin one-shot read.
+    process.stdout.write(banner)
     return new Promise<boolean>(resolve => {
-      // Use raw stdin so we don't disturb the outer readline interface
       process.stdin.setRawMode?.(true)
       process.stdin.resume()
       process.stdin.setEncoding('utf8')
@@ -839,8 +888,7 @@ function makeRouter(
         process.stdin.setRawMode?.(false)
         process.stdin.pause()
         process.stdin.removeListener('data', onKey)
-        const answer = key.trim().toLowerCase()
-        const confirmed = answer === 'y'
+        const confirmed = key.trim().toLowerCase() === 'y'
         process.stdout.write(confirmed ? `${green('y')}\n\n` : `${dim('N')}\n\n`)
         resolve(confirmed)
       }
@@ -938,7 +986,7 @@ async function streamExperienceSummary(
     const { apiKey, baseURL, flashModel } = router.getProviderConfig()
     if (!apiKey) return
 
-    if (flashModel.startsWith('deepseek-')) {
+    if (getModelProtocol(flashModel, baseURL) === 'openai') {
       const OpenAI = (await import('openai')).default
       const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
       const stream = await client.chat.completions.create({
@@ -1201,6 +1249,11 @@ async function streamPrompt(
           )
           break
         }
+        case 'compact_start': {
+          meter.hide()
+          await safeStdoutWrite(`\n${dim('🗜  会话压缩中…')}\n`)
+          break
+        }
         case 'result': {
           meter.hide()
           await closeThinkingBlock()
@@ -1367,6 +1420,75 @@ async function reviewPendingExperiences(
       console.log(dim('  已跳过 (保留在待审队列)'))
     }
   }
+
+  const remaining = pending.count
+  if (committed > 0 || remaining > 0) {
+    console.log(
+      `\n${green(`✓ 已提交 ${committed} 条`)}` +
+      (remaining > 0 ? `  ${yellow(`剩余 ${remaining} 条待审`)}` : '') +
+      '\n',
+    )
+  }
+  return committed
+}
+
+// ── Memory review ──────────────────────────────────────────────────────────────
+
+/**
+ * Interactive review of pending memory entries (global, all modes).
+ * Each proposal was queued either by the `memory_write` tool or the
+ * post-session auto-writer. Only approved entries are written to the global
+ * memory directory. Returns the count of committed entries.
+ */
+async function reviewPendingMemories(
+  rl: readline.Interface,
+  pending: MemoryPendingStore,
+): Promise<number> {
+  const entries = [...pending.list()]
+  if (entries.length === 0) {
+    console.log(dim('\n暂无待审记忆条目。\n'))
+    return 0
+  }
+
+  console.log(
+    `\n${bold('记忆审核')} ${dim(`(${entries.length} 条待审)`)}\n` +
+    `${dim('记忆仅存储用户画像 (user) 与反馈 (feedback)，需要你审核后才会写入。')}\n`,
+  )
+
+  let committed = 0
+  for (const entry of entries) {
+    const p = entry.proposal
+    const origin = entry.origin === 'auto' ? '自动提取' : 'AI 主动'
+    console.log(
+      `\n${'─'.repeat(60)}\n` +
+      `${bold(p.name)} ${dim(`[${p.type}]`)} ${dim(`(${origin})`)}\n` +
+      `${dim('摘要:')} ${p.description}\n` +
+      `${dim('正文:')} ${p.body.slice(0, 300)}${p.body.length > 300 ? '…' : ''}\n` +
+      `${dim('文件:')} ${p.filename}\n` +
+      `${'─'.repeat(60)}\n`,
+    )
+
+    const choice = await askQuestion(rl, `提交 [y=是 / n=丢弃 / s=跳过]: `)
+    const c = choice.trim().toLowerCase()
+    if (c === 'y' || c === 'yes') {
+      const result = await pending.commit(entry.pendingId)
+      if (result.ok) {
+        console.log(green(`  ✓ 已写入记忆 (${result.filename})`))
+        committed++
+      } else if (result.reason === 'duplicate' || result.reason === 'exists') {
+        console.log(yellow(`  ⚠ 已存在同名记忆，已跳过 (${result.detail ?? p.filename})`))
+        pending.remove(entry.pendingId)
+      } else {
+        console.log(red(`  ✗ 写入失败${result.detail ? `: ${result.detail}` : ''}`))
+      }
+    } else if (c === 'n') {
+      pending.remove(entry.pendingId)
+      console.log(dim('  已丢弃'))
+    } else {
+      console.log(dim('  已跳过 (保留在待审队列)'))
+    }
+  }
+  await pending.flush()
 
   const remaining = pending.count
   if (committed > 0 || remaining > 0) {
@@ -1659,7 +1781,7 @@ async function callTeamPlanner(router: SessionRouter, input: string, snapshot: T
     const { apiKey, baseURL, flashModel } = router.getProviderConfig()
     if (!apiKey) return null
 
-    if (flashModel.startsWith('deepseek-')) {
+    if (getModelProtocol(flashModel, baseURL) === 'openai') {
       const OpenAI = (await import('openai')).default
       const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
       const message = await client.chat.completions.create({
@@ -2136,16 +2258,21 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // Create rl BEFORE router so makeRouter can capture it in beforeToolCall.
   // The guard hook uses this interface; creating it later would mean the first
   // router is built without a guard (before the first `/clear`).
+  const PROMPT_YOU = `\n${bold(cyan('you'))} › `
   const rl = createInterface({
     input:  process.stdin,
     output: process.stdout,
-    prompt: `\n${bold(cyan('you'))} › `,
+    prompt: PROMPT_YOU,
     terminal: isTTY,
     historySize: 100,
   })
 
   // ── Session resume ────────────────────────────────────────────────────────
   let resumedMessages: ConversationMessage[] = []
+  // The picked session's id — forwarded to RoboticsSession as resumeSessionId so
+  // R5 binds to THIS exact session's milestone bucket (findBySession) rather than
+  // the most recently active session in the workspace.
+  let resumedSessionId: string | undefined
   if (!opts.json && isTTY) {
     if (opts.resume) {
       // Explicit --resume <id> or --resume last
@@ -2164,6 +2291,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           )
         } else {
           resumedMessages = await SessionStore.loadHistory(targetId)
+          resumedSessionId = targetId
           // Restore the mode from the saved session.
           if (meta && opts.mode === 'auto' && meta.mode && meta.mode !== 'auto') {
             opts.mode = meta.mode as CliOptions['mode']
@@ -2182,6 +2310,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
         const resumed = await runSessionPicker(rl, opts.workspace)
         if (resumed) {
           resumedMessages = resumed.messages
+          resumedSessionId = resumed.sessionId
           // Restore the mode from the saved session so the router starts in the
           // correct mode instead of re-detecting it from the first user message.
           if (opts.mode === 'auto' && resumed.mode && resumed.mode !== 'auto') {
@@ -2194,7 +2323,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
 
   let router: SessionRouter
   const getCurrentRouter = () => router
-  router = makeRouter(opts, hardwareProfileText || undefined, rl, resumedMessages.length > 0 ? resumedMessages : undefined, getCurrentRouter)
+  router = makeRouter(opts, hardwareProfileText || undefined, rl, resumedMessages.length > 0 ? resumedMessages : undefined, getCurrentRouter, _promptLineInline, resumedSessionId)
 
   // Register standard tools for agentic/campaign/auto modes.
   // Robotics mode registers its own tools internally (RoboticsSession.init).
@@ -2368,13 +2497,25 @@ async function runRepl(opts: CliOptions): Promise<void> {
   let _isStreaming = false
   let _steerArmed = false
   let _steerNotify: (() => void) | null = null
+  // True only while readline owns the `steer ›` prompt during a steer input, so
+  // the paste-driven prompt sync below doesn't clobber it back to `you ›`.
+  let _steerInputActive = false
+  // True while a wizard (e.g. the hardware-profile prompts) owns the line via
+  // rl.question(). Unlike interactiveInputActive (used by _promptLineInline,
+  // which reads through the shared paste queue), a wizard reads input NATIVELY
+  // through readline — so the stdin 'data' handler must NOT feed the paste
+  // accumulator or reset the prompt while it's set, and the 'line' handler must
+  // not enqueue. Otherwise the data handler clobbers the wizard's question
+  // prompt with `you ›` on every keystroke, and the accumulator is left in a
+  // half-buffered state that swallows the first real line afterward (the
+  // "wizard hint vanishes, then the prompt freezes" bug).
+  let _wizardActive = false
   const _armSteer = (): void => {
     _steerArmed = true
     const notify = _steerNotify
     _steerNotify = null
     notify?.()
   }
-  const _youPrompt = `\n${bold(cyan('you'))} › `
   const _steerPrompt = `${bold(cyan('steer'))} › `
   const steerHooks = {
     waitArmed: (): Promise<void> =>
@@ -2383,11 +2524,12 @@ async function runRepl(opts: CliOptions): Promise<void> {
     beginInput: (): void => {
       // readline now renders + redraws THIS prompt as the user types, so the
       // line stays a `steer ›` line instead of reverting to `you ›`.
+      _steerInputActive = true
       rl.setPrompt(_steerPrompt)
       rl.prompt()
     },
     read: (): Promise<string | null> => _nextInput(),
-    endInput: (): void => { rl.setPrompt(_youPrompt) },
+    endInput: (): void => { _steerInputActive = false; rl.setPrompt(PROMPT_YOU) },
   }
 
   function _enqueueInput(combined: string): void {
@@ -2404,6 +2546,39 @@ async function runRepl(opts: CliOptions): Promise<void> {
     return new Promise<string | null>(resolve => _inputResolvers.push(resolve))
   }
 
+  // Inline confirmation reader for mid-turn prompts (e.g. multi-agent escalation).
+  // Prints the question and reads the next line through the SAME shared queue the
+  // main loop uses, so the keystroke is never lost to a competing raw-stdin read.
+  // Marks input active so the team-reminder timer doesn't fire over the prompt.
+  async function _promptLineInline(question: string): Promise<string | null> {
+    setInteractiveActive(true)
+    try {
+      process.stdout.write(question)
+      return await _nextInput()
+    } finally {
+      setInteractiveActive(false)
+      if (isTTY && !_steerInputActive) rl.setPrompt(PROMPT_YOU)
+    }
+  }
+
+  // Run an interactive wizard that reads input natively via rl.question() (the
+  // hardware-profile prompts). While it runs we suspend the paste accumulator
+  // and prompt-sync (see _wizardActive), then clear any stale chunk state and
+  // restore the `you ›` prompt so the main loop's next line is classified fresh
+  // and actually reaches _nextInput().
+  async function runWizard<T>(fn: () => Promise<T>): Promise<T> {
+    _wizardActive = true
+    setInteractiveActive(true)   // also silence the team-reminder timer
+    try {
+      return await fn()
+    } finally {
+      _wizardActive = false
+      setInteractiveActive(false)
+      _paste.clear()
+      if (isTTY) rl.setPrompt(PROMPT_YOU)
+    }
+  }
+
   // Must be prepended so it fires BEFORE readline's own 'data' handler — this
   // guarantees the chunk is recorded before any resulting 'line' event fires.
   process.stdin.prependListener('data', (buf: Buffer) => {
@@ -2415,15 +2590,34 @@ async function runRepl(opts: CliOptions): Promise<void> {
       _paste.resetChunk()   // SIGINT drain — don't classify against this chunk
       return
     }
+    // A wizard (rl.question) owns the line: let readline render and read it
+    // natively. Touching the paste state or prompt here would overwrite the
+    // wizard's question prompt with `you ›` and corrupt the accumulator.
+    if (_wizardActive) return
     _paste.onData(buf.toString())
+    // While a multi-line paste is still being collected, blank readline's prompt
+    // so the trailing partial line isn't redrawn with a second `you ›` prefix on
+    // the next keystroke. Restored to PROMPT_YOU once the buffer flushes. Skipped
+    // during a steer input so it doesn't clobber the `steer ›` prompt.
+    if (isTTY && !_steerInputActive) {
+      rl.setPrompt(_paste.buffering ? '' : PROMPT_YOU)
+    }
   })
 
   rl.on('line', (rawLine) => {
     if (Date.now() < ignoreInputUntil) return   // SIGINT drain — silently discard
+    // A wizard's rl.question consumes lines via its own callback; this listener
+    // must stay out of the way so it doesn't double-handle or enqueue them.
+    if (_wizardActive) return
     // Returns a complete message only on a bare Enter; null means "still a
     // paste in progress — accumulate and wait for the user's explicit Enter".
     const submit = _paste.onLine(rawLine)
-    if (submit !== null) _enqueueInput(submit)
+    if (submit !== null) {
+      // Buffer flushed — restore the normal prompt for the next turn (the data
+      // handler blanked it while the paste was being collected).
+      if (isTTY && !_steerInputActive) rl.setPrompt(PROMPT_YOU)
+      _enqueueInput(submit)
+    }
   })
 
   rl.on('SIGINT', () => {
@@ -2437,6 +2631,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // Clear any paste accumulator state so buffered content before the
     // interrupt is not submitted after the drain window expires.
     _paste.clear()
+    if (isTTY) rl.setPrompt(PROMPT_YOU)   // paste-collection may have blanked it
     process.stdout.write(`\n${yellow('Interrupted')} ${dim('(press Ctrl+C again to exit)')}\n`)
     setTimeout(() => { ctrlCPressed = false }, 2000)
     rl.prompt()
@@ -2485,6 +2680,16 @@ async function runRepl(opts: CliOptions): Promise<void> {
             console.log(
               `${yellow(`⏸  ${principleCount} 条原则待审核`)} — ` +
               `${dim('下次在同一项目启动 robotics 模式后，可用 /principle review 审核提交。')}\n`,
+            )
+          }
+          // Memory is global (all modes). Surface tool-proposed memories queued
+          // this session; the post-session auto-writer runs inside dispose()
+          // below and its proposals are surfaced via /memory on next launch.
+          const memoryCount = getMemoryPendingStore().count
+          if (memoryCount > 0) {
+            console.log(
+              `${yellow(`⏸  ${memoryCount} 条记忆待审核`)} — ` +
+              `${dim('使用 /memory review 审核提交。')}\n`,
             )
           }
           console.log(`\n${dim('Goodbye.')}\n`)
@@ -2546,12 +2751,12 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(`\n${yellow('硬件选择仅在 robotics 模式下可用。')}\n`)
             } else {
               const hp = new HardwareProfile()
-              const selected = await selectHardwareProfile(hp, opts.workspace, rl)
+              const selected = await runWizard(() => selectHardwareProfile(hp, opts.workspace, rl))
               opts.hardwareId     = selected.name || undefined
               hardwareProfileText = selected.profileText
               // Rebuild router with the new hardware binding (keeps same workspace/key/model)
               await router.dispose().catch(() => undefined)
-              router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter)
+              router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter, _promptLineInline)
               savedMessageCount = 0
               console.log(green('\n✓ 硬件配置已更新，新会话已启动。\n'))
             }
@@ -2654,7 +2859,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
                   console.log(green(`✓ 已加载 ${messages.length} 条历史消息，继续 ${selected.mode} 模式。\n`))
                   opts.mode = selected.mode as CliOptions['mode']
                   await router.dispose().catch(() => undefined)
-                  router = makeRouter(opts, hardwareProfileText || undefined, rl, messages, getCurrentRouter)
+                  router = makeRouter(opts, hardwareProfileText || undefined, rl, messages, getCurrentRouter, _promptLineInline, selected.sessionId)
                   savedMessageCount = messages.length
                 }
               }
@@ -2664,10 +2869,22 @@ async function runRepl(opts: CliOptions): Promise<void> {
         }
         case '/experience': {
           const subCmd = input.split(/\s+/).slice(1).join(' ').toLowerCase()
-          const pending = router.getPendingExperiences()
+          let pending = router.getPendingExperiences()
+          // The robotics session is created lazily on the first message, so
+          // before any prompt is sent `getPendingExperiences()` is null even in
+          // robotics mode. Pending experiences are disk-persisted per project,
+          // so load them directly to support "resume → review" without first
+          // having to send a message.
+          if (!pending && (opts.mode === 'robotics' || router.mode === 'robotics')) {
+            const diskStore = new ExperiencePendingStore(opts.workspace)
+            await diskStore.load()
+            pending = diskStore
+          }
           if (subCmd === 'review') {
             if (!pending) {
               console.log(yellow('\n/experience review 仅在 robotics 模式下可用。\n'))
+            } else if (pending.count === 0) {
+              console.log(`\n${dim('暂无待审经验。')}\n`)
             } else {
               const store = new ExperienceStore()
               await reviewPendingExperiences(rl, pending, store, async id => {
@@ -2730,6 +2947,27 @@ async function runRepl(opts: CliOptions): Promise<void> {
           }
           break
         }
+        case '/memory': {
+          const subCmd = input.split(/\s+/).slice(1).join(' ').toLowerCase()
+          // Memory is global (all modes); load the process-wide queue from disk.
+          await ensureMemoryPendingLoaded()
+          const pendingMemories = getMemoryPendingStore()
+          if (subCmd === 'review') {
+            if (pendingMemories.count === 0) {
+              console.log(`\n${dim('暂无待审记忆。')}\n`)
+            } else {
+              await reviewPendingMemories(rl, pendingMemories)
+            }
+          } else {
+            const count = pendingMemories.count
+            if (count > 0) {
+              console.log(`\n${yellow(`⏸  ${count} 条记忆待审核`)} — 使用 ${cyan('/memory review')} 审核提交\n`)
+            } else {
+              console.log(`\n${dim('暂无待审记忆。')}\n`)
+            }
+          }
+          break
+        }
         case '/team': {
           const [, rawTeamSub = ''] = input.split(/\s+/)
           const teamSub = rawTeamSub.toLowerCase()
@@ -2743,7 +2981,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
         }
         case '/clear':
           await router.dispose().catch(() => undefined)
-          router = makeRouter(opts, undefined, rl, undefined, getCurrentRouter)
+          router = makeRouter(opts, undefined, rl, undefined, getCurrentRouter, _promptLineInline)
           savedMessageCount = 0
           console.log(green('\nNew session started.\n'))
           break
@@ -2774,13 +3012,13 @@ async function runRepl(opts: CliOptions): Promise<void> {
           `在继续之前，请绑定一个硬件配置。\n`,
         )
         const hp = new HardwareProfile()
-        const selected = await selectHardwareProfile(hp, opts.workspace, rl)
+        const selected = await runWizard(() => selectHardwareProfile(hp, opts.workspace, rl))
         opts.hardwareId     = selected.name || undefined
         hardwareProfileText = selected.profileText
         // Lock mode so the new router skips re-detection (no second flash model call)
         opts.mode = 'robotics'
         await router.dispose().catch(() => undefined)
-        router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter)
+        router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter, _promptLineInline)
         if (opts.hardwareId) {
           console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定。\n`))
         }
@@ -2850,14 +3088,14 @@ async function runRepl(opts: CliOptions): Promise<void> {
         `\n${c.magenta}robotics${c.reset} 模式已激活，请绑定硬件配置以优化后续回复。\n`,
       )
       const hp = new HardwareProfile()
-      const selected = await selectHardwareProfile(hp, opts.workspace, rl)
+      const selected = await runWizard(() => selectHardwareProfile(hp, opts.workspace, rl))
       opts.hardwareId     = selected.name || undefined
       hardwareProfileText = selected.profileText
       if (hardwareProfileText) {
         await persistCurrentSession(input)
         opts.mode = 'robotics'
         await router.dispose().catch(() => undefined)
-        router = makeRouter(opts, hardwareProfileText, rl, undefined, getCurrentRouter)
+        router = makeRouter(opts, hardwareProfileText, rl, undefined, getCurrentRouter, _promptLineInline)
         savedMessageCount = 0
       }
       if (opts.hardwareId) {

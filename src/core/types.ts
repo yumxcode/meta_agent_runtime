@@ -66,6 +66,12 @@ export interface MetaAgentStreamEvent {
   sessionId: string
 }
 
+/** Conversation compaction has started (slow, LLM-backed) — for a "compacting…" UI hint */
+export interface MetaAgentCompactStartEvent {
+  type: 'compact_start'
+  sessionId: string
+}
+
 /** Retry notification when API returns a retryable error */
 export interface MetaAgentRetryEvent {
   type: 'api_retry'
@@ -83,6 +89,7 @@ export type MetaAgentEvent =
   | MetaAgentResultEvent
   | MetaAgentStreamEvent
   | MetaAgentRetryEvent
+  | MetaAgentCompactStartEvent
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool interface — every capability registered in the ToolRegistry implements this
@@ -246,6 +253,12 @@ export interface MetaAgentTool {
   isConcurrencySafe?: boolean
   /** Maximum characters to keep from this tool's result. Undefined uses runtime default. */
   maxResultSizeChars?: number
+  /**
+   * Per-tool execution timeout in ms. Undefined → kernel default (3 min).
+   * Set to 0 to opt out (e.g. tools that await a sub-agent, which is bounded
+   * by the sub-agent's own 5-min wall-clock cap instead).
+   */
+  timeoutMs?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

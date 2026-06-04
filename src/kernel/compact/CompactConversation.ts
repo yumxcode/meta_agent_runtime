@@ -18,6 +18,8 @@ import type { FileStateCache } from '../session/FileStateCache.js'
 import type { ThinkingConfig } from '../types/KernelConfig.js'
 import { stripImagesFromMessages, normalizeMessagesForAPI } from '../messages/MessageNormalizer.js'
 import { normalizeMessagesForDeepSeek } from '../messages/DeepSeekMessageNormalizer.js'
+import { buildAnthropicAuth } from '../api/AnthropicClient.js'
+import { getModelProtocol } from '../../providers/registry.js'
 import { buildCompactPrompt, formatCompactSummary, extractCompactInstructions } from './CompactPrompt.js'
 import { buildPostCompactMessages } from './PostCompact.js'
 import type { CompactionResult } from './PostCompact.js'
@@ -31,7 +33,11 @@ export interface CompactOptions {
   apiKey?: string
   baseURL?: string
   systemPrompt?: string       // used to extract ## Compact Instructions
-  customInstructions?: string // explicit override
+  /**
+   * Explicit override. May be a thunk resolved here at compaction time so the
+   * instructions reflect live session state rather than config-time state.
+   */
+  customInstructions?: string | (() => string | null | undefined)
   thinkingConfig?: ThinkingConfig
   abortSignal?: AbortSignal
   maxRetries?: number
@@ -48,9 +54,17 @@ export async function compactConversation(
 ): Promise<CompactionResult> {
   const compactModel = options.model ?? COMPACT_MODEL_DEFAULT
 
-  // Extract custom instructions from system prompt if not explicitly provided
+  // Resolve custom instructions. When a thunk is supplied, evaluate it now — at
+  // compaction time — so the instructions reflect live session state (active
+  // task IDs, phase, hardware constraints) rather than config-time state.
+  // Coerce null → undefined so buildCompactPrompt treats "nothing to add" uniformly.
+  const resolvedCustom =
+    typeof options.customInstructions === 'function'
+      ? options.customInstructions() ?? undefined
+      : options.customInstructions
+  // Fall back to extracting ## Compact Instructions from the system prompt.
   const customInstructions =
-    options.customInstructions ??
+    resolvedCustom ??
     (options.systemPrompt ? extractCompactInstructions(options.systemPrompt) : undefined)
 
   const compactSystemPrompt = buildCompactPrompt(customInstructions)
@@ -96,14 +110,14 @@ async function callCompactModel(
   model: string,
   options: CompactOptions,
 ): Promise<string> {
-  // Route to native OpenAI-format client for DeepSeek models
-  if (model.startsWith('deepseek-')) {
+  // Route to native OpenAI-format client for OpenAI-protocol providers (DeepSeek)
+  if (getModelProtocol(model, options.baseURL) === 'openai') {
     return callCompactModelDeepSeek(messages, systemPrompt, model, options)
   }
 
-  // Anthropic path
+  // Anthropic path (incl. Bearer-auth compat endpoints like Zhipu GLM)
   const client = new Anthropic({
-    apiKey: options.apiKey ?? process.env['ANTHROPIC_API_KEY'],
+    ...buildAnthropicAuth(options.apiKey, options.baseURL),
     baseURL: options.baseURL,
     maxRetries: options.maxRetries ?? 2,
   })

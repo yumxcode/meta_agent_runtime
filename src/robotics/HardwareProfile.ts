@@ -1,10 +1,11 @@
 import { readdir } from 'fs/promises'
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, readJsonFile } from '../core/persist/index.js'
 import type { HardwareProfileData } from './types.js'
 
-const PROFILES_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'hardware_profiles')
+const PROFILES_ROOT = join(META_AGENT_HOME, 'robotics', 'hardware_profiles')
 
 export class HardwareProfile {
   private readonly dir: string

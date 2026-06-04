@@ -40,6 +40,29 @@ export interface AutoCompactResult {
 const SKIPPED_QUERY_SOURCES = new Set(['compact', 'session_memory'])
 
 /**
+ * Pure predicate: would autoCompactIfNeeded() actually run a compaction for
+ * this state? Mirrors the recursion-guard / disable / circuit-breaker /
+ * token-threshold gates below so callers (e.g. KernelLoop, to emit a
+ * "compacting…" indicator) can decide WITHOUT triggering the work. Keep this in
+ * lockstep with the gates in autoCompactIfNeeded.
+ */
+export function shouldAutoCompact(
+  messagesForQuery: readonly KernelMessage[],
+  model: string,
+  querySource: string | undefined,
+  tracking: AutoCompactTrackingState | undefined,
+  maxOutputTokens: number | undefined,
+  force = false,
+): boolean {
+  if (querySource && SKIPPED_QUERY_SOURCES.has(querySource)) return false
+  if (isAutoCompactDisabled()) return false
+  if ((tracking?.consecutiveFailures ?? 0) >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) return false
+  if (force) return true
+  const tokenCount = tokenCountWithEstimation(messagesForQuery)
+  return calculateTokenWarningState(tokenCount, model, maxOutputTokens).isAtCompactThreshold
+}
+
+/**
  * Check if auto-compact should trigger, and if so run it.
  *
  * @param messagesForQuery  - The messages that will be sent to the API (after boundary slice)

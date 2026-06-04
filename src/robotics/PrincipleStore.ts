@@ -1,4 +1,5 @@
 import { homedir } from 'os'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile } from '../core/persist/index.js'
 import type {
@@ -8,7 +9,7 @@ import type {
 } from './types.js'
 import { makePrincipleId } from './types.js'
 
-const PRINCIPLE_ROOT = join(homedir(), '.claude', 'meta-agent', 'robotics', 'principles')
+const PRINCIPLE_ROOT = join(META_AGENT_HOME, 'robotics', 'principles')
 const MANIFEST_FILE = 'PRINCIPLE_MANIFEST.json'
 const LOAD_CONCURRENCY = 32
 const PRINCIPLE_ID_RE = /^pr_[0-9a-z]+_[0-9a-f]{8}$/

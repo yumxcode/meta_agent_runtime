@@ -198,7 +198,7 @@ export class JobManager {
           for (const listener of rj.progressListeners) listener(p)
         }
       },
-      onCompleted: (id, partial) => {
+      onCompleted: async (id, partial) => {
         const rj = this.jobs.get(id)
         if (!rj) return
         const now = Date.now()
@@ -213,11 +213,17 @@ export class JobManager {
           metrics: { ...rj.job.metrics },
         }
         rj.result = result
-        this._transition(id, 'completed')
+        const persisted = await this._transition(id, 'completed')
+        if (!persisted) {
+          const err = new Error(`Job ${id} completed but terminal state could not be persisted`)
+          for (const { reject } of rj.completionResolvers) reject(err)
+          rj.completionResolvers = []
+          return
+        }
         for (const { resolve } of rj.completionResolvers) resolve(result)
         rj.completionResolvers = []
       },
-      onFailed: (id, err) => {
+      onFailed: async (id, err) => {
         const rj = this.jobs.get(id)
         if (!rj) return
         const now = Date.now()
@@ -232,11 +238,11 @@ export class JobManager {
           error: err.message,
         }
         rj.result = result
-        this._transition(id, 'failed')
+        await this._transition(id, 'failed')
         for (const { reject } of rj.completionResolvers) reject(err)
         rj.completionResolvers = []
       },
-      onCancelled: (id) => {
+      onCancelled: async (id) => {
         const rj = this.jobs.get(id)
         if (!rj) return
         const now = Date.now()
@@ -249,7 +255,7 @@ export class JobManager {
           metrics: { ...rj.job.metrics },
         }
         rj.result = result
-        this._transition(id, 'cancelled')
+        await this._transition(id, 'cancelled')
         const err = new Error(`Job ${id} was cancelled`)
         for (const { reject } of rj.completionResolvers) reject(err)
         rj.completionResolvers = []
@@ -407,20 +413,26 @@ export class JobManager {
           progressListeners: [],
           completionResolvers: [],
         })
+        if (TERMINAL_STATUSES.has(job.status)) {
+          this._dropFromTerminalOrder(job.jobId)
+          this._terminalOrder.push(job.jobId)
+        }
       }
     }
+    this._evictTerminalIfOverCap()
     return all
   }
 
   // ── internal helpers ───────────────────────────────────────────────────────
 
-  private _transition(jobId: JobId, status: JobStatus): void {
+  private async _transition(jobId: JobId, status: JobStatus): Promise<boolean> {
     const rt = this.jobs.get(jobId)
-    if (!rt) return
+    if (!rt) return false
     rt.job.status = status
     // Fire-and-forget persist with exponential back-off.
-    // Don't await — we're inside an executor callback.
-    void this._persistWithRetry(jobId, { ...rt.job })
+    // Active transitions remain non-blocking; terminal transitions are awaited
+    // by their callbacks before resolving/rejecting awaitJob() callers.
+    const persistPromise = this._persistWithRetry(jobId, { ...rt.job })
 
     // S2: When a job enters a terminal status, drop progress / completion
     // closures (they're already drained by the executor callback) and put the
@@ -428,11 +440,13 @@ export class JobManager {
     // eligible for eviction — active jobs stay in the Map regardless of cap.
     if (TERMINAL_STATUSES.has(status)) {
       rt.progressListeners.length = 0
-      rt.completionResolvers.length = 0
       this._dropFromTerminalOrder(jobId)
       this._terminalOrder.push(jobId)
       this._evictTerminalIfOverCap()
+      return persistPromise
     }
+    void persistPromise
+    return true
   }
 
   /** S2: drop oldest terminal jobs until size ≤ _terminalJobCap. */
@@ -467,12 +481,13 @@ export class JobManager {
     jobId: JobId,
     snapshot: EngineeringJob,
     attempt = 0,
-  ): Promise<void> {
+  ): Promise<boolean> {
     const MAX_RETRIES  = 3
     const BASE_DELAY_MS = 100   // 100 ms, 200 ms, 400 ms
 
     try {
       await this.store.save(snapshot)
+      return true
     } catch (err) {
       if (attempt < MAX_RETRIES - 1) {
         const delay = BASE_DELAY_MS * 2 ** attempt
@@ -500,6 +515,7 @@ export class JobManager {
         for (const { reject } of rt.completionResolvers) reject(persistErr)
         rt.completionResolvers = []
       }
+      return false
     }
   }
 }

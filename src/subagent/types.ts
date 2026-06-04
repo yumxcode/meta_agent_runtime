@@ -63,6 +63,12 @@ export interface SubAgentConfig {
   maxTurns: number
   /** Maximum cost in USD before the sub-agent is force-stopped.  Default: 0.5 */
   maxBudgetUsd: number
+  /**
+   * Maximum wall-clock duration in ms before the sub-agent is force-stopped.
+   * Default: 300_000 (5 min). 0 disables the cap. On timeout the runner
+   * interrupts the inner session and writes a terminal 'failed' state.
+   */
+  maxDurationMs?: number
 
   // ── Notification mode ─────────────────────────────────────────────────────
   /**
@@ -97,7 +103,7 @@ export interface SubAgentConfig {
   /**
    * API key forwarded from the parent session.
    * When omitted the sub-agent runner resolves from env vars
-   * (DEEPSEEK_API_KEY → QWEN_API_KEY → ANTHROPIC_API_KEY in priority order).
+   * (ZHIPU_API_KEY → DEEPSEEK_API_KEY → QWEN_API_KEY → ANTHROPIC_API_KEY in priority order).
    */
   apiKey?: string
   /** Provider base URL forwarded from the parent session. */
@@ -133,6 +139,7 @@ export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> =
   allowedTools:            undefined,
   maxTurns:                10,
   maxBudgetUsd:            0.5,
+  maxDurationMs:           300_000,
   useEventDriven:          true,
   pollIntervalMs:          1_800_000,
   requireHumanApproval:    false,
@@ -208,7 +215,7 @@ export interface SubAgentResult {
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// Persisted record (stored at ~/.claude/meta-agent/subtasks/<taskId>.json)
+// Persisted record (stored at ~/.meta-agent/subtasks/<taskId>.json)
 // ─────────────────────────────────────────────────────────────────────────────
 
 export interface SubAgentRecord {

@@ -15,8 +15,18 @@ export interface CompactConfig {
   enabled: boolean
   /** Model to use for compact summarisation (default: flashModel) */
   model?: string
-  /** Custom compact instructions (injected into the compact prompt's ## Compact Instructions section) */
-  customInstructions?: string
+  /**
+   * Custom compact instructions, injected at the front of the compact side-call
+   * prompt (the ## Additional Instructions section), ahead of the conversation
+   * being summarised.
+   *
+   * May be a plain string, or a thunk resolved lazily at compaction time — use
+   * the thunk form when the instructions depend on live session state (e.g.
+   * active sub-agent task IDs, current phase, hardware constraints) that must be
+   * current at the moment compaction fires rather than captured at config time.
+   * Returning null/undefined from the thunk means "no custom instructions".
+   */
+  customInstructions?: string | (() => string | null | undefined)
   /** querySource tag — 'compact' to prevent recursion */
   querySource?: string
 }

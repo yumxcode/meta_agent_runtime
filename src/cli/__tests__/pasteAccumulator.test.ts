@@ -170,4 +170,37 @@ describe('PasteAccumulator', () => {
     // If readline hands back the marker-laden buffer, it must be cleaned out.
     expect(typeLine(acc, PASTE_START + 'hello' + PASTE_END)).toBe('hello')
   })
+
+  // ── buffering (drives prompt suppression so a paste tail isn't redrawn with a
+  //    second `you ›` prefix) ───────────────────────────────────────────────
+  describe('buffering', () => {
+    it('is false at rest and for a plain typed line', () => {
+      const acc = new PasteAccumulator()
+      expect(acc.buffering).toBe(false)
+      acc.onData('\r')
+      expect(acc.buffering).toBe(false)
+    })
+
+    it('is true while a multi-line paste is being collected, false after flush', () => {
+      const acc = new PasteAccumulator()
+      paste(acc, 'a\nb\nc')          // "a","b" emitted, "c" buffered
+      expect(acc.buffering).toBe(true)
+      typeLine(acc, 'cd')            // explicit Enter flushes the block
+      expect(acc.buffering).toBe(false)
+    })
+
+    it('is true the instant a bracketed paste opens (before any line fires)', () => {
+      const acc = new PasteAccumulator()
+      acc.onData(PASTE_START + 'partial')   // open marker, content, no close yet
+      expect(acc.buffering).toBe(true)
+    })
+
+    it('resets to false after clear()', () => {
+      const acc = new PasteAccumulator()
+      paste(acc, 'a\nb\nc\n')
+      expect(acc.buffering).toBe(true)
+      acc.clear()
+      expect(acc.buffering).toBe(false)
+    })
+  })
 })

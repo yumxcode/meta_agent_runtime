@@ -13,7 +13,7 @@
 import { KernelSession } from '../kernel/index.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import type { MetaAgentConfig } from '../core/config.js'
-import { resolveConfig, detectProvider, isAnthropicProvider } from '../core/config.js'
+import { resolveConfig } from '../core/config.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
 import { toKernelTool } from './toolAdapter.js'
 import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
@@ -48,8 +48,15 @@ export class AgenticSession {
   constructor(config: MetaAgentConfig) {
     this._config = config
     const resolved = resolveConfig(config)
-    const { apiKey, baseURL } = detectProvider(config)
-    const isAnthropic = isAnthropicProvider(baseURL)
+    const apiKey = resolved.apiKey
+    const baseURL = resolved.baseURL
+    const caps = resolved.capabilities
+    // Anthropic-format providers that don't accept the thinking param (e.g. Qwen)
+    // must not receive it; OpenAI-protocol providers map thinking → reasoning_effort
+    // downstream, so leave their config untouched.
+    const thinkingConfig = resolved.protocol === 'anthropic' && !caps.anthropicThinkingParam
+      ? { type: 'disabled' as const }
+      : resolved.thinkingConfig
 
     this._engine = new KernelSession({
       apiKey,
@@ -81,6 +88,11 @@ export class AgenticSession {
       compact: {
         enabled: true,
         model: resolved.flashModel,
+        // Lazy thunk (or string) forwarded from the caller; resolved at
+        // compaction time inside compactConversation(). RoboticsSession uses
+        // this to route its mode-specific compact instructions here instead of
+        // the every-turn volatile prefix.
+        customInstructions: config.compact?.customInstructions,
       },
       // Thinking on the primary model — sourced from resolved.thinkingConfig
       // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the
@@ -89,11 +101,12 @@ export class AgenticSession {
       //   • DeepSeek  → sends `reasoning_effort: 'max'`
       //   • Qwen      → goes through Anthropic-compat endpoint, thinking enabled
       // Fallback model still honours fallbackThinkingConfig (default disabled).
-      thinkingConfig: resolved.thinkingConfig,
-      // Anthropic-only betas: token-efficient-tools + interleaved-thinking
-      // Skip for third-party providers (DeepSeek, Qwen, etc.) — they return 400
-      includeDefaultBetas: isAnthropic ? undefined : false,
-      betas: isAnthropic ? ['token-efficient-tools-2025-02-19'] : [],
+      thinkingConfig,
+      // Anthropic-only betas: token-efficient-tools + interleaved-thinking.
+      // Gated by provider capability — third-party providers (GLM, DeepSeek,
+      // Qwen, …) return 400 when these betas are present.
+      includeDefaultBetas: caps.anthropicBetas ? undefined : false,
+      betas: caps.anthropicBetas ? ['token-efficient-tools-2025-02-19'] : [],
       querySource: 'main',
       debug: resolved.debugMode,
     })
