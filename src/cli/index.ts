@@ -68,6 +68,7 @@ import type { RouterOptions } from '../routing/types.js'
 import type { MetaAgentEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
+import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -3176,6 +3177,10 @@ async function main(): Promise<void> {
   sanitizeEnvKeys()
 
   const opts = parseCliArgs()
+  const bwrapWarning = getMissingBwrapWarning()
+  if (bwrapWarning) {
+    process.stderr.write(`${yellow(bwrapWarning)}\n`)
+  }
   assertApiKeyConfigured(opts)
 
   if (opts.prompt !== null) {
