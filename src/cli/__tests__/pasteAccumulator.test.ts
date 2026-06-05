@@ -157,6 +157,43 @@ describe('PasteAccumulator', () => {
     expect(typeLine(acc, 'c')).toBe('a\nb\nc')
   })
 
+  it('recognises a CLOSING marker split mid-sequence across chunks (the freeze bug)', () => {
+    const acc = new PasteAccumulator()
+    acc.onData(PASTE_START)            // paste opens
+    acc.onData('a\nb\nc')              // content (paste still open)
+    expect(acc.onLine('a')).toBeNull()
+    expect(acc.onLine('b')).toBeNull()
+    expect(acc.buffering).toBe(true)
+    // Closing marker "\x1b[201~" arrives split across a stdin read boundary.
+    acc.onData('\x1b[20')              // first half — must NOT be lost
+    acc.onData('1~')                   // second half completes the marker
+    // Paste must now be closed: a subsequent typed line submits the block.
+    expect(typeLine(acc, 'c')).toBe('a\nb\nc')
+    // And the accumulator is no longer stuck in buffering mode.
+    expect(acc.buffering).toBe(false)
+  })
+
+  it('recognises an OPENING marker split mid-sequence across chunks', () => {
+    const acc = new PasteAccumulator()
+    acc.onData('\x1b[20')              // first half of opening marker
+    acc.onData('0~x\ny\nz')            // completes "\x1b[200~" then content
+    expect(acc.onLine('x')).toBeNull() // classified as paste, accumulated
+    expect(acc.onLine('y')).toBeNull()
+    acc.onData(PASTE_END)
+    expect(typeLine(acc, 'z')).toBe('x\ny\nz')
+  })
+
+  it('does not over-carry a complete marker whose tail looks like a prefix', () => {
+    const acc = new PasteAccumulator()
+    // "\x1b[200~" ends with "\x1b[200", a prefix of the marker — must still be
+    // treated as a COMPLETE opening marker, not held back as a partial.
+    acc.onData(PASTE_START)
+    acc.onData('hello')
+    expect(acc.buffering).toBe(true)   // paste is genuinely open
+    acc.onData(PASTE_END)
+    expect(typeLine(acc, 'hello')).toBe('hello')
+  })
+
   it('does not treat a newline typed after a paste closes as pasted', () => {
     const acc = new PasteAccumulator()
     expect(bracketPaste(acc, 'one\n')).toEqual([null])

@@ -74,6 +74,8 @@ import {
 } from '../core/dynamicPrompt.js'
 import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
+import { createWebFetchTool } from '../tools/network/web_fetch/index.js'
+import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { createSkillTool } from '../tools/system/skill/index.js'
 import { createMemoryWriteTool } from '../tools/system/memory_write/index.js'
@@ -365,7 +367,9 @@ export class RoboticsSession {
   private _storeSessionId: string = ''
 
   constructor(config: RoboticsSessionOptions = {}) {
-    this.sessionId = randomUUID()
+    // When resuming, reuse the original session ID so SessionStore.append()
+    // upserts the existing record instead of creating a new one.
+    this.sessionId = config.resumeSessionId ?? randomUUID()
     this.robot = config.robot
     this.projectDir = config.projectDir ?? process.cwd()
     this._domain = config.domain
@@ -587,6 +591,22 @@ export class RoboticsSession {
     }
     this.inner.registerTool(await createBashTool())
     this.inner.registerTool(makeGetSubAgentStatusTool(this.bridge))
+    // Network tools — required by sub-agents (e.g. PaperSearchAgent) whose
+    // allowedTools include 'web_fetch'. Registering it here also makes it
+    // resolvable in the bridge's tool registry (wired below).
+    // NOTE: web_search is intentionally not registered — the Anthropic
+    // web-search API is unavailable; use an MCP-based search instead.
+    this.inner.registerTool(await createWebFetchTool())
+
+    // MCP tools — mcp_call / list_mcp_resources / read_mcp_resource. These talk
+    // to the process-global MCP client registry (populated by loadMcpConfig()
+    // at CLI startup), so both the main agent and any sub-agent that lists them
+    // in allowedTools can reach the connected MCP servers — e.g. an MCP-based
+    // search server used by paper_search in place of the removed web_search.
+    const mcpTools = await createMcpTools()
+    for (const tool of mcpTools) {
+      this.inner.registerTool(tool)
+    }
     // Skill tool — gives the robotics agent access to user-defined skills under
     // ~/.meta-agent/skills/robotics/ and <projectDir>/.meta-agent/skills/
     this.inner.registerTool(await createSkillTool(this.projectDir, 'robotics'))
@@ -610,6 +630,15 @@ export class RoboticsSession {
         this.inner.registerTool(tool)
       }
     }
+
+    // ── 4b. Wire the sub-agent tool registry ──────────────────────────────
+    // CRITICAL: sub-agents resolve their config.allowedTools against the
+    // bridge's tool registry. Without this call the registry stays empty, so
+    // every sub-agent (paper_search, experiment_dispatch, …) is launched with
+    // ZERO tools — the model emits one line and terminates with turnsUsed=0,
+    // which surfaces as a hollow "complete" with no real work done.
+    // Must run AFTER all main-session tools are registered above.
+    this.bridge.setToolRegistry(this.inner.getToolRegistry())
 
     // ── 5. Dynamic sections (R1-R5 + W1) ─────────────────────────────────
     // Sections are built lazily on first submit() via _getRoboticsExtensions().

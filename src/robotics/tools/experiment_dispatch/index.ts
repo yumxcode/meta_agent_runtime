@@ -215,7 +215,7 @@ Rules:
           if (final?.status === 'completed') {
             await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
             return {
-              content: `✅ Experiment completed.\n\nTask ID: ${record.taskId}\n\n${final.result ?? ''}`,
+              content: `✅ Experiment completed.\n\nTask ID: ${record.taskId}\n\n${final.result?.summary ?? ''}`,
               isError: false,
             }
           }

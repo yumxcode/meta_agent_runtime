@@ -34,6 +34,7 @@ import { SessionRouter } from '../routing/SessionRouter.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
+import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
 import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
@@ -68,6 +69,8 @@ import type { RouterOptions } from '../routing/types.js'
 import type { MetaAgentEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
+import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js'
+import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
@@ -98,6 +101,7 @@ const green = (s: string) => `${c.green}${s}${c.reset}`
 const gray  = (s: string) => `${c.gray}${s}${c.reset}`
 const red   = (s: string) => `${c.red}${s}${c.reset}`
 const yellow = (s: string) => `${c.yellow}${s}${c.reset}`
+const terminalText = (input: unknown) => sanitizeTerminalText(input)
 
 // ── Help text ─────────────────────────────────────────────────────────────────
 
@@ -260,7 +264,7 @@ function parseCliArgs(): CliOptions {
       allowPositionals: true,
     })
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = terminalText(err instanceof Error ? err.message : String(err))
     console.error(red(`Error: ${msg}`))
     process.exit(1)
   }
@@ -777,10 +781,11 @@ async function confirmToolCall(
   input: Record<string, unknown>,
   opLabel: string,
 ): Promise<BeforeToolCallResult> {
-  const cmd = String(input['command'] ?? JSON.stringify(input)).slice(0, 240)
+  const cmd = sanitizeTerminalPreview(input['command'] ?? JSON.stringify(input), 240)
+  const label = terminalText(opLabel)
 
   process.stdout.write(
-    `\n${yellow('⚠')}  ${bold('检测到敏感操作')} ${dim(`[${opLabel}]`)}\n` +
+    `\n${yellow('⚠')}  ${bold('检测到敏感操作')} ${dim(`[${label}]`)}\n` +
     `${dim('命令预览:')} ${cyan(cmd)}\n\n` +
     `  ${green('1')}. ${bold('允许')}         — 执行此操作\n` +
     `  ${red('2')}. ${bold('拒绝')}         — 跳过，让 AI 换个方式\n` +
@@ -944,6 +949,11 @@ function makeRouter(
     }
   }
 
+  // Inject MCP server tool-name summary into D5 (progressive disclosure).
+  if (_mcpServerInstructions.length > 0) {
+    cfg.mcpServers = _mcpServerInstructions
+  }
+
   return new SessionRouter(cfg)
 }
 
@@ -1017,9 +1027,10 @@ async function streamExperienceSummary(
       for await (const chunk of stream) {
         summaryText += chunk.choices[0]?.delta?.content ?? ''
       }
-      if (summaryText.trim()) {
+      const safeSummaryText = terminalText(summaryText)
+      if (safeSummaryText.trim()) {
         process.stdout.write(`\n${dim('─── 经验提议摘要 (side-call) ───────────────────────────────────')}\n`)
-        process.stdout.write(summaryText)
+        process.stdout.write(safeSummaryText)
         process.stdout.write(`\n${dim('─────────────────────────────────────────────────────────────')}\n\n`)
       }
       return
@@ -1054,9 +1065,10 @@ async function streamExperienceSummary(
         summaryText += event.delta.text
       }
     }
-    if (summaryText.trim()) {
+    const safeSummaryText = terminalText(summaryText)
+    if (safeSummaryText.trim()) {
       process.stdout.write(`\n${dim('─── 经验提议摘要 (side-call) ───────────────────────────────────')}\n`)
-      process.stdout.write(summaryText)
+      process.stdout.write(safeSummaryText)
       process.stdout.write(`\n${dim('─────────────────────────────────────────────────────────────')}\n\n`)
     }
   } catch { /* best-effort — side-call failure must NEVER crash the REPL */ }
@@ -1064,7 +1076,7 @@ async function streamExperienceSummary(
 
 // ── Stream a single prompt ────────────────────────────────────────────────────
 
-const DEFAULT_CLI_MAX_VISIBLE_CHARS = 200_000
+const DEFAULT_CLI_MAX_VISIBLE_CHARS = 50_000
 
 function getCliMaxVisibleChars(): number {
   const raw = process.env['META_AGENT_CLI_MAX_VISIBLE_CHARS']
@@ -1116,6 +1128,7 @@ async function streamPrompt(
   let visibleChars = 0
   let visibleTruncated = false
   const visibleLimit = getCliMaxVisibleChars()
+  const outputSanitizer = new TerminalSanitizer()
 
   // ── Live reasoning indicator ──────────────────────────────────────────────
   // Reasoning models stream their chain of thought before any visible answer.
@@ -1135,16 +1148,18 @@ async function streamPrompt(
 
   async function writeVisible(text: string): Promise<void> {
     if (!text || visibleTruncated) return
+    const safeText = outputSanitizer.sanitize(text)
+    if (!safeText) return
     const remaining = visibleLimit - visibleChars
     if (remaining <= 0) {
       visibleTruncated = true
       await safeStdoutWrite(`\n${yellow('⚠')}  ${yellow('本轮终端输出已达到显示上限，后续内容已隐藏。')} ${dim('完整上下文仍保留在会话历史中。')}\n`)
       return
     }
-    const chunk = text.length > remaining ? text.slice(0, remaining) : text
+    const chunk = safeText.length > remaining ? safeText.slice(0, remaining) : safeText
     visibleChars += chunk.length
     await safeStdoutWrite(chunk)
-    if (chunk.length < text.length) {
+    if (chunk.length < safeText.length) {
       visibleTruncated = true
       await safeStdoutWrite(`\n${yellow('⚠')}  ${yellow('本轮终端输出已达到显示上限，后续内容已隐藏。')} ${dim('完整上下文仍保留在会话历史中。')}\n`)
     }
@@ -1243,14 +1258,16 @@ async function streamPrompt(
         }
         case 'tool_use': {
           meter.hide()
+          const toolName = sanitizeTerminalText(event.toolName)
+          const preview = sanitizeTerminalPreview(JSON.stringify(event.toolInput), 80)
           await safeStdoutWrite(
-            `\n${dim('⚙')}  ${cyan(event.toolName)} ${gray(JSON.stringify(event.toolInput).slice(0, 80))}\n`,
+            `\n${dim('⚙')}  ${cyan(toolName)} ${gray(preview)}\n`,
           )
           break
         }
         case 'tool_result': {
           meter.hide()
-          const preview = String(event.content ?? '').slice(0, 120)
+          const preview = sanitizeTerminalPreview(event.content, 120)
           await safeStdoutWrite(
             `   ${dim('→')} ${gray(preview)}${preview.length >= 120 ? gray('…') : ''}\n`,
           )
@@ -1285,7 +1302,7 @@ async function streamPrompt(
               `${dim('任务已提前终止。可继续输入或拆分为更小的子任务。')}\n`,
             )
           } else if (event.subtype === 'error_during_execution') {
-            const errDetails = (event as { errors?: string[] }).errors?.join('\n  ')
+            const errDetails = sanitizeTerminalText((event as { errors?: string[] }).errors?.join('\n  ') ?? '')
             await safeStdoutWrite(
               `\n${red('✗')}  ${red('执行过程中发生错误。')} ` +
               `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
@@ -1339,7 +1356,7 @@ async function runSessionPicker(
   console.log(`\n${bold('历史会话:')} ${dim('(仅显示当前 workspace，选择一个以继续上次对话)')}\n`)
   sessions.forEach((s, i) => {
     const ago = formatAge(Date.now() - s.lastActivity)
-    const preview = s.firstPrompt.slice(0, 60)
+    const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
     console.log(
       `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
       `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -1699,13 +1716,13 @@ function formatTeamState(state: TeamState | null | undefined): string {
   const done = state.tasks.filter(t => t.status === 'done')
 
   const lines: string[] = ['', bold('Team Mode (v2.0 — 协作日志)')]
-  lines.push(state.github ? `${dim('GitHub:')} ${cyan(state.github)}` : `${dim('GitHub:')} ${dim('(not set)')}`)
-  lines.push(`${dim('Updated:')} ${state.updatedAt}`)
+  lines.push(state.github ? `${dim('GitHub:')} ${cyan(terminalText(state.github))}` : `${dim('GitHub:')} ${dim('(not set)')}`)
+  lines.push(`${dim('Updated:')} ${terminalText(state.updatedAt)}`)
   lines.push('')
 
   lines.push(bold('Goals'))
   if (state.goals.length === 0) lines.push(`  ${dim('none')}`)
-  else state.goals.forEach(g => lines.push(`  - ${g}`))
+  else state.goals.forEach(g => lines.push(`  - ${terminalText(g)}`))
   lines.push('')
 
   lines.push(bold('进行中（锁定）'))
@@ -1716,7 +1733,7 @@ function formatTeamState(state: TeamState | null | undefined): string {
       const stale = isStaleClaim(t)
       const marker = stale ? yellow('⚠') : '🔒'
       const claim = t.claimedAt ? ` ${dim(`claimed ${relAgo(t.claimedAt)}`)}` : ''
-      lines.push(`  ${marker} ${cyan(t.id)} ${t.title} · ${t.ownerUnit}${claim} · ${dim(`${t.attempts.length} attempts`)}`)
+      lines.push(`  ${marker} ${cyan(terminalText(t.id))} ${terminalText(t.title)} · ${terminalText(t.ownerUnit)}${claim} · ${dim(`${t.attempts.length} attempts`)}`)
     }
   }
   lines.push('')
@@ -1724,21 +1741,21 @@ function formatTeamState(state: TeamState | null | undefined): string {
   if (paused.length > 0) {
     lines.push(bold('暂停'))
     for (const t of paused) {
-      const owner = t.ownerUnit ? ` · ${t.ownerUnit}` : ''
-      lines.push(`  - ${cyan(t.id)} ${t.title}${owner} · ${dim(`${t.attempts.length} attempts`)}`)
+      const owner = t.ownerUnit ? ` · ${terminalText(t.ownerUnit)}` : ''
+      lines.push(`  - ${cyan(terminalText(t.id))} ${terminalText(t.title)}${owner} · ${dim(`${t.attempts.length} attempts`)}`)
     }
     lines.push('')
   }
 
   lines.push(bold('待领'))
   if (open.length === 0) lines.push(`  ${dim('none')}`)
-  else open.forEach(t => lines.push(`  - ${cyan(t.id)} ${t.title}`))
+  else open.forEach(t => lines.push(`  - ${cyan(terminalText(t.id))} ${terminalText(t.title)}`))
   lines.push('')
 
   if (done.length > 0) {
     lines.push(bold('已完成'))
     for (const t of done.slice(-5)) {
-      lines.push(`  - ${dim(t.id)} ${dim(t.title)} ${dim(`(${t.attempts.length} attempts)`)}`)
+      lines.push(`  - ${dim(terminalText(t.id))} ${dim(terminalText(t.title))} ${dim(`(${t.attempts.length} attempts)`)}`)
     }
     lines.push('')
   }
@@ -1746,8 +1763,8 @@ function formatTeamState(state: TeamState | null | undefined): string {
   if (state.units.length > 0) {
     lines.push(bold('Units'))
     for (const u of state.units) {
-      const cur = u.currentTask ? ` task=${u.currentTask}` : ''
-      lines.push(`  - ${cyan(u.id)} ${dim(u.status)} last=${relAgo(u.lastSeen)}${cur}`)
+      const cur = u.currentTask ? ` task=${terminalText(u.currentTask)}` : ''
+      lines.push(`  - ${cyan(terminalText(u.id))} ${dim(terminalText(u.status))} last=${relAgo(u.lastSeen)}${cur}`)
     }
     lines.push('')
   }
@@ -1766,17 +1783,17 @@ function formatTeamLog(state: TeamState | null | undefined, limit = 8): string {
   if (rows.length === 0) return `${bold('Recent attempts')}\n  ${dim('none — 使用 /team note 追加')}\n`
   const lines: string[] = [bold(`Recent attempts (latest ${Math.min(limit, rows.length)})`)]
   for (const r of rows.slice(0, limit)) {
-    lines.push(`  - ${dim(relAgo(r.at))} ${cyan(r.taskId)} ${r.unit}`)
-    lines.push(`      ${dim('方向:')} ${r.direction}`)
-    lines.push(`      ${dim('结果:')} ${r.outcome}`)
-    if (r.ref) lines.push(`      ${dim('ref:')} ${r.ref}`)
+    lines.push(`  - ${dim(relAgo(r.at))} ${cyan(terminalText(r.taskId))} ${terminalText(r.unit)}`)
+    lines.push(`      ${dim('方向:')} ${terminalText(r.direction)}`)
+    lines.push(`      ${dim('结果:')} ${terminalText(r.outcome)}`)
+    if (r.ref) lines.push(`      ${dim('ref:')} ${terminalText(r.ref)}`)
   }
   return `${lines.join('\n')}\n`
 }
 
 function formatTeamWatcherEvents(events: TeamWatcherEvent[] | undefined): string {
   if (!events || events.length === 0) return ''
-  const lines = ['', bold('Watcher'), ...events.slice(-5).map(e => `  - ${dim(e.at)} ${e.message}`), '']
+  const lines = ['', bold('Watcher'), ...events.slice(-5).map(e => `  - ${dim(terminalText(e.at))} ${terminalText(e.message)}`), '']
   return `${lines.join('\n')}\n`
 }
 
@@ -1909,8 +1926,8 @@ async function _runTeamEntryGuideInner(
   )
   if (plan?.guidance || plan?.summary) {
     console.log(`\n${bold('Team Guide')}`)
-    if (plan.summary) console.log(`${dim('判断:')} ${plan.summary}`)
-    if (plan.guidance) console.log(`${dim('建议:')} ${plan.guidance}`)
+    if (plan.summary) console.log(`${dim('判断:')} ${terminalText(plan.summary)}`)
+    if (plan.guidance) console.log(`${dim('建议:')} ${terminalText(plan.guidance)}`)
   }
   if (plan?.risk === 'blocked') {
     console.log(red(`\n⚠ Planner 判断存在阻塞，已跳过任何写入建议。`))
@@ -1918,8 +1935,8 @@ async function _runTeamEntryGuideInner(
     await executePlan(controller, plan, q => askQuestion(rl, q), {
       onAction: (action, status, detail) => {
         const tag = status === 'done' ? green('✓') : status === 'failed' ? red('✗') : status === 'skipped' ? yellow('-') : dim('→')
-        const note = detail ? ` ${dim(detail)}` : ''
-        console.log(`  ${tag} ${action.type}${action.taskId ? ` ${cyan(action.taskId)}` : ''}${note}`)
+        const note = detail ? ` ${dim(terminalText(detail))}` : ''
+        console.log(`  ${tag} ${terminalText(action.type)}${action.taskId ? ` ${cyan(terminalText(action.taskId))}` : ''}${note}`)
       },
     })
   }
@@ -2227,13 +2244,13 @@ async function handleTeamCommand(
         }
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         if (!['status', 'board', 'log'].includes(sub)) {
-          console.log(dim(`未知 team 子命令 "${sub}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, pull, conflicts.\n`))
+          console.log(dim(`未知 team 子命令 "${terminalText(sub)}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, pull, conflicts.\n`))
         }
         break
       }
     }
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = terminalText(err instanceof Error ? err.message : String(err))
     console.log(`\n${red('team error:')} ${msg}\n`)
   }
 }
@@ -2391,7 +2408,6 @@ async function runRepl(opts: CliOptions): Promise<void> {
       const sessionId = router.getSessionId()
       if (!sessionId) return
       const messages = router.getMessages()
-      if (messages.length <= savedMessageCount) return
       const firstUserMsg = messages.find(m => m.role === 'user')
       const firstPromptText = firstUserMsg
         ? (typeof firstUserMsg.content === 'string'
@@ -2399,19 +2415,21 @@ async function runRepl(opts: CliOptions): Promise<void> {
             : JSON.stringify(firstUserMsg.content)
           ).slice(0, 80)
         : currentInput.slice(0, 80)
-      await SessionStore.append(
-        sessionId,
-        {
-          mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
-          startTime:     Date.now(),
-          lastActivity:  Date.now(),
-          messageCount:  messages.length,
-          firstPrompt:   firstPromptText,
-          workspace:     opts.workspace,
-        },
-        messages,
-        savedMessageCount,
-      )
+      const meta = {
+        mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
+        startTime:     Date.now(),
+        lastActivity:  Date.now(),
+        messageCount:  messages.length,
+        firstPrompt:   firstPromptText,
+        workspace:     opts.workspace,
+      }
+      if (messages.length < savedMessageCount) {
+        await SessionStore.replace(sessionId, meta, messages)
+      } else if (messages.length > savedMessageCount) {
+        await SessionStore.append(sessionId, meta, messages, savedMessageCount)
+      } else {
+        return
+      }
       savedMessageCount = messages.length
     } catch {
       // session save is best-effort — never crash the REPL
@@ -2441,7 +2459,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
             if (fresh.length > 0 && teamModeUsed) {
               process.stdout.write(`\n${yellow('Team 动态')}\n`)
               fresh.slice(-5).forEach(event => {
-                process.stdout.write(`  - ${event.message}\n`)
+                process.stdout.write(`  - ${sanitizeTerminalText(event.message)}\n`)
               })
               process.stdout.write(`${dim('使用 /team status、/team sync 或 /team pull 查看详情。')}\n`)
               rl.prompt(true)
@@ -2755,7 +2773,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     exiting = true
     if (teamReminderTimer) clearInterval(teamReminderTimer)
     disableBracketedPaste()
-    if (err) console.error(`\n${red('Fatal:')} ${err instanceof Error ? err.message : String(err)}\n`)
+    if (err) console.error(`\n${red('Fatal:')} ${terminalText(err instanceof Error ? err.message : String(err))}\n`)
     try { await router.dispose() } catch { /* best-effort */ }
     try { rl.close() } catch { /* best-effort */ }
     process.exit(code)
@@ -2841,7 +2859,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
             console.log(`\n${bold('选择要删除的会话:')} ${dim('(仅当前 workspace；输入序号删除，all 删除全部，回车取消)')}\n`)
             sessions.forEach((s, i) => {
               const ago = formatAge(Date.now() - s.lastActivity)
-              const preview = s.firstPrompt.slice(0, 60)
+              const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
               console.log(
                 `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                 `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -2869,7 +2887,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
               if (idx >= 1 && idx <= sessions.length) {
                 const selected = sessions[idx - 1]!
                 await SessionStore.deleteSession(selected.sessionId)
-                const preview = selected.firstPrompt.slice(0, 50)
+                const preview = sanitizeTerminalPreview(selected.firstPrompt, 50)
                 console.log(green(`\n✓ 已删除会话: ${dim(preview)}\n`))
               } else {
                 console.log(yellow('\n无效选择。\n'))
@@ -2884,7 +2902,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
                 console.log(`\n${bold('历史会话:')} ${dim('(仅当前 workspace；输入序号加载并继续上次对话)')}\n`)
               sessions.forEach((s, i) => {
                 const ago = formatAge(Date.now() - s.lastActivity)
-                const preview = s.firstPrompt.slice(0, 60)
+                const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
                 console.log(
                   `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                   `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -3087,7 +3105,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
       )
     } catch (err) {
       if (!interrupted) {
-        const msg = err instanceof Error ? err.message : String(err)
+        const msg = terminalText(err instanceof Error ? err.message : String(err))
         console.error(`\n${red('Error:')} ${msg}\n`)
       }
     } finally {
@@ -3174,7 +3192,7 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   try {
     await streamPrompt(router, opts.prompt!, opts.json, opts.showThinking)
   } catch (err) {
-    const msg = err instanceof Error ? err.message : String(err)
+    const msg = terminalText(err instanceof Error ? err.message : String(err))
     console.error(red(`Error: ${msg}`))
     process.exitCode = 1
   } finally {
@@ -3184,9 +3202,21 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
 
 // ── Entry point ───────────────────────────────────────────────────────────────
 
+/**
+ * Process-wide MCP server instructions for D5 injection.
+ * Populated once at startup after all MCP clients are registered.
+ * makeRouter() reads this to inject into cfg.mcpServers.
+ */
+let _mcpServerInstructions: McpServerInstruction[] = []
+
 async function main(): Promise<void> {
   // Sanitize env-var API keys once so detectProvider() receives clean values
   sanitizeEnvKeys()
+  // Load ~/.meta-agent/mcp.json and register all configured MCP servers.
+  loadMcpConfig()
+  // Pre-compute D5 tool-name + description summary for all registered MCP servers.
+  // Stored in module variable so makeRouter() can inject into cfg.mcpServers.
+  _mcpServerInstructions = await buildMcpServerInstructions()
 
   const opts = parseCliArgs()
   const bwrapWarning = getMissingBwrapWarning()
@@ -3203,6 +3233,6 @@ async function main(): Promise<void> {
 }
 
 main().catch(err => {
-  console.error(red(`Fatal: ${err instanceof Error ? err.message : String(err)}`))
+  console.error(red(`Fatal: ${terminalText(err instanceof Error ? err.message : String(err))}`))
   process.exit(1)
 })

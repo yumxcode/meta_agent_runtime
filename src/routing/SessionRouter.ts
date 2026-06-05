@@ -482,11 +482,17 @@ export class SessionRouter {
   private async _createImpl(mode: SessionMode): Promise<SessionImpl> {
     switch (mode) {
       case 'agentic': {
-        return new MetaAgentSession(this._cfgAsConfig())
+        return new MetaAgentSession({
+          ...this._cfgAsConfig(),
+          sessionId: this._resumeSessionId,
+        })
       }
 
       case 'campaign': {
-        return new CampaignSession(this._cfgAsConfig())
+        return new CampaignSession({
+          ...this._cfgAsConfig(),
+          sessionId: this._resumeSessionId,
+        })
       }
 
       case 'robotics': {

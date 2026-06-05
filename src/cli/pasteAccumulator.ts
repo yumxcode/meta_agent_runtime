@@ -60,18 +60,56 @@ export class PasteAccumulator {
   private pasteOpen = false
   /** True if the chunk behind the pending 'line' event(s) is pasted content. */
   private chunkIsPaste = false
+  /**
+   * Trailing bytes held back from the previous chunk because they form the
+   * *start* of a paste marker that may complete in the next chunk. A large
+   * paste is delivered as several stdin reads, and a 6-byte marker can land on
+   * a read boundary (e.g. "\x1b[20" | "1~"). Without re-joining the halves the
+   * indexOf() scan never sees the marker, so `pasteOpen` would stick `true`
+   * forever and every later line would be silently accumulated — a frozen REPL.
+   */
+  private carry = ''
+
+  /**
+   * Length of the longest suffix of `buf` that is a *partial* (incomplete)
+   * paste marker — i.e. the bytes to hold back for the next chunk. Only the
+   * region after the last COMPLETE marker is eligible, so a fully-delivered
+   * marker is never mistaken for a partial one.
+   */
+  private static trailingPartialMarkerLen(buf: string): number {
+    let afterLastComplete = 0
+    for (const marker of [PASTE_START, PASTE_END]) {
+      const idx = buf.lastIndexOf(marker)
+      if (idx >= 0) afterLastComplete = Math.max(afterLastComplete, idx + marker.length)
+    }
+    const residual = buf.slice(afterLastComplete)
+    const max = Math.min(PASTE_START.length - 1, residual.length)
+    for (let len = max; len > 0; len--) {
+      const suffix = residual.slice(residual.length - len)
+      if (PASTE_START.startsWith(suffix) || PASTE_END.startsWith(suffix)) return len
+    }
+    return 0
+  }
 
   /** Record the raw stdin chunk preceding the next 'line' event(s). */
   onData(chunk: string): void {
+    // Re-attach any partial-marker bytes carried over from the previous chunk so
+    // a marker split across a stdin read boundary is still recognised, then hold
+    // back a fresh partial-marker tail (if any) for the next chunk.
+    const buf = this.carry + chunk
+    const carryLen = PasteAccumulator.trailingPartialMarkerLen(buf)
+    const scan = carryLen > 0 ? buf.slice(0, buf.length - carryLen) : buf
+    this.carry = carryLen > 0 ? buf.slice(buf.length - carryLen) : ''
+
     // A chunk's lines are pasted if a paste was already open OR this chunk opens
     // one (markers and content can arrive together or split across chunks).
-    this.chunkIsPaste = this.pasteOpen || chunk.includes(PASTE_START)
+    this.chunkIsPaste = this.pasteOpen || scan.includes(PASTE_START)
     // Walk the markers in order to compute the open/closed state for the chunks
     // that follow this one.
     let i = 0
-    while (i < chunk.length) {
-      const start = chunk.indexOf(PASTE_START, i)
-      const end = chunk.indexOf(PASTE_END, i)
+    while (i < scan.length) {
+      const start = scan.indexOf(PASTE_START, i)
+      const end = scan.indexOf(PASTE_END, i)
       if (start === -1 && end === -1) break
       if (end === -1 || (start !== -1 && start < end)) {
         this.pasteOpen = true
@@ -83,7 +121,7 @@ export class PasteAccumulator {
     }
     // Keep a marker-free copy so the bare-Enter fallback test isn't fooled by
     // a lone marker sharing the chunk with the newline.
-    this.lastChunk = chunk.replace(PASTE_MARKER_RE, '')
+    this.lastChunk = scan.replace(PASTE_MARKER_RE, '')
   }
 
   /**
@@ -94,6 +132,7 @@ export class PasteAccumulator {
   resetChunk(): void {
     this.lastChunk = ''
     this.chunkIsPaste = false
+    this.carry = ''
   }
 
   /**
@@ -137,6 +176,7 @@ export class PasteAccumulator {
     this.lines.length = 0
     this.pasteOpen = false
     this.chunkIsPaste = false
+    this.carry = ''
   }
 
   /**

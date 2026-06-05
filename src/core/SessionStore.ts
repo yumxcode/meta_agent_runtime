@@ -13,7 +13,7 @@
  *     crashes the CLI session in progress.
  */
 
-import { readFile, appendFile, mkdir, open, stat, rm } from 'node:fs/promises'
+import { readFile, appendFile, mkdir, open, stat, rm, writeFile } from 'node:fs/promises'
 import { atomicWriteJson } from './persist/index.js'
 import { SessionMetaSchema, parseArrayFiltered } from './persist/schemas.js'
 import { existsSync } from 'node:fs'
@@ -60,6 +60,24 @@ async function ensureDir(dir: string): Promise<void> {
   await mkdir(dir, { recursive: true })
 }
 
+function stripThinkingForStorage(message: ConversationMessage): ConversationMessage {
+  if (!Array.isArray(message.content)) return message
+  const content = message.content.filter(block =>
+    block.type !== 'thinking' && block.type !== 'redacted_thinking',
+  )
+  if (content.length === message.content.length) return message
+  return { ...message, content } as ConversationMessage
+}
+
+function serializeMessages(messages: readonly ConversationMessage[]): string {
+  if (messages.length === 0) return ''
+  return messages
+    .map(stripThinkingForStorage)
+    .filter(m => !Array.isArray(m.content) || m.content.length > 0)
+    .map(m => JSON.stringify(m))
+    .join('\n') + '\n'
+}
+
 async function readIndex(): Promise<SessionMeta[]> {
   try {
     const raw = await readFile(INDEX_FILE, 'utf-8')
@@ -103,11 +121,27 @@ export class SessionStore {
     if (messages.length === 0 || appendFrom >= messages.length) return
     try {
       await ensureDir(sessionDir(sessionId))
-      const lines = messages
-        .slice(appendFrom)
-        .map(m => JSON.stringify(m))
-        .join('\n') + '\n'
+      const lines = serializeMessages(messages.slice(appendFrom))
       await appendFile(historyPath(sessionId), lines, 'utf-8')
+      await SessionStore._upsertIndex({ sessionId, ...meta })
+    } catch {
+      // Best-effort — never crash the session on a storage failure
+    }
+  }
+
+  /**
+   * Replace a session's persisted history with the current in-memory message
+   * list. Used after compaction, where the message array shrinks and append-by-
+   * index can no longer represent the authoritative history.
+   */
+  static async replace(
+    sessionId: string,
+    meta: Omit<SessionMeta, 'sessionId'>,
+    messages: readonly ConversationMessage[],
+  ): Promise<void> {
+    try {
+      await ensureDir(sessionDir(sessionId))
+      await writeFile(historyPath(sessionId), serializeMessages(messages), 'utf-8')
       await SessionStore._upsertIndex({ sessionId, ...meta })
     } catch {
       // Best-effort — never crash the session on a storage failure

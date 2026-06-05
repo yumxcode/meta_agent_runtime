@@ -47,6 +47,20 @@ async function* textStream(text: string, inputTokens = 100, outputTokens = 50): 
   yield { type: 'message_stop' }
 }
 
+async function* thinkingThenTextStream(thinking: string, text: string): AsyncGenerator<import('../api/AnthropicClient.js').StreamEvent> {
+  yield { type: 'message_start', usage: { input_tokens: 100 } }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  yield { type: 'content_block_start', index: 0, content_block: { type: 'thinking', thinking: '' } as any }
+  yield { type: 'content_block_delta', index: 0, delta: { type: 'thinking_delta', thinking } }
+  yield { type: 'content_block_stop', index: 0 }
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  yield { type: 'content_block_start', index: 1, content_block: { type: 'text', text: '' } as any }
+  yield { type: 'content_block_delta', index: 1, delta: { type: 'text_delta', text } }
+  yield { type: 'content_block_stop', index: 1 }
+  yield { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 50 } }
+  yield { type: 'message_stop' }
+}
+
 /**
  * Build a stream that emits a single tool_use block then end_turn.
  */
@@ -118,6 +132,21 @@ describe('KernelSession — basic text response', () => {
     const msgs = session.getMessages()
     expect(msgs.some(m => m.role === 'user')).toBe(true)
     expect(msgs.some(m => m.role === 'assistant')).toBe(true)
+  })
+
+  it('strips hidden thinking blocks from in-memory history after the turn', async () => {
+    mockStream.mockImplementation(() => thinkingThenTextStream('private reasoning', 'Reply'))
+    const session = new KernelSession(makeConfig())
+    const events = await collectEvents(session, 'Hello')
+
+    expect(events.some(e => e.type === 'thinking_delta')).toBe(true)
+    expect(JSON.stringify(session.getMessages())).not.toContain('private reasoning')
+    expect(session.getMessages()).toContainEqual(
+      expect.objectContaining({
+        role: 'assistant',
+        content: [{ type: 'text', text: 'Reply' }],
+      }),
+    )
   })
 })
 

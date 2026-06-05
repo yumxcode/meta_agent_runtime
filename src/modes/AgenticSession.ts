@@ -152,6 +152,17 @@ export class AgenticSession {
     })))
   }
 
+  /**
+   * Snapshot of all currently-registered tools, keyed by tool name.
+   *
+   * Used to hand the sub-agent dispatcher (SubAgentBridge) a registry so that
+   * sub-agents can resolve the tools listed in their `allowedTools`. Returns a
+   * fresh Map each call — callers may not mutate the internal tool list.
+   */
+  getToolRegistry(): Map<string, MetaAgentTool> {
+    return new Map(this._registeredTools.map(t => [t.name, t]))
+  }
+
   // ── Submission ────────────────────────────────────────────────────────────
 
   async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {

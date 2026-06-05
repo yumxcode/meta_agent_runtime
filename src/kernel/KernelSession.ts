@@ -12,7 +12,7 @@
  */
 import type { KernelConfig } from './types/KernelConfig.js'
 import type { KernelEvent, ResultEvent, PermissionDenial } from './types/KernelEvent.js'
-import type { KernelMessage } from './types/KernelMessage.js'
+import type { ContentBlock, KernelMessage } from './types/KernelMessage.js'
 import type { KernelTool } from './types/KernelTool.js'
 import type { TokenUsage } from './types/TokenUsage.js'
 import { emptyUsage, addUsage } from './types/TokenUsage.js'
@@ -44,6 +44,24 @@ function stripVolatileContextFromMessages(messages: KernelMessage[]): void {
       return { ...block, text: stripped }
     })
     if (changed) msg.content = content
+  }
+}
+
+function stripThinkingBlocksFromMutableMessages(messages: KernelMessage[]): void {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!
+    let changed = false
+    const content = msg.content.filter((block: ContentBlock) => {
+      const keep = block.type !== 'thinking' && block.type !== 'redacted_thinking'
+      if (!keep) changed = true
+      return keep
+    })
+    if (!changed) continue
+    if (msg.role === 'assistant' && content.length === 0) {
+      messages.splice(i, 1)
+    } else {
+      msg.content = content
+    }
   }
 }
 
@@ -147,6 +165,7 @@ export class KernelSession {
 
       const resultEvent = this._buildResultEvent(loopResult, loopError)
       stripVolatileContextFromMessages(this._messages)
+      stripThinkingBlocksFromMutableMessages(this._messages)
 
       // Emit terminal result event
       yield resultEvent

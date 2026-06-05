@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { clearWebFetchCache, createWebFetchTool } from '../web_fetch/index.js'
+import { clearWebFetchCache, createPinnedLookup, createWebFetchTool } from '../web_fetch/index.js'
 import type { ToolCallContext } from '../../../core/types.js'
 
 function makeCtx(): ToolCallContext {
@@ -76,5 +76,39 @@ describe('web_fetch — SSRF defence (H1)', () => {
     )
     expect(result.isError).toBe(true)
     expect(String(result.content)).toMatch(/Refused|localhost/)
+  })
+})
+
+describe('web_fetch — pinned DNS lookup', () => {
+  it('returns address and family for normal lookup mode', () => {
+    const pinnedLookup = createPinnedLookup({ address: '93.184.216.34', family: 4 })
+
+    pinnedLookup('example.com', {}, (err, address, family) => {
+      expect(err).toBeNull()
+      expect(address).toBe('93.184.216.34')
+      expect(family).toBe(4)
+    })
+  })
+
+  it('returns LookupAddress[] for all:true lookup mode', () => {
+    const pinnedLookup = createPinnedLookup({ address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 })
+
+    pinnedLookup('example.com', { all: true }, (err, address, family) => {
+      expect(err).toBeNull()
+      expect(address).toEqual([
+        { address: '2606:2800:220:1:248:1893:25c8:1946', family: 6 },
+      ])
+      expect(family).toBeUndefined()
+    })
+  })
+
+  it('re-validates pinned addresses defensively', () => {
+    const pinnedLookup = createPinnedLookup({ address: '127.0.0.1', family: 4 })
+
+    pinnedLookup('example.com', { all: true }, (err, address, family) => {
+      expect(err?.message).toContain('pinned address failed re-validation')
+      expect(address).toBe('')
+      expect(family).toBe(0)
+    })
   })
 })

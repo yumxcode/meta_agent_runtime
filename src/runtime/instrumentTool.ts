@@ -203,11 +203,10 @@ export function instrumentTool(
     }
   }
 
-  // Return a new MetaAgentTool that delegates everything but call()
+  // Return a new MetaAgentTool that preserves metadata such as timeoutMs and
+  // maxResultSizeChars, while replacing only the call implementation.
   return {
-    name: tool.name,
-    description: tool.description,
-    inputSchema: tool.inputSchema,
+    ...tool,
     call,
   }
 }

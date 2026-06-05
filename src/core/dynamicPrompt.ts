@@ -13,6 +13,7 @@
  *   Memory writes are handled by a post-session sub-agent that evaluates and
  *   persists valuable public memories.  The main agent only reads (D1b); it
  *   does not need to know how to write.
+ *   D5  mcp_instructions      — MCP server tool list (name+desc, grouped with D1d)
  *   D2  env_info              — session_id, available tools, timestamp
  *   D3  language              — user language preference
  *   D4  current_mode          — single-line mode announcement
@@ -23,7 +24,6 @@
  *         direct:   general rules only
  *         agentic:  general rules + provenance tools (dedup before expensive calls)
  *         campaign: full rules — general + provenance tools + V&V response handling
- *   D5  mcp_instructions      — MCP tool instructions (when connected)
  *   D6  output_style          — report verbosity preference
  *   D7  summarize_tool_results — directive to note key findings mid-turn
  *
@@ -1135,18 +1135,21 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
   const base: SystemPromptSection[] = [
     // D1c: Agent Directives — project-specific workflow procedures, rules, and
     // caveats loaded from AGENT.md.  Placed first so the project owner's standing
-    // instructions form the outermost framing before any session-specific context
-    // (task contract, memories, campaign state) is injected.
+    // instructions form the outermost framing before any session-specific context.
     buildAgentDirectivesSection(effectiveProjectDir),
-    // D1d: Skill Manifest — compact list of user-defined skills available in this
-    // mode.  Placed immediately after project directives so the model knows what
-    // skills are available before any session-specific context is injected.
-    // Skills are separate from tools: they are Markdown files the model loads
-    // on demand via skill(action="load") — no skill content is injected here.
-    buildSkillManifestSection(opts.mode, effectiveProjectDir),
-    // D0: Task Contract — goal anchor immediately after project directives so the
-    // model sees original intent before any volatile sections.
+    // D0: Task Contract — goal anchor immediately after project directives.
+    // Together D1c + D0 establish "rules + goal" as the outermost frame before
+    // capabilities (D1d/D5) and environmental context (D2/D3/D4) are injected.
     ...(opts.taskContract ? [buildTaskContractSection(opts.taskContract)] : []),
+    // D1d: Skill Manifest — compact list of user-defined skills available in this
+    // mode.  Placed after the goal frame so the model knows what skills it can
+    // use to accomplish the task.  Skills are Markdown files loaded on demand
+    // via skill(action="load") — no skill content is injected here.
+    buildSkillManifestSection(opts.mode, effectiveProjectDir),
+    // D5: MCP Instructions — connected MCP servers and their available tools
+    // (name + description only, no schemas).  Grouped with D1d so the model
+    // sees all available capabilities (skills + MCP) together after the goal frame.
+    buildMcpInstructionsSection(opts.mcpServers),
     // NOTE: D1b (memory_content) has been moved to buildVolatileContextSections().
     // It must NOT be in the system message — DeepSeek KV cache requires the
     // system message to be byte-identical across turns to get prefix cache hits.
@@ -1157,11 +1160,10 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     buildCampaignKnowledgeSection(opts.mode),
     buildToolInvocationSection(opts.mode),
     // Rx: mode-specific STABLE extensions — injected here so they appear after the
-    // shared tool protocol but before infrastructure sections (MCP, output style).
+    // shared tool protocol but before output preferences.
     // Only pass memoized sections here; volatile mode sections go to modeExtensions
     // in buildVolatileContextSections() instead.
     ...(opts.modeExtensions ?? []),
-    buildMcpInstructionsSection(opts.mcpServers),
     buildOutputStyleSection(opts.outputStyle),
     buildSummarizeToolResultsSection(opts.mode),
     // NOTE: D11 (subagent_notifications) has been moved to buildVolatileContextSections().

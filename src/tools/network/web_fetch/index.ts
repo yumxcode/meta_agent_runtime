@@ -1,4 +1,5 @@
 import { lookup } from 'node:dns/promises'
+import { isIP } from 'node:net'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import type { LookupAddress } from 'node:dns'
@@ -47,6 +48,15 @@ function stripHtml(html: string): string {
 
 const ALLOWED_PROTOCOLS = new Set(['http:', 'https:'])
 
+/**
+ * When META_AGENT_TRUST_FAKE_IP=1 is set, the 198.18/15 benchmark range is
+ * allowed through.  This range is used as a "fake IP" pool by transparent
+ * proxies such as Clash (TUN + fake-ip DNS mode): the proxy intercepts the
+ * connection and routes it to the real destination.  Without this opt-in the
+ * SSRF check refuses the fake IP before the proxy gets a chance to intercept.
+ */
+const TRUST_FAKE_IP = process.env['META_AGENT_TRUST_FAKE_IP'] === '1'
+
 /** Returns null if the IP is allowed, otherwise a human-readable rejection. */
 function classifyIp(ip: string): string | null {
   // IPv4 private ranges (RFC 1918) + loopback + link-local + CG-NAT + IMDS
@@ -61,7 +71,7 @@ function classifyIp(ip: string): string | null {
     if (a === 172 && b >= 16 && b <= 31) return 'private 172.16/12'
     if (a === 192 && b === 168) return 'private 192.168/16'
     if (a === 192 && b === 0) return 'IETF / IANA reserved 192.0/16'
-    if (a === 198 && (b === 18 || b === 19)) return 'benchmark 198.18/15'
+    if (a === 198 && (b === 18 || b === 19) && !TRUST_FAKE_IP) return 'benchmark 198.18/15'
     if (a === 100 && b >= 64 && b <= 127) return 'CG-NAT 100.64/10'
     if (a >= 224 && a <= 239) return 'multicast 224/4'
     if (a >= 240) return 'reserved 240/4'
@@ -135,6 +145,36 @@ interface PinnedResponse {
   text(): Promise<string>
 }
 
+type PinnedLookupCallback = (
+  err: NodeJS.ErrnoException | null,
+  address: string | LookupAddress[],
+  family?: number,
+) => void
+
+/** @internal exported for regression tests around Node's lookup callback modes. */
+export function createPinnedLookup(pinned: LookupAddress) {
+  return (
+    _hostname: string,
+    opts: unknown,
+    cb: PinnedLookupCallback,
+  ): void => {
+    if (classifyIp(pinned.address) !== null) {
+      cb(new Error('pinned address failed re-validation'), '', 0)
+      return
+    }
+    if (
+      opts !== null &&
+      typeof opts === 'object' &&
+      'all' in opts &&
+      (opts as { all?: unknown }).all === true
+    ) {
+      cb(null, [{ address: pinned.address, family: pinned.family }])
+      return
+    }
+    cb(null, pinned.address, pinned.family)
+  }
+}
+
 /**
  * Perform a single HTTP(S) request PINNED to a set of pre-validated IPs.
  *
@@ -154,18 +194,7 @@ function requestPinned(
     const pinned = target.addresses[0]!
 
     // Custom lookup: ignore the queried hostname and return a validated IP.
-    // Re-classify defensively in case a future caller widens the address set.
-    const pinnedLookup = (
-      _hostname: string,
-      _opts: unknown,
-      cb: (err: NodeJS.ErrnoException | null, address: string, family: number) => void,
-    ): void => {
-      if (classifyIp(pinned.address) !== null) {
-        cb(new Error('pinned address failed re-validation'), '', 0)
-        return
-      }
-      cb(null, pinned.address, pinned.family)
-    }
+    const pinnedLookup = createPinnedLookup(pinned)
 
     const req = requestFn(
       target.url,

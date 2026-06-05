@@ -236,6 +236,32 @@ export class SubAgentRunner {
     // V&V protocols, or provenance tooling guidance — those belong to the main agent.
     const tools = await this._resolveToolsWithSandbox(sandboxHandle)
 
+    // Guard: if the task requested tools but none resolved, the agent would run
+    // with an empty toolset — emitting a single line and terminating with
+    // turnsUsed=0, which deceptively looks like success. Fail loudly instead so
+    // the misconfiguration (e.g. bridge.setToolRegistry never called, or a typo
+    // in allowedTools) surfaces rather than producing a hollow "complete".
+    const requestedTools = cfg.allowedTools ?? []
+    if (requestedTools.length > 0 && tools.length === 0) {
+      await sandboxHandle?.destroy()
+      await this._writeTerminal('failed', {
+        success:      false,
+        summary:      '',
+        error:        truncate(
+          `No tools resolved for sub-agent. Requested [${requestedTools.join(', ')}] ` +
+          `but the dispatcher's tool registry is empty or has no matching names. ` +
+          `Ensure bridge.setToolRegistry() was called with these tools registered.`,
+          ERROR_MAX_CHARS,
+        ),
+        turnsUsed:    0,
+        inputTokens:  0,
+        outputTokens: 0,
+        costUsd:      0,
+        durationMs:   Date.now() - startMs,
+      })
+      return
+    }
+
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
       maxTurns:     cfg.maxTurns,

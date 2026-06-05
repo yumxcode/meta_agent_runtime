@@ -18,7 +18,12 @@ export async function createListMcpResourcesTool(): Promise<MetaAgentTool> {
           const tools = await client.listTools()
           if (tools.length === 0) { lines.push('  Tools: (none)') } else {
             lines.push(`  Tools (${tools.length}):`)
-            for (const t of tools) lines.push(`    - ${t.name}${t.description ? `: ${t.description}` : ''}`)
+            for (const t of tools) {
+              lines.push(`    - ${t.name}${t.description ? `: ${t.description}` : ''}`)
+              if (t.inputSchema) {
+                lines.push(`      inputSchema: ${JSON.stringify(t.inputSchema)}`)
+              }
+            }
           }
         } catch (e) { lines.push(`  Tools: Error listing — ${e instanceof Error ? e.message : String(e)}`) }
         if (client.listResources) {

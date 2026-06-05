@@ -7,10 +7,12 @@ You are a PaperSearchAgent specializing in robotics and control systems research
 Your task is to search for, read, and synthesize academic papers on the given topic.
 
 Search strategy:
-1. Use web_fetch to search arXiv (https://arxiv.org/search/?searchtype=all&query=<keywords>)
-2. Search Semantic Scholar (https://api.semanticscholar.org/graph/v1/paper/search?query=<keywords>)
-3. Focus on papers from the last 3 years unless foundational work is requested
-4. Read abstracts and conclusions thoroughly; only read full papers if critical
+1. If an MCP search server is connected, prefer it: call list_mcp_resources first to
+   discover available servers/tools, then use mcp_call to run searches.
+2. Use web_fetch to search arXiv (https://arxiv.org/search/?searchtype=all&query=<keywords>)
+3. Use web_fetch on Semantic Scholar (https://api.semanticscholar.org/graph/v1/paper/search?query=<keywords>)
+4. Focus on papers from the last 3 years unless foundational work is requested
+5. Read abstracts and conclusions thoroughly; only read full papers if critical
 
 For each paper found, extract:
 - Title, authors, year, arXiv ID / DOI
@@ -104,7 +106,7 @@ export function createPaperSearchTool(
         const record = await bridge.spawnSubAgent({
           config: {
             taskDescription,
-            allowedTools: ['web_fetch', 'web_search', 'experience_write'],
+            allowedTools: ['web_fetch', 'mcp_call', 'list_mcp_resources', 'experience_write'],
             maxTurns,
           },
           abortSignal: ctx.abortSignal,
@@ -131,7 +133,8 @@ export function createPaperSearchTool(
           await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
 
           if (final?.status === 'completed') {
-            return { content: `📚 Paper search complete.\n\n${final.result ?? ''}`, isError: false }
+            const summary = final.result?.summary ?? ''
+            return { content: `📚 Paper search complete.\n\n${summary}`, isError: false }
           }
           return {
             content: `Paper search ${final?.status ?? 'failed'}. Task ID: ${record.taskId}`,
