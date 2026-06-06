@@ -10,7 +10,7 @@
  */
 
 import { describe, it, expect } from 'vitest'
-import { buildRoboticsCompactInstructions } from '../compactInstructions.js'
+import { buildRoboticsCompactInstructions, buildRoboticsDeterministicAnchors } from '../compactInstructions.js'
 import type { RoboticsProjectState } from '../types.js'
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -161,5 +161,59 @@ describe('buildRoboticsCompactInstructions', () => {
     const state = makeState({ currentPhase: 'init' })
     const result = buildRoboticsCompactInstructions({ state })
     expect(result).toContain('## Compact Instructions (Robotics Mode)')
+  })
+
+  it('lists completed sub-agent task IDs and asks to preserve their final status', () => {
+    const state = makeState({
+      completedSubAgentTaskIds: ['TASK_20260606_001', 'TASK_20260606_002'],
+    })
+    const result = buildRoboticsCompactInstructions({ state })
+    expect(result).not.toBeNull()
+    expect(result).toContain('Completed Sub-Agent Tasks')
+    expect(result).toContain('TASK_20260606_001')
+    expect(result).toContain('TASK_20260606_002')
+    expect(result).toContain('merge-or-discard')
+  })
+})
+
+describe('buildRoboticsDeterministicAnchors', () => {
+  it('returns null when there is nothing worth anchoring', () => {
+    expect(buildRoboticsDeterministicAnchors({ state: null })).toBeNull()
+    expect(buildRoboticsDeterministicAnchors({ state: makeState() })).toBeNull()
+  })
+
+  it('renders a factual anchor block with active + completed task IDs, phase, and hardware', () => {
+    const state = makeState({
+      currentPhase: 'train — 3/5',
+      activeSubAgentTasks: [
+        {
+          taskId: 'TASK_ACTIVE_9',
+          role: 'experiment',
+          title: 'Gait tuning',
+          spawnedAt: Date.now(),
+          on_complete: 'merge if reward improves',
+        },
+      ],
+      completedSubAgentTaskIds: ['TASK_DONE_1'],
+    })
+    const result = buildRoboticsDeterministicAnchors({
+      state,
+      hardwareSummary: 'Max joint velocity: 10 rad/s',
+    })
+    expect(result).not.toBeNull()
+    expect(result).toContain('Robotics State Anchors (deterministic)')
+    expect(result).toContain('TASK_ACTIVE_9')
+    expect(result).toContain('merge if reward improves')
+    expect(result).toContain('TASK_DONE_1')
+    expect(result).toContain('train — 3/5')
+    expect(result).toContain('Max joint velocity')
+  })
+
+  it('is factual (not instruction-framed) so it can be appended to summary output', () => {
+    const result = buildRoboticsDeterministicAnchors({ state: makeState({ currentPhase: 'deploy' }) })
+    expect(result).not.toBeNull()
+    // No "you MUST preserve" steering language — this block is appended verbatim.
+    expect(result).not.toContain('you MUST')
+    expect(result).not.toContain('## Compact Instructions')
   })
 })

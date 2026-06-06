@@ -93,6 +93,9 @@ export class AgenticSession {
         // this to route its mode-specific compact instructions here instead of
         // the every-turn volatile prefix.
         customInstructions: config.compact?.customInstructions,
+        // Deterministic state anchors appended to the compact output in every
+        // path; RoboticsSession routes its live-state anchor block here.
+        deterministicAnchors: config.compact?.deterministicAnchors,
       },
       // Thinking on the primary model — sourced from resolved.thinkingConfig
       // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the

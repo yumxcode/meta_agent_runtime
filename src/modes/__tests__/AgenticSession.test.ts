@@ -92,6 +92,23 @@ describe('AgenticSession facade wiring', () => {
     expect(session.getMessages()[0]?.role).toBe('user')
     expect(session.getMessages()[1]?.role).toBe('assistant')
   })
+
+  it('passes the resolved flashModel into kernel compact config', () => {
+    const session = new AgenticSession({
+      apiKey: 'test-key',
+      baseURL: 'https://open.bigmodel.cn/api/anthropic',
+      model: 'glm-5.1',
+      flashModel: 'glm-4.5-air',
+      tools: [],
+    })
+
+    const engineConfig = (session as unknown as {
+      _engine: { _config: { baseURL?: string; compact?: { model?: string } } }
+    })._engine._config
+
+    expect(engineConfig.baseURL).toBe('https://open.bigmodel.cn/api/anthropic')
+    expect(engineConfig.compact?.model).toBe('glm-4.5-air')
+  })
 })
 
 describe('MetaAgentSession facade wiring', () => {

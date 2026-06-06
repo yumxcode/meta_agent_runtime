@@ -1376,7 +1376,7 @@ async function runSessionPicker(
   console.log(`\n${bold('历史会话:')} ${dim('(仅显示当前 workspace，选择一个以继续上次对话)')}\n`)
   sessions.forEach((s, i) => {
     const ago = formatAge(Date.now() - s.lastActivity)
-    const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
+    const preview = sessionPromptPreview(s.firstPrompt, 60)
     console.log(
       `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
       `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -1399,6 +1399,80 @@ async function runSessionPicker(
   }
   console.log(green(`✓ 已加载 ${messages.length} 条历史消息，继续上次 ${selected.mode} 模式会话。\n`))
   return { sessionId: selected.sessionId, messages, mode: selected.mode }
+}
+
+function sessionPromptPreview(firstPrompt: string, limit: number): string {
+  return sanitizeTerminalPreview(extractPromptPreviewText(firstPrompt), limit)
+}
+
+function extractPromptPreviewText(raw: string): string {
+  try {
+    const parsed = JSON.parse(raw) as unknown
+    const rendered = renderPromptContent(parsed)
+    if (rendered) return rendered
+  } catch {
+    const rendered = renderTruncatedJsonPromptPreview(raw)
+    if (rendered) return rendered
+  }
+  return raw
+}
+
+function renderTruncatedJsonPromptPreview(raw: string): string {
+  const textMatch = raw.match(/"type"\s*:\s*"text"\s*,\s*"text"\s*:\s*"((?:\\.|[^"\\])*)/)
+  if (textMatch?.[1]) {
+    try {
+      return JSON.parse(`"${textMatch[1]}"`) as string
+    } catch {
+      return textMatch[1]
+    }
+  }
+  if (/"type"\s*:\s*"tool_result"/.test(raw)) return '[tool_result] historical tool output'
+  if (/"type"\s*:\s*"tool_use"/.test(raw)) return '[tool_use] historical tool call'
+  return ''
+}
+
+function firstPromptFromMessage(message: ConversationMessage | undefined, fallback: string): string {
+  if (!message) return fallback.slice(0, 80)
+  return renderPromptContent(message.content).slice(0, 80) || fallback.slice(0, 80)
+}
+
+function findSessionPreviewMessage(messages: readonly ConversationMessage[]): ConversationMessage | undefined {
+  const realUser = messages.find(message => {
+    if (message.role !== 'user') return false
+    const meta = message as unknown as Record<string, unknown>
+    if (meta['isCompactSummary'] || meta['isCompactBoundary'] || meta['sourceToolAssistantUUID']) return false
+    const text = renderPromptContent(message.content)
+    return text.length > 0 && !text.startsWith('[Local resume summary]')
+  })
+  if (realUser) return realUser
+
+  return messages.find(message => {
+    if (message.role !== 'user') return false
+    return renderPromptContent(message.content).length > 0
+  })
+}
+
+function renderPromptContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+
+  const parts = content.map(block => {
+    if (!block || typeof block !== 'object') return ''
+    const item = block as Record<string, unknown>
+    if (item['type'] === 'text' && typeof item['text'] === 'string') return item['text']
+    if (item['type'] === 'tool_use') {
+      const name = typeof item['name'] === 'string' ? item['name'] : 'tool'
+      return `[tool_use: ${name}]`
+    }
+    if (item['type'] === 'tool_result') {
+      const result = item['content']
+      if (typeof result === 'string') return `[tool_result] ${result}`
+      return '[tool_result]'
+    }
+    return ''
+  }).filter(Boolean)
+
+  return parts.join(' ').replace(/\s+/g, ' ').trim()
 }
 
 function formatAge(ms: number): string {
@@ -2428,13 +2502,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
       const sessionId = router.getSessionId()
       if (!sessionId) return
       const messages = router.getMessages()
-      const firstUserMsg = messages.find(m => m.role === 'user')
-      const firstPromptText = firstUserMsg
-        ? (typeof firstUserMsg.content === 'string'
-            ? firstUserMsg.content
-            : JSON.stringify(firstUserMsg.content)
-          ).slice(0, 80)
-        : currentInput.slice(0, 80)
+      const firstUserMsg = findSessionPreviewMessage(messages)
+      const firstPromptText = firstPromptFromMessage(firstUserMsg, currentInput)
       const meta = {
         mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
         startTime:     Date.now(),
@@ -2879,7 +2948,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
             console.log(`\n${bold('选择要删除的会话:')} ${dim('(仅当前 workspace；输入序号删除，all 删除全部，回车取消)')}\n`)
             sessions.forEach((s, i) => {
               const ago = formatAge(Date.now() - s.lastActivity)
-              const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
+              const preview = sessionPromptPreview(s.firstPrompt, 60)
               console.log(
                 `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                 `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -2907,7 +2976,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
               if (idx >= 1 && idx <= sessions.length) {
                 const selected = sessions[idx - 1]!
                 await SessionStore.deleteSession(selected.sessionId)
-                const preview = sanitizeTerminalPreview(selected.firstPrompt, 50)
+                const preview = sessionPromptPreview(selected.firstPrompt, 50)
                 console.log(green(`\n✓ 已删除会话: ${dim(preview)}\n`))
               } else {
                 console.log(yellow('\n无效选择。\n'))
@@ -2922,7 +2991,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
                 console.log(`\n${bold('历史会话:')} ${dim('(仅当前 workspace；输入序号加载并继续上次对话)')}\n`)
               sessions.forEach((s, i) => {
                 const ago = formatAge(Date.now() - s.lastActivity)
-                const preview = sanitizeTerminalPreview(s.firstPrompt, 60)
+                const preview = sessionPromptPreview(s.firstPrompt, 60)
                 console.log(
                   `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                   `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,

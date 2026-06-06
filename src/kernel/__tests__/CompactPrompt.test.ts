@@ -12,7 +12,9 @@ import {
   extractCompactInstructions,
   buildCompactPrompt,
   buildCompactSummaryMessage,
+  buildFallbackCompactSummary,
 } from '../compact/CompactPrompt.js'
+import type { KernelMessage } from '../types/KernelMessage.js'
 
 // ── formatCompactSummary ──────────────────────────────────────────────────────
 
@@ -172,5 +174,82 @@ describe('buildCompactSummaryMessage', () => {
   it('includes the context-continuation preamble', () => {
     const msg = buildCompactSummaryMessage('Summary:\nContext.')
     expect(msg).toContain('previous conversation that ran out of context')
+  })
+})
+
+// ── buildFallbackCompactSummary ───────────────────────────────────────────────
+
+describe('buildFallbackCompactSummary', () => {
+  function msg(
+    uuid: string,
+    role: 'user' | 'assistant',
+    text: string,
+    meta: Partial<KernelMessage> = {},
+  ): KernelMessage {
+    return {
+      uuid,
+      role,
+      content: [{ type: 'text', text }],
+      ...meta,
+    }
+  }
+
+  it('preserves the first explicit user request and recent user messages', () => {
+    const messages: KernelMessage[] = [
+      msg('u1', 'user', 'initial task: analyse the training curve'),
+      msg('a1', 'assistant', 'working on it'),
+      msg('u2', 'user', 'latest request: decide whether it plateaued'),
+    ]
+
+    const summary = buildFallbackCompactSummary(messages)
+
+    expect(summary).toContain('Summary:')
+    expect(summary).toContain('initial task: analyse the training curve')
+    expect(summary).toContain('latest request: decide whether it plateaued')
+    expect(summary).toContain('compact model did not produce a usable high-fidelity summary')
+  })
+
+  it('summarises tool use and clips very large outputs', () => {
+    const largeOutput = 'x'.repeat(50_000)
+    const messages: KernelMessage[] = [
+      msg('u1', 'user', 'run diagnostics'),
+      {
+        uuid: 'a1',
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tool-1', name: 'bash', input: { command: 'gm task data values' } }],
+      },
+      {
+        uuid: 'u2',
+        role: 'user',
+        sourceToolAssistantUUID: 'a1',
+        content: [{
+          type: 'tool_result',
+          tool_use_id: 'tool-1',
+          content: largeOutput,
+          is_error: false,
+        }],
+      } as KernelMessage,
+    ]
+
+    const summary = buildFallbackCompactSummary(messages)
+
+    expect(summary).toContain('[tool_use bash]')
+    expect(summary).toContain('[tool_result tool-1]')
+    expect(summary).toContain('[truncated]')
+    expect(summary.length).toBeLessThanOrEqual(28_000)
+  })
+
+  it('carries recent existing compact summaries forward', () => {
+    const messages: KernelMessage[] = [
+      msg('u1', 'user', 'initial task'),
+      msg('s1', 'user', 'older compact summary', { isCompactSummary: true }),
+      msg('s2', 'user', 'newer compact summary', { isCompactSummary: true }),
+    ]
+
+    const summary = buildFallbackCompactSummary(messages)
+
+    expect(summary).toContain('Existing Compact Summaries')
+    expect(summary).toContain('older compact summary')
+    expect(summary).toContain('newer compact summary')
   })
 })

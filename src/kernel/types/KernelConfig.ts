@@ -27,6 +27,20 @@ export interface CompactConfig {
    * Returning null/undefined from the thunk means "no custom instructions".
    */
   customInstructions?: string | (() => string | null | undefined)
+  /**
+   * Deterministic state anchors appended to the compact OUTPUT (the summary
+   * itself), independent of the model-generated summary. Unlike
+   * customInstructions — which only steer the summarisation model and are lost
+   * when the model returns a terse or empty summary — these anchors are appended
+   * verbatim and protected from truncation in every path (rich summary, terse
+   * summary, and empty-response fallback).
+   *
+   * Use the thunk form when the anchors depend on live session state (e.g.
+   * robotics active/completed sub-agent task IDs, phase, hardware safety
+   * limits, experience working set) that must reflect the moment compaction
+   * fires. Returning null/undefined means "no extra anchors".
+   */
+  deterministicAnchors?: string | (() => string | null | undefined)
   /** querySource tag — 'compact' to prevent recursion */
   querySource?: string
 }

@@ -28,6 +28,9 @@ const INDEX_FILE    = join(SESSIONS_ROOT, 'index.json')
 const MAX_INDEX_ENTRIES = 50   // keep last 50 sessions in the index
 const MAX_RESUME_BYTES = 5 * 1024 * 1024
 const MAX_RESUME_MESSAGES = 200
+const RESUME_SUMMARY_RECENT_USER_LIMIT = 8
+const RESUME_SUMMARY_RECENT_ASSISTANT_LIMIT = 6
+const RESUME_SUMMARY_TEXT_LIMIT = 1_000
 
 // ── Public types ─────────────────────────────────────────────────────────────
 
@@ -76,6 +79,149 @@ function serializeMessages(messages: readonly ConversationMessage[]): string {
     .filter(m => !Array.isArray(m.content) || m.content.length > 0)
     .map(m => JSON.stringify(m))
     .join('\n') + '\n'
+}
+
+function contentBlocks(message: ConversationMessage): Array<Record<string, unknown>> {
+  return Array.isArray(message.content)
+    ? message.content as Array<Record<string, unknown>>
+    : [{ type: 'text', text: message.content }]
+}
+
+function textFromMessage(message: ConversationMessage): string {
+  return contentBlocks(message)
+    .filter(block => block['type'] === 'text' && typeof block['text'] === 'string')
+    .map(block => block['text'] as string)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function clip(text: string, limit = RESUME_SUMMARY_TEXT_LIMIT): string {
+  if (text.length <= limit) return text
+  return `${text.slice(0, Math.max(0, limit - 16))}... [truncated]`
+}
+
+function buildLocalResumeSummary(
+  omitted: readonly ConversationMessage[],
+  retainedCount: number,
+  parsedCount: number,
+): ConversationMessage | null {
+  if (omitted.length === 0) return null
+
+  const toolUseCounts = new Map<string, number>()
+  let toolResultCount = 0
+  let toolResultErrorCount = 0
+  let toolResultChars = 0
+
+  const userTexts: string[] = []
+  const assistantTexts: string[] = []
+
+  for (const message of omitted) {
+    const text = textFromMessage(message)
+    if (text) {
+      if (message.role === 'user') userTexts.push(text)
+      else assistantTexts.push(text)
+    }
+
+    for (const block of contentBlocks(message)) {
+      if (block['type'] === 'tool_use') {
+        const name = typeof block['name'] === 'string' ? block['name'] : 'unknown'
+        toolUseCounts.set(name, (toolUseCounts.get(name) ?? 0) + 1)
+      } else if (block['type'] === 'tool_result') {
+        toolResultCount++
+        if (block['is_error']) toolResultErrorCount++
+        if (typeof block['content'] === 'string') toolResultChars += block['content'].length
+      }
+    }
+  }
+
+  const firstUser = userTexts[0]
+  const recentUsers = userTexts.slice(-RESUME_SUMMARY_RECENT_USER_LIMIT)
+  const recentAssistant = assistantTexts.slice(-RESUME_SUMMARY_RECENT_ASSISTANT_LIMIT)
+  const toolUseSummary = [...toolUseCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 12)
+    .map(([name, count]) => `- ${name}: ${count}`)
+
+  const lines = [
+    '[Local resume summary]',
+    `This session was resumed from ${parsedCount} stored messages. Earlier history (${omitted.length} messages) was summarized locally; the most recent ${retainedCount} messages are preserved after this summary.`,
+    'Older tool outputs are not fully included here. Re-run tools or re-read files before relying on exact historical output.',
+    '',
+    '## First User Request',
+    firstUser ? `- ${clip(firstUser)}` : '- No earlier user text was available.',
+    '',
+    '## Recent Earlier User Messages',
+    ...(recentUsers.length > 0 ? recentUsers.map(text => `- ${clip(text)}`) : ['- None.']),
+    '',
+    '## Recent Earlier Assistant Messages',
+    ...(recentAssistant.length > 0 ? recentAssistant.map(text => `- ${clip(text)}`) : ['- None.']),
+    '',
+    '## Earlier Tool Activity',
+    ...(toolUseSummary.length > 0 ? toolUseSummary : ['- No earlier tool_use blocks.']),
+    `- tool_result blocks: ${toolResultCount} (${toolResultErrorCount} errors, ${toolResultChars} chars total)`,
+  ]
+
+  return { role: 'user', content: [{ type: 'text', text: lines.join('\n') }] }
+}
+
+function toolUseIdsIn(messages: readonly ConversationMessage[]): Set<string> {
+  const ids = new Set<string>()
+  for (const message of messages) {
+    for (const block of contentBlocks(message)) {
+      if (block['type'] === 'tool_use' && typeof block['id'] === 'string') {
+        ids.add(block['id'])
+      }
+    }
+  }
+  return ids
+}
+
+function hasToolResult(message: ConversationMessage): boolean {
+  return contentBlocks(message).some(block => block['type'] === 'tool_result')
+}
+
+function hasOnlyToolResults(message: ConversationMessage): boolean {
+  const blocks = contentBlocks(message)
+  return blocks.length > 0 && blocks.every(block => block['type'] === 'tool_result')
+}
+
+function startsWithOrphanToolResult(messages: readonly ConversationMessage[]): boolean {
+  const first = messages[0]
+  if (!first || !hasToolResult(first)) return false
+  const toolUseIds = toolUseIdsIn(messages)
+  return contentBlocks(first)
+    .filter(block => block['type'] === 'tool_result')
+    .some(block => typeof block['tool_use_id'] === 'string' && !toolUseIds.has(block['tool_use_id']))
+}
+
+function trimToSafeResumeBoundary(messages: readonly ConversationMessage[]): ConversationMessage[] {
+  let start = 0
+  while (start < messages.length) {
+    const candidate = messages.slice(start)
+    const first = candidate[0]
+    if (!first) break
+    if (startsWithOrphanToolResult(candidate) || hasOnlyToolResults(first)) {
+      start++
+      continue
+    }
+    break
+  }
+  return messages.slice(start)
+}
+
+function buildResumedHistory(parsed: readonly ConversationMessage[]): ConversationMessage[] {
+  if (parsed.length <= MAX_RESUME_MESSAGES) {
+    return trimToSafeResumeBoundary(parsed)
+  }
+
+  const recentLimit = MAX_RESUME_MESSAGES - 1
+  const recentRaw = parsed.slice(-recentLimit)
+  const recent = trimToSafeResumeBoundary(recentRaw)
+  const omitted = parsed.slice(0, parsed.length - recentRaw.length + (recentRaw.length - recent.length))
+  const summary = buildLocalResumeSummary(omitted, recent.length, parsed.length)
+
+  return summary ? [summary, ...recent] : recent
 }
 
 async function readIndex(): Promise<SessionMeta[]> {
@@ -171,11 +317,11 @@ export class SessionStore {
       } else {
         raw = await readFile(path, 'utf-8')
       }
-      return raw
+      const parsed = raw
         .split('\n')
         .filter(Boolean)
-        .slice(-MAX_RESUME_MESSAGES)
         .map(line => JSON.parse(line) as ConversationMessage)
+      return buildResumedHistory(parsed)
     } catch {
       return []
     }

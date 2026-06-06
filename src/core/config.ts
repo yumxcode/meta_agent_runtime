@@ -130,6 +130,14 @@ export interface MetaAgentConfig {
    */
   compact?: {
     customInstructions?: string | (() => string | null | undefined)
+    /**
+     * Deterministic state anchors appended to the compact OUTPUT (not just the
+     * side-call prompt), surviving terse/empty summaries. Resolved lazily at
+     * compaction time. Used by RoboticsSession to guarantee active/completed
+     * sub-agent task IDs, phase, hardware safety limits and the experience
+     * working set persist across compaction regardless of summary quality.
+     */
+    deterministicAnchors?: string | (() => string | null | undefined)
   }
 
   /**

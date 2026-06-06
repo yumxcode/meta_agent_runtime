@@ -1,3 +1,5 @@
+import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
+
 /**
  * CompactPrompt — the 9-section summarisation prompt.
  * Mirrors CC's prompt.ts exactly, including the ## Compact Instructions injection.
@@ -150,4 +152,352 @@ export function buildCompactSummaryMessage(formattedSummary: string): string {
     'Resume directly — do not acknowledge the summary, do not recap what was happening,',
     'do not preface with "I\'ll continue" or similar. Pick up the last task as if the break never happened.',
   ].join('\n')
+}
+
+const FALLBACK_RECENT_MESSAGE_COUNT = 24
+const FALLBACK_EXISTING_SUMMARY_COUNT = 2
+const FALLBACK_MAX_TOTAL_CHARS = 28_000
+const FALLBACK_MAX_MESSAGE_CHARS = 1_800
+const FALLBACK_MAX_ANCHOR_CHARS = 3_600
+const CONTINUITY_MAX_TOTAL_CHARS = 32_000
+const CONTINUITY_MAX_ITEM_CHARS = 1_600
+const CONTINUITY_MAX_ANCHOR_CHARS = 4_000
+const CONTINUITY_RECENT_USER_COUNT = 10
+const CONTINUITY_RECENT_ASSISTANT_COUNT = 8
+const CONTINUITY_RECENT_TOOL_RESULT_COUNT = 10
+const CONTINUITY_EXISTING_SUMMARY_COUNT = 3
+/**
+ * When the model summary is already this long (chars), it is treated as
+ * "rich" and the bulky verbatim recent-detail anchor sections (recent user /
+ * assistant / tool messages) are omitted to avoid duplicating content the
+ * summary already covers. The lightweight durable objective anchors and the
+ * tool-activity summary are always kept regardless of summary length.
+ */
+const SUMMARY_RICH_CHAR_THRESHOLD = 2_000
+/** Hard budget for caller-supplied (e.g. robotics) deterministic anchors. */
+const EXTRA_ANCHOR_MAX_CHARS = 4_000
+
+export interface ContinuityEnrichOptions {
+  /**
+   * Caller-supplied deterministic anchor block (e.g. robotics live state:
+   * active/completed sub-agent task IDs, phase, hardware safety limits,
+   * experience working set). Always appended and protected from truncation so
+   * it survives terse summaries and the empty-response fallback path — the
+   * exact scenarios where the model-prompt instructions are unreliable.
+   */
+  extraAnchors?: string
+}
+
+/**
+ * Append deterministic continuity anchors to a model-generated compact summary.
+ * This protects long engineering sessions from over-compression when a compact
+ * model returns an overly terse summary.
+ *
+ * Anchors are layered so a healthy, comprehensive summary is not bloated:
+ *  - Durable objective anchors + tool-activity summary: always appended (cheap).
+ *  - Recent verbatim user/assistant/tool detail: appended ONLY when the model
+ *    summary is terse (< SUMMARY_RICH_CHAR_THRESHOLD), since a rich summary
+ *    already covers that ground.
+ *  - extraAnchors (caller deterministic state): always appended, never clipped
+ *    away — the model summary is clipped first if the combined text is too long.
+ */
+export function enrichCompactSummaryWithContinuity(
+  modelSummary: string,
+  messages: readonly KernelMessage[],
+  options: ContinuityEnrichOptions = {},
+): string {
+  const summary = modelSummary.trim()
+  const includeRecentDetail = summary.length < SUMMARY_RICH_CHAR_THRESHOLD
+  const generic = buildCompactContinuityAnchors(messages, { includeRecentDetail })
+  const extra = options.extraAnchors
+    ? clip(options.extraAnchors.trim(), EXTRA_ANCHOR_MAX_CHARS)
+    : ''
+
+  const appended = [extra, generic].filter(Boolean).join('\n\n')
+  if (!appended) return summary
+
+  // Protect the appended anchors: if the combined text overflows the ceiling,
+  // clip the (regenerable) model summary rather than the deterministic anchors.
+  const room = Math.max(0, CONTINUITY_MAX_TOTAL_CHARS - appended.length - 2)
+  const summaryClipped = clip(summary, room)
+  return summaryClipped ? `${summaryClipped}\n\n${appended}` : appended
+}
+
+/**
+ * Build a deterministic local summary when the compact side-call returns no
+ * text. This is intentionally lossy, but it preserves the durable anchors that
+ * keep the session usable and actually shrinks context instead of retrying a
+ * broken compact model until the main request hits the blocking limit.
+ */
+export function buildFallbackCompactSummary(
+  messages: readonly KernelMessage[],
+  options: ContinuityEnrichOptions = {},
+): string {
+  const extraAnchors = options.extraAnchors
+    ? clip(options.extraAnchors.trim(), EXTRA_ANCHOR_MAX_CHARS)
+    : ''
+  const existingSummaries = messages
+    .filter(message => message.isCompactSummary)
+    .slice(-FALLBACK_EXISTING_SUMMARY_COUNT)
+    .map(message => clip(renderMessageContent(message), FALLBACK_MAX_ANCHOR_CHARS))
+    .filter(Boolean)
+
+  const firstUser = messages.find(isRealUserMessage)
+  const recentMessages = messages
+    .filter(message => !message.isCompactBoundary && message.content.length > 0)
+    .slice(-FALLBACK_RECENT_MESSAGE_COUNT)
+
+  const used = new Set<string>()
+  const recentLines: string[] = []
+  for (const message of recentMessages) {
+    if (used.has(message.uuid)) continue
+    used.add(message.uuid)
+    const rendered = renderMessageContent(message)
+    if (!rendered) continue
+    recentLines.push(`- ${messageLabel(message)}: ${clip(rendered, FALLBACK_MAX_MESSAGE_CHARS)}`)
+  }
+
+  const firstUserText = firstUser
+    ? clip(renderMessageContent(firstUser), FALLBACK_MAX_ANCHOR_CHARS)
+    : 'No explicit user request was available in the retained messages.'
+
+  const continuityAnchors = buildCompactContinuityAnchors(messages)
+  const body = [
+    'Summary:',
+    '## 1. Primary Request and Intent',
+    '- Local fallback summary generated because the compact model did not produce a usable high-fidelity summary.',
+    `- First explicit user request: ${firstUserText}`,
+    ...(extraAnchors
+      ? ['', '## Deterministic State Anchors (caller-provided)', extraAnchors]
+      : []),
+    '',
+    '## 2. Key Technical Concepts',
+    '- Exact technical concepts were not model-summarised. Use the preserved recent messages below and re-read files before relying on code details.',
+    '',
+    '## 3. Files and Code Sections',
+    '- File contents from before compaction are not carried forward by this fallback. Re-read any file before editing or citing exact code.',
+    '',
+    '## 4. Errors and Fixes',
+    '- Compact side-call produced an empty text response. The runtime replaced it with this deterministic fallback so the session can continue.',
+    '',
+    '## 5. Problem Solving',
+    '- Continue from the latest user request and recent tool outputs. Treat older details as incomplete unless repeated in existing compact summaries or recent messages.',
+    '',
+    '## 6. All User Messages',
+    ...renderRecentUserMessages(messages),
+    '',
+    '## 7. Pending Tasks',
+    '- Infer pending work from the most recent user message and recent assistant/tool context below.',
+    '',
+    '## 8. Current Work',
+    ...(
+      recentLines.length > 0
+        ? recentLines
+        : ['- No recent message content was available.']
+    ),
+    '',
+    '## 9. Optional Next Step',
+    '- Resume directly from the newest user request. If exact historical data is needed, query the source again rather than relying on this fallback.',
+    ...(existingSummaries.length > 0
+      ? [
+          '',
+          '## Existing Compact Summaries',
+          ...existingSummaries.map((summary, index) => `### Summary ${index + 1}\n${summary}`),
+        ]
+      : []),
+    ...(continuityAnchors
+      ? [
+          '',
+          continuityAnchors,
+        ]
+      : []),
+  ].join('\n')
+
+  return clip(body, FALLBACK_MAX_TOTAL_CHARS)
+}
+
+function buildCompactContinuityAnchors(
+  messages: readonly KernelMessage[],
+  options: { includeRecentDetail?: boolean } = {},
+): string {
+  const includeRecentDetail = options.includeRecentDetail ?? true
+  const realUsers = messages.filter(isRealUserMessage)
+  const firstUser = realUsers[0]
+  const latestUser = realUsers[realUsers.length - 1]
+
+  const existingSummaries = messages
+    .filter(message => message.isCompactSummary)
+    .slice(-CONTINUITY_EXISTING_SUMMARY_COUNT)
+    .map(message => clip(renderMessageContent(message), CONTINUITY_MAX_ANCHOR_CHARS))
+    .filter(Boolean)
+
+  const recentUsers = realUsers
+    .slice(-CONTINUITY_RECENT_USER_COUNT)
+    .map(message => clip(renderMessageContent(message), CONTINUITY_MAX_ITEM_CHARS))
+    .filter(Boolean)
+
+  const recentAssistant = messages
+    .filter(message => message.role === 'assistant' && !message.isMeta && message.content.length > 0)
+    .slice(-CONTINUITY_RECENT_ASSISTANT_COUNT)
+    .map(message => clip(renderMessageContent(message), CONTINUITY_MAX_ITEM_CHARS))
+    .filter(Boolean)
+
+  const recentToolResults = messages
+    .filter(message => message.sourceToolAssistantUUID || message.content.some(block => block.type === 'tool_result'))
+    .slice(-CONTINUITY_RECENT_TOOL_RESULT_COUNT)
+    .map(message => clip(renderMessageContent(message), CONTINUITY_MAX_ITEM_CHARS))
+    .filter(Boolean)
+
+  const toolUseCounts = new Map<string, number>()
+  let toolResultCount = 0
+  let toolResultErrorCount = 0
+  for (const message of messages) {
+    for (const block of message.content) {
+      if (block.type === 'tool_use') {
+        toolUseCounts.set(block.name, (toolUseCounts.get(block.name) ?? 0) + 1)
+      } else if (block.type === 'tool_result') {
+        toolResultCount++
+        if (block.is_error) toolResultErrorCount++
+      }
+    }
+  }
+
+  const toolActivity = [...toolUseCounts.entries()]
+    .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+    .slice(0, 12)
+    .map(([name, count]) => `- ${name}: ${count}`)
+
+  const lines = [
+    '## Deterministic Continuity Anchors',
+    '- These anchors were generated locally to reduce information loss and goal drift after compaction.',
+    '- Treat exact file contents and exact command output as stale unless re-read or re-run.',
+    '',
+    '### Durable Objective Anchors',
+    firstUser
+      ? `- First explicit user request: ${clip(renderMessageContent(firstUser), CONTINUITY_MAX_ANCHOR_CHARS)}`
+      : '- First explicit user request: unavailable.',
+    latestUser
+      ? `- Latest explicit user request: ${clip(renderMessageContent(latestUser), CONTINUITY_MAX_ANCHOR_CHARS)}`
+      : '- Latest explicit user request: unavailable.',
+    // Bulky verbatim recent-detail sections are only emitted when the model
+    // summary was terse; a rich summary already covers this ground (see
+    // SUMMARY_RICH_CHAR_THRESHOLD in enrichCompactSummaryWithContinuity).
+    ...(includeRecentDetail
+      ? [
+          '',
+          '### Recent User Requests',
+          ...(recentUsers.length > 0 ? recentUsers.map(text => `- ${text}`) : ['- None.']),
+          '',
+          '### Recent Assistant Progress',
+          ...(recentAssistant.length > 0 ? recentAssistant.map(text => `- ${text}`) : ['- None.']),
+          '',
+          '### Recent Tool Results',
+          ...(recentToolResults.length > 0 ? recentToolResults.map(text => `- ${text}`) : ['- None.']),
+        ]
+      : []),
+    '',
+    '### Tool Activity Summary',
+    ...(toolActivity.length > 0 ? toolActivity : ['- No tool_use blocks retained.']),
+    `- tool_result blocks retained in compact input: ${toolResultCount} (${toolResultErrorCount} errors)`,
+    ...(existingSummaries.length > 0
+      ? [
+          '',
+          '### Existing Summaries Carried Forward',
+          ...existingSummaries.map((summary, index) => `- Summary ${index + 1}: ${summary}`),
+        ]
+      : []),
+  ]
+
+  return clip(lines.join('\n'), CONTINUITY_MAX_TOTAL_CHARS)
+}
+
+function isRealUserMessage(message: KernelMessage): boolean {
+  return message.role === 'user' &&
+    !message.isMeta &&
+    !message.isCompactSummary &&
+    !message.isCompactBoundary &&
+    !message.sourceToolAssistantUUID
+}
+
+function renderRecentUserMessages(messages: readonly KernelMessage[]): string[] {
+  const userMessages = messages
+    .filter(isRealUserMessage)
+    .slice(-8)
+    .map(message => `- ${clip(renderMessageContent(message), FALLBACK_MAX_MESSAGE_CHARS)}`)
+    .filter(line => line !== '- ')
+
+  return userMessages.length > 0
+    ? userMessages
+    : ['- No explicit user messages were available in the retained messages.']
+}
+
+function messageLabel(message: KernelMessage): string {
+  if (message.isCompactSummary) return 'compact_summary'
+  if (message.isMeta) return `${message.role}_meta`
+  if (message.sourceToolAssistantUUID) return 'tool_result'
+  return message.role
+}
+
+function renderMessageContent(message: KernelMessage): string {
+  return message.content
+    .map(renderContentBlock)
+    .filter(Boolean)
+    .join(' ')
+    .replace(/\s+/g, ' ')
+    .trim()
+}
+
+function renderContentBlock(block: ContentBlock): string {
+  switch (block.type) {
+    case 'text':
+      return stripVolatileContextPrefix(block.text)
+    case 'tool_use':
+      return `[tool_use ${block.name}] ${stringifyCompact(block.input)}`
+    case 'tool_result':
+      return `[tool_result ${block.tool_use_id}${block.is_error ? ' error' : ''}] ${renderToolResultContent(block.content)}`
+    case 'image':
+      return '[image omitted]'
+    case 'thinking':
+    case 'redacted_thinking':
+      return ''
+    default:
+      return `[${String((block as { type?: unknown }).type ?? 'unknown')} omitted]`
+  }
+}
+
+function renderToolResultContent(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (Array.isArray(content)) {
+    return content
+      .map(item => {
+        if (!item || typeof item !== 'object') return ''
+        const maybeBlock = item as Partial<ContentBlock>
+        return maybeBlock.type ? renderContentBlock(maybeBlock as ContentBlock) : ''
+      })
+      .filter(Boolean)
+      .join(' ')
+  }
+  return ''
+}
+
+function stringifyCompact(value: unknown): string {
+  try {
+    return JSON.stringify(value ?? {})
+  } catch {
+    return String(value)
+  }
+}
+
+function stripVolatileContextPrefix(text: string): string {
+  if (!text.startsWith('<context>')) return text
+  const end = text.indexOf('</context>')
+  if (end < 0) return text
+  const rest = text.slice(end + '</context>'.length)
+  return rest.replace(/^\s*---\s*/, '').trimStart()
+}
+
+function clip(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text
+  if (maxChars <= 20) return text.slice(0, maxChars)
+  return `${text.slice(0, maxChars - 20)}... [truncated]`
 }

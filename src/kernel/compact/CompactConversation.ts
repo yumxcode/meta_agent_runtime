@@ -13,14 +13,20 @@
  */
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
-import type { KernelMessage } from '../types/KernelMessage.js'
+import type { ContentBlock, KernelMessage } from '../types/KernelMessage.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 import type { ThinkingConfig } from '../types/KernelConfig.js'
 import { stripImagesFromMessages, normalizeMessagesForAPI } from '../messages/MessageNormalizer.js'
 import { normalizeMessagesForDeepSeek } from '../messages/DeepSeekMessageNormalizer.js'
 import { buildAnthropicAuth } from '../api/AnthropicClient.js'
 import { getModelProtocol } from '../../providers/registry.js'
-import { buildCompactPrompt, formatCompactSummary, extractCompactInstructions } from './CompactPrompt.js'
+import {
+  buildCompactPrompt,
+  formatCompactSummary,
+  extractCompactInstructions,
+  buildFallbackCompactSummary,
+  enrichCompactSummaryWithContinuity,
+} from './CompactPrompt.js'
 import { buildPostCompactMessages } from './PostCompact.js'
 import type { CompactionResult } from './PostCompact.js'
 
@@ -28,6 +34,10 @@ const COMPACT_MAX_PTL_RETRIES = 3
 export const COMPACT_MODEL_DEFAULT = 'deepseek-v4-flash'
 export const COMPACT_MAX_TOKENS = 12_000
 const RECENT_USER_ANCHOR_COUNT = 6
+const COMPACT_TEXT_BLOCK_CHAR_LIMIT = 8_000
+const COMPACT_TOOL_RESULT_BLOCK_CHAR_LIMIT = 4_000
+const COMPACT_TOOL_RESULT_TOTAL_CHAR_BUDGET = 80_000
+type ToolResultContent = Extract<ContentBlock, { type: 'tool_result' }>['content']
 
 export interface CompactOptions {
   model?: string
@@ -39,11 +49,34 @@ export interface CompactOptions {
    * instructions reflect live session state rather than config-time state.
    */
   customInstructions?: string | (() => string | null | undefined)
+  /**
+   * Deterministic state anchors appended to the summary output in every path
+   * (rich/terse/empty-fallback). May be a thunk resolved here at compaction
+   * time so the anchors reflect live session state. See CompactConfig.
+   */
+  deterministicAnchors?: string | (() => string | null | undefined)
   thinkingConfig?: ThinkingConfig
   abortSignal?: AbortSignal
   maxRetries?: number
   /** Messages that must remain visible after compact, outside the summary. */
   messagesToKeep?: readonly KernelMessage[]
+}
+
+class CompactEmptyResponseError extends Error {
+  constructor(message = 'Compact model returned empty response') {
+    super(message)
+    this.name = 'CompactEmptyResponseError'
+  }
+}
+
+class CompactPromptTooLongError extends Error {
+  status = 400
+  error = { type: 'prompt_too_long' }
+
+  constructor(message = 'Compact model context window exceeded') {
+    super(message)
+    this.name = 'CompactPromptTooLongError'
+  }
 }
 
 /**
@@ -70,10 +103,19 @@ export async function compactConversation(
     resolvedCustom ??
     (options.systemPrompt ? extractCompactInstructions(options.systemPrompt) : undefined)
 
+  // Resolve deterministic anchors the same way (thunk → live state). These are
+  // appended to the summary OUTPUT, so they survive even when the model returns
+  // a terse or empty summary.
+  const extraAnchors =
+    typeof options.deterministicAnchors === 'function'
+      ? options.deterministicAnchors() ?? undefined
+      : options.deterministicAnchors
+
   const compactSystemPrompt = buildCompactPrompt(customInstructions)
 
-  // Strip images to avoid PTL in the compact request
-  const stripped = stripImagesFromMessages(messages)
+  // Strip large/non-text payloads before the compact side-call. The compact
+  // model needs the shape of recent work, not full historical command output.
+  const stripped = shrinkMessagesForCompact(stripImagesFromMessages(messages))
 
   // PTL retry loop: drop oldest messages on each failure
   let messagesToSummarise = [...stripped]
@@ -89,8 +131,13 @@ export async function compactConversation(
       )
 
       const formatted = formatCompactSummary(summary)
-      return buildPostCompactMessages(formatted, fileCache, options.messagesToKeep)
+      const enrichedSummary = enrichCompactSummaryWithContinuity(formatted, stripped, { extraAnchors })
+      return buildPostCompactMessages(enrichedSummary, fileCache, options.messagesToKeep)
     } catch (error: unknown) {
+      if (isCompactEmptyResponse(error)) {
+        const fallback = buildFallbackCompactSummary(stripped, { extraAnchors })
+        return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep)
+      }
       if (isPromptTooLong(error) && messagesToSummarise.length > 2) {
         // Drop old non-anchor messages first. Keep durable anchors such as the
         // first user request, compact summaries, and recent user messages.
@@ -100,6 +147,11 @@ export async function compactConversation(
       }
       throw error
     }
+  }
+
+  if (isPromptTooLong(lastError)) {
+    const fallback = buildFallbackCompactSummary(stripped, { extraAnchors })
+    return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep)
   }
 
   throw lastError ?? new Error('Compact failed: could not summarise conversation')
@@ -146,6 +198,84 @@ function trimPromptTooLongMessages(messages: readonly KernelMessage[]): KernelMe
   return messages.filter(message => !toDrop.has(message.uuid))
 }
 
+function shrinkMessagesForCompact(messages: readonly KernelMessage[]): KernelMessage[] {
+  let remainingToolResultChars = COMPACT_TOOL_RESULT_TOTAL_CHAR_BUDGET
+
+  return [...messages].reverse().map(message => {
+    const content = message.content.map(block => {
+      if (block.type === 'text') {
+        const text = stripVolatileContextPrefix(block.text)
+        return {
+          ...block,
+          text: clipForCompact(text, COMPACT_TEXT_BLOCK_CHAR_LIMIT, 'text block'),
+        }
+      }
+
+      if (block.type === 'tool_result') {
+        const [content, remaining] = shrinkToolResultContent(
+          block.content,
+          remainingToolResultChars,
+        )
+        remainingToolResultChars = remaining
+        return { ...block, content }
+      }
+
+      return block
+    })
+    return { ...message, content }
+  }).reverse()
+}
+
+function shrinkToolResultContent(
+  content: ToolResultContent,
+  remainingBudget: number,
+): [ToolResultContent, number] {
+  if (typeof content === 'string') {
+    const allowed = Math.min(COMPACT_TOOL_RESULT_BLOCK_CHAR_LIMIT, remainingBudget)
+    const next = Math.max(0, remainingBudget - Math.min(content.length, allowed))
+    return [clipToolResultForCompact(content, allowed), next]
+  }
+
+  if (Array.isArray(content)) {
+    let remaining = remainingBudget
+    const nextContent = content.map(item => {
+      if (!item || typeof item !== 'object') return item
+      const block = item as unknown as Record<string, unknown>
+      if (block['type'] !== 'text' || typeof block['text'] !== 'string') return item
+      const allowed = Math.min(COMPACT_TOOL_RESULT_BLOCK_CHAR_LIMIT, remaining)
+      remaining = Math.max(0, remaining - Math.min(block['text'].length, allowed))
+      return {
+        ...block,
+        text: clipToolResultForCompact(block['text'], allowed),
+      }
+    })
+    return [nextContent as ToolResultContent, remaining]
+  }
+
+  return [content, remainingBudget]
+}
+
+function clipToolResultForCompact(text: string, limit: number): string {
+  if (limit <= 0) {
+    return `[tool_result omitted for compact; original length ${text.length} chars]`
+  }
+  return clipForCompact(text, limit, 'tool_result')
+}
+
+function clipForCompact(text: string, limit: number, label: string): string {
+  if (text.length <= limit) return text
+  const suffix = `\n[${label} truncated for compact; original length ${text.length} chars]`
+  return `${text.slice(0, Math.max(0, limit - suffix.length))}${suffix}`
+}
+
+function stripVolatileContextPrefix(text: string): string {
+  if (!text.startsWith('<context>')) return text
+  const end = text.indexOf('</context>')
+  if (end < 0) return text
+  const rest = text.slice(end + '</context>'.length)
+  return rest.replace(/^\s*---\s*/, '').trimStart()
+}
+
 async function callCompactModel(
   messages: KernelMessage[],
   systemPrompt: string,
@@ -176,6 +306,10 @@ async function callCompactModel(
     signal: options.abortSignal,
   })
 
+  if (isCompactContextWindowStop(response.stop_reason)) {
+    throw new CompactPromptTooLongError(`Compact model stopped: ${response.stop_reason}`)
+  }
+
   // Extract text content from the response
   const text = response.content
     .filter(b => b.type === 'text')
@@ -183,10 +317,16 @@ async function callCompactModel(
     .join('')
 
   if (!text.trim()) {
-    throw new Error('Compact model returned empty response')
+    throw new CompactEmptyResponseError()
   }
 
   return text
+}
+
+function isCompactContextWindowStop(stopReason: unknown): boolean {
+  return typeof stopReason === 'string' &&
+    (stopReason.includes('context_window_exceeded') ||
+      stopReason.includes('prompt_too_long'))
 }
 
 async function callCompactModelDeepSeek(
@@ -216,13 +356,18 @@ async function callCompactModelDeepSeek(
 
   const text = response.choices[0]?.message?.content ?? ''
   if (!text.trim()) {
-    throw new Error('Compact model (DeepSeek) returned empty response')
+    throw new CompactEmptyResponseError('Compact model (DeepSeek) returned empty response')
   }
 
   return text
 }
 
+function isCompactEmptyResponse(error: unknown): boolean {
+  return error instanceof CompactEmptyResponseError
+}
+
 function isPromptTooLong(error: unknown): boolean {
+  if (error instanceof CompactPromptTooLongError) return true
   if (!error || typeof error !== 'object') return false
   const e = error as Record<string, unknown>
   if (e['status'] === 400 && typeof e['message'] === 'string') {

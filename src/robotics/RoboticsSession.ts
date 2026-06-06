@@ -66,7 +66,7 @@ import type { QueryAnalyzer, QueryIntent } from '../context/QueryAnalyzer.js'
 import type { ExperienceMatch } from '../context/sources/IKnowledgeSource.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, buildR6Section, renderR4Snapshot, renderR5Snapshot } from './dynamicSections.js'
-import { buildRoboticsCompactInstructions } from './compactInstructions.js'
+import { buildRoboticsCompactInstructions, buildRoboticsDeterministicAnchors } from './compactInstructions.js'
 import {
   buildDynamicSections,
   buildVolatileContextSections,
@@ -435,7 +435,15 @@ export class RoboticsSession {
       // being summarised — instead of riding in the every-turn volatile prefix
       // (where extractCompactInstructions never saw it and the compact agent was
       // told to discard the <context> block anyway).
-      compact: { customInstructions: () => this._buildCompactInstructions() ?? undefined },
+      compact: {
+        customInstructions: () => this._buildCompactInstructions() ?? undefined,
+        // Deterministic robotics state anchors, appended to the summary output in
+        // every path (rich/terse/empty-fallback) so active+completed sub-agent
+        // task IDs, phase, hardware safety limits and the experience working set
+        // survive even when the model under-summarises. Resolved lazily at
+        // compaction time to reflect live state.
+        deterministicAnchors: () => this._buildDeterministicCompactAnchors() ?? undefined,
+      },
     } as MetaAgentConfig)
   }
 
@@ -724,7 +732,21 @@ export class RoboticsSession {
    * when there is nothing worth preserving.
    */
   private _buildCompactInstructions(): string | null {
-    return buildRoboticsCompactInstructions({
+    return buildRoboticsCompactInstructions(this._compactContext())
+  }
+
+  /**
+   * Build the factual deterministic anchor block appended to the compact output
+   * in every path. Wired via config.compact.deterministicAnchors as a thunk so
+   * it reflects live state at the moment compaction fires.
+   */
+  private _buildDeterministicCompactAnchors(): string | null {
+    return buildRoboticsDeterministicAnchors(this._compactContext())
+  }
+
+  /** Shared live-state snapshot for the compact instruction + anchor builders. */
+  private _compactContext() {
+    return {
       state: this._state,
       hardwareSummary: this._hwSummary,
       experienceWorkingSet: this._experienceWorkingSet.map(selection => ({
@@ -733,7 +755,7 @@ export class RoboticsSession {
         appliesBecause: selection.appliesBecause,
         principle: selection.experience.abstractPrinciple,
       })),
-    })
+    }
   }
 
   async proposePrincipleForExperience(

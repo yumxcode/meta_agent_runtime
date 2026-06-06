@@ -79,4 +79,53 @@ describe('SessionStore', () => {
     expect(loaded).toEqual(compacted)
     expect(JSON.stringify(loaded)).not.toContain('old answer')
   })
+
+  it('summarizes older history and keeps the resumed window bounded', async () => {
+    const { SessionStore } = await import('../SessionStore.js')
+    const messages: ConversationMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'original long-running task' }] },
+      ...Array.from({ length: 220 }, (_, i): ConversationMessage => ({
+        role: i % 2 === 0 ? 'assistant' : 'user',
+        content: [{ type: 'text', text: `recent-ish message ${i}` }],
+      })),
+    ]
+
+    await SessionStore.append('session-c', meta(messages.length), messages, 0)
+
+    const loaded = await SessionStore.loadHistory('session-c')
+    expect(loaded).toHaveLength(200)
+    expect(JSON.stringify(loaded[0])).toContain('[Local resume summary]')
+    expect(JSON.stringify(loaded[0])).toContain('original long-running task')
+    expect(JSON.stringify(loaded)).toContain('recent-ish message 219')
+  })
+
+  it('does not resume from an orphan tool_result boundary', async () => {
+    const { SessionStore } = await import('../SessionStore.js')
+    const messages: ConversationMessage[] = [
+      { role: 'user', content: [{ type: 'text', text: 'initial request' }] },
+      {
+        role: 'assistant',
+        content: [{ type: 'tool_use', id: 'tool-1', name: 'bash', input: { command: 'echo old' } }],
+      },
+      {
+        role: 'user',
+        content: [{ type: 'tool_result', tool_use_id: 'tool-1', content: 'old output' }],
+      },
+      ...Array.from({ length: 198 }, (_, i): ConversationMessage => ({
+        role: i % 2 === 0 ? 'assistant' : 'user',
+        content: [{ type: 'text', text: `safe message ${i}` }],
+      })),
+    ]
+
+    await SessionStore.append('session-d', meta(messages.length), messages, 0)
+
+    const loaded = await SessionStore.loadHistory('session-d')
+    expect(JSON.stringify(loaded[0])).toContain('[Local resume summary]')
+    expect(JSON.stringify(loaded[0])).toContain('tool_result blocks: 1')
+    expect(loaded[1]).toEqual({
+      role: 'assistant',
+      content: [{ type: 'text', text: 'safe message 0' }],
+    })
+    expect(JSON.stringify(loaded.slice(1, 3))).not.toContain('tool_result')
+  })
 })
