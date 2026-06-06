@@ -90,6 +90,14 @@ export function translateKernelEvent(
         sessionId: state.sessionId,
       }]
 
+    case 'compact_boundary':
+      return [{
+        type: 'compact_boundary',
+        previousTokens: event.compactMetadata.previousTokens,
+        summaryTokens: event.compactMetadata.summaryTokens,
+        sessionId: state.sessionId,
+      }]
+
     case 'compact_failed':
       return [{
         type: 'compact_failed',

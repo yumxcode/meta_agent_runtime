@@ -30,16 +30,53 @@ import {
 import { createSandboxExecutor } from '../sandbox/index.js'
 import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
+import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SUMMARY_MAX_CHARS = 2_000
+const SUMMARY_MAX_CHARS = 8_000
 const ERROR_MAX_CHARS   = 500
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 3) + '...'
+}
+
+/** Matches fenced ```json … ``` blocks (the structured payload sub-agents emit). */
+const JSON_BLOCK_RE = /```json\s*[\s\S]*?```/gi
+
+/** Return the LAST fenced ```json``` block (fences included), or null. */
+export function extractLastJsonBlock(text: string): string | null {
+  let match: RegExpExecArray | null
+  let last: string | null = null
+  JSON_BLOCK_RE.lastIndex = 0
+  while ((match = JSON_BLOCK_RE.exec(text)) !== null) last = match[0]
+  return last
+}
+
+/**
+ * Build a summary that fits in `max` chars WITHOUT discarding the structured
+ * result.  Sub-agents are instructed to place a ```json``` block at the end —
+ * naive head-truncation would cut exactly that off.  So when the text overflows,
+ * we keep the JSON block whole and fill the remaining budget with the narration
+ * prefix, rather than slicing the head and losing the payload.
+ */
+export function buildSummaryFromText(text: string, max: number): string {
+  const trimmed = text.trim()
+  if (trimmed.length <= max) return trimmed
+
+  const jsonBlock = extractLastJsonBlock(trimmed)
+  if (jsonBlock && jsonBlock.length <= max) {
+    const prefix = trimmed.slice(0, trimmed.indexOf(jsonBlock)).trim()
+    const budget = max - jsonBlock.length - 2 // 2 for the joining newlines
+    if (budget <= 0 || prefix.length === 0) return jsonBlock
+    const keptPrefix = prefix.length <= budget ? prefix : prefix.slice(0, budget - 3) + '...'
+    return `${keptPrefix}\n\n${jsonBlock}`
+  }
+
+  // No usable JSON block (or it alone overflows) — fall back to head truncation.
+  return truncate(trimmed, max)
 }
 
 // ── Progress state extraction ─────────────────────────────────────────────────
@@ -107,6 +144,8 @@ export class SubAgentRunner {
   private _cancelReason: string | undefined
   /** Set when the wall-clock cap (maxDurationMs) fired — distinguishes timeout from user cancel. */
   private _timedOut = false
+  /** Authoritative result the sub-agent submitted via the return_result tool, if any. */
+  private _returnedResult?: ReturnedResult
 
   constructor(
     record: SubAgentRecord,
@@ -262,11 +301,18 @@ export class SubAgentRunner {
       return
     }
 
+    // Always give the sub-agent an explicit result channel. The payload it submits
+    // here becomes the authoritative summary (see _summaryFor), independent of how
+    // chatty the run was. Injected on top of the resolved tools so it never masks
+    // the "no tools resolved" guard above.
+    const returnResultTool = makeReturnResultTool(r => { this._returnedResult = r })
+    const sessionTools = [...tools, returnResultTool]
+
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
       maxTurns:     cfg.maxTurns,
       maxBudgetUsd: cfg.maxBudgetUsd,
-      tools,
+      tools:        sessionTools,
       verbose: false,
       includeStreamEvents: false,
       // Optional credential forwarding — omit when undefined so env-var detection still works
@@ -342,7 +388,7 @@ export class SubAgentRunner {
           if (this._timedOut || this.abortSignal.aborted) {
             await this._writeTerminal(this._timedOut ? 'failed' : 'cancelled', {
               success:      false,
-              summary:      truncate(lastText, SUMMARY_MAX_CHARS),
+              summary:      this._summaryFor(lastText),
               error:        this._timedOut
                 ? `Sub-agent exceeded ${maxDurationMs}ms wall-clock limit`
                 : (this._cancelReason ?? 'cancelled'),
@@ -361,7 +407,7 @@ export class SubAgentRunner {
           const isError = event.subtype !== 'success'
           const result: SubAgentResult = {
             success:      !isError,
-            summary:      truncate((lastText.trim() || event.result).trim(), SUMMARY_MAX_CHARS),
+            summary:      this._summaryFor(lastText, event.result),
             error:        isError
               ? truncate(this._stopReasonToError(event.subtype), ERROR_MAX_CHARS)
               : undefined,
@@ -384,7 +430,7 @@ export class SubAgentRunner {
       // cap interrupted the session, or (unexpectedly) the loop ended early.
       await this._writeTerminal('failed', {
         success:      false,
-        summary:      truncate(lastText, SUMMARY_MAX_CHARS),
+        summary:      this._summaryFor(lastText),
         error:        this._timedOut
           ? `Sub-agent exceeded ${maxDurationMs}ms wall-clock limit`
           : 'Session ended without a result event',
@@ -401,7 +447,7 @@ export class SubAgentRunner {
       const errMsg = err instanceof Error ? err.message : String(err)
       await this._writeTerminal('failed', {
         success:      false,
-        summary:      truncate(lastText, SUMMARY_MAX_CHARS),
+        summary:      this._summaryFor(lastText),
         error:        truncate(errMsg, ERROR_MAX_CHARS),
         turnsUsed,
         inputTokens,
@@ -454,6 +500,31 @@ export class SubAgentRunner {
           : t,
       ),
     )
+  }
+
+  /**
+   * Resolve the summary for a terminal record.
+   *
+   * Prefers the result the sub-agent explicitly submitted via return_result —
+   * that is the authoritative answer and is independent of run-time narration.
+   * The structured `data` is appended as a ```json``` block so downstream
+   * consumers (and JSON-priority truncation) can recover it.  Falls back to the
+   * accumulated `lastText` (JSON-block-preserving truncation) for sub-agents that
+   * never called return_result.
+   */
+  private _summaryFor(lastText: string, fallback = ''): string {
+    if (this._returnedResult) {
+      const { summary, data } = this._returnedResult
+      let out = summary.trim()
+      if (data !== undefined) {
+        let json: string
+        try { json = JSON.stringify(data, null, 2) } catch { json = String(data) }
+        out = out ? `${out}\n\n\`\`\`json\n${json}\n\`\`\`` : `\`\`\`json\n${json}\n\`\`\``
+      }
+      return buildSummaryFromText(out, SUMMARY_MAX_CHARS)
+    }
+    const source = (lastText.trim() || fallback).trim()
+    return buildSummaryFromText(source, SUMMARY_MAX_CHARS)
   }
 
   private _stopReasonToError(subtype: string): string {

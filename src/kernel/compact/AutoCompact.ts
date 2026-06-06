@@ -10,7 +10,7 @@
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 import type { CompactOptions } from './CompactConversation.js'
-import { compactConversation } from './CompactConversation.js'
+import { COMPACT_MAX_TOKENS, COMPACT_MODEL_DEFAULT, compactConversation } from './CompactConversation.js'
 import { calculateTokenWarningState, isAutoCompactDisabled } from '../utils/Context.js'
 import { tokenCountWithEstimation } from '../api/TokenCount.js'
 
@@ -59,14 +59,17 @@ export function shouldAutoCompact(
   querySource: string | undefined,
   tracking: AutoCompactTrackingState | undefined,
   maxOutputTokens: number | undefined,
+  compactModelOrForce?: string | boolean,
   force = false,
 ): boolean {
   if (querySource && SKIPPED_QUERY_SOURCES.has(querySource)) return false
   if (isAutoCompactDisabled()) return false
   if ((tracking?.consecutiveFailures ?? 0) >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) return false
-  if (force) return true
+  const compactModel = typeof compactModelOrForce === 'string' ? compactModelOrForce : undefined
+  const forceCompact = typeof compactModelOrForce === 'boolean' ? compactModelOrForce : force
+  if (forceCompact) return true
   const tokenCount = tokenCountWithEstimation(messagesForQuery)
-  return calculateTokenWarningState(tokenCount, model, maxOutputTokens).isAtCompactThreshold
+  return shouldCompactForTokenCount(tokenCount, model, maxOutputTokens, compactModel)
 }
 
 /**
@@ -113,7 +116,12 @@ export async function autoCompactIfNeeded(
 
   // ── Token threshold check ─────────────────────────────────────────────────
   const tokenCount = tokenCountWithEstimation(messagesForQuery)
-  const { isAtCompactThreshold } = calculateTokenWarningState(tokenCount, model, maxOutputTokens)
+  const isAtCompactThreshold = shouldCompactForTokenCount(
+    tokenCount,
+    model,
+    maxOutputTokens,
+    compactOptions.model,
+  )
 
   if (!force && !isAtCompactThreshold) {
     return { wasCompacted: false, tracking: { ...currentTracking, turnCounter: currentTracking.turnCounter + 1 } }
@@ -164,4 +172,19 @@ function compactErrorSummary(error: unknown): string {
   } catch {
     return String(error)
   }
+}
+
+function shouldCompactForTokenCount(
+  tokenCount: number,
+  model: string,
+  maxOutputTokens: number | undefined,
+  compactModel: string | undefined,
+): boolean {
+  const mainThreshold = calculateTokenWarningState(tokenCount, model, maxOutputTokens).isAtCompactThreshold
+  const compactThreshold = calculateTokenWarningState(
+    tokenCount,
+    compactModel ?? COMPACT_MODEL_DEFAULT,
+    COMPACT_MAX_TOKENS,
+  ).isAtCompactThreshold
+  return mainThreshold || compactThreshold
 }

@@ -1,6 +1,7 @@
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
+import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
 
 export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
@@ -28,7 +29,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
       try {
         const record = await bridge.spawnSubAgent({
           config: {
-            taskDescription,
+            taskDescription: withReturnResultHint(taskDescription),
             systemPrompt: input['system_prompt'] as string | undefined,
             allowedTools: input['allowed_tools'] as string[] | undefined,
             maxTurns,
@@ -90,6 +91,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
           if (status.status === 'completed') {
             return {
               content: JSON.stringify({
+                task_id: record.taskId,
                 success: status.result?.success ?? true,
                 summary: status.result?.summary ?? '',
                 turns_used: status.result?.turnsUsed,

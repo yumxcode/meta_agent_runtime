@@ -1,6 +1,7 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { makeSubAgentTaskId } from '../../../subagent/types.js'
+import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
 import type { GitWorkspaceManager } from '../../git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 import type { ExperimentSpec } from '../../types.js'
@@ -173,7 +174,7 @@ Rules:
         const record = await bridge.spawnSubAgent({
           taskId,
           config: {
-            taskDescription,
+            taskDescription: withReturnResultHint(taskDescription),
             allowedTools: (input['allowed_tools'] as string[] | undefined) ?? [
               'bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep', 'experience_write',
             ],

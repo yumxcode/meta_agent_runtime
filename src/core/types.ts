@@ -72,6 +72,16 @@ export interface MetaAgentCompactStartEvent {
   sessionId: string
 }
 
+/** Conversation compaction completed — carries pre/post token estimates for UI. */
+export interface MetaAgentCompactBoundaryEvent {
+  type: 'compact_boundary'
+  /** Estimated tokens before compaction (the messages that were summarised). */
+  previousTokens: number
+  /** Estimated tokens of the resulting summary. */
+  summaryTokens: number
+  sessionId: string
+}
+
 /** Conversation compaction failed but the session continued. */
 export interface MetaAgentCompactFailedEvent {
   type: 'compact_failed'
@@ -100,6 +110,7 @@ export type MetaAgentEvent =
   | MetaAgentStreamEvent
   | MetaAgentRetryEvent
   | MetaAgentCompactStartEvent
+  | MetaAgentCompactBoundaryEvent
   | MetaAgentCompactFailedEvent
 
 // ─────────────────────────────────────────────────────────────────────────────

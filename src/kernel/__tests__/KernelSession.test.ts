@@ -21,6 +21,8 @@ vi.mock('../api/AnthropicClient.js', () => ({
 }))
 
 vi.mock('../compact/CompactConversation.js', () => ({
+  COMPACT_MODEL_DEFAULT: 'deepseek-v4-flash',
+  COMPACT_MAX_TOKENS: 12_000,
   compactConversation: vi.fn(),
 }))
 

@@ -1285,6 +1285,26 @@ async function streamPrompt(
           await safeStdoutWrite(`\n${dim('🗜  会话压缩中…')}\n`)
           break
         }
+        case 'compact_boundary': {
+          meter.hide()
+          const prev = event.previousTokens ?? 0
+          const after = event.summaryTokens ?? 0
+          const freed = Math.max(0, prev - after)
+          const k = (n: number) => `${(n / 1000).toFixed(1)}k`
+          await safeStdoutWrite(
+            `${dim(`🗜  压缩完成 ${k(prev)} → ${k(after)}（释放 ${k(freed)}）`)}\n`,
+          )
+          break
+        }
+        case 'compact_failed': {
+          meter.hide()
+          const attempt = typeof event.attempt === 'number' ? event.attempt : 0
+          const err = sanitizeTerminalPreview(event.error ?? 'unknown error', 120)
+          await safeStdoutWrite(
+            `\n${yellow('⚠')}  ${yellow(`会话压缩失败（第 ${attempt}/3 次），继续使用当前上下文。`)} ${dim(err)}\n`,
+          )
+          break
+        }
         case 'result': {
           meter.hide()
           await closeThinkingBlock()

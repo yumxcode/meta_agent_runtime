@@ -9,7 +9,7 @@ export const DEFAULT_WEB_SEARCH_MODEL = 'claude-sonnet-4-6'
 
 /** MCP server name and tool name for the GLM web search fallback. */
 const GLM_MCP_SERVER = 'web-search-prime'
-const GLM_MCP_TOOL   = 'webSearchPrime'
+const GLM_MCP_TOOL   = 'web_search_prime'
 
 /**
  * Try the GLM webSearchPrime MCP as a fallback when no Anthropic key is available.
@@ -19,7 +19,11 @@ async function callGlmSearch(query: string): Promise<ToolResult | null> {
   const client = mcpClients.get(GLM_MCP_SERVER)
   if (!client) return null
   try {
-    const result = await client.callTool(GLM_MCP_TOOL, { query })
+    const result = await client.callTool(GLM_MCP_TOOL, {
+      search_query: query,
+      content_size: 'medium',
+      location: 'us',
+    })
     const text = result.content.filter(c => c.type === 'text' && c.text).map(c => c.text!).join('\n')
     return { content: text || 'No results found', isError: false }
   } catch (err) {

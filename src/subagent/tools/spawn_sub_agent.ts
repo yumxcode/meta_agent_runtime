@@ -8,6 +8,7 @@
 
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../core/types.js'
 import type { SubAgentBridge } from '../SubAgentBridge.js'
+import { withReturnResultHint } from './return_result.js'
 
 export function makeSpawnSubAgentTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
@@ -146,7 +147,7 @@ WHEN NOT TO USE:
 
         const record = await bridge.spawnSubAgent({
           config: {
-            taskDescription,
+            taskDescription:       withReturnResultHint(taskDescription),
             systemPrompt:          input['system_prompt'] as string | undefined,
             allowedTools:          input['allowed_tools'] as string[] | undefined,
             maxTurns:              typeof input['max_turns']        === 'number' ? input['max_turns']        : 10,

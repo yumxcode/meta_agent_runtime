@@ -75,6 +75,7 @@ import {
 import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
 import { createWebFetchTool } from '../tools/network/web_fetch/index.js'
+import { createWebSearchTool } from '../tools/network/web_search/index.js'
 import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { createSkillTool } from '../tools/system/skill/index.js'
@@ -592,11 +593,16 @@ export class RoboticsSession {
     this.inner.registerTool(await createBashTool())
     this.inner.registerTool(makeGetSubAgentStatusTool(this.bridge))
     // Network tools — required by sub-agents (e.g. PaperSearchAgent) whose
-    // allowedTools include 'web_fetch'. Registering it here also makes it
-    // resolvable in the bridge's tool registry (wired below).
-    // NOTE: web_search is intentionally not registered — the Anthropic
-    // web-search API is unavailable; use an MCP-based search instead.
+    // allowedTools include 'web_fetch' / 'web_search'. Registering here also
+    // makes them resolvable in the bridge's tool registry (wired below).
     this.inner.registerTool(await createWebFetchTool())
+    // web_search gives the agent a real discovery path so it stops guessing
+    // search-page URLs (e.g. github.com/search) that 404. It self-selects a
+    // backend at call time — Anthropic web-search when ANTHROPIC_API_KEY is
+    // set, else the GLM web-search-prime MCP (ZHIPU_API_KEY) — and returns a
+    // clear "configure a backend" error if neither is available, which is
+    // still strictly better than fabricating dead URLs.
+    this.inner.registerTool(await createWebSearchTool())
 
     // MCP tools — mcp_call / list_mcp_resources / read_mcp_resource. These talk
     // to the process-global MCP client registry (populated by loadMcpConfig()

@@ -25,8 +25,8 @@ import { buildPostCompactMessages } from './PostCompact.js'
 import type { CompactionResult } from './PostCompact.js'
 
 const COMPACT_MAX_PTL_RETRIES = 3
-const COMPACT_MODEL_DEFAULT = 'deepseek-v4-flash'
-const COMPACT_MAX_TOKENS = 65_536
+export const COMPACT_MODEL_DEFAULT = 'deepseek-v4-flash'
+export const COMPACT_MAX_TOKENS = 12_000
 const RECENT_USER_ANCHOR_COUNT = 6
 
 export interface CompactOptions {

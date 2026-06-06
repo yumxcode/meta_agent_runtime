@@ -310,6 +310,7 @@ export async function* runKernelLoop(
         config.compact?.querySource ?? config.querySource,
         state.autoCompactTracking,
         state.maxOutputTokensOverride ?? config.maxOutputTokens,
+        config.compact?.model,
       )
     ) {
       yield { type: 'compact_start', sessionId }

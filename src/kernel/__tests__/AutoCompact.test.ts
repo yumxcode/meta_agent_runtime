@@ -18,6 +18,8 @@ import { FileStateCache } from '../session/FileStateCache.js'
 // Mock compactConversation so we don't need a live API
 
 vi.mock('../compact/CompactConversation.js', () => ({
+  COMPACT_MODEL_DEFAULT: 'deepseek-v4-flash',
+  COMPACT_MAX_TOKENS: 12_000,
   compactConversation: vi.fn(),
 }))
 
@@ -179,6 +181,24 @@ describe('autoCompactIfNeeded — threshold', () => {
       makeMessages(), MODEL, new FileStateCache(), 'main', freshTracking(), MAX_OUTPUT, COMPACT_OPTIONS,
     )
     expect(result.wasCompacted).toBe(true)
+  })
+
+  it('uses the compact model window when it is smaller than the main model window', async () => {
+    mockTokenCount.mockReturnValue(104_000)
+    mockCompact.mockResolvedValue({ postCompactMessages: makeMessages(1), summaryTokenEstimate: 0 })
+
+    const result = await autoCompactIfNeeded(
+      makeMessages(),
+      MODEL,
+      new FileStateCache(),
+      'main',
+      freshTracking(),
+      MAX_OUTPUT,
+      { ...COMPACT_OPTIONS, model: 'glm-4.5-air' },
+    )
+
+    expect(result.wasCompacted).toBe(true)
+    expect(mockCompact).toHaveBeenCalledOnce()
   })
 
   it('force-compacts even when below threshold', async () => {

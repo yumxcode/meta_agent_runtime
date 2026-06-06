@@ -7,6 +7,26 @@ import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/t
 import { loadToolPrompt } from '../../util.js'
 
 const MAX_CONTENT = 100 * 1024
+
+/**
+ * Request headers presented to the remote server.
+ *
+ * Many sites (GitHub, anything behind Cloudflare) reject obvious bot
+ * User-Agents with 403/404, so we present a realistic browser UA by default.
+ * Override with META_AGENT_WEB_FETCH_UA when a specific identity is required.
+ */
+const DEFAULT_USER_AGENT =
+  'Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) ' +
+  'Chrome/124.0.0.0 Safari/537.36'
+
+function buildRequestHeaders(): Record<string, string> {
+  return {
+    'User-Agent': process.env['META_AGENT_WEB_FETCH_UA'] || DEFAULT_USER_AGENT,
+    Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8',
+    'Accept-Language': 'en-US,en;q=0.9',
+  }
+}
+
 /** Max entries — eviction runs on both insert and read paths. */
 const CACHE_MAX = 50
 /** Max redirects we follow manually. */
@@ -37,6 +57,35 @@ function stripHtml(html: string): string {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"')
     .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+/**
+ * Produce a short, actionable hint for a non-2xx response so the model
+ * self-corrects instead of retrying the same dead URL. Returns '' when no
+ * specific guidance applies.
+ */
+function nonOkHint(url: string, status: number): string {
+  let host = ''
+  try { host = new URL(url).hostname } catch { /* ignore */ }
+  const isSearchPage = /[?&]q=/.test(url) && /\/search\b/.test(url)
+  if (host === 'github.com' && isSearchPage) {
+    return ' Hint: github.com/search blocks non-browser clients. Use the API: ' +
+      'https://api.github.com/search/repositories?q=<keywords>&sort=stars'
+  }
+  if (status === 404) {
+    return ' Hint: the URL does not exist or the server rejects bots. ' +
+      'Try a JSON API endpoint or a different source rather than retrying this URL.'
+  }
+  if (status === 403 || status === 429) {
+    return ' Hint: blocked or rate-limited. Prefer an official API endpoint, ' +
+      'or back off and try a different source.'
+  }
+  return ''
+}
+
+/** Heuristic: did an HTML page strip down to almost nothing (likely a SPA shell)? */
+function looksLikeEmptySpa(stripped: string, contentType: string): boolean {
+  return contentType.includes('html') && stripped.replace(/\s+/g, ' ').trim().length < 200
 }
 
 // ── H1: SSRF defence ──────────────────────────────────────────────────────────
@@ -200,7 +249,7 @@ function requestPinned(
       target.url,
       {
         method: 'GET',
-        headers: { 'User-Agent': 'MetaAgentRuntime/1.0', Accept: '*/*' },
+        headers: buildRequestHeaders(),
         signal,
         // eslint-disable-next-line @typescript-eslint/no-explicit-any
         lookup: pinnedLookup as any,
@@ -309,7 +358,10 @@ export async function createWebFetchTool(): Promise<MetaAgentTool> {
         }
         const { res, finalUrl } = fetchOutcome
         if (res.status < 200 || res.status >= 300) {
-          return { content: `HTTP ${res.status}: ${res.statusText}`, isError: true }
+          return {
+            content: `HTTP ${res.status}: ${res.statusText}.${nonOkHint(finalUrl, res.status)}`,
+            isError: true,
+          }
         }
 
         const ct = res.headers.get('content-type') ?? ''
@@ -319,6 +371,17 @@ export async function createWebFetchTool(): Promise<MetaAgentTool> {
           try { text = JSON.stringify(JSON.parse(raw), null, 2) } catch { text = raw }
         } else {
           text = ct.includes('html') ? stripHtml(raw) : raw
+        }
+        // Near-empty HTML almost always means a JavaScript-rendered (SPA) page —
+        // tell the model so it doesn't treat the empty shell as "no results".
+        if (looksLikeEmptySpa(text, ct)) {
+          return {
+            content: `URL: ${finalUrl}\nPrompt: ${prompt}\n\n---\n\n` +
+              `[This page returned almost no text after HTML stripping — it is ` +
+              `likely client-rendered (SPA) and cannot be read by a raw fetch. ` +
+              `Try an API endpoint for this site, or a different source.]\n\n${text}`.trim(),
+            isError: false,
+          }
         }
         if (text.length > MAX_CONTENT) text = text.slice(0, MAX_CONTENT) + `\n[Truncated — ${text.length} chars total]`
 
