@@ -48,14 +48,17 @@ import { GitWorkspaceManager } from '../git/GitWorkspaceManager.js'
 import { createExperienceSearchTool } from './experience_search/index.js'
 import { createExperienceWriteTool } from './experience_write/index.js'
 import { createExperienceLoadTool } from './experience_load/index.js'
+import { createExperienceDeleteTool } from './experience_delete/index.js'
 import { createPrincipleSearchTool } from './principle_search/index.js'
 import { createPrinciplePromoteTool } from './principle_promote/index.js'
 import { createPrincipleLoadTool } from './principle_load/index.js'
+import { createPrincipleDeleteTool } from './principle_delete/index.js'
 import { createHardwareProfileReadTool } from './hardware_profile_read/index.js'
 import { createHardwareProfileWriteTool } from './hardware_profile_write/index.js'
 import { createPhysicalAnchorSearchTool } from './physical_anchor_search/index.js'
 import { createPhysicalAnchorWriteTool } from './physical_anchor_write/index.js'
 import { createPhysicalAnchorLoadTool } from './physical_anchor_load/index.js'
+import { createPhysicalAnchorDeleteTool } from './anchor_delete/index.js'
 import { createExperimentDispatchTool } from './experiment_dispatch/index.js'
 import { createPaperSearchTool } from './paper_search/index.js'
 import { createProgressNoteTool } from './progress_note/index.js'
@@ -76,14 +79,17 @@ export {
   createExperienceSearchTool,
   createExperienceWriteTool,
   createExperienceLoadTool,
+  createExperienceDeleteTool,
   createPrincipleSearchTool,
   createPrinciplePromoteTool,
   createPrincipleLoadTool,
+  createPrincipleDeleteTool,
   createHardwareProfileReadTool,
   createHardwareProfileWriteTool,
   createPhysicalAnchorSearchTool,
   createPhysicalAnchorWriteTool,
   createPhysicalAnchorLoadTool,
+  createPhysicalAnchorDeleteTool,
   createExperimentDispatchTool,
   createPaperSearchTool,
   createProgressNoteTool,
@@ -162,9 +168,11 @@ export function createRoboticsTools(opts: RoboticsToolsOptions): MetaAgentTool[]
     createExperienceSearchTool(store),
     createExperienceWriteTool(store, pendingStore, opts.flashClient),
     createExperienceLoadTool(store),
+    createExperienceDeleteTool(store),
     createPrincipleSearchTool(principles),
     createPrinciplePromoteTool(store, physicalAnchors, pendingPrinciples, opts.flashClient),
     createPrincipleLoadTool(principles),
+    createPrincipleDeleteTool(principles),
 
     // ── Hardware profile tools ───────────────────────────────────────────────
     createHardwareProfileReadTool(hwProfile),
@@ -172,6 +180,7 @@ export function createRoboticsTools(opts: RoboticsToolsOptions): MetaAgentTool[]
     createPhysicalAnchorSearchTool(physicalAnchors),
     createPhysicalAnchorWriteTool(pendingPhysicalAnchors),
     createPhysicalAnchorLoadTool(physicalAnchors),
+    createPhysicalAnchorDeleteTool(physicalAnchors),
 
     // ── Sub-agent dispatchers ────────────────────────────────────────────────
     createExperimentDispatchTool(opts.bridge, gitMgr, opts.projectDir, opts.sessionId),

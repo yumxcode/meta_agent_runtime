@@ -158,6 +158,16 @@ export interface KernelConfig {
   /** Maximum API retries for transient errors (default: 5) */
   maxRetries?: number
 
+  /**
+   * Maximum CONSECUTIVE model-call (stream) errors to recover from before
+   * giving up on the turn. On each recovery the error is surfaced into the
+   * conversation (as a system warning + a guidance message) and the turn is
+   * retried, so the model can react instead of the turn hard-aborting.
+   * Set to 0 to disable recovery and restore the previous fail-fast behaviour.
+   * Default: 2.
+   */
+  maxStreamErrorRecoveries?: number
+
   // ── Compact ───────────────────────────────────────────────────────────────
 
   /** Auto-compact configuration */

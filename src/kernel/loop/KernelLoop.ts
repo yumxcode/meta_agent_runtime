@@ -165,6 +165,60 @@ interface StreamAccumulator {
   stopReason: string | null
 }
 
+/**
+ * Abort-aware delay. Resolves early (without rejecting) if the signal aborts so
+ * the caller can re-check `signal.aborted` and bail cleanly.
+ */
+function delay(ms: number, signal: AbortSignal): Promise<void> {
+  if (ms <= 0 || signal.aborted) return Promise.resolve()
+  return new Promise<void>(resolve => {
+    const onAbort = (): void => { clearTimeout(timer); resolve() }
+    const timer = setTimeout(() => {
+      signal.removeEventListener('abort', onAbort)
+      resolve()
+    }, ms)
+    signal.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Condense a model-call error into a single sanitized line for surfacing into
+ * the conversation and the warning event. Prefers a nested `error.message`
+ * (provider error envelopes) and strips control chars / caps length.
+ */
+function summarizeStreamError(err: unknown): string {
+  let msg: string
+  if (err instanceof Error) {
+    msg = err.message
+  } else if (err && typeof err === 'object') {
+    const rec = err as Record<string, unknown>
+    const nested = rec['error']
+    if (nested && typeof nested === 'object' && typeof (nested as Record<string, unknown>)['message'] === 'string') {
+      msg = String((nested as Record<string, unknown>)['message'])
+    } else if (typeof rec['message'] === 'string') {
+      msg = String(rec['message'])
+    } else {
+      try { msg = JSON.stringify(err) } catch { msg = String(err) }
+    }
+  } else {
+    msg = String(err)
+  }
+  // eslint-disable-next-line no-control-regex
+  msg = msg.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
+  return msg.length > 500 ? msg.slice(0, 500) + '…' : msg
+}
+
+/** Guidance message injected into history so the model can self-correct. */
+function buildStreamErrorRecoveryText(detail: string): string {
+  return (
+    `[系统] 上一步模型调用失败：${detail}\n` +
+    `这通常是网络/网关瞬时波动，或本轮上下文过大（例如抓取了过长的文档）。\n` +
+    `请据此决定如何继续：若判断为瞬时错误可直接重试当前步骤；` +
+    `若可能是上下文过大，请避免再次注入大段原文（改用更小范围/分页抓取或只取关键片段），` +
+    `或基于已掌握的信息直接继续推进，不要因此中断任务。`
+  )
+}
+
 function newAccumulator(): StreamAccumulator {
   return {
     blocks: [],
@@ -640,8 +694,50 @@ export async function* runKernelLoop(
       return done('aborted_streaming')
     }
 
+    // ── Step 12b: recover from model-call (stream) errors ────────────────────
+    // A streamError that is not PromptTooLongError / FallbackTriggeredError used
+    // to be re-thrown here, aborting the whole turn as error_during_execution —
+    // the model never got to react. Instead, surface the error into the
+    // conversation (like a failed tool result) and retry the turn, so the model
+    // can decide how to proceed (retry, change approach, answer with what it
+    // has). Bounded by maxStreamErrorRecoveries to avoid looping on a persistent
+    // error; on a transient gateway error ("please retry later") the retry
+    // usually self-heals.
     if (streamError) {
+      const maxRecoveries = config.maxStreamErrorRecoveries ?? 2
+      // FallbackTriggeredError is a control-flow signal ("this model can't do
+      // it"): if it reached here the fallback branch declined to handle it (no
+      // fallbackModel, or tombstoned), so retrying the same model is pointless —
+      // keep failing fast. Only genuine network/provider errors are recoverable.
+      const recoverable = !(streamError instanceof FallbackTriggeredError)
+      if (recoverable && maxRecoveries > 0 && state.streamErrorRecoveryCount < maxRecoveries) {
+        const attempt = state.streamErrorRecoveryCount + 1
+        const detail = summarizeStreamError(streamError)
+        yield {
+          type: 'system_message',
+          subtype: 'warning',
+          text:
+            `模型调用失败（第 ${attempt}/${maxRecoveries} 次恢复）：${detail}　将注入错误并重试。`,
+          sessionId,
+        }
+        // Drop any partial assistant blocks from this failed attempt and inject a
+        // guidance message the model will read on the retry.
+        append(makeTextUserMessage(buildStreamErrorRecoveryText(detail), { isMeta: true }))
+        state = { ...state, streamErrorRecoveryCount: attempt }
+        // Brief backoff before retrying — the provider layer already exhausted
+        // its own HTTP retries, so give a transient gateway error a moment.
+        await delay(Math.min(1000 * attempt, 3000), signal)
+        if (signal.aborted) return done('aborted_streaming')
+        continue
+      }
+      // Recovery disabled or exhausted — preserve the original fail-fast path.
       throw streamError
+    }
+
+    // A turn streamed successfully — clear the consecutive-error counter so only
+    // back-to-back failures count toward the recovery budget.
+    if (state.streamErrorRecoveryCount !== 0) {
+      state = { ...state, streamErrorRecoveryCount: 0 }
     }
 
     // Commit assistant messages to history

@@ -21,6 +21,13 @@ export interface LoopState {
   /** Whether a reactive compact has already been attempted (avoid loops) */
   hasAttemptedReactiveCompact: boolean
 
+  /**
+   * How many CONSECUTIVE model-call (stream) errors have been recovered from in
+   * this turn. Reset to 0 after any fully successful streamed turn. Bounds the
+   * surface-and-retry recovery so a persistent provider error can't loop.
+   */
+  streamErrorRecoveryCount: number
+
   /** Number of completed agentic turns */
   turnCount: number
 
@@ -45,6 +52,7 @@ export function initialLoopState(
     maxOutputTokensRecoveryCount: 0,
     maxOutputTokensOverride: undefined,
     hasAttemptedReactiveCompact: false,
+    streamErrorRecoveryCount: 0,
     turnCount: 0,
     currentModel: model,
     fallbackTriggered: false,

@@ -1,3 +1,4 @@
+import { rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
@@ -70,6 +71,21 @@ export class PhysicalAnchorStore {
   async load(id: string): Promise<PhysicalAnchorEntry | null> {
     if (!isPhysicalAnchorId(id)) return null
     return readJsonFile<PhysicalAnchorEntry>(join(this.dir, `${id}.json`))
+  }
+
+  /**
+   * Permanently delete a committed physical anchor by ID and rebuild the manifest.
+   * Returns true if the file existed and was removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    if (!isPhysicalAnchorId(id)) return false
+    try {
+      await rm(join(this.dir, `${id}.json`))
+    } catch {
+      return false
+    }
+    await this._rebuildManifestFromFiles().catch(() => undefined)
+    return true
   }
 
   async search(query: PhysicalAnchorSearchQuery = {}): Promise<PhysicalAnchorEntry[]> {

@@ -66,6 +66,14 @@ export function translateKernelEvent(
         sessionId: state.sessionId,
       }]
 
+    case 'system_message':
+      return [{
+        type: 'system_message',
+        subtype: event.subtype,
+        text: event.text,
+        sessionId: state.sessionId,
+      }]
+
     case 'result': {
       const durationMs = Date.now() - state.startMs
       const subtype = mapResultSubtype(event.subtype)
@@ -108,7 +116,7 @@ export function translateKernelEvent(
         sessionId: state.sessionId,
       }]
 
-    // compact_boundary, system_message, tool_use_summary — not surfaced upstream
+    // tool_use_summary — not surfaced upstream
     default:
       return []
   }

@@ -1,4 +1,4 @@
-import { readFile, readdir } from 'fs/promises'
+import { readFile, readdir, rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
@@ -124,6 +124,22 @@ export class ExperienceStore {
       updatedAt: Date.now(),
     }
     await atomicWriteJson(join(this.dir, `${experienceId}.json`), updated)
+    await this.rebuildIndex()
+    return true
+  }
+
+  /**
+   * Permanently delete a committed experience by ID and rebuild the index.
+   * Returns true if the file existed and was removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    if (!isExperienceId(id)) return false
+    const file = join(this.dir, `${id}.json`)
+    try {
+      await rm(file)
+    } catch {
+      return false
+    }
     await this.rebuildIndex()
     return true
   }

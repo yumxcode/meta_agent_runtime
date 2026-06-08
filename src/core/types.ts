@@ -101,6 +101,14 @@ export interface MetaAgentRetryEvent {
   sessionId: string
 }
 
+/** Non-fatal system notice surfaced to the user (e.g. stream-error recovery). */
+export interface MetaAgentSystemMessageEvent {
+  type: 'system_message'
+  subtype: 'warning' | 'info'
+  text: string
+  sessionId: string
+}
+
 export type MetaAgentEvent =
   | MetaAgentTextEvent
   | MetaAgentThinkingDeltaEvent
@@ -109,6 +117,7 @@ export type MetaAgentEvent =
   | MetaAgentResultEvent
   | MetaAgentStreamEvent
   | MetaAgentRetryEvent
+  | MetaAgentSystemMessageEvent
   | MetaAgentCompactStartEvent
   | MetaAgentCompactBoundaryEvent
   | MetaAgentCompactFailedEvent

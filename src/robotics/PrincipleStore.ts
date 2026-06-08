@@ -1,3 +1,4 @@
+import { rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
@@ -73,6 +74,21 @@ export class PrincipleStore {
   async load(id: string): Promise<PrincipleEntry | null> {
     if (!isPrincipleId(id)) return null
     return readJsonFile<PrincipleEntry>(join(this.dir, `${id}.json`))
+  }
+
+  /**
+   * Permanently delete a committed principle by ID and rebuild the manifest.
+   * Returns true if the file existed and was removed.
+   */
+  async delete(id: string): Promise<boolean> {
+    if (!isPrincipleId(id)) return false
+    try {
+      await rm(join(this.dir, `${id}.json`))
+    } catch {
+      return false
+    }
+    await this._rebuildManifestFromFiles().catch(() => undefined)
+    return true
   }
 
   async search(query: PrincipleSearchQuery = {}): Promise<PrincipleEntry[]> {

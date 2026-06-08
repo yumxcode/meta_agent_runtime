@@ -7,6 +7,7 @@ export { createExitPlanModeTool } from './exit_plan_mode/index.js'
 export { createSkillTool } from './skill/index.js'
 export { createConfigTool } from './config/index.js'
 export { createMemoryWriteTool } from './memory_write/index.js'
+export { createMemoryDeleteTool } from './memory_delete/index.js'
 export { listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession } from './cronStore.js'
 export type { CronJob } from './cronStore.js'
 
@@ -21,6 +22,7 @@ import { createExitPlanModeTool } from './exit_plan_mode/index.js'
 import { createSkillTool } from './skill/index.js'
 import { createConfigTool } from './config/index.js'
 import { createMemoryWriteTool } from './memory_write/index.js'
+import { createMemoryDeleteTool } from './memory_delete/index.js'
 
 export interface SystemToolsOptions {
   /**
@@ -56,5 +58,6 @@ export async function createSystemTools(options: SystemToolsOptions = {}): Promi
     createSkillTool(options.cwd, options.mode ?? 'agentic'),
     createConfigTool(options.cwd),
     createMemoryWriteTool({ mode: options.mode ?? 'agentic', domain: options.domain }),
+    createMemoryDeleteTool(),
   ])
 }
