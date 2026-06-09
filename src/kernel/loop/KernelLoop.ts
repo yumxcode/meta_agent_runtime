@@ -140,6 +140,138 @@ function cloneLastRealUserTextMessage(messages: readonly KernelMessage[]): Kerne
 }
 
 /**
+ * Token budget for the "current-turn tail" preserved verbatim across a
+ * compaction. The tail (the assistant ⇄ tool_result cycles since the last real
+ * user message) is kept OUTSIDE the summary so the freshest tool_use/tool_result
+ * pairs survive at full fidelity instead of being lossily folded into the flash
+ * summary.
+ *
+ * It is bounded so a long inner loop can't defeat the point of compacting:
+ * summary (≤ COMPACT_MAX_TOKENS ≈ 12k) + tail (≤ this budget) stays well under
+ * any realistic compaction threshold, so preserving the tail cannot itself
+ * re-trigger an immediate compaction (infinite-loop guard).
+ */
+const CURRENT_TURN_TAIL_TOKEN_BUDGET = 40_000
+
+/** Per-message rough token estimate. Mirrors TokenCount.roughTokenCount. */
+function estimateMessageTokens(message: KernelMessage): number {
+  let chars = 0
+  for (const block of message.content) {
+    if ('text' in block && typeof block.text === 'string') {
+      chars += block.text.length
+    } else if ('thinking' in block && typeof (block as { thinking?: unknown }).thinking === 'string') {
+      chars += (block as { thinking: string }).thinking.length
+    } else if ('input' in block) {
+      chars += JSON.stringify((block as { input?: unknown }).input ?? {}).length
+    } else if ('content' in block) {
+      const c = (block as { content?: unknown }).content
+      if (typeof c === 'string') {
+        chars += c.length
+      } else if (Array.isArray(c)) {
+        for (const inner of c) {
+          if (inner && typeof inner === 'object' && 'text' in inner) {
+            chars += String((inner as { text?: unknown }).text ?? '').length
+          }
+        }
+      }
+    }
+  }
+  return Math.ceil(chars / 4)
+}
+
+/**
+ * Group a message tail into "units", where each unit is one assistant message
+ * plus the user (tool_result / meta) messages that follow it up to the next
+ * assistant message. Leading non-assistant messages (e.g. an injected steering
+ * message that sits before the first assistant reply) are dropped — they cannot
+ * form a valid standalone unit and the real user text is preserved separately.
+ */
+function groupTailUnits(tail: readonly KernelMessage[]): KernelMessage[][] {
+  const units: KernelMessage[][] = []
+  let current: KernelMessage[] | null = null
+  for (const message of tail) {
+    if (message.role === 'assistant') {
+      if (current) units.push(current)
+      current = [message]
+    } else if (current) {
+      current.push(message)
+    }
+  }
+  if (current) units.push(current)
+  return units
+}
+
+/**
+ * A unit is "complete" (safe to send to the API) iff every tool_use block in
+ * its head assistant message has a matching tool_result in the following user
+ * messages. A text-only assistant message (no tool_use) is trivially complete.
+ * This is the protocol guard: we never keep half a tool pair.
+ */
+function isCompleteTailUnit(unit: readonly KernelMessage[]): boolean {
+  const head = unit[0]
+  if (!head || head.role !== 'assistant') return false
+
+  const toolUseIds = head.content
+    .filter(block => block.type === 'tool_use')
+    .map(block => (block as { id: string }).id)
+  if (toolUseIds.length === 0) return true
+
+  const resultIds = new Set<string>()
+  for (let i = 1; i < unit.length; i++) {
+    for (const block of unit[i]!.content) {
+      if (block.type === 'tool_result') {
+        resultIds.add((block as { tool_use_id: string }).tool_use_id)
+      }
+    }
+  }
+  return toolUseIds.every(id => resultIds.has(id))
+}
+
+/**
+ * Build the messages to preserve verbatim after a compaction:
+ *   [ <last real user message, text-only, stripped> , ...<bounded current-turn tail> ]
+ *
+ * The tail is taken from the messages AFTER the last real user message, grouped
+ * into complete assistant⇄tool_result units, then accumulated newest-first until
+ * the token budget is hit (always keeping at least the most recent complete
+ * unit). applyToolResultBudget is applied first so a single oversized result is
+ * still clipped to the per-tool limit — identical to normal-flow behaviour.
+ */
+export function buildMessagesToKeepAfterCompact(
+  messages: readonly KernelMessage[],
+  tools: KernelConfig['tools'],
+  budgetTokens: number = CURRENT_TURN_TAIL_TOKEN_BUDGET,
+): KernelMessage[] {
+  // Constraint: per-tool clipping, consistent with the live loop.
+  const budgeted = applyToolResultBudget(messages, tools)
+
+  const userText = cloneLastRealUserTextMessage(budgeted)
+
+  let lastUserIdx = -1
+  for (let i = budgeted.length - 1; i >= 0; i--) {
+    if (isRealUserMessage(budgeted[i]!)) { lastUserIdx = i; break }
+  }
+  if (lastUserIdx < 0) return userText
+
+  const tail = budgeted.slice(lastUserIdx + 1)
+  const units = groupTailUnits(tail).filter(isCompleteTailUnit)
+
+  const kept: KernelMessage[][] = []
+  let used = 0
+  for (let i = units.length - 1; i >= 0; i--) {
+    const unitTokens = units[i]!.reduce((sum, m) => sum + estimateMessageTokens(m), 0)
+    // Guard: always keep the most recent complete unit (kept.length === 0),
+    // even if it alone exceeds the budget — its results are already per-tool
+    // clipped, so this can't blow up unbounded.
+    if (kept.length > 0 && used + unitTokens > budgetTokens) break
+    kept.unshift(units[i]!)
+    used += unitTokens
+  }
+
+  return [...userText, ...kept.flat()]
+}
+
+/**
  * Wrap a raw user correction so the model reads it as live supplemental guidance
  * rather than a brand-new task. Mirrors the redirect-message phrasing used by
  * the permission policy's option 3.
@@ -351,7 +483,7 @@ export async function* runKernelLoop(
     // identically and there's one canonical place to change the join rule.
     const effectiveSystemPrompt =
       assembleSystemPrompt(config.systemPrompt, config.appendSystemPrompt) ?? ''
-    const messagesToKeepAfterCompact = cloneLastRealUserTextMessage(messagesForQuery)
+    const messagesToKeepAfterCompact = buildMessagesToKeepAfterCompact(messagesForQuery, config.tools)
 
     // Surface a "compacting…" indicator before the slow LLM-backed summarization
     // begins. We probe the same gates autoCompactIfNeeded uses so the event only
@@ -622,7 +754,7 @@ export async function* runKernelLoop(
               systemPrompt: effectiveSystemPrompt,
               customInstructions: config.compact?.customInstructions,
               deterministicAnchors: config.compact?.deterministicAnchors,
-              messagesToKeep: cloneLastRealUserTextMessage(currentMessagesForQuery),
+              messagesToKeep: buildMessagesToKeepAfterCompact(currentMessagesForQuery, config.tools),
               abortSignal: signal,
               maxRetries: config.maxRetries,
             },
