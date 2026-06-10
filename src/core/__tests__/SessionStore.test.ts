@@ -129,3 +129,33 @@ describe('SessionStore', () => {
     expect(JSON.stringify(loaded.slice(1, 3))).not.toContain('tool_result')
   })
 })
+
+describe('session titles', () => {
+  it('updateTitle sets the title and per-turn persists preserve it', async () => {
+    const { SessionStore } = await import('../SessionStore.js')
+    const messages = [
+      { role: 'user', content: [{ type: 'text', text: '增加对称性 reward' }] },
+    ] as never[]
+
+    await SessionStore.append('sess-1', meta(1), messages, 0)
+    await SessionStore.updateTitle('sess-1', '步态对称性 reward 调参', 1)
+
+    let [entry] = await SessionStore.listSessions(1)
+    expect(entry?.title).toBe('步态对称性 reward 调参')
+    expect(entry?.titleMessageCount).toBe(1)
+
+    // A later per-turn persist rebuilds meta WITHOUT title fields — the
+    // merge-preserving upsert must keep the generated title.
+    await SessionStore.append('sess-1', meta(2), [...messages,
+      { role: 'assistant', content: [{ type: 'text', text: 'ok' }] } as never], 1)
+    ;[entry] = await SessionStore.listSessions(1)
+    expect(entry?.title).toBe('步态对称性 reward 调参')
+    expect(entry?.messageCount).toBe(2)
+  })
+
+  it('updateTitle is a no-op for unknown sessions', async () => {
+    const { SessionStore } = await import('../SessionStore.js')
+    await SessionStore.updateTitle('nonexistent', 'x', 1)
+    expect(await SessionStore.listSessions(5)).toEqual([])
+  })
+})

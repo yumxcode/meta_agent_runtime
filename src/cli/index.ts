@@ -63,7 +63,7 @@ import type {
   TeamTaskKind,
 } from '../robotics/team/TeamStore.js'
 import { isStaleClaim } from '../robotics/team/TeamStore.js'
-import { SessionStore } from '../core/SessionStore.js'
+import { SessionStore, type SessionMeta } from '../core/SessionStore.js'
 import { detectProvider } from '../core/config.js'
 import { loadModelConfigFile } from '../core/modelConfigFile.js'
 import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveCommandPatterns.js'
@@ -82,7 +82,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.8'
+const VERSION = '0.2.10'
 const DEFAULT_CLI_MAX_TURNS = 100
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -1096,6 +1096,110 @@ async function streamExperienceSummary(
   } catch { /* best-effort — side-call failure must NEVER crash the REPL */ }
 }
 
+// ── Session title generation (flash side-call) ───────────────────────────────
+//
+// The session picker previously showed the raw first user prompt (often a long
+// rambling sentence). A flash side-call distills the session into a ≤16-char
+// title after the first turn, refreshed every 40 messages as the task evolves.
+// Same isolation pattern as streamExperienceSummary: separate client, nothing
+// enters the main session history; failures are silently ignored.
+
+const SESSION_TITLE_SYSTEM = `你是会话标题生成器。根据给出的工程会话内容，输出一个简短中文标题，概括这个会话的**任务目标**——用户最终想达成什么，而不是聊天话题或第一句话的复述。
+要求：不超过 16 个字；优先"对象+目标"结构（如"双足步态对称性优化"、"机械臂抓取成功率提升"）；
+只输出标题本身——不要引号、书名号、句号、解释或任何前后缀。`
+
+function sanitizeSessionTitle(raw: string): string | null {
+  const firstLine = raw.split('\n').map(l => l.trim()).find(Boolean) ?? ''
+  const stripped = firstLine
+    .replace(/^["'《【「『\s]+|["'》】」』。．.\s]+$/g, '')
+    .replace(/\s+/g, ' ')
+  if (!stripped) return null
+  return sanitizeTerminalText(stripped.slice(0, 32))
+}
+
+/**
+ * Deterministic fallback when the flash side-call fails: take the first real
+ * user message and cut it at the first sentence boundary (then clause
+ * boundary), clamped to 20 chars. Guarantees every session gets SOME concise
+ * title even with no flash model available.
+ */
+function fallbackSessionTitle(messages: readonly ConversationMessage[]): string | null {
+  for (const m of messages) {
+    if (m.role !== 'user') continue
+    const text = renderPromptContent(m.content)
+    if (!text || text.startsWith('[Local resume summary]') || text.startsWith('[tool_')) continue
+    let candidate = text.split(/[。！？!?\n]/)[0] ?? ''
+    if (candidate.length > 20) candidate = candidate.split(/[，,；;：:]/)[0] ?? candidate
+    candidate = candidate.replace(/\s+/g, ' ').trim().slice(0, 20)
+    return candidate ? sanitizeTerminalText(candidate) : null
+  }
+  return null
+}
+
+async function generateSessionTitle(router: SessionRouter): Promise<string | null> {
+  try {
+    const messages = router.getMessages()
+    const userTexts: string[] = []
+    let lastAssistant = ''
+    for (const m of messages) {
+      const text = renderPromptContent(m.content)
+      if (!text || text.startsWith('[Local resume summary]') || text.startsWith('[tool_')) continue
+      if (m.role === 'user') userTexts.push(text)
+      else if (m.role === 'assistant') lastAssistant = text
+    }
+    if (userTexts.length === 0) return null
+
+    const input = [
+      `首条用户消息：${userTexts[0]!.slice(0, 300)}`,
+      ...(userTexts.length > 1
+        ? [`最近用户消息：${userTexts.slice(-3).map(t => t.slice(0, 150)).join(' / ')}`]
+        : []),
+      ...(lastAssistant ? [`最近助手回复（摘）：${lastAssistant.slice(0, 200)}`] : []),
+    ].join('\n')
+
+    const { apiKey, baseURL, flashModel } = router.getProviderConfig()
+    if (!apiKey) return null
+
+    if (getModelProtocol(flashModel, baseURL) === 'openai') {
+      const OpenAI = (await import('openai')).default
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 8_000 })
+      const response = await client.chat.completions.create({
+        model: flashModel,
+        max_tokens: 48,
+        messages: [
+          { role: 'system', content: SESSION_TITLE_SYSTEM },
+          { role: 'user', content: input },
+        ],
+      })
+      return sanitizeSessionTitle(response.choices[0]?.message?.content ?? '')
+    }
+
+    let client = router.getSideCallClient()
+    if (!client) {
+      client = new (await import('@anthropic-ai/sdk')).default({ apiKey, baseURL, timeout: 8_000, maxRetries: 1 })
+    }
+    const response = await client.messages.create({
+      model: flashModel,
+      max_tokens: 48,
+      system: SESSION_TITLE_SYSTEM,
+      messages: [{ role: 'user', content: input }],
+    })
+    const text = response.content
+      .filter(b => b.type === 'text')
+      .map(b => (b as { type: 'text'; text: string }).text).join('')
+    return sanitizeSessionTitle(text)
+  } catch {
+    return null   // best-effort — title generation must never disturb the REPL
+  }
+}
+
+/** Picker display: prefer the generated title; fall back to the prompt preview. */
+function sessionDisplayTitle(s: SessionMeta, previewLimit: number): string {
+  const title = s.title?.trim()
+  if (title) return sanitizeTerminalText(title)
+  return sessionPromptPreview(s.firstPrompt, previewLimit)
+}
+
 // ── Stream a single prompt ────────────────────────────────────────────────────
 
 const DEFAULT_CLI_MAX_VISIBLE_CHARS = 50_000
@@ -1407,7 +1511,7 @@ async function runSessionPicker(
   console.log(`\n${bold('历史会话:')} ${dim('(仅显示当前 workspace，选择一个以继续上次对话)')}\n`)
   sessions.forEach((s, i) => {
     const ago = formatAge(Date.now() - s.lastActivity)
-    const preview = sessionPromptPreview(s.firstPrompt, 60)
+    const preview = sessionDisplayTitle(s, 60)
     console.log(
       `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
       `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -2869,6 +2973,79 @@ async function runRepl(opts: CliOptions): Promise<void> {
   let interrupted = false
   // Track how many messages we've already saved so append writes only new ones.
   let savedMessageCount = resumedMessages.length
+  // ── Session title state ──
+  // One session = one goal = one title:
+  //   - NEW session → flash side-call generates the goal title after turn 1.
+  //   - RESUMED session → the old title is carried over verbatim; flash is
+  //     never re-invoked (re-entering a session means continuing its goal).
+  //   - Flash failure → deterministic local fallback (first clause of the
+  //     first user message) is written immediately so the picker always shows
+  //     something concise; later flash attempts (≤3 total) may upgrade it.
+  const TITLE_FLASH_MAX_ATTEMPTS = 3
+  let sessionTitle: string | null = null
+  let titleSource: 'flash' | 'fallback' | 'carried' | null = null
+  let titleFlashAttempts = 0
+  let titleGenInFlight = false
+  /** sessionId the current title was last written to (resume → new id). */
+  let titlePersistedFor: string | null = null
+  let titlePersistedValue: string | null = null
+  const resetTitleState = (): void => {
+    sessionTitle = null
+    titleSource = null
+    titleFlashAttempts = 0
+    titlePersistedFor = null
+    titlePersistedValue = null
+  }
+  const maybeGenerateSessionTitle = (): void => {
+    if (opts.json || titleGenInFlight) return
+    const sessionId = router.getSessionId()
+    if (!sessionId) return
+    const count = router.getMessages().length
+    const needFlash =
+      titleSource !== 'carried' &&            // resumed sessions keep their goal title
+      titleSource !== 'flash' &&              // flash title is final
+      titleFlashAttempts < TITLE_FLASH_MAX_ATTEMPTS &&
+      count >= 2
+    const needPersist =
+      sessionTitle !== null &&
+      (titlePersistedFor !== sessionId || titlePersistedValue !== sessionTitle)
+    if (!needFlash && !needPersist) return
+    titleGenInFlight = true
+    void (async () => {
+      try {
+        if (needFlash) {
+          titleFlashAttempts++
+          const title = await generateSessionTitle(router)
+          if (title) {
+            sessionTitle = title
+            titleSource = 'flash'
+          } else if (titleSource === null) {
+            const fb = fallbackSessionTitle(router.getMessages())
+            if (fb) {
+              sessionTitle = fb
+              titleSource = 'fallback'   // flash may upgrade on a later turn
+            }
+          }
+        }
+        if (sessionTitle !== null &&
+            (titlePersistedFor !== sessionId || titlePersistedValue !== sessionTitle)) {
+          await SessionStore.updateTitle(sessionId, sessionTitle, count)
+          titlePersistedFor = sessionId
+          titlePersistedValue = sessionTitle
+        }
+      } catch { /* best-effort */ }
+      finally { titleGenInFlight = false }
+    })()
+  }
+  // Resumed session: carry the old goal title over to the new session entry.
+  if (resumedSessionId) {
+    const resumedMeta = await SessionStore.getSession(resumedSessionId)
+    const carried = resumedMeta?.title?.trim()
+    if (carried) {
+      sessionTitle = carried
+      titleSource = 'carried'
+    }
+  }
   // Track whether the real debug dir has been printed (becomes known after first submit)
   let debugDirShown = false
   // Bounded: a weeks-long robotics session polls every 45s and would otherwise
@@ -3355,7 +3532,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
             console.log(`\n${bold('选择要删除的会话:')} ${dim('(仅当前 workspace；输入序号删除，all 删除全部，回车取消)')}\n`)
             sessions.forEach((s, i) => {
               const ago = formatAge(Date.now() - s.lastActivity)
-              const preview = sessionPromptPreview(s.firstPrompt, 60)
+              const preview = sessionDisplayTitle(s, 60)
               console.log(
                 `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                 `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -3383,7 +3560,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
               if (idx >= 1 && idx <= sessions.length) {
                 const selected = sessions[idx - 1]!
                 await SessionStore.deleteSession(selected.sessionId)
-                const preview = sessionPromptPreview(selected.firstPrompt, 50)
+                const preview = sessionDisplayTitle(selected, 50)
                 console.log(green(`\n✓ 已删除会话: ${dim(preview)}\n`))
               } else {
                 console.log(yellow('\n无效选择。\n'))
@@ -3398,7 +3575,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
                 console.log(`\n${bold('历史会话:')} ${dim('(仅当前 workspace；输入序号加载并继续上次对话)')}\n`)
               sessions.forEach((s, i) => {
                 const ago = formatAge(Date.now() - s.lastActivity)
-                const preview = sessionPromptPreview(s.firstPrompt, 60)
+                const preview = sessionDisplayTitle(s, 60)
                 console.log(
                   `  ${cyan(String(i + 1))}. ${bold(s.mode.padEnd(10))} ` +
                   `${dim(ago.padEnd(12))} ${dim(`[${s.messageCount} 条]`)}  ${preview}`,
@@ -3549,6 +3726,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           await router.dispose().catch(() => undefined)
           router = makeRouter(opts, undefined, rl, undefined, getCurrentRouter, _promptLineInline)
           savedMessageCount = 0
+          resetTitleState()
           console.log(green('\nNew session started.\n'))
           break
         case '/help':
@@ -3673,6 +3851,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // Append only the new messages (since savedMessageCount) so the file grows
     // incrementally rather than being rewritten on every turn.
     await persistCurrentSession(input)
+
+    // Fire-and-forget: generate (new sessions) or persist (carried titles).
+    maybeGenerateSessionTitle()
 
     rl.prompt()
   }

@@ -40,9 +40,13 @@ export interface SessionMeta {
   startTime: number
   lastActivity: number
   messageCount: number
-  /** First ~80 chars of the first user prompt — shown in the session picker. */
+  /** First ~80 chars of the first user prompt — picker fallback when no title. */
   firstPrompt: string
   workspace?: string
+  /** Flash-generated concise title (≤ ~16 chars). Preferred picker display. */
+  title?: string
+  /** messageCount when the title was generated — drives refresh cadence. */
+  titleMessageCount?: number
 }
 
 export interface SessionListOptions {
@@ -386,13 +390,35 @@ export class SessionStore {
     }
   }
 
+  /**
+   * Set/refresh the generated title on an indexed session. No-op when the
+   * session is not in the index. Best-effort like all SessionStore writes.
+   */
+  static async updateTitle(
+    sessionId: string,
+    title: string,
+    titleMessageCount: number,
+  ): Promise<void> {
+    try {
+      const entries = await readIndex()
+      const idx = entries.findIndex(e => e.sessionId === sessionId)
+      if (idx < 0) return
+      entries[idx] = { ...entries[idx]!, title, titleMessageCount }
+      await writeIndex(entries)
+    } catch {
+      // Best-effort
+    }
+  }
+
   // ── Private ────────────────────────────────────────────────────────────────
 
   private static async _upsertIndex(meta: SessionMeta): Promise<void> {
     const entries = await readIndex()
     const idx = entries.findIndex(e => e.sessionId === meta.sessionId)
     if (idx >= 0) {
-      entries[idx] = meta
+      // Merge-preserve: per-turn persists rebuild meta WITHOUT the title fields;
+      // a plain replace would wipe the generated title on every turn.
+      entries[idx] = { ...entries[idx], ...meta }
     } else {
       entries.unshift(meta)
     }
