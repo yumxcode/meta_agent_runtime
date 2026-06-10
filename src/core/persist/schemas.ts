@@ -52,6 +52,12 @@ export const TeamTaskSchema = z.object({
   id:        z.string(),
   title:     z.string(),
   status:    TeamTaskStatusSchema,
+  /**
+   * Optional robotics lane tag (算法/试验/落地). Optional so v2.0 boards
+   * written before the field existed still parse; zod strips unknown keys,
+   * so the field MUST be declared here or reads would silently drop it.
+   */
+  kind:      z.enum(['algo', 'exp', 'deploy']).optional(),
   /** Non-empty = claimed; only the owner can note/drop/done. */
   ownerUnit: z.string().optional(),
   /** ISO of claim time — used for stale-claim visual warnings. */

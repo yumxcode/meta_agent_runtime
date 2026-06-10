@@ -18,7 +18,7 @@ describe('TeamStore.take — exclusive ownership', () => {
   it('first take succeeds, sets ownerUnit + claimedAt', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     const { task } = await alice.take('TASK-001')
     expect(task.ownerUnit).toBe('alice')
@@ -29,7 +29,7 @@ describe('TeamStore.take — exclusive ownership', () => {
   it('second take by a different unit throws and names the owner', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
 
@@ -41,7 +41,7 @@ describe('TeamStore.take — exclusive ownership', () => {
   it('same-owner re-take is a no-op (returns same task without error)', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     const first = await alice.take('TASK-001')
     const second = await alice.take('TASK-001')
@@ -52,7 +52,7 @@ describe('TeamStore.take — exclusive ownership', () => {
   it('refuses to take a done task', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     await alice.updateTaskStatus('TASK-001', 'done')
@@ -62,7 +62,7 @@ describe('TeamStore.take — exclusive ownership', () => {
   it('promotes paused → open on take by current owner', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     await alice.updateTaskStatus('TASK-001', 'paused')
@@ -76,7 +76,7 @@ describe('TeamStore.drop', () => {
   it('owner can drop; ownership and currentTask clear', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     const { task, state } = await alice.drop('TASK-001')
@@ -88,7 +88,7 @@ describe('TeamStore.drop', () => {
   it('non-owner cannot drop', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
 
@@ -101,7 +101,7 @@ describe('TeamStore.steal', () => {
   it('overrides owner and appends an audit attempt', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
 
@@ -118,7 +118,7 @@ describe('TeamStore.steal', () => {
   it('on un-owned task behaves like take()', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     const { task, previousOwner } = await alice.steal('TASK-001', 'no one')
     expect(previousOwner).toBeUndefined()
@@ -131,7 +131,7 @@ describe('TeamStore.note — attempts log', () => {
   it('owner appends an attempt with direction/outcome/ref', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     const { task, attempt } = await alice.note({
@@ -149,7 +149,7 @@ describe('TeamStore.note — attempts log', () => {
   it('non-owner cannot note', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
 
@@ -161,7 +161,7 @@ describe('TeamStore.note — attempts log', () => {
   it('refuses note on un-owned task', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await expect(alice.note({ taskId: 'TASK-001', direction: 'x', outcome: 'y' }))
       .rejects.toThrow(/无人持有/)
@@ -170,7 +170,7 @@ describe('TeamStore.note — attempts log', () => {
   it('requires both direction and outcome', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     await expect(alice.note({ taskId: 'TASK-001', direction: '', outcome: 'y' })).rejects.toThrow(/direction/)
@@ -180,7 +180,7 @@ describe('TeamStore.note — attempts log', () => {
   it('marking done releases the lock and clears unit.currentTask', async () => {
     const dir = await tempDir()
     const alice = new TeamStore(dir, 'alice')
-    await alice.init()
+    await alice.init('https://github.com/acme/demo')
     await alice.addTask({ id: 'TASK-001', title: 'demo' })
     await alice.take('TASK-001')
     const { task, state } = await alice.updateTaskStatus('TASK-001', 'done')

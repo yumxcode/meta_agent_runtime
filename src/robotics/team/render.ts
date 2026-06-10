@@ -9,10 +9,15 @@
  * All renderers are pure functions of TeamState (or static text) — no IO.
  */
 
-import { isStaleClaim, type TeamState, type TeamTask } from './types.js'
+import { TASK_KIND_LABELS, isStaleClaim, type TeamState, type TeamTask } from './types.js'
 
 function attemptsCount(task: TeamTask): string {
   return `${task.attempts.length} 次尝试`
+}
+
+/** `[算法] ` / `[试验] ` / `[落地] ` prefix, empty for untagged tasks. */
+function kindTag(task: TeamTask): string {
+  return task.kind ? `[${TASK_KIND_LABELS[task.kind]}] ` : ''
 }
 
 function relTime(iso?: string): string {
@@ -43,7 +48,7 @@ export function renderBoard(state: TeamState): string {
     for (const t of owned) {
       const marker = isStaleClaim(t) ? '⚠' : '🔒'
       const claim = t.claimedAt ? ` · claimed ${relTime(t.claimedAt)}` : ''
-      lines.push(`- ${marker} ${t.id} ${t.title} · ${t.ownerUnit}${claim} · ${attemptsCount(t)}`)
+      lines.push(`- ${marker} ${t.id} ${kindTag(t)}${t.title} · ${t.ownerUnit}${claim} · ${attemptsCount(t)}`)
     }
     lines.push('')
   }
@@ -52,7 +57,7 @@ export function renderBoard(state: TeamState): string {
     lines.push('## 暂停')
     for (const t of paused) {
       const owner = t.ownerUnit ? ` · ${t.ownerUnit}` : ''
-      lines.push(`- ${t.id} ${t.title}${owner} · ${attemptsCount(t)}`)
+      lines.push(`- ${t.id} ${kindTag(t)}${t.title}${owner} · ${attemptsCount(t)}`)
     }
     lines.push('')
   }
@@ -61,14 +66,14 @@ export function renderBoard(state: TeamState): string {
   if (open.length === 0) {
     lines.push('- _none_', '')
   } else {
-    for (const t of open) lines.push(`- ${t.id} ${t.title}`)
+    for (const t of open) lines.push(`- ${t.id} ${kindTag(t)}${t.title}`)
     lines.push('')
   }
 
   if (done.length > 0) {
     lines.push('## 已完成')
     for (const t of done.slice(-10)) {
-      lines.push(`- ${t.id} ${t.title} · ${attemptsCount(t)}`)
+      lines.push(`- ${t.id} ${kindTag(t)}${t.title} · ${attemptsCount(t)}`)
     }
     lines.push('')
   }
@@ -150,8 +155,9 @@ export function renderReadme(): string {
     '- `/team note <id> "<direction>" :: "<outcome>" [@ref]` — 追加一条尝试',
     '- `/team drop [id]`      — 释放（仅 owner）',
     '- `/team done [id]`      — 标完成（仅 owner）',
-    '- `/team add "<title>"`  — 新增任务',
+    '- `/team add "<title>" [--kind algo|exp|deploy]`  — 新增任务（可选泳道标签）',
     '- `/team steal <id> [reason]` — 强制接手他人任务（自动写 audit attempt）',
+    '- `/team push`           — 提交并推送 team/ 变更（仅 team 目录，队友 /team pull 后可见）',
     '',
     '## Migration',
     '',

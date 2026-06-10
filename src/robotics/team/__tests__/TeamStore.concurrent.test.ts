@@ -20,7 +20,7 @@ describe('TeamStore — optimistic concurrency', () => {
   it('rejects writes when team.json has been modified between read and write', async () => {
     const dir = await tempDir()
     const a = new TeamStore(dir, 'unit-a')
-    await a.init()
+    await a.init('https://github.com/acme/demo')
 
     // Two parallel addTask calls race.  Both ensure() → read state with updatedAt=X
     // before either writeAll() finishes.  The first writer succeeds (updatedAt → X');
@@ -43,7 +43,7 @@ describe('TeamStore — optimistic concurrency', () => {
   it('allows writes when updatedAt is unchanged', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-b')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     const result = await store.addTask({ id: 'TASK-002', title: 'first add', paths: ['src/**'] })
     expect(result.task.id).toBe('TASK-002')
   })
@@ -51,7 +51,7 @@ describe('TeamStore — optimistic concurrency', () => {
   it('two serial writes from the same unit both succeed', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-c')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     await store.addTask({ id: 'TASK-001', title: 'one' })
     await store.addTask({ id: 'TASK-002', title: 'two' })
     const state = await store.status()
@@ -61,8 +61,8 @@ describe('TeamStore — optimistic concurrency', () => {
   it('init() is idempotent', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-d')
-    const first = await store.init()
-    const second = await store.init()
+    const first = await store.init('https://github.com/acme/demo')
+    const second = await store.init('https://github.com/acme/demo')
     expect(second.project).toBe(first.project)
     expect(second.tasks).toHaveLength(first.tasks.length)
   })
@@ -70,7 +70,7 @@ describe('TeamStore — optimistic concurrency', () => {
   it('parseOrNull rejects a structurally invalid team.json (returns null)', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-e')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     const path = join(dir, 'team', 'team.json')
     // Corrupt by removing a required field — Zod should reject.
     await writeFile(path, JSON.stringify({ schemaVersion: '1.0' }), 'utf8')

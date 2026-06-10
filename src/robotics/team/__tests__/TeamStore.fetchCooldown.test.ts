@@ -26,7 +26,7 @@ describe('TeamStore — git fetch cooldown', () => {
   it('sync({fetch:false}) never runs git and never updates _lastFetchAt', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-fetch-2')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     const summary = await store.sync({ fetch: false, updatePresence: false, writeActivity: false })
     expect(summary.gitFetched).toBe(false)
     expect(store.msSinceLastFetch()).toBe(Number.POSITIVE_INFINITY)

@@ -30,7 +30,7 @@ describe('TeamStore — markdown view writes (v2.0)', () => {
   it('writes board.md, log.md, goals.md, README.md after init', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-view')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     for (const f of ['board.md', 'log.md', 'goals.md', 'README.md']) {
       await waitForFile(join(dir, 'team', f))
     }
@@ -39,7 +39,7 @@ describe('TeamStore — markdown view writes (v2.0)', () => {
   it('does NOT generate the deprecated modules.md / units.md / decisions.md / activity.md', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-no-legacy')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     // give fire-and-forget view writes a chance
     await new Promise(r => setTimeout(r, 100))
     const entries = await readdir(join(dir, 'team'))
@@ -52,7 +52,7 @@ describe('TeamStore — markdown view writes (v2.0)', () => {
   it('README.md describes the v2.0 commit boundary', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-readme')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     await waitForFile(join(dir, 'team', 'README.md'))
     const content = await readFile(join(dir, 'team', 'README.md'), 'utf8')
     expect(content).toContain('Source of truth')
@@ -65,7 +65,7 @@ describe('TeamStore — markdown view writes (v2.0)', () => {
   it('leaves no .tmp files in team/ after a write completes', async () => {
     const dir = await tempDir()
     const store = new TeamStore(dir, 'unit-tmp')
-    await store.init()
+    await store.init('https://github.com/acme/demo')
     await store.addTask({ id: 'TASK-002', title: 'view test' })
     await new Promise(r => setTimeout(r, 100))
     const entries = await readdir(join(dir, 'team'))

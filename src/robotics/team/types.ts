@@ -13,6 +13,23 @@
 
 export type TeamTaskStatus = 'open' | 'paused' | 'done'
 
+/**
+ * Optional task lane for robotics collaboration:
+ *   algo   — 算法（模型/控制/规划开发）
+ *   exp    — 试验（仿真/实机实验与验证）
+ *   deploy — 场景落地（集成/部署/现场调试）
+ * Absent = uncategorised (fully backward compatible with existing boards).
+ */
+export type TeamTaskKind = 'algo' | 'exp' | 'deploy'
+
+export const VALID_TASK_KINDS: TeamTaskKind[] = ['algo', 'exp', 'deploy']
+
+export const TASK_KIND_LABELS: Record<TeamTaskKind, string> = {
+  algo: '算法',
+  exp: '试验',
+  deploy: '落地',
+}
+
 /** ms threshold for "claim has gone stale" board warnings (7 days). */
 export const STALE_CLAIM_MS = 7 * 24 * 60 * 60 * 1000
 
@@ -28,6 +45,8 @@ export interface TeamTask {
   id: string
   title: string
   status: TeamTaskStatus
+  /** Optional lane tag (algo|exp|deploy). Absent on legacy tasks. */
+  kind?: TeamTaskKind
   /** Non-empty = locked; only owner can note/drop/done. */
   ownerUnit?: string
   /** ISO of claim time — drives stale-claim visual warnings on the board. */

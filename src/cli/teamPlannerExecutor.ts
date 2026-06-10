@@ -30,6 +30,7 @@ function describeAction(a: TeamPlannerAction): string {
     case 'steal_task':       return `steal ${a.taskId ?? '<unspecified>'}${a.reason ? ` (${a.reason})` : ''}`
     case 'sync_team':        return 'fetch + sync team state'
     case 'pull_team':        return 'pull remote team/ files'
+    case 'push_team':        return 'commit + push local team/ changes'
     default:                 return (a as { type: string }).type
   }
 }
@@ -70,6 +71,9 @@ async function runAction(controller: RoboticsTeamController, a: TeamPlannerActio
       return
     case 'pull_team':
       await controller.teamPull?.()
+      return
+    case 'push_team':
+      await controller.teamPush?.()
       return
     default:
       throw new Error(`unknown action type "${(a as { type: string }).type}"`)

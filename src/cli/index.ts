@@ -60,6 +60,7 @@ import type { TeamWatcherEvent } from '../robotics/team/TeamWatcher.js'
 import type {
   TeamState,
   TeamTask,
+  TeamTaskKind,
 } from '../robotics/team/TeamStore.js'
 import { isStaleClaim } from '../robotics/team/TeamStore.js'
 import { SessionStore } from '../core/SessionStore.js'
@@ -81,7 +82,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.3'
+const VERSION = '0.2.4'
 const DEFAULT_CLI_MAX_TURNS = 100
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -147,9 +148,9 @@ ${bold('INTERACTIVE COMMANDS')}
   /hardware             Show bound hardware profile (robotics mode)
   /hardware select      Re-run hardware profile selection wizard
   /team                 Show board + recent attempts (entry guide)
-  /team init [github]   Create team/ collaboration template
-  /team join [github]   Join this unit to the team
-  /team add "<title>"   Create a new task
+  /team init [github-url]   Create team/ template (GitHub 必绑；origin 指向 GitHub 时可省略)
+  /team join [github] [--as <name>]   Join this unit to the team
+  /team add "<title>" [--kind algo|exp|deploy]   Create a new task (optional lane)
   /team take <task>     Exclusively claim a task (fails if owned by another)
   /team note <id> "<direction>" :: "<outcome>" [@ref]   Append an attempt
   /team drop [task]     Release a task you own
@@ -157,6 +158,7 @@ ${bold('INTERACTIVE COMMANDS')}
   /team done [task]     Mark task done (only owner)
   /team status / board  Show current board
   /team sync            Fetch remotes and refresh team status
+  /team push            Commit & push team/ changes (only team dir) to teammates
   /team pull            Apply remote team/ files only when local team/ is clean
   /team conflicts       Show merge conflict guidance for the current workspace
   /team conflicts resolve  Auto-resolve team.json conflict using --theirs strategy
@@ -755,6 +757,11 @@ function detectSensitiveOp(
 ): string | null {
   if (toolName === 'write_file' || toolName === 'edit_file') return toolName
   if (toolName === 'notebook_edit') return toolName
+  // Team board mutations that change what teammates see — a human confirms
+  // each. team_note is deliberately NOT here (lab-notebook append on a task
+  // this unit already owns; the agent writes it directly).
+  if (toolName === 'team_take') return 'team_take（领取团队任务）'
+  if (toolName === 'team_mark_done') return 'team_mark_done（标记团队任务完成）'
   if (toolName !== 'bash' && toolName !== 'powershell') return null
   const cmd = String(input['command'] ?? '')
   const sensitiveLabel = detectSensitiveShellCommand(cmd)
@@ -2202,7 +2209,17 @@ async function _runTeamEntryGuideInner(
   if (!state) {
     const answer = await askQuestion(rl, `尚未初始化 team/ 模板。现在初始化并加入？[Y/n] `)
     if (/^(n|no|否)$/i.test(answer.trim())) return
-    state = await controller.teamJoin?.()
+    try {
+      state = await controller.teamJoin?.()
+    } catch (err) {
+      // GitHub is the team SSOT — when origin isn't a GitHub remote we must
+      // ask for the repo URL explicitly before any team state is created.
+      if ((err as Error)?.name !== 'TeamGithubRequiredError') throw err
+      console.log(yellow('\nteam 模式以 GitHub 仓库为唯一事实源（未能从 origin 自动检测到 GitHub 地址）。'))
+      const url = (await askQuestion(rl, `请输入 GitHub 仓库地址（如 https://github.com/org/repo，回车取消）: `)).trim()
+      if (!url) { console.log(dim('已取消 team 初始化。')); return }
+      state = await controller.teamJoin?.(url)
+    }
     console.log(green('\n✓ team 已初始化并加入。'))
   } else {
     // unitId is exposed via controller indirectly; for simplicity treat absence
@@ -2216,6 +2233,11 @@ async function _runTeamEntryGuideInner(
       }
     }
   }
+
+  // Refresh remote state first (fetch bounded by the 10-min cooldown) so the
+  // board reflects teammates' latest takes/notes before we display it.
+  await controller.teamWatcherPoll?.().catch(() => undefined)
+  state = await controller.teamStatus?.() ?? state
 
   // Show the board + recent attempts — the primary collaboration view.
   console.log(formatTeamState(state))
@@ -2324,6 +2346,20 @@ async function getTeamController(router: SessionRouter, opts: CliOptions): Promi
   return controller
 }
 
+/** Print a one-line hint when local team/ changes haven't been pushed yet. */
+async function printTeamPublishHint(controller: TeamCliController): Promise<void> {
+  try {
+    const s = await controller.teamPublishState?.()
+    if (!s || !s.isGitRepo) return
+    if (s.dirty.length > 0 || s.unpushedCommits > 0) {
+      console.log(
+        dim(`  ⇡ 本地 team/ 有未发布变更（未提交=${s.dirty.length}, 未推送 commit=${s.unpushedCommits}）— 运行 `) +
+        cyan('/team push') + dim(' 发布给队友。'),
+      )
+    }
+  } catch { /* advisory only */ }
+}
+
 async function handleTeamCommand(
   input: string,
   router: SessionRouter,
@@ -2362,8 +2398,12 @@ async function handleTeamCommand(
         break
       }
       case 'join': {
-        const state = await controller.teamJoin?.(arg)
-        console.log(green('\n✓ 已加入 team。'))
+        // /team join [github] [--as 张三]
+        const asIdx = rest.findIndex(t => t === '--as')
+        const human = asIdx >= 0 ? rest.slice(asIdx + 1).join(' ').trim() || undefined : undefined
+        const githubArg = (asIdx >= 0 ? rest.slice(0, asIdx) : rest).join(' ').trim() || undefined
+        const state = await controller.teamJoin?.(githubArg, human)
+        console.log(green('\n✓ 已加入 team。') + (human ? dim(`  (human: ${human})`) : ''))
         console.log(formatTeamState(state))
         break
       }
@@ -2374,10 +2414,20 @@ async function handleTeamCommand(
         }
         const state = await controller.teamStatus?.()
         const id = nextTeamTaskId(state?.tasks ?? [])
-        const title = arg.replace(/^['"]|['"]$/g, '').trim()
-        const result = await controller.teamTaskAdd?.({ id, title })
-        console.log(green(`\n✓ 已新增 ${result?.task.id ?? id}: ${title}。`))
+        // /team add "<title>" [--kind algo|exp|deploy]
+        const kindMatch = arg.match(/\s--kind\s+(algo|exp|deploy)\s*$/i)
+        const kind = kindMatch ? kindMatch[1]!.toLowerCase() as TeamTaskKind : undefined
+        const rawTitle = kindMatch ? arg.slice(0, kindMatch.index) : arg
+        const title = rawTitle.replace(/^['"]|['"]$/g, '').trim()
+        if (!title) {
+          console.log(`\n${yellow('用法:')} ${cyan('/team add "<task title>" [--kind algo|exp|deploy]')}\n`)
+          break
+        }
+        const result = await controller.teamTaskAdd?.({ id, title, ...(kind ? { kind } : {}) })
+        const kindNote = kind ? dim(`  [${kind}]`) : ''
+        console.log(green(`\n✓ 已新增 ${result?.task.id ?? id}: ${title}。`) + kindNote)
         console.log(formatTeamState(result?.state))
+        await printTeamPublishHint(controller)
         break
       }
       case 'take': {
@@ -2385,15 +2435,30 @@ async function handleTeamCommand(
           console.log(`\n${yellow('用法:')} ${cyan('/team take TASK-001')}\n`)
           break
         }
+        // Double-claim guard: fetch remote state first; if the remote team/
+        // has changes we haven't pulled, a teammate may already own this task.
+        process.stdout.write(dim('领取前同步远端 team 状态…'))
+        const preSync = await controller.teamSync?.().catch(() => undefined)
+        process.stdout.write('\r')
+        if (preSync && preSync.remoteTeamChanges.length > 0) {
+          console.log(
+            `${yellow('⚠ 远端 team/ 有未拉取的变更，已中止领取（避免双领）。')}\n` +
+            `${dim('先运行')} ${cyan('/team pull')} ${dim('应用远端状态，再重新 take。')}`,
+          )
+          preSync.remoteTeamChanges.slice(0, 5).forEach(change => console.log(dim(`  - ${change}`)))
+          break
+        }
         const result = await controller.teamTake?.(arg)
         console.log(green(`\n✓ 已领取 ${result?.task.id ?? arg}。`))
         console.log(formatTeamState(result?.state))
+        await printTeamPublishHint(controller)
         break
       }
       case 'drop': {
         const result = await controller.teamDrop?.(arg)
         console.log(green(`\n✓ 已释放 ${result?.task.id ?? '(当前任务)'}。`))
         console.log(formatTeamState(result?.state))
+        await printTeamPublishHint(controller)
         break
       }
       case 'steal': {
@@ -2411,6 +2476,7 @@ async function handleTeamCommand(
           console.log(dim(`  audit: ${last.direction} — ${last.outcome}`))
         }
         console.log(formatTeamState(result?.state))
+        await printTeamPublishHint(controller)
         break
       }
       case 'note': {
@@ -2427,6 +2493,7 @@ async function handleTeamCommand(
         console.log(dim(`  方向: ${parsed.direction}`))
         console.log(dim(`  结果: ${parsed.outcome}`))
         if (parsed.ref) console.log(dim(`  ref: ${parsed.ref}`))
+        await printTeamPublishHint(controller)
         break
       }
       case 'done': {
@@ -2440,6 +2507,7 @@ async function handleTeamCommand(
         const result = await controller.teamTaskStatus?.(taskId, 'done')
         console.log(green(`\n✓ ${result?.task.id ?? taskId} -> done。`))
         console.log(formatTeamState(result?.state))
+        await printTeamPublishHint(controller)
         break
       }
       case 'pause': {
@@ -2468,6 +2536,17 @@ async function handleTeamCommand(
         }
         console.log(formatTeamState(summary?.state))
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
+        break
+      }
+      case 'push': {
+        process.stdout.write(dim('正在发布 team/ 变更…'))
+        const pushResult = await controller.teamPush?.()
+        process.stdout.write('\r')
+        if (pushResult?.pushed) {
+          console.log(green('✓ ' + pushResult.message) + dim('  队友执行 /team pull 后可见。'))
+        } else {
+          console.log(yellow('⚠ ' + (pushResult?.message ?? 'push 不可用（robotics 模式未激活？）')))
+        }
         break
       }
       case 'pull': {
@@ -2549,7 +2628,7 @@ async function handleTeamCommand(
         }
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         if (!['status', 'board', 'log'].includes(sub)) {
-          console.log(dim(`未知 team 子命令 "${terminalText(sub)}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, pull, conflicts.\n`))
+          console.log(dim(`未知 team 子命令 "${terminalText(sub)}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, push, pull, conflicts.\n`))
         }
         break
       }

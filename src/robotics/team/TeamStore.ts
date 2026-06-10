@@ -28,12 +28,15 @@ import { atomicWriteFile, atomicWriteJson, withFileLock } from '../../core/persi
 import { migrateTeamState } from '../../core/persist/schemas.js'
 import {
   STALE_CLAIM_MS,
+  TASK_KIND_LABELS,
+  VALID_TASK_KINDS,
   VALID_TASK_STATUSES,
   isActiveTask,
   isStaleClaim,
   type TeamAttempt,
   type TeamState,
   type TeamTask,
+  type TeamTaskKind,
   type TeamTaskStatus,
   type TeamUnit,
 } from './types.js'
@@ -48,12 +51,15 @@ const execFileAsync = promisify(execFile)
 
 export {
   STALE_CLAIM_MS,
+  TASK_KIND_LABELS,
+  VALID_TASK_KINDS,
   VALID_TASK_STATUSES,
   isActiveTask,
   isStaleClaim,
   type TeamAttempt,
   type TeamState,
   type TeamTask,
+  type TeamTaskKind,
   type TeamTaskStatus,
   type TeamUnit,
 }
@@ -67,6 +73,23 @@ const FETCH_COOLDOWN_MS = 10 * 60 * 1000
 export interface TeamTaskAddInput {
   id: string
   title: string
+  /** Optional lane tag: algo | exp | deploy. */
+  kind?: TeamTaskKind
+}
+
+export interface TeamPublishState {
+  /** Uncommitted changes under team/ (git status --porcelain lines). */
+  dirty: string[]
+  /** Local commits touching team/ that the upstream doesn't have yet. */
+  unpushedCommits: number
+  /** False when the project isn't a git repo (publishing not applicable). */
+  isGitRepo: boolean
+}
+
+export interface TeamPushResult {
+  committed: boolean
+  pushed: boolean
+  message: string
 }
 
 export interface TeamSyncOptions {
@@ -125,6 +148,36 @@ export interface TeamNoteInput {
 
 function nowIso(): string {
   return new Date().toISOString()
+}
+
+/**
+ * Thrown when team mode would be created/used without a GitHub binding.
+ * GitHub is the team SSOT: every board must be tied to exactly one repo.
+ */
+export class TeamGithubRequiredError extends Error {
+  override name = 'TeamGithubRequiredError'
+  constructor(message?: string) {
+    super(
+      message ??
+      'Team mode 要求绑定 GitHub 仓库（团队共享状态的唯一事实源）。\n' +
+      '用法: /team init <github-repo-url>（如 https://github.com/org/repo），\n' +
+      '或先 git remote add origin git@github.com:org/repo.git 后重试（将自动检测）。',
+    )
+  }
+}
+
+/**
+ * Normalize any GitHub remote form to a canonical https URL:
+ *   git@github.com:org/repo.git      → https://github.com/org/repo
+ *   https://github.com/org/repo.git  → https://github.com/org/repo
+ *   github.com/org/repo              → https://github.com/org/repo
+ * Returns null for anything that is not a github.com repo reference.
+ */
+export function normalizeGithubUrl(raw: string | undefined): string | null {
+  if (!raw) return null
+  const m = raw.trim().match(/github\.com[:/]+([\w.-]+)\/([\w.-]+?)(?:\.git)?\/?$/i)
+  if (!m) return null
+  return `https://github.com/${m[1]}/${m[2]}`
 }
 
 function defaultUnitId(): string {
@@ -186,10 +239,55 @@ export class TeamStore {
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
 
+  /**
+   * Resolve the mandatory GitHub binding (team SSOT):
+   * explicit URL wins (validated + normalized); otherwise auto-detect from the
+   * project's `origin` remote; otherwise throw TeamGithubRequiredError.
+   */
+  private async _resolveGithub(explicit?: string): Promise<string> {
+    if (explicit !== undefined && explicit.trim() !== '') {
+      const normalized = normalizeGithubUrl(explicit)
+      if (!normalized) {
+        throw new TeamGithubRequiredError(
+          `"${explicit}" 不是有效的 GitHub 仓库地址。` +
+          `需形如 https://github.com/org/repo 或 git@github.com:org/repo.git。`,
+        )
+      }
+      return normalized
+    }
+    const detected = await this.detectGithubRemote()
+    if (detected) return detected
+    throw new TeamGithubRequiredError()
+  }
+
+  /** Auto-detect the GitHub repo from the `origin` remote (normalized https). */
+  async detectGithubRemote(): Promise<string | undefined> {
+    try {
+      const { stdout } = await execFileAsync(
+        'git', ['remote', 'get-url', 'origin'],
+        { cwd: this.projectDir, timeout: 5_000 },
+      )
+      return normalizeGithubUrl(stdout.trim()) ?? undefined
+    } catch {
+      return undefined
+    }
+  }
+
   async init(github?: string): Promise<TeamState> {
     const existing = await this.read()
-    if (existing) return existing
-    const state = defaultState(this.projectDir, github)
+    if (existing) {
+      // Backfill legacy boards created before the GitHub-SSOT rule.
+      if (!existing.github) {
+        const resolved = await this._resolveGithub(github)
+        const originalUpdatedAt = existing.updatedAt
+        existing.github = resolved
+        existing.updatedAt = nowIso()
+        await this.writeAll(existing, originalUpdatedAt)
+      }
+      return existing
+    }
+    const resolved = await this._resolveGithub(github)
+    const state = defaultState(this.projectDir, resolved)
     await this.writeAll(state)
     return state
   }
@@ -207,7 +305,17 @@ export class TeamStore {
     }
     const originalUpdatedAt = state.updatedAt
     state.units = [...state.units.filter(u => u.id !== this.unitId), unit]
-    if (github) state.github = github
+    // Explicit URL on join rebinds (validated); invalid input is rejected
+    // rather than silently stored.
+    if (github) {
+      const normalized = normalizeGithubUrl(github)
+      if (!normalized) {
+        throw new TeamGithubRequiredError(
+          `"${github}" 不是有效的 GitHub 仓库地址，join 已中止。`,
+        )
+      }
+      state.github = normalized
+    }
     state.updatedAt = nowIso()
     await this.writeAll(state, originalUpdatedAt)
     return state
@@ -217,6 +325,19 @@ export class TeamStore {
 
   async addTask(input: TeamTaskAddInput): Promise<{ state: TeamState; task: TeamTask }> {
     const state = await this.ensure()
+    // GitHub is the team SSOT — no task may be created on an unbound board.
+    // (ensure→init enforces this for new boards; this guard catches legacy
+    // team.json files written before the rule, backfilling when detectable.)
+    if (!state.github) {
+      const detected = await this.detectGithubRemote()
+      if (!detected) {
+        throw new TeamGithubRequiredError(
+          '当前 team 板尚未绑定 GitHub 仓库，无法创建任务。\n' +
+          '运行 /team init <github-repo-url> 绑定（GitHub 是 team 协作的唯一事实源）。',
+        )
+      }
+      state.github = detected   // persisted by the writeAll below
+    }
     const id = input.id.trim().toUpperCase()
     if (!/^TASK-[A-Z0-9._-]+$/.test(id)) {
       throw new Error('Task id must look like TASK-001')
@@ -225,10 +346,14 @@ export class TeamStore {
       throw new Error(`${id} already exists`)
     }
     if (!input.title.trim()) throw new Error('Task title is required')
+    if (input.kind !== undefined && !VALID_TASK_KINDS.includes(input.kind)) {
+      throw new Error(`Invalid task kind: ${input.kind} (valid: ${VALID_TASK_KINDS.join('|')})`)
+    }
     const task: TeamTask = {
       id,
       title: input.title.trim(),
       status: 'open',
+      ...(input.kind ? { kind: input.kind } : {}),
       attempts: [],
       updatedAt: nowIso(),
     }
@@ -483,6 +608,83 @@ export class TeamStore {
     }
   }
 
+  /**
+   * Publish state: what local team/ work the rest of the team can't see yet.
+   * dirty = uncommitted team/ files; unpushedCommits = committed-but-unpushed
+   * commits touching team/.
+   */
+  async publishState(): Promise<TeamPublishState> {
+    try {
+      await execFileAsync('git', ['rev-parse', '--git-dir'], { cwd: this.projectDir, timeout: 5_000 })
+    } catch {
+      return { dirty: [], unpushedCommits: 0, isGitRepo: false }
+    }
+    const dirty = await this.localTeamChanges()
+    let unpushedCommits = 0
+    try {
+      const { stdout } = await execFileAsync(
+        'git', ['rev-list', '--count', '@{u}..HEAD', '--', TEAM_DIR],
+        { cwd: this.projectDir, timeout: 5_000 },
+      )
+      unpushedCommits = Number.parseInt(stdout.trim(), 10) || 0
+    } catch { /* no upstream — treated as nothing unpushed; push() reports it */ }
+    return { dirty, unpushedCommits, isGitRepo: true }
+  }
+
+  /**
+   * Publish local team/ changes: stage ONLY team/, commit, push.
+   * Never touches anything outside the team directory, so it cannot swallow
+   * unrelated work-in-progress code into the commit.
+   */
+  async push(): Promise<TeamPushResult> {
+    const state = await this.publishState()
+    if (!state.isGitRepo) {
+      return { committed: false, pushed: false, message: '当前项目不是 git 仓库，无法发布 team 状态。' }
+    }
+
+    let committed = false
+    if (state.dirty.length > 0) {
+      await execFileAsync('git', ['add', '--', TEAM_DIR], { cwd: this.projectDir, timeout: 10_000 })
+      try {
+        await execFileAsync(
+          'git', ['commit', '-m', `team(${this.unitId}): board update`, '--', TEAM_DIR],
+          { cwd: this.projectDir, timeout: 15_000 },
+        )
+        committed = true
+      } catch (err) {
+        const e = err as { stderr?: string; stdout?: string; message?: string }
+        const detail = (e.stderr || e.stdout || e.message || String(err)).trim()
+        // "nothing to commit" can race with a concurrent commit; treat as ok.
+        if (!/nothing to commit|no changes added/i.test(detail)) {
+          return { committed: false, pushed: false, message: `commit 失败: ${detail}` }
+        }
+      }
+    } else if (state.unpushedCommits === 0) {
+      return { committed: false, pushed: false, message: 'team/ 没有需要发布的变更。' }
+    }
+
+    try {
+      await execFileAsync('git', ['push'], { cwd: this.projectDir, timeout: 60_000 })
+      return { committed, pushed: true, message: committed ? '已提交并推送 team/ 变更。' : '已推送此前提交的 team/ 变更。' }
+    } catch (err) {
+      const e = err as { stderr?: string; message?: string }
+      const detail = (e.stderr || e.message || String(err)).trim()
+      if (/no upstream|set-upstream/i.test(detail)) {
+        try {
+          await execFileAsync('git', ['push', '-u', 'origin', 'HEAD'], { cwd: this.projectDir, timeout: 60_000 })
+          return { committed, pushed: true, message: '已推送（并设置 upstream origin/HEAD）。' }
+        } catch (err2) {
+          const e2 = err2 as { stderr?: string; message?: string }
+          return {
+            committed, pushed: false,
+            message: `已提交但推送失败: ${(e2.stderr || e2.message || String(err2)).trim()}`,
+          }
+        }
+      }
+      return { committed, pushed: false, message: `已提交但推送失败: ${detail}（队友看不到变更，请稍后重试 /team push）` }
+    }
+  }
+
   async pullRemoteTeam(): Promise<TeamPullResult> {
     const before = await this.sync({ fetch: true, forceFetch: true, updatePresence: false })
     const upstreamBranch = before.upstreamBranch
@@ -619,6 +821,7 @@ export class TeamStore {
   async formatPromptContext(): Promise<string | null> {
     const state = await this.read()
     if (!state) return null
+    const kindTag = (t: TeamTask): string => (t.kind ? `[${TASK_KIND_LABELS[t.kind]}] ` : '')
     const active = state.tasks.filter(isActiveTask)
     const mine = active.filter(t => t.ownerUnit === this.unitId)
     const others = active.filter(t => t.ownerUnit && t.ownerUnit !== this.unitId)
@@ -641,17 +844,17 @@ export class TeamStore {
       '',
       '### Your tasks',
       ...(mine.length
-        ? mine.map(t => `- ${t.id}: ${t.title} [${t.status}] attempts=${t.attempts.length}`)
+        ? mine.map(t => `- ${t.id}: ${kindTag(t)}${t.title} [${t.status}] attempts=${t.attempts.length}`)
         : ['- none']),
       '',
       '### Others working',
       ...(others.length
-        ? others.slice(0, 12).map(t => `- ${t.id}: ${t.title} owner=${t.ownerUnit} attempts=${t.attempts.length}${isStaleClaim(t) ? ' (claim stale)' : ''}`)
+        ? others.slice(0, 12).map(t => `- ${t.id}: ${kindTag(t)}${t.title} owner=${t.ownerUnit} attempts=${t.attempts.length}${isStaleClaim(t) ? ' (claim stale)' : ''}`)
         : ['- none']),
       '',
       '### Open tasks (unclaimed)',
       ...(open.length
-        ? open.map(t => `- ${t.id}: ${t.title}`)
+        ? open.map(t => `- ${t.id}: ${kindTag(t)}${t.title}`)
         : ['- none']),
       '',
       '### Recent attempts (latest 8 across team)',
@@ -661,7 +864,11 @@ export class TeamStore {
       '',
       'Team mode rules: tasks are exclusively owned once taken; only the owner can note/drop/done. ' +
       'When the user describes work, surface useful collaboration cues — what others tried, what failed, who has the lock. ' +
-      'Do NOT mutate team state without explicit instruction; surface intent and let the user run /team take, /team note, /team drop, /team done, /team steal.',
+      'You MAY record attempts on tasks THIS unit owns via the team_note tool — do so proactively after a meaningful ' +
+      'experiment/debug round concludes (direction + outcome + ref like a wandb/git/rosbag link). ' +
+      'team_take / team_mark_done are available but prompt the user for confirmation — propose them when appropriate. ' +
+      'NEVER steal a task yourself; suggest /team steal and let the user decide. ' +
+      'Local team changes are only visible to teammates after /team push — remind the user when changes are unpublished.',
     ].filter((s): s is string => s !== null).join('\n')
   }
 

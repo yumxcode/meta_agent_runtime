@@ -35,7 +35,12 @@ export class TeamWatcher {
 
   constructor(
     private readonly store: TeamStore,
-    private readonly intervalMs = 1_800_000,
+    /**
+     * 5 min default: short enough that a teammate's take/note lands within a
+     * coffee break, long enough to stay negligible. Actual `git fetch` traffic
+     * is still bounded by TeamStore's 10-min fetch cooldown.
+     */
+    private readonly intervalMs = 300_000,
   ) {}
 
   start(): void {

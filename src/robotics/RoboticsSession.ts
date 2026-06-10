@@ -86,9 +86,10 @@ import { WorkflowStateStore } from '../workflow/WorkflowStateStore.js'
 import type { WorkflowDefinition, WorkflowRepairInput, WorkflowState } from '../workflow/types.js'
 import { buildW1Section } from '../workflow/dynamicSection.js'
 import { createWorkflowTools } from '../workflow/tools/index.js'
-import { TeamStore, type TeamNoteInput, type TeamSyncSummary, type TeamTaskAddInput, type TeamTaskStatus } from './team/TeamStore.js'
+import { TeamStore, type TeamNoteInput, type TeamPublishState, type TeamPushResult, type TeamSyncSummary, type TeamTaskAddInput, type TeamTaskStatus } from './team/TeamStore.js'
 import { TeamWatcher, type TeamWatcherEvent } from './team/TeamWatcher.js'
 import { buildTeamSection } from './team/dynamicSection.js'
+import { createTeamTools } from './tools/team/index.js'
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
@@ -627,6 +628,14 @@ export class RoboticsSession {
     // Memory write tool — allows the robotics agent to propose user/feedback memories.
     // Queued for human review; never auto-committed.
     this.inner.registerTool(await createMemoryWriteTool({ mode: 'robotics', domain: this._domain }))
+    // Team collaboration tools — the agent half of a "human + meta-agent" unit.
+    // team_note writes directly (low-risk lab-notebook append on tasks this
+    // unit owns); team_take / team_mark_done are flagged sensitive by the CLI
+    // guard so a human confirms each. All three error cleanly when team mode
+    // is not initialised, so unconditional registration is safe.
+    for (const tool of createTeamTools(this)) {
+      this.inner.registerTool(tool)
+    }
 
     // ── 4. Register workflow tools (if workflow found) ────────────────────
     if (this._workflowDef) {
@@ -1356,6 +1365,28 @@ export class RoboticsSession {
     const result = await this.teamStore.pullRemoteTeam()
     await this.teamWatcher.forceSync(false)
     return result
+  }
+
+  /** Publish local team/ changes: stage team/ only, commit, push. */
+  async teamPush(): Promise<TeamPushResult> {
+    const result = await this.teamStore.push()
+    await this.teamWatcher.forceSync(false)
+    return result
+  }
+
+  /** What local team/ work teammates can't see yet (dirty + unpushed). */
+  async teamPublishState(): Promise<TeamPublishState> {
+    return this.teamStore.publishState()
+  }
+
+  /** True when team/team.json exists (team mode initialised for this project). */
+  async teamExists(): Promise<boolean> {
+    return this.teamStore.exists()
+  }
+
+  /** This unit's id (user-hostname) — the owner identity for take/note/done. */
+  teamUnitId(): string {
+    return this.teamStore.unitId
   }
 
   async teamConflicts() {

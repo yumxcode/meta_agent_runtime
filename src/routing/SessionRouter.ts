@@ -76,6 +76,8 @@ export interface RoboticsTeamController {
   // Git transport
   teamSync?(): Promise<import('../robotics/team/TeamStore.js').TeamSyncSummary>
   teamPull?(): Promise<import('../robotics/team/TeamStore.js').TeamPullResult>
+  teamPush?(): Promise<import('../robotics/team/TeamStore.js').TeamPushResult>
+  teamPublishState?(): Promise<import('../robotics/team/TeamStore.js').TeamPublishState>
   teamConflicts?(): Promise<import('../robotics/team/TeamStore.js').MergeConflictReport>
   teamResolveTeamJson?(): Promise<import('../robotics/team/TeamStore.js').TeamJsonResolveResult>
 
