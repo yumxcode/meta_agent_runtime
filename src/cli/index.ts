@@ -82,7 +82,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.7'
+const VERSION = '0.2.8'
 const DEFAULT_CLI_MAX_TURNS = 100
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────

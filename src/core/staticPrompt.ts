@@ -36,7 +36,9 @@ function getIdentitySection(mode: StaticPromptMode): string {
   const modeDesc: Record<StaticPromptMode, string> = {
     agentic:  '当前模式：**Agentic** — 专注于代码开发与软件工程任务。',
     campaign: '当前模式：**Campaign** — 专注于工业工程项目开发，含 DOE 实验设计、多保真度仿真与 Pareto 优化。',
-    robotics: '当前模式：**Robotics** — 专注于机器人算法开发与落地，含策略训练、仿真到实机迁移与多 Agent 编排。',
+    // 中性表述：多 Agent 编排仅在 multi 变体下激活（由 R1 节裁定），
+    // 此处用"可选"避免与 single 变体的 "Handle everything yourself" 矛盾。
+    robotics: '当前模式：**Robotics** — 专注于机器人算法开发与落地，含策略训练、仿真到实机迁移，并可选多 Agent 编排。',
   }
 
   const base = `\
@@ -64,11 +66,13 @@ ${modeDesc[mode]}`
 // ─────────────────────────────────────────────────────────────────────────────
 
 export const DEFAULT_SUB_AGENT_SYSTEM_PROMPT = `\
-你是 Meta-Agent 子智能体。使用可用工具完整执行指定任务——不要过度延伸，也不要半途而废。\
-完成后，向父智能体报告已完成的内容和关键发现；父智能体会将结果转述给用户。
+你是 Meta-Agent 子智能体。使用可用工具完整执行指定任务——不要过度延伸，也不要半途而废。
+
+完成时必须调用 \`return_result\` 工具提交最终结果（summary 写结论，结构化数据放 data）——\
+这是父智能体读取你成果的权威通道；只在对话里描述结果而不调用它，等于没有交付。
 
 重要：严禁绕过 V&V 验证器或修改溯源记录。若无法完成任务，\
-请明确报告阻塞原因，而非返回无声明的部分结果。`
+请通过 \`return_result\` 明确报告阻塞原因，而非返回无声明的部分结果。`
 
 // ─────────────────────────────────────────────────────────────────────────────
 // S2 — 系统规则

@@ -31,6 +31,7 @@ function describeAction(a: TeamPlannerAction): string {
     case 'sync_team':        return 'fetch + sync team state'
     case 'pull_team':        return 'pull remote team/ files'
     case 'push_team':        return 'commit + push local team/ changes'
+    case 'set_focus':        return `switch focus to ${a.taskId ?? '<unspecified>'}`
     default:                 return (a as { type: string }).type
   }
 }
@@ -74,6 +75,10 @@ async function runAction(controller: RoboticsTeamController, a: TeamPlannerActio
       return
     case 'push_team':
       await controller.teamPush?.()
+      return
+    case 'set_focus':
+      if (!a.taskId) throw new Error('set_focus missing taskId')
+      await controller.teamFocus?.(a.taskId)
       return
     default:
       throw new Error(`unknown action type "${(a as { type: string }).type}"`)

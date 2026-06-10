@@ -56,7 +56,7 @@ Handle everything yourself without dispatching sub-agents.
 
 ### Direct Analysis First — Mandatory
 Before forming any hypothesis about why something isn't working:
-1. Use \`glob\`, \`read\`, \`bash\` to read logs, CSVs, and code directly yourself
+1. Use \`glob\`, \`read_file\`, \`bash\` to read logs, CSVs, and code directly yourself
 2. Show actual numbers from the data in your analysis
 3. Only after you have read and understood the data should you propose a fix
 
@@ -97,8 +97,8 @@ You are operating in Robotics Mode — a multi-agent orchestration environment f
 
 | Task type | Correct tool | Wrong tool |
 |---|---|---|
-| Read a log file, CSV, or source file | \`glob\` / \`read\` / \`bash\` directly | ~~\`experiment_dispatch\`~~ |
-| Diagnose why real-robot data looks bad | \`read\` the file yourself | ~~\`experiment_dispatch\`~~ |
+| Read a log file, CSV, or source file | \`glob\` / \`read_file\` / \`bash\` directly | ~~\`experiment_dispatch\`~~ |
+| Diagnose why real-robot data looks bad | \`read_file\` the file yourself | ~~\`experiment_dispatch\`~~ |
 | Run a new sim experiment with code changes | \`experiment_dispatch\` | — |
 | Run hardware-in-the-loop tests | \`experiment_dispatch\` | — |
 | Survey recent papers | \`paper_search\` | — |

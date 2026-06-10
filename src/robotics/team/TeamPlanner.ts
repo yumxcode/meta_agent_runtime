@@ -26,6 +26,7 @@ export type TeamPlannerActionType =
   | 'sync_team'
   | 'pull_team'
   | 'push_team'
+  | 'set_focus'
 
 export interface TeamPlannerAction {
   type: TeamPlannerActionType
@@ -58,16 +59,20 @@ export interface TeamPlannerSnapshot {
 
 export const TEAM_PLANNER_SYSTEM = `你是 meta-agent robot mode 的 TeamPlanner（v2.0 协作日志模型）。
 
-模型只有三类对象：unit / task / attempt。task 有 owner（排他），attempts[] 是 append-only 的方向+结果记录。
+模型只有三类对象：unit / task / attempt。task 有 owner（排他锁），attempts[] 是 append-only 的方向+结果记录。
+一个 unit 可同时持有多个 task；unit 的 focus（currentTask）指向其正在推进的那个。
+drop_task / mark_done 不带 taskId 时作用于 focus 任务——用户持有多个任务时务必显式给 taskId。
+task 可带可选泳道标签 kind: algo（算法）| exp（试验）| deploy（落地）。
 
 你的工作：在用户进入 /team 或自然描述协作意图时，给出一段简短中文建议，并附 0 到 N 个机器可执行动作。
 
 硬规则：
 1. 只输出 JSON，不要 markdown、不要 JSON 外文本。
 2. 不要发明不存在的 taskId。
-3. 任何会修改 team.json 或 git 状态的动作（take_task/add_note/drop_task/mark_done/mark_paused/steal_task/sync_team/pull_team/push_team）默认 requiresConfirmation=true。仅 show_board 可 false。
+3. 任何会修改 team.json 或 git 状态的动作（take_task/add_note/drop_task/mark_done/mark_paused/steal_task/sync_team/pull_team/push_team/set_focus）默认 requiresConfirmation=true。仅 show_board 可 false。
 3b. 用户完成 take/note/done 等修改后，本地变更需要 push_team 才对队友可见——在合适时机提议它。
 4. steal_task 只有在 task.ownerUnit 是他人时才允许。reason 必填。
+4b. set_focus 仅对用户自己持有的 task 提议；用户在多个持有任务间切换工作时使用。
 5. add_note 必须指定 taskId、direction、outcome；ref 可选。只对自己持有的 task 提议 note。
 6. 若用户意图是普通开发推进而不是 team 协作，continueToAgent=true、actions=[]，让主 agent 继续。
 7. 若用户意图是 team 协作（看 board、领、记录、释放、完成），continueToAgent=false。
@@ -81,7 +86,7 @@ JSON schema:
   "guidance": "给用户的简短中文引导",
   "actions": [
     {
-      "type": "show_board|take_task|add_note|drop_task|mark_done|mark_paused|steal_task|sync_team|pull_team|push_team",
+      "type": "show_board|take_task|add_note|drop_task|mark_done|mark_paused|steal_task|sync_team|pull_team|push_team|set_focus",
       "taskId": "TASK-001",
       "direction": "试用 ResNet50 替换 backbone",
       "outcome": "失败：sim +0.3%，real -2%",

@@ -5,7 +5,6 @@
  *   - truncateEntrypointContent()   same 200-line / 25 KB caps + warning message
  *   - ensureMemoryDirExists()       mkdir -p, idempotent
  *   - loadMemoryIndex()             reads and truncates MEMORY.md
- *   - buildMemoryGuidanceLines()    static guidance text (taxonomy + write protocol)
  */
 
 import { mkdir, readFile } from 'fs/promises'
@@ -14,9 +13,6 @@ import {
   MEMORY_ENTRYPOINT_NAME,
   getMemoryEntrypoint,
 } from './paths.js'
-// types.ts exports the full taxonomy/write-protocol constants (TYPES_SECTION,
-// HOW_TO_SAVE_SECTION, etc.) for tests and doc generation — not injected every
-// turn since buildMemoryGuidanceLines now uses a compact reference card.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Truncation constants — identical to CC
@@ -124,46 +120,4 @@ export async function loadMemoryIndex(): Promise<string | null> {
     // File not yet created — normal on first run
     return null
   }
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Guidance text builder
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Build the static guidance text block injected into the system prompt.
- *
- * Deliberately compact (~200 words) so it does not dominate the prompt on
- * every turn.  The full taxonomy, write protocol, and drift caveats live in
- * types.ts and are available for deep inspection; this card is the "always
- * visible" reference that covers the 95 % case.
- */
-export function buildMemoryGuidanceLines(memoryDir: string = MEMORY_DIR): string[] {
-  return [
-    '## 工程记忆系统',
-    '',
-    `持久记忆目录：\`${memoryDir}\`（直接用 Write 工具写入，无需 mkdir）。`,
-    '记忆跨会话持久保存。召回通过 MEMORY.md 索引 + 按查询相关性加载话题文件。',
-    '',
-    '**类型速查**（选最匹配的一种）：',
-    '- `user` — 用户角色、背景、协作偏好',
-    '- `feedback` — 用户对工作方式的纠正或确认（两者都记）',
-    '- `domain_knowledge` — 已验证的物理常数/标准/材料属性（须注明来源）',
-    '- `campaign_lessons` — 已完成 campaign 的可迁移经验（REPORTING 阶段后保存）',
-    '- `robot_lessons` — robotics mode 中可迁移的错误、警告、避坑经验',
-    '- `reference` — 外部资源指针（API 端点、文档 URL）',
-    '',
-    '**Campaign mode 硬边界**：',
-    '① 仿真/计算结果 → provenance tracker（prov-xxx ID）',
-    '② 活跃 campaign 状态 → campaign_context（实时注入）',
-    '③ 项目专属参数 → campaign 配置文件',
-    '',
-    '**Robotics mode 硬边界**：成熟工程经验 → ExperienceStore；memory 只记公共偏好、警告和错误模式。',
-    '',
-    '**保存两步**：① 写 `<name>.md`（含 frontmatter: name/type/date）',
-    '② 在 `MEMORY.md` 加一行指针。写前先扫 MEMORY.md 确认无重复条目。',
-    '',
-    '**使用前验证**：记忆中的路径/函数/数值反映写入时状态，不代表现在仍有效。',
-    '数值用于计算前须核对来源；无法核实时注明"来自记忆，未核实"。',
-  ]
 }

@@ -287,7 +287,7 @@ export function buildEnvInfoSection(
 
     const envItems = [
       `当前日期：${currentDate}`,
-      `知识截止日期：2025 年 5 月（此日期之后的事件请通过工具获取最新信息）`,
+      `模型知识存在截止日期，可能滞后于当前日期数月以上——任何时效性信息（版本号、价格、新闻、API 变更等）必须通过工具获取，不得凭记忆回答`,
     ]
 
     return [
@@ -333,7 +333,11 @@ export function buildCurrentModeSection(mode: AgentMode): SystemPromptSection {
     // 模型调用不了，该句只是浪费 token。
     agentic:  'AGENTIC — 多轮工具调用已启用。',
     campaign: 'CAMPAIGN — 完整多步骤 campaign 工作流已激活；按指示使用 campaign 和仿真工具。',
-    robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置、Git 工作区及子 Agent 编排已激活。优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
+    // 注意保持中性：子 Agent 编排是否可用由 R1（Robotics Development Mode 节）
+    // 按 single/multi 变体决定，此处不预先断言"已激活"，避免与 R1 single 变体矛盾。
+    robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置与 Git 工作区已激活。' +
+      '是否启用子 Agent 编排以 "Robotics Development Mode" 节为准。' +
+      '优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
   }
   return systemPromptSection('current_mode', () => {
     return `## 当前模式\n\n${modeDescriptions[mode]}`

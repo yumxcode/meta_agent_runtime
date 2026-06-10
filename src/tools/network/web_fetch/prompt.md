@@ -22,8 +22,8 @@ Prefer structured JSON API endpoints, which are bot-friendly and stable:
 - Papers:         https://api.semanticscholar.org/graph/v1/paper/search?query=<keywords>
 - arXiv:          https://export.arxiv.org/api/query?search_query=all:<keywords>
 
-If you need to discover URLs (i.e. actually search the web), use a connected
-search tool / MCP search server instead of guessing URLs here.
+If you need to discover URLs (i.e. actually search the web), use the
+`web_search` tool instead of guessing URLs here.
 
 Notes:
 - Content is cached for 15 minutes.
