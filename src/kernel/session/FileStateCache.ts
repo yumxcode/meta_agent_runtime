@@ -31,8 +31,12 @@ export class FileStateCache {
   }
 
   record(path: string, sizeBytes: number, mtimeMs?: number): void {
+    // True LRU: Map.set() on an existing key keeps its ORIGINAL insertion
+    // position, so without the delete a re-read file never refreshes its
+    // recency and hot files get evicted before cold ones (FIFO behaviour).
+    this._entries.delete(path)
     this._entries.set(path, { path, readAt: Date.now(), sizeBytes, mtimeMs })
-    // LRU eviction: drop oldest entries if over limit
+    // LRU eviction: drop least-recently-recorded entries if over limit
     if (this._entries.size > this._maxEntries) {
       const oldest = this._entries.keys().next().value
       if (oldest !== undefined) this._entries.delete(oldest)

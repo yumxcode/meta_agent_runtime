@@ -213,58 +213,74 @@ export async function* streamMessages(
   }
 
   let attempt = 0
-  while (true) {
-    try {
-      const stream = await client.messages.create(requestParams, {
-        signal: params.abortSignal,
-      })
+  // True once any stream event has been yielded to the caller. After that
+  // point a retry would REPLAY the whole response from the start — the caller
+  // already rendered the first attempt's text (duplicate terminal output) and,
+  // if a message_stop was already consumed, would double-count the assistant
+  // message and its usage/cost. Mid-stream failures are instead thrown to
+  // KernelLoop's stream-error recovery, which injects the error into the
+  // conversation and retries the turn without replaying UI output.
+  let yieldedAny = false
+  try {
+    while (true) {
+      try {
+        const stream = await client.messages.create(requestParams, {
+          signal: params.abortSignal,
+        })
 
-      for await (const event of stream) {
-        yield event as unknown as StreamEvent
-      }
-      if (writer) await writer.close()
-      return
-    } catch (error: unknown) {
-      if (isPromptTooLongError(error)) {
-        throw new PromptTooLongError()
-      }
+        for await (const event of stream) {
+          yieldedAny = true
+          yield event as unknown as StreamEvent
+        }
+        return
+      } catch (error: unknown) {
+        if (isPromptTooLongError(error)) {
+          throw new PromptTooLongError()
+        }
 
-      // Detect model-capability errors → let KernelLoop switch to fallbackModel
-      if (isFallbackTriggeredError(error)) {
-        throw new FallbackTriggeredError(
-          error instanceof Error ? error.message : 'Fallback triggered',
-        )
-      }
+        // Detect model-capability errors → let KernelLoop switch to fallbackModel
+        if (isFallbackTriggeredError(error)) {
+          throw new FallbackTriggeredError(
+            error instanceof Error ? error.message : 'Fallback triggered',
+          )
+        }
 
-      const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
-      if (isRetryableError(error) && attempt >= maxRetries && !params.abortSignal.aborted) {
-        if (writer) await writer.close().catch(() => {})
-        throw new AvailabilityFallbackTriggeredError(
-          error instanceof Error ? error.message : 'Provider unavailable after retries',
-        )
-      }
+        // Mid-stream failure after events were already delivered — never
+        // replay (see yieldedAny comment above).
+        if (yieldedAny) throw error
 
-      if (
-        !isRetryableError(error) ||
-        attempt >= maxRetries ||
-        params.abortSignal.aborted
-      ) {
-        if (writer) await writer.close().catch(() => {})
-        throw error
-      }
+        const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
+        if (isRetryableError(error) && attempt >= maxRetries && !params.abortSignal.aborted) {
+          throw new AvailabilityFallbackTriggeredError(
+            error instanceof Error ? error.message : 'Provider unavailable after retries',
+          )
+        }
 
-      attempt++
-      const base = Math.min(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS)
-      const jitter = Math.random() * 0.25 * base
-      const delayMs = Math.floor(base + jitter)
-      onRetry?.(attempt, maxRetries, delayMs, getErrorStatus(error))
-      const completed = await abortableSleep(delayMs, params.abortSignal)
-      if (!completed) {
-        // Aborted mid-backoff — rethrow the original error so KernelLoop can
-        // surface the interruption rather than silently retrying.
-        if (writer) await writer.close().catch(() => {})
-        throw error
+        if (
+          !isRetryableError(error) ||
+          attempt >= maxRetries ||
+          params.abortSignal.aborted
+        ) {
+          throw error
+        }
+
+        attempt++
+        const base = Math.min(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS)
+        const jitter = Math.random() * 0.25 * base
+        const delayMs = Math.floor(base + jitter)
+        onRetry?.(attempt, maxRetries, delayMs, getErrorStatus(error))
+        const completed = await abortableSleep(delayMs, params.abortSignal)
+        if (!completed) {
+          // Aborted mid-backoff — rethrow the original error so KernelLoop can
+          // surface the interruption rather than silently retrying.
+          throw error
+        }
       }
     }
+  } finally {
+    // Single close point: covers normal completion, every throw path, AND the
+    // consumer abandoning the generator mid-stream (break / early return),
+    // which previously leaked the debug file handle.
+    if (writer) await writer.close().catch(() => {})
   }
 }

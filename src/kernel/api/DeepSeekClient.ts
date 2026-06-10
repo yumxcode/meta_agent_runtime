@@ -209,6 +209,11 @@ export async function* streamDeepSeekMessages(
   }
 
   let attempt = 0
+  // True once any stream event has been yielded. After that point a retry
+  // would replay the whole response (duplicate terminal output / potential
+  // double-counted message) — mid-stream failures are thrown to KernelLoop's
+  // stream-error recovery instead. Mirrors AnthropicClient.streamMessages.
+  let yieldedAny = false
   while (true) {
     try {
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -218,12 +223,18 @@ export async function* streamDeepSeekMessages(
           { signal: params.abortSignal },
         )
 
-      yield* processStream(stream, config.debug, params.sessionId, baseRequest as Record<string, unknown>)
+      for await (const event of processStream(stream, config.debug, params.sessionId, baseRequest as Record<string, unknown>)) {
+        yieldedAny = true
+        yield event
+      }
       return
     } catch (error: unknown) {
       if (isPromptTooLongError(error)) {
         throw new PromptTooLongError()
       }
+
+      // Never replay a partially-delivered stream (see yieldedAny above).
+      if (yieldedAny) throw error
 
       const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
       if (isRetryableError(error) && attempt >= maxRetries && !params.abortSignal.aborted) {

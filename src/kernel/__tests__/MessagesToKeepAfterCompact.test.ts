@@ -3,7 +3,8 @@
  * preserved verbatim across a compaction.
  */
 import { describe, it, expect } from 'vitest'
-import { buildMessagesToKeepAfterCompact } from '../loop/KernelLoop.js'
+import { buildMessagesToKeepAfterCompact, formatSteeringMessage } from '../loop/KernelLoop.js'
+import { tokenCountWithEstimation } from '../api/TokenCount.js'
 import { normalizeMessagesForAPI } from '../messages/MessageNormalizer.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { KernelTool } from '../types/KernelTool.js'
@@ -95,5 +96,51 @@ describe('buildMessagesToKeepAfterCompact', () => {
     const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS)
     expect(kept).toHaveLength(1)
     expect(kept[0]!.role).toBe('user')
+  })
+
+  it('strips stale usage from preserved assistant messages (post-compact token estimate)', () => {
+    const staleAssistant: KernelMessage = {
+      ...assistantCall('t1'),
+      usage: { inputTokens: 175_000, outputTokens: 800, cacheReadTokens: 0, cacheWriteTokens: 0 },
+    }
+    const msgs: KernelMessage[] = [
+      user('tune the PID controller'),
+      staleAssistant,
+      toolResult('t1', 'simulation sweep output'),
+    ]
+
+    const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS)
+    const keptAssistant = kept.find(m => m.role === 'assistant')!
+    expect(keptAssistant).toBeDefined()
+    expect(keptAssistant.usage).toBeUndefined()
+
+    // The post-compact estimate must reflect the small real content, not the
+    // 175k pre-compact context — otherwise compaction immediately re-triggers
+    // and the blocking-limit check false-positives.
+    expect(tokenCountWithEstimation(kept)).toBeLessThan(1_000)
+
+    // Must clone, never mutate: the live history still carries its usage.
+    expect(staleAssistant.usage).toBeDefined()
+    expect(staleAssistant.usage!.inputTokens).toBe(175_000)
+  })
+
+  it('prefers the last NON-steering user message as the verbatim anchor', () => {
+    const steer: KernelMessage = {
+      uuid: crypto.randomUUID(),
+      role: 'user',
+      isSteering: true,
+      content: [{ type: 'text', text: formatSteeringMessage('改用更小的步长') }],
+    }
+    const msgs: KernelMessage[] = [
+      user('original task: optimise the controller'),
+      assistantCall('t1'), toolResult('t1', 'r1'),
+      steer,
+      assistantCall('t2'), toolResult('t2', 'r2'),
+    ]
+    const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS)
+    const firstText = (kept[0]!.content[0] as { text: string }).text
+    expect(firstText).toBe('original task: optimise the controller')
+    // The tail after the steer message is still preserved
+    expect(JSON.stringify(kept)).toContain('t2')
   })
 })

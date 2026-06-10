@@ -37,6 +37,12 @@ export interface KernelMessage {
   isMeta?: boolean          // hidden from user UI, e.g. max_output_tokens recovery msgs
   isCompactSummary?: boolean // this is the compacted summary user message
   isInterruption?: boolean  // user interruption message
+  /**
+   * Mid-turn user steering correction (Ctrl+G). Sent to the API like a normal
+   * user message, but compaction prefers the last NON-steering user message as
+   * the verbatim task anchor so a late correction can't displace the task.
+   */
+  isSteering?: boolean
 
   // Usage for assistant messages (from API response)
   usage?: {
@@ -62,7 +68,7 @@ export interface KernelMessage {
 /** Create a minimal user message */
 export function makeUserMessage(
   content: ContentBlock[],
-  meta?: Partial<Pick<KernelMessage, 'isMeta' | 'isCompactSummary' | 'isInterruption' | 'sourceToolAssistantUUID'>>,
+  meta?: Partial<Pick<KernelMessage, 'isMeta' | 'isCompactSummary' | 'isInterruption' | 'isSteering' | 'sourceToolAssistantUUID'>>,
 ): KernelMessage {
   return {
     uuid: crypto.randomUUID(),

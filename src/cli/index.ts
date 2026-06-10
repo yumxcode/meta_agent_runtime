@@ -81,7 +81,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.1'
+const VERSION = '0.2.3'
 const DEFAULT_CLI_MAX_TURNS = 100
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -2698,7 +2698,21 @@ async function runRepl(opts: CliOptions): Promise<void> {
   let savedMessageCount = resumedMessages.length
   // Track whether the real debug dir has been printed (becomes known after first submit)
   let debugDirShown = false
+  // Bounded: a weeks-long robotics session polls every 45s and would otherwise
+  // accumulate one key per team event forever. When the cap is hit the oldest
+  // half is pruned (Set preserves insertion order); re-notifying a months-old
+  // event once is harmless, unbounded growth is not.
+  const MAX_SEEN_TEAM_EVENTS = 2_000
   const seenTeamReminderEvents = new Set<string>()
+  const pruneSeenTeamEvents = (): void => {
+    if (seenTeamReminderEvents.size <= MAX_SEEN_TEAM_EVENTS) return
+    const dropCount = Math.floor(MAX_SEEN_TEAM_EVENTS / 2)
+    let dropped = 0
+    for (const key of seenTeamReminderEvents) {
+      if (dropped++ >= dropCount) break
+      seenTeamReminderEvents.delete(key)
+    }
+  }
   let teamReminderInitialized = false
   let teamReminderRunning = false
   // Only show Team 动态 notifications after the user explicitly uses a /team command
@@ -2752,6 +2766,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
               seenTeamReminderEvents.add(key)
               return !seen
             })
+            pruneSeenTeamEvents()
             if (!teamReminderInitialized) {
               teamReminderInitialized = true
               return
@@ -3012,6 +3027,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
     if (exiting) return
     exiting = true
     if (teamReminderTimer) clearInterval(teamReminderTimer)
+    // Hard-exit fuse for the EOF/Ctrl+D path — same rationale as disposeAndExit.
+    const hardExit = setTimeout(() => process.exit(0), 15_000)
+    hardExit.unref?.()
     void (async () => {
       try {
         if (!opts.json) {
@@ -3071,6 +3089,11 @@ async function runRepl(opts: CliOptions): Promise<void> {
   const disposeAndExit = async (code: number, err?: unknown): Promise<void> => {
     if (exiting) return
     exiting = true
+    // Hard-exit fuse: if router.dispose() hangs (stuck git worktree purge,
+    // wedged sub-agent teardown, …) the process must still terminate.
+    // unref() keeps the timer from holding the event loop open itself.
+    const hardExit = setTimeout(() => process.exit(code), 15_000)
+    hardExit.unref?.()
     if (teamReminderTimer) clearInterval(teamReminderTimer)
     disableBracketedPaste()
     if (err) console.error(`\n${red('Fatal:')} ${terminalText(err instanceof Error ? err.message : String(err))}\n`)

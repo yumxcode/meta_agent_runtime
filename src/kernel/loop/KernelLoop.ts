@@ -116,8 +116,18 @@ function isRealUserMessage(message: KernelMessage): boolean {
     !message.sourceToolAssistantUUID
 }
 
+/**
+ * Pick the user message preserved verbatim across a compaction.
+ * Prefers the last NON-steering real user message: a mid-turn Ctrl+G
+ * correction must not displace the actual task as the post-compact anchor
+ * (the correction's content still survives inside the summary).
+ * Falls back to the last real user message when only steering exists.
+ */
 function cloneLastRealUserTextMessage(messages: readonly KernelMessage[]): KernelMessage[] {
-  const message = [...messages].reverse().find(isRealUserMessage)
+  const reversed = [...messages].reverse()
+  const message =
+    reversed.find(m => isRealUserMessage(m) && !m.isSteering) ??
+    reversed.find(isRealUserMessage)
   if (!message) return []
 
   const textBlocks = message.content
@@ -268,7 +278,22 @@ export function buildMessagesToKeepAfterCompact(
     used += unitTokens
   }
 
-  return [...userText, ...kept.flat()]
+  // Strip stale `usage` from preserved assistant messages. usage.inputTokens
+  // describes the FULL pre-compact context (possibly ~180k); if it survives,
+  // tokenCountWithEstimation reads it after the compaction and concludes the
+  // context is still huge — re-triggering compaction (summarising the summary)
+  // and false-positive blocking_limit terminations. Post-compact estimation
+  // falls back to roughTokenCount until the next API response restores an
+  // accurate figure — the same situation as session start.
+  // NOTE: must clone, never mutate — this function also runs on iterations
+  // where no compaction happens, and the inputs alias the live history.
+  const keptFlat = kept.flat().map(msg => {
+    if (msg.role !== 'assistant' || !msg.usage) return msg
+    const { usage: _staleUsage, ...rest } = msg
+    return rest as KernelMessage
+  })
+
+  return [...userText, ...keptFlat]
 }
 
 /**
@@ -397,6 +422,28 @@ function finaliseAccumulator(acc: StreamAccumulator): {
 
 const NO_PROGRESS_REPEAT_LIMIT = 3
 
+/**
+ * Window length for the A↔B oscillation guard: 6 entries = 3 full ABAB cycles.
+ * The consecutive-repeat counter misses a model that alternates between two
+ * identical tool batches ("try A… try B… try A…"); requiring three strict
+ * period-2 cycles keeps legitimate re-reads (read → edit → re-read) safe.
+ */
+const ALTERNATION_WINDOW = 6
+
+/**
+ * True when the last ALTERNATION_WINDOW turn signatures form a strict ABAB…
+ * period-2 oscillation of two DIFFERENT signatures. Identical consecutive
+ * signatures are the consecutive-repeat counter's job, not this guard's.
+ */
+export function isAlternatingToolSignatures(history: readonly string[]): boolean {
+  if (history.length < ALTERNATION_WINDOW) return false
+  const recent = history.slice(-ALTERNATION_WINDOW)
+  const even = recent[0]!
+  const odd = recent[1]!
+  if (even === odd) return false
+  return recent.every((sig, i) => sig === (i % 2 === 0 ? even : odd))
+}
+
 function stableStringify(value: unknown): string {
   if (value === null || typeof value !== 'object') {
     const encoded = JSON.stringify(value)
@@ -427,6 +474,7 @@ export async function* runKernelLoop(
   let resultText = ''
   let lastToolRequestSignature = ''
   let repeatedToolRequestCount = 0
+  const toolSignatureHistory: string[] = []
 
   // Helper: push messages and re-point state.messages at the live array.
   //
@@ -471,7 +519,7 @@ export async function* runKernelLoop(
     for (const steerText of steers) {
       const trimmed = steerText.trim()
       if (!trimmed) continue
-      append(makeTextUserMessage(formatSteeringMessage(trimmed), { isMeta: false }))
+      append(makeTextUserMessage(formatSteeringMessage(trimmed), { isMeta: false, isSteering: true }))
     }
 
     // ── Step 1: applyToolResultBudget ────────────────────────────────────────
@@ -593,13 +641,17 @@ export async function* runKernelLoop(
     const assistantMessages: KernelMessage[] = []
     const acc = newAccumulator()
     let streamError: unknown = null
+    // Declared OUTSIDE the try so retry notifications collected before a
+    // terminal stream failure can still be drained (previously they were only
+    // yielded when a subsequent stream event arrived — a request that retried
+    // N times and then failed surfaced zero api_retry events).
+    const retryEvents: KernelEvent[] = []
 
     // Route to OpenAI-format (DeepSeek) or Anthropic-format wire protocol via
     // the provider registry — baseURL wins, model name is the fallback signal.
     const isDeepSeek = getModelProtocol(state.currentModel, config.baseURL) === 'openai'
 
     try {
-      const retryEvents: KernelEvent[] = []
       const retryCallback = (attempt: number, maxRetries: number, retryDelayMs: number, errorStatus: number | null): void => {
         retryEvents.push({ type: 'api_retry', attempt, maxRetries, retryDelayMs, errorStatus, sessionId })
       }
@@ -732,6 +784,10 @@ export async function* runKernelLoop(
         }
       }
     } catch (err: unknown) {
+      // Surface any retry notifications collected before the terminal failure.
+      for (const retryEvent of retryEvents.splice(0)) {
+        yield retryEvent
+      }
       if (err instanceof PromptTooLongError) {
         if (
           config.compact?.enabled !== false &&
@@ -946,6 +1002,17 @@ export async function* runKernelLoop(
     if (repeatedToolRequestCount >= NO_PROGRESS_REPEAT_LIMIT) {
       resultText =
         `Stopped: the model repeated the same tool request ${repeatedToolRequestCount} times without making progress.`
+      yield { type: 'text_delta', delta: resultText, sessionId }
+      return done('no_progress')
+    }
+    // A↔B oscillation guard: the consecutive counter above resets on every
+    // signature change, so a model ping-ponging between two identical tool
+    // batches never trips it. Three strict period-2 cycles (ABABAB) = stuck.
+    toolSignatureHistory.push(toolRequestSignature)
+    if (toolSignatureHistory.length > ALTERNATION_WINDOW) toolSignatureHistory.shift()
+    if (isAlternatingToolSignatures(toolSignatureHistory)) {
+      resultText =
+        'Stopped: the model alternated between the same two tool requests repeatedly without making progress.'
       yield { type: 'text_delta', delta: resultText, sessionId }
       return done('no_progress')
     }

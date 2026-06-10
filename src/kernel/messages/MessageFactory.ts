@@ -16,7 +16,7 @@ export { makeUserMessage, makeAssistantMessage, makeCompactBoundaryMessage }
 // ── Specialised factories ────────────────────────────────────────────────────
 
 /** User message that injects a string as a text block */
-export function makeTextUserMessage(text: string, meta?: Partial<Pick<KernelMessage, 'isMeta' | 'isCompactSummary' | 'isInterruption'>>): KernelMessage {
+export function makeTextUserMessage(text: string, meta?: Partial<Pick<KernelMessage, 'isMeta' | 'isCompactSummary' | 'isInterruption' | 'isSteering'>>): KernelMessage {
   return makeUserMessage([{ type: 'text', text }], meta)
 }
 

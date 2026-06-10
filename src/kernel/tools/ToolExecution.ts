@@ -151,6 +151,13 @@ export async function executeToolCall(
 
   try {
     const callPromise = tool.call(parsedInput, callContext)
+    // Observe the race loser: when the timeout wins, callPromise keeps running
+    // in the background (non-abort-aware tools ignore the signal). If it later
+    // rejects, that would surface as an unhandledRejection — which long-running
+    // hosts (the CLI registers process.on('unhandledRejection') → exit) treat
+    // as fatal. A no-op catch keeps the rejection observed without affecting
+    // the awaited race below.
+    if (useTimeout) void callPromise.catch(() => {})
     const result = useTimeout
       ? await Promise.race([
           callPromise,
