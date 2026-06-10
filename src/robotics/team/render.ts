@@ -81,8 +81,12 @@ export function renderBoard(state: TeamState): string {
   if (state.units.length > 0) {
     lines.push('## Units')
     for (const u of state.units) {
-      const cur = u.currentTask ? ` task=${u.currentTask}` : ''
-      lines.push(`- ${u.id} · ${u.status} · last seen ${relTime(u.lastSeen)}${cur}`)
+      const ownedTasks = state.tasks.filter(t => t.ownerUnit === u.id && t.status !== 'done')
+      const ownedNote = ownedTasks.length > 0 ? ` · owns=${ownedTasks.length}` : ''
+      const focusNote = u.currentTask && ownedTasks.some(t => t.id === u.currentTask)
+        ? ` · focus=${u.currentTask}`
+        : ''
+      lines.push(`- ${u.id} · ${u.status} · last seen ${relTime(u.lastSeen)}${ownedNote}${focusNote}`)
     }
     lines.push('')
   }
@@ -153,8 +157,9 @@ export function renderReadme(): string {
     '- `/team`                — board + log',
     '- `/team take <task-id>` — 排他领取（已被领则失败并打印 owner）',
     '- `/team note <id> "<direction>" :: "<outcome>" [@ref]` — 追加一条尝试',
-    '- `/team drop [id]`      — 释放（仅 owner）',
-    '- `/team done [id]`      — 标完成（仅 owner）',
+    '- `/team focus <id>`     — 多任务时切换焦点（无参 done/drop 作用于焦点）',
+    '- `/team drop [id]`      — 释放（仅 owner；无参=焦点任务）',
+    '- `/team done [id]`      — 标完成（仅 owner；无参=焦点任务）',
     '- `/team add "<title>" [--kind algo|exp|deploy]`  — 新增任务（可选泳道标签）',
     '- `/team steal <id> [reason]` — 强制接手他人任务（自动写 audit attempt）',
     '- `/team push`           — 提交并推送 team/ 变更（仅 team 目录，队友 /team pull 后可见）',

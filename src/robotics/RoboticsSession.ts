@@ -1367,6 +1367,24 @@ export class RoboticsSession {
     return result
   }
 
+  /** Switch this unit's focus to a task it owns. */
+  async teamFocus(taskId: string) {
+    this.sectionRegistry.invalidate('robotics_team_mode')
+    const result = await this.teamStore.focus(taskId)
+    await this.teamWatcher.forceSync(false)
+    return result
+  }
+
+  /** All active tasks this unit owns + the current focus id. */
+  async teamOwnedTasks() {
+    return this.teamStore.ownedActiveTasks()
+  }
+
+  /** Resolve a no-arg done/drop target: explicit → focus → single-owned → throw. */
+  async teamResolveOwnTaskId(explicit?: string): Promise<string> {
+    return this.teamStore.requireOwnTaskId(explicit)
+  }
+
   /** Publish local team/ changes: stage team/ only, commit, push. */
   async teamPush(): Promise<TeamPushResult> {
     const result = await this.teamStore.push()

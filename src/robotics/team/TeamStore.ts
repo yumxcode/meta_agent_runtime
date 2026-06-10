@@ -411,13 +411,71 @@ export class TeamStore {
   }
 
   /**
+   * All ACTIVE tasks this unit owns, plus the current focus (unit.currentTask
+   * when it points at one of them). Multi-ownership is first-class: a unit may
+   * hold several tasks; `focus` is the one it is actively pushing right now.
+   */
+  async ownedActiveTasks(): Promise<{ owned: TeamTask[]; focusId?: string }> {
+    const state = await this.read()
+    if (!state) return { owned: [] }
+    const owned = state.tasks.filter(t => t.ownerUnit === this.unitId && t.status !== 'done')
+    const current = state.units.find(u => u.id === this.unitId)?.currentTask
+    const focusId = current && owned.some(t => t.id === current) ? current : undefined
+    return { owned, focusId }
+  }
+
+  /**
+   * Switch this unit's focus to a task it already owns.
+   * Focus is what no-arg /team done and /team drop act on.
+   */
+  async focus(taskId: string): Promise<{ state: TeamState; task: TeamTask }> {
+    const state = await this.ensure()
+    const task = this.requireTask(state, taskId)
+    if (task.ownerUnit !== this.unitId) {
+      throw new Error(`${task.id} 不是你持有的任务（owner=${task.ownerUnit ?? '无'}），无法设为 focus。先 /team take。`)
+    }
+    if (task.status === 'done') {
+      throw new Error(`${task.id} 已 done，无法设为 focus。`)
+    }
+    const originalUpdatedAt = state.updatedAt
+    const unit = this.ensureUnit(state)
+    unit.currentTask = task.id
+    unit.lastSeen = nowIso()
+    state.updatedAt = nowIso()
+    await this.writeAll(state, originalUpdatedAt)
+    return { state, task }
+  }
+
+  /**
+   * Resolve "which of MY tasks did you mean" for no-arg done/drop:
+   *   explicit id → as-is; else focus; else the single owned task;
+   *   else throw with the owned list so the user can be explicit.
+   * This replaces the old single-currentTask assumption that could silently
+   * act on the wrong task once a unit holds more than one.
+   */
+  async requireOwnTaskId(explicit?: string): Promise<string> {
+    if (explicit?.trim()) return explicit.trim()
+    const { owned, focusId } = await this.ownedActiveTasks()
+    if (focusId) return focusId
+    if (owned.length === 1) return owned[0]!.id
+    if (owned.length === 0) {
+      throw new Error('你当前没有持有任何任务。先 /team take <task-id>。')
+    }
+    throw new Error(
+      `你持有 ${owned.length} 个任务（${owned.map(t => t.id).join(', ')}）且 focus 不明确，` +
+      `请显式指定任务 id，或先 /team focus <task-id>。`,
+    )
+  }
+
+  /**
    * Release a task.  Only the current owner can drop.  Sets ownerUnit=null
    * and clears the recorded claimedAt.
+   * No-arg resolution: focus → single owned task → error (never guesses
+   * among multiple owned tasks).
    */
   async drop(taskId?: string): Promise<{ state: TeamState; task: TeamTask }> {
+    const id = await this.requireOwnTaskId(taskId)
     const state = await this.ensure()
-    const id = taskId || state.units.find(u => u.id === this.unitId)?.currentTask
-    if (!id) throw new Error('No task specified and this unit has no current task.')
     const task = this.requireTask(state, id)
     if (task.ownerUnit && task.ownerUnit !== this.unitId) {
       throw new Error(`${task.id} 被 ${task.ownerUnit} 持有，无法 drop。需要交接请用 /team steal。`)
@@ -824,6 +882,8 @@ export class TeamStore {
     const kindTag = (t: TeamTask): string => (t.kind ? `[${TASK_KIND_LABELS[t.kind]}] ` : '')
     const active = state.tasks.filter(isActiveTask)
     const mine = active.filter(t => t.ownerUnit === this.unitId)
+    const focusCandidate = state.units.find(u => u.id === this.unitId)?.currentTask
+    const focusId = focusCandidate && mine.some(t => t.id === focusCandidate) ? focusCandidate : undefined
     const others = active.filter(t => t.ownerUnit && t.ownerUnit !== this.unitId)
     const open = state.tasks.filter(t => !t.ownerUnit && t.status !== 'done').slice(0, 8)
     const recentAttempts: Array<{ task: TeamTask; attempt: TeamAttempt }> = []
@@ -842,9 +902,9 @@ export class TeamStore {
       '### Goals',
       ...state.goals.slice(0, 5).map(g => `- ${g}`),
       '',
-      '### Your tasks',
+      '### Your tasks' + (mine.length > 1 ? ` (${mine.length} owned${focusId ? `, focus=${focusId}` : ', no focus set'})` : ''),
       ...(mine.length
-        ? mine.map(t => `- ${t.id}: ${kindTag(t)}${t.title} [${t.status}] attempts=${t.attempts.length}`)
+        ? mine.map(t => `- ${t.id === focusId ? '★ ' : ''}${t.id}: ${kindTag(t)}${t.title} [${t.status}] attempts=${t.attempts.length}`)
         : ['- none']),
       '',
       '### Others working',
@@ -864,6 +924,8 @@ export class TeamStore {
       '',
       'Team mode rules: tasks are exclusively owned once taken; only the owner can note/drop/done. ' +
       'When the user describes work, surface useful collaboration cues — what others tried, what failed, who has the lock. ' +
+      'A unit may own MULTIPLE tasks; the ★focus marks the one being actively pushed (switch with /team focus <id>). ' +
+      'When this unit owns more than one task, ALWAYS name the explicit taskId in team_note / team_mark_done — never rely on implicit "current task". ' +
       'You MAY record attempts on tasks THIS unit owns via the team_note tool — do so proactively after a meaningful ' +
       'experiment/debug round concludes (direction + outcome + ref like a wandb/git/rosbag link). ' +
       'team_take / team_mark_done are available but prompt the user for confirmation — propose them when appropriate. ' +

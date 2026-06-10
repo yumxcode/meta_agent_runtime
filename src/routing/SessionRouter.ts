@@ -71,6 +71,9 @@ export interface RoboticsTeamController {
   teamDrop?(taskId?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
   teamSteal?(taskId: string, reason?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; previousOwner?: string }>
   teamNote?(input: import('../robotics/team/TeamStore.js').TeamNoteInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; attempt: import('../robotics/team/TeamStore.js').TeamAttempt }>
+  teamFocus?(taskId: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
+  teamOwnedTasks?(): Promise<{ owned: import('../robotics/team/TeamStore.js').TeamTask[]; focusId?: string }>
+  teamResolveOwnTaskId?(explicit?: string): Promise<string>
   teamTaskStatus?(taskId: string, status: import('../robotics/team/TeamStore.js').TeamTaskStatus): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
 
   // Git transport

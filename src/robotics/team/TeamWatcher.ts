@@ -201,7 +201,9 @@ export class TeamWatcher {
       if (!old) {
         this.record(`unit joined: ${unit.id}`)
       } else if ((old.currentTask ?? '') !== (unit.currentTask ?? '')) {
-        this.record(`unit ${unit.id} task changed ${old.currentTask ?? 'none'} -> ${unit.currentTask ?? 'none'}`)
+        // currentTask is the unit's FOCUS pointer (a unit may own several
+        // tasks); ownership changes are reported separately per task above.
+        this.record(`unit ${unit.id} focus changed ${old.currentTask ?? 'none'} -> ${unit.currentTask ?? 'none'}`)
       }
     }
   }

@@ -82,7 +82,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.5'
+const VERSION = '0.2.7'
 const DEFAULT_CLI_MAX_TURNS = 100
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
@@ -153,7 +153,8 @@ ${bold('INTERACTIVE COMMANDS')}
   /team add "<title>" [--kind algo|exp|deploy]   Create a new task (optional lane)
   /team take <task>     Exclusively claim a task (fails if owned by another)
   /team note <id> "<direction>" :: "<outcome>" [@ref]   Append an attempt
-  /team drop [task]     Release a task you own
+  /team focus <task>    Switch focus among tasks you own (no-arg done/drop target)
+  /team drop [task]     Release a task you own (no-arg: focus task)
   /team steal <task> [reason]   Forcibly take a task; records audit attempt
   /team done [task]     Mark task done (only owner)
   /team status / board  Show current board
@@ -2221,6 +2222,8 @@ async function _runTeamEntryGuideInner(
       state = await controller.teamJoin?.(url)
     }
     console.log(green('\n✓ team 已初始化并加入。'))
+    // Entry guide already holds setInteractiveActive — don't toggle it here.
+    await offerTeamPush(controller, _opts, rl, undefined)
   } else {
     // unitId is exposed via controller indirectly; for simplicity treat absence
     // as "not joined" only when there are zero units (otherwise the watcher's
@@ -2230,6 +2233,7 @@ async function _runTeamEntryGuideInner(
       if (!/^(n|no|否)$/i.test(answer.trim())) {
         state = await controller.teamJoin?.(state.github)
         console.log(green('\n✓ 已加入 team。'))
+        await offerTeamPush(controller, _opts, rl, undefined)
       }
     }
   }
@@ -2346,6 +2350,52 @@ async function getTeamController(router: SessionRouter, opts: CliOptions): Promi
   return controller
 }
 
+/**
+ * After init/join (when the board is brand-new or presence changed), offer to
+ * publish immediately — in the initialisation flow this is almost always the
+ * next step, so asking beats hinting. Falls back to the passive hint in
+ * non-interactive contexts or when the user declines.
+ */
+async function offerTeamPush(
+  controller: TeamCliController,
+  opts: CliOptions,
+  rl?: readline.Interface,
+  setInteractiveActive?: (v: boolean) => void,
+): Promise<void> {
+  try {
+    const s = await controller.teamPublishState?.()
+    if (!s) return
+    if (!s.isGitRepo) {
+      console.log(dim('  （当前项目不是 git 仓库，team 状态暂无法发布到 GitHub。）'))
+      return
+    }
+    if (s.dirty.length === 0 && s.unpushedCommits === 0) return
+    if (!rl || opts.json || !isTTY) {
+      await printTeamPublishHint(controller)
+      return
+    }
+    setInteractiveActive?.(true)
+    let answer: string
+    try {
+      answer = await askQuestion(rl, `  现在发布到 GitHub（仅 commit + push team/ 目录）？[Y/n] `)
+    } finally {
+      setInteractiveActive?.(false)
+    }
+    if (/^(n|no|否)$/i.test(answer.trim())) {
+      await printTeamPublishHint(controller)
+      return
+    }
+    process.stdout.write(dim('  正在发布 team/ 变更…'))
+    const result = await controller.teamPush?.()
+    process.stdout.write('\r')
+    if (result?.pushed) {
+      console.log(green(`  ✓ ${result.message}`) + dim('  队友执行 /team pull 后可见。'))
+    } else {
+      console.log(yellow(`  ⚠ ${result?.message ?? 'push 失败'}`) + dim('  可稍后用 /team push 重试。'))
+    }
+  } catch { /* advisory only — never block the init/join flow */ }
+}
+
 /** Print a one-line hint when local team/ changes haven't been pushed yet. */
 async function printTeamPublishHint(controller: TeamCliController): Promise<void> {
   try {
@@ -2393,8 +2443,9 @@ async function handleTeamCommand(
     switch (sub) {
       case 'init': {
         const state = await controller.teamInit?.(arg)
-        console.log(green('\n✓ team 模板已初始化。') + dim('  文件位于 team/，请提交 team.json 到 GitHub。'))
+        console.log(green('\n✓ team 模板已初始化。') + dim('  文件位于 team/，team.json 为唯一事实源（SSOT: GitHub）。'))
         console.log(formatTeamState(state))
+        await offerTeamPush(controller, opts, rl, setInteractiveActive)
         break
       }
       case 'join': {
@@ -2405,6 +2456,7 @@ async function handleTeamCommand(
         const state = await controller.teamJoin?.(githubArg, human)
         console.log(green('\n✓ 已加入 team。') + (human ? dim(`  (human: ${human})`) : ''))
         console.log(formatTeamState(state))
+        await offerTeamPush(controller, opts, rl, setInteractiveActive)
         break
       }
       case 'add': {
@@ -2448,8 +2500,27 @@ async function handleTeamCommand(
           preSync.remoteTeamChanges.slice(0, 5).forEach(change => console.log(dim(`  - ${change}`)))
           break
         }
+        // WIP soft limit: holding several active tasks is legal (waiting on a
+        // training run while calibrating is real life) but hoarding hurts the
+        // team — confirm before the 3rd concurrent claim.
+        const ownedBefore = await controller.teamOwnedTasks?.()
+        if (rl && isTTY && !opts.json && (ownedBefore?.owned.length ?? 0) >= 2) {
+          const ids = ownedBefore!.owned.map(t => t.id).join(', ')
+          setInteractiveActive?.(true)
+          let confirm: string
+          try {
+            confirm = await askQuestion(rl, `  你已持有 ${ownedBefore!.owned.length} 个任务（${ids}），确认再领 ${arg}？[y/N] `)
+          } finally {
+            setInteractiveActive?.(false)
+          }
+          if (!/^(y|yes|是|确认)$/i.test(confirm.trim())) {
+            console.log(dim('已取消领取。'))
+            break
+          }
+        }
         const result = await controller.teamTake?.(arg)
-        console.log(green(`\n✓ 已领取 ${result?.task.id ?? arg}。`))
+        const focusNote = (ownedBefore?.owned.length ?? 0) > 0 ? dim('  (focus 已切换至该任务)') : ''
+        console.log(green(`\n✓ 已领取 ${result?.task.id ?? arg}。`) + focusNote)
         console.log(formatTeamState(result?.state))
         await printTeamPublishHint(controller)
         break
@@ -2496,10 +2567,33 @@ async function handleTeamCommand(
         await printTeamPublishHint(controller)
         break
       }
+      case 'focus': {
+        if (!arg) {
+          const owned = await controller.teamOwnedTasks?.()
+          if (!owned || owned.owned.length === 0) {
+            console.log(`\n${dim('你当前没有持有任何任务。')}\n`)
+          } else {
+            console.log(`\n${bold('你持有的任务:')}`)
+            owned.owned.forEach(t => console.log(`  ${t.id === owned.focusId ? cyan('★') : ' '} ${t.id} ${t.title}`))
+            console.log(`\n${dim('用法:')} ${cyan('/team focus TASK-001')} ${dim('切换焦点（done/drop 无参时作用于焦点任务）')}\n`)
+          }
+          break
+        }
+        const result = await controller.teamFocus?.(arg)
+        console.log(green(`\n✓ focus 已切换到 ${result?.task.id ?? arg}: ${result?.task.title ?? ''}。`))
+        break
+      }
       case 'done': {
-        const state = await controller.teamStatus?.()
-        const myTask = state?.tasks.find(t => t.ownerUnit && t.status !== 'done')
-        const taskId = arg || myTask?.id || ''
+        // Resolve MY task: explicit id → focus → single-owned → clear error.
+        // (The old code picked the first ACTIVE task owned by ANYONE — with
+        // multi-task ownership it could mark the wrong task done.)
+        let taskId: string
+        try {
+          taskId = await controller.teamResolveOwnTaskId?.(arg) ?? ''
+        } catch (resolveErr) {
+          console.log(`\n${yellow(terminalText(resolveErr instanceof Error ? resolveErr.message : String(resolveErr)))}\n`)
+          break
+        }
         if (!taskId) {
           console.log(`\n${yellow('没有当前任务。')} 使用 ${cyan('/team done TASK-001')}。\n`)
           break
@@ -2628,7 +2722,7 @@ async function handleTeamCommand(
         }
         console.log(formatTeamWatcherEvents(controller.teamWatcherEvents?.()))
         if (!['status', 'board', 'log'].includes(sub)) {
-          console.log(dim(`未知 team 子命令 "${terminalText(sub)}"。可用: init, join, add, take, note, drop, steal, done, pause, status, board, log, sync, push, pull, conflicts.\n`))
+          console.log(dim(`未知 team 子命令 "${terminalText(sub)}"。可用: init, join, add, take, focus, note, drop, steal, done, pause, status, board, log, sync, push, pull, conflicts.\n`))
         }
         break
       }
