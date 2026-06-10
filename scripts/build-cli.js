@@ -114,6 +114,32 @@ await build({
 
 await chmod(join(root, 'dist/cli.mjs'), 0o755)
 
+// ── Mirror prompt.md files into dist ─────────────────────────────────────────
+// The library build (plain tsc) emits only .js/.d.ts; tools load their
+// description from a sibling prompt.md at RUNTIME via loadToolPrompt().
+// Without this copy, library consumers of dist/index.js crash with ENOENT on
+// createWebSearchTool() etc. (the CLI bundle is unaffected — esbuild inlines
+// the prompts above). Keep dist a faithful mirror of src for every prompt.md.
+{
+  const { readdir, mkdir, copyFile } = await import('node:fs/promises')
+  const { dirname, relative } = await import('node:path')
+  async function* walkPrompts(dir) {
+    for (const entry of await readdir(dir, { withFileTypes: true })) {
+      const full = join(dir, entry.name)
+      if (entry.isDirectory()) yield* walkPrompts(full)
+      else if (entry.name === 'prompt.md') yield full
+    }
+  }
+  let copied = 0
+  for await (const src of walkPrompts(join(root, 'src'))) {
+    const dest = join(root, 'dist', relative(join(root, 'src'), src))
+    await mkdir(dirname(dest), { recursive: true })
+    await copyFile(src, dest)
+    copied++
+  }
+  console.log(`✅  ${copied} prompt.md file(s) mirrored into dist/.`)
+}
+
 console.log('✅  dist/cli.mjs built and marked executable.')
 console.log('   Install globally:  npm link')
 console.log('   Or run directly:   node dist/cli.mjs --help')
