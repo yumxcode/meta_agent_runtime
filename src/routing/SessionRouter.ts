@@ -42,6 +42,7 @@ import { EMPTY_USAGE } from '../core/types.js'
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import { CampaignSession } from '../modes/CampaignSession.js'
 import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
+import { prefetchRelevantMemories, getMemoryRecallTimeoutMs } from '../core/memory/findRelevantMemories.js'
 import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
@@ -109,6 +110,8 @@ export class SessionRouter {
   private readonly _cfg: ResolvedConfig
   private readonly _hint: SessionModeHint
   private readonly _debug: boolean
+  /** P0-1: lazy side-call client used only by the memory-recall prefetch. */
+  private readonly _recallClient: Anthropic | null = null
   /** Robot/platform name forwarded to RoboticsSession (undefined = no hardware binding). */
   private readonly _robot: string | undefined
   /** Whether user explicitly resumed a prior session — forwarded to RoboticsSession. */
@@ -162,6 +165,20 @@ export class SessionRouter {
           baseURL:    this._cfg.baseURL,
           timeout:    3_000,
           maxRetries: 1,
+        })
+      : null
+
+    // P0-1: dedicated client for the memory-recall prefetch. Mirrors the
+    // condition under which MetaAgentSession's D1b section gets a client
+    // (protocol === 'anthropic'), so the prefetch compatibility check matches.
+    // SDK timeout tracks the recall timeout (env-tunable for slow providers)
+    // instead of the detection client's hard 3 s.
+    this._recallClient = (this._cfg.apiKey && this._cfg.protocol === 'anthropic')
+      ? new Anthropic({
+          apiKey:     this._cfg.apiKey,
+          baseURL:    this._cfg.baseURL,
+          timeout:    getMemoryRecallTimeoutMs() + 2_000,
+          maxRetries: 0,
         })
       : null
   }
@@ -222,6 +239,18 @@ export class SessionRouter {
    * before forwarding the message.
    */
   async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
+    // P0-1: start the per-query memory recall NOW so it overlaps mode
+    // detection and backend initialisation instead of running serially after
+    // them. Single-flight + consume-once + compatibility-checked inside
+    // findRelevantMemories — when anything mismatches, the prompt build simply
+    // recomputes fresh, so correctness never depends on this call.
+    prefetchRelevantMemories({
+      query:       prompt,
+      client:      this._recallClient ?? undefined,
+      sessionMode: this._currentMode ?? undefined,
+      domainScope: this._cfg.domain,
+      flashModel:  this._cfg.flashModel,
+    })
     await this._ensureImpl(prompt)
     yield* this._impl!.submit(prompt)
   }

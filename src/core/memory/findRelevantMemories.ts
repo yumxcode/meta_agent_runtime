@@ -132,12 +132,49 @@ function truncateToBytes(content: string, maxBytes: number, totalBytes: number):
 // ─────────────────────────────────────────────────────────────────────────────
 
 /**
+ * P1-2: header-scan cache, keyed by directory path.
+ *
+ * Invalidation strategy (two layers, both cheap):
+ *   1. Directory mtime — memory files are written via atomic write-then-rename,
+ *      and renames into the directory bump its mtime, so create/update/delete
+ *      through the runtime are all detected with ONE stat() call.
+ *   2. 30 s TTL — covers the one case dir-mtime misses: a file hand-edited
+ *      IN PLACE outside the runtime (file mtime changes, dir mtime does not).
+ *
+ * Race-safety: the cache stores resolved header arrays (never shared mutable
+ * state); a concurrent writer simply causes the next call to re-scan.
+ */
+const SCAN_CACHE_TTL_MS = 30_000
+const _scanCache = new Map<string, { dirMtimeMs: number; at: number; headers: TopicFileHeader[] }>()
+
+/** @testonly — drop all cached directory scans. */
+export function clearTopicScanCache(): void {
+  _scanCache.clear()
+}
+
+/**
  * Read all *.md files in the memory directory (excluding MEMORY.md) and
  * extract their frontmatter headers.  Files that cannot be parsed are skipped.
  */
 export async function scanTopicFiles(
   memoryDir: string = MEMORY_DIR,
 ): Promise<TopicFileHeader[]> {
+  // P1-2: serve from cache when the directory is unchanged and the TTL is fresh.
+  let dirMtimeMs = -1
+  try {
+    dirMtimeMs = (await stat(memoryDir)).mtimeMs
+    const cached = _scanCache.get(memoryDir)
+    if (
+      cached &&
+      cached.dirMtimeMs === dirMtimeMs &&
+      Date.now() - cached.at < SCAN_CACHE_TTL_MS
+    ) {
+      return cached.headers
+    }
+  } catch {
+    // Directory missing/unstatable — fall through; readdir below handles it.
+  }
+
   let entries: string[]
   try {
     entries = await readdir(memoryDir)
@@ -197,7 +234,16 @@ export async function scanTopicFiles(
       }),
   )
 
-  return results.filter((h): h is TopicFileHeader => h !== null)
+  const headers = results.filter((h): h is TopicFileHeader => h !== null)
+  if (dirMtimeMs >= 0) {
+    _scanCache.set(memoryDir, { dirMtimeMs, at: Date.now(), headers })
+    // Bound: callers only ever use a handful of distinct memory dirs.
+    if (_scanCache.size > 8) {
+      const oldest = _scanCache.keys().next().value
+      if (oldest !== undefined) _scanCache.delete(oldest)
+    }
+  }
+  return headers
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -262,6 +308,23 @@ function keywordScore(header: TopicFileHeader, queryTokens: Set<string>): number
 // that don't provide a flashModel string.
 const RELEVANCE_MODEL_FALLBACK = 'deepseek-v4-flash'
 
+/**
+ * Flash relevance-call timeout. Default 3 s; override with
+ * META_AGENT_MEMORY_RECALL_TIMEOUT_MS (clamped 500 ms..120 s).
+ * Read lazily so tests / startup overrides both work.
+ */
+const DEFAULT_RECALL_TIMEOUT_MS = 3_000
+export function getMemoryRecallTimeoutMs(): number {
+  return getRecallTimeoutMs()
+}
+function getRecallTimeoutMs(): number {
+  const raw = process.env['META_AGENT_MEMORY_RECALL_TIMEOUT_MS']
+  if (raw === undefined) return DEFAULT_RECALL_TIMEOUT_MS
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return DEFAULT_RECALL_TIMEOUT_MS
+  return Math.min(120_000, Math.max(500, parsed))
+}
+
 const RELEVANCE_SYSTEM_PROMPT = `\
 You are selecting engineering memory files that will be useful to an AI assistant as it processes a user query.
 
@@ -292,9 +355,12 @@ async function selectByFlashModel(
     .join('\n')
 
   try {
-    // 3 s timeout: this is a pre-turn side-call; a hung flash model request would
+    // Timeout: this is a pre-turn side-call; a hung flash model request would
     // stall every submit() for up to 600 s (SDK default).  On timeout the
     // catch block falls through to keyword-based selection (Fix #5).
+    // Default 3 s; env-tunable because slow providers (first token 15–30 s)
+    // may want a longer window — especially now that prefetching overlaps this
+    // call with mode detection and session init.
     const msg = await withAbortableTimeout(signal =>
       client.messages.create({
         model: flashModel,
@@ -305,7 +371,7 @@ async function selectByFlashModel(
           content: `Query: ${query}\n\nAvailable memory files:\n${manifest}`,
         }],
       }, { signal }),
-      3_000,
+      getRecallTimeoutMs(),
     )
 
     const raw = msg.content[0]?.type === 'text' ? msg.content[0].text : ''
@@ -395,6 +461,89 @@ function _passesFilters(
   return true
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// P0-1: single-flight prefetch
+//
+// The memory recall (flash side-call + file loads) sits on the critical path
+// between the user pressing Enter and the first main-model token. Callers that
+// know the query EARLY (SessionRouter.submit, before mode detection and
+// backend init) can start the recall immediately; when the D1b prompt section
+// later calls findRelevantMemories() with the same query, it consumes the
+// in-flight promise instead of starting over — overlapping recall latency
+// with mode detection / session construction.
+//
+// Race-safety contract:
+//   - Single-flight: a second prefetch for the same (query, memoryDir) is a
+//     no-op while one is pending/unconsumed.
+//   - Consume-once: findRelevantMemories() DELETES the entry before awaiting,
+//     so a memory write later in the same turn can never be masked by a stale
+//     cached recall on the next turn.
+//   - Compatibility check: the consumer's options must match the prefetch's
+//     options on every field that influences the result (memoryDir,
+//     domainScope, maxCandidates, flashModel, client presence). On mismatch
+//     the prefetched value is discarded and a fresh recall runs — correctness
+//     never depends on the prefetch.  NOTE: sessionMode/mode is intentionally
+//     EXCLUDED from this check — it does not affect recall output today
+//     (see _passesFilters). If that ever changes, add it to _compatOf().
+//   - Failure isolation: a rejected prefetch promise is observed immediately
+//     (no unhandledRejection) and the consumer falls back to a fresh recall.
+// ─────────────────────────────────────────────────────────────────────────────
+
+interface PrefetchEntry {
+  compat: string
+  promise: Promise<RelevantMemory[]>
+  createdAt: number
+}
+
+const PREFETCH_TTL_MS = 60_000
+const PREFETCH_MAX_ENTRIES = 8
+const _prefetchCache = new Map<string, PrefetchEntry>()
+
+function _prefetchKey(opts: FindRelevantMemoriesOptions): string {
+  return `${opts.query.trim()} ${opts.memoryDir ?? MEMORY_DIR}`
+}
+
+/** Serialise every option that influences the recall RESULT (see contract above). */
+function _compatOf(opts: FindRelevantMemoriesOptions): string {
+  return JSON.stringify({
+    domainScope: opts.domainScope ?? null,
+    maxCandidates: opts.maxCandidates ?? 5,
+    flashModel: opts.flashModel ?? null,
+    hasClient: Boolean(opts.client),
+  })
+}
+
+/**
+ * Start a memory recall in the background for `opts.query`. Fire-and-forget;
+ * never throws. The result is picked up by the next findRelevantMemories()
+ * call with a matching query (see contract above).
+ */
+export function prefetchRelevantMemories(opts: FindRelevantMemoriesOptions): void {
+  try {
+    if (!opts.query.trim()) return
+    const key = _prefetchKey(opts)
+    if (_prefetchCache.has(key)) return  // single-flight
+    const promise = _findRelevantMemoriesFresh(opts)
+    // Observe rejection so an unconsumed failed prefetch never surfaces as an
+    // unhandledRejection (the CLI treats those as fatal).
+    promise.catch(() => undefined)
+    _prefetchCache.set(key, { compat: _compatOf(opts), promise, createdAt: Date.now() })
+    // Bound the cache: evict oldest entries beyond the cap.
+    while (_prefetchCache.size > PREFETCH_MAX_ENTRIES) {
+      const oldest = _prefetchCache.keys().next().value
+      if (oldest === undefined) break
+      _prefetchCache.delete(oldest)
+    }
+  } catch {
+    // Prefetch is best-effort by definition.
+  }
+}
+
+/** @testonly — drop all prefetched entries. */
+export function clearMemoryPrefetchCache(): void {
+  _prefetchCache.clear()
+}
+
 /**
  * Find and load the memory files most relevant to the current query.
  *
@@ -405,10 +554,36 @@ function _passesFilters(
  * Applies scope and mode filters before selection so out-of-scope memories
  * cannot pollute a long-running task's context.
  *
+ * Consumes a matching prefetchRelevantMemories() result when one is in flight
+ * (P0-1); otherwise computes fresh.
+ *
  * Returns an array of { header, content } objects ready to inject into the
  * system prompt.  Empty array when no memory files exist yet.
  */
 export async function findRelevantMemories(
+  opts: FindRelevantMemoriesOptions,
+): Promise<RelevantMemory[]> {
+  const key = _prefetchKey(opts)
+  const entry = _prefetchCache.get(key)
+  if (entry) {
+    // Consume-once: remove BEFORE awaiting so concurrent consumers and
+    // subsequent turns always trigger a fresh recall.
+    _prefetchCache.delete(key)
+    if (
+      Date.now() - entry.createdAt < PREFETCH_TTL_MS &&
+      entry.compat === _compatOf(opts)
+    ) {
+      try {
+        return await entry.promise
+      } catch {
+        // Prefetch failed (network, timeout edge…) — fall through to fresh.
+      }
+    }
+  }
+  return _findRelevantMemoriesFresh(opts)
+}
+
+async function _findRelevantMemoriesFresh(
   opts: FindRelevantMemoriesOptions,
 ): Promise<RelevantMemory[]> {
   const {
@@ -455,7 +630,14 @@ export async function findRelevantMemories(
 
   // Select candidates
   let selectedFilenames: string[]
-  if (client && query.trim() && candidateHeaders.length > 0) {
+  if (candidateHeaders.length <= maxCandidates) {
+    // P0-2: small memory library — every candidate fits within the injection
+    // limit anyway, so the flash relevance call cannot reduce the set further.
+    // Skip the side-call entirely (saves an LLM round-trip on the critical
+    // path for the common small-library case). The total-byte budget below
+    // still bounds prompt growth.
+    selectedFilenames = candidateHeaders.map(h => h.filename)
+  } else if (client && query.trim()) {
     // Preferred: flash model side-call
     selectedFilenames = await selectByFlashModel(query, candidateHeaders, client, opts.flashModel)
     // Fallback to keyword match if flash model returned nothing (handles empty query / network failure)

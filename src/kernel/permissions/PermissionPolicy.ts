@@ -134,6 +134,20 @@ function looksLikeFilesystemPath(candidate: string): boolean {
   return KNOWN_OS_ROOT_DIRS.has(firstComp)
 }
 
+/**
+ * System executable/library roots that bash commands may legitimately
+ * reference (interpreters, compilers, shared libs). These are enforceable as
+ * read-only by the OS sandbox, so referencing them is not a workspace escape.
+ * Deliberately narrow: /etc, /var (except tmp), /home, /Users etc. stay blocked.
+ */
+const READONLY_SYSTEM_PATH_PREFIXES = [
+  '/usr/bin/', '/usr/local/bin/', '/usr/sbin/', '/usr/lib/', '/usr/local/lib/',
+  '/usr/share/', '/usr/include/', '/usr/local/include/',
+  '/bin/', '/sbin/', '/lib/', '/lib64/',
+  '/opt/homebrew/bin/', '/opt/homebrew/lib/',
+  '/System/Library/', '/Library/Developer/',
+]
+
 function findWorkspaceViolation(
   tool: KernelTool,
   input: Record<string, unknown>,
@@ -158,6 +172,12 @@ function findWorkspaceViolation(
       // Skip anything that doesn't look like a real filesystem path (URL segments,
       // route strings like /settings, regex patterns like /^\d+/, comments //).
       if (!looksLikeFilesystemPath(candidate)) continue
+      // L7-fix: legitimate interpreter/toolchain references like
+      // `/usr/bin/python3 x.py` were rejected by the heuristic. System
+      // executable roots are effectively read-only for the agent (writes there
+      // are blocked by the OS sandbox / file permissions anyway), so allow
+      // them instead of failing useful commands. /etc and friends stay blocked.
+      if (READONLY_SYSTEM_PATH_PREFIXES.some(p => candidate.startsWith(p))) continue
       if (
         !(allowTmp && (candidate.startsWith('/tmp/') || candidate.startsWith('/var/tmp/'))) &&
         !candidate.startsWith('/dev/') &&

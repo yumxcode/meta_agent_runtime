@@ -118,7 +118,31 @@ export class CampaignMonitor {
     const startedAt = Date.now()
     const effectivePollMs = opts.pollIntervalMs ?? POLL_INTERVAL_MS
 
+    // L4-fix: re-entrancy guard. setInterval fires on schedule regardless of
+    // whether the previous async tick finished; a slow tick (large eval file,
+    // slow disk) would otherwise stack overlapping ticks and their I/O.
+    let tickInFlight = false
+
     const interval = setInterval(async () => {
+      if (tickInFlight) return
+      tickInFlight = true
+      try {
+        await CampaignMonitor._runTick(campaignId, opts, startedAt)
+      } finally {
+        tickInFlight = false
+      }
+    }, effectivePollMs)
+    interval.unref?.()
+
+    _active.set(campaignId, interval)
+  }
+
+  private static async _runTick(
+    campaignId: string,
+    opts: WatchOptions,
+    startedAt: number,
+  ): Promise<void> {
+    {
       // _tick() returns the phase it observed (or null when the campaign stopped
       // or the store was unavailable).  We reuse this value in the timeout checks
       // below to avoid a second CampaignStateStore.load() call per tick.
@@ -211,11 +235,7 @@ export class CampaignMonitor {
         }
         CampaignMonitor._stop(campaignId)
       }
-    }, effectivePollMs)
-
-    // Allow the Node.js process to exit even if this interval is running
-    interval.unref?.()
-    _active.set(campaignId, interval)
+    }
   }
 
   /** Stop watching a specific campaign. */

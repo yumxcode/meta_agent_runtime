@@ -170,10 +170,23 @@ export async function withFileLock<T>(
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err
       // Lock held by someone else — reclaim if stale, else wait and retry.
+      //
+      // M1-fix: stale reclamation must not unlink() directly.  Two processes
+      // can both observe the same stale lock; if A unlinks + recreates first,
+      // B's later unlink would delete A's FRESH lock and both would enter the
+      // critical section.  Instead we claim the stale lock via rename() —
+      // atomic, so exactly ONE process wins the claim; the loser's rename
+      // fails with ENOENT and it simply retries against the new state.
       try {
         const st = await stat(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
-          await unlink(lockPath).catch(() => {})
+          const claimPath = `${lockPath}.${process.pid}.${randomUUID().slice(0, 8)}.reclaim`
+          try {
+            await rename(lockPath, claimPath)
+            await unlink(claimPath).catch(() => {})
+          } catch {
+            // Someone else claimed it first — fall through and retry.
+          }
           continue
         }
       } catch {

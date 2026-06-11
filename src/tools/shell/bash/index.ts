@@ -1,11 +1,9 @@
-import { execFile } from 'child_process'
-import { promisify } from 'util'
+import { spawn } from 'child_process'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
 import { isInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
 
-const execFileAsync = promisify(execFile)
 const DEFAULT_MAX_OUT = 100 * 1024
 const DEFAULT_TIMEOUT_MS = 30_000
 const MAX_TIMEOUT_MS = 120_000
@@ -118,6 +116,99 @@ export interface BashToolOptions {
 
 const DEFAULT_MAIN_SANDBOX: SandboxConfig = { allowUnsandboxedFallback: true }
 
+interface RunResult {
+  stdout: string
+  stderr: string
+  code: number | null
+  timedOut: boolean
+  aborted: boolean
+}
+
+/**
+ * M4-fix: run a command in its OWN PROCESS GROUP and, on timeout/abort, kill
+ * the whole group (`kill(-pid)`), not just the direct child.  The previous
+ * execFile({ timeout }) only SIGTERM'd the bash wrapper, so pipelines and
+ * backgrounded children (`npm install`, training scripts, …) survived as
+ * orphans and accumulated on the machine.
+ */
+function runProcessGroup(
+  file: string,
+  args: string[],
+  opts: {
+    timeoutMs: number
+    cwd: string
+    env: NodeJS.ProcessEnv
+    signal: AbortSignal
+    /** Per-stream capture cap (bytes kept in memory). */
+    captureLimit: number
+  },
+): Promise<RunResult> {
+  return new Promise<RunResult>((resolve, reject) => {
+    const useGroup = process.platform !== 'win32'
+    let child: ReturnType<typeof spawn>
+    try {
+      child = spawn(file, args, {
+        cwd: opts.cwd,
+        env: opts.env,
+        detached: useGroup,           // own process group → group-killable
+        stdio: ['ignore', 'pipe', 'pipe'],
+      })
+    } catch (err) {
+      reject(err)
+      return
+    }
+
+    let stdout = ''
+    let stderr = ''
+    let timedOut = false
+    let aborted = false
+    let settled = false
+
+    const killGroup = (): void => {
+      if (child.pid === undefined) return
+      try {
+        if (useGroup) {
+          process.kill(-child.pid, 'SIGKILL')   // negative pid = whole group
+        } else {
+          child.kill('SIGKILL')
+        }
+      } catch { /* already exited */ }
+    }
+
+    const timer = setTimeout(() => {
+      timedOut = true
+      killGroup()
+    }, opts.timeoutMs)
+
+    const onAbort = (): void => {
+      aborted = true
+      killGroup()
+    }
+    if (opts.signal.aborted) onAbort()
+    else opts.signal.addEventListener('abort', onAbort, { once: true })
+
+    child.stdout?.on('data', (chunk: Buffer) => {
+      if (stdout.length < opts.captureLimit) stdout += chunk.toString('utf-8')
+    })
+    child.stderr?.on('data', (chunk: Buffer) => {
+      if (stderr.length < opts.captureLimit) stderr += chunk.toString('utf-8')
+    })
+
+    const finish = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      clearTimeout(timer)
+      opts.signal.removeEventListener('abort', onAbort)
+      fn()
+    }
+
+    child.on('error', (err) => finish(() => reject(err)))
+    child.on('close', (code) =>
+      finish(() => resolve({ stdout, stderr, code, timedOut, aborted })),
+    )
+  })
+}
+
 export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAgentTool> {
   const { sandboxHandle } = opts
   const envPolicy: ShellEnvPolicy = opts.envPolicy ?? 'filtered'
@@ -190,29 +281,44 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
         : { file: 'bash', args: ['-c', command] }
 
       try {
-        const { stdout, stderr } = await execFileAsync(execSpec.file, execSpec.args, {
-          timeout: timeoutMs, cwd, maxBuffer: limit * 2,
-          signal: ctx.abortSignal, env: buildShellEnv(envPolicy),
+        const res = await runProcessGroup(execSpec.file, execSpec.args, {
+          timeoutMs,
+          cwd,
+          env: buildShellEnv(envPolicy),
+          signal: ctx.abortSignal,
+          captureLimit: limit * 2,
         })
-        const parts: string[] = []
-        if (stdout) parts.push(trunc(stdout))
-        if (stderr) parts.push(`STDERR:\n${trunc(stderr)}`)
-        return { content: parts.join('\n') || '(no output)', isError: false }
-      } catch (err: unknown) {
-        const e = err as { killed?: boolean; stdout?: string; stderr?: string; code?: number; message?: string }
-        if (e.killed) {
+
+        if (res.timedOut || res.aborted) {
           // M9: surface any captured output BEFORE the kill so the model can
           // see how far the command got before timing out.
-          const parts: string[] = [`Command timed out after ${timeoutMs}ms`]
-          if (e.stdout) parts.push(trunc(e.stdout))
-          if (e.stderr) parts.push(`STDERR:\n${trunc(e.stderr)}`)
+          const parts: string[] = [
+            res.timedOut
+              ? `Command timed out after ${timeoutMs}ms`
+              : 'Command aborted',
+          ]
+          if (res.stdout) parts.push(trunc(res.stdout))
+          if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
           return { content: parts.join('\n'), isError: true }
         }
+
+        if (res.code === 0) {
+          const parts: string[] = []
+          if (res.stdout) parts.push(trunc(res.stdout))
+          if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
+          return { content: parts.join('\n') || '(no output)', isError: false }
+        }
+
         const parts: string[] = []
-        if (e.stdout) parts.push(trunc(e.stdout))
-        if (e.stderr) parts.push(`STDERR:\n${trunc(e.stderr)}`)
-        if (e.code !== undefined) parts.push(`Exit code: ${e.code}`)
-        return { content: parts.join('\n') || e.message || String(err), isError: true }
+        if (res.stdout) parts.push(trunc(res.stdout))
+        if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
+        parts.push(`Exit code: ${res.code ?? 'unknown'}`)
+        return { content: parts.join('\n'), isError: true }
+      } catch (err: unknown) {
+        return {
+          content: err instanceof Error ? err.message : String(err),
+          isError: true,
+        }
       }
     },
   }

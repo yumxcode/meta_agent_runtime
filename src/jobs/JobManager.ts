@@ -15,6 +15,12 @@
  *   caller can call reattach(jobId) to read the persisted record and, if
  *   the job was interrupted mid-run, re-queue it.
  *
+ *   ⚠ Crash-consistency contract: non-terminal transitions persist
+ *   fire-and-forget (with retry), so a job killed between running →
+ *   completed may be persisted as 'running'.  Hosts MUST call loadSession()
+ *   or reattach() after a restart — both normalise interrupted jobs to
+ *   'failed' — before trusting list()/poll() results.
+ *
  * Progress subscriptions:
  *   await() accepts an optional onProgress callback that is called
  *   synchronously every time the running handler reports progress.

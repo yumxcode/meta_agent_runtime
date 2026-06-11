@@ -289,6 +289,10 @@ export class MetaAgentSession {
       // use the flash model for memory recall; OpenAI-protocol providers
       // (DeepSeek) fall back to keyword matching since this client can't reach them.
       client:         this.config.protocol === 'anthropic' ? this.client : undefined,
+      // Thread the resolved flash model so D1b's relevance side-call targets a
+      // model that actually exists on this provider (and so the P0-1 prefetch
+      // compatibility check matches — see prefetchRelevantMemories).
+      flashModel:     this.config.flashModel,
       mode,
       domain:         this.config.domain,
       subAgentBridge: this._subAgentBridge,

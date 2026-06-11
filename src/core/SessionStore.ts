@@ -14,7 +14,7 @@
  */
 
 import { readFile, appendFile, mkdir, open, stat, rm, writeFile } from 'node:fs/promises'
-import { atomicWriteJson } from './persist/index.js'
+import { atomicWriteJson, withFileLock } from './persist/index.js'
 import { SessionMetaSchema, parseArrayFiltered } from './persist/schemas.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -321,10 +321,24 @@ export class SessionStore {
       } else {
         raw = await readFile(path, 'utf-8')
       }
-      const parsed = raw
-        .split('\n')
-        .filter(Boolean)
-        .map(line => JSON.parse(line) as ConversationMessage)
+      // Per-line tolerance: a single corrupt line (e.g. a partial append from
+      // a crash mid-write) must NOT nuke the whole history. Skip bad lines,
+      // keep everything parseable, and surface the loss in a warning.
+      const parsed: ConversationMessage[] = []
+      let dropped = 0
+      for (const line of raw.split('\n')) {
+        if (!line) continue
+        try {
+          parsed.push(JSON.parse(line) as ConversationMessage)
+        } catch {
+          dropped++
+        }
+      }
+      if (dropped > 0) {
+        console.warn(
+          `[SessionStore] Skipped ${dropped} corrupt history line(s) for session ${sessionId}`,
+        )
+      }
       return buildResumedHistory(parsed)
     } catch {
       return []
@@ -364,10 +378,12 @@ export class SessionStore {
    */
   static async deleteSession(sessionId: string): Promise<void> {
     try {
-      // Remove from index
-      const entries = await readIndex()
-      const filtered = entries.filter(e => e.sessionId !== sessionId)
-      await writeIndex(filtered)
+      // Remove from index (read-modify-write under the cross-process lock)
+      await withFileLock(INDEX_FILE, async () => {
+        const entries = await readIndex()
+        const filtered = entries.filter(e => e.sessionId !== sessionId)
+        await writeIndex(filtered)
+      })
       // Remove directory (best-effort)
       await rm(sessionDir(sessionId), { recursive: true, force: true })
     } catch {
@@ -381,7 +397,7 @@ export class SessionStore {
   static async deleteAllSessions(): Promise<void> {
     try {
       const entries = await readIndex()
-      await writeIndex([])
+      await withFileLock(INDEX_FILE, () => writeIndex([]))
       await Promise.all(
         entries.map(e => rm(sessionDir(e.sessionId), { recursive: true, force: true })),
       )
@@ -400,11 +416,13 @@ export class SessionStore {
     titleMessageCount: number,
   ): Promise<void> {
     try {
-      const entries = await readIndex()
-      const idx = entries.findIndex(e => e.sessionId === sessionId)
-      if (idx < 0) return
-      entries[idx] = { ...entries[idx]!, title, titleMessageCount }
-      await writeIndex(entries)
+      await withFileLock(INDEX_FILE, async () => {
+        const entries = await readIndex()
+        const idx = entries.findIndex(e => e.sessionId === sessionId)
+        if (idx < 0) return
+        entries[idx] = { ...entries[idx]!, title, titleMessageCount }
+        await writeIndex(entries)
+      })
     } catch {
       // Best-effort
     }
@@ -413,18 +431,24 @@ export class SessionStore {
   // ── Private ────────────────────────────────────────────────────────────────
 
   private static async _upsertIndex(meta: SessionMeta): Promise<void> {
-    const entries = await readIndex()
-    const idx = entries.findIndex(e => e.sessionId === meta.sessionId)
-    if (idx >= 0) {
-      // Merge-preserve: per-turn persists rebuild meta WITHOUT the title fields;
-      // a plain replace would wipe the generated title on every turn.
-      entries[idx] = { ...entries[idx], ...meta }
-    } else {
-      entries.unshift(meta)
-    }
-    // Sort newest-first by lastActivity, then keep index bounded.
-    // Sort before slice so the most-recently-active sessions always survive the cap.
-    entries.sort((a, b) => b.lastActivity - a.lastActivity)
-    await writeIndex(entries.slice(0, MAX_INDEX_ENTRIES))
+    // M2-fix: the whole read→merge→write must be atomic ACROSS PROCESSES.
+    // Two concurrent CLI sessions both rewrite index.json at every turn end;
+    // without the lock, the slower writer silently drops the faster writer's
+    // upsert (lost update) and sessions vanish from the picker.
+    await withFileLock(INDEX_FILE, async () => {
+      const entries = await readIndex()
+      const idx = entries.findIndex(e => e.sessionId === meta.sessionId)
+      if (idx >= 0) {
+        // Merge-preserve: per-turn persists rebuild meta WITHOUT the title fields;
+        // a plain replace would wipe the generated title on every turn.
+        entries[idx] = { ...entries[idx], ...meta }
+      } else {
+        entries.unshift(meta)
+      }
+      // Sort newest-first by lastActivity, then keep index bounded.
+      // Sort before slice so the most-recently-active sessions always survive the cap.
+      entries.sort((a, b) => b.lastActivity - a.lastActivity)
+      await writeIndex(entries.slice(0, MAX_INDEX_ENTRIES))
+    })
   }
 }

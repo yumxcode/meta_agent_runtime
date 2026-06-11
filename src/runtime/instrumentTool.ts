@@ -23,11 +23,61 @@
  *   session.registerTool(instrumented)
  */
 
+import { createHash } from 'crypto'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../core/types.js'
 import type { RuntimeContext } from './RuntimeContext.js'
 import type { DimensionalRecord } from '../jobs/types.js'
 import type { VVContext } from '../validation/types.js'
 import { requiresAbort, failures } from '../validation/types.js'
+
+// ─────────────────────────────────────────────────────────────────────────────
+// P1-3: output-parse and provenance-payload bounds
+// ─────────────────────────────────────────────────────────────────────────────
+
+/** Only attempt structured V&V parsing for outputs up to this size. */
+const MAX_PARSE_OUTPUT_CHARS = 256 * 1024
+
+/** Per-string-field cap inside persisted provenance records. */
+const MAX_PROVENANCE_FIELD_CHARS = 4_096
+
+/**
+ * Cheap pre-check: does `content` plausibly contain a JSON object/array?
+ * Avoids running JSON.parse over large plain-text tool outputs (it scans the
+ * whole string before failing on, e.g., a 100 KB log that happens to start
+ * with '{' inside a code fence — the first-char check rejects most text fast).
+ */
+function looksLikeJson(content: string): boolean {
+  if (content.length > MAX_PARSE_OUTPUT_CHARS) return false
+  for (let i = 0; i < content.length; i++) {
+    const c = content.charCodeAt(i)
+    if (c === 32 || c === 9 || c === 10 || c === 13) continue  // whitespace
+    return c === 123 || c === 91  // '{' or '['
+  }
+  return false
+}
+
+/**
+ * Bound a record's top-level string fields for provenance persistence.
+ * Large payloads (write_file content, fetched documents…) are truncated and
+ * annotated with a sha256 so the full value remains verifiable against the
+ * original artifact without writing it to disk twice.
+ */
+function slimForProvenance(record: DimensionalRecord): DimensionalRecord {
+  let changed = false
+  const out: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(record)) {
+    if (typeof value === 'string' && value.length > MAX_PROVENANCE_FIELD_CHARS) {
+      const digest = createHash('sha256').update(value).digest('hex').slice(0, 16)
+      out[key] =
+        value.slice(0, MAX_PROVENANCE_FIELD_CHARS) +
+        `…[truncated for provenance: ${value.length} chars total, sha256:${digest}]`
+      changed = true
+    } else {
+      out[key] = value
+    }
+  }
+  return (changed ? out : record) as DimensionalRecord
+}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Options
@@ -91,7 +141,7 @@ export function instrumentTool(
         toolName: tool.name,
         toolVersion,
         fidelityLevel,
-        input: input as DimensionalRecord,
+        input: slimForProvenance(input as DimensionalRecord),
         modelName: '',
         systemPrompt,
         output: {},
@@ -133,7 +183,7 @@ export function instrumentTool(
     // Attempt to parse the output as JSON for structured V&V checks.
     // If the output is plain text, we still run the hook chain with {}
     let output: DimensionalRecord = {}
-    if (!result.isError) {
+    if (!result.isError && looksLikeJson(result.content)) {
       try {
         const parsed = JSON.parse(result.content)
         if (typeof parsed === 'object' && parsed !== null) {
@@ -160,10 +210,10 @@ export function instrumentTool(
       toolName: tool.name,
       toolVersion,
       fidelityLevel,
-      input: input as DimensionalRecord,
+      input: slimForProvenance(input as DimensionalRecord),
       modelName: '',
       systemPrompt,
-      output,
+      output: slimForProvenance(output),
       validationResults: allVVResults,
       artifacts: [],
     })

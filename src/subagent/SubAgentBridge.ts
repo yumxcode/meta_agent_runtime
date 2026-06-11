@@ -19,7 +19,7 @@
  */
 
 import { randomUUID } from 'crypto'
-import { readTask, writeTask, releaseWriteChain, listTasksForSession, cleanupTerminalTasks } from './SubAgentTaskStore.js'
+import { readTask, writeTask, mutateTask, releaseWriteChain, listTasksForSession, cleanupTerminalTasks } from './SubAgentTaskStore.js'
 import { SubAgentRunner } from './SubAgentRunner.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
@@ -37,7 +37,11 @@ import type { MetaAgentTool } from '../core/types.js'
 
 const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
-const DEFAULT_SUB_AGENT_START_DELAY_MS = 250
+// P2-1: 50 ms is enough to avoid a thundering-herd of simultaneous session
+// constructions while keeping a 4-task fan-out under 200 ms of added latency
+// (was 250 ms → 750 ms for 4 tasks). Raise via META_AGENT_SUB_AGENT_START_DELAY_MS
+// if a provider rate-limits concurrent request starts.
+const DEFAULT_SUB_AGENT_START_DELAY_MS = 50
 const MAX_PENDING_NOTIFICATIONS = 100
 const DEFAULT_DESTROY_WAIT_MS = 10_000
 
@@ -370,13 +374,20 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this._reserveBudget(taskId, requestedBudget)
 
     const abortController = new AbortController()
-    // If parent is aborted, cancel this sub-agent
+    // If parent is aborted, cancel this sub-agent.
+    // M5-fix: an ALREADY-aborted signal never fires its 'abort' listener
+    // (per spec), so check .aborted first — otherwise a spawn racing a user
+    // interrupt would queue and run despite the parent turn being cancelled.
     if (opts.abortSignal) {
-      const forwardAbort = () => abortController.abort()
-      opts.abortSignal.addEventListener('abort', forwardAbort, { once: true })
-      this.parentAbortCleanups.set(taskId, () => {
-        opts.abortSignal?.removeEventListener('abort', forwardAbort)
-      })
+      if (opts.abortSignal.aborted) {
+        abortController.abort()
+      } else {
+        const forwardAbort = () => abortController.abort()
+        opts.abortSignal.addEventListener('abort', forwardAbort, { once: true })
+        this.parentAbortCleanups.set(taskId, () => {
+          opts.abortSignal?.removeEventListener('abort', forwardAbort)
+        })
+      }
     }
 
     // Start poll timer if not event-driven
@@ -453,32 +464,45 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       // map entry will be cleaned up at destroy() time.
     }
 
-    // Write cancelled status immediately
-    const updated: SubAgentRecord = {
-      ...record,
-      status:       'cancelled',
-      completedAt:  Date.now(),
-      result: {
-        success:      false,
-        summary:      reason ? `Cancelled: ${reason}` : 'Cancelled by parent agent',
-        error:        'cancelled',
-        turnsUsed:    0,
-        inputTokens:  0,
-        outputTokens: 0,
-        costUsd:      0,
-        durationMs:   Date.now() - (record.startedAt ?? record.createdAt),
-      },
-      pendingHumanApproval: false,
-    }
-    await writeTask(updated)
-    await releaseWriteChain(taskId)
-    this._settleBudget(taskId, updated.result?.costUsd)
-
-    CampaignEventBus.emit('subagent:failed', {
-      taskId,
-      parentSessionId: this.parentSessionId,
-      error: 'cancelled',
+    // Write cancelled status immediately.
+    // L1-fix: go through mutateTask so the terminal-state check and the write
+    // happen atomically on the per-task write chain — a runner finishing in
+    // parallel can no longer interleave (whoever writes first wins; the loser
+    // observes the terminal record and backs off).
+    const written = await mutateTask(taskId, disk => {
+      const base = disk ?? record
+      if (TERMINAL_STATUSES.has(base.status)) return null
+      return {
+        ...base,
+        status:       'cancelled',
+        completedAt:  Date.now(),
+        result: {
+          success:      false,
+          summary:      reason ? `Cancelled: ${reason}` : 'Cancelled by parent agent',
+          error:        'cancelled',
+          turnsUsed:    0,
+          inputTokens:  0,
+          outputTokens: 0,
+          costUsd:      0,
+          durationMs:   Date.now() - (base.startedAt ?? base.createdAt),
+        },
+        pendingHumanApproval: false,
+      }
     })
+    await releaseWriteChain(taskId)
+
+    if (written) {
+      this._settleBudget(taskId, written.result?.costUsd)
+      CampaignEventBus.emit('subagent:failed', {
+        taskId,
+        parentSessionId: this.parentSessionId,
+        error: 'cancelled',
+      })
+    } else {
+      // Runner reached terminal state first — settle with its actual cost.
+      const finalRecord = await readTask(taskId).catch(() => null)
+      this._settleBudget(taskId, finalRecord?.result?.costUsd)
+    }
 
     this._clearPollTimer(taskId)
     this.runners.delete(taskId)

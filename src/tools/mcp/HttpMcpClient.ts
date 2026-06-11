@@ -27,6 +27,60 @@ type JsonRpcResponse<T = unknown> = {
 
 const DEFAULT_PROTOCOL_VERSION = '2025-03-26'
 
+/**
+ * M3-fix: per-request wall-clock timeout and response-body size cap.
+ * A hung MCP server must not stall a tool call until the kernel's 3-minute
+ * fallback, and a buggy/malicious server must not stream an unbounded body
+ * into memory. Both are env-tunable.
+ */
+const DEFAULT_REQUEST_TIMEOUT_MS = 60_000
+const DEFAULT_MAX_RESPONSE_BYTES = 10 * 1024 * 1024  // 10 MB
+
+function envInt(name: string, fallback: number, min: number, max: number): number {
+  const raw = process.env[name]
+  if (raw === undefined) return fallback
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return fallback
+  return Math.min(max, Math.max(min, parsed))
+}
+
+function requestTimeoutMs(): number {
+  return envInt('META_AGENT_MCP_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 600_000)
+}
+
+function maxResponseBytes(): number {
+  return envInt('META_AGENT_MCP_MAX_RESPONSE_BYTES', DEFAULT_MAX_RESPONSE_BYTES, 1024, 256 * 1024 * 1024)
+}
+
+/**
+ * Read a Response body as text with a hard byte cap. Cancels the underlying
+ * stream once the cap is exceeded so the connection is released promptly.
+ */
+async function readBodyCapped(res: Response, maxBytes: number): Promise<string> {
+  if (!res.body) return res.text()
+  const reader = res.body.getReader()
+  const chunks: Uint8Array[] = []
+  let total = 0
+  try {
+    while (true) {
+      const { done, value } = await reader.read()
+      if (done) break
+      total += value.byteLength
+      if (total > maxBytes) {
+        await reader.cancel().catch(() => undefined)
+        throw new Error(
+          `MCP response exceeded ${maxBytes} bytes ` +
+          `(raise META_AGENT_MCP_MAX_RESPONSE_BYTES if this is expected)`,
+        )
+      }
+      chunks.push(value)
+    }
+  } finally {
+    reader.releaseLock()
+  }
+  return Buffer.concat(chunks).toString('utf-8')
+}
+
 export class HttpMcpClient implements McpClient {
   private readonly _url: string
   private readonly _baseHeaders: Record<string, string>
@@ -74,7 +128,7 @@ export class HttpMcpClient implements McpClient {
    */
   private async _parse<T>(res: Response): Promise<JsonRpcResponse<T>> {
     const contentType = res.headers.get('content-type') ?? ''
-    const text = await res.text()
+    const text = await readBodyCapped(res, maxResponseBytes())
 
     if (contentType.includes('text/event-stream')) {
       for (const rawLine of text.split(/\r?\n/)) {
@@ -99,6 +153,7 @@ export class HttpMcpClient implements McpClient {
   private async _initialize(): Promise<void> {
     const initRes = await fetch(this._url, {
       method: 'POST',
+      signal: AbortSignal.timeout(requestTimeoutMs()),
       headers: { ...this._baseHeaders },
       body: JSON.stringify({
         jsonrpc: '2.0',
@@ -130,6 +185,7 @@ export class HttpMcpClient implements McpClient {
     // no response expected). Best-effort: some servers don't require it.
     await fetch(this._url, {
       method: 'POST',
+      signal: AbortSignal.timeout(requestTimeoutMs()),
       headers: this._requestHeaders(),
       body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
     }).catch(() => undefined)
@@ -151,6 +207,7 @@ export class HttpMcpClient implements McpClient {
 
     const res = await fetch(this._url, {
       method: 'POST',
+      signal: AbortSignal.timeout(requestTimeoutMs()),
       headers: this._requestHeaders(),
       body: JSON.stringify({
         jsonrpc: '2.0',

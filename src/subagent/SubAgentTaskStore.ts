@@ -88,6 +88,48 @@ export function writeTask(record: SubAgentRecord): Promise<void> {
 }
 
 /**
+ * Atomically read-decide-write a task record ON THE PER-TASK WRITE CHAIN.
+ *
+ * L1-fix: writeTask() only serialises the WRITES; a caller that does
+ * `readTask() → decide → writeTask()` still races other writers in the
+ * decide window (e.g. SubAgentRunner's completed write overwriting
+ * cancelTask's cancelled write).  mutateTask() runs the read, the decision,
+ * and the write as ONE chain link, closing that window for all in-process
+ * writers that go through this store.
+ *
+ * `mutate` receives the current on-disk record (null when missing/corrupt)
+ * and returns the record to write — or null to write nothing (keep disk).
+ * Resolves with the written record, or null when nothing was written.
+ */
+export function mutateTask(
+  taskId: SubAgentTaskId,
+  mutate: (current: SubAgentRecord | null) => SubAgentRecord | null,
+): Promise<SubAgentRecord | null> {
+  const doMutate = async (): Promise<SubAgentRecord | null> => {
+    const current = await readJsonFile<SubAgentRecord>(taskPath(taskId))
+    const next = mutate(current)
+    if (next !== null) {
+      await ensureDir(subtaskDir())
+      await atomicWriteJson(taskPath(taskId), next)
+    }
+    return next
+  }
+
+  const prev = _writeChains.get(taskId) ?? Promise.resolve()
+  const run = prev.catch(() => {}).then(doMutate)
+  _writeChains.set(
+    taskId,
+    run.then(
+      () => undefined,
+      err => {
+        console.error(`[SubAgentTaskStore] Mutate failed for ${taskId}:`, err)
+      },
+    ),
+  )
+  return run
+}
+
+/**
  * Release the in-memory write chain for a task after all pending writes drain.
  * This keeps terminal task records on disk while preventing long-running
  * processes from retaining one Promise chain per historical task.

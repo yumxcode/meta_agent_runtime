@@ -19,6 +19,16 @@ vi.mock('../SubAgentTaskStore.js', () => ({
   writeTask: vi.fn(async (record: SubAgentRecord) => {
     mockState.tasks.set(record.taskId, { ...record })
   }),
+  mutateTask: vi.fn(
+    async (
+      taskId: string,
+      mutate: (current: SubAgentRecord | null) => SubAgentRecord | null,
+    ) => {
+      const next = mutate(mockState.tasks.get(taskId) ?? null)
+      if (next !== null) mockState.tasks.set(taskId, { ...next })
+      return next
+    },
+  ),
   releaseWriteChain: vi.fn(async () => {}),
   cleanupTerminalTasks: vi.fn(async () => 0),
   listTasksForSession: vi.fn(async (parentSessionId: string) =>

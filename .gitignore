@@ -11,6 +11,14 @@ dist/
 *.log
 .DS_Store
 
+# FUSE artifacts (deleted-but-open files on FUSE mounts)
+.fuse_hidden*
+
+# Runtime write artifacts (atomic-write temps, corrupt quarantine, lock files)
+*.corrupt
+*.tmp
+*.lock
+
 # Editor / tooling
 .vscode/
 .idea/

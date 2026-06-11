@@ -107,6 +107,7 @@ export function buildMemoryContentSection(
   client?: Anthropic,
   sessionMode?: string,
   domainScope?: string,
+  flashModel?: string,
 ): SystemPromptSection {
   return DANGEROUS_uncachedSystemPromptSection(
     'memory_content',
@@ -115,7 +116,7 @@ export function buildMemoryContentSection(
 
       const [index, relevant] = await Promise.all([
         loadMemoryIndex(),
-        findRelevantMemories({ query: currentQuery, memoryDir: MEMORY_DIR, client, sessionMode, domainScope }),
+        findRelevantMemories({ query: currentQuery, memoryDir: MEMORY_DIR, client, sessionMode, domainScope, flashModel }),
       ])
 
       const parts: string[] = []
@@ -1020,6 +1021,12 @@ export interface VolatileContextOptions {
   currentQuery?: string
   /** Client for flash model memory side-call; falls back to keyword match. */
   client?: Anthropic
+  /**
+   * Flash model id for the D1b relevance side-call. When omitted the recall
+   * falls back to a hard-coded default that may not exist on the configured
+   * provider — always thread the resolved flashModel when known.
+   */
+  flashModel?: string
   /** Agent mode — scopes D1b memory relevance and enables campaign sections. */
   mode?: AgentMode
   /** Engineering domain — filters domain-scoped memories in D1b. */
@@ -1062,6 +1069,7 @@ export function buildVolatileContextSections(opts: VolatileContextOptions): Syst
       opts.client,
       opts.mode,
       opts.domain,
+      opts.flashModel,
     ),
   ]
 

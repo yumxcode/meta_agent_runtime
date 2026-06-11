@@ -279,7 +279,22 @@ function requestPinned(
           total += chunk.length
           // Read a little past MAX_CONTENT so the caller's truncation message
           // is accurate; then stop to bound memory.
-          if (total <= MAX_CONTENT * 2) chunks.push(chunk)
+          if (total <= MAX_CONTENT * 2) {
+            chunks.push(chunk)
+            return
+          }
+          // L2-fix: once over the cap, TERMINATE the transfer instead of
+          // draining it — a malicious server could otherwise stream gigabytes
+          // and hold the connection/bandwidth until the tool timeout. Resolving
+          // first makes the destroy-triggered 'error' a no-op (promise already
+          // settled).
+          resolvePromise({
+            status,
+            statusText: res.statusMessage ?? '',
+            headers,
+            text: async () => Buffer.concat(chunks).toString('utf-8'),
+          })
+          res.destroy()
         })
         res.on('end', () => {
           resolvePromise({

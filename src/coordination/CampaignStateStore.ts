@@ -27,7 +27,7 @@ import {
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, ensureDir, readJsonFile } from '../core/persist/index.js'
+import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../core/persist/index.js'
 import type {
   CampaignContextCapsule,
   CampaignPhase,
@@ -213,7 +213,12 @@ export class CampaignStateStore {
     }
 
     entry.count++
-    const run = entry.chain.then(() => fn())
+    // M6-fix: the in-process promise chain only serialises callers within ONE
+    // process. Workers running as separate processes would still interleave
+    // their reload→mutate→write triples (lost updates). Wrapping the critical
+    // section in the cross-process file lock closes that hole; in the common
+    // single-process case the lock is uncontended (one open()+unlink()).
+    const run = entry.chain.then(() => withFileLock(this.paths.state, fn))
     // Advance the stored tail to always-resolving so the next waiter chains correctly
     entry.chain = run.then(() => {}, () => {})
     // Decrement ref-count when this operation settles; self-destruct when at 0
@@ -531,6 +536,16 @@ export class CampaignStateStore {
     try {
       fh = await open(this.paths.evaluations, 'r')
       const { size } = await fh.stat()
+
+      // M6-fix: detect truncation/recreation. If the file is now SHORTER than
+      // our cached offset (campaign dir cleaned and recreated, file rotated…),
+      // the incremental cursor is meaningless — reset and re-read from the
+      // start instead of silently never seeing new results again.
+      if (size < cached.offset) {
+        cached.offset = 0
+        cached.results = []
+        newOffset = 0
+      }
 
       if (size > cached.offset) {
         const toRead = size - cached.offset

@@ -18,7 +18,7 @@ import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import type { MetaAgentTool } from '../core/types.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
-import { writeTask, readTask, releaseWriteChain } from './SubAgentTaskStore.js'
+import { writeTask, readTask, mutateTask, releaseWriteChain } from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
   TERMINAL_STATUSES,
@@ -265,6 +265,13 @@ export class SubAgentRunner {
       )
     }
 
+    // L3-fix: every step below (tool resolution, session creation, the agentic
+    // loop) runs inside this try so the finally block ALWAYS destroys the
+    // sandbox handle — previously an exception thrown between handle creation
+    // and the old try boundary leaked the handle.
+    let durationTimer: ReturnType<typeof setTimeout> | undefined
+    try { // ← outer try: ensures sandboxHandle.destroy() always runs
+
     // Build the isolated session config.
     // Forward provider credentials from the parent session when explicit —
     // otherwise MetaAgentSession.resolveConfig() picks them up from env vars.
@@ -282,7 +289,7 @@ export class SubAgentRunner {
     // in allowedTools) surfaces rather than producing a hollow "complete".
     const requestedTools = cfg.allowedTools ?? []
     if (requestedTools.length > 0 && tools.length === 0) {
-      await sandboxHandle?.destroy()
+      // (sandboxHandle is destroyed by the outer finally)
       await this._writeTerminal('failed', {
         success:      false,
         summary:      '',
@@ -328,7 +335,7 @@ export class SubAgentRunner {
     // — e.g. an inner web_fetch that never returns. Interrupting the session
     // ends the submit() generator; _timedOut steers terminal handling below.
     const maxDurationMs = cfg.maxDurationMs ?? 300_000
-    const durationTimer = maxDurationMs > 0
+    durationTimer = maxDurationMs > 0
       ? setTimeout(() => {
           this._timedOut = true
           this._cancelReason = 'timeout'
@@ -337,7 +344,6 @@ export class SubAgentRunner {
         }, maxDurationMs)
       : undefined
 
-    try { // ← outer try: ensures sandboxHandle.destroy() always runs
     try {
       // Abort signal forwarding
       if (this.abortSignal.aborted) {
@@ -545,27 +551,32 @@ export class SubAgentRunner {
     result: SubAgentResult,
   ): Promise<void> {
     // Guard against double-terminal (e.g. abort + error racing)
-    // Guard against double-terminal writes.
-    // IMPORTANT: also guard if the in-memory record is 'running' but the on-disk
-    // record has already been set to 'cancelled' by SubAgentBridge.cancelTask().
-    // Re-read the disk state to pick up any external cancellation.
     if (TERMINAL_STATUSES.has(this.record.status) && this.record.status !== 'running') return
-    const diskRecord = await readTask(this.record.taskId)
-    if (diskRecord && TERMINAL_STATUSES.has(diskRecord.status)) {
+
+    // L1-fix: the read-decide-write below runs atomically on the per-task
+    // write chain (mutateTask), so a concurrent cancelTask() 'cancelled' write
+    // can no longer be overwritten by this runner's 'completed' in the window
+    // between an unsynchronised read and write.
+    const candidate: SubAgentRecord = {
+      ...this.record,
+      status,
+      completedAt: Date.now(),
+      result,
+      pendingHumanApproval:
+        status === 'completed' && this.record.config.requireHumanApproval,
+    }
+    const written = await mutateTask(this.record.taskId, disk =>
+      disk && TERMINAL_STATUSES.has(disk.status) ? null : candidate,
+    )
+    if (written === null) {
       // Another code path (e.g. cancelTask) already wrote a terminal state.
-      // Update our in-memory record but do not overwrite the disk state.
-      this.record.status = diskRecord.status
+      // Sync our in-memory record but do not overwrite the disk state.
+      const disk = await readTask(this.record.taskId)
+      if (disk) this.record.status = disk.status
       await releaseWriteChain(this.record.taskId)
       return
     }
-
-    this.record.status      = status
-    this.record.completedAt = Date.now()
-    this.record.result      = result
-    this.record.pendingHumanApproval =
-      status === 'completed' && this.record.config.requireHumanApproval
-
-    await writeTask(this.record)
+    Object.assign(this.record, candidate)
     await releaseWriteChain(this.record.taskId)
 
     // Publish event

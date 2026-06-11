@@ -531,12 +531,11 @@ export async function* runKernelLoop(
     // identically and there's one canonical place to change the join rule.
     const effectiveSystemPrompt =
       assembleSystemPrompt(config.systemPrompt, config.appendSystemPrompt) ?? ''
-    const messagesToKeepAfterCompact = buildMessagesToKeepAfterCompact(messagesForQuery, config.tools)
 
-    // Surface a "compacting…" indicator before the slow LLM-backed summarization
-    // begins. We probe the same gates autoCompactIfNeeded uses so the event only
-    // fires when a compaction will actually run.
-    if (
+    // Probe the same gates autoCompactIfNeeded uses so (a) the "compacting…"
+    // indicator only fires when a compaction will actually run, and (b) the
+    // keep-set below is only computed when it will actually be consumed.
+    const willCompact =
       config.compact?.enabled !== false &&
       shouldAutoCompact(
         messagesForQuery,
@@ -546,7 +545,20 @@ export async function* runKernelLoop(
         state.maxOutputTokensOverride ?? config.maxOutputTokens,
         config.compact?.model,
       )
-    ) {
+
+    // P2-2: buildMessagesToKeepAfterCompact (incl. a second tool-result-budget
+    // pass) used to run on EVERY iteration; it is only meaningful when a
+    // compaction actually runs this turn. shouldAutoCompact and
+    // autoCompactIfNeeded share the same gates (kept in lockstep — see
+    // shouldAutoCompact docstring); if they ever drift, the worst case is a
+    // compaction with an empty keep-set (summary-only), never a protocol error.
+    const messagesToKeepAfterCompact = willCompact
+      ? buildMessagesToKeepAfterCompact(messagesForQuery, config.tools)
+      : []
+
+    // Surface a "compacting…" indicator before the slow LLM-backed summarization
+    // begins.
+    if (willCompact) {
       yield { type: 'compact_start', sessionId }
     }
 
@@ -833,7 +845,10 @@ export async function* runKernelLoop(
           }
           if (reactiveCompactResult.wasCompacted && reactiveCompactResult.postCompactMessages) {
             mutableMessages.splice(0, mutableMessages.length, ...reactiveCompactResult.postCompactMessages)
-            state = { ...state, messages: [...mutableMessages] }
+            // L6-fix: keep state.messages pointing at the LIVE mutableMessages
+            // array (same invariant as append() / the proactive compact path).
+            // A copy here silently broke the shared-reference invariant.
+            state = { ...state, messages: mutableMessages }
             yield {
               type: 'compact_boundary',
               compactMetadata: {
