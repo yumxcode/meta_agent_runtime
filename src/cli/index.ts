@@ -1266,6 +1266,19 @@ interface SteerHooks {
   endInput: () => void
 }
 
+// ── Active thinking-meter registry ────────────────────────────────────────────
+// streamPrompt owns a ThinkingMeter that redraws an in-place status line on a
+// 120ms timer. When an interactive prompt must appear mid-turn (e.g. the
+// multi-agent escalation confirmation), that timer erases the prompt on its next
+// tick — the user is left staring at the "等待模型响应…" spinner with no visible
+// question, and a blind <Enter> silently declines. streamPrompt registers its
+// meter here so any mid-turn prompt reader can pause the spinner first; the
+// stream's own event handlers re-show it when the next model event arrives.
+let _activeThinkingMeter: ThinkingMeter | null = null
+function pauseActiveThinkingMeter(): void {
+  _activeThinkingMeter?.hide()
+}
+
 async function streamPrompt(
   router: SessionRouter,
   prompt: string,
@@ -1297,6 +1310,9 @@ async function streamPrompt(
     meterTimer = setInterval(() => meter.tick(), 120)
     if (typeof meterTimer.unref === 'function') meterTimer.unref()
   }
+  // Expose this turn's meter so mid-turn interactive prompts can pause the
+  // spinner before printing (otherwise the timer redraws over the question).
+  _activeThinkingMeter = meter
 
   async function writeVisible(text: string): Promise<void> {
     if (!text || visibleTruncated) return
@@ -1526,6 +1542,7 @@ async function streamPrompt(
     // including on interrupt/error paths — so it never bleeds into the prompt.
     if (meterTimer) clearInterval(meterTimer)
     meter.hide()
+    if (_activeThinkingMeter === meter) _activeThinkingMeter = null
   }
 }
 
@@ -2003,6 +2020,7 @@ async function reviewPendingPrinciples(
   pending: PrinciplePendingStore,
   store: PrincipleStore,
   experienceStore?: ExperienceStore,
+  anchorStore?: PhysicalAnchorStore,
 ): Promise<number> {
   const entries = [...pending.list()]
   if (entries.length === 0) {
@@ -2048,7 +2066,7 @@ async function reviewPendingPrinciples(
 
     const choice = await askQuestion(rl, `提交 [y=是 / n=丢弃 / s=跳过]: `)
     if (choice.toLowerCase() === 'y' || choice.toLowerCase() === 'yes') {
-      const id = await pending.commit(entry.pendingId, store, experienceStore)
+      const id = await pending.commit(entry.pendingId, store, experienceStore, anchorStore)
       if (id) {
         console.log(green(`  ✓ 已提交 (ID: ${id})`))
         committed++
@@ -3321,6 +3339,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // main loop uses, so the keystroke is never lost to a competing raw-stdin read.
   // Marks input active so the team-reminder timer doesn't fire over the prompt.
   async function _promptLineInline(question: string): Promise<string | null> {
+    // Pause the streaming spinner first — its 120ms redraw timer would otherwise
+    // erase this question on the next tick, hiding the prompt entirely. The
+    // stream's event handlers re-show the meter on the next model event.
+    pauseActiveThinkingMeter()
     setInteractiveActive(true)
     try {
       process.stdout.write(question)
@@ -3671,20 +3693,39 @@ async function runRepl(opts: CliOptions): Promise<void> {
             } else {
               const store = new ExperienceStore()
               await reviewPendingExperiences(rl, pending, store, async id => {
-                // Reinforce/challenge committed principles this experience cites.
-                const signals = await router.reinforcePrinciplesFromExperience(id)
-                for (const s of signals) {
-                  const label = s.signal === 'observation'
+                // Recognition-before-generation: claim existing principles (+reinforce),
+                // else evaluate mechanism convergence across the global store.
+                type AnchorSig = { anchorId: string; verdict: 'corroborated' | 'contradicted' | 'neutral'; propagated?: string[] }
+                const outcome = await router.evaluatePromotionForExperience(id) as
+                  | { kind: 'reinforced'; principleIds: string[]; signal: 'observation' | 'contradiction'; anchorSignals?: AnchorSig[] }
+                  | { kind: 'proposed'; pendingId: string; clusterIds: string[]; anchorSignals?: AnchorSig[] }
+                  | { kind: 'rejected'; reason: string; anchorSignals?: AnchorSig[] }
+                  | { kind: 'none'; reason: string; anchorSignals?: AnchorSig[] }
+                  | null
+                if (!outcome) return
+                if (outcome.kind === 'reinforced') {
+                  const label = outcome.signal === 'observation'
                     ? green('+1 佐证')
                     : yellow('+1 反证（已降权，建议 /principle review 复核）')
-                  console.log(dim(`  ⟳ 原则 ${s.principleId}: ${label}`))
-                }
-                const result = await router.proposePrincipleForExperience(id, 'confidence_threshold') as
-                  | { promoted?: boolean; pendingId?: string; reason?: string; score?: number }
-                  | null
-                if (result?.promoted) {
-                  console.log(yellow(`  ⏸ 已生成待审原则 (pending ID: ${result.pendingId}, score: ${result.score ?? 'n/a'})`))
+                  for (const pid of outcome.principleIds) {
+                    console.log(dim(`  ⟳ 原则 ${pid}: ${label}`))
+                  }
+                } else if (outcome.kind === 'proposed') {
+                  console.log(yellow(`  ⏸ 经验收敛，已生成待审原则 (pending ID: ${outcome.pendingId}, 簇 ${outcome.clusterIds.length} 条)`))
                   console.log(dim(`  使用 /principle review 审核是否提交。`))
+                } else if (outcome.kind === 'rejected') {
+                  console.log(dim(`  ○ 该簇暂不足以成为原则：${outcome.reason}`))
+                }
+                // Physical anchor signals (validate/challenge + contradiction propagation).
+                for (const s of outcome.anchorSignals ?? []) {
+                  if (s.verdict === 'corroborated') {
+                    console.log(dim(`  ⚓ 锚点 ${s.anchorId}: ${green('+1 佐证')}`))
+                  } else if (s.verdict === 'contradicted') {
+                    console.log(dim(`  ⚓ 锚点 ${s.anchorId}: ${yellow('+1 反证（已降权）')}`))
+                    for (const pid of s.propagated ?? []) {
+                      console.log(dim(`    ⚠ 原则 ${pid} 因锚点反证连带降权，建议 /principle review 复核`))
+                    }
+                  }
                 }
               })
             }
@@ -3708,7 +3749,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(yellow('\n/principle review 仅在 robotics 模式下可用。\n'))
             } else {
               const store = new PrincipleStore()
-              await reviewPendingPrinciples(rl, pendingPrinciples, store, new ExperienceStore())
+              await reviewPendingPrinciples(rl, pendingPrinciples, store, new ExperienceStore(), new PhysicalAnchorStore())
             }
           } else {
             const count = pendingPrinciples?.count ?? 0

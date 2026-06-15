@@ -55,6 +55,7 @@ import { PhysicalAnchorSource } from '../context/sources/PhysicalAnchorSource.js
 import { PrincipleStore } from './PrincipleStore.js'
 import { PrinciplePendingStore } from './PrinciplePendingStore.js'
 import { proposePrincipleFromExperience } from './PrinciplePromotion.js'
+import { evaluatePromotion, type EvaluatePromotionResult } from './PrincipleConvergence.js'
 import { HardwareProfile } from './HardwareProfile.js'
 import { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
@@ -829,6 +830,22 @@ export class RoboticsSession {
       principleStore: this.principles,
       flash: this._flashClient,
       reason,
+    })
+  }
+
+  /**
+   * Run the recognition-before-generation pipeline for a freshly-committed
+   * experience: claim existing principles (+reinforce), else evaluate mechanism
+   * convergence and propose a principle when ≥ N experiences converge.
+   * Called from /experience review per committed experience.
+   */
+  async evaluatePromotionForExperience(experienceId: string): Promise<EvaluatePromotionResult> {
+    return evaluatePromotion(experienceId, {
+      experienceStore: this.store,
+      principleStore: this.principles,
+      anchorStore: this.physicalAnchors,
+      pendingStore: this.pendingPrinciples,
+      flash: this._flashClient,
     })
   }
 

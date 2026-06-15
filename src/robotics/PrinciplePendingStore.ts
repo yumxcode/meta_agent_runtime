@@ -6,6 +6,7 @@ import { join } from 'path'
 import { atomicWriteJson } from '../core/persist/index.js'
 import type { PrincipleStore } from './PrincipleStore.js'
 import type { ExperienceStore } from './ExperienceStore.js'
+import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import {
   KNOWLEDGE_CONFIDENCE_TIERS,
   PRINCIPLE_ABSTRACTION_LEVELS,
@@ -99,6 +100,7 @@ export class PrinciplePendingStore {
     pendingId: string,
     store: PrincipleStore,
     experienceStore?: ExperienceStore,
+    anchorStore?: PhysicalAnchorStore,
   ): Promise<string | null> {
     const entry = this._pending.find(p => p.pendingId === pendingId)
     if (!entry) return null
@@ -106,7 +108,19 @@ export class PrinciplePendingStore {
     try {
       const normalized = validatePrincipleInput(entry.input)
       if (!normalized.ok) return null
-      const id = await store.write(normalized.value)
+
+      // Validate cited anchors exist — drop dangling IDs so the principle never
+      // references a non-existent physical fact.
+      let anchorIds = normalized.value.anchoredByPhysicalAnchorIds
+      if (anchorStore && anchorIds.length > 0) {
+        const checks = await Promise.all(anchorIds.map(async aid => ({
+          aid, ok: Boolean(await anchorStore.load(aid).catch(() => null)),
+        })))
+        anchorIds = checks.filter(c => c.ok).map(c => c.aid)
+      }
+
+      const id = await store.write({ ...normalized.value, anchoredByPhysicalAnchorIds: anchorIds })
+
       if (experienceStore) {
         const sourceIds = [
           normalized.value.sourceExperienceId,
@@ -114,6 +128,13 @@ export class PrinciplePendingStore {
         ].filter((value): value is string => typeof value === 'string' && value.length > 0)
         await Promise.allSettled([...new Set(sourceIds)].map(sourceId =>
           experienceStore.appendPrincipleReference(sourceId, id),
+        ))
+      }
+      // Back-link anchor → principle so a later anchor contradiction can propagate
+      // to this principle (§7.2).
+      if (anchorStore && anchorIds.length > 0) {
+        await Promise.allSettled(anchorIds.map(aid =>
+          anchorStore.appendPrincipleReference(aid, id),
         ))
       }
       this.remove(pendingId)

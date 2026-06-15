@@ -56,6 +56,7 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
           ...(entry.relatedPapers?.length ? ['## Related Papers', ...entry.relatedPapers.map(p => `- ${p}`), ''] : []),
           ...(entry.evidenceRefs?.length ? ['## Evidence References', ...entry.evidenceRefs.map(ref => `- ${ref}`), ''] : []),
           ...(entry.principleIds?.length ? ['## Linked Principles', ...entry.principleIds.map(id => `- ${id}`), ''] : []),
+          ...(entry.anchorIds?.length ? ['## Linked Physical Anchors', ...entry.anchorIds.map(id => `- ${id}`), ''] : []),
           ...(entry.sourceTaskId ? [`**Source task**: ${entry.sourceTaskId}`, ''] : []),
           ...(entry.fullReport ? ['---', '## Full Report', entry.fullReport] : []),
         ]

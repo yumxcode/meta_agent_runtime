@@ -459,6 +459,14 @@ export class SessionRouter {
     return []
   }
 
+  async evaluatePromotionForExperience(experienceId: string): Promise<unknown | null> {
+    const impl = this._impl as any
+    if (impl && typeof impl.evaluatePromotionForExperience === 'function') {
+      return impl.evaluatePromotionForExperience(experienceId)
+    }
+    return null
+  }
+
   getRoboticsTeamController(): RoboticsTeamController | null {
     if (this._currentMode !== 'robotics') return null
     const impl = this._impl as RoboticsTeamController | undefined

@@ -124,6 +124,8 @@ export interface ExperienceEntry {
   sourceSessionId?: string
   /** Reviewed principles promoted from or linked to this concrete experience. */
   principleIds?: string[]
+  /** Physical anchors this experience applied, validated, or contradicted. Usually empty. */
+  anchorIds?: string[]
   relatedPapers?: string[]
   fullReport?: string    // Markdown, loaded on demand only
 }
@@ -173,6 +175,12 @@ export interface PhysicalAnchorEntry {
   source?: string
   lastVerifiedAt?: number
   invalidates?: string[]
+  /** Number of experiments whose evidence corroborated this fact. Defaults to 0. */
+  observationCount?: number
+  /** Number of experiments that observed this fact NOT to hold. Defaults to 0. */
+  contradictionCount?: number
+  /** Reviewed principles that cite this anchor as physical support (back-link). */
+  principleIds?: string[]
 }
 
 export interface PhysicalAnchorSearchQuery {

@@ -25,6 +25,7 @@ export function createPhysicalAnchorLoadTool(store: PhysicalAnchorStore): MetaAg
           `# ${anchor.title}`,
           `**ID**: ${anchor.id}`,
           `**Domain**: ${anchor.domain} | **Scope**: ${anchor.scope} | **Confidence**: ${anchor.confidenceTier}`,
+          `**Observations**: ${anchor.observationCount ?? 0} | **Contradictions**: ${anchor.contradictionCount ?? 0}`,
           ...(anchor.robot ? [`**Robot**: ${anchor.robot}`] : []),
           ...(anchor.source ? [`**Source**: ${anchor.source}`] : []),
           ...(anchor.tags.length ? [`**Tags**: ${anchor.tags.join(', ')}`] : []),
@@ -40,6 +41,7 @@ export function createPhysicalAnchorLoadTool(store: PhysicalAnchorStore): MetaAg
           '',
           ...(anchor.evidenceRefs.length ? ['## Evidence References', ...anchor.evidenceRefs.map(ref => `- ${ref}`), ''] : []),
           ...(anchor.invalidates?.length ? ['## Invalidates', ...anchor.invalidates.map(item => `- ${item}`), ''] : []),
+          ...(anchor.principleIds?.length ? ['## Depended-on by Principles', ...anchor.principleIds.map(id => `- ${id}`), ''] : []),
         ]
         return { content: lines.join('\n'), isError: false }
       } catch (err) {

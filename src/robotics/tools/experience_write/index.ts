@@ -1,27 +1,39 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ExperienceStore } from '../../ExperienceStore.js'
 import { validateExperienceInput, type ExperiencePendingStore } from '../../ExperiencePendingStore.js'
+import { validatePhysicalAnchorInput, type PhysicalAnchorPendingStore } from '../../PhysicalAnchorPendingStore.js'
+import type { PhysicalAnchorStore } from '../../PhysicalAnchorStore.js'
 import type { FlashClient } from '../../../core/flash/FlashClient.js'
 
+const MAX_ANCHORS_PER_EXPERIENCE = 2
+
 // ─────────────────────────────────────────────────────────────────────────────
-// Flash prompt: extract same-domain abstract principle
+// Flash prompt: combined distillation — one call yields the abstract principle
+// (always) AND, strictly, any physical anchor worth preserving (default none).
 // ─────────────────────────────────────────────────────────────────────────────
 
-const PRINCIPLE_SYSTEM = `\
-Extract the single most transferable abstract principle from a robotics experiment.
+const EXPERIENCE_DISTILL_SYSTEM = `\
+You distill one completed robotics experience into reusable knowledge. Return JSON only:
+{"abstract_principle": "<one line>", "anchors": [ <0-2 anchors> ]}
 
-The principle should be:
-- Domain-bounded: transferable within the same robotics domain, without forcing cross-domain generalization
-- Mechanistic: capture the root cause or success mechanism, not the surface symptom
-- Concise: 1-2 sentences maximum
+abstract_principle — ALWAYS produce one concise, domain-bounded, mechanistic line (the single
+most transferable lesson). 1-2 sentences. Capture the root cause/success mechanism, not the
+surface symptom.
 
-Examples of good principles:
-- "Spatial resolution × map size × branching factor determines peak memory; estimate before coding."
-- "Algorithm latency must be bounded relative to control loop frequency; otherwise state estimation diverges."
-- "Sim-to-real gap is largest for contact-rich or high-frequency tasks; validate with real hardware at first milestone."
-- "Gradient-based optimizers diverge when reward scale differs by orders of magnitude across terms; normalize first."
+anchors — DEFAULT to []. Most experiences yield no anchor. Do NOT extract for the sake of it.
+An anchor is a CONCRETE device/physics fact an LLM would otherwise ignore or get wrong — a
+measured limit, hardware behavior, datasheet/spec value, or reproducible quirk. It is NOT a
+transferable mechanism (that is abstract_principle) and NOT a task step.
+Add an anchor ONLY when ALL hold:
+  - a concrete, specific physical/device fact grounded in THIS experiment's evidence
+    (a measurement, observation, or cited spec);
+  - it would change future planning or debugging;
+  - it is NOT already in the "Known anchors" list below (do not duplicate).
+Omit anything vague, speculative, one-off, or common knowledge. Max 2 anchors.
+Each anchor: {"title","domain","scope":"global|robot|code","fact","mechanism","implication","confidence_tier":"observed|reproduced|derived|reported|hypothesis","evidence_refs":[]}
 
-Return only the principle text. No JSON, no explanation, no preamble.`
+Example — anchor: "Go2 actuator latency ≈ 8 ms under load"; principle: "latency must be bounded
+relative to control-loop frequency". The first is a concrete fact, the second a rule.`
 
 function hashForCache(text: string): string {
   let h = 5381
@@ -29,6 +41,35 @@ function hashForCache(text: string): string {
     h = (h * 33) ^ text.charCodeAt(i)
   }
   return (h >>> 0).toString(36)
+}
+
+interface Distillation {
+  abstractPrinciple?: string
+  anchors: Array<Record<string, unknown>>
+}
+
+/**
+ * Parse the combined-distillation JSON. Tolerant of code fences and of a bare
+ * principle line (legacy/degraded responses): if no JSON object is found but
+ * text is present, treat the whole text as the abstract principle with no anchors.
+ */
+function parseDistillation(raw: string | null): Distillation {
+  if (!raw?.trim()) return { anchors: [] }
+  try {
+    const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim()
+    const match = cleaned.match(/\{[\s\S]*\}/)
+    if (!match) return { abstractPrinciple: cleaned.slice(0, 400), anchors: [] }
+    const parsed = JSON.parse(match[0]) as unknown
+    if (!parsed || typeof parsed !== 'object') return { anchors: [] }
+    const obj = parsed as Record<string, unknown>
+    const ap = typeof obj['abstract_principle'] === 'string' ? obj['abstract_principle'].trim() : undefined
+    const anchors = Array.isArray(obj['anchors'])
+      ? obj['anchors'].filter((a): a is Record<string, unknown> => Boolean(a) && typeof a === 'object' && !Array.isArray(a))
+      : []
+    return { abstractPrinciple: ap || undefined, anchors }
+  } catch {
+    return { anchors: [] }
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -47,6 +88,8 @@ export function createExperienceWriteTool(
   _store: ExperienceStore,
   pendingStore: ExperiencePendingStore,
   flash?: FlashClient,
+  anchorStore?: PhysicalAnchorStore,
+  anchorPendingStore?: PhysicalAnchorPendingStore,
 ): MetaAgentTool {
   return {
     name: 'experience_write',
@@ -161,6 +204,22 @@ export function createExperienceWriteTool(
           type: 'number',
           description: 'Unix timestamp in ms when this lesson was last verified',
         },
+        principle_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Committed principle IDs (pr_…) this experience applied or tested. ' +
+            'Usually empty — set ONLY when a known principle genuinely informed this work, ' +
+            'so its outcome can reinforce or challenge that principle. Do not invent IDs.',
+        },
+        anchor_ids: {
+          type: 'array',
+          items: { type: 'string' },
+          description:
+            'Physical anchor IDs (pa_…) this experiment validated or relied on. ' +
+            'Usually empty — set ONLY when the experiment genuinely bore on a known physical fact, ' +
+            'so its outcome can corroborate or contradict that anchor. Do not invent IDs.',
+        },
       },
     },
     async call(input): Promise<ToolResult> {
@@ -177,28 +236,66 @@ export function createExperienceWriteTool(
         const title = normalized.value.title
         const success = normalized.value.success
 
-        // ── Extract abstract principle via flash (30 s timeout) ───────────
-        // The principle supports same-domain matching in ExperiencePatternChecker.
-        // On timeout or error we proceed without it — the entry is still useful.
+        // ── Combined distillation via flash (one call) ────────────────────
+        // Always yields the abstract principle; strictly yields 0-2 physical
+        // anchor candidates. On timeout/error we proceed without either — the
+        // experience entry is still useful.
         let abstractPrinciple: string | undefined
+        let anchorTitles: string[] = []
         if (flash) {
+          // Dedup context: known anchors in this domain so flash won't re-propose.
+          let knownAnchors = ''
+          if (anchorStore) {
+            const existing = await anchorStore
+              .search({ domain: normalized.value.domain, robot: normalized.value.robot, limit: 10 })
+              .catch(() => [])
+            knownAnchors = existing.map(a => `- ${a.title}: ${a.fact.slice(0, 120)}`).join('\n')
+          }
           const userContext = [
             `Title: ${title}`,
             `Domain: ${normalized.value.domain}`,
+            normalized.value.robot ? `Robot: ${normalized.value.robot}` : '',
             `Outcome: ${success ? 'success' : 'failure'}`,
             `Problem: ${normalized.value.problem.slice(0, 300)}`,
             `Solution: ${normalized.value.solution.slice(0, 400)}`,
             normalized.value.failureReason ? `Failure reason: ${normalized.value.failureReason.slice(0, 200)}` : '',
+            '',
+            `Known anchors (do not duplicate):\n${knownAnchors || '(none)'}`,
           ].filter(Boolean).join('\n')
 
           const raw = await flash.query({
-            system: PRINCIPLE_SYSTEM,
+            system: EXPERIENCE_DISTILL_SYSTEM,
             user: userContext,
-            maxTokens: 120,
+            maxTokens: 600,
             timeoutMs: 30_000,
-            cacheKey: `principle:${hashForCache(userContext)}`,
+            cacheKey: `distill:${hashForCache(userContext)}`,
           })
-          if (raw?.trim()) abstractPrinciple = raw.trim().slice(0, 400)
+          const distilled = parseDistillation(raw)
+          if (distilled.abstractPrinciple) abstractPrinciple = distilled.abstractPrinciple.slice(0, 400)
+
+          // Queue any strict anchor candidates (cap 2) for /anchor review.
+          if (anchorPendingStore && distilled.anchors.length > 0) {
+            for (const anchor of distilled.anchors.slice(0, MAX_ANCHORS_PER_EXPERIENCE)) {
+              const candidate: Record<string, unknown> = {
+                domain: anchor['domain'] ?? normalized.value.domain,
+                scope: anchor['scope'] ?? 'code',
+                title: anchor['title'],
+                fact: anchor['fact'],
+                mechanism: anchor['mechanism'],
+                implication: anchor['implication'],
+                confidence_tier: anchor['confidence_tier'] ?? 'observed',
+                evidence_refs: anchor['evidence_refs'],
+                ...(normalized.value.robot ? { robot: normalized.value.robot } : {}),
+              }
+              if (!validatePhysicalAnchorInput(candidate).ok) continue
+              try {
+                anchorPendingStore.add(candidate)
+                anchorTitles.push(String(anchor['title']))
+              } catch {
+                // Queue full or invalid — skip this anchor, keep the experience.
+              }
+            }
+          }
         }
 
         // ── Queue in pending buffer ───────────────────────────────────────
@@ -214,6 +311,9 @@ export function createExperienceWriteTool(
             `标题: ${title}\n` +
             `结果: ${success ? '✅ 成功' : '❌ 失败'}\n` +
             (abstractPrinciple ? `原理: ${abstractPrinciple}\n` : '') +
+            (anchorTitles.length
+              ? `物理锚点候选: ${anchorTitles.join('; ')}（已入 /anchor review 队列）\n`
+              : '') +
             `\n此条经验不会自动写入共享知识库。\n` +
             `请在对话结束后运行 /experience review 进行审核，` +
             `由你决定是否提交、编辑或丢弃。`,

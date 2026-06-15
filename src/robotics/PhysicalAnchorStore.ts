@@ -34,7 +34,10 @@ export function isPhysicalAnchorId(id: string): boolean {
 }
 
 function anchorScore(anchor: PhysicalAnchorEntry): number {
-  return CONFIDENCE_WEIGHT[anchor.confidenceTier] + Math.min(anchor.evidenceRefs.length, 8) * 10
+  return CONFIDENCE_WEIGHT[anchor.confidenceTier]
+    + Math.min(anchor.evidenceRefs.length, 8) * 10
+    + Math.min(anchor.observationCount ?? 0, 10) * 8
+    - (anchor.contradictionCount ?? 0) * 50
 }
 
 export class PhysicalAnchorStore {
@@ -71,6 +74,59 @@ export class PhysicalAnchorStore {
   async load(id: string): Promise<PhysicalAnchorEntry | null> {
     if (!isPhysicalAnchorId(id)) return null
     return readJsonFile<PhysicalAnchorEntry>(join(this.dir, `${id}.json`))
+  }
+
+  /**
+   * Record a later experiment outcome against a committed anchor:
+   *   - 'observation'   → an experiment corroborated the physical fact (raises score)
+   *   - 'contradiction' → an experiment observed the fact NOT to hold (lowers score by
+   *     50, so a falsified anchor sinks in search and surfaces for human re-review).
+   * Returns the updated entry, or null when the anchor does not exist.
+   */
+  async recordOutcomeSignal(
+    id: string,
+    kind: 'observation' | 'contradiction',
+  ): Promise<PhysicalAnchorEntry | null> {
+    const a = await this.load(id)
+    if (!a) return null
+    const updated: PhysicalAnchorEntry = {
+      ...a,
+      observationCount: (a.observationCount ?? 0) + (kind === 'observation' ? 1 : 0),
+      contradictionCount: (a.contradictionCount ?? 0) + (kind === 'contradiction' ? 1 : 0),
+      lastVerifiedAt: kind === 'observation' ? Date.now() : a.lastVerifiedAt,
+      updatedAt: Date.now(),
+    }
+    await atomicWriteJson(join(this.dir, `${id}.json`), updated)
+    await this._upsertManifest(updated).catch(() => undefined)
+    return updated
+  }
+
+  recordObservation(id: string): Promise<PhysicalAnchorEntry | null> {
+    return this.recordOutcomeSignal(id, 'observation')
+  }
+
+  recordContradiction(id: string): Promise<PhysicalAnchorEntry | null> {
+    return this.recordOutcomeSignal(id, 'contradiction')
+  }
+
+  /**
+   * Back-link a committed principle that cites this anchor as physical support.
+   * Enables contradiction propagation (anchor falsified → flag dependent principles).
+   * Returns true when the anchor exists (idempotent on duplicates).
+   */
+  async appendPrincipleReference(anchorId: string, principleId: string): Promise<boolean> {
+    const a = await this.load(anchorId)
+    if (!a) return false
+    const principleIds = a.principleIds ?? []
+    if (principleIds.includes(principleId)) return true
+    const updated: PhysicalAnchorEntry = {
+      ...a,
+      principleIds: [...principleIds, principleId],
+      updatedAt: Date.now(),
+    }
+    await atomicWriteJson(join(this.dir, `${anchorId}.json`), updated)
+    await this._upsertManifest(updated).catch(() => undefined)
+    return true
   }
 
   /**

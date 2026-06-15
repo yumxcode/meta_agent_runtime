@@ -19,6 +19,13 @@ import type { PrincipleStore } from './PrincipleStore.js'
  */
 export const PRINCIPLE_PROMOTION_SCORE_THRESHOLD = 450
 
+/**
+ * Convergence threshold: the minimum number of distinct experiences that must
+ * share one mechanism before a cluster may be promoted to a principle. A single
+ * experience is only ever an observation point, never a principle.
+ */
+export const N_CONVERGENCE = 3
+
 export type PrinciplePromotionReason = 'confidence_threshold' | 'explicit_user_request'
 
 export interface PrinciplePromotionResult {
@@ -26,12 +33,16 @@ export interface PrinciplePromotionResult {
   pendingId?: string
   reason:
     | 'below_threshold'
+    | 'below_convergence'
     | 'missing_experience'
     | 'missing_flash'
     | 'flash_failed'
+    | 'rejected_by_judge'
     | 'already_promoted'
     | 'already_pending'
     | 'queued'
+  /** One-sentence reason the abstraction judge declined, when reason === 'rejected_by_judge'. */
+  judgeReason?: string
   score?: number
 }
 
@@ -97,17 +108,23 @@ export async function proposePrincipleFromExperience(opts: {
   })
   if (!raw) return { promoted: false, reason: 'flash_failed', score }
 
-  const proposal = parsePrincipleProposal(raw)
-  if (!proposal) return { promoted: false, reason: 'flash_failed', score }
+  const judged = parsePrincipleJudgement(raw)
+  if (judged.kind === 'invalid') return { promoted: false, reason: 'flash_failed', score }
+  if (judged.kind === 'reject') {
+    return { promoted: false, reason: 'rejected_by_judge', judgeReason: judged.reason, score }
+  }
+  const proposal = judged.proposal
+
+  const derivedIds = filterRejectedMembers(
+    ensureIncludes(proposal['derived_from_experience_ids'] as string[] | undefined, experience.id),
+    proposal['rejected_members'],
+  )
 
   const pendingId = opts.pendingStore.add({
     ...proposal,
     promotion_reason: opts.reason,
     source_experience_id: experience.id,
-    derived_from_experience_ids: ensureIncludes(
-      proposal['derived_from_experience_ids'] as string[] | undefined,
-      experience.id,
-    ),
+    derived_from_experience_ids: derivedIds,
     confidence_tier: proposal['confidence_tier'] ?? experience.confidenceTier ?? 'observed',
     observation_count: proposal['observation_count'] ?? experience.observationCount ?? 1,
     contradiction_count: proposal['contradiction_count'] ?? experience.contradictionCount ?? 0,
@@ -117,16 +134,121 @@ export async function proposePrincipleFromExperience(opts: {
   return { promoted: true, pendingId, reason: 'queued', score }
 }
 
+/**
+ * Promote a CONVERGENT CLUSTER of experiences into one principle candidate.
+ *
+ * Unlike the single-experience path, the trigger here is mechanism convergence
+ * across ≥ N distinct experiences. The Flash judge may still REJECT the whole
+ * cluster (default-reject prompt), or trim non-fitting members via
+ * `rejected_members`; if the retained set falls below `minRetained` the cluster
+ * is rejected as below_convergence rather than forced through.
+ */
+export async function proposePrincipleFromCluster(opts: {
+  cluster: ExperienceEntry[]
+  /** The experience whose commit triggered this evaluation (becomes source_experience_id). */
+  trigger: ExperienceEntry
+  anchorStore: PhysicalAnchorStore
+  pendingStore: PrinciplePendingStore
+  flash?: FlashClient | null
+  /** Confidence tier computed from source diversity (see diversityTier). */
+  tier: ExperienceEntry['confidenceTier']
+  minRetained?: number
+}): Promise<PrinciplePromotionResult> {
+  const minRetained = opts.minRetained ?? N_CONVERGENCE
+  if (opts.cluster.length < minRetained) return { promoted: false, reason: 'below_convergence' }
+  if (!opts.flash) return { promoted: false, reason: 'missing_flash' }
+
+  const domain = opts.trigger.domain
+  const anchors = await opts.anchorStore.search({ domain, robot: opts.trigger.robot, limit: 8 })
+
+  const clusterIds = opts.cluster.map(e => e.id).join(',')
+  const raw = await opts.flash.query({
+    system: PRINCIPLE_PROMOTION_SYSTEM,
+    user: formatClusterPromotionInput(opts.cluster, anchors),
+    maxTokens: 1_000,
+    timeoutMs: 30_000,
+    cacheKey: `principle-cluster:${domain}:${clusterIds}`,
+  })
+  if (!raw) return { promoted: false, reason: 'flash_failed' }
+
+  const judged = parsePrincipleJudgement(raw)
+  if (judged.kind === 'invalid') return { promoted: false, reason: 'flash_failed' }
+  if (judged.kind === 'reject') {
+    return { promoted: false, reason: 'rejected_by_judge', judgeReason: judged.reason }
+  }
+  const proposal = judged.proposal
+
+  // Trim members the judge flagged as not fitting the mechanism, then ensure the
+  // retained set is still convergent. Default to the full cluster when the model
+  // omits derived_from_experience_ids.
+  const proposed = proposal['derived_from_experience_ids'] as string[] | undefined
+  const clusterIdSet = new Set(opts.cluster.map(e => e.id))
+  const base = Array.isArray(proposed) && proposed.some(id => clusterIdSet.has(id))
+    ? proposed.filter(id => clusterIdSet.has(id))
+    : opts.cluster.map(e => e.id)
+  const retained = filterRejectedMembers(base, proposal['rejected_members'])
+  if (retained.length < minRetained) return { promoted: false, reason: 'below_convergence' }
+
+  // Ground the principle: union the Flash-proposed anchors with anchors the
+  // retained cluster experiences already validated, so a newborn principle is
+  // anchored on the physical facts its evidence rests on (§2.4 晋升时接锚点).
+  const retainedSet = new Set(retained)
+  const sharedAnchorIds = new Set<string>()
+  for (const e of opts.cluster) {
+    if (!retainedSet.has(e.id)) continue
+    for (const aid of e.anchorIds ?? []) sharedAnchorIds.add(aid)
+  }
+  const proposedAnchors = Array.isArray(proposal['anchored_by_physical_anchor_ids'])
+    ? (proposal['anchored_by_physical_anchor_ids'] as unknown[]).filter((v): v is string => typeof v === 'string')
+    : []
+  const anchoredBy = [...new Set([...proposedAnchors, ...sharedAnchorIds])]
+
+  const pendingId = opts.pendingStore.add({
+    ...proposal,
+    promotion_reason: 'confidence_threshold',
+    source_experience_id: opts.trigger.id,
+    derived_from_experience_ids: retained,
+    anchored_by_physical_anchor_ids: anchoredBy,
+    confidence_tier: opts.tier ?? proposal['confidence_tier'] ?? 'observed',
+    observation_count: proposal['observation_count'] ?? retained.length,
+    contradiction_count: 0,
+    last_verified_at: proposal['last_verified_at'] ?? opts.trigger.lastVerifiedAt,
+  })
+
+  return { promoted: true, pendingId, reason: 'queued' }
+}
+
 const PRINCIPLE_PROMOTION_SYSTEM = `\
-You promote robotics experiences into a reusable Principle candidate.
+You evaluate whether a CLUSTER of robotics experiences justifies ONE reusable principle.
 
-Return JSON only. The candidate will go to human review before it is committed.
+Default to REJECT. Most clusters do not deserve a principle. Do not abstract for the sake
+of abstracting — a false principle pollutes the knowledge base and misleads future agents.
+Return JSON only. The candidate, if any, goes to human review before it is committed.
 
-Principle means: a transferable causal or constraint structure, not a one-off fact and not an action recipe.
-It must explicitly state boundaries so future agents know when it applies and when it does not.
+A principle is a transferable causal or constraint structure — not a one-off fact, not an
+action recipe, not a restatement of the observations.
 
-Schema:
+REJECT — return {"promote": false, "reason": "<one sentence>"} — when ANY holds:
+- The experiences are only superficially or coincidentally similar; no single shared
+  causal or constraint mechanism actually links them.
+- You cannot state a mechanism (WHY it holds) grounded in physics, math, control, signal,
+  or statistics — restating the observation is NOT a mechanism.
+- It is a one-off fact, an environment/version/tooling quirk, or a workaround, not
+  transferable within the domain.
+- It is an action recipe ("do X then Y") rather than a causal or constraint structure.
+- It is too vague to bound — you cannot state real preconditions or non-applicable cases.
+- It merely restates something trivially obvious or true by definition.
+- The evidence is too thin or internally contradictory to trust.
+
+PROMOTE — return the full schema with "promote": true — ONLY when ALL hold:
+- A single transferable mechanism genuinely explains EVERY retained experience.
+- You can articulate why it holds from first principles.
+- You can state concrete boundaries: when it applies AND when it does not.
+- It would actually change a future agent's decision in this domain.
+
+Schema when promoting:
 {
+  "promote": true,
   "title": "short name",
   "statement": "transferable principle",
   "mechanism": "why it holds",
@@ -136,7 +258,8 @@ Schema:
   "preconditions": ["conditions required for the principle to apply"],
   "applicability_bounds": ["numeric, structural, or context bounds"],
   "non_applicable_when": ["clear exclusions"],
-  "derived_from_experience_ids": ["experience ids"],
+  "derived_from_experience_ids": ["experience ids that fit the mechanism"],
+  "rejected_members": ["cluster experience ids that do NOT fit — do not fold them in"],
   "anchored_by_physical_anchor_ids": ["physical anchor ids"],
   "evidence_refs": ["logs, commits, reports, papers, datasheets"],
   "invalidated_assumptions": ["assumptions this principle corrects"],
@@ -147,9 +270,12 @@ Schema:
 }
 
 Rules:
-- Use physical anchors when they genuinely constrain the principle; otherwise leave the anchor list empty.
+- Prefer rejecting over forcing a weak principle.
+- If only a subset of the cluster shares the mechanism, promote on that subset and list the
+  rest in rejected_members.
+- Use physical anchors only when they genuinely constrain the principle; otherwise leave empty.
 - Use first_principles_support for foundational reasons, not citations.
-- Bound the principle narrowly enough to avoid overgeneralization.
+- Bound narrowly; never overgeneralize beyond the evidence.
 - Do not invent measurements; use only provided evidence.`
 
 function formatExperienceBlock(e: ExperienceEntry): string {
@@ -210,17 +336,34 @@ function formatPromotionInput(
   ].join('\n')
 }
 
-function parsePrincipleProposal(raw: string): Record<string, unknown> | null {
+type PromotionJudgement =
+  | { kind: 'invalid' }
+  | { kind: 'reject'; reason: string }
+  | { kind: 'promote'; proposal: Record<string, unknown> }
+
+/**
+ * Parse the Flash judge's response. The strict prompt may abstain via
+ * `{"promote": false, "reason": ...}`; an explicit promote:false is the ONLY
+ * abstain signal. A body with no `promote` field but a real proposal is treated
+ * as a promotion (backward compatible) and validated downstream.
+ */
+function parsePrincipleJudgement(raw: string): PromotionJudgement {
   try {
     const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/i, '').trim()
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) return null
+    if (!jsonMatch) return { kind: 'invalid' }
     const parsed = JSON.parse(jsonMatch[0]) as unknown
-    return parsed && typeof parsed === 'object' && !Array.isArray(parsed)
-      ? parsed as Record<string, unknown>
-      : null
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) return { kind: 'invalid' }
+    const obj = parsed as Record<string, unknown>
+    if (obj['promote'] === false) {
+      const reason = typeof obj['reason'] === 'string' && obj['reason'].trim()
+        ? obj['reason'].trim().slice(0, 300)
+        : 'cluster does not justify a transferable principle'
+      return { kind: 'reject', reason }
+    }
+    return { kind: 'promote', proposal: obj }
   } catch {
-    return null
+    return { kind: 'invalid' }
   }
 }
 
@@ -228,4 +371,42 @@ function ensureIncludes(values: string[] | undefined, required: string): string[
   const out = Array.isArray(values) ? values.filter(v => typeof v === 'string') : []
   if (!out.includes(required)) out.unshift(required)
   return out
+}
+
+/** Drop any experience IDs the judge flagged as not fitting the mechanism. */
+function filterRejectedMembers(ids: string[], rejected: unknown): string[] {
+  if (!Array.isArray(rejected) || rejected.length === 0) return ids
+  const drop = new Set(rejected.filter((v): v is string => typeof v === 'string'))
+  const kept = ids.filter(id => !drop.has(id))
+  // Never return empty if everything was dropped — fall back to the original set
+  // so the caller's minRetained check decides, rather than silently zeroing out.
+  return kept.length > 0 ? kept : ids
+}
+
+function formatClusterPromotionInput(
+  cluster: ExperienceEntry[],
+  anchors: Awaited<ReturnType<PhysicalAnchorStore['search']>>,
+): string {
+  const clusterBlock = cluster.map(formatExperienceBlock).join('\n\n')
+  const anchorBlock = anchors.map(a => [
+    `ID: ${a.id}`,
+    `Domain: ${a.domain}`,
+    `Scope: ${a.scope}`,
+    a.robot ? `Robot: ${a.robot}` : '',
+    `Confidence: ${a.confidenceTier}`,
+    `Fact: ${a.fact}`,
+    a.mechanism ? `Mechanism: ${a.mechanism}` : '',
+    `Implication: ${a.implication}`,
+    a.evidenceRefs.length ? `Evidence refs: ${a.evidenceRefs.join('; ')}` : '',
+  ].filter(Boolean).join('\n')).join('\n\n')
+
+  return [
+    'Promotion trigger: mechanism convergence across a cluster of experiences',
+    '',
+    'Candidate cluster (judge whether ONE mechanism explains these):',
+    clusterBlock,
+    '',
+    'Candidate physical anchors:',
+    anchorBlock || '(none)',
+  ].join('\n')
 }

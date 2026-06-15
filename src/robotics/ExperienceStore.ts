@@ -128,6 +128,23 @@ export class ExperienceStore {
     return true
   }
 
+  /** Link a physical anchor this experience applied/validated/contradicted. Idempotent. */
+  async appendAnchorReference(experienceId: string, anchorId: string): Promise<boolean> {
+    if (!isExperienceId(experienceId)) return false
+    const entry = await this.load(experienceId)
+    if (!entry) return false
+    const anchorIds = entry.anchorIds ?? []
+    if (anchorIds.includes(anchorId)) return true
+    const updated: ExperienceEntry = {
+      ...entry,
+      anchorIds: [...anchorIds, anchorId],
+      updatedAt: Date.now(),
+    }
+    await atomicWriteJson(join(this.dir, `${experienceId}.json`), updated)
+    await this.rebuildIndex()
+    return true
+  }
+
   /**
    * Permanently delete a committed experience by ID and rebuild the index.
    * Returns true if the file existed and was removed.

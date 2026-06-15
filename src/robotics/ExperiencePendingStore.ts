@@ -147,6 +147,8 @@ export class ExperiencePendingStore {
         contradictionCount: normalized.value.contradictionCount,
         invalidatedAssumptions: normalized.value.invalidatedAssumptions,
         lastVerifiedAt: normalized.value.lastVerifiedAt,
+        principleIds: normalized.value.principleIds,
+        anchorIds: normalized.value.anchorIds,
       })
       this.remove(pendingId)
       return id
@@ -218,6 +220,10 @@ type NormalizedExperienceInput = {
   contradictionCount?: number
   invalidatedAssumptions?: string[]
   lastVerifiedAt?: number
+  /** Committed principle IDs this experience applied or tested. Usually empty. */
+  principleIds?: string[]
+  /** Physical anchor IDs this experience applied/validated. Usually empty. */
+  anchorIds?: string[]
 }
 
 export function validateExperienceInput(input: Record<string, unknown>): { ok: true; value: NormalizedExperienceInput } | { ok: false } {
@@ -255,8 +261,28 @@ export function validateExperienceInput(input: Record<string, unknown>): { ok: t
       contradictionCount: normalizeNonNegativeInteger(input['contradiction_count'], 0),
       invalidatedAssumptions: normalizeStringArray(input['invalidated_assumptions'], 10, 240),
       lastVerifiedAt: normalizeTimestamp(input['last_verified_at']),
+      principleIds: normalizePrincipleIds(input['principle_ids']),
+      anchorIds: normalizeIdList(input['anchor_ids'], PHYSICAL_ANCHOR_ID_RE),
     },
   }
+}
+
+const PRINCIPLE_ID_RE = /^pr_[0-9a-z]+_[0-9a-f]{8}$/
+const PHYSICAL_ANCHOR_ID_RE = /^pa_[0-9a-z]+_[0-9a-f]{8}$/
+
+/** Keep only well-formed, de-duplicated principle IDs (≤ 20). */
+function normalizePrincipleIds(value: unknown): string[] | undefined {
+  return normalizeIdList(value, PRINCIPLE_ID_RE)
+}
+
+/** Keep only well-formed, de-duplicated IDs matching `re` (≤ 20). */
+function normalizeIdList(value: unknown, re: RegExp): string[] | undefined {
+  if (!Array.isArray(value)) return undefined
+  const out = [...new Set(
+    value.filter((v): v is string => typeof v === 'string' && re.test(v.trim()))
+      .map(v => v.trim()),
+  )].slice(0, 20)
+  return out.length ? out : undefined
 }
 
 function requiredString(value: unknown, max: number): string | null {
