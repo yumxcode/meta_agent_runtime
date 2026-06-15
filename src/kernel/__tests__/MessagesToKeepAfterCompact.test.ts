@@ -143,4 +143,71 @@ describe('buildMessagesToKeepAfterCompact', () => {
     // The tail after the steer message is still preserved
     expect(JSON.stringify(kept)).toContain('t2')
   })
+
+  it('keeps steering corrections verbatim inside their chronological unit', () => {
+    const steer: KernelMessage = {
+      uuid: crypto.randomUUID(),
+      role: 'user',
+      isSteering: true,
+      content: [{ type: 'text', text: formatSteeringMessage('切换到 isaac-gym-v19') }],
+    }
+    const msgs: KernelMessage[] = [
+      user('train the policy'),
+      assistantCall('t1'), toolResult('t1', 'r1'),
+      steer,
+      assistantCall('t2'), toolResult('t2', 'r2'),
+    ]
+    const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS)
+    // The steering text must survive the compaction keep-set
+    expect(JSON.stringify(kept)).toContain('isaac-gym-v19')
+    // The pre-steering unit (t1) must also survive — steering must not shrink
+    // the preserved tail to only post-steering work.
+    expect(JSON.stringify(kept)).toContain('t1')
+  })
+
+  it('clones budget-evicted steering corrections right after the user anchor', () => {
+    const big = 'x'.repeat(4000) // ~1000 tokens per result
+    const steer: KernelMessage = {
+      uuid: crypto.randomUUID(),
+      role: 'user',
+      isSteering: true,
+      content: [{ type: 'text', text: formatSteeringMessage('不要再修改 reward,只调 lr') }],
+    }
+    const msgs: KernelMessage[] = [
+      user('task'),
+      assistantCall('t1'), toolResult('t1', big),
+      steer, // rides in unit t1, which the budget below will evict
+      assistantCall('t2'), toolResult('t2', big),
+      assistantCall('t3'), toolResult('t3', big),
+    ]
+    // Budget that fits ~1 unit only → unit t1 (carrying the steer) is evicted
+    const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS, 1200)
+    expect(JSON.stringify(kept)).not.toContain('"t1"')
+    // …but the steering correction itself must be re-cloned into the keep-set
+    expect(JSON.stringify(kept)).toContain('只调 lr')
+    const steerClone = kept.find(m => m.isSteering)
+    expect(steerClone).toBeDefined()
+    expect(steerClone!.uuid).not.toBe(steer.uuid) // clone, not alias
+    // Protocol-valid after summary placement
+    const wire = normalizeMessagesForAPI([
+      { uuid: 's', role: 'user', content: [{ type: 'text', text: 'SUMMARY' }], isCompactSummary: true },
+      ...kept,
+    ])
+    expect(wire[0]!.role).toBe('user')
+  })
+
+  it('marks user/steering text clones with isKeepSetClone + sourceUuid (F-3)', () => {
+    const original = user('analyze V10-c')
+    const msgs: KernelMessage[] = [
+      original,
+      assistantCall('t1'), toolResult('t1', 'r1'),
+    ]
+    const kept = buildMessagesToKeepAfterCompact(msgs, NO_TOOLS)
+    const clone = kept[0]!
+    expect(clone.isKeepSetClone).toBe(true)
+    expect(clone.sourceUuid).toBe(original.uuid)
+    expect(clone.uuid).not.toBe(original.uuid)
+    // Kept tail units keep their ORIGINAL uuids (needed for F-2 dedupe)
+    expect(kept.slice(1).map(m => m.uuid)).toEqual(msgs.slice(1).map(m => m.uuid))
+  })
 })

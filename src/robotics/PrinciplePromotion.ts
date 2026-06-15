@@ -3,15 +3,35 @@ import type { ExperienceEntry } from './types.js'
 import { experienceRetrievalScore, type ExperienceStore } from './ExperienceStore.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import type { PrinciplePendingStore } from './PrinciplePendingStore.js'
+import type { PrincipleStore } from './PrincipleStore.js'
 
-export const PRINCIPLE_PROMOTION_SCORE_THRESHOLD = 500
+/**
+ * Auto-promotion threshold against experienceRetrievalScore
+ * (= CONFIDENCE_WEIGHT[tier] + min(observations,10)*8 − contradictions*40).
+ *
+ * At 450 the auto path admits:
+ *   - reproduced (500 base)            → always
+ *   - observed (400 base) with obs ≥ 7 → 400 + 7*8 = 456 ≥ 450
+ * and still excludes derived (≤430), reported (≤280), hypothesis (≤180), which
+ * can only become principles via an explicit user request. The earlier value of
+ * 500 made the observation-count term dead weight (observed peaked at 480 < 500,
+ * so ONLY reproduced could ever auto-promote regardless of corroboration).
+ */
+export const PRINCIPLE_PROMOTION_SCORE_THRESHOLD = 450
 
 export type PrinciplePromotionReason = 'confidence_threshold' | 'explicit_user_request'
 
 export interface PrinciplePromotionResult {
   promoted: boolean
   pendingId?: string
-  reason: 'below_threshold' | 'missing_experience' | 'missing_flash' | 'flash_failed' | 'queued'
+  reason:
+    | 'below_threshold'
+    | 'missing_experience'
+    | 'missing_flash'
+    | 'flash_failed'
+    | 'already_promoted'
+    | 'already_pending'
+    | 'queued'
   score?: number
 }
 
@@ -29,6 +49,8 @@ export async function proposePrincipleFromExperience(opts: {
   experienceStore: ExperienceStore
   anchorStore: PhysicalAnchorStore
   pendingStore: PrinciplePendingStore
+  /** Committed principle store — enables dedup against already-promoted principles. */
+  principleStore?: PrincipleStore | null
   flash?: FlashClient | null
   reason: PrinciplePromotionReason
   threshold?: number
@@ -40,6 +62,19 @@ export async function proposePrincipleFromExperience(opts: {
   if (opts.reason === 'confidence_threshold' && !shouldTriggerPrinciplePromotion(experience, opts.threshold)) {
     return { promoted: false, reason: 'below_threshold', score }
   }
+
+  // Dedup: never queue a second principle for an experience that already has a
+  // committed or pending one. Without this the confidence_threshold path re-fires
+  // a fresh candidate every time the experience is re-reviewed, proliferating
+  // near-duplicate principles.
+  if (opts.principleStore) {
+    const committed = await opts.principleStore.search({ experienceId: opts.experienceId, limit: 1 })
+    if (committed.length > 0) return { promoted: false, reason: 'already_promoted', score }
+  }
+  if (opts.pendingStore.hasPendingForExperience(opts.experienceId)) {
+    return { promoted: false, reason: 'already_pending', score }
+  }
+
   if (!opts.flash) return { promoted: false, reason: 'missing_flash', score }
 
   const related = await opts.experienceStore.search({
@@ -57,7 +92,7 @@ export async function proposePrincipleFromExperience(opts: {
     system: PRINCIPLE_PROMOTION_SYSTEM,
     user: formatPromotionInput(experience, related, anchors, opts.reason),
     maxTokens: 1_000,
-    timeoutMs: 8_000,
+    timeoutMs: 30_000,
     cacheKey: `principle-promotion:${opts.reason}:${experience.id}:${score}`,
   })
   if (!raw) return { promoted: false, reason: 'flash_failed', score }
@@ -117,13 +152,8 @@ Rules:
 - Bound the principle narrowly enough to avoid overgeneralization.
 - Do not invent measurements; use only provided evidence.`
 
-function formatPromotionInput(
-  target: ExperienceEntry,
-  related: ExperienceEntry[],
-  anchors: Awaited<ReturnType<PhysicalAnchorStore['search']>>,
-  reason: PrinciplePromotionReason,
-): string {
-  const relatedBlock = related.map(e => [
+function formatExperienceBlock(e: ExperienceEntry): string {
+  return [
     `ID: ${e.id}`,
     `Domain: ${e.domain}`,
     e.robot ? `Robot: ${e.robot}` : '',
@@ -135,7 +165,24 @@ function formatPromotionInput(
     e.outcome.failureReason ? `Failure reason: ${e.outcome.failureReason}` : '',
     e.invalidatedAssumptions?.length ? `Invalidated assumptions: ${e.invalidatedAssumptions.join('; ')}` : '',
     e.evidenceRefs?.length ? `Evidence refs: ${e.evidenceRefs.join('; ')}` : '',
-  ].filter(Boolean).join('\n')).join('\n\n')
+  ].filter(Boolean).join('\n')
+}
+
+function formatPromotionInput(
+  target: ExperienceEntry,
+  related: ExperienceEntry[],
+  anchors: Awaited<ReturnType<PhysicalAnchorStore['search']>>,
+  reason: PrinciplePromotionReason,
+): string {
+  // The TARGET experience is what we are promoting — render it as its own block,
+  // never folded into (or replaced by) the related set. The related search can
+  // exceed its limit or use different filters, so relying on it to surface the
+  // target is unsafe.
+  const targetBlock = formatExperienceBlock(target)
+  const relatedBlock = related
+    .filter(e => e.id !== target.id)
+    .map(formatExperienceBlock)
+    .join('\n\n')
 
   const anchorBlock = anchors.map(a => [
     `ID: ${a.id}`,
@@ -152,8 +199,11 @@ function formatPromotionInput(
   return [
     `Promotion trigger: ${reason}`,
     '',
-    'Target experience:',
-    relatedBlock || `ID: ${target.id}\nPrinciple hint: ${target.abstractPrinciple ?? target.outcome.summary}`,
+    'Target experience (the one being promoted):',
+    targetBlock,
+    '',
+    'Related experiences (same domain/robot — context only):',
+    relatedBlock || '(none)',
     '',
     'Candidate physical anchors:',
     anchorBlock || '(none)',

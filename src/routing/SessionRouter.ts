@@ -48,7 +48,9 @@ import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { clearWebFetchCache } from '../tools/network/web_fetch/index.js'
+import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
+import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
+import { clearWebFetchCache, createWebFetchTool } from '../tools/network/web_fetch/index.js'
 import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js'
 import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
@@ -98,6 +100,7 @@ interface SessionImpl {
   registerTool(tool: MetaAgentTool): void
   interrupt(): void
   steer?(text: string): boolean
+  compactNow?(): Promise<import('../kernel/index.js').ManualCompactResult>
   getMessages(): readonly ConversationMessage[]
   getUsage(): TokenUsage
   getEstimatedCost(): number
@@ -158,12 +161,13 @@ export class SessionRouter {
     // so sending the flash model side-call there would fail with a 404/400.
     // The detector falls back to regex heuristics automatically when this client
     // is null (Task #22 fix).
-    // Fail-fast: 3 s timeout, 1 retry so a slow API never stalls session start.
+    // Flash side-call timeout: 30 s, 1 retry. Slow providers such as GLM may
+    // take 15-30 s to complete, but still fall back safely on timeout.
     this._detectionClient = (this._cfg.apiKey && isAnthropicProvider(this._cfg.baseURL))
       ? new Anthropic({
           apiKey:     this._cfg.apiKey,
           baseURL:    this._cfg.baseURL,
-          timeout:    3_000,
+          timeout:    30_000,
           maxRetries: 1,
         })
       : null
@@ -192,7 +196,8 @@ export class SessionRouter {
 
   /**
    * Return the lightweight Anthropic client used for side-calls (mode detection,
-   * experience summaries, etc.).  This client is short-timeout (3 s) and always
+   * experience summaries, etc.).  This client uses the shared flash side-call
+   * timeout (30 s) and always
    * targets the configured provider's API — it is intentionally separate from the
    * main session client so side-calls never pollute conversation history.
    *
@@ -285,6 +290,17 @@ export class SessionRouter {
    */
   steer(text: string): boolean {
     return this._impl?.steer?.(text) ?? false
+  }
+
+  /**
+   * Manual compaction (/compact) — forwards to the backend. Returns a
+   * not-compacted result when no backend exists yet (nothing to compact).
+   */
+  async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    if (!this._impl?.compactNow) {
+      return { compacted: false, reason: '会话尚未开始，没有可压缩的上下文。' }
+    }
+    return this._impl.compactNow()
   }
 
   getMessages(): readonly ConversationMessage[] {
@@ -433,6 +449,16 @@ export class SessionRouter {
     return null
   }
 
+  async reinforcePrinciplesFromExperience(
+    experienceId: string,
+  ): Promise<Array<{ principleId: string; signal: 'observation' | 'contradiction' }>> {
+    const impl = this._impl as any
+    if (impl && typeof impl.reinforcePrinciplesFromExperience === 'function') {
+      return impl.reinforcePrinciplesFromExperience(experienceId)
+    }
+    return []
+  }
+
   getRoboticsTeamController(): RoboticsTeamController | null {
     if (this._currentMode !== 'robotics') return null
     const impl = this._impl as RoboticsTeamController | undefined
@@ -516,10 +542,31 @@ export class SessionRouter {
   private async _createImpl(mode: SessionMode): Promise<SessionImpl> {
     switch (mode) {
       case 'agentic': {
-        return new MetaAgentSession({
+        const session = new MetaAgentSession({
           ...this._cfgAsConfig(),
           sessionId: this._resumeSessionId,
         })
+        // ── Research sub-agent wiring (shared mechanism with robotics) ──────
+        // research_dispatch runs literature/web research in an ISOLATED
+        // sub-agent context, persists the report under <projectDir>/.meta-agent/
+        // research/, and hands the main agent only a conclusion + report path.
+        // The bridge's tool registry is the session's LIVE map, so tools
+        // registered later (CLI standard tools) are resolvable by sub-agents.
+        const projectDir = this._cfg.projectDir ?? process.cwd()
+        const bridge = new SubAgentBridge(session.getSessionId())
+        bridge.setToolRegistry(session.getToolRegistry())
+        // Sub-agents read full texts in their discarded-after-run context —
+        // override the main agent's budgeted web_fetch with the full variant.
+        bridge.setSubAgentToolOverrides([await createWebFetchTool()])
+        session.registerTool(createResearchDispatchTool({
+          dispatcher: bridge,
+          projectDir,
+          sessionId: session.getSessionId(),
+        }))
+        session.registerTool(makeGetSubAgentStatusTool(bridge))
+        // D11: completion/failure notifications flow into the volatile prefix.
+        session.setSubAgentBridge(bridge)
+        return session
       }
 
       case 'campaign': {

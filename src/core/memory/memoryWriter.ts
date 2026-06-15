@@ -262,6 +262,7 @@ async function callMemoryWriterModel(opts: {
       apiKey: opts.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
       baseURL: opts.baseURL ?? 'https://api.deepseek.com',
       maxRetries: 1,
+      timeout: 30_000,
     })
     const response = await withTimeout(
       client.chat.completions.create({
@@ -272,7 +273,7 @@ async function callMemoryWriterModel(opts: {
           { role: 'user', content: opts.user },
         ],
       }),
-      8_000,
+      30_000,
     )
     return response.choices[0]?.message?.content ?? ''
   }
@@ -294,7 +295,7 @@ async function callMemoryWriterModel(opts: {
       system: opts.system,
       messages: [{ role: 'user', content: opts.user }],
     }),
-    8_000,
+    30_000,
   )
 
   return response.content[0]?.type === 'text' ? response.content[0].text : ''

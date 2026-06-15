@@ -19,17 +19,110 @@ import { emptyUsage, addUsage } from './types/TokenUsage.js'
 import { makeTextUserMessage } from './messages/MessageFactory.js'
 import { FileStateCache } from './session/FileStateCache.js'
 import { createBootstrapState } from './session/BootstrapState.js'
-import { runKernelLoop, type LoopResult, type LoopTerminationReason } from './loop/KernelLoop.js'
+import { runKernelLoop, buildMessagesToKeepAfterCompact, type LoopResult, type LoopTerminationReason } from './loop/KernelLoop.js'
 import type { AutoCompactTrackingState } from './compact/AutoCompact.js'
+import { compactConversation } from './compact/CompactConversation.js'
+import { getMessagesAfterCompactBoundary } from './messages/MessageNormalizer.js'
+import { applyToolResultBudget } from './tools/ToolResultBudget.js'
+import { tokenCountWithEstimation } from './api/TokenCount.js'
+import { assembleSystemPrompt } from './utils/AssembleSystemPrompt.js'
 
-const VOLATILE_CONTEXT_PREFIX_START = '<context>\n'
-const VOLATILE_CONTEXT_PREFIX_END = '\n</context>\n\n---\n\n'
+import { stripVolatileContextPrefix } from './utils/VolatileContext.js'
 
-function stripVolatileContextPrefix(text: string): string {
-  if (!text.startsWith(VOLATILE_CONTEXT_PREFIX_START)) return text
-  const end = text.lastIndexOf(VOLATILE_CONTEXT_PREFIX_END)
-  if (end < 0) return text
-  return text.slice(end + VOLATILE_CONTEXT_PREFIX_END.length)
+/** Result of a manual (user-initiated) compaction. */
+export interface ManualCompactResult {
+  compacted: boolean
+  /** Reason when compacted=false (already-compact, in-flight turn, error…). */
+  reason?: string
+  /** Token estimate of the context BEFORE compaction. */
+  previousTokens?: number
+  /** Token estimate of the context AFTER compaction. */
+  postTokens?: number
+}
+
+/**
+ * Cap for the captured original-goal anchor text. Long enough to keep a
+ * detailed first request verbatim, short enough that the anchor can never
+ * meaningfully contribute to context pressure.
+ */
+const ORIGINAL_GOAL_MAX_CHARS = 2_000
+/**
+ * How many of the session's earliest real user messages are captured into the
+ * "original session goal" anchor. The first message alone often under-specifies
+ * the goal (e.g. "帮我看个问题" followed by the actual task in message 2-3), so
+ * the first few messages are kept together.
+ */
+export const ORIGINAL_GOAL_MESSAGE_COUNT = 3
+/**
+ * Per-message budget for goal messages AFTER the first. Kept small so the
+ * combined goal (2000 + 2×700 + labels) stays under the compact pipeline's
+ * anchor clip limits (CONTINUITY_MAX_ANCHOR_CHARS 4000 / FALLBACK 3600) and
+ * none of the captured messages is silently clipped away downstream.
+ */
+const ORIGINAL_GOAL_FOLLOWUP_MAX_CHARS = 700
+
+/**
+ * Extract the durable goal text from a candidate user message: text blocks
+ * only, volatile prefix stripped, meta/steering/compact artifacts excluded.
+ */
+function extractUserGoalText(
+  message: KernelMessage,
+  maxChars: number = ORIGINAL_GOAL_MAX_CHARS,
+): string | null {
+  if (
+    message.role !== 'user' ||
+    message.isMeta ||
+    message.isCompactSummary ||
+    message.isCompactBoundary ||
+    message.isSteering ||
+    // Keep-set clones are mid-session requests re-emitted by compaction; on a
+    // resumed history they sit at the front and must not be mistaken for the
+    // session's original goal.
+    message.isKeepSetClone ||
+    message.sourceToolAssistantUUID
+  ) return null
+  const text = message.content
+    .filter((block): block is ContentBlock & { type: 'text'; text: string } =>
+      block.type === 'text' && typeof (block as { text?: unknown }).text === 'string')
+    .map(block => stripVolatileContextPrefix(block.text))
+    .join('\n')
+    .trim()
+  if (!text) return null
+  return text.length <= maxChars
+    ? text
+    : `${text.slice(0, maxChars - 14)}… [truncated]`
+}
+
+/**
+ * Collect goal parts from the earliest real user messages (up to `limit`).
+ * Used on the resume path; the live path appends incrementally in submitMessage.
+ */
+export function collectOriginalUserGoalParts(
+  messages: readonly KernelMessage[],
+  limit: number = ORIGINAL_GOAL_MESSAGE_COUNT,
+): string[] {
+  const parts: string[] = []
+  for (const message of messages) {
+    if (parts.length >= limit) break
+    const maxChars = parts.length === 0
+      ? ORIGINAL_GOAL_MAX_CHARS
+      : ORIGINAL_GOAL_FOLLOWUP_MAX_CHARS
+    const goal = extractUserGoalText(message, maxChars)
+    if (goal) parts.push(goal)
+  }
+  return parts
+}
+
+/**
+ * Format captured goal parts into the single anchor string consumed by the
+ * compact pipeline. A single part is returned bare (back-compat with the
+ * pre-existing single-message format); multiple parts are labelled and
+ * indented so they render as one bullet in the continuity anchors.
+ */
+export function formatOriginalUserGoal(parts: readonly string[]): string | null {
+  if (parts.length === 0) return null
+  if (parts.length === 1) return parts[0] ?? null
+  return parts.map((part, i) => `[user message ${i + 1}] ${part}`).join('\n  ')
 }
 
 function stripVolatileContextFromMessages(messages: KernelMessage[]): void {
@@ -86,10 +179,25 @@ export class KernelSession {
   private static readonly MAX_PERMISSION_DENIALS = 1_000
   /** S1: guard against double dispose. */
   private _disposed = false
+  /**
+   * The first ORIGINAL_GOAL_MESSAGE_COUNT real user requests seen by this
+   * session, captured BEFORE any compaction can fold them into a summary.
+   * Multiple messages are kept because the first message alone often
+   * under-specifies the goal (greeting/context first, actual task in message
+   * 2-3). Passed into the compact pipeline as a deterministic "original
+   * session goal" anchor so the goal survives any number of nested
+   * compactions verbatim — the in-history "first user message" anchor
+   * degrades after compaction #1 (it then points at the cloned
+   * last-user-message from the keep-set, not the session's original goal).
+   */
+  private _originalUserGoalParts: string[] = []
 
   constructor(config: KernelConfig) {
     this._config = { ...config }
     this._messages = [...(config.initialMessages ?? [])]
+    // Resume path: recover the goal from the earliest real user messages in
+    // the restored history (best available source — pre-compact history is gone).
+    this._originalUserGoalParts = collectOriginalUserGoalParts(this._messages)
     this._fileCache = new FileStateCache()
     const bootstrap = createBootstrapState(config.cwd, config.sessionId)
     this._sessionId = bootstrap.sessionId
@@ -132,6 +240,13 @@ export class KernelSession {
             }
 
       this._messages.push(userMessage)
+      if (this._originalUserGoalParts.length < ORIGINAL_GOAL_MESSAGE_COUNT) {
+        const maxChars = this._originalUserGoalParts.length === 0
+          ? ORIGINAL_GOAL_MAX_CHARS
+          : ORIGINAL_GOAL_FOLLOWUP_MAX_CHARS
+        const goal = extractUserGoalText(userMessage, maxChars)
+        if (goal) this._originalUserGoalParts.push(goal)
+      }
       this._config.onMessagesUpdate?.(this._messages)
 
       // ── Run the loop. Events are yielded immediately; the terminal result is
@@ -150,6 +265,7 @@ export class KernelSession {
           cumulativeCostUsd: this._totalCostUsd,
           autoCompactTracking: this._autoCompactTracking,
           drainSteering: () => this._steerQueue.splice(0),
+          originalUserGoal: formatOriginalUserGoal(this._originalUserGoalParts) ?? undefined,
         })
 
         let step = await gen.next()
@@ -207,6 +323,69 @@ export class KernelSession {
     if (!trimmed || !this._submitInFlight) return false
     this._steerQueue.push(trimmed)
     return true
+  }
+
+  /**
+   * Manual (user-initiated) compaction — `/compact`.
+   *
+   * Runs the SAME pipeline as auto-compact (summary side-call, keep-set,
+   * deterministic anchors, original-goal anchor, quality gate + fallback) but
+   * bypasses the token-threshold check: the user decides WHEN, the pipeline
+   * decides HOW. Refuses while a turn is in flight — compaction mutates the
+   * message history the loop is iterating.
+   */
+  async compactNow(): Promise<ManualCompactResult> {
+    if (this._submitInFlight) {
+      return { compacted: false, reason: '当前轮次仍在执行中，请等待完成后再压缩。' }
+    }
+
+    stripVolatileContextFromMessages(this._messages)
+    const budgeted = applyToolResultBudget(this._messages, this._config.tools)
+    const messagesForQuery = [...getMessagesAfterCompactBoundary(budgeted)]
+
+    const hasRealUser = messagesForQuery.some(extractUserGoalText)
+    if (messagesForQuery.length < 2 || !hasRealUser) {
+      return { compacted: false, reason: '当前上下文过短，没有可压缩的内容。' }
+    }
+
+    const previousTokens = tokenCountWithEstimation(messagesForQuery)
+    const effectiveSystemPrompt =
+      assembleSystemPrompt(this._config.systemPrompt, this._config.appendSystemPrompt) ?? ''
+
+    try {
+      const result = await compactConversation(messagesForQuery, this._fileCache, {
+        model: this._config.compact?.model,
+        apiKey: this._config.apiKey,
+        baseURL: this._config.baseURL,
+        systemPrompt: effectiveSystemPrompt,
+        customInstructions: this._config.compact?.customInstructions,
+        deterministicAnchors: this._config.compact?.deterministicAnchors,
+        originalUserGoal: formatOriginalUserGoal(this._originalUserGoalParts) ?? undefined,
+        messagesToKeep: buildMessagesToKeepAfterCompact(messagesForQuery, this._config.tools),
+        promptProfile: this._config.compact?.promptProfile,
+        maxRetries: this._config.maxRetries,
+      })
+
+      this._messages.splice(0, this._messages.length, ...result.postCompactMessages)
+      this._autoCompactTracking = {
+        compacted: true,
+        turnId: crypto.randomUUID(),
+        turnCounter: 0,
+        consecutiveFailures: 0,
+      }
+      this._config.onMessagesUpdate?.(this._messages)
+
+      return {
+        compacted: true,
+        previousTokens,
+        postTokens: tokenCountWithEstimation(getMessagesAfterCompactBoundary(this._messages)),
+      }
+    } catch (err) {
+      return {
+        compacted: false,
+        reason: `压缩失败：${err instanceof Error ? err.message : String(err)}`,
+      }
+    }
   }
 
   /** Read-only view of the full message history */

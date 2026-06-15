@@ -195,6 +195,7 @@ export function buildRoboticsDeterministicAnchors(ctx: RoboticsCompactContext): 
   return [
     '## Robotics State Anchors (deterministic)',
     '- Generated from live session state at compaction time; preserved verbatim regardless of summary quality.',
+    '- These reflect the state AT COMPACTION TIME. If the system prompt carries a newer snapshot (hardware profile, phase, progress), the SYSTEM PROMPT wins.',
     '',
     sections.join('\n\n'),
   ].join('\n')

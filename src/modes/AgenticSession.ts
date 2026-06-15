@@ -18,17 +18,7 @@ import { instrumentTool } from '../runtime/instrumentTool.js'
 import { toKernelTool } from './toolAdapter.js'
 import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
-import type { KernelMessage } from '../kernel/index.js'
-
-function toKernelMessages(messages: readonly ConversationMessage[] | undefined): KernelMessage[] {
-  return (messages ?? []).map(message => ({
-    uuid: crypto.randomUUID(),
-    role: message.role,
-    content: typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : message.content as KernelMessage['content'],
-  }))
-}
+import { toKernelMessages } from './messageBridge.js'
 
 export class AgenticSession {
   private readonly _engine: KernelSession
@@ -87,7 +77,7 @@ export class AgenticSession {
       maxRetries: resolved.maxRetries,
       compact: {
         enabled: true,
-        model: resolved.flashModel,
+        model: resolved.compactModel,
         // Lazy thunk (or string) forwarded from the caller; resolved at
         // compaction time inside compactConversation(). RoboticsSession uses
         // this to route its mode-specific compact instructions here instead of
@@ -96,6 +86,10 @@ export class AgenticSession {
         // Deterministic state anchors appended to the compact output in every
         // path; RoboticsSession routes its live-state anchor block here.
         deterministicAnchors: config.compact?.deterministicAnchors,
+        // Per-mode compact section template. RoboticsSession/MetaAgentSession
+        // forward 'robotics'/'agentic' through config.compact; bare agentic
+        // sessions default to the generic 9-section template.
+        promptProfile: config.compact?.promptProfile ?? 'agentic',
       },
       // Thinking on the primary model — sourced from resolved.thinkingConfig
       // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the
@@ -202,6 +196,11 @@ export class AgenticSession {
 
   /** Inject a mid-turn user correction. See KernelSession.steer(). */
   steer(text: string): boolean { return this._engine.steer(text) }
+
+  /** Manual compaction (/compact) — same pipeline as auto-compact, forced. */
+  async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    return this._engine.compactNow()
+  }
 
   /**
    * S1 + S9: Release all per-session resources.  Forwards to the inner

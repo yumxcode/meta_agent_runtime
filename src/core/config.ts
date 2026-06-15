@@ -5,7 +5,7 @@
  * Ref: claude-code-source-code-main/src/QueryEngine.ts → QueryEngineConfig
  *
  * Provider auto-detection:
- *   ZHIPU_API_KEY      → https://open.bigmodel.cn/api/anthropic (GLM coding plan — glm-5.1, Anthropic-format, Bearer auth)
+ *   ZHIPU_API_KEY      → https://open.bigmodel.cn/api/anthropic (GLM coding plan — glm-5.2, Anthropic-format, Bearer auth)
  *   DEEPSEEK_API_KEY   → https://api.deepseek.com              (deepseek-v4-flash, native OpenAI format)
  *   QWEN_API_KEY       → https://dashscope.aliyuncs.com/apps/anthropic  (qwen-max / qwen-plus)
  *   ANTHROPIC_API_KEY  → https://api.anthropic.com            (Claude models)
@@ -17,6 +17,7 @@ import type { EngineeringDomain, MetaAgentTool } from './types.js'
 import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js'
 import type { ThinkingConfig } from '../kernel/index.js'
+import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 import type { OutputStyle } from './dynamicPrompt.js'
 import { loadModelConfigFile } from './modelConfigFile.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
@@ -112,12 +113,19 @@ export interface MetaAgentConfig {
   fallbackModel?: string
 
   /**
-   * Fast auxiliary (flash) model for side-calls: compact summarisation, mode
-   * detection, memory relevance, experience summarisation.  When omitted the
-   * provider's default flash model is used.  Overridable via the global config
-   * file (~/.meta-agent/config.json → flashModel).
+   * Fast auxiliary (flash) model for side-calls: mode detection, memory
+   * relevance, experience summarisation, and other small enrichments. When
+   * omitted the provider's default flash model is used. Overridable via the
+   * global config file (~/.meta-agent/config.json → flashModel).
    */
   flashModel?: string
+
+  /**
+   * Model used specifically for context compaction. Defaults to `flashModel`.
+   * Use this when the best compact summariser has a larger context window but
+   * is too slow for lightweight flash side-calls.
+   */
+  compactModel?: string
 
   /**
    * Compaction overrides forwarded to the kernel's CompactConfig.
@@ -138,6 +146,13 @@ export interface MetaAgentConfig {
      * working set persist across compaction regardless of summary quality.
      */
     deterministicAnchors?: string | (() => string | null | undefined)
+    /**
+     * Per-mode compact section template. RoboticsSession sets 'robotics',
+     * CampaignSession 'campaign'; defaults to 'agentic' downstream. Forwarded
+     * into the kernel compact call so the summariser produces domain-appropriate
+     * sections.
+     */
+    promptProfile?: CompactProfile
   }
 
   /**
@@ -352,8 +367,10 @@ export type ResolvedConfig = Required<
   fallbackThinkingConfig?: ThinkingConfig
   fallbackBetas?: string[]
   fallbackIncludeDefaultBetas?: boolean
-  /** Fast auxiliary model for side-calls (compact, mode detection, memory, etc.) */
+  /** Fast auxiliary model for side-calls (mode detection, memory, small enrichments, etc.) */
   flashModel: string
+  /** Model used specifically for compact summarisation. */
+  compactModel: string
   /** Wire protocol for the resolved provider ('anthropic' | 'openai'). */
   protocol: Protocol
   /** Effective capability flags (betas / thinking / prompt-cache) for the provider. */
@@ -399,6 +416,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
   const resolvedFallbackModel =
     file.fallbackModel ?? config.fallbackModel ?? (fallbackModel !== model ? fallbackModel : undefined)
   const resolvedFlashModel = file.flashModel ?? config.flashModel ?? flashModel
+  const resolvedCompactModel = file.compactModel ?? config.compactModel ?? resolvedFlashModel
   return {
     apiKey,
     baseURL,
@@ -406,6 +424,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     protocol: resolvedProvider.protocol,
     capabilities: resolvedProvider.capabilities,
     flashModel: resolvedFlashModel,
+    compactModel: resolvedCompactModel,
     fallbackModel: resolvedFallbackModel,
     // Default to adaptive so the primary LLM thinks before answering. Callers
     // can opt out by passing `{ type: 'disabled' }`.

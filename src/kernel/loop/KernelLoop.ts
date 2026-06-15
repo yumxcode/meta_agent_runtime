@@ -48,10 +48,8 @@ import { calcCostUsd } from '../utils/CostTracker.js'
 import { parseCacheUsage } from '../utils/parseCacheUsage.js'
 import { getModelProtocol } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
+import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
-
-const VOLATILE_CONTEXT_PREFIX_START = '<context>\n'
-const VOLATILE_CONTEXT_PREFIX_END = '\n</context>\n\n---\n\n'
 
 // ── Return type ───────────────────────────────────────────────────────────────
 
@@ -99,13 +97,12 @@ export interface KernelLoopContext {
    * wired or queued.
    */
   drainSteering?: () => string[]
-}
-
-function stripVolatileContextPrefix(text: string): string {
-  if (!text.startsWith(VOLATILE_CONTEXT_PREFIX_START)) return text
-  const end = text.lastIndexOf(VOLATILE_CONTEXT_PREFIX_END)
-  if (end < 0) return text
-  return text.slice(end + VOLATILE_CONTEXT_PREFIX_END.length)
+  /**
+   * The session's original first user request, captured by KernelSession
+   * before any compaction. Forwarded into the compact pipeline so the
+   * "original session goal" deterministic anchor survives nested compactions.
+   */
+  originalUserGoal?: string
 }
 
 function isRealUserMessage(message: KernelMessage): boolean {
@@ -146,6 +143,11 @@ function cloneLastRealUserTextMessage(messages: readonly KernelMessage[]): Kerne
     uuid: crypto.randomUUID(),
     role: 'user',
     content: textBlocks,
+    // Mark as a keep-set clone so (a) goal capture never mistakes it for the
+    // session's original request after a resume, and (b) continuity anchors
+    // can exclude its source from the recent-detail sections (F-2/F-3).
+    isKeepSetClone: true,
+    sourceUuid: message.uuid,
   }]
 }
 
@@ -238,14 +240,47 @@ function isCompleteTailUnit(unit: readonly KernelMessage[]): boolean {
 }
 
 /**
+ * Clone a steering message down to its text blocks (volatile prefix stripped).
+ * The isSteering flag is preserved so a later compaction classifies the clone
+ * correctly again. Returns null when no usable text remains.
+ */
+function cloneSteeringTextMessage(message: KernelMessage): KernelMessage | null {
+  const textBlocks = message.content
+    .filter((block): block is ContentBlock & { type: 'text'; text: string } =>
+      block.type === 'text' && typeof (block as { text?: unknown }).text === 'string',
+    )
+    .map(block => ({ ...block, text: stripVolatileContextPrefix(block.text) }))
+    .filter(block => block.text.trim().length > 0)
+  if (textBlocks.length === 0) return null
+  return {
+    uuid: crypto.randomUUID(),
+    role: 'user',
+    content: textBlocks,
+    isSteering: true,
+    isKeepSetClone: true,
+    sourceUuid: message.uuid,
+  }
+}
+
+/**
  * Build the messages to preserve verbatim after a compaction:
- *   [ <last real user message, text-only, stripped> , ...<bounded current-turn tail> ]
+ *   [ <last NON-steering real user message, text-only, stripped> ,
+ *     ...<steering corrections not covered by kept units> ,
+ *     ...<bounded current-turn tail> ]
  *
- * The tail is taken from the messages AFTER the last real user message, grouped
- * into complete assistant⇄tool_result units, then accumulated newest-first until
- * the token budget is hit (always keeping at least the most recent complete
- * unit). applyToolResultBudget is applied first so a single oversized result is
- * still clipped to the per-tool limit — identical to normal-flow behaviour.
+ * The tail is anchored at the last NON-steering real user message — a mid-turn
+ * steering correction must not silently shrink the preserved tail to only the
+ * post-steering work. Steering messages inside the tail ride along verbatim in
+ * their chronological unit; steering that falls outside the kept units (budget
+ * overflow or leading position) is cloned text-only right after the user
+ * anchor, so a correction issued shortly before compaction can never be lost
+ * to a terse summary.
+ *
+ * Units are complete assistant⇄tool_result groups accumulated newest-first
+ * until the token budget is hit (always keeping at least the most recent
+ * complete unit). applyToolResultBudget is applied first so a single oversized
+ * result is still clipped to the per-tool limit — identical to normal-flow
+ * behaviour.
  */
 export function buildMessagesToKeepAfterCompact(
   messages: readonly KernelMessage[],
@@ -257,13 +292,20 @@ export function buildMessagesToKeepAfterCompact(
 
   const userText = cloneLastRealUserTextMessage(budgeted)
 
+  // Anchor at the last NON-steering real user message; fall back to the last
+  // real user message (which may be a steering one) when none exists.
   let lastUserIdx = -1
+  let lastNonSteeringUserIdx = -1
   for (let i = budgeted.length - 1; i >= 0; i--) {
-    if (isRealUserMessage(budgeted[i]!)) { lastUserIdx = i; break }
+    const message = budgeted[i]!
+    if (!isRealUserMessage(message)) continue
+    if (lastUserIdx < 0) lastUserIdx = i
+    if (!message.isSteering) { lastNonSteeringUserIdx = i; break }
   }
-  if (lastUserIdx < 0) return userText
+  const anchorIdx = lastNonSteeringUserIdx >= 0 ? lastNonSteeringUserIdx : lastUserIdx
+  if (anchorIdx < 0) return userText
 
-  const tail = budgeted.slice(lastUserIdx + 1)
+  const tail = budgeted.slice(anchorIdx + 1)
   const units = groupTailUnits(tail).filter(isCompleteTailUnit)
 
   const kept: KernelMessage[][] = []
@@ -293,7 +335,18 @@ export function buildMessagesToKeepAfterCompact(
     return rest as KernelMessage
   })
 
-  return [...userText, ...keptFlat]
+  // Guarantee steering survival: any steering correction in the tail that did
+  // NOT make it into a kept unit (dropped by budget, or in leading position
+  // before the first assistant reply) is cloned text-only right after the user
+  // anchor. Steering inside kept units already survives verbatim in place.
+  const keptUuids = new Set(keptFlat.map(message => message.uuid))
+  const orphanSteering = tail
+    .filter(message =>
+      isRealUserMessage(message) && message.isSteering && !keptUuids.has(message.uuid))
+    .map(cloneSteeringTextMessage)
+    .filter((message): message is KernelMessage => message !== null)
+
+  return [...userText, ...orphanSteering, ...keptFlat]
 }
 
 /**
@@ -586,7 +639,9 @@ export async function* runKernelLoop(
             systemPrompt: effectiveSystemPrompt,
             customInstructions: config.compact?.customInstructions,
             deterministicAnchors: config.compact?.deterministicAnchors,
+            originalUserGoal: ctx.originalUserGoal,
             messagesToKeep: messagesToKeepAfterCompact,
+            promptProfile: config.compact?.promptProfile,
             abortSignal: signal,
             maxRetries: config.maxRetries,
           },
@@ -822,7 +877,9 @@ export async function* runKernelLoop(
               systemPrompt: effectiveSystemPrompt,
               customInstructions: config.compact?.customInstructions,
               deterministicAnchors: config.compact?.deterministicAnchors,
+              originalUserGoal: ctx.originalUserGoal,
               messagesToKeep: buildMessagesToKeepAfterCompact(currentMessagesForQuery, config.tools),
+              promptProfile: config.compact?.promptProfile,
               abortSignal: signal,
               maxRetries: config.maxRetries,
             },

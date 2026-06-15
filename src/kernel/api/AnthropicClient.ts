@@ -230,6 +230,9 @@ export async function* streamMessages(
 
         for await (const event of stream) {
           yieldedAny = true
+          // Accumulate response content for the markdown debug twin (no-op
+          // when debug is off — writer is null).
+          writer?.recordStreamEvent(event)
           yield event as unknown as StreamEvent
         }
         return

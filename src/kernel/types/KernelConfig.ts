@@ -4,6 +4,7 @@
 import type { KernelTool, KernelToolContext } from './KernelTool.js'
 import type { KernelMessage } from './KernelMessage.js'
 import type { PermissionDenial } from './KernelEvent.js'
+import type { CompactProfile } from '../compact/CompactPrompt.js'
 
 export type ThinkingConfig =
   | { type: 'disabled' }
@@ -41,6 +42,13 @@ export interface CompactConfig {
    * fires. Returning null/undefined means "no extra anchors".
    */
   deterministicAnchors?: string | (() => string | null | undefined)
+  /**
+   * Per-mode compact prompt profile. Selects which 9-section template the
+   * summariser is asked to produce: 'agentic' (default generic), 'robotics'
+   * (adds Experiment Ledger / Dead Ends / assumptions), or 'campaign' (adds
+   * provenance + phase gate). Each agent mode sets this at construction.
+   */
+  promptProfile?: CompactProfile
   /** querySource tag — 'compact' to prevent recursion */
   querySource?: string
 }

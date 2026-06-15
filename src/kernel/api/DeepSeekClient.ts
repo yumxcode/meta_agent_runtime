@@ -300,6 +300,21 @@ async function* processStream(
   }
 
   try {
+    for await (const event of processStreamInner(stream)) {
+      // Accumulate response content for the markdown debug twin.
+      writer?.recordStreamEvent(event)
+      yield event
+    }
+  } finally {
+    if (writer) await writer.close().catch(() => undefined)
+  }
+}
+
+/** Pure normalization of the OpenAI chunk stream into Anthropic-shaped events. */
+async function* processStreamInner(
+  stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
+): AsyncGenerator<StreamEvent> {
+  {
     // Block index tracking
     let nextBlockIdx = 0
     let thinkingBlockIdx = -1
@@ -422,7 +437,5 @@ async function* processStream(
     }
 
     yield { type: 'message_stop' }
-  } finally {
-    if (writer) await writer.close().catch(() => undefined)
   }
 }

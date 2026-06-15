@@ -65,6 +65,20 @@ export class PrinciplePendingStore {
     return this._pending
   }
 
+  /**
+   * True if a pending principle already derives from the given experience — used
+   * to dedup the confidence_threshold path, which would otherwise queue a fresh
+   * candidate every time the experience is re-reviewed.
+   */
+  hasPendingForExperience(experienceId: string): boolean {
+    if (!experienceId) return false
+    return this._pending.some(p => {
+      if (p.input['source_experience_id'] === experienceId) return true
+      const derived = p.input['derived_from_experience_ids']
+      return Array.isArray(derived) && derived.includes(experienceId)
+    })
+  }
+
   get count(): number {
     return this._pending.length
   }

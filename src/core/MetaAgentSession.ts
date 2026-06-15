@@ -55,6 +55,12 @@ import {
   type AgentMode,
 } from './dynamicPrompt.js'
 import type { TaskContract } from './contract/types.js'
+import type { SubAgentRecord } from '../subagent/types.js'
+import {
+  buildAgenticCompactInstructions,
+  buildAgenticDeterministicAnchors,
+} from './compact/agenticCompactAnchors.js'
+import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
 import { AgenticSession } from '../modes/AgenticSession.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -110,6 +116,16 @@ export class MetaAgentSession {
   // ── External attachments ──────────────────────────────────────────────────
   private _subAgentBridge: SubAgentBridge | undefined = undefined
   private _taskContract: TaskContract | undefined = undefined
+  /**
+   * Sub-agent task snapshot for the compact thunks. The thunks
+   * (config.compact.customInstructions / deterministicAnchors) resolve
+   * synchronously inside compactConversation(), so they cannot await
+   * bridge.listTasks(); instead the snapshot is refreshed on the
+   * `compact_start` event interception in _submitInner() — the kernel loop is
+   * suspended while the event propagates through the generator chain, so the
+   * async refresh completes before compaction reads the thunks.
+   */
+  private _subAgentTasksSnapshot: SubAgentRecord[] | null = null
 
   // ── Inner engine ──────────────────────────────────────────────────────────
   private readonly _inner: AgenticSession
@@ -176,6 +192,31 @@ export class MetaAgentSession {
       appendSystemPrompt: '', // starts empty; set on first submit()
       tools: [],              // registered below after MetaAgentSession wrapping
       planModeRef: this._planModeRef,
+      // Agentic-mode compact protection (mirrors RoboticsSession): lazy thunks
+      // resolved at compaction time so sub-agent task IDs, terminal outcomes
+      // and the task-contract identity survive compaction deterministically.
+      // Caller-supplied compact values are composed, not replaced.
+      compact: {
+        customInstructions: () =>
+          this._composeCompactValue(
+            buildAgenticCompactInstructions(this._agenticCompactContext()),
+            config.compact?.customInstructions,
+          ),
+        deterministicAnchors: () =>
+          this._composeCompactValue(
+            // Persisted research reports first: post-compaction the model must
+            // re-READ those files, never re-RUN the research. Then the
+            // sub-agent/contract state anchors.
+            [
+              buildResearchArtifactAnchors(this.config.projectDir),
+              buildAgenticDeterministicAnchors(this._agenticCompactContext()),
+            ].filter(Boolean).join('\n\n') || null,
+            config.compact?.deterministicAnchors,
+          ),
+        // Forward the caller's profile (RoboticsSession passes 'robotics');
+        // plain MetaAgent/agentic sessions default to the generic template.
+        promptProfile: config.compact?.promptProfile ?? 'agentic',
+      },
     })
 
     this.sessionId = this._inner.getSessionId()
@@ -307,7 +348,49 @@ export class MetaAgentSession {
       : prompt
 
     // ── Step 3: Delegate to AgenticSession ────────────────────────────────
-    yield* this._inner.submit(effectivePrompt)
+    for await (const ev of this._inner.submit(effectivePrompt)) {
+      // compact_start fires BEFORE the compact side-call runs; the kernel loop
+      // is suspended until we resume the generator, so refreshing the
+      // sub-agent snapshot here guarantees the compact thunks read live state.
+      if (ev.type === 'compact_start') {
+        await this._refreshSubAgentTasksSnapshot()
+      }
+      yield ev
+    }
+  }
+
+  /** Refresh the sub-agent task snapshot consumed by the compact thunks. */
+  private async _refreshSubAgentTasksSnapshot(): Promise<void> {
+    if (!this._subAgentBridge) return
+    try {
+      this._subAgentTasksSnapshot = await this._subAgentBridge.listTasks()
+    } catch {
+      // Keep the previous snapshot — a stale anchor beats none at all.
+    }
+  }
+
+  /** Shared live-state snapshot for the agentic compact thunks. */
+  private _agenticCompactContext() {
+    return {
+      subAgentTasks: this._subAgentTasksSnapshot,
+      taskContract: this._taskContract ?? null,
+    }
+  }
+
+  /**
+   * Compose our own compact block with a caller-supplied one (string or
+   * thunk). Our deterministic state comes first; the caller's guidance is
+   * appended. Returns undefined when neither produced content.
+   */
+  private _composeCompactValue(
+    own: string | null,
+    callerValue: string | (() => string | null | undefined) | undefined,
+  ): string | undefined {
+    const caller = typeof callerValue === 'function'
+      ? callerValue() ?? undefined
+      : callerValue
+    const combined = [own ?? undefined, caller].filter(Boolean).join('\n\n')
+    return combined || undefined
   }
 
   /**
@@ -332,6 +415,16 @@ export class MetaAgentSession {
   /** Inject a mid-turn user correction. See KernelSession.steer(). */
   steer(text: string): boolean {
     return this._inner.steer(text)
+  }
+
+  /**
+   * Manual compaction (/compact). Refreshes the sub-agent task snapshot first
+   * so the compact thunks (deterministic anchors) read live state — mirrors
+   * the compact_start interception on the auto path.
+   */
+  async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    await this._refreshSubAgentTasksSnapshot()
+    return this._inner.compactNow()
   }
 
   /** All messages in the current conversation. */
@@ -377,6 +470,15 @@ export class MetaAgentSession {
    */
   setSubAgentBridge(bridge: SubAgentBridge): void {
     this._subAgentBridge = bridge
+  }
+
+  /**
+   * LIVE view of the registered (wrapped) tools — the same Map mutated by
+   * registerTool(). Used by SessionRouter to wire a sub-agent dispatcher's
+   * tool registry so tools registered later are still resolvable.
+   */
+  getToolRegistry(): Map<string, MetaAgentTool> {
+    return this.toolRegistry
   }
 
   /**

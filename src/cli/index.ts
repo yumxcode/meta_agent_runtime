@@ -182,6 +182,8 @@ ${bold('INTERACTIVE COMMANDS')}
   /memory review        Interactively review & commit pending memories
   /memory delete        Pick & permanently delete a committed memory
   /memory delete review      Review & apply AI-proposed memory deletions
+  /compact              Compact the conversation context now (manual; same
+                        pipeline as auto-compact — summary + keep-set + anchors)
   /clear                Start a new session (same workspace/hardware)
   /exit  or  Ctrl+D     Quit
 
@@ -191,7 +193,7 @@ ${bold('DURING A TURN')}
   Ctrl+C                Interrupt the current turn (press twice to quit)
 
 ${bold('ENVIRONMENT VARIABLES')}
-  ZHIPU_API_KEY         GLM coding plan key  ${dim('← default provider (glm-5.1)')}
+  ZHIPU_API_KEY         GLM coding plan key  ${dim('← default provider (glm-5.2)')}
   DEEPSEEK_API_KEY      DeepSeek API key
   ANTHROPIC_API_KEY     Anthropic API key
   QWEN_API_KEY          Qwen API key
@@ -202,12 +204,19 @@ ${bold('CONFIG FILE')}
   ${cyan('~/.meta-agent/config.json')}  ${dim('(legacy: ~/.claude/meta-agent/config.json)')}
   Pins model selection without env vars or flags. All fields optional:
     {
-      "mainModel":     "glm-5.1",
-      "fallbackModel": "glm-4.6",
-      "flashModel":    "glm-4.5-air",
-      "apiKey":        "...",
-      "baseURL":       "https://open.bigmodel.cn/api/anthropic"
+      "LLM": {
+        "mainModel":     "glm-5.2",
+        "fallbackModel": "glm-4.7",
+        "flashModel":    "glm-4.5-air",
+        "compactModel":  "glm-5.2",
+        "apiKey":        "...",
+        "baseURL":       "https://open.bigmodel.cn/api/anthropic"
+      },
+      "web_search": {
+        "tavilyApiKey":  "tvly-..."
+      }
     }
+  (legacy flat format with the same keys at top level is still accepted)
   Precedence: config file > CLI flags > built-in defaults.
 
 ${bold('EXAMPLES')}
@@ -413,7 +422,7 @@ function assertApiKeyConfigured(opts: CliOptions): void {
   console.error(
     red('Error: API key is required before starting a session.') + '\n' +
     dim('Set one of these environment variables, or pass --api-key:') + '\n' +
-    `  ${cyan('export ZHIPU_API_KEY="..."')} ${dim('(default provider — glm-5.1)')}\n` +
+    `  ${cyan('export ZHIPU_API_KEY="..."')} ${dim('(default provider — glm-5.2)')}\n` +
     `  ${cyan('export DEEPSEEK_API_KEY="sk-..."')}\n` +
     `  ${cyan('export QWEN_API_KEY="sk-..."')}\n` +
     `  ${cyan('export ANTHROPIC_API_KEY="sk-..."')}\n` +
@@ -756,7 +765,21 @@ function detectSensitiveOp(
   input: Record<string, unknown>,
   workspace?: string,
 ): string | null {
-  if (toolName === 'write_file' || toolName === 'edit_file') return toolName
+  if (toolName === 'write_file') return toolName
+  // edit_file: in-place edits INSIDE the workspace run without confirmation
+  // (the kernel permission policy still hard-denies paths outside the
+  // workspace). Only guard when the target path escapes the workspace.
+  if (toolName === 'edit_file') {
+    const filePath = input['file_path']
+    if (
+      workspace &&
+      typeof filePath === 'string' && filePath &&
+      !filePath.startsWith(workspace) && !filePath.startsWith('/tmp')
+    ) {
+      return `edit_file 工作目录外路径 (${filePath.slice(0, 60)})`
+    }
+    return null
+  }
   if (toolName === 'notebook_edit') return toolName
   // Team board mutations that change what teammates see — a human confirms
   // each. team_note is deliberately NOT here (lab-notebook append on a task
@@ -1034,7 +1057,7 @@ async function streamExperienceSummary(
 
     if (getModelProtocol(flashModel, baseURL) === 'openai') {
       const OpenAI = (await import('openai')).default
-      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 30_000 })
       const stream = await client.chat.completions.create({
         model:      flashModel,
         max_tokens: 512,
@@ -1065,7 +1088,7 @@ async function streamExperienceSummary(
       client = new (await import('@anthropic-ai/sdk')).default({
         apiKey,
         baseURL,
-        timeout:    8_000,
+        timeout:    30_000,
         maxRetries: 1,
       })
     }
@@ -1162,7 +1185,7 @@ async function generateSessionTitle(router: SessionRouter): Promise<string | nul
 
     if (getModelProtocol(flashModel, baseURL) === 'openai') {
       const OpenAI = (await import('openai')).default
-      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 8_000 })
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 30_000 })
       const response = await client.chat.completions.create({
         model: flashModel,
         max_tokens: 48,
@@ -1176,7 +1199,7 @@ async function generateSessionTitle(router: SessionRouter): Promise<string | nul
 
     let client = router.getSideCallClient()
     if (!client) {
-      client = new (await import('@anthropic-ai/sdk')).default({ apiKey, baseURL, timeout: 8_000, maxRetries: 1 })
+      client = new (await import('@anthropic-ai/sdk')).default({ apiKey, baseURL, timeout: 30_000, maxRetries: 1 })
     }
     const response = await client.messages.create({
       model: flashModel,
@@ -1226,6 +1249,9 @@ async function safeStdoutWrite(text: string): Promise<void> {
 interface SteerHooks {
   /** Resolves when a steer has been armed (Ctrl+G); immediate if already armed. */
   waitArmed: () => Promise<void>
+  /** Synchronous armed check, so an already-armed steer can pre-empt a resolved
+   *  pending event instead of losing the Promise.race to it. */
+  isArmed: () => boolean
   /** Clear the armed flag after servicing a steer prompt. */
   consume: () => void
   /**
@@ -1315,8 +1341,16 @@ async function streamPrompt(
     // SAME pending event — so the model is never aborted, only back-pressured.
     let pending = gen.next()
     while (true) {
+      // An already-armed steer must pre-empt the next event. During a heavy
+      // reasoning phase `pending` is almost always already resolved, so a plain
+      // Promise.race would keep choosing it (it sits first in the array) and the
+      // armed steer would be starved — the symptom being a flickering meter and a
+      // `steer ›` prompt that never holds. Check the armed flag synchronously
+      // first; only race when nothing is armed yet.
       const raced = steering
-        ? await Promise.race([pending, steering.waitArmed().then(() => '__steer__' as const)])
+        ? (steering.isArmed()
+            ? ('__steer__' as const)
+            : await Promise.race([pending, steering.waitArmed().then(() => '__steer__' as const)]))
         : await pending
 
       if (raced === '__steer__') {
@@ -1993,6 +2027,11 @@ async function reviewPendingPrinciples(
     const firstPrinciples = (input['first_principles_support'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
     const bounds = (input['applicability_bounds'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
     const exclusions = (input['non_applicable_when'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
+    // Surface the evidence chain and any counterexamples so the reviewer can
+    // judge fabrication / overgeneralization before approving (the promotion
+    // model is told "do not invent measurements", but only review enforces it).
+    const evidence = (input['evidence_refs'] as string[] | undefined)?.slice(0, 4).join('; ') ?? ''
+    const counterExamples = (input['counter_examples'] as string[] | undefined)?.slice(0, 3).join('; ') ?? ''
 
     console.log(
       `\n${'─'.repeat(60)}\n` +
@@ -2002,6 +2041,8 @@ async function reviewPendingPrinciples(
       (firstPrinciples ? `${dim('第一性原理支撑:')} ${firstPrinciples}\n` : '') +
       (bounds ? `${dim('适用边界:')} ${bounds}\n` : '') +
       (exclusions ? `${dim('不适用:')} ${exclusions}\n` : '') +
+      (evidence ? `${dim('证据:')} ${evidence}\n` : `${yellow('⚠ 无证据引用')}\n`) +
+      (counterExamples ? `${dim('反例:')} ${counterExamples}\n` : '') +
       `${'─'.repeat(60)}\n`,
     )
 
@@ -2244,7 +2285,7 @@ async function callTeamPlanner(router: SessionRouter, input: string, snapshot: T
 
     if (getModelProtocol(flashModel, baseURL) === 'openai') {
       const OpenAI = (await import('openai')).default
-      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1 })
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 30_000 })
       const message = await client.chat.completions.create({
         model:      flashModel,
         max_tokens: 900,
@@ -2261,7 +2302,7 @@ async function callTeamPlanner(router: SessionRouter, input: string, snapshot: T
       client = new (await import('@anthropic-ai/sdk')).default({
         apiKey,
         baseURL,
-        timeout:    12_000,
+        timeout:    30_000,
         maxRetries: 1,
       })
     }
@@ -2965,6 +3006,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
       system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
+      // Main-session web_fetch is result-budgeted: full-text reading belongs in
+      // isolated research sub-agents (research_dispatch), not the long-lived
+      // main context. Sub-agents get an unbudgeted override via the bridge.
+      network: { webFetch: { maxResultSizeChars: 8_000 } },
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -3239,6 +3284,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
   const steerHooks = {
     waitArmed: (): Promise<void> =>
       _steerArmed ? Promise.resolve() : new Promise<void>(resolve => { _steerNotify = resolve }),
+    isArmed: (): boolean => _steerArmed,
     consume: (): void => { _steerArmed = false; _steerNotify = null },
     beginInput: (): void => {
       // readline now renders + redraws THIS prompt as the user types, so the
@@ -3625,6 +3671,14 @@ async function runRepl(opts: CliOptions): Promise<void> {
             } else {
               const store = new ExperienceStore()
               await reviewPendingExperiences(rl, pending, store, async id => {
+                // Reinforce/challenge committed principles this experience cites.
+                const signals = await router.reinforcePrinciplesFromExperience(id)
+                for (const s of signals) {
+                  const label = s.signal === 'observation'
+                    ? green('+1 佐证')
+                    : yellow('+1 反证（已降权，建议 /principle review 复核）')
+                  console.log(dim(`  ⟳ 原则 ${s.principleId}: ${label}`))
+                }
                 const result = await router.proposePrincipleForExperience(id, 'confidence_threshold') as
                   | { promoted?: boolean; pendingId?: string; reason?: string; score?: number }
                   | null
@@ -3720,6 +3774,23 @@ async function runRepl(opts: CliOptions): Promise<void> {
           }
           teamModeUsed = true   // user explicitly entered team mode — enable notifications
           await handleTeamCommand(input, router, opts, rl, setInteractiveActive)
+          break
+        }
+        case '/compact': {
+          // Manual compaction — same pipeline as auto-compact (summary +
+          // keep-set + deterministic anchors + quality gate), forced now.
+          console.log(dim('\n🗜  正在压缩会话上下文…'))
+          const compactResult = await router.compactNow()
+          if (compactResult.compacted) {
+            const prev = ((compactResult.previousTokens ?? 0) / 1000).toFixed(1)
+            const post = ((compactResult.postTokens ?? 0) / 1000).toFixed(1)
+            console.log(green(`🗜  压缩完成 ${prev}k → ${post}k tokens\n`))
+            // Persist the compacted history so resume sees the compact form.
+            await persistCurrentSession(input).catch(() => undefined)
+            savedMessageCount = router.getMessages().length
+          } else {
+            console.log(yellow(`未压缩：${compactResult.reason ?? '未知原因'}\n`))
+          }
           break
         }
         case '/clear':
@@ -3868,6 +3939,10 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
       system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
+      // Main-session web_fetch is result-budgeted: full-text reading belongs in
+      // isolated research sub-agents (research_dispatch), not the long-lived
+      // main context. Sub-agents get an unbudgeted override via the bridge.
+      network: { webFetch: { maxResultSizeChars: 8_000 } },
     })
     for (const tool of tools) {
       router.registerTool(tool)

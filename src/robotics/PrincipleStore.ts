@@ -77,6 +77,40 @@ export class PrincipleStore {
   }
 
   /**
+   * Record a later outcome against a committed principle:
+   *   - 'observation'   → a new experience corroborated it (raises retrieval score)
+   *   - 'contradiction' → a new experience contradicted it (lowers retrieval
+   *     score by 50/contradiction, so a challenged principle sinks in search and
+   *     surfaces for human re-review instead of silently standing forever).
+   * Returns the updated entry, or null when the principle does not exist.
+   */
+  async recordOutcomeSignal(
+    id: string,
+    kind: 'observation' | 'contradiction',
+  ): Promise<PrincipleEntry | null> {
+    const entry = await this.load(id)
+    if (!entry) return null
+    const updated: PrincipleEntry = {
+      ...entry,
+      observationCount: entry.observationCount + (kind === 'observation' ? 1 : 0),
+      contradictionCount: entry.contradictionCount + (kind === 'contradiction' ? 1 : 0),
+      lastVerifiedAt: kind === 'observation' ? Date.now() : entry.lastVerifiedAt,
+      updatedAt: Date.now(),
+    }
+    await atomicWriteJson(join(this.dir, `${id}.json`), updated)
+    await this._upsertManifest(updated).catch(() => undefined)
+    return updated
+  }
+
+  recordObservation(id: string): Promise<PrincipleEntry | null> {
+    return this.recordOutcomeSignal(id, 'observation')
+  }
+
+  recordContradiction(id: string): Promise<PrincipleEntry | null> {
+    return this.recordOutcomeSignal(id, 'contradiction')
+  }
+
+  /**
    * Permanently delete a committed principle by ID and rebuild the manifest.
    * Returns true if the file existed and was removed.
    */

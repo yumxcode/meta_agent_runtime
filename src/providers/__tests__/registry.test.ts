@@ -95,7 +95,7 @@ describe('provider registry', () => {
       const r = resolveProvider({})
       expect(r.provider).toBe('zhipu')
       expect(r.apiKey).toBe('zk')
-      expect(r.defaultModel).toBe('glm-5.1')
+      expect(r.defaultModel).toBe('glm-5.2')
     })
 
     it('falls back to anthropic default with empty key when nothing set', () => {
@@ -110,7 +110,7 @@ describe('provider registry', () => {
       expect(getModelPricing('glm-4.5-air').input).toBe(0.11)
       expect(getModelPricing('glm-4.5').input).toBe(0.43)
       expect(getModelContextWindow('glm-4.5-air')).toBe(128_000)
-      expect(getModelContextWindow('glm-5.1')).toBe(200_000)
+      expect(getModelContextWindow('glm-5.1')).toBe(1_000_000)
     })
     it('deepseek 1M context, known pricing', () => {
       expect(getModelContextWindow('deepseek-v4-flash')).toBe(1_000_000)

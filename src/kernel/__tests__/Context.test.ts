@@ -105,24 +105,25 @@ describe('calculateTokenWarningState', () => {
   const MAX_OUT = 32_768
   // effectiveContextWindow = 200_000 - min(32_768, 20_000) = 180_000
   const EFFECTIVE = 180_000
-  const AUTOCOMPACT_BUFFER = 13_000
+  // Default auto-compact trigger = 65% of the effective window.
+  const THRESHOLD = Math.floor(EFFECTIVE * 0.65)
   const MANUAL_BUFFER = 3_000
 
   it('returns correct threshold values for default config', () => {
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
     expect(state.effectiveContextWindow).toBe(EFFECTIVE)
-    expect(state.autoCompactThreshold).toBe(EFFECTIVE - AUTOCOMPACT_BUFFER)
+    expect(state.autoCompactThreshold).toBe(THRESHOLD)
     expect(state.blockingLimit).toBe(EFFECTIVE - MANUAL_BUFFER)
   })
 
   it('isAtCompactThreshold is false below threshold', () => {
-    const below = EFFECTIVE - AUTOCOMPACT_BUFFER - 1
+    const below = THRESHOLD - 1
     const { isAtCompactThreshold } = calculateTokenWarningState(below, MODEL, MAX_OUT)
     expect(isAtCompactThreshold).toBe(false)
   })
 
   it('isAtCompactThreshold is true at threshold', () => {
-    const at = EFFECTIVE - AUTOCOMPACT_BUFFER
+    const at = THRESHOLD
     const { isAtCompactThreshold } = calculateTokenWarningState(at, MODEL, MAX_OUT)
     expect(isAtCompactThreshold).toBe(true)
   })
@@ -148,13 +149,13 @@ describe('calculateTokenWarningState', () => {
   it('ignores invalid CLAUDE_AUTOCOMPACT_PCT_OVERRIDE and uses default', () => {
     process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = 'bad'
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
-    expect(state.autoCompactThreshold).toBe(EFFECTIVE - AUTOCOMPACT_BUFFER)
+    expect(state.autoCompactThreshold).toBe(THRESHOLD)
   })
 
   it('ignores out-of-range CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (>1)', () => {
     process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = '1.5'
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
-    expect(state.autoCompactThreshold).toBe(EFFECTIVE - AUTOCOMPACT_BUFFER)
+    expect(state.autoCompactThreshold).toBe(THRESHOLD)
   })
 
   it('caps maxOutputTokens contribution at 20_000', () => {

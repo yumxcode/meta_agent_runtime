@@ -177,7 +177,7 @@ export function createExperienceWriteTool(
         const title = normalized.value.title
         const success = normalized.value.success
 
-        // ── Extract abstract principle via flash (3 s timeout) ────────────
+        // ── Extract abstract principle via flash (30 s timeout) ───────────
         // The principle supports same-domain matching in ExperiencePatternChecker.
         // On timeout or error we proceed without it — the entry is still useful.
         let abstractPrinciple: string | undefined
@@ -195,7 +195,7 @@ export function createExperienceWriteTool(
             system: PRINCIPLE_SYSTEM,
             user: userContext,
             maxTokens: 120,
-            timeoutMs: 3_000,
+            timeoutMs: 30_000,
             cacheKey: `principle:${hashForCache(userContext)}`,
           })
           if (raw?.trim()) abstractPrinciple = raw.trim().slice(0, 400)

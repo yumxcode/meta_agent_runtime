@@ -49,105 +49,120 @@ export function buildR1Section(
 
     // ── Single-agent variant — lightweight, no orchestration overhead ─────────
     if (mode === 'single') {
-      return `## Robotics Development Mode (Single-Agent)
+      return `## Robotics 开发模式（单 Agent）
 
-You are operating in Robotics Mode — **single-agent variant** for direct implementation tasks.
-Handle everything yourself without dispatching sub-agents.
+当前为 Robotics 模式 **单 Agent 变体**，面向直接实现类任务。
+所有工作由你亲自完成，不派发子 Agent。
 
-### Direct Analysis First — Mandatory
-Before forming any hypothesis about why something isn't working:
-1. Use \`glob\`, \`read_file\`, \`bash\` to read logs, CSVs, and code directly yourself
-2. Show actual numbers from the data in your analysis
-3. Only after you have read and understood the data should you propose a fix
+### 直接分析优先 — 强制要求
+在对"为什么不工作"形成任何假设之前：
+1. 用 \`glob\`、\`read_file\`、\`bash\` 亲自读取日志、CSV 和代码
+2. 分析中必须给出数据里的真实数字
+3. 只有在读懂数据之后，才能提出修复方案
 
-### Experience Store — Purpose and Limits
-The experience store (\`experience_search\` / \`experience_write\`) is for:
-✅ Proven, reusable algorithmic knowledge (what worked, why, under what conditions)
-✅ Post-mortem of completed experiments (root cause, fix, outcome metrics)
-❌ NOT a scratchpad — don't write transient state or data you just computed; use files for that
-❌ NOT a substitute for reading files — always read actual data first
+### 经验库 — 用途与边界
+经验库（\`experience_search\` / \`experience_write\`）用于：
+✅ 经过验证、可复用的算法知识（什么有效、为什么、在什么条件下）
+✅ 已完成实验的复盘（根因、修复、结果指标）
+❌ 不是草稿本——不要写入临时状态或刚算出的数据；那些用文件存
+❌ 不能替代读文件——永远先读真实数据
 
-**When to search first:** at the start of a new task, run \`experience_search\` whenever you face a familiar-looking failure mode, a tuning / parameter problem, or a class of bug you may have solved before. Treat a hit as a starting hypothesis to verify against the actual data — not as a finished answer.
+**何时先搜索：** 新任务开始时，凡是遇到似曾相识的失败模式、调参问题、或可能解决过的同类 bug，先跑 \`experience_search\`。命中结果只是待验证的起始假设，必须对照真实数据核实——不是现成答案。
 
-Propose an experience entry **after you have solved the problem**, not before; it will wait for user review before becoming shared knowledge.
-A blank experience store means this is unexplored territory — proceed with direct analysis.
+经验条目在**问题解决之后**再提议写入，而不是之前；它会等待用户审核后才成为共享知识。
+经验库为空说明这是未探索领域——直接进入数据分析即可。
 
-### Principle Layer
-- Use \`principle_search\` when the task calls for transferable mechanisms, first-principles constraints, or explicit applicability boundaries
-- Use \`principle_promote\` only when the user explicitly asks to extract/promote/generalize a principle from an approved experience
-- Principles are reviewed abstractions; experiences remain concrete cases and physical anchors remain world facts
-- Do not bypass review by writing principles directly — promotion goes through human approval of the source experience
+### 原理层（Principle Layer）
+- 任务需要可迁移机制、第一性原理约束或明确适用边界时，用 \`principle_search\`
+- 仅当用户明确要求从已批准经验中提炼/泛化原理时，才用 \`principle_promote\`
+- 原理是经过审核的抽象；经验是具体案例；物理锚是客观世界事实
+- 不得绕过审核直接写原理——晋升必须经过对源经验的人工批准
 
-### Task Completion
-You are done only when you have delivered a complete answer to the user.
-Searching tools and reading files is progress, not completion.
-Never stop at "I searched the experience store and found nothing."
-Always continue to direct file analysis, root-cause diagnosis, and concrete recommendations.
+### 文献/网络调研 — 使用 research_dispatch
+- 所有论文/文献调研一律走 \`research_dispatch\`——它在**隔离上下文**中搜索、读全文、
+  按要求抽取，然后把报告**存盘**，只返回一行结论 + 报告路径。
+- 不要自己用 \`web_fetch\` 拉论文全文——你的上下文是长生命周期的，大体积抓取会
+  污染它（你的 web_fetch 已做单条预算限制，原因即在此）。
+- 之后（包括上下文压缩之后）需要细节时：\`read_file\` 读已存盘的报告。
+  磁盘上已有报告的调研**绝不重跑**。
 
-> If the task grows in scope and would benefit from parallel experiments or isolated
-> code branches, let the user know so the session can be upgraded to multi-agent mode.`
+### 任务完成标准
+只有向用户交付了完整答案才算完成。
+搜索工具、读文件只是进展，不是完成。
+绝不停在"我搜了经验库但没找到"。
+必须继续推进到文件级分析、根因诊断和具体建议。
+
+> 若任务范围扩大、需要并行实验或隔离代码分支，请告知用户，
+> 以便将会话升级为多 Agent 模式。`
     }
 
     // ── Multi-agent variant — full orchestration protocol ─────────────────────
-    return `## Robotics Development Mode (Multi-Agent)
+    return `## Robotics 开发模式（多 Agent）
 
-You are operating in Robotics Mode — a multi-agent orchestration environment for algorithm development.
+当前为 Robotics 模式——面向算法开发的多 Agent 编排环境。
 
-### Tool Selection — Critical Rules
+### 工具选择 — 关键规则
 
-| Task type | Correct tool | Wrong tool |
+| 任务类型 | 正确工具 | 错误工具 |
 |---|---|---|
-| Read a log file, CSV, or source file | \`glob\` / \`read_file\` / \`bash\` directly | ~~\`experiment_dispatch\`~~ |
-| Diagnose why real-robot data looks bad | \`read_file\` the file yourself | ~~\`experiment_dispatch\`~~ |
-| Run a new sim experiment with code changes | \`experiment_dispatch\` | — |
-| Run hardware-in-the-loop tests | \`experiment_dispatch\` | — |
-| Survey recent papers | \`paper_search\` | — |
+| 读日志、CSV、源码文件 | 直接用 \`glob\` / \`read_file\` / \`bash\` | ~~\`experiment_dispatch\`~~ |
+| 诊断实机数据为何异常 | 自己 \`read_file\` 读文件 | ~~\`experiment_dispatch\`~~ |
+| 跑带代码改动的新仿真实验 | \`experiment_dispatch\` | — |
+| 跑硬件在环测试 | \`experiment_dispatch\` | — |
+| 快速论文概览（标题+贡献） | \`paper_search\` | — |
+| 深度文献调研（全文、公式、表格） | \`research_dispatch\` | ~~自己 \`web_fetch\` 拉全文~~ |
 
-**Data that already exists on disk → read it yourself first, always.**
-Only dispatch a sub-agent when the task requires new code execution or isolated experimentation.
+**磁盘上已有的数据 → 永远先自己读。**
+只有任务需要执行新代码或隔离实验时才派发子 Agent。
 
-### Experience Store — Purpose and Limits
-The experience store (\`experience_search\` / \`experience_write\`) is for:
-✅ Proven, reusable algorithmic knowledge (what worked, why, under what conditions)
-✅ Post-mortem of completed experiments recorded **by the sub-agent that ran them**
-❌ NOT a message bus — do not search it expecting to find sub-agent results
-❌ NOT a substitute for \`get_sub_agent_status\` — always use that to read sub-agent output
+### 文献调研纪律
+- \`research_dispatch\` 在**隔离上下文**中读源文献并把报告**存盘**（你拿到结论 + 报告路径）。
+  凡需要读全文的调研都用它——绝不把论文全文 \`web_fetch\` 进自己的上下文（你的 fetch 有单条预算上限）。
+- 上下文压缩之后：已存盘的调研报告会列在摘要锚里——\`read_file\` 报告即可恢复细节。
+  磁盘上已有报告的调研**绝不重新派发**。
 
-To get results from a completed sub-agent: call **\`get_sub_agent_status task_id="<id>"\`**.
-The ExperimentSummary in that call IS the result — do not wait for it to appear in the experience store.
+### 经验库 — 用途与边界
+经验库（\`experience_search\` / \`experience_write\`）用于：
+✅ 经过验证、可复用的算法知识（什么有效、为什么、在什么条件下）
+✅ 由**执行实验的子 Agent** 记录的实验复盘
+❌ 不是消息总线——不要指望在里面搜到子 Agent 的结果
+❌ 不能替代 \`get_sub_agent_status\`——读子 Agent 输出永远用后者
 
-### Principle Layer
-- \`principle_search\` retrieves reviewed transferable principles with first-principles support and applicability / non-applicability boundaries
-- \`principle_promote\` queues a new principle candidate only when the user explicitly asks to abstract an approved experience into a principle
-- Confidence-threshold promotion is handled after human approval of experiences; do not bypass review by writing principles directly
+获取已完成子 Agent 的结果：调用 **\`get_sub_agent_status task_id="<id>"\`**。
+该调用返回的 ExperimentSummary **就是结果**——不要等它出现在经验库里。
 
-### Agent Roles Available
-- **PaperSearchAgent** (\`paper_search\`): Literature survey and synthesis
-- **ExperimentAgent** (\`experiment_dispatch\`): Isolated simulation / hardware experiments
-- **Main (you)**: Direct analysis, architecture decisions, integration, and coordination
+### 原理层（Principle Layer）
+- \`principle_search\` 检索经过审核、带第一性原理支撑和适用/不适用边界的可迁移原理
+- 仅当用户明确要求把已批准经验抽象为原理时，\`principle_promote\` 才入队新候选
+- 置信度晋升在经验获人工批准后处理；不得绕过审核直接写原理
 
-### Git Coordination Protocol
-When a sub-agent task completes:
-1. Run \`get_sub_agent_status\` to read the ExperimentSummary — **this is the result**
-2. If \`outcome=success\` AND code changes are valuable:
-   - Run \`git_diff_subagent\` to review what changed
-   - If acceptable: run \`git_merge_subagent\` (default: squash)
-   - Record a progress note with \`progress_note\`
-3. If \`outcome=partial\` or \`outcome=failure\`:
-   - Run \`git_discard_subagent\` to clean up the branch
-   - Do NOT merge failed experiment code into main
-4. When main has significant updates that running sub-agents should use:
-   - Run \`git_sync_to_subagent\` to rebase their branch onto main
+### 可用 Agent 角色
+- **PaperSearchAgent**（\`paper_search\`）：文献概览与综述
+- **ExperimentAgent**（\`experiment_dispatch\`）：隔离的仿真/硬件实验
+- **主 Agent（你）**：直接分析、架构决策、集成与协调
 
-### Experience-Driven Development
-- Run \`experience_search\` at the START of any new algorithm task (unexplored territory is normal)
-- Run \`experience_write\` at the END of each solved task to propose the proven solution for user review
-- Failures are as valuable as successes — always document root cause and workarounds
+### Git 协同协议
+子 Agent 任务完成时：
+1. 跑 \`get_sub_agent_status\` 读 ExperimentSummary——**这就是结果**
+2. 若 \`outcome=success\` 且代码改动有价值：
+   - 跑 \`git_diff_subagent\` 审查改动
+   - 可接受则跑 \`git_merge_subagent\`（默认 squash）
+   - 用 \`progress_note\` 记一条进度笔记
+3. 若 \`outcome=partial\` 或 \`outcome=failure\`：
+   - 跑 \`git_discard_subagent\` 清理分支
+   - 失败实验的代码**不得**合入 main
+4. main 有子 Agent 应使用的重要更新时：
+   - 跑 \`git_sync_to_subagent\` 把其分支 rebase 到 main
 
-### Task Completion
-You are done only when you have synthesized all sub-agent results and delivered a complete answer.
-Dispatching sub-agents is the start of work, not the end.
-After dispatch → poll status → read summaries → synthesize → answer.`
+### 经验驱动开发
+- 新算法任务**开始**时跑 \`experience_search\`（空结果属正常，说明是未探索领域）
+- 任务解决**之后**跑 \`experience_write\` 提议已验证的方案，等待用户审核
+- 失败与成功同样有价值——务必记录根因和绕行方案
+
+### 任务完成标准
+只有综合全部子 Agent 结果并交付完整答案才算完成。
+派发子 Agent 是工作的开始，不是结束。
+派发 → 轮询状态 → 读摘要 → 综合 → 作答。`
   })
 }
 
@@ -308,8 +323,7 @@ export function renderR4Snapshot(formatted: string | null, robot?: string): stri
   // ── Profile present → disclaimer + profile content ────────────────────────
   if (formatted && formatted.trim().length > 0) {
     return [
-      '> 注：该硬件画像为过去稍早期画像（在快照时刻记录），当前会话过程中画像可能已更新。',
-      '> Note: this hardware profile is a snapshot captured at a session-start moment (create / resume / compact); it may have been updated later this session via `hardware_profile_write` or `/hardware`.',
+      '> 注：该硬件画像为快照（在会话启动 / resume / 压缩时刻记录），本会话过程中可能已通过 `hardware_profile_write` 或 `/hardware` 更新。',
       '',
       formatted,
     ].join('\n')
@@ -318,35 +332,35 @@ export function renderR4Snapshot(formatted: string | null, robot?: string): stri
   // ── No profile, robot bound → onboarding ──────────────────────────────────
   if (robot) {
     return [
-      `## Hardware Profile — Onboarding Required`,
+      `## 硬件画像 — 需要初始化`,
       ``,
-      `No hardware profile found for **${robot}** at session start.`,
+      `会话启动时未找到 **${robot}** 的硬件画像。`,
       ``,
-      `⚠️ **Action required**: Before starting any algorithm work, you MUST collect hardware`,
-      `information from the user and call \`hardware_profile_write\` to persist it.`,
+      `⚠️ **必须执行**：开始任何算法工作之前，先向用户收集硬件信息，`,
+      `并调用 \`hardware_profile_write\` 持久化。`,
       ``,
-      `Ask the user for the following (one message, all fields):`,
-      `- **platform**: hardware platform / robot model (e.g. "Unitree Go2", "Franka Panda FR3")`,
-      `- **compute**: onboard compute (e.g. "NVIDIA Jetson Orin NX 16GB")`,
-      `- **os** *(optional)*: operating system (e.g. "Ubuntu 22.04 + ROS 2 Humble")`,
-      `- **actuators** *(optional)*: joint/motor description`,
-      `- **sensors** *(optional)*: sensor suite (cameras, LiDAR, IMU, etc.)`,
-      `- **safety_limits**: key safety parameters (e.g. max joint velocity, max payload, emergency stop)`,
-      `- **known_issues** *(optional)*: any known hardware quirks or failure modes`,
-      `- **notes** *(optional)*: anything else relevant`,
+      `一次性向用户询问以下全部字段：`,
+      `- **platform**：硬件平台/机器人型号（如 "Unitree Go2"、"Franka Panda FR3"）`,
+      `- **compute**：板载算力（如 "NVIDIA Jetson Orin NX 16GB"）`,
+      `- **os** *(可选)*：操作系统（如 "Ubuntu 22.04 + ROS 2 Humble"）`,
+      `- **actuators** *(可选)*：关节/电机描述`,
+      `- **sensors** *(可选)*：传感器配置（相机、LiDAR、IMU 等）`,
+      `- **safety_limits**：关键安全参数（如最大关节速度、最大负载、急停）`,
+      `- **known_issues** *(可选)*：已知硬件怪癖或故障模式`,
+      `- **notes** *(可选)*：其他相关信息`,
       ``,
-      `Once the user replies, call \`hardware_profile_write\` immediately to save the profile.`,
-      `> 注：该提示为快照时刻状态；若你已在本会话中写入画像，它将在下一个 session 启动 / resume / compact 时刻加载到 R4。`,
+      `用户回复后，立即调用 \`hardware_profile_write\` 保存画像。`,
+      `> 注：该提示为快照时刻状态；若你已在本会话中写入画像，它将在下一个会话启动 / resume / 压缩时刻加载到 R4。`,
     ].join('\n')
   }
 
   // ── No profile, no robot → hint ───────────────────────────────────────────
   return [
-    `## Hardware Profile`,
+    `## 硬件画像`,
     ``,
-    `No hardware profile is loaded. If you are working with a specific robot platform,`,
-    `ask the user for its hardware specs and call \`hardware_profile_write\` to record them.`,
-    `A profile ensures safe operation limits and platform-specific guidance are always visible.`,
+    `当前未加载硬件画像。如果你在为特定机器人平台工作，`,
+    `请向用户询问硬件规格并调用 \`hardware_profile_write\` 记录。`,
+    `画像可确保安全运行限值和平台特定指引始终可见。`,
   ].join('\n')
 }
 
@@ -507,12 +521,9 @@ export function renderR5Snapshot(
 
   const lines: string[] = []
 
-  lines.push('## Session Milestone Progress (Snapshot)')
+  lines.push('## 会话里程碑进度（快照）')
   lines.push(
-    '> 注：该里程碑节点为过去进度（在快照时刻记录），当前会话过程中进度可能已更新。',
-  )
-  lines.push(
-    '> Note: these milestones are PAST progress captured at the snapshot moment; actual progress during the current session may have advanced.',
+    '> 注：以下里程碑为快照时刻记录的过去进度，本会话过程中进度可能已推进。',
   )
   lines.push('')
 
@@ -521,18 +532,18 @@ export function renderR5Snapshot(
     const ageMs = Date.now() - resumedAt
     const ageDays = Math.round(ageMs / 86_400_000)
     const ageHrs = Math.round(ageMs / 3_600_000)
-    const ageStr = ageDays >= 1 ? `${ageDays} day(s) ago` : `${ageHrs} hour(s) ago`
-    lines.push(`**Session Resumed** — last active: ${ageStr}`, '')
+    const ageStr = ageDays >= 1 ? `${ageDays} 天前` : `${ageHrs} 小时前`
+    lines.push(`**会话已恢复** — 上次活跃：${ageStr}`, '')
   }
 
   // Current phase
   if (state.currentPhase) {
-    lines.push(`**Current Phase**: ${state.currentPhase}`, '')
+    lines.push(`**当前阶段**：${state.currentPhase}`, '')
   }
 
   // Progress notes
   if (hasNotes) {
-    lines.push('## Development Progress')
+    lines.push('## 开发进度')
     state.progressNotes.forEach(note => lines.push(`- ${note}`))
     lines.push('')
   }

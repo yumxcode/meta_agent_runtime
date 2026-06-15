@@ -395,6 +395,9 @@ export class SubAgentRunner {
             await this._writeTerminal(this._timedOut ? 'failed' : 'cancelled', {
               success:      false,
               summary:      this._summaryFor(lastText),
+              // Partial deliverable submitted before the timeout/cancel is
+              // still valuable — preserve it for the dispatcher.
+              output:       this._returnedData(),
               error:        this._timedOut
                 ? `Sub-agent exceeded ${maxDurationMs}ms wall-clock limit`
                 : (this._cancelReason ?? 'cancelled'),
@@ -414,6 +417,11 @@ export class SubAgentRunner {
           const result: SubAgentResult = {
             success:      !isError,
             summary:      this._summaryFor(lastText, event.result),
+            // Preserve the structured return_result payload VERBATIM. The
+            // summary embeds it too, but summary is truncated to 8k chars —
+            // large deliverables (e.g. research report markdown) must survive
+            // intact for the dispatching tool to persist them to disk.
+            output:       this._returnedData(),
             error:        isError
               ? truncate(this._stopReasonToError(event.subtype), ERROR_MAX_CHARS)
               : undefined,
@@ -531,6 +539,24 @@ export class SubAgentRunner {
     }
     const source = (lastText.trim() || fallback).trim()
     return buildSummaryFromText(source, SUMMARY_MAX_CHARS)
+  }
+
+  /**
+   * The structured `data` payload from return_result, size-capped so a runaway
+   * sub-agent cannot bloat the task store (cap ≈ 512 KB serialized).
+   */
+  private _returnedData(): unknown {
+    const data = this._returnedResult?.data
+    if (data === undefined) return undefined
+    try {
+      const serialized = JSON.stringify(data)
+      if (serialized.length > 512 * 1024) {
+        return { truncated: true, reason: `return_result data exceeded 512KB (${serialized.length} chars)` }
+      }
+    } catch {
+      return undefined
+    }
+    return data
   }
 
   private _stopReasonToError(subtype: string): string {

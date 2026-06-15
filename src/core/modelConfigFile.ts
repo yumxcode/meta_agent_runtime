@@ -2,15 +2,27 @@
  * Model config file — global, user-editable model selection.
  *
  * Lets users pin which models the runtime uses without setting env vars or CLI
- * flags on every invocation.  Three selection points plus optional credentials:
+ * flags on every invocation.
+ *
+ * GROUPED format (preferred):
  *
  *   {
- *     "mainModel":     "glm-5.1",       // primary interaction model
- *     "fallbackModel": "glm-4.6",       // used when the primary lacks a feature
- *     "flashModel":    "glm-4.5-air",   // fast side-calls (compact / mode / memory)
- *     "apiKey":        "…",             // optional — overrides env detection
- *     "baseURL":       "https://open.bigmodel.cn/api/anthropic"  // optional
+ *     "LLM": {
+ *       "mainModel":     "glm-5.2",       // primary interaction model
+ *       "fallbackModel": "glm-4.7",       // used when the primary lacks a feature
+ *       "flashModel":    "glm-4.5-air",   // fast side-calls (mode / memory / enrichments)
+ *       "compactModel":  "glm-5.2",       // high-context compact summarisation
+ *       "apiKey":        "…",             // optional — overrides env detection
+ *       "baseURL":       "https://open.bigmodel.cn/api/anthropic"
+ *     },
+ *     "web_search": {
+ *       "tavilyApiKey":  "tvly-…"         // preferred web_search provider
+ *     }
  *   }
+ *
+ * LEGACY flat format (all the same keys at the top level) is still accepted;
+ * grouped values win when both are present. Internally everything is
+ * flattened into the same ModelConfigFile shape, so consumers are unchanged.
  *
  * Location (global only, first existing file wins):
  *   1. ~/.meta-agent/config.json          (primary — matches memory/subtasks dir)
@@ -33,10 +45,18 @@ export interface ModelConfigFile {
   fallbackModel?: string
   /** Fast auxiliary model for side-calls. */
   flashModel?: string
+  /** Model used specifically for compact summarisation. Defaults to flashModel. */
+  compactModel?: string
   /** API key override — bypasses env-var detection when set. */
   apiKey?: string
   /** Provider base URL override. */
   baseURL?: string
+  /**
+   * Tavily API key for the web_search tool (preferred search provider).
+   * Equivalent to setting TAVILY_API_KEY in the environment; the env var wins
+   * when both are present.
+   */
+  tavilyApiKey?: string
 }
 
 let _pathsOverride: string[] | null = null
@@ -57,21 +77,36 @@ export function setModelConfigPathsForTest(paths: string[] | null): void {
   resetModelConfigFileCache()
 }
 
-const STRING_FIELDS = ['mainModel', 'fallbackModel', 'flashModel', 'apiKey', 'baseURL'] as const
+const STRING_FIELDS = ['mainModel', 'fallbackModel', 'flashModel', 'compactModel', 'apiKey', 'baseURL', 'tavilyApiKey'] as const
 
 let _cache: ModelConfigFile | null = null
 let _warned = false
 
-/** Coerce arbitrary parsed JSON into a validated ModelConfigFile (string fields only). */
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+}
+
+/**
+ * Coerce arbitrary parsed JSON into a validated ModelConfigFile.
+ *
+ * Accepts BOTH layouts:
+ *   - grouped (preferred): { "LLM": {model/credential fields}, "web_search": {tavilyApiKey} }
+ *   - legacy flat:         all fields at the top level
+ * Grouped values take precedence over flat ones when both exist.
+ */
 function sanitize(raw: unknown, sourcePath: string): ModelConfigFile {
-  if (raw === null || typeof raw !== 'object' || Array.isArray(raw)) {
+  if (!isRecord(raw)) {
     warnOnce(`meta-agent: ${sourcePath} must contain a JSON object — ignoring.`)
     return {}
   }
-  const obj = raw as Record<string, unknown>
+  const llm = isRecord(raw['LLM']) ? raw['LLM'] : {}
+  const webSearch = isRecord(raw['web_search']) ? raw['web_search'] : {}
+  // Flatten: legacy top-level fields first, grouped fields override.
+  const merged: Record<string, unknown> = { ...raw, ...llm, ...webSearch }
+
   const out: ModelConfigFile = {}
   for (const field of STRING_FIELDS) {
-    const v = obj[field]
+    const v = merged[field]
     if (v === undefined || v === null) continue
     if (typeof v !== 'string' || v.trim() === '') {
       warnOnce(`meta-agent: ${sourcePath} field "${field}" must be a non-empty string — ignoring it.`)

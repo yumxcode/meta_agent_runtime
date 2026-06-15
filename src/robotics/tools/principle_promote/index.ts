@@ -3,12 +3,14 @@ import type { FlashClient } from '../../../core/flash/FlashClient.js'
 import type { ExperienceStore } from '../../ExperienceStore.js'
 import type { PhysicalAnchorStore } from '../../PhysicalAnchorStore.js'
 import type { PrinciplePendingStore } from '../../PrinciplePendingStore.js'
+import type { PrincipleStore } from '../../PrincipleStore.js'
 import { proposePrincipleFromExperience } from '../../PrinciplePromotion.js'
 
 export function createPrinciplePromoteTool(
   experienceStore: ExperienceStore,
   anchorStore: PhysicalAnchorStore,
   pendingStore: PrinciplePendingStore,
+  principleStore: PrincipleStore,
   flash?: FlashClient,
 ): MetaAgentTool {
   return {
@@ -35,13 +37,19 @@ export function createPrinciplePromoteTool(
         experienceStore,
         anchorStore,
         pendingStore,
+        principleStore,
         flash,
         reason: 'explicit_user_request',
       })
       if (!result.promoted) {
+        // 'already_promoted' / 'already_pending' / 'below_threshold' are benign
+        // no-ops, not failures — a principle for this experience already exists.
+        const benign = result.reason === 'below_threshold'
+          || result.reason === 'already_promoted'
+          || result.reason === 'already_pending'
         return {
           content: `principle_promote did not queue a proposal: ${result.reason}`,
-          isError: result.reason !== 'below_threshold',
+          isError: !benign,
         }
       }
       return {

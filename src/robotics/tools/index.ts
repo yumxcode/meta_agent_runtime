@@ -170,7 +170,7 @@ export function createRoboticsTools(opts: RoboticsToolsOptions): MetaAgentTool[]
     createExperienceLoadTool(store),
     createExperienceDeleteTool(store),
     createPrincipleSearchTool(principles),
-    createPrinciplePromoteTool(store, physicalAnchors, pendingPrinciples, opts.flashClient),
+    createPrinciplePromoteTool(store, physicalAnchors, pendingPrinciples, principles, opts.flashClient),
     createPrincipleLoadTool(principles),
     createPrincipleDeleteTool(principles),
 

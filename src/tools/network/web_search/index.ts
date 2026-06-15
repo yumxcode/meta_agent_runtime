@@ -2,6 +2,7 @@ import Anthropic from '@anthropic-ai/sdk'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import { mcpClients } from '../../mcp/registry.js'
+import { loadModelConfigFile } from '../../../core/modelConfigFile.js'
 
 export interface WebSearchToolOptions {
   /** Anthropic API key (last-resort provider). */
@@ -24,6 +25,14 @@ export const DEFAULT_WEB_SEARCH_MODEL = 'claude-sonnet-4-6'
  * Pin a single provider (no fallback) with META_AGENT_SEARCH_PROVIDER=
  * tavily | glm | anthropic — useful for cost control and debugging.
  */
+/** First argument that is a non-empty (after trim) string, else undefined. */
+function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
+  for (const v of values) {
+    if (typeof v === 'string' && v.trim() !== '') return v.trim()
+  }
+  return undefined
+}
+
 const TAVILY_ENDPOINT = 'https://api.tavily.com/search'
 const TAVILY_MAX_RESULTS = 8
 const TAVILY_SNIPPET_CHARS = 600
@@ -159,7 +168,17 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
 
       const allowedDomains = input['allowed_domains'] as string[] | undefined
       const blockedDomains = input['blocked_domains'] as string[] | undefined
-      const tavilyKey = options.tavilyApiKey ?? process.env['TAVILY_API_KEY'] ?? ''
+      // Resolution: explicit option → env var → ~/.meta-agent/config.json
+      // ("tavilyApiKey"). The config-file path is what most users actually
+      // configure; without it the chain silently fell through to GLM MCP even
+      // though Tavily is the preferred provider. Empty/whitespace values are
+      // treated as absent so an empty env var cannot mask the config file.
+      const tavilyKey =
+        firstNonEmpty(
+          options.tavilyApiKey,
+          process.env['TAVILY_API_KEY'],
+          loadModelConfigFile().tavilyApiKey,
+        ) ?? ''
       const anthropicKey = options.apiKey ?? process.env['ANTHROPIC_API_KEY'] ?? ''
       const model = options.model ?? DEFAULT_WEB_SEARCH_MODEL
       const pinned = (process.env['META_AGENT_SEARCH_PROVIDER'] ?? '').trim().toLowerCase()

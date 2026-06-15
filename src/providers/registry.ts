@@ -147,13 +147,16 @@ export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
     envKeys: ['ZHIPU_API_KEY', 'ZAI_API_KEY', 'GLM_API_KEY'],
     urlMatchers: ['bigmodel.cn', 'z.ai'],
     modelMatchers: ['glm-'],
-    models: { default: 'glm-5.1', fallback: 'glm-4.6', flash: 'glm-4.5-air' },
+    // flash (compact / mode-detect / memory side-calls): glm-5.2 — its 1M window
+    // sets the auto-compact trigger at 65% of the effective window (~637k).
+    models: { default: 'glm-5.2', fallback: 'glm-4.6', flash: 'glm-5.2' },
     capabilities: CAP_ZHIPU,
     modelTable: {
       // -air entries MUST precede their bare prefixes; longest-match guards this
       // regardless, but keep the order readable.
       'glm-4.5-air': { contextWindow: 128_000, maxOutput: 131_072, pricing: GLM_AIR },
-      'glm-5.1':     { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_STD },
+      'glm-5.2':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
+      'glm-5.1':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5-turbo': { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_AIR },
       'glm-4.7':     { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-4.6':     { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_STD },

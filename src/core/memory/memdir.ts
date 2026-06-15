@@ -7,7 +7,9 @@
  *   - loadMemoryIndex()             reads and truncates MEMORY.md
  */
 
-import { mkdir, readFile } from 'fs/promises'
+import { mkdir, readFile, rename, writeFile } from 'fs/promises'
+import { createHash } from 'crypto'
+import { join, dirname } from 'path'
 import {
   MEMORY_DIR,
   MEMORY_ENTRYPOINT_NAME,
@@ -115,9 +117,95 @@ export async function loadMemoryIndex(): Promise<string | null> {
   try {
     const raw = await readFile(getMemoryEntrypoint(), 'utf-8')
     if (!raw.trim()) return null
-    return truncateEntrypointContent(raw).content
+    const repaired = await repairMemoryEntrypoint(raw, getMemoryEntrypoint())
+    return truncateEntrypointContent(repaired).content
   } catch {
     // File not yet created — normal on first run
     return null
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// One-time entrypoint repair (legacy topic/index collision)
+// ─────────────────────────────────────────────────────────────────────────────
+
+let _repairAttempted = false
+
+/** Test hook — allow the repair to run again within one process. */
+export function resetMemoryRepairForTest(): void {
+  _repairAttempted = false
+}
+
+/**
+ * Heal a LEGACY malformed MEMORY.md: older memory-writer versions could name a
+ * topic file `memory.md`, which on case-insensitive filesystems IS the
+ * MEMORY.md entrypoint — the topic entry (frontmatter + body) and the index
+ * bullets got mashed into one file, duplicating the entry in every render.
+ *
+ * Repair (runs at most once per process, only when the file STARTS with a
+ * frontmatter fence):
+ *   1. Split the embedded entry (frontmatter + body) from the bullet index.
+ *   2. Write the entry to its own topic file `mem_<hash>.md` (skip if exists).
+ *   3. Rewrite MEMORY.md with only the bullets, fixing `](memory.md)` links
+ *      to point at the extracted file.
+ * A backup of the original is kept as MEMORY.md.bak. On any failure the
+ * original content is returned unchanged.
+ */
+export async function repairMemoryEntrypoint(
+  raw: string,
+  entrypointPath: string,
+): Promise<string> {
+  if (_repairAttempted) return raw
+  _repairAttempted = true
+
+  const trimmed = raw.trimStart()
+  if (!trimmed.startsWith('---')) return raw
+
+  try {
+    // Locate the closing frontmatter fence.
+    const fenceEnd = trimmed.indexOf('\n---', 3)
+    if (fenceEnd < 0) return raw
+
+    // The embedded entry = frontmatter + body up to the first index bullet
+    // line (`- [name](file.md) - …`) or end of file.
+    const afterFence = trimmed.indexOf('\n', fenceEnd + 1) + 1
+    const bulletRe = /^- \[.*?\]\(.*?\.md\)/m
+    const rest = trimmed.slice(afterFence)
+    const bulletMatch = bulletRe.exec(rest)
+
+    const entryBody = (bulletMatch ? rest.slice(0, bulletMatch.index) : rest).trim()
+    const bullets = (bulletMatch ? rest.slice(bulletMatch.index) : '').trim()
+    const frontmatter = trimmed.slice(0, afterFence).trim()
+    if (!entryBody) return raw
+
+    // Derive a stable topic filename from the entry name.
+    const nameMatch = frontmatter.match(/^name:\s*(.+)$/m)
+    const entryName = nameMatch?.[1]?.trim() ?? 'recovered_memory'
+    const hash = createHash('sha1').update(entryName).digest('hex').slice(0, 8)
+    const topicFilename = `mem_${hash}.md`
+    const topicPath = join(dirname(entrypointPath), topicFilename)
+
+    // 1. Persist the extracted entry (do not clobber an existing file).
+    try {
+      await readFile(topicPath, 'utf-8')
+    } catch {
+      await writeFile(topicPath, `${frontmatter}\n\n${entryBody}\n`, 'utf-8')
+    }
+
+    // 2. Rewrite the index: bullets only, with self-links repointed.
+    const fixedBullets = bullets
+      .replace(/\]\(memory\.md\)/gi, `](${topicFilename})`)
+    const newIndex = fixedBullets || `- [${entryName}](${topicFilename}) - (recovered entry)`
+
+    // 3. Backup + atomic-ish replace.
+    await writeFile(`${entrypointPath}.bak`, raw, 'utf-8')
+    const tmp = `${entrypointPath}.tmp`
+    await writeFile(tmp, `${newIndex}\n`, 'utf-8')
+    await rename(tmp, entrypointPath)
+
+    return newIndex
+  } catch {
+    // Best-effort: never let a repair failure break memory loading.
+    return raw
   }
 }

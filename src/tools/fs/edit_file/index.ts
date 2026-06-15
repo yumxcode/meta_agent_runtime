@@ -10,7 +10,9 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
   return {
     name: 'edit_file',
     description,
-    permission: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+    // sensitive: false — in-place edits INSIDE the workspace run without user
+    // approval; paths outside the workspace are still denied by the policy.
+    permission: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
     inputSchema: {
       type: 'object',
       properties: {

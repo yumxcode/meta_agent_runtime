@@ -135,3 +135,35 @@ describe('web_search provider chain: Tavily → GLM → Anthropic', () => {
     expect(result.content).toContain('TAVILY_API_KEY')
   })
 })
+
+describe('web_search tavilyApiKey from ~/.meta-agent/config.json', () => {
+  it('uses the config-file tavilyApiKey when no option/env key is set', async () => {
+    const { mkdtempSync, writeFileSync } = await import('fs')
+    const { tmpdir } = await import('os')
+    const { join } = await import('path')
+    const { setModelConfigPathsForTest } = await import('../../../core/modelConfigFile.js')
+
+    const dir = mkdtempSync(join(tmpdir(), 'cfg-'))
+    const cfgPath = join(dir, 'config.json')
+    writeFileSync(cfgPath, JSON.stringify({ tavilyApiKey: 'tvly-from-config' }))
+    setModelConfigPathsForTest([cfgPath])
+    vi.stubEnv('TAVILY_API_KEY', '')
+    try {
+      const fetchMock = stubTavilyFetch({ json: { answer: 'ok', results: [] } })
+      const glmCalls: Array<{ toolName: string; toolInput: Record<string, unknown> }> = []
+      registerGlmMock(glmCalls)
+
+      const tool = await createWebSearchTool()
+      const res = await tool.call({ query: 'reward design' }, ctx() as never)
+
+      expect(res.isError).toBe(false)
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+      const headers = (fetchMock.mock.calls[0] as unknown[])[1] as { headers: Record<string, string> }
+      expect(headers.headers['authorization']).toBe('Bearer tvly-from-config')
+      // Tavily succeeded → GLM MCP must NOT be called
+      expect(glmCalls).toHaveLength(0)
+    } finally {
+      setModelConfigPathsForTest(null)
+    }
+  })
+})

@@ -13,6 +13,7 @@ import {
   buildCompactPrompt,
   buildCompactSummaryMessage,
   buildFallbackCompactSummary,
+  isTurnComplete,
 } from '../compact/CompactPrompt.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
 
@@ -127,34 +128,65 @@ Other content.
 describe('buildCompactPrompt', () => {
   it('includes the base compact prompt text', () => {
     const prompt = buildCompactPrompt()
-    expect(prompt).toContain('detailed summary of the conversation')
+    expect(prompt).toContain('详细的总结')
   })
 
-  it('includes the 9-section structure', () => {
+  it('defaults to the agentic 9-section structure', () => {
     const prompt = buildCompactPrompt()
-    expect(prompt).toContain('## 1. Primary Request and Intent')
-    expect(prompt).toContain('## 9. Optional Next Step')
+    expect(prompt).toContain('## 1. 主要请求与意图')
+    expect(prompt).toContain('## 9. 可选的下一步')
   })
 
   it('includes no-tools preamble', () => {
     const prompt = buildCompactPrompt()
-    expect(prompt).toContain('Do NOT call any tools')
+    expect(prompt).toContain('不要调用任何工具')
   })
 
   it('injects custom instructions when provided', () => {
-    const prompt = buildCompactPrompt('Always include git hashes.')
-    expect(prompt).toContain('## Additional Instructions')
-    expect(prompt).toContain('Always include git hashes.')
+    const prompt = buildCompactPrompt('务必保留 git hash。')
+    expect(prompt).toContain('## 额外指令')
+    expect(prompt).toContain('务必保留 git hash。')
   })
 
   it('does not add additional instructions section when none provided', () => {
     const prompt = buildCompactPrompt()
-    expect(prompt).not.toContain('## Additional Instructions')
+    expect(prompt).not.toContain('## 额外指令')
   })
 
   it('ends with the no-tools trailer', () => {
     const prompt = buildCompactPrompt()
-    expect(prompt.trimEnd()).toContain('Respond with TEXT ONLY')
+    expect(prompt.trimEnd()).toContain('只能用纯文本回复')
+  })
+
+  // ── per-mode profiles ───────────────────────────────────────────────────────
+
+  it('agentic profile has the base 9 sections, no domain sections', () => {
+    const prompt = buildCompactPrompt(undefined, 'agentic')
+    expect(prompt).toContain('## 9. 可选的下一步')
+    expect(prompt).not.toContain('实验台账')
+    expect(prompt).not.toContain('Provenance 台账')
+  })
+
+  it('robotics profile adds Experiment Ledger, Dead Ends, assumptions', () => {
+    const prompt = buildCompactPrompt(undefined, 'robotics')
+    expect(prompt).toContain('## 10. 实验台账（Experiment Ledger）')
+    expect(prompt).toContain('## 11. 失败方向（Dead Ends）')
+    expect(prompt).toContain('## 12. 假设与运行条件')
+    expect(prompt).toContain('commit/branch')
+    expect(prompt).not.toContain('Provenance 台账')
+  })
+
+  it('campaign profile adds Provenance ledger and Phase Gate', () => {
+    const prompt = buildCompactPrompt(undefined, 'campaign')
+    expect(prompt).toContain('## 10. Provenance 台账')
+    expect(prompt).toContain('## 11. 阶段门状态（Phase Gate）')
+    expect(prompt).not.toContain('实验台账')
+  })
+
+  it('unknown profile falls back to agentic', () => {
+    const prompt = buildCompactPrompt(undefined, 'nope' as never)
+    expect(prompt).toContain('## 1. 主要请求与意图')
+    expect(prompt).not.toContain('实验台账')
   })
 })
 
@@ -168,12 +200,84 @@ describe('buildCompactSummaryMessage', () => {
 
   it('includes the resume instruction', () => {
     const msg = buildCompactSummaryMessage('Summary:\nContext.')
-    expect(msg).toContain('Continue the conversation from where it left off')
+    expect(msg).toContain('从中断处继续对话')
   })
 
   it('includes the context-continuation preamble', () => {
     const msg = buildCompactSummaryMessage('Summary:\nContext.')
-    expect(msg).toContain('previous conversation that ran out of context')
+    expect(msg).toContain('因上下文超限而中断的对话继续而来')
+  })
+
+  it('uses the resume postamble for an interrupted turn (default)', () => {
+    const msg = buildCompactSummaryMessage('Summary:\nContext.', false)
+    expect(msg).toContain('把上一个任务当作从未中断过一样接着做')
+    expect(msg).not.toContain('上一个任务已经完成')
+  })
+
+  it('uses the await-instruction postamble for a completed turn', () => {
+    const msg = buildCompactSummaryMessage('Summary:\nContext.', true)
+    expect(msg).toContain('上一个任务已经完成')
+    expect(msg).toContain('等待用户的下一条指令')
+    expect(msg).not.toContain('把上一个任务当作从未中断过一样接着做')
+  })
+})
+
+// ── isTurnComplete ────────────────────────────────────────────────────────────
+
+describe('isTurnComplete', () => {
+  const mk = (
+    role: 'user' | 'assistant',
+    content: KernelMessage['content'],
+    meta: Partial<KernelMessage> = {},
+  ): KernelMessage => ({ uuid: crypto.randomUUID(), role, content, ...meta })
+
+  const text = (t: string): KernelMessage['content'] => [{ type: 'text', text: t }]
+
+  it('returns true when the tail is a clean assistant answer', () => {
+    const messages = [
+      mk('user', text('do the thing')),
+      mk('assistant', text('done — here is the result')),
+    ]
+    expect(isTurnComplete(messages)).toBe(true)
+  })
+
+  it('returns false when the tail is an unanswered user message', () => {
+    const messages = [
+      mk('assistant', text('previous answer')),
+      mk('user', text('現在的進展如何')),
+    ]
+    expect(isTurnComplete(messages)).toBe(false)
+  })
+
+  it('returns false when the assistant still has a pending tool_use', () => {
+    const messages = [
+      mk('user', text('do it')),
+      mk('assistant', [{ type: 'tool_use', id: 't1', name: 'bash', input: {} } as never]),
+    ]
+    expect(isTurnComplete(messages)).toBe(false)
+  })
+
+  it('returns false when the tail is a tool_result awaiting the assistant', () => {
+    const messages = [
+      mk('assistant', [{ type: 'tool_use', id: 't1', name: 'bash', input: {} } as never]),
+      mk('user', [{ type: 'tool_result', tool_use_id: 't1', content: 'ok' } as never], {
+        sourceToolAssistantUUID: 'a1',
+      }),
+    ]
+    expect(isTurnComplete(messages)).toBe(false)
+  })
+
+  it('skips trailing compact-boundary / empty entries to find the real tail', () => {
+    const messages = [
+      mk('user', text('do the thing')),
+      mk('assistant', text('done')),
+      mk('user', [], { isCompactBoundary: true }),
+    ]
+    expect(isTurnComplete(messages)).toBe(true)
+  })
+
+  it('returns false for empty history', () => {
+    expect(isTurnComplete([])).toBe(false)
   })
 })
 

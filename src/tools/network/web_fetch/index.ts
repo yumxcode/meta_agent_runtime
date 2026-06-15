@@ -332,11 +332,24 @@ async function fetchWithSafeRedirects(
   return { ok: false, reason: `too many redirects (>${MAX_REDIRECTS})` }
 }
 
-export async function createWebFetchTool(): Promise<MetaAgentTool> {
+export interface WebFetchToolOptions {
+  /**
+   * Per-result character budget applied by the kernel (applyToolResultBudget).
+   * MAIN sessions should set a tight budget (e.g. 8k) so a single fetch cannot
+   * flood the long-lived context — full-text reading belongs in isolated
+   * research sub-agents, which register an unbudgeted variant.
+   */
+  maxResultSizeChars?: number
+}
+
+export async function createWebFetchTool(options: WebFetchToolOptions = {}): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'web_fetch',
     description,
+    ...(options.maxResultSizeChars !== undefined
+      ? { maxResultSizeChars: options.maxResultSizeChars }
+      : {}),
     isConcurrencySafe: true,
     permission: { category: 'network', planMode: 'allow' },
     inputSchema: {

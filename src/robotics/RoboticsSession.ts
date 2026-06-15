@@ -75,6 +75,21 @@ import {
 import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
 import { createWebFetchTool } from '../tools/network/web_fetch/index.js'
+import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
+import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
+
+/**
+ * Per-result budget for the MAIN agent's web_fetch. A single unbudgeted fetch
+ * (≤100 KB) in the long-lived context is the noise amplifier behind the
+ * compact-rework loop; full-text reading goes through research_dispatch.
+ */
+const MAIN_AGENT_WEB_FETCH_MAX_CHARS = 8_000
+
+/** Join optional anchor/instruction blocks; null when none produced content. */
+function composeAnchorBlocks(...blocks: Array<string | null | undefined>): string | null {
+  const combined = blocks.filter(Boolean).join('\n\n')
+  return combined || null
+}
 import { createWebSearchTool } from '../tools/network/web_search/index.js'
 import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
@@ -444,6 +459,9 @@ export class RoboticsSession {
         // survive even when the model under-summarises. Resolved lazily at
         // compaction time to reflect live state.
         deterministicAnchors: () => this._buildDeterministicCompactAnchors() ?? undefined,
+        // Robotics summary template: 9 sections + Experiment Ledger / Dead Ends /
+        // assumptions, routed through AgenticSession into the kernel compact call.
+        promptProfile: 'robotics',
       },
     } as MetaAgentConfig)
   }
@@ -604,7 +622,13 @@ export class RoboticsSession {
     // Network tools — required by sub-agents (e.g. PaperSearchAgent) whose
     // allowedTools include 'web_fetch' / 'web_search'. Registering here also
     // makes them resolvable in the bridge's tool registry (wired below).
-    this.inner.registerTool(await createWebFetchTool())
+    //
+    // MAIN-agent web_fetch carries a tight per-result budget (8k chars): a
+    // single full-text fetch (up to 100 KB) in the long-lived main context is
+    // the documented noise amplifier behind compact-rework loops. Full-text
+    // reading belongs in isolated research sub-agents — the bridge registry
+    // below overrides web_fetch with an unbudgeted variant for sub-agents.
+    this.inner.registerTool(await createWebFetchTool({ maxResultSizeChars: MAIN_AGENT_WEB_FETCH_MAX_CHARS }))
     // web_search gives the agent a real discovery path so it stops guessing
     // search-page URLs (e.g. github.com/search) that 404. It self-selects a
     // backend at call time — Anthropic web-search when ANTHROPIC_API_KEY is
@@ -654,6 +678,19 @@ export class RoboticsSession {
       }
     }
 
+    // ── 4a-research. Research dispatch — isolated literature research ─────
+    // Searches/fetches/extracts in a sub-agent's own context, persists the
+    // report under <projectDir>/.meta-agent/research/, and returns only a one-line
+    // conclusion + report path to the main agent. Compact anchors (see
+    // _buildDeterministicCompactAnchors) then steer post-compaction recovery
+    // to re-READ the report file instead of re-RUNNING the research.
+    this.inner.registerTool(createResearchDispatchTool({
+      dispatcher: this.bridge,
+      projectDir: this.projectDir,
+      sessionId: this._storeSessionId,
+      extraAllowedTools: ['experience_write'],
+    }))
+
     // ── 4b. Wire the sub-agent tool registry ──────────────────────────────
     // CRITICAL: sub-agents resolve their config.allowedTools against the
     // bridge's tool registry. Without this call the registry stays empty, so
@@ -661,7 +698,12 @@ export class RoboticsSession {
     // ZERO tools — the model emits one line and terminates with turnsUsed=0,
     // which surfaces as a hollow "complete" with no real work done.
     // Must run AFTER all main-session tools are registered above.
+    //
+    // Sub-agents get an UNBUDGETED web_fetch override: their context is
+    // isolated and discarded after the run, so full-text reading is exactly
+    // where it belongs. The main agent's own web_fetch stays budgeted (8k).
     this.bridge.setToolRegistry(this.inner.getToolRegistry())
+    this.bridge.setSubAgentToolOverrides([await createWebFetchTool()])
 
     // ── 5. Dynamic sections (R1-R5 + W1) ─────────────────────────────────
     // Sections are built lazily on first submit() via _getRoboticsExtensions().
@@ -741,7 +783,10 @@ export class RoboticsSession {
    * when there is nothing worth preserving.
    */
   private _buildCompactInstructions(): string | null {
-    return buildRoboticsCompactInstructions(this._compactContext())
+    return composeAnchorBlocks(
+      buildRoboticsCompactInstructions(this._compactContext()),
+      buildResearchArtifactAnchors(this.projectDir),
+    )
   }
 
   /**
@@ -750,7 +795,12 @@ export class RoboticsSession {
    * it reflects live state at the moment compaction fires.
    */
   private _buildDeterministicCompactAnchors(): string | null {
-    return buildRoboticsDeterministicAnchors(this._compactContext())
+    return composeAnchorBlocks(
+      buildRoboticsDeterministicAnchors(this._compactContext()),
+      // Persisted research reports: post-compaction the model must re-READ
+      // these files, never re-RUN the research (soft constraint).
+      buildResearchArtifactAnchors(this.projectDir),
+    )
   }
 
   /** Shared live-state snapshot for the compact instruction + anchor builders. */
@@ -776,9 +826,35 @@ export class RoboticsSession {
       experienceStore: this.store,
       anchorStore: this.physicalAnchors,
       pendingStore: this.pendingPrinciples,
+      principleStore: this.principles,
       flash: this._flashClient,
       reason,
     })
+  }
+
+  /**
+   * Reinforce/challenge loop: when a freshly-committed experience cites
+   * principleIds, fold its outcome back into those committed principles —
+   * a success corroborates (observationCount++), a failure contradicts
+   * (contradictionCount++, lowering the principle's retrieval score so a
+   * challenged principle sinks and resurfaces for human re-review).
+   * Returns the per-principle signals applied (empty when the experience cites
+   * no principles).
+   */
+  async reinforcePrinciplesFromExperience(
+    experienceId: string,
+  ): Promise<Array<{ principleId: string; signal: 'observation' | 'contradiction' }>> {
+    const experience = await this.store.load(experienceId)
+    const principleIds = experience?.principleIds ?? []
+    if (!experience || principleIds.length === 0) return []
+    const signal: 'observation' | 'contradiction' =
+      experience.outcome.success ? 'observation' : 'contradiction'
+    const applied: Array<{ principleId: string; signal: 'observation' | 'contradiction' }> = []
+    for (const principleId of [...new Set(principleIds)]) {
+      const updated = await this.principles.recordOutcomeSignal(principleId, signal).catch(() => null)
+      if (updated) applied.push({ principleId, signal })
+    }
+    return applied
   }
 
   // ── Lifecycle: dispose ────────────────────────────────────────────────────
@@ -899,7 +975,7 @@ export class RoboticsSession {
         system: systemPrompt,
         user: userMsg,
         maxTokens: 800,
-        timeoutMs: 8_000,
+        timeoutMs: 30_000,
       })
     } catch { return }
 
@@ -1028,6 +1104,18 @@ export class RoboticsSession {
   /** Inject a mid-turn user correction. See KernelSession.steer(). */
   steer(text: string): boolean {
     return this.inner.steer(text)
+  }
+
+  /**
+   * Manual compaction (/compact). Mirrors the compact_start interception on
+   * the auto path: refresh R4/R5 snapshots and force an experience-candidate
+   * reload so the post-compact stable prompt reflects current state.
+   */
+  async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    this._refreshR5Snapshot()
+    await this._refreshR4Snapshot()
+    this._forceExperienceCandidateLoad = true
+    return this.inner.compactNow()
   }
 
   getMessages(): readonly ConversationMessage[] {
@@ -1164,7 +1252,7 @@ export class RoboticsSession {
         `Candidate experiences:\n${candidates.map(formatExperienceCandidate).join('\n\n')}`,
       ].join('\n\n'),
       maxTokens: 220,
-      timeoutMs: 4_000,
+      timeoutMs: 30_000,
       cacheKey: `experience-working-set:${createHash('sha256')
         .update([
           prompt.slice(0, 800),
@@ -1577,7 +1665,7 @@ Required output:
 META-WORKFLOW content:
 ${input.content.slice(0, 12000)}`,
       maxTokens: 3000,
-      timeoutMs: 8_000,
+      timeoutMs: 30_000,
       cacheKey: `workflow-repair:${input.mode}:${contentHash}`,
     })
   }
@@ -1650,7 +1738,7 @@ Reply with a JSON object: {"mode":"single"|"multi","reason":"<one sentence why>"
         system: systemPrompt,
         user: userContent,
         maxTokens: 60,
-        timeoutMs: 5_000,
+        timeoutMs: 30_000,
         cacheKey: `robotics-agent-mode:${this.sessionId}:${firstPrompt.slice(0, 120)}`,
       }) ?? ''
 

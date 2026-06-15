@@ -35,11 +35,12 @@ describe('loadModelConfigFile', () => {
     expect(loadModelConfigFile()).toEqual({})
   })
 
-  it('reads the three model fields plus apiKey / baseURL', () => {
+  it('reads the model fields plus apiKey / baseURL', () => {
     writeFileSync(pathA, JSON.stringify({
       mainModel: 'glm-5.1',
       fallbackModel: 'glm-4.6',
       flashModel: 'glm-4.5-air',
+      compactModel: 'glm-5.1',
       apiKey: 'k',
       baseURL: 'https://open.bigmodel.cn/api/anthropic',
     }))
@@ -48,9 +49,49 @@ describe('loadModelConfigFile', () => {
       mainModel: 'glm-5.1',
       fallbackModel: 'glm-4.6',
       flashModel: 'glm-4.5-air',
+      compactModel: 'glm-5.1',
       apiKey: 'k',
       baseURL: 'https://open.bigmodel.cn/api/anthropic',
     })
+  })
+
+  it('reads the GROUPED format ({ LLM: {...}, web_search: {...} })', () => {
+    writeFileSync(pathA, JSON.stringify({
+      LLM: {
+        mainModel: 'glm-5.1',
+        fallbackModel: 'glm-4.7',
+        flashModel: 'glm-4.5-air',
+        compactModel: 'glm-5.1',
+        apiKey: 'k-grouped',
+        baseURL: 'https://open.bigmodel.cn/api/anthropic',
+      },
+      web_search: {
+        tavilyApiKey: 'tvly-grouped',
+      },
+    }))
+    setModelConfigPathsForTest([pathA, pathB])
+    expect(loadModelConfigFile()).toEqual({
+      mainModel: 'glm-5.1',
+      fallbackModel: 'glm-4.7',
+      flashModel: 'glm-4.5-air',
+      compactModel: 'glm-5.1',
+      apiKey: 'k-grouped',
+      baseURL: 'https://open.bigmodel.cn/api/anthropic',
+      tavilyApiKey: 'tvly-grouped',
+    })
+  })
+
+  it('grouped fields override legacy flat fields when both are present', () => {
+    writeFileSync(pathA, JSON.stringify({
+      mainModel: 'flat-model',
+      tavilyApiKey: 'tvly-flat',
+      LLM: { mainModel: 'grouped-model' },
+      web_search: { tavilyApiKey: 'tvly-grouped' },
+    }))
+    setModelConfigPathsForTest([pathA, pathB])
+    const cfg = loadModelConfigFile()
+    expect(cfg.mainModel).toBe('grouped-model')
+    expect(cfg.tavilyApiKey).toBe('tvly-grouped')
   })
 
   it('prefers the first existing candidate path', () => {

@@ -163,6 +163,8 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * in their config.allowedTools that are also present in this registry.
    */
   private toolRegistry: Map<string, MetaAgentTool> = new Map()
+  /** Sub-agent-only tool overrides (see setSubAgentToolOverrides). */
+  private subAgentToolOverrides: Map<string, MetaAgentTool> = new Map()
 
   /**
    * Pending notifications keyed by parentSessionId.
@@ -268,6 +270,23 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    */
   setToolRegistry(registry: Map<string, MetaAgentTool>): void {
     this.toolRegistry = registry
+  }
+
+  /**
+   * Sub-agent-only tool overrides, merged OVER the main registry at runner
+   * construction time. Used to give sub-agents variants that differ from the
+   * main agent's — e.g. an UNBUDGETED web_fetch: the main agent's fetch is
+   * result-budgeted (its context is long-lived), while a research sub-agent
+   * must read full texts in its isolated, discarded-after-run context.
+   */
+  setSubAgentToolOverrides(tools: readonly MetaAgentTool[]): void {
+    this.subAgentToolOverrides = new Map(tools.map(t => [t.name, t]))
+  }
+
+  /** Effective registry for a new runner: main registry + overrides. */
+  private _effectiveToolRegistry(): Map<string, MetaAgentTool> {
+    if (this.subAgentToolOverrides.size === 0) return this.toolRegistry
+    return new Map([...this.toolRegistry, ...this.subAgentToolOverrides])
   }
 
   /**
@@ -718,7 +737,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
         const runner = new SubAgentRunner(
           queued.record,
-          this.toolRegistry,
+          this._effectiveToolRegistry(),
           queued.abortController.signal,
         )
         this.queuedStarts.delete(taskId)

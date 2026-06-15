@@ -35,8 +35,13 @@ export interface ToolPermissionOverride extends ToolPermissionDeclaration {
 
 const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   read_file: { category: 'read', pathFields: ['file_path'], requiresWorkspace: true, planMode: 'allow' },
-  write_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
-  edit_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+  // write_file / edit_file: NOT sensitive — writes inside the workspace
+  // auto-allow without user approval in every mode (agentic/robotics/campaign).
+  // The workspace boundary is still hard-enforced: paths outside the workspace
+  // are denied (requiresWorkspace), and plan mode still gates writes (planMode:
+  // 'ask') so a planning turn does not silently modify files.
+  write_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
+  edit_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
   notebook_edit: { category: 'write', pathFields: ['notebook_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
   glob: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
   grep: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
@@ -255,11 +260,13 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     context,
   ): Promise<CanUseToolResult> => {
     const record = asRecord(input)
-    const configuredPermission = mergePermissionDeclaration(
-      DEFAULT_TOOL_PERMISSIONS[tool.name],
+    // Precedence (low → high): DEFAULT_TOOL_PERMISSIONS < tool's own declaration
+    // < user permissions.json. The user config file is the highest authority so
+    // an operator can flip any tool's gates (e.g. sensitive) without code changes.
+    const permission = mergePermissionDeclaration(
+      mergePermissionDeclaration(DEFAULT_TOOL_PERMISSIONS[tool.name], tool.permission),
       permissionConfig.tools?.[tool.name],
     )
-    const permission = mergePermissionDeclaration(configuredPermission, tool.permission)
 
     if (permission.enabled === false) {
       return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` }

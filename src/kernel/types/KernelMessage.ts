@@ -43,6 +43,21 @@ export interface KernelMessage {
    * the verbatim task anchor so a late correction can't displace the task.
    */
   isSteering?: boolean
+  /**
+   * Text-only clone created by the compact keep-set builder
+   * (cloneLastRealUserTextMessage / cloneSteeringTextMessage). The clone
+   * preserves the user's words across a compaction but is NOT the original
+   * message: goal capture (originalUserGoal) must skip it — otherwise, after a
+   * resume, a mid-session request cloned by compaction #N would be mistaken
+   * for the session's first user message.
+   */
+  isKeepSetClone?: boolean
+  /**
+   * For keep-set clones: the uuid of the original message this was cloned
+   * from. Used by the compact continuity anchors to exclude content that the
+   * keep-set already preserves verbatim (F-2 dedupe).
+   */
+  sourceUuid?: string
 
   // Usage for assistant messages (from API response)
   usage?: {

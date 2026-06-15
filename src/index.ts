@@ -287,3 +287,8 @@ export type {
   ActiveSubAgentRecord,
   RoboticsProjectState,
 } from './robotics/types.js'
+
+// ── Research (isolated literature research with disk-persisted deliverables) ──
+export { createResearchDispatchTool, RESEARCH_MAX_DURATION_MS } from './tools/research/research_dispatch/index.js'
+export { ResearchStore, buildResearchArtifactAnchors, researchRootDir } from './research/ResearchStore.js'
+export type { ResearchIndexEntry, SaveResearchResultOptions } from './research/ResearchStore.js'

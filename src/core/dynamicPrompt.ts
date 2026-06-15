@@ -102,6 +102,38 @@ async function _readCtxCached() {
 //   2. Recalled topic files depend on the current user query (per-query relevance).
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * Strip a leading YAML frontmatter block (`---\n…\n---`) from recalled memory
+ * file content. The D1b renderer already shows name/date in the entry header;
+ * re-injecting six metadata lines per file duplicated the index bullets.
+ */
+export function stripMemoryFrontmatter(content: string): string {
+  const trimmed = content.replace(/^\s+/, '')
+  if (!trimmed.startsWith('---')) return content.trim()
+  const end = trimmed.indexOf('\n---', 3)
+  if (end < 0) return content.trim()
+  return trimmed.slice(trimmed.indexOf('\n', end + 1) + 1).trim()
+}
+
+/**
+ * 召回差集 — remove index bullets whose topic file is recalled IN FULL this
+ * turn. A bullet is identified by its `](<filename>)` link; non-bullet lines
+ * (headers, notes) are always kept. Blank-line runs left by removed bullets
+ * are collapsed.
+ */
+export function filterRecalledIndexBullets(
+  index: string,
+  recalledFilenames: ReadonlySet<string>,
+): string {
+  if (recalledFilenames.size === 0) return index.trim()
+  const kept = index.split('\n').filter(line => {
+    const link = line.match(/\]\(([^)\s]+\.md)\)/)
+    if (!link) return true
+    return !recalledFilenames.has(link[1]!.toLowerCase())
+  })
+  return kept.join('\n').replace(/\n{3,}/g, '\n\n').trim()
+}
+
 export function buildMemoryContentSection(
   currentQuery: string,
   client?: Anthropic,
@@ -121,10 +153,44 @@ export function buildMemoryContentSection(
 
       const parts: string[] = []
 
-      // MEMORY.md index
+      // Recalled topic files — computed FIRST so the index render below can
+      // subtract them (召回差集).
+      // Hygiene (dedup): ① never re-inject the entrypoint index itself — it is
+      // always rendered above (defense-in-depth: on case-insensitive
+      // filesystems a lowercase memory.md IS the index), ② drop duplicates
+      // (same filename case-insensitively, or identical body), ③ strip YAML
+      // frontmatter — name/date are already rendered in the header line.
+      const seenNames = new Set<string>()
+      const seenBodies = new Set<string>()
+      const deduped = relevant
+        .map(mem => ({ ...mem, body: stripMemoryFrontmatter(mem.content) }))
+        .filter(mem => {
+          const key = mem.header.filename.toLowerCase()
+          if (key === MEMORY_ENTRYPOINT_NAME.toLowerCase()) return false
+          if (seenNames.has(key) || seenBodies.has(mem.body)) return false
+          seenNames.add(key)
+          seenBodies.add(mem.body)
+          return true
+        })
+
+      // MEMORY.md index — recall difference set: bullets whose topic file is
+      // recalled IN FULL below are pure duplication (the bullet description is
+      // a compression of the body's first lines), so they are filtered out.
+      // Bullets for NOT-recalled entries stay — they are the cheap fail-safe
+      // signal that lets the model read_file an entry the recall missed.
+      const recalledFilenames = new Set(deduped.map(mem => mem.header.filename.toLowerCase()))
+      const filteredIndex = index
+        ? filterRecalledIndexBullets(index, recalledFilenames)
+        : index
+
       parts.push(`## ${MEMORY_ENTRYPOINT_NAME}`, '')
-      if (index) {
-        parts.push(index)
+      if (filteredIndex) {
+        parts.push(filteredIndex)
+      } else if (index) {
+        // Every indexed entry is recalled in full below — say so instead of
+        // rendering an empty index (the model must still know the index is
+        // not empty when proposing new memories).
+        parts.push('*(all indexed memories are recalled in full below)*')
       } else {
         parts.push(
           `Your ${MEMORY_ENTRYPOINT_NAME} is currently empty.`,
@@ -132,11 +198,10 @@ export function buildMemoryContentSection(
         )
       }
 
-      // Recalled topic files (injected inline after the index)
-      if (relevant.length > 0) {
+      if (deduped.length > 0) {
         parts.push('', '## Recalled memory files', '')
-        for (const mem of relevant) {
-          const { header, content } = mem
+        for (const mem of deduped) {
+          const { header, body: content } = mem
 
           // Base meta: type · date
           const metaParts: string[] = []
@@ -337,7 +402,7 @@ export function buildCurrentModeSection(mode: AgentMode): SystemPromptSection {
     // 注意保持中性：子 Agent 编排是否可用由 R1（Robotics Development Mode 节）
     // 按 single/multi 变体决定，此处不预先断言"已激活"，避免与 R1 single 变体矛盾。
     robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置与 Git 工作区已激活。' +
-      '是否启用子 Agent 编排以 "Robotics Development Mode" 节为准。' +
+      '是否启用子 Agent 编排以 "Robotics 开发模式" 节为准。' +
       '优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
   }
   return systemPromptSection('current_mode', () => {

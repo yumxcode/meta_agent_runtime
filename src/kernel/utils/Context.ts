@@ -4,7 +4,7 @@
  * Window sizes come from the Provider Registry (single source of truth).
  * Threshold logic mirrors CC's autocompact.ts.
  */
-import { getModelContextWindow, DEFAULT_CONTEXT_WINDOW } from '../../providers/registry.js'
+import { getModelContextWindow } from '../../providers/registry.js'
 
 export function getContextWindowSize(model: string): number {
   // Allow env override (CC: CLAUDE_CODE_AUTO_COMPACT_WINDOW)
@@ -18,10 +18,14 @@ export function getContextWindowSize(model: string): number {
 
 // ── Threshold calculations (mirroring CC's autocompact.ts) ───────────────────
 
-const AUTOCOMPACT_BUFFER_TOKENS = 13_000
 const MANUAL_COMPACT_BUFFER_TOKENS = 3_000
 const DEFAULT_MAX_OUTPUT_TOKENS = 32_768
-const LONG_CONTEXT_AUTOCOMPACT_CAP = 180_000
+/**
+ * Default auto-compact trigger as a fraction of the effective context window.
+ * Compaction fires once the live context reaches this share of the window.
+ * Overridable per-run via CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (0 < pct ≤ 1).
+ */
+const AUTOCOMPACT_THRESHOLD_PCT = 0.65
 
 export interface TokenWarningState {
   /** Context is at or above the autocompact trigger threshold */
@@ -44,21 +48,21 @@ export function calculateTokenWarningState(
   const contextWindow = getContextWindowSize(model)
   const effectiveContextWindow = contextWindow - Math.min(maxOutputTokens, 20_000)
 
-  let autoCompactThreshold: number
+  // Default trigger = 65% of the effective window. An explicit, in-range
+  // CLAUDE_AUTOCOMPACT_PCT_OVERRIDE replaces the 0.65 default.
+  let pct = AUTOCOMPACT_THRESHOLD_PCT
   if (pctOverride) {
-    const pct = parseFloat(pctOverride)
-    if (!isNaN(pct) && pct > 0 && pct <= 1) {
-      autoCompactThreshold = Math.floor(effectiveContextWindow * pct)
-    } else {
-      autoCompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
-    }
-  } else {
-    autoCompactThreshold = effectiveContextWindow - AUTOCOMPACT_BUFFER_TOKENS
+    const parsed = parseFloat(pctOverride)
+    if (!isNaN(parsed) && parsed > 0 && parsed <= 1) pct = parsed
   }
+  let autoCompactThreshold = Math.floor(effectiveContextWindow * pct)
 
-  if (!pctOverride && contextWindow > DEFAULT_CONTEXT_WINDOW) {
-    const rawCap = process.env['META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD']
-    const cap = rawCap ? Number.parseInt(rawCap, 10) : LONG_CONTEXT_AUTOCOMPACT_CAP
+  // Optional hard cap (off by default) for cost/latency control on very large
+  // windows — set META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD to a token count
+  // to compact earlier than the percentage rule would.
+  const rawCap = process.env['META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD']
+  if (rawCap) {
+    const cap = Number.parseInt(rawCap, 10)
     if (Number.isFinite(cap) && cap > 0) {
       autoCompactThreshold = Math.min(autoCompactThreshold, cap)
     }

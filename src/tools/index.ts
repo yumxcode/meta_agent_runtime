@@ -78,7 +78,7 @@ import type { SystemToolsOptions } from './system/index.js'
 import { createAgentTools } from './agent/index.js'
 
 export interface StandardToolsOptions {
-  network?: { webSearch?: { apiKey?: string; model?: string } }
+  network?: import('./network/index.js').NetworkToolsOptions
   /** Pass any ISubAgentDispatcher implementation — typically a SubAgentBridge instance. */
   agent?: { bridge: ISubAgentDispatcher }
   /** Options forwarded to createSystemTools (cwd, planModeRef). */

@@ -34,7 +34,7 @@ describe('compactConversation', () => {
       })
       .mockResolvedValueOnce({
         stop_reason: 'end_turn',
-        content: [{ type: 'text', text: '<summary>Recovered summary.</summary>' }],
+        content: [{ type: 'text', text: '<summary>Recovered summary. 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。</summary>' }],
         usage: { input_tokens: 100, output_tokens: 10 },
       })
 
@@ -111,7 +111,7 @@ describe('compactConversation', () => {
   it('adds deterministic continuity anchors when the model summary is terse', async () => {
     createMock.mockResolvedValueOnce({
       stop_reason: 'end_turn',
-      content: [{ type: 'text', text: '<summary>Short summary.</summary>' }],
+      content: [{ type: 'text', text: '<summary>Short summary. 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。</summary>' }],
       usage: { input_tokens: 100, output_tokens: 10 },
     })
 
@@ -141,7 +141,7 @@ describe('compactConversation', () => {
   it('appends caller deterministicAnchors to the summary (success path) and protects them', async () => {
     createMock.mockResolvedValueOnce({
       stop_reason: 'end_turn',
-      content: [{ type: 'text', text: '<summary>Model summary body.</summary>' }],
+      content: [{ type: 'text', text: '<summary>Model summary body. 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。</summary>' }],
       usage: { input_tokens: 100, output_tokens: 10 },
     })
 
@@ -218,7 +218,7 @@ describe('compactConversation', () => {
   it('strips robotics volatile context prefixes from compact input and anchors', async () => {
     createMock.mockResolvedValueOnce({
       stop_reason: 'end_turn',
-      content: [{ type: 'text', text: '<summary>Short summary.</summary>' }],
+      content: [{ type: 'text', text: '<summary>Short summary. 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 这里是足够长的真实摘要正文，覆盖主要请求、关键技术概念、文件改动与下一步计划。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。 补充：实验对比、错误修复记录、待办事项与验证步骤也已包含在内，确保超过质量门槛。</summary>' }],
       usage: { input_tokens: 100, output_tokens: 10 },
     })
 

@@ -24,17 +24,21 @@ export interface CompactionResult {
  *
  * @param rawSummary    - Formatted summary text from the compact agent
  * @param fileCache     - Will be cleared (files need re-reading after compact)
+ * @param messagesToKeep - Verbatim tail preserved outside the summary
+ * @param turnComplete  - true when compaction ran at a finished turn boundary;
+ *   selects the "await next instruction" summary postamble over "resume".
  */
 export function buildPostCompactMessages(
   rawSummary: string,
   fileCache: FileStateCache,
   messagesToKeep: readonly KernelMessage[] = [],
+  turnComplete = false,
 ): CompactionResult {
   // 1. Boundary marker
   const boundaryMarker = makeCompactBoundaryMessage()
 
   // 2. Summary user message
-  const summaryText = buildCompactSummaryMessage(rawSummary)
+  const summaryText = buildCompactSummaryMessage(rawSummary, turnComplete)
   const summaryMessage = makeTextUserMessage(summaryText, { isCompactSummary: true })
 
   // 3. Preserve lightweight file-awareness before clearing the cache. The file

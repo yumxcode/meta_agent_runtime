@@ -107,6 +107,81 @@ describe('Principle promotion', () => {
     expect(sourceExperience?.principleIds).toContain(committedId)
   })
 
+  it('auto-promotes a well-observed observed-tier experience (threshold recalibration)', async () => {
+    // observed(400) + min(7,10)*8 = 456 ≥ 450 → now eligible; was impossible at 500.
+    const exp = {
+      domain: 'locomotion', title: 't', tags: [], difficulty: 'high',
+      problem: 'p', solution: 's',
+      outcome: { success: true, summary: 'ok' },
+      abstractPrinciple: 'bound latency',
+      confidenceTier: 'observed' as const, observationCount: 7, contradictionCount: 0,
+    }
+    expect(shouldTriggerPrinciplePromotion({ ...exp } as never)).toBe(true)
+    // 6 observations → 448 < 450 → still excluded.
+    expect(shouldTriggerPrinciplePromotion({ ...exp, observationCount: 6 } as never)).toBe(false)
+  })
+
+  it('dedups: skips when a pending or committed principle already exists', async () => {
+    const expDir = await tempDir()
+    const anchorDir = await tempDir()
+    const pendingDir = await tempDir()
+    const principleDir = await tempDir()
+    const experiences = new ExperienceStore(expDir)
+    const anchors = new PhysicalAnchorStore(anchorDir)
+    const pending = new PrinciplePendingStore('/project/dedup', pendingDir)
+    const principles = new PrincipleStore(principleDir)
+
+    const anchorId = await anchors.write({
+      domain: 'locomotion', scope: 'robot', title: 'a', fact: 'f',
+      implication: 'i', tags: [], confidenceTier: 'observed', evidenceRefs: [],
+    })
+    const experienceId = await experiences.write({
+      domain: 'locomotion', title: 't', tags: [], difficulty: 'high',
+      problem: 'p', solution: 's',
+      outcome: { success: false, summary: 'reproduced', failureReason: 'stale' },
+      abstractPrinciple: 'bound latency',
+      confidenceTier: 'reproduced', observationCount: 2, contradictionCount: 0,
+    })
+    const base = {
+      experienceId, experienceStore: experiences, anchorStore: anchors,
+      pendingStore: pending, principleStore: principles,
+      flash: flashReturning(anchorId), reason: 'confidence_threshold' as const,
+    }
+
+    const first = await proposePrincipleFromExperience(base)
+    expect(first.promoted).toBe(true)
+
+    // Second attempt while one is pending → already_pending, no new queue entry.
+    const second = await proposePrincipleFromExperience(base)
+    expect(second.promoted).toBe(false)
+    expect(second.reason).toBe('already_pending')
+    expect(pending.count).toBe(1)
+
+    // Commit it, then a third attempt → already_promoted.
+    await pending.commit(pending.list()[0]!.pendingId, principles, experiences)
+    const third = await proposePrincipleFromExperience(base)
+    expect(third.promoted).toBe(false)
+    expect(third.reason).toBe('already_promoted')
+    await pending.flush()
+  })
+
+  it('records observation / contradiction signals on a committed principle', async () => {
+    const principleDir = await tempDir()
+    const principles = new PrincipleStore(principleDir)
+    const id = await principles.write({
+      title: 't', statement: 's', mechanism: 'm',
+      firstPrinciplesSupport: [], domains: ['locomotion'], abstractionLevel: 'system',
+      preconditions: [], applicabilityBounds: [], nonApplicableWhen: [],
+      derivedFromExperienceIds: [], anchoredByPhysicalAnchorIds: [], evidenceRefs: [],
+      confidenceTier: 'observed', observationCount: 1, contradictionCount: 0,
+    } as never)
+    const afterObs = await principles.recordObservation(id)
+    expect(afterObs?.observationCount).toBe(2)
+    const afterContra = await principles.recordContradiction(id)
+    expect(afterContra?.contradictionCount).toBe(1)
+    expect(await principles.recordObservation('pr_bogus_00000000')).toBeNull()
+  })
+
   it('allows explicit user-request promotion below the confidence threshold', async () => {
     const expDir = await tempDir()
     const anchorDir = await tempDir()

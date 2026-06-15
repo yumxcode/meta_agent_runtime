@@ -323,12 +323,43 @@ export function accumulateUsage(a: TokenUsage, b: Partial<TokenUsage>): TokenUsa
 // Conversation message (internal representation)
 // ─────────────────────────────────────────────────────────────────────────────
 
-export interface UserMessage {
+/**
+ * Optional kernel metadata carried by persisted / resumed messages.
+ *
+ * KernelMessage flags survive JSON serialization in SessionStore (history.jsonl
+ * stores whole objects), but were previously DROPPED on resume because
+ * ConversationMessage had no corresponding fields and toKernelMessages() only
+ * mapped role/content. Losing them breaks compact-boundary slicing and lets
+ * compact summaries / keep-set clones be mistaken for real user messages —
+ * poisoning the original-goal anchor on resumed sessions (review F-1/F-3).
+ */
+export interface MessageKernelMeta {
+  /** Original kernel uuid; preserved across persist/resume when present. */
+  uuid?: string
+  /** Hidden system-injected message (recovery guidance, file reminders, …). */
+  isMeta?: boolean
+  /** Compact summary user message (also used for local resume summaries). */
+  isCompactSummary?: boolean
+  /** Compact boundary sentinel. */
+  isCompactBoundary?: boolean
+  /** Mid-turn user steering correction. */
+  isSteering?: boolean
+  /** User interruption message. */
+  isInterruption?: boolean
+  /** Text-only clone emitted by the compact keep-set builder. */
+  isKeepSetClone?: boolean
+  /** For keep-set clones: uuid of the original message. */
+  sourceUuid?: string
+  /** For tool_result messages: the assistant message they answer. */
+  sourceToolAssistantUUID?: string
+}
+
+export interface UserMessage extends MessageKernelMeta {
   role: 'user'
   content: string | ContentBlock[]
 }
 
-export interface AssistantMessage {
+export interface AssistantMessage extends MessageKernelMeta {
   role: 'assistant'
   content: ContentBlock[]
 }

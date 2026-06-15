@@ -185,7 +185,13 @@ export async function scanTopicFiles(
   // Parallelise all file reads across the directory (Fix #9: was a serial loop).
   const results = await Promise.all(
     entries
-      .filter(entry => entry.endsWith('.md') && entry !== MEMORY_ENTRYPOINT_NAME)
+      // Case-INSENSITIVE entrypoint exclusion: on case-insensitive filesystems
+      // (macOS/Windows) a lowercase `memory.md` IS the MEMORY.md index file —
+      // a case-sensitive compare let the index be recalled as a topic file,
+      // duplicating the entire index inside the <memory> block every turn.
+      .filter(entry =>
+        entry.endsWith('.md') &&
+        entry.toLowerCase() !== MEMORY_ENTRYPOINT_NAME.toLowerCase())
       .slice(0, MAX_TOPIC_FILES_TO_SCAN)
       .map(async (entry): Promise<TopicFileHeader | null> => {
         const filePath = join(memoryDir, entry)
@@ -309,11 +315,11 @@ function keywordScore(header: TopicFileHeader, queryTokens: Set<string>): number
 const RELEVANCE_MODEL_FALLBACK = 'deepseek-v4-flash'
 
 /**
- * Flash relevance-call timeout. Default 3 s; override with
+ * Flash relevance-call timeout. Default 30 s; override with
  * META_AGENT_MEMORY_RECALL_TIMEOUT_MS (clamped 500 ms..120 s).
  * Read lazily so tests / startup overrides both work.
  */
-const DEFAULT_RECALL_TIMEOUT_MS = 3_000
+const DEFAULT_RECALL_TIMEOUT_MS = 30_000
 export function getMemoryRecallTimeoutMs(): number {
   return getRecallTimeoutMs()
 }

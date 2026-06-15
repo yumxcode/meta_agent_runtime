@@ -166,7 +166,13 @@ function buildLocalResumeSummary(
     `- tool_result blocks: ${toolResultCount} (${toolResultErrorCount} errors, ${toolResultChars} chars total)`,
   ]
 
-  return { role: 'user', content: [{ type: 'text', text: lines.join('\n') }] }
+  // isCompactSummary: this is a summary artifact, not a real user request —
+  // goal capture and compact anchor selection must skip it (review F-1).
+  return {
+    role: 'user',
+    content: [{ type: 'text', text: lines.join('\n') }],
+    isCompactSummary: true,
+  }
 }
 
 function toolUseIdsIn(messages: readonly ConversationMessage[]): Set<string> {

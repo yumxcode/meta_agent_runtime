@@ -29,15 +29,15 @@ describe('detectProvider — Zhipu GLM', () => {
     }
   })
 
-  it('selects glm-5.1 on the bigmodel Anthropic endpoint when ZHIPU_API_KEY is set', () => {
+  it('selects glm-5.2 on the bigmodel Anthropic endpoint when ZHIPU_API_KEY is set', () => {
     process.env['ZHIPU_API_KEY'] = 'zhipu-test-key'
     const d = detectProvider({})
     expect(d.provider).toBe('zhipu')
     expect(d.apiKey).toBe('zhipu-test-key')
     expect(d.baseURL).toBe('https://open.bigmodel.cn/api/anthropic')
-    expect(d.defaultModel).toBe('glm-5.1')
+    expect(d.defaultModel).toBe('glm-5.2')
     expect(d.fallbackModel).toBe('glm-4.6')
-    expect(d.flashModel).toBe('glm-4.5-air')
+    expect(d.flashModel).toBe('glm-5.2')
   })
 
   it('accepts ZAI_API_KEY and GLM_API_KEY as aliases', () => {
@@ -55,7 +55,7 @@ describe('detectProvider — Zhipu GLM', () => {
     process.env['ANTHROPIC_API_KEY'] = 'anthropic-key'
     const d = detectProvider({})
     expect(d.provider).toBe('zhipu')
-    expect(d.defaultModel).toBe('glm-5.1')
+    expect(d.defaultModel).toBe('glm-5.2')
   })
 
   it('infers zhipu from an explicit bigmodel / z.ai baseURL', () => {

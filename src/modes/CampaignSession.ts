@@ -23,17 +23,7 @@ import { buildCampaignMemoryBlock } from './campaignMemory.js'
 import { toKernelTool } from './toolAdapter.js'
 import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
-import type { KernelMessage } from '../kernel/index.js'
-
-function toKernelMessages(messages: readonly ConversationMessage[] | undefined): KernelMessage[] {
-  return (messages ?? []).map(message => ({
-    uuid: crypto.randomUUID(),
-    role: message.role,
-    content: typeof message.content === 'string'
-      ? [{ type: 'text', text: message.content }]
-      : message.content as KernelMessage['content'],
-  }))
-}
+import { toKernelMessages } from './messageBridge.js'
 
 export class CampaignSession {
   private readonly _engine: KernelSession
@@ -91,8 +81,10 @@ export class CampaignSession {
       maxRetries: resolved.maxRetries,
       compact: {
         enabled: true,
-        model: resolved.flashModel,
+        model: resolved.compactModel,
         // ## Compact Instructions injected via appendSystemPrompt each submit()
+        // Campaign-specific summary template: 9 sections + provenance + phase gate.
+        promptProfile: 'campaign',
       },
       // Thinking on the primary model — honours resolved.thinkingConfig so
       // callers can opt out via `{ type: 'disabled' }`.  Defaults to adaptive,
@@ -221,6 +213,11 @@ export class CampaignSession {
 
   /** Inject a mid-turn user correction. See KernelSession.steer(). */
   steer(text: string): boolean { return this._engine.steer(text) }
+
+  /** Manual compaction (/compact) — same pipeline as auto-compact, forced. */
+  async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    return this._engine.compactNow()
+  }
 
   /**
    * S1 + S9: Release per-session resources.  Forwards to the inner KernelSession

@@ -11,7 +11,9 @@ export async function createWriteFileTool(): Promise<MetaAgentTool> {
   return {
     name: 'write_file',
     description,
-    permission: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+    // NOT sensitive: writes inside the workspace auto-allow without approval in
+    // every mode. Workspace boundary stays hard-enforced; plan mode still gates.
+    permission: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
     inputSchema: {
       type: 'object',
       properties: {

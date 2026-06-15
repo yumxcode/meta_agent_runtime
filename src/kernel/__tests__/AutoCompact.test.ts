@@ -39,7 +39,7 @@ const mockTokenCount = vi.mocked(tokenCountWithEstimation)
 const MODEL = 'claude-sonnet-4-6'
 const MAX_OUTPUT = 32_768
 // effectiveContextWindow = 200_000 - 20_000 = 180_000
-// autoCompactThreshold = 180_000 - 13_000 = 167_000
+// autoCompactThreshold = floor(180_000 * 0.65) = 117_000
 const BELOW_THRESHOLD = 100_000
 const ABOVE_THRESHOLD = 170_000
 

@@ -308,7 +308,7 @@ export class ModeDetector {
     model: string,
   ): Promise<ModeDetectionResult> {
     try {
-      // 5 s timeout: routing is on the critical path to the first API call.
+      // 30 s timeout: routing is on the critical path to the first API call.
       // A network partition or rate-limit backoff should not stall session
       // start for 600 s (SDK default).  Falls back to heuristics on timeout
       // (Fix #6).
@@ -319,7 +319,7 @@ export class ModeDetector {
           system: LLM_SYSTEM_PROMPT,
           messages: [{ role: 'user', content: prompt }],
         }, { signal }),
-        5_000,
+        30_000,
       )
 
       const raw = msg.content[0]?.type === 'text'

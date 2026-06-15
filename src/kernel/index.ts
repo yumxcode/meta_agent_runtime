@@ -8,6 +8,7 @@
 
 // ── Primary entry point ───────────────────────────────────────────────────────
 export { KernelSession } from './KernelSession.js'
+export type { ManualCompactResult } from './KernelSession.js'
 
 // ── Configuration types ───────────────────────────────────────────────────────
 export type {

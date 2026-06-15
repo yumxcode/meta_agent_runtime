@@ -82,7 +82,11 @@ export function sanitizeFilename(value: unknown, fallbackName: string): string {
     .replace(/[^a-z0-9]+/g, '_')
     .replace(/^_+|_+$/g, '')
     .slice(0, 80)
-  if (base) return `${base}.md`
+  // Guard: a topic file must NEVER collide with the MEMORY.md entrypoint.
+  // On case-insensitive filesystems (macOS/Windows) a proposal named
+  // "memory.md" IS the index file — the topic body and the index get mashed
+  // into one file, duplicating the entry in every <memory> block render.
+  if (base && `${base}.md` !== 'memory.md') return `${base}.md`
   // Non-Latin names (e.g. Chinese) produce an empty base after ASCII-only sanitization.
   // Use a stable short hash of the original name so every entry gets a unique filename
   // instead of all colliding on the generic 'memory.md' fallback.

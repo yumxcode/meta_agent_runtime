@@ -3,7 +3,7 @@
  *
  * Responsibilities:
  *   • Single Anthropic client instance per FlashClient (no per-call creation)
- *   • Hard timeout on every request (default 4 s)
+ *   • Hard timeout on every request (default 30 s)
  *   • In-memory result cache keyed by caller-supplied cacheKey
  *   • Returns null on timeout / network error — callers MUST implement fallback
  *
@@ -18,7 +18,7 @@
 
 import Anthropic from '@anthropic-ai/sdk'
 import OpenAI from 'openai'
-import { detectProvider } from '../config.js'
+import { resolveConfig } from '../config.js'
 import { getModelProtocol } from '../../providers/registry.js'
 import { buildAnthropicAuth } from '../../kernel/api/AnthropicClient.js'
 import { withAbortableTimeout } from '../utils/withTimeout.js'
@@ -32,7 +32,7 @@ export interface FlashQueryOpts {
   system: string
   user: string
   maxTokens: number
-  /** Hard timeout in ms. Default: 4000 */
+  /** Hard timeout in ms. Default: 30000 */
   timeoutMs?: number
   /**
    * When set, the result is cached in memory under this key.
@@ -52,9 +52,10 @@ export class FlashClient {
   private readonly model: string
   private readonly cache = new Map<string, string>()
   private static readonly MAX_CACHE_ENTRIES = 512
+  static readonly DEFAULT_TIMEOUT_MS = 30_000
 
-  constructor(config: Pick<MetaAgentConfig, 'apiKey' | 'baseURL' | 'model'>) {
-    const { apiKey, baseURL, flashModel } = detectProvider(config)
+  constructor(config: Pick<MetaAgentConfig, 'apiKey' | 'baseURL' | 'model' | 'flashModel'>) {
+    const { apiKey, baseURL, flashModel } = resolveConfig(config)
     this.model = flashModel
     if (getModelProtocol(flashModel, baseURL) === 'openai') {
       this.anthropicClient = null
@@ -98,7 +99,7 @@ export class FlashClient {
               { role: 'user', content: opts.user },
             ],
           }, { signal }),
-          opts.timeoutMs ?? 4_000,
+          opts.timeoutMs ?? FlashClient.DEFAULT_TIMEOUT_MS,
         )
         text = msg.choices[0]?.message?.content?.trim() || null
       } else if (this.anthropicClient) {
@@ -109,7 +110,7 @@ export class FlashClient {
             system: opts.system,
             messages: [{ role: 'user', content: opts.user }],
           }, { signal }),
-          opts.timeoutMs ?? 4_000,
+          opts.timeoutMs ?? FlashClient.DEFAULT_TIMEOUT_MS,
         )
 
         const block = msg.content[0]

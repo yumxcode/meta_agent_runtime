@@ -26,9 +26,14 @@ import {
   extractCompactInstructions,
   buildFallbackCompactSummary,
   enrichCompactSummaryWithContinuity,
+  isUsableCompactSummary,
+  isTurnComplete,
+  COMPACT_FINAL_INSTRUCTION,
 } from './CompactPrompt.js'
+import type { CompactProfile } from './CompactPrompt.js'
 import { buildPostCompactMessages } from './PostCompact.js'
 import type { CompactionResult } from './PostCompact.js'
+import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
 
 const COMPACT_MAX_PTL_RETRIES = 3
 export const COMPACT_MODEL_DEFAULT = 'deepseek-v4-flash'
@@ -55,11 +60,21 @@ export interface CompactOptions {
    * time so the anchors reflect live session state. See CompactConfig.
    */
   deterministicAnchors?: string | (() => string | null | undefined)
+  /**
+   * The session's original goal — the first few real user requests (captured
+   * before any compaction, pre-formatted into one string by KernelSession).
+   * Emitted as a protected "Original session goal" line in the deterministic
+   * continuity anchors of every summary path, so the goal cannot drift across
+   * nested compactions ("telephone game" through summary-of-summary chains).
+   */
+  originalUserGoal?: string
   thinkingConfig?: ThinkingConfig
   abortSignal?: AbortSignal
   maxRetries?: number
   /** Messages that must remain visible after compact, outside the summary. */
   messagesToKeep?: readonly KernelMessage[]
+  /** Per-mode section-template selector for the summariser prompt. */
+  promptProfile?: CompactProfile
 }
 
 class CompactEmptyResponseError extends Error {
@@ -90,6 +105,12 @@ export async function compactConversation(
 ): Promise<CompactionResult> {
   const compactModel = options.model ?? COMPACT_MODEL_DEFAULT
 
+  // Decide turn ownership from the LIVE messages (before stripping/trimming):
+  // a finished turn boundary gets the "await next instruction" postamble, an
+  // interrupted turn keeps the "resume the last task" framing. Computed once
+  // here and threaded into every post-compact build path below.
+  const turnComplete = isTurnComplete(messages)
+
   // Resolve custom instructions. When a thunk is supplied, evaluate it now — at
   // compaction time — so the instructions reflect live session state (active
   // task IDs, phase, hardware constraints) rather than config-time state.
@@ -111,7 +132,13 @@ export async function compactConversation(
       ? options.deterministicAnchors() ?? undefined
       : options.deterministicAnchors
 
-  const compactSystemPrompt = buildCompactPrompt(customInstructions)
+  const compactSystemPrompt = buildCompactPrompt(customInstructions, options.promptProfile)
+
+  // F-2 dedupe: messages the keep-set preserves verbatim outside the summary.
+  // Kept units carry their ORIGINAL uuids; the user/steering text clones carry
+  // the original's uuid in sourceUuid — collect both so the continuity anchors
+  // and fallback summary never duplicate keep-set content.
+  const excludeMessageUuids = collectKeepSetUuids(options.messagesToKeep)
 
   // Strip large/non-text payloads before the compact side-call. The compact
   // model needs the shape of recent work, not full historical command output.
@@ -131,12 +158,34 @@ export async function compactConversation(
       )
 
       const formatted = formatCompactSummary(summary)
-      const enrichedSummary = enrichCompactSummaryWithContinuity(formatted, stripped, { extraAnchors })
-      return buildPostCompactMessages(enrichedSummary, fileCache, options.messagesToKeep)
+      // Quality gate: a non-empty response is not necessarily a summary.
+      // Observed failure mode (GLM, no tools armed): the "summary" is 100%
+      // leaked tool-call template text — formatCompactSummary strips it,
+      // leaving (near-)nothing. Propagating that through nested compactions
+      // destroys the session narrative; the deterministic local fallback is
+      // strictly better.
+      if (!isUsableCompactSummary(formatted, summary)) {
+        const fallback = buildFallbackCompactSummary(stripped, {
+          extraAnchors,
+          originalUserGoal: options.originalUserGoal,
+          excludeMessageUuids,
+        })
+        return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep, turnComplete)
+      }
+      const enrichedSummary = enrichCompactSummaryWithContinuity(formatted, stripped, {
+        extraAnchors,
+        originalUserGoal: options.originalUserGoal,
+        excludeMessageUuids,
+      })
+      return buildPostCompactMessages(enrichedSummary, fileCache, options.messagesToKeep, turnComplete)
     } catch (error: unknown) {
       if (isCompactEmptyResponse(error)) {
-        const fallback = buildFallbackCompactSummary(stripped, { extraAnchors })
-        return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep)
+        const fallback = buildFallbackCompactSummary(stripped, {
+          extraAnchors,
+          originalUserGoal: options.originalUserGoal,
+          excludeMessageUuids,
+        })
+        return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep, turnComplete)
       }
       if (isPromptTooLong(error) && messagesToSummarise.length > 2) {
         // Drop old non-anchor messages first. Keep durable anchors such as the
@@ -150,14 +199,34 @@ export async function compactConversation(
   }
 
   if (isPromptTooLong(lastError)) {
-    const fallback = buildFallbackCompactSummary(stripped, { extraAnchors })
-    return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep)
+    const fallback = buildFallbackCompactSummary(stripped, {
+      extraAnchors,
+      originalUserGoal: options.originalUserGoal,
+      excludeMessageUuids,
+    })
+    return buildPostCompactMessages(fallback, fileCache, options.messagesToKeep, turnComplete)
   }
 
   throw lastError ?? new Error('Compact failed: could not summarise conversation')
 }
 
 // ── Internal helpers ──────────────────────────────────────────────────────────
+
+/**
+ * Collect the identity set of the keep-set: original uuids of kept units plus
+ * the sourceUuid of each text clone. Used to exclude keep-set-covered messages
+ * from the summary's recent-detail / fallback sections (F-2 dedupe).
+ */
+function collectKeepSetUuids(
+  messagesToKeep: readonly KernelMessage[] | undefined,
+): ReadonlySet<string> {
+  const ids = new Set<string>()
+  for (const message of messagesToKeep ?? []) {
+    ids.add(message.uuid)
+    if (message.sourceUuid) ids.add(message.sourceUuid)
+  }
+  return ids
+}
 
 function isRealUserMessage(message: KernelMessage): boolean {
   return message.role === 'user' &&
@@ -268,12 +337,22 @@ function clipForCompact(text: string, limit: number, label: string): string {
   return `${text.slice(0, Math.max(0, limit - suffix.length))}${suffix}`
 }
 
-function stripVolatileContextPrefix(text: string): string {
-  if (!text.startsWith('<context>')) return text
-  const end = text.indexOf('</context>')
-  if (end < 0) return text
-  const rest = text.slice(end + '</context>'.length)
-  return rest.replace(/^\s*---\s*/, '').trimStart()
+/**
+ * Append the summarization instruction as the LAST user message — adjacent to
+ * the generation point, where it outweighs the tool-call pattern saturation of
+ * the conversation body (see COMPACT_FINAL_INSTRUCTION). Applied inside the
+ * model-call so PTL retries (which trim old messages) always keep it last.
+ */
+function withFinalInstruction(messages: readonly KernelMessage[]): KernelMessage[] {
+  return [
+    ...messages,
+    {
+      uuid: crypto.randomUUID(),
+      role: 'user',
+      content: [{ type: 'text', text: COMPACT_FINAL_INSTRUCTION }],
+      isMeta: true,
+    },
+  ]
 }
 
 async function callCompactModel(
@@ -294,7 +373,7 @@ async function callCompactModel(
     maxRetries: options.maxRetries ?? 2,
   })
 
-  const apiMessages = normalizeMessagesForAPI(messages)
+  const apiMessages = normalizeMessagesForAPI(withFinalInstruction(messages))
 
   const response = await client.messages.create({
     model,
@@ -342,7 +421,7 @@ async function callCompactModelDeepSeek(
   })
 
   // Compact is text-only — include systemPrompt and convert to OpenAI format
-  const dsMessages = normalizeMessagesForDeepSeek(messages, systemPrompt)
+  const dsMessages = normalizeMessagesForDeepSeek(withFinalInstruction(messages), systemPrompt)
 
   const response = await client.chat.completions.create(
     {

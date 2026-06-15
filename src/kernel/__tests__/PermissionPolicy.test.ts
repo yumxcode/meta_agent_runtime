@@ -98,6 +98,21 @@ describe('createPermissionPolicy', () => {
     expect(result.behavior).toBe('allow')
   })
 
+  it('auto-allows write_file by default (non-sensitive) with no approval channel', async () => {
+    const canUseTool = createPermissionPolicy({ workspaceRoot: process.cwd() })
+    // No tool.permission → DEFAULT_TOOL_PERMISSIONS.write_file applies (sensitive:false).
+    const tool = { ...writeTool(), permission: undefined }
+    const result = await canUseTool(tool, { file_path: 'tmp.txt' }, 'a', 't', context())
+    expect(result.behavior).toBe('allow')
+  })
+
+  it('still denies write_file outside the workspace (boundary enforced)', async () => {
+    const canUseTool = createPermissionPolicy({ workspaceRoot: process.cwd() })
+    const tool = { ...writeTool(), permission: undefined }
+    const result = await canUseTool(tool, { file_path: '/etc/passwd' }, 'a', 't', context())
+    expect(result.behavior).toBe('deny')
+  })
+
   it('denies sensitive PowerShell commands when no approval channel is available', async () => {
     const canUseTool = createPermissionPolicy({ workspaceRoot: process.cwd() })
     const result = await canUseTool(powershellTool(), { command: 'Remove-Item foo; git push' }, 'a', 't', context())
