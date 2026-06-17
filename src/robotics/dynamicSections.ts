@@ -377,86 +377,62 @@ export function renderR4Snapshot(formatted: string | null, robot?: string): stri
 // When no pager is provided, falls back to layer 2 inline (backward-compatible).
 // pendingCount is shown so the user knows anchors await review after the session.
 
+/**
+ * R6 — Physical Anchors (v1: full session-scoped load, memoized).
+ *
+ * Anchors are few, stable physical facts. We load the whole session-scoped set
+ * (global + this robot + this project's code scope) ONCE and memoize it, so the
+ * block stays byte-stable across turns and keeps the prompt cache warm. It is
+ * invalidated only when /anchor review commits new anchors (RoboticsSession
+ * .invalidateAnchors), which incrementally folds them in on the next turn.
+ *
+ * Per-turn relevance recall is intentionally NOT used for anchors — they are
+ * low-volume and stable, so full memoized injection is both complete and
+ * cache-friendly. (Principle recall is deferred entirely in v1.)
+ */
 export function buildR6Section(
   anchorStore: PhysicalAnchorStore,
-  pager?: ContextPager,
-  _currentQuery?: string,
-  _robot?: string,
+  robot?: string,
   anchorSource?: PhysicalAnchorSource,
-  pendingCount = 0,
 ): SystemPromptSection {
   const effectiveSource = anchorSource ?? new PhysicalAnchorSource(anchorStore)
+  const PER_SCOPE = 20  // PhysicalAnchorStore.search caps at 20; ample for low-volume anchors
 
-  return DANGEROUS_uncachedSystemPromptSection(
+  return systemPromptSection(
     'physical_anchors',
     async () => {
       try {
-        const all = await anchorStore.search({ limit: 100 })
+        // Session-scoped full load: global facts + this robot + this project's code scope.
+        const [globalAnchors, robotAnchors, codeAnchors] = await Promise.all([
+          anchorStore.search({ scope: 'global', limit: PER_SCOPE }),
+          robot ? anchorStore.search({ scope: 'robot', robot, limit: PER_SCOPE }) : Promise.resolve([]),
+          anchorStore.search({ scope: 'code', limit: PER_SCOPE }),
+        ])
+        const seen = new Set<string>()
+        const all: typeof globalAnchors = []
+        for (const a of [...globalAnchors, ...robotAnchors, ...codeAnchors]) {
+          if (!seen.has(a.id)) { seen.add(a.id); all.push(a) }
+        }
 
-        // ── Empty state ────────────────────────────────────────────────────────
         if (all.length === 0) {
-          const pendingNote = pendingCount > 0
-            ? ` (${pendingCount} pending review — run \`/anchor review\` to commit)`
-            : ''
           return [
             '## Physical Anchors',
-            `No physical anchors recorded yet${pendingNote}. ` +
+            'No physical anchors recorded yet. ' +
             'Use `physical_anchor_write` to propose hardware facts, measured physical behavior, ' +
             'datasheet constraints, or device quirks that should anchor future reasoning.',
           ].join('\n')
         }
 
-        // ── Layer 1: Manifest line ────────────────────────────────────────────
         const manifestLine = await effectiveSource.getManifestLine()
-        const pendingNote = pendingCount > 0
-          ? `  *(${pendingCount} pending review — \`/anchor review\`)*`
-          : ''
-
-        // ── Layer 2: Priority slots (global + robot scope only) ──────────────
-        const priorityAnchors = await effectiveSource.loadPriorityAnchors(3)
-
-        if (pager) {
-          // Manifest-style rendering for pager mode
-          const manifest = pager.renderManifest([manifestLine + pendingNote])
-          const checkedOut = pager.renderForTurn()
-          const parts: string[] = [manifest]
-          if (checkedOut) parts.push(checkedOut)
-          return parts.join('\n\n')
+        const lines: string[] = ['## Physical Anchors', `> ${manifestLine}`]
+        for (const anchor of all) {
+          lines.push('', formatPhysicalAnchorSlot(anchor))
         }
-
-        // ── Non-pager fallback: inline manifest + priority slots ──────────────
-        const lines: string[] = [
-          '## Physical Anchors',
-          `> ${manifestLine}${pendingNote}`,
-        ]
-
-        if (priorityAnchors.length > 0) {
-          lines.push('', '### High-Priority Anchors (global / robot scope)')
-          for (const anchor of priorityAnchors) {
-            lines.push('', formatPhysicalAnchorSlot(anchor))
-          }
-        }
-
-        const codeCount = all.filter(a => a.scope === 'code').length
-        if (codeCount > 0) {
-          lines.push(
-            '',
-            `*${codeCount} code-scoped anchor(s) available — use \`physical_anchor_search\` ` +
-            `or \`physical_anchor_load\` to retrieve them when relevant.*`,
-          )
-        } else if (priorityAnchors.length === 0) {
-          lines.push(
-            '',
-            'Use `physical_anchor_search` or `physical_anchor_load` when a physical/device fact may constrain this turn.',
-          )
-        }
-
         return lines.join('\n')
       } catch {
         return null
       }
     },
-    'Physical anchors can be added during the session and scope / pending count change; must stay current.',
   )
 }
 

@@ -77,3 +77,36 @@ describe('TeamStore — optimistic concurrency', () => {
     expect(await store.status()).toBeNull()
   })
 })
+
+describe('TeamStore — corrupt file protection (H1)', () => {
+  it('a mutation never overwrites a corrupt team.json with an empty board', async () => {
+    const dir = await tempDir()
+    const store = new TeamStore(dir, 'unit-h1')
+    await store.init('https://github.com/acme/demo')
+    await store.addTask({ id: 'TASK-001', title: 'precious work' })
+
+    const path = join(dir, 'team', 'team.json')
+    // Simulate a git merge-conflict marker / half-written file (invalid JSON).
+    const corrupt = '<<<<<<< HEAD\n{ "schemaVersion": "2.0" }\n=======\n{}\n>>>>>>> other\n'
+    await writeFile(path, corrupt, 'utf8')
+
+    // The mutation must fail loudly instead of silently recreating a blank board.
+    await expect(
+      store.addTask({ id: 'TASK-002', title: 'new' }),
+    ).rejects.toThrow(/无法解析|corrupt/i)
+
+    // The original (corrupt) bytes must still be on disk for `git restore` —
+    // NOT replaced by a default empty board.
+    expect(await readFile(path, 'utf8')).toBe(corrupt)
+  })
+
+  it('status() degrades to null on a corrupt board without throwing or overwriting', async () => {
+    const dir = await tempDir()
+    const store = new TeamStore(dir, 'unit-h1b')
+    await store.init('https://github.com/acme/demo')
+    const path = join(dir, 'team', 'team.json')
+    await writeFile(path, 'not json at all', 'utf8')
+    expect(await store.status()).toBeNull()
+    expect(await readFile(path, 'utf8')).toBe('not json at all')
+  })
+})

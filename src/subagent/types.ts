@@ -131,6 +131,38 @@ export interface SubAgentConfig {
    *   sandbox: { writeAllowPaths: ['/tmp/artifacts'], network: 'none' }
    */
   sandbox?: import('../sandbox/types.js').SandboxConfig
+
+  // ── Autonomy (auto mode) ──────────────────────────────────────────────────
+  /**
+   * Autonomy profile forwarded to the sub-agent's own permission policy, so the
+   * workspace jail and auto-approve posture extend transitively to sub-agents.
+   * Set by SubAgentBridge when the parent is in auto mode — closes the
+   * "run_agent sub-agent escapes the jail" hole.
+   */
+  autonomy?: import('../core/types.js').AutonomyProfile
+  /**
+   * Project working directory for the sub-agent (its workspace jail root and
+   * sandbox writable root). When the parent is in auto mode this is set to the
+   * jail root (or the per-task git worktree). Defaults to process.cwd().
+   */
+  projectDir?: string
+
+  /**
+   * Auto mode retry bookkeeping: how many times this task has already been
+   * retried (0 on first dispatch). Incremented on each automatic re-spawn.
+   * Internal — callers don't set this.
+   */
+  retryCount?: number
+
+  /**
+   * Auto mode: when true AND the parent armed an AutoWorktreeCoordinator over a
+   * git workspace, the sub-agent runs in its OWN git worktree+branch so its
+   * writes cannot race other concurrent sub-agents. The main agent merges the
+   * branch back serially via the auto worktree tools. Opt-in: read-only / report
+   * sub-agents (e.g. research_dispatch) leave this unset and share the tree
+   * (protected by the write mutex). Default: false.
+   */
+  isolateWorktree?: boolean
 }
 
 /** Defaults applied by SubAgentBridge.spawnSubAgent() */

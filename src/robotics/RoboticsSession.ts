@@ -56,6 +56,7 @@ import { PrincipleStore } from './PrincipleStore.js'
 import { PrinciplePendingStore } from './PrinciplePendingStore.js'
 import { proposePrincipleFromExperience } from './PrinciplePromotion.js'
 import { evaluatePromotion, type EvaluatePromotionResult } from './PrincipleConvergence.js'
+import { extractKnowledgePostSession } from './postSessionExtract.js'
 import { HardwareProfile } from './HardwareProfile.js'
 import { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
@@ -302,6 +303,8 @@ export class RoboticsSession {
   private _experienceWorkingSetKeywords = new Set<string>()
   private _forceExperienceCandidateLoad = true
   private _lastExperiencePreloadTrace: ExperiencePreloadTrace | null = null
+  /** Bumped on /anchor review commit; keys the memoized R6 section for incremental refresh. */
+  private _anchorVersion = 0
   /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
   private _agentMode: RoboticsAgentMode = 'single'
   /** True once mode has been classified or overridden; prevents re-classification. */
@@ -922,97 +925,27 @@ export class RoboticsSession {
 
     await this.bridge.dispose().catch(() => undefined)
 
-    // Post-session physical anchor extraction (best-effort, ≤8 s).
-    // Use the flash model to scan the conversation for stable physical/device
-    // facts that should be preserved as anchors.  Results go into the pending
-    // queue — nothing is committed until the user runs /anchor review.
-    await this._extractAnchorsPostSession().catch(() => undefined)
+    // Post-session knowledge extraction (best-effort). One strict flash call
+    // scans the transcript for durable experiences AND physical anchors; both
+    // default to none. Candidates go to their pending queues for human review
+    // (/experience review, /anchor review) — nothing is auto-committed.
+    await extractKnowledgePostSession({
+      messages: this.inner.getMessages(),
+      flash: this._flashClient,
+      experiencePending: this.pendingExperiences,
+      anchorPending: this.pendingPhysicalAnchors,
+    }).catch(() => undefined)
   }
 
   /**
-   * After the session ends, send the conversation transcript to the flash
-   * model and ask it to identify concrete physical/hardware/physics facts that
-   * warrant a PhysicalAnchor entry.  Each candidate is added to the pending
-   * store for human review — it is never auto-committed.
-   *
-   * Silently skipped when:
-   *   - no FlashClient is available
-   *   - fewer than 3 conversation turns (not enough context)
-   *   - flash call times out or fails
+   * Bump the anchor knowledge version and drop the memoized R6 section so the
+   * next turn re-renders the full committed anchor set. Call after /anchor review
+   * commits new anchors so they incrementally appear without breaking the prompt
+   * cache mid-session.
    */
-  private async _extractAnchorsPostSession(): Promise<void> {
-    if (!this._flashClient) return
-    const messages = this.inner.getMessages()
-    // Need at least a few turns of real work before extraction is meaningful
-    if (messages.length < 6) return
-
-    // Build a condensed transcript (assistant text only, capped to avoid token bloat)
-    const TURN_LIMIT = 12
-    const assistantTurns = messages
-      .filter(m => m.role === 'assistant')
-      .slice(-TURN_LIMIT)
-      .map(m => {
-        const text = typeof m.content === 'string'
-          ? m.content
-          : (m.content as Array<{ type: string; text?: string }>)
-              .filter(b => b.type === 'text')
-              .map(b => b.text ?? '')
-              .join(' ')
-        return text.slice(0, 400)
-      })
-      .join('\n---\n')
-
-    if (!assistantTurns.trim()) return
-
-    const systemPrompt =
-      'You are a physical-anchor extractor for a robotics AI system. ' +
-      'Physical anchors are stable, factual, non-obvious facts about hardware, physics, or device behavior ' +
-      'that an LLM might ignore or get wrong without explicit grounding. ' +
-      'Good anchors: measured limits, datasheet constraints, observed failure modes, motor/sensor quirks, ROS driver bugs, ' +
-      'calibration drift, physical deadbands, thermal effects. ' +
-      'Bad anchors: general robotics knowledge, algorithm descriptions, obvious physics, user opinions.\n\n' +
-      'Respond with a JSON array (may be empty []) of candidates, each: ' +
-      '{"domain":"<one of: motion_planning,perception,manipulation,locomotion,navigation,simulation,hardware_interface,deployment,calibration,general>",' +
-      '"scope":"<global|robot|code>",' +
-      '"title":"<≤80 chars>",' +
-      '"fact":"<concrete fact ≤400 chars>",' +
-      '"implication":"<operational implication ≤300 chars>",' +
-      '"confidence_tier":"<observed|reproduced|derived|reported|hypothesis>",' +
-      '"tags":["tag1","tag2"]}. ' +
-      'Output JSON only, no markdown, no prose.'
-
-    const userMsg =
-      `Session transcript (recent assistant turns):\n\n${assistantTurns}\n\n` +
-      'Identify up to 5 physical/hardware facts from this transcript that warrant anchoring. ' +
-      'If none qualify, return [].'
-
-    let raw: string | null = null
-    try {
-      raw = await this._flashClient.query({
-        system: systemPrompt,
-        user: userMsg,
-        maxTokens: 800,
-        timeoutMs: 30_000,
-      })
-    } catch { return }
-
-    if (!raw) return
-
-    let candidates: unknown[]
-    try {
-      // Strip markdown fences if present
-      const cleaned = raw.replace(/^```(?:json)?\s*/i, '').replace(/\s*```\s*$/, '').trim()
-      candidates = JSON.parse(cleaned)
-      if (!Array.isArray(candidates)) return
-    } catch { return }
-
-    for (const c of candidates.slice(0, 5)) {
-      if (typeof c === 'object' && c !== null) {
-        this.pendingPhysicalAnchors.add(c as Record<string, unknown>)
-      }
-    }
-
-    await this.pendingPhysicalAnchors.flush().catch(() => undefined)
+  invalidateAnchors(): void {
+    this._anchorVersion++
+    this.sectionRegistry.invalidate('physical_anchors')
   }
 
   // ── SessionImpl interface ─────────────────────────────────────────────────
@@ -1590,6 +1523,9 @@ export class RoboticsSession {
       // only changes at session-start moments (create / resume / compact), so
       // it does not invalidate the KV cache every turn.
       buildR5Section(() => this._r5Snapshot),
+      // R6 — physical anchors: full session-scoped set, memoized for cache
+      // stability; invalidated only on /anchor review commit (invalidateAnchors).
+      buildR6Section(this.physicalAnchors, this.robot, this.anchorSource),
     ]
 
     // W1 goes first when a workflow is loaded (it provides the most critical context)
@@ -1623,8 +1559,8 @@ export class RoboticsSession {
    */
   private _getVolatileRoboticsExtensions() {
     const sections = [
-      // R6 — physical anchors: immutable world facts + safety constraints.
-      buildR6Section(this.physicalAnchors, undefined, undefined, this.robot, this.anchorSource, this.pendingPhysicalAnchors.count),
+      // R6 moved to stable extensions (memoized full anchor set) — see
+      // _getStableRoboticsExtensions + invalidateAnchors().
       // R2 — experience index: prior knowledge to draw on.
       buildR2Section(this.store, this.contextPager, this.experienceSource),
       // R3 — sub-agent task state: most volatile, read last.

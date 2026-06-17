@@ -2,6 +2,7 @@ import { readFile, stat } from 'fs/promises'
 import { extname } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
+import { resolveInsideWorkspace } from '../workspaceGuard.js'
 
 const MAX_LINES = 2000
 const MAX_READ_BYTES = 5 * 1024 * 1024
@@ -28,11 +29,17 @@ export async function createReadFileTool(): Promise<MetaAgentTool> {
       required: ['file_path'],
     },
     async call(input: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolResult> {
-      const filePath = input['file_path'] as string
+      const rawPath = input['file_path'] as string
       const offset = typeof input['offset'] === 'number' ? Math.max(1, input['offset']) : 1
       const limit = typeof input['limit'] === 'number' ? input['limit'] : MAX_LINES
 
-      if (!filePath) return { content: 'Error: file_path is required', isError: true }
+      if (!rawPath) return { content: 'Error: file_path is required', isError: true }
+      // Defence-in-depth: the kernel policy also gates on workspaceRoot, but the
+      // tool-internal guard must resolve the SAME canonical path it reads (and
+      // records in the FileStateCache) so edit_file's TOCTOU check keys match.
+      const resolved = resolveInsideWorkspace(rawPath, _ctx.workspaceRoot)
+      if (!resolved.ok) return { content: resolved.error, isError: true }
+      const filePath = resolved.path
 
       try {
         const fileStat = await stat(filePath)

@@ -1,7 +1,8 @@
 import { spawn } from 'child_process'
+import { StringDecoder } from 'string_decoder'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
-import { isInsideWorkspace } from '../../fs/workspaceGuard.js'
+import { resolveInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
 
 const DEFAULT_MAX_OUT = 100 * 1024
@@ -163,6 +164,10 @@ function runProcessGroup(
     let timedOut = false
     let aborted = false
     let settled = false
+    // L2: decode incrementally so a multi-byte UTF-8 sequence split across two
+    // chunks is not turned into replacement characters at the boundary.
+    const outDecoder = new StringDecoder('utf8')
+    const errDecoder = new StringDecoder('utf8')
 
     const killGroup = (): void => {
       if (child.pid === undefined) return
@@ -188,10 +193,10 @@ function runProcessGroup(
     else opts.signal.addEventListener('abort', onAbort, { once: true })
 
     child.stdout?.on('data', (chunk: Buffer) => {
-      if (stdout.length < opts.captureLimit) stdout += chunk.toString('utf-8')
+      if (stdout.length < opts.captureLimit) stdout += outDecoder.write(chunk)
     })
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (stderr.length < opts.captureLimit) stderr += chunk.toString('utf-8')
+      if (stderr.length < opts.captureLimit) stderr += errDecoder.write(chunk)
     })
 
     const finish = (fn: () => void): void => {
@@ -204,7 +209,12 @@ function runProcessGroup(
 
     child.on('error', (err) => finish(() => reject(err)))
     child.on('close', (code) =>
-      finish(() => resolve({ stdout, stderr, code, timedOut, aborted })),
+      finish(() => {
+        // Flush any bytes the decoders held back at a chunk boundary.
+        if (stdout.length < opts.captureLimit) stdout += outDecoder.end()
+        if (stderr.length < opts.captureLimit) stderr += errDecoder.end()
+        resolve({ stdout, stderr, code, timedOut, aborted })
+      }),
     )
   })
 }
@@ -265,9 +275,13 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
     async call(input: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolResult> {
       const command = input['command'] as string
       const timeoutMs = resolveTimeoutMs(input['timeout_ms'])
-      const cwd = (input['cwd'] as string | undefined) ?? process.cwd()
+      const rawCwd = (input['cwd'] as string | undefined) ?? process.cwd()
       if (!command) return { content: 'Error: command is required', isError: true }
-      if (!isInsideWorkspace(cwd, ctx.workspaceRoot)) return { content: `Error: cwd is outside workspace: ${cwd}`, isError: true }
+      const resolvedCwd = resolveInsideWorkspace(rawCwd, ctx.workspaceRoot)
+      if (!resolvedCwd.ok) return { content: `Error: cwd is outside workspace: ${rawCwd}`, isError: true }
+      // Run on the canonical absolute cwd the guard approved — a relative cwd
+      // must not be re-resolved against process.cwd() at spawn time.
+      const cwd = resolvedCwd.path
       const limit = getMaxOut()
       const trunc = (s: string) => s.length > limit ? s.slice(0, limit) + `\n[Truncated — ${s.length} bytes]` : s
 

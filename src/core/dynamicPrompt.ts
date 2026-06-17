@@ -60,7 +60,11 @@ import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/
 
 // ── AgentMode ─────────────────────────────────────────────────────────────────
 
-export type AgentMode = 'agentic' | 'campaign' | 'robotics'
+// Alias of the canonical SessionMode (core/modes.ts) — kept as a named export so
+// the many AgentMode importers are unchanged, while there is only ONE mode union.
+import { MODE_PROFILES } from './modes.js'
+import type { SessionMode } from './modes.js'
+export type AgentMode = SessionMode
 
 // ─────────────────────────────────────────────────────────────────────────────
 // P2: D8/D10 micro-cache — 500 ms TTL
@@ -393,20 +397,9 @@ export function buildLanguageSection(language?: string): SystemPromptSection {
 // ─────────────────────────────────────────────────────────────────────────────
 
 export function buildCurrentModeSection(mode: AgentMode): SystemPromptSection {
-  const modeDescriptions: Record<AgentMode, string> = {
-    // Agentic：说明多轮工具调用已启用即可。
-    // "不得启动 campaign" 是多余的负面约束——campaign 工具根本没有注册，
-    // 模型调用不了，该句只是浪费 token。
-    agentic:  'AGENTIC — 多轮工具调用已启用。',
-    campaign: 'CAMPAIGN — 完整多步骤 campaign 工作流已激活；按指示使用 campaign 和仿真工具。',
-    // 注意保持中性：子 Agent 编排是否可用由 R1（Robotics Development Mode 节）
-    // 按 single/multi 变体决定，此处不预先断言"已激活"，避免与 R1 single 变体矛盾。
-    robotics: 'ROBOTICS — 机器人开发专项模式；ExperienceStore、硬件配置与 Git 工作区已激活。' +
-      '是否启用子 Agent 编排以 "Robotics 开发模式" 节为准。' +
-      '优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
-  }
+  // Per-mode "当前模式" text now lives in the single MODE_PROFILES table.
   return systemPromptSection('current_mode', () => {
-    return `## 当前模式\n\n${modeDescriptions[mode]}`
+    return `## 当前模式\n\n${MODE_PROFILES[mode].currentModeText}`
   })
 }
 

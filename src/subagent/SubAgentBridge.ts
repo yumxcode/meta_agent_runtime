@@ -45,6 +45,46 @@ const DEFAULT_SUB_AGENT_START_DELAY_MS = 50
 const MAX_PENDING_NOTIFICATIONS = 100
 const DEFAULT_DESTROY_WAIT_MS = 10_000
 
+// ── Auto-mode sub-agent retry policy ──────────────────────────────────────────
+/** Default number of automatic retries for a failed sub-agent (auto mode). */
+const DEFAULT_AUTO_RETRY_LIMIT = 2
+/** Auto-mode conservative scheduler defaults (override-able by env vars). */
+const AUTO_MAX_CONCURRENT_SUB_AGENTS = 3
+const AUTO_DEFAULT_TOTAL_BUDGET_USD = 5
+
+const MERGED_NOTICE_RE = /^\[(\d+) 条更早的子代理通知已合并/
+
+/**
+ * Collapse a batch of overflow notifications into ONE summary line that
+ * preserves the total count (accumulating any prior merged-summary count), so
+ * backpressure never silently loses sub-agent outcomes.
+ */
+export function mergeOverflowNotifications(overflow: readonly string[]): string {
+  let count = 0
+  const samples: string[] = []
+  for (const n of overflow) {
+    const m = MERGED_NOTICE_RE.exec(n)
+    if (m) {
+      count += parseInt(m[1]!, 10)
+    } else {
+      count += 1
+      if (samples.length < 3) samples.push(n.length > 120 ? n.slice(0, 117) + '…' : n)
+    }
+  }
+  const eg = samples.length ? ` 例如：${samples.join(' | ')}` : ''
+  return `[${count} 条更早的子代理通知已合并，未丢弃]${eg}`
+}
+
+/** Exponential backoff (capped) before re-spawning a failed sub-agent. */
+export function retryBackoffMs(attempt: number): number {
+  return Math.min(30_000, 1_000 * 2 ** Math.max(0, attempt))
+}
+
+/** Whether a failed sub-agent should be retried. */
+export function shouldRetrySubAgent(attempt: number, limit: number, armed: boolean): boolean {
+  return armed && limit > 0 && attempt < limit
+}
+
 function envInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]
   if (raw === undefined) return fallback
@@ -84,6 +124,12 @@ export interface SubAgentBridgeOptions {
   maxTotalSubAgentBudgetUsd?: number
   /** Minimum delay between starting queued sub-agents. */
   startDelayMs?: number
+  /**
+   * Auto mode: lower the DEFAULT concurrency (→ AUTO_MAX_CONCURRENT_SUB_AGENTS)
+   * and apply a non-null default total budget (→ AUTO_DEFAULT_TOTAL_BUDGET_USD)
+   * for unattended safety. Explicit options and env vars still take precedence.
+   */
+  conservativeAutoDefaults?: boolean
 }
 
 interface QueuedSubAgent {
@@ -165,6 +211,14 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private toolRegistry: Map<string, MetaAgentTool> = new Map()
   /** Sub-agent-only tool overrides (see setSubAgentToolOverrides). */
   private subAgentToolOverrides: Map<string, MetaAgentTool> = new Map()
+  /** Auto-mode jail forwarded to every spawned sub-agent (see setAutonomyJail). */
+  private _autonomyJail: { workspaceRoot: string; autonomy: import('../core/types.js').AutonomyProfile } | null = null
+  /** Auto-mode worktree isolation (see setWorktreeCoordinator). */
+  private _worktreeCoordinator: import('../core/auto/AutoWorktreeCoordinator.js').AutoWorktreeCoordinator | null = null
+  /** Auto-mode failed-sub-agent retry limit (0 = no retry; set when jail armed). */
+  private _autoRetryLimit = 0
+  /** Pending retry backoff timers, cleared on dispose. */
+  private readonly _retryTimers = new Set<ReturnType<typeof setTimeout>>()
 
   /**
    * Pending notifications keyed by parentSessionId.
@@ -211,10 +265,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     SubAgentBridge._bridgesBySessionId.set(parentSessionId, this)
 
     this.parentSessionId = parentSessionId
+    // Auto mode: lower the DEFAULTS (concurrency + a non-null total budget) but
+    // keep precedence explicit-option > env > default, so an operator can still
+    // raise them via env without code changes.
+    const concurrencyDefault = options.conservativeAutoDefaults
+      ? AUTO_MAX_CONCURRENT_SUB_AGENTS : DEFAULT_MAX_CONCURRENT_SUB_AGENTS
     this.maxConcurrentSubAgents = Math.max(
       1,
       options.maxConcurrentSubAgents ??
-        envInt('META_AGENT_MAX_CONCURRENT_SUB_AGENTS', DEFAULT_MAX_CONCURRENT_SUB_AGENTS, 1, 64),
+        envInt('META_AGENT_MAX_CONCURRENT_SUB_AGENTS', concurrencyDefault, 1, 64),
     )
     this.maxQueuedSubAgents = Math.max(
       0,
@@ -222,7 +281,8 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         envInt('META_AGENT_MAX_QUEUED_SUB_AGENTS', DEFAULT_MAX_QUEUED_SUB_AGENTS, 0, 10_000),
     )
     this.maxTotalSubAgentBudgetUsd = options.maxTotalSubAgentBudgetUsd ??
-      this._envBudgetUsd('META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD')
+      this._envBudgetUsd('META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD') ??
+      (options.conservativeAutoDefaults ? AUTO_DEFAULT_TOTAL_BUDGET_USD : undefined)
     this.startDelayMs = Math.max(
       0,
       options.startDelayMs ??
@@ -249,10 +309,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     this._onFailed = (e) => {
       if (e.parentSessionId !== this.parentSessionId) return
-      this._enqueueNotification(
-        `[${e.taskId}] ✗ 失败 | 原因: ${e.error.slice(0, 200)}`,
-      )
       this._clearPollTimer(e.taskId)
+      // Auto mode: retry transient failures with exponential backoff before
+      // surfacing the failure to the main agent. Fire-and-forget.
+      void this._maybeRetryFailed(e.taskId, e.error)
     }
 
     CampaignEventBus.on('subagent:completed', this._onCompleted)
@@ -281,6 +341,57 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    */
   setSubAgentToolOverrides(tools: readonly MetaAgentTool[]): void {
     this.subAgentToolOverrides = new Map(tools.map(t => [t.name, t]))
+  }
+
+  /**
+   * Arm the auto-mode jail. When set, every spawned sub-agent inherits:
+   *   - a fail-closed OS sandbox whose only writable root is the workspace
+   *     (no extra writeAllowPaths) — closes the run_agent jail-escape hole;
+   *   - the autonomy profile, so the sub-agent's OWN permission policy enforces
+   *     the same workspace jail + auto-approve posture;
+   *   - projectDir bound to the jail root.
+   * Explicit per-spawn `sandbox` / `autonomy` / `projectDir` still win (e.g. a
+   * worktree-bound projectDir), so this only fills the defaults.
+   */
+  setAutonomyJail(
+    jail: { workspaceRoot: string; autonomy: import('../core/types.js').AutonomyProfile } | null,
+    opts?: { retryLimit?: number },
+  ): void {
+    this._autonomyJail = jail
+    this._autoRetryLimit = jail ? (opts?.retryLimit ?? DEFAULT_AUTO_RETRY_LIMIT) : 0
+  }
+
+  /**
+   * Arm auto-mode worktree isolation. Sub-agents spawned with
+   * config.isolateWorktree then run in their own git worktree+branch. The main
+   * agent merges/diffs/discards via the coordinator (exposed by getter).
+   */
+  setWorktreeCoordinator(coord: import('../core/auto/AutoWorktreeCoordinator.js').AutoWorktreeCoordinator | null): void {
+    this._worktreeCoordinator = coord
+  }
+
+  /** The armed worktree coordinator, if any (used by the auto worktree tools). */
+  getWorktreeCoordinator(): import('../core/auto/AutoWorktreeCoordinator.js').AutoWorktreeCoordinator | null {
+    return this._worktreeCoordinator
+  }
+
+  /**
+   * Apply the armed auto-mode jail to a fully-merged sub-agent config.
+   * No-op when the jail is not armed. Forces a fail-closed sandbox (the
+   * unsandboxed fallback is never allowed under autonomy, regardless of what a
+   * caller passed), while preserving any explicit extra sandbox keys
+   * (e.g. writeAllowPaths for a worktree). autonomy/projectDir are FILLED only
+   * when the caller didn't set them, so worktree-bound projectDir still wins.
+   */
+  private _applyAutonomyJail(config: SubAgentConfig): SubAgentConfig {
+    const jail = this._autonomyJail
+    if (!jail) return config
+    return {
+      ...config,
+      sandbox: { ...config.sandbox, allowUnsandboxedFallback: false },
+      autonomy: config.autonomy ?? jail.autonomy,
+      projectDir: config.projectDir ?? jail.workspaceRoot,
+    }
   }
 
   /** Effective registry for a new runner: main registry + overrides. */
@@ -312,6 +423,8 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this.destroyed = true
     CampaignEventBus.off('subagent:completed', this._onCompleted)
     CampaignEventBus.off('subagent:failed',    this._onFailed)
+    for (const timer of this._retryTimers) clearTimeout(timer)
+    this._retryTimers.clear()
     for (const [taskId] of this.pollTimers) this._clearPollTimer(taskId)
     for (const [taskId, queued] of this.queuedStarts) {
       queued.abortController.abort()
@@ -348,10 +461,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * the scheduler starts it asynchronously when capacity is available.
    */
   async spawnSubAgent(opts: SpawnSubAgentOptions): Promise<SubAgentRecord> {
-    const config: SubAgentConfig = {
+    let config: SubAgentConfig = this._applyAutonomyJail({
       ...DEFAULT_SUB_AGENT_CONFIG,
       ...opts.config,
-    }
+    })
 
     const outstandingTasks = this.activeTaskIds.size + this.queuedStarts.size
     const maxOutstandingTasks = this.maxConcurrentSubAgents + this.maxQueuedSubAgents
@@ -379,6 +492,25 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
 
     const taskId = opts.taskId ?? makeSubAgentTaskId()
+
+    // Auto mode worktree isolation: when requested AND a git-backed coordinator
+    // is armed, give this sub-agent its own worktree+branch and bind its
+    // projectDir + sandbox writable root there, so its writes cannot race other
+    // concurrent sub-agents. Best-effort: on any git failure we fall back to the
+    // shared tree (still protected by the write mutex).
+    if (config.isolateWorktree && this._worktreeCoordinator?.enabled) {
+      try {
+        const wt = await this._worktreeCoordinator.allocate(taskId)
+        if (wt) {
+          config = {
+            ...config,
+            projectDir: wt.worktreePath,
+            sandbox: { ...config.sandbox, writeAllowPaths: [wt.worktreePath] },
+          }
+        }
+      } catch { /* fall back to shared tree */ }
+    }
+
     const record: SubAgentRecord = {
       schemaVersion:        '1.0',
       taskId,
@@ -411,7 +543,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     // Start poll timer if not event-driven
     if (!config.useEventDriven) {
-      this._startPollTimer(taskId, config.pollIntervalMs)
+      this._startPollTimer(taskId, config.pollIntervalMs, config.maxDurationMs)
     }
 
     this.queuedStarts.set(taskId, { record, abortController })
@@ -591,16 +723,65 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
   // ── Internal helpers ────────────────────────────────────────────────────────
 
+  /**
+   * Auto mode: on a sub-agent failure, retry with exponential backoff up to the
+   * limit. Each retry re-spawns the SAME config (new taskId) with an incremented
+   * retryCount. When retries are exhausted (or not armed), the failure is
+   * surfaced to the main agent as a notification so it can decide what to do.
+   * Returns nothing; enqueues the appropriate notification.
+   */
+  private async _maybeRetryFailed(taskId: SubAgentTaskId, error: string): Promise<void> {
+    const surfaceFailure = () =>
+      this._enqueueNotification(`[${taskId}] ✗ 失败 | 原因: ${error.slice(0, 200)}`)
+
+    if (this.destroyed) return
+    const rec = await readTask(taskId).catch(() => null)
+    const attempt = rec?.config.retryCount ?? 0
+    if (!rec || !shouldRetrySubAgent(attempt, this._autoRetryLimit, this._autonomyJail !== null)) {
+      surfaceFailure()
+      return
+    }
+
+    const delay = retryBackoffMs(attempt)
+    this._enqueueNotification(
+      `[${taskId}] ↻ 失败，将在 ${Math.round(delay / 1000)}s 后第 ${attempt + 1}/${this._autoRetryLimit} 次重试 | 原因: ${error.slice(0, 120)}`,
+    )
+    const timer = setTimeout(() => {
+      this._retryTimers.delete(timer)
+      if (this.destroyed) return
+      void this.spawnSubAgent({ config: { ...rec.config, retryCount: attempt + 1 } }).catch(() => {
+        this._enqueueNotification(`[${taskId}] ✗ 重试派发失败；原始错误: ${error.slice(0, 120)}`)
+      })
+    }, delay)
+    if (timer.unref) timer.unref()
+    this._retryTimers.add(timer)
+  }
+
   private _enqueueNotification(text: string): void {
-    // S12: prefer shift() over splice() — V8's fast path keeps shift amortised
-    // O(1) for small arrays, while splice always re-allocates the storage.
     this.pendingNotifications.push(text)
-    while (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
-      this.pendingNotifications.shift()
+    // Backpressure: instead of SILENTLY dropping the oldest overflow (which
+    // loses sub-agent outcomes in a long unattended run), collapse the oldest
+    // entries into ONE merged-summary line that preserves the count. Nothing is
+    // lost without trace; the array stays bounded.
+    if (this.pendingNotifications.length > MAX_PENDING_NOTIFICATIONS) {
+      const overflowCount = this.pendingNotifications.length - (MAX_PENDING_NOTIFICATIONS - 1)
+      const overflow = this.pendingNotifications.splice(0, overflowCount)
+      this.pendingNotifications.unshift(mergeOverflowNotifications(overflow))
     }
   }
 
-  private _startPollTimer(taskId: SubAgentTaskId, intervalMs: number): void {
+  private _startPollTimer(
+    taskId: SubAgentTaskId,
+    intervalMs: number,
+    maxDurationMs?: number,
+  ): void {
+    const startedAt = Date.now()
+    // M5: absolute safety cap. If the task never reaches a terminal state — e.g.
+    // its runner died in another process without writing a terminal record —
+    // stop polling instead of leaking this interval for the host's lifetime.
+    // Generous slack over the runner's own wall-clock cap so a legitimately
+    // slow task is never cut off early.
+    const maxAgeMs = Math.max((maxDurationMs ?? 300_000) * 4, intervalMs * 4)
     const timer = setInterval(async () => {
       const record = await readTask(taskId)
       if (!record) {
@@ -625,6 +806,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
           resultLine = `✗ 失败 | ${record.result?.error ?? 'unknown'}`
         }
         this._enqueueNotification(`[${taskId}] ${resultLine}`)
+        this._clearPollTimer(taskId)
+        return
+      }
+      // Non-terminal but past the safety cap — declare lost and stop polling.
+      if (Date.now() - startedAt > maxAgeMs) {
+        this._enqueueNotification(
+          `[${taskId}] ⚠ 轮询超时：子代理在 ${Math.round(maxAgeMs / 60_000)} 分钟内未进入终态` +
+          `（其 runner 进程可能已退出），已停止轮询。`,
+        )
         this._clearPollTimer(taskId)
       }
     }, intervalMs)

@@ -5,11 +5,9 @@ import { afterEach, describe, expect, it, vi } from 'vitest'
 import type { FlashClient, FlashQueryOpts } from '../../core/flash/FlashClient.js'
 import { ExperienceStore } from '../ExperienceStore.js'
 import { PhysicalAnchorStore } from '../PhysicalAnchorStore.js'
-import { PhysicalAnchorPendingStore } from '../PhysicalAnchorPendingStore.js'
 import { PrincipleStore } from '../PrincipleStore.js'
 import { PrinciplePendingStore } from '../PrinciplePendingStore.js'
 import { ExperiencePendingStore, validateExperienceInput } from '../ExperiencePendingStore.js'
-import { createExperienceWriteTool } from '../tools/experience_write/index.js'
 import { proposePrincipleFromCluster } from '../PrinciplePromotion.js'
 import { claimAnchorsForExperience, evaluatePromotion } from '../PrincipleConvergence.js'
 import type { ExperienceEntry, PhysicalAnchorEntry } from '../types.js'
@@ -74,61 +72,8 @@ describe('PhysicalAnchorStore signals', () => {
 })
 
 // ─────────────────────────────────────────────────────────────────────────────
-// experience_write — combined distillation
-// ─────────────────────────────────────────────────────────────────────────────
-
-describe('experience_write combined distillation', () => {
-  function makeTool(flashResponse: string | null) {
-    const expDir = ''
-    void expDir
-    return async () => {
-      const store = new ExperienceStore(await tempDir())
-      const pending = new ExperiencePendingStore('/proj/d', await tempDir())
-      const anchorStore = new PhysicalAnchorStore(await tempDir())
-      const anchorPending = new PhysicalAnchorPendingStore('/proj/d', await tempDir())
-      const flash = { query: vi.fn().mockResolvedValue(flashResponse) } as unknown as FlashClient
-      const tool = createExperienceWriteTool(store, pending, flash, anchorStore, anchorPending)
-      return { store, pending, anchorPending, tool }
-    }
-  }
-
-  const validInput = {
-    domain: 'locomotion', title: 'gait latency', problem: 'unstable gait',
-    solution: 'bound latency', success: true, outcome_summary: 'stabilized',
-  }
-
-  it('extracts principle and queues a strict anchor candidate', async () => {
-    const { pending, anchorPending, tool } = await makeTool(JSON.stringify({
-      abstract_principle: 'bound latency vs control freq',
-      anchors: [{ title: 'go2 latency', domain: 'locomotion', scope: 'robot', fact: 'latency ≈ 8ms', implication: 'budget it', confidence_tier: 'observed', evidence_refs: [] }],
-    }))()
-    await tool.call(validInput, {})
-    expect(pending.list()[0]!.input['abstract_principle']).toBe('bound latency vs control freq')
-    expect(anchorPending.count).toBe(1)
-    await pending.flush(); await anchorPending.flush()
-  })
-
-  it('caps anchor candidates at 2', async () => {
-    const mk = (n: number) => ({ title: `a${n}`, domain: 'locomotion', scope: 'robot', fact: `fact ${n}`, implication: 'i', confidence_tier: 'observed', evidence_refs: [] })
-    const { anchorPending, tool } = await makeTool(JSON.stringify({
-      abstract_principle: 'x', anchors: [mk(1), mk(2), mk(3)],
-    }))()
-    await tool.call(validInput, {})
-    expect(anchorPending.count).toBe(2)
-    await anchorPending.flush()
-  })
-
-  it('defaults to no anchor and still queues the experience when flash fails', async () => {
-    const { pending, anchorPending, tool } = await makeTool(null)()
-    await tool.call(validInput, {})
-    expect(pending.count).toBe(1)
-    expect(anchorPending.count).toBe(0)
-    await pending.flush()
-  })
-})
-
-// ─────────────────────────────────────────────────────────────────────────────
-// anchor claim + contradiction propagation
+// anchor claim + contradiction propagation (DEFERRED code — kept dormant, still
+// validated here so a future re-wire is safe)
 // ─────────────────────────────────────────────────────────────────────────────
 
 function anchorClaimFlash(verdicts: Array<{ id: string; verdict: string }>): FlashClient {

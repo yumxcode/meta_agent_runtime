@@ -1,0 +1,79 @@
+/**
+ * DriftGate — auto-mode mid-flight reflection (Checkpoint + Learn).
+ *
+ * Verify fires once, at "I'm done". DriftGate fires DURING a long run, at coarse
+ * structural boundaries, to answer a different question: "are we still heading at
+ * the goal, and is there a durable lesson worth recording?" It is the loop's
+ * periodic "stop, look back, confirm we haven't wandered off" — exactly the
+ * Checkpoint role the blog describes, plus the write half of Learn.
+ *
+ * Like VerifyGate, this module holds ONLY the kernel-side contract; the
+ * implementation (spawning a drift sub-agent that reads goal + checkpoint and may
+ * write experiences) lives in core/auto/learn and is injected via
+ * KernelConfig.driftGate. The kernel never imports it.
+ *
+ * Trigger policy (double safety, evaluated in the loop):
+ *   • a compaction boundary just occurred this turn (primary — a natural,
+ *     structural "a lot has accumulated, take stock" point), OR
+ *   • DRIFT_TURN_INTERVAL turns have elapsed since the last drift check
+ *     (fallback so a short-but-drifting run still gets examined).
+ */
+
+/** Turn-count fallback trigger when no compaction boundary has fired. */
+export const DRIFT_TURN_INTERVAL = 5
+
+/** Why a drift check was triggered (observability + judge hint). */
+export type DriftReason = 'compaction_boundary' | 'turn_interval'
+
+/** Structured verdict returned by the drift agent. */
+export interface DriftVerdict {
+  /** True when the run has wandered off the goal and needs correction. */
+  drifted: boolean
+  /** Severity hint; 'minor' nudges, 'major' is a strong steer. */
+  severity?: 'minor' | 'major'
+  /** Concrete corrective steps to re-inject when drifted. */
+  corrective: string[]
+  /** Free-text reasoning / what was observed. */
+  note?: string
+  /** IDs of experiences the agent wrote this round (observability only). */
+  experiencesWritten?: string[]
+}
+
+/** Arguments the loop hands the drift gate. */
+export interface DriftGateArgs {
+  /** Workspace root (auto jail root) — the kernel's live cwd. */
+  workspaceRoot: string
+  /** Completed-turn count so far. */
+  turnCount: number
+  /** What triggered this check. */
+  reason: DriftReason
+  /** Abort signal — drift work bails when the parent run is interrupted. */
+  signal: AbortSignal
+}
+
+/**
+ * The drift gate. Best-effort: implementations MUST resolve (never reject); on
+ * any internal failure resolve to `{ drifted: false, corrective: [] }` so a
+ * broken drift checker can never derail a healthy run (fail-open).
+ */
+export type DriftGateFn = (args: DriftGateArgs) => Promise<DriftVerdict>
+
+/**
+ * Build the one-shot meta message re-injected when drift is detected. Framed as
+ * an external mid-flight review so the executor treats it as a course
+ * correction, not as its own rumination.
+ */
+export function buildDriftCorrectionPrompt(verdict: DriftVerdict): string {
+  const sev = verdict.severity === 'major' ? '（严重）' : ''
+  const items = verdict.corrective.length
+    ? verdict.corrective.map((s, i) => `  ${i + 1}. ${s}`).join('\n')
+    : '  （未给出具体纠偏项，请对照原始目标自查当前方向）'
+  const note = verdict.note ? `\n判断依据：${verdict.note}` : ''
+  return (
+    `[系统·航向校正${sev}] 一次独立的中途审查（对照原始目标与进度快照）判定当前推进已偏离目标。` +
+    `请在继续前先校正方向：\n` +
+    items +
+    note +
+    '\n\n如果你认为没有偏离，请用一句话说明理由再继续；否则按上述校正后推进。'
+  )
+}

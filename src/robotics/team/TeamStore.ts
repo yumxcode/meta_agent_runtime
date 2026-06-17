@@ -167,6 +167,25 @@ export class TeamGithubRequiredError extends Error {
 }
 
 /**
+ * Thrown when team.json exists on disk but cannot be parsed/validated
+ * (e.g. git conflict markers, a half-written file, or an unknown schema).
+ *
+ * H1: read() throws this instead of returning null so that ensure()→init()
+ * can NOT silently overwrite the corrupt file with an empty default board and
+ * destroy the entire team log. The bytes are left in place for `git restore`.
+ */
+export class TeamStateCorruptError extends Error {
+  override name = 'TeamStateCorruptError'
+  constructor(statePath: string) {
+    super(
+      `[TeamStore] 无法解析 ${statePath}（可能是 git 合并冲突标记或半写文件）。\n` +
+      '为避免覆盖丢失团队看板，已中止本次操作并保留原文件。\n' +
+      '请用 `git restore team/team.json`/手动修复冲突后重试，或确认无用后删除该文件再重新 /team init。',
+    )
+  }
+}
+
+/**
  * Normalize any GitHub remote form to a canonical https URL:
  *   git@github.com:org/repo.git      → https://github.com/org/repo
  *   https://github.com/org/repo.git  → https://github.com/org/repo
@@ -234,7 +253,7 @@ export class TeamStore {
   }
 
   async status(): Promise<TeamState | null> {
-    return this.read()
+    return this.readSafe()
   }
 
   // ── Lifecycle ──────────────────────────────────────────────────────────────
@@ -416,7 +435,7 @@ export class TeamStore {
    * hold several tasks; `focus` is the one it is actively pushing right now.
    */
   async ownedActiveTasks(): Promise<{ owned: TeamTask[]; focusId?: string }> {
-    const state = await this.read()
+    const state = await this.readSafe()
     if (!state) return { owned: [] }
     const owned = state.tasks.filter(t => t.ownerUnit === this.unitId && t.status !== 'done')
     const current = state.units.find(u => u.id === this.unitId)?.currentTask
@@ -537,6 +556,14 @@ export class TeamStore {
    * record attempts (forces "if you want to write here, take it first").
    */
   async note(input: TeamNoteInput): Promise<{ state: TeamState; task: TeamTask; attempt: TeamAttempt }> {
+    // L4: note() is the documented high-contention path (concurrent attempts
+    // race on the same file). Auto-retry the read→mutate→write a few times on an
+    // optimistic-concurrency conflict so a teammate's interleaved write doesn't
+    // surface as a hard error the user has to manually re-issue.
+    return this._retryOnConflict(() => this._noteOnce(input))
+  }
+
+  private async _noteOnce(input: TeamNoteInput): Promise<{ state: TeamState; task: TeamTask; attempt: TeamAttempt }> {
     const direction = input.direction.trim()
     const outcome = input.outcome.trim()
     if (!direction) throw new Error('note direction is required')
@@ -650,7 +677,7 @@ export class TeamStore {
       } catch { /* ignore */ }
     }
 
-    const state = await this.read()
+    const state = await this.readSafe()
     if (state && updatePresence) {
       const originalUpdatedAt = state.updatedAt
       const unit = this.ensureUnit(state)
@@ -769,7 +796,7 @@ export class TeamStore {
       await execFileAsync('git', ['checkout', upstreamBranch, '--', TEAM_DIR], { cwd: this.projectDir, timeout: 30_000 })
     }
 
-    const state = await this.read()
+    const state = await this.readSafe()
     const after = await this.sync({ fetch: false, updatePresence: false })
     return { applied: true, upstreamBranch, changedFiles: before.remoteTeamChanges, sync: after, state }
   }
@@ -877,7 +904,7 @@ export class TeamStore {
   // ── Prompt context for the AI ─────────────────────────────────────────────
 
   async formatPromptContext(): Promise<string | null> {
-    const state = await this.read()
+    const state = await this.readSafe()
     if (!state) return null
     const kindTag = (t: TeamTask): string => (t.kind ? `[${TASK_KIND_LABELS[t.kind]}] ` : '')
     const active = state.tasks.filter(isActiveTask)
@@ -936,6 +963,28 @@ export class TeamStore {
 
   // ── Internals ─────────────────────────────────────────────────────────────
 
+  /**
+   * Retry an optimistic-concurrency-guarded mutation when writeAll() reports a
+   * concurrent modification. Each attempt re-reads fresh state (the op calls
+   * ensure() itself), so a teammate's interleaved write is absorbed rather than
+   * bubbled up as a hard error. Non-conflict errors propagate immediately.
+   */
+  private async _retryOnConflict<T>(op: () => Promise<T>, tries = 3): Promise<T> {
+    let lastErr: unknown
+    for (let attempt = 0; attempt < tries; attempt++) {
+      try {
+        return await op()
+      } catch (err) {
+        if (!(err instanceof Error) || !/Concurrent modification/.test(err.message)) {
+          throw err
+        }
+        lastErr = err
+        await new Promise(resolve => setTimeout(resolve, 25 * (attempt + 1)))
+      }
+    }
+    throw lastErr
+  }
+
   private formatOwnedError(task: TeamTask): string {
     const ago = task.claimedAt
       ? `${Math.round((Date.now() - Date.parse(task.claimedAt)) / 3_600_000)}h 前`
@@ -956,14 +1005,40 @@ export class TeamStore {
     return await this.read() ?? await this.init(github)
   }
 
+  /**
+   * Strict read. Missing file → null; a file that exists but is corrupt or
+   * fails schema validation → throws TeamStateCorruptError (H1). Mutation paths
+   * (ensure/init) use this so a corrupt board is never overwritten.
+   */
   private async read(): Promise<TeamState | null> {
     const raw = await fileText(this.statePath)
-    if (!raw) return null
+    if (raw === null) return null
+    let json: unknown
     try {
-      const json = JSON.parse(raw) as unknown
-      return migrateTeamState(json) as TeamState | null
+      json = JSON.parse(raw)
     } catch {
-      return null
+      throw new TeamStateCorruptError(this.statePath)
+    }
+    const migrated = migrateTeamState(json) as TeamState | null
+    // A non-empty file that validates to null (unknown schema / invalid shape)
+    // is also corrupt — returning null here would let init() overwrite it.
+    if (migrated === null) throw new TeamStateCorruptError(this.statePath)
+    return migrated
+  }
+
+  /**
+   * Best-effort read for read-only/display paths (status, prompt context, git
+   * sync). Never throws: a corrupt board surfaces as "no board" for display
+   * while the strict read() still guards every mutation. The bytes are left
+   * untouched so the strict path can still report the corruption and the user
+   * can recover them.
+   */
+  private async readSafe(): Promise<TeamState | null> {
+    try {
+      return await this.read()
+    } catch (err) {
+      if (err instanceof TeamStateCorruptError) return null
+      throw err
     }
   }
 

@@ -484,6 +484,7 @@ export class KernelSession {
         aborted_streaming: 'error_during_execution',
         aborted_tools:     'error_during_execution',
         max_budget_usd:    'error_max_budget_usd',
+        verify_exhausted:  'error_during_execution',
         error:             'error_during_execution',
       }
 
@@ -491,7 +492,11 @@ export class KernelSession {
         type: 'result',
         subtype: subtypeMap[loopResult.reason],
         sessionId: this._sessionId,
-        usage: loopResult.totalUsage,
+        // M3: report CUMULATIVE usage so it matches costUsd, which the loop
+        // already returns cumulatively (seeded with cumulativeCostUsd). The
+        // session's running _totalUsage is added to this loop's usage here
+        // because _totalUsage isn't folded in until after this event is built.
+        usage: addUsage(this._totalUsage, loopResult.totalUsage),
         costUsd: loopResult.costUsd,
         numTurns: loopResult.numTurns,
         stopReason: null,

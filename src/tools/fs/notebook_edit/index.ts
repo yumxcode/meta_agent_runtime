@@ -35,6 +35,8 @@ export async function createNotebookEditTool(): Promise<MetaAgentTool> {
       const workspaceError = assertInsideWorkspace(p, _ctx.workspaceRoot)
       if (workspaceError) return { content: workspaceError, isError: true }
       if (mode !== 'delete' && src === undefined) return { content: 'Error: new_source required', isError: true }
+      // Auto mode: hold the path lock across the read-modify-write (no-op otherwise).
+      const release = _ctx.writeMutex ? await _ctx.writeMutex.acquire(p) : null
       try {
         const fileStat = await stat(p)
         if (fileStat.size > MAX_NOTEBOOK_BYTES) {
@@ -58,6 +60,7 @@ export async function createNotebookEditTool(): Promise<MetaAgentTool> {
         await writeFile(p, JSON.stringify(nb, null, 1), 'utf-8')
         return { content: `Cell ${n} ${mode}d in ${p}`, isError: false }
       } catch (err) { return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true } }
+      finally { release?.() }
     },
   }
 }

@@ -252,7 +252,9 @@ export class SubAgentRunner {
     let sandboxHandle: SandboxHandle | undefined
     if (cfg.sandbox) {
       const executor = createSandboxExecutor()
-      const workspaceRoot = process.cwd()
+      // Bind the sandbox's writable root to the sub-agent's jail root (auto mode
+      // sets projectDir to the jail / worktree); falls back to cwd otherwise.
+      const workspaceRoot = cfg.projectDir ?? process.cwd()
       if (executor.platform === 'noop' && !cfg.sandbox.allowUnsandboxedFallback) {
         throw new Error(
           'Sandbox requested, but no supported sandbox backend is available. ' +
@@ -327,6 +329,10 @@ export class SubAgentRunner {
       ...(cfg.baseURL  !== undefined && { baseURL:  cfg.baseURL }),
       ...(cfg.model    !== undefined && { model:    cfg.model }),
       ...(cfg.fallbackModel !== undefined && { fallbackModel: cfg.fallbackModel }),
+      // Auto mode: extend the parent's workspace jail to the sub-agent's own
+      // permission policy + bind its jail root. Absent for non-auto parents.
+      ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
+      ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
     }
 
     this.session = new MetaAgentSession(sessionConfig)
@@ -591,19 +597,25 @@ export class SubAgentRunner {
       pendingHumanApproval:
         status === 'completed' && this.record.config.requireHumanApproval,
     }
-    const written = await mutateTask(this.record.taskId, disk =>
-      disk && TERMINAL_STATUSES.has(disk.status) ? null : candidate,
-    )
-    if (written === null) {
-      // Another code path (e.g. cancelTask) already wrote a terminal state.
-      // Sync our in-memory record but do not overwrite the disk state.
-      const disk = await readTask(this.record.taskId)
-      if (disk) this.record.status = disk.status
+    let written: SubAgentRecord | null
+    try {
+      written = await mutateTask(this.record.taskId, disk =>
+        disk && TERMINAL_STATUSES.has(disk.status) ? null : candidate,
+      )
+      if (written === null) {
+        // Another code path (e.g. cancelTask) already wrote a terminal state.
+        // Sync our in-memory record but do not overwrite the disk state.
+        const disk = await readTask(this.record.taskId)
+        if (disk) this.record.status = disk.status
+      } else {
+        Object.assign(this.record, candidate)
+      }
+    } finally {
+      // M4: always release the per-task write chain, even if mutateTask threw —
+      // otherwise the chain entry leaks and later writes for this task wedge.
       await releaseWriteChain(this.record.taskId)
-      return
     }
-    Object.assign(this.record, candidate)
-    await releaseWriteChain(this.record.taskId)
+    if (written === null) return
 
     // Publish event
     if (status === 'completed') {

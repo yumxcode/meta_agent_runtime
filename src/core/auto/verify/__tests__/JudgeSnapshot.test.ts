@@ -1,0 +1,71 @@
+import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { execFileSync } from 'child_process'
+import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { withReadonlySnapshot } from '../JudgeSnapshot.js'
+
+function git(dir: string, args: string[]): void {
+  execFileSync('git', ['-C', dir, ...args], { stdio: 'ignore' })
+}
+
+describe('withReadonlySnapshot', () => {
+  let dir: string
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'ma-snap-'))
+  })
+  afterEach(() => {
+    try { rmSync(dir, { recursive: true, force: true }) } catch { /* noop */ }
+  })
+
+  it('passes null when not a git repo', async () => {
+    const got = await withReadonlySnapshot(dir, async p => p)
+    expect(got).toBeNull()
+  })
+
+  it('captures uncommitted edits AND untracked new files', async () => {
+    git(dir, ['init'])
+    git(dir, ['config', 'user.email', 't@t.dev'])
+    git(dir, ['config', 'user.name', 'tester'])
+    writeFileSync(join(dir, 'committed.txt'), 'original\n')
+    git(dir, ['add', '-A'])
+    git(dir, ['commit', '-m', 'init'])
+
+    // Executor-style mutations WITHOUT committing:
+    writeFileSync(join(dir, 'committed.txt'), 'EDITED\n')   // uncommitted edit
+    writeFileSync(join(dir, 'brand-new.txt'), 'NEW\n')      // untracked new file
+
+    const result = await withReadonlySnapshot(dir, async snap => {
+      expect(snap).not.toBeNull()
+      return {
+        edited: readFileSync(join(snap!, 'committed.txt'), 'utf-8'),
+        hasNew: existsSync(join(snap!, 'brand-new.txt')),
+        newBody: existsSync(join(snap!, 'brand-new.txt'))
+          ? readFileSync(join(snap!, 'brand-new.txt'), 'utf-8')
+          : '',
+      }
+    })
+
+    expect(result.edited).toBe('EDITED\n')   // sees the uncommitted edit
+    expect(result.hasNew).toBe(true)         // sees the untracked file
+    expect(result.newBody).toBe('NEW\n')
+  })
+
+  it('cleans up the worktree after use and leaves the live tree untouched', async () => {
+    git(dir, ['init'])
+    git(dir, ['config', 'user.email', 't@t.dev'])
+    git(dir, ['config', 'user.name', 'tester'])
+    writeFileSync(join(dir, 'a.txt'), 'a\n')
+    git(dir, ['add', '-A'])
+    git(dir, ['commit', '-m', 'init'])
+    writeFileSync(join(dir, 'a.txt'), 'live-edit\n')
+
+    await withReadonlySnapshot(dir, async () => undefined)
+
+    // Snapshot worktree removed.
+    expect(existsSync(join(dir, '.meta-agent', 'auto', 'verify-snapshot'))).toBe(false)
+    // Live working tree edit is preserved (snapshot used an isolated index).
+    expect(readFileSync(join(dir, 'a.txt'), 'utf-8')).toBe('live-edit\n')
+  })
+})

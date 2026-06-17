@@ -13,6 +13,7 @@ import type { CompactOptions } from './CompactConversation.js'
 import { COMPACT_MAX_TOKENS, COMPACT_MODEL_DEFAULT, compactConversation } from './CompactConversation.js'
 import { calculateTokenWarningState, isAutoCompactDisabled } from '../utils/Context.js'
 import { tokenCountWithEstimation } from '../api/TokenCount.js'
+import { structuralTruncate } from './StructuralTruncate.js'
 
 const MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3
 
@@ -109,12 +110,7 @@ export async function autoCompactIfNeeded(
     return { wasCompacted: false, tracking: currentTracking }
   }
 
-  // ── Circuit breaker ───────────────────────────────────────────────────────
-  if (currentTracking.consecutiveFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
-    return { wasCompacted: false, tracking: currentTracking }
-  }
-
-  // ── Token threshold check ─────────────────────────────────────────────────
+  // ── Token threshold check (needed before the circuit-breaker fallback) ─────
   const tokenCount = tokenCountWithEstimation(messagesForQuery)
   const isAtCompactThreshold = shouldCompactForTokenCount(
     tokenCount,
@@ -122,6 +118,17 @@ export async function autoCompactIfNeeded(
     maxOutputTokens,
     compactOptions.model,
   )
+
+  // ── Circuit breaker ───────────────────────────────────────────────────────
+  if (currentTracking.consecutiveFailures >= MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES) {
+    // Auto mode: the model compactor is wedged, but an unattended session must
+    // not grow into the blocking limit. Fall back to no-model truncation so the
+    // context always shrinks. Only when actually at/over the threshold.
+    if (compactOptions.autonomyFallback && (force || isAtCompactThreshold)) {
+      return runStructuralFallback(messagesForQuery, model, maxOutputTokens, currentTracking)
+    }
+    return { wasCompacted: false, tracking: currentTracking }
+  }
 
   if (!force && !isAtCompactThreshold) {
     return { wasCompacted: false, tracking: { ...currentTracking, turnCounter: currentTracking.turnCounter + 1 } }
@@ -151,6 +158,21 @@ export async function autoCompactIfNeeded(
       ...currentTracking,
       consecutiveFailures,
     }
+    // Auto mode: on the failure that opens (or after) the circuit breaker, run the
+    // no-model fallback this turn so the context shrinks instead of marching to
+    // the blocking limit. Tracking still records the failure for observability.
+    if (compactOptions.autonomyFallback) {
+      const fallback = runStructuralFallback(messagesForQuery, model, maxOutputTokens, newTracking)
+      return {
+        ...fallback,
+        failure: {
+          attempt: consecutiveFailures,
+          querySource,
+          error: compactErrorSummary(_error),
+          consecutiveFailures,
+        },
+      }
+    }
     return {
       wasCompacted: false,
       tracking: newTracking,
@@ -161,6 +183,26 @@ export async function autoCompactIfNeeded(
         consecutiveFailures,
       },
     }
+  }
+}
+
+/**
+ * Run the no-model structural-truncation fallback and shape it as an
+ * AutoCompactResult. wasCompacted is true so the loop swaps in the shrunk
+ * messages. Tracking is marked compacted but the caller may overlay failure info.
+ */
+function runStructuralFallback(
+  messagesForQuery: readonly KernelMessage[],
+  model: string,
+  maxOutputTokens: number | undefined,
+  tracking: AutoCompactTrackingState,
+): AutoCompactResult {
+  const result = structuralTruncate(messagesForQuery, model, maxOutputTokens)
+  return {
+    wasCompacted: true,
+    postCompactMessages: result.postCompactMessages,
+    summaryTokenEstimate: result.summaryTokenEstimate,
+    tracking: { ...tracking, compacted: true, turnCounter: 0 },
   }
 }
 

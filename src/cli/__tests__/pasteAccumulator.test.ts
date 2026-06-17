@@ -47,9 +47,96 @@ function paste(acc: PasteAccumulator, chunk: string): Array<string | null> {
 }
 
 describe('PasteAccumulator', () => {
+  it('reports paste chunks for display suppression without flagging ordinary Enter', () => {
+    const acc = new PasteAccumulator()
+    expect(acc.onData('typed')).toMatchObject({ isPaste: false, text: 'typed' })
+    expect(acc.onData('\r')).toMatchObject({ isPaste: false, text: '\r' })
+    expect(acc.onData(PASTE_START + 'pasted text' + PASTE_END))
+      .toMatchObject({ isPaste: true, text: 'pasted text' })
+  })
+
+  it('reports markerless multiline paste chunks and split bare-newline chunks', () => {
+    const acc = new PasteAccumulator()
+    expect(acc.onData('L1\nL2')).toMatchObject({ isPaste: true, text: 'L1\nL2' })
+    expect(acc.onLine('L1')).toBeNull()
+    expect(acc.onData('\n')).toMatchObject({ isPaste: true, text: '\n' })
+  })
+
   it('submits a single typed line on Enter', () => {
     const acc = new PasteAccumulator()
     expect(typeLine(acc, 'hello world')).toBe('hello world')
+  })
+
+  // ── Fallback coalesce window (markerless terminals) ──────────────────────
+  describe('fallback coalesce window', () => {
+    // A controllable fake timer so tests can decide whether the window elapses.
+    function makeAcc() {
+      const timers: Array<{ id: number; fn: () => void }> = []
+      let next = 1
+      const submits: string[] = []
+      const acc = new PasteAccumulator({
+        coalesceMs: 15,
+        onDeferredSubmit: (m) => submits.push(m),
+        schedule: (fn) => { const id = next++; timers.push({ id, fn }); return id },
+        cancel: (h) => { const i = timers.findIndex(t => t.id === h); if (i >= 0) timers.splice(i, 1) },
+      })
+      return {
+        acc, submits,
+        elapse: () => { const pend = timers.splice(0); pend.forEach(t => t.fn()) },
+        pending: () => timers.length,
+      }
+    }
+
+    it('re-joins a paste split when a lone-newline chunk lands mid-paste', () => {
+      const { acc, submits, elapse, pending } = makeAcc()
+      // Markerless paste "L1\nL2" delivered, then a lone "\n" chunk (the split),
+      // then "L3\nL4" — historically this flushed "L1\nL2" early.
+      acc.onData('报错了：L1\nL2')
+      expect(acc.onLine('报错了：L1')).toBeNull()   // buffered
+      acc.onData('\n')                               // lone-newline chunk
+      expect(acc.onLine('L2')).toBeNull()            // DEFERRED, not flushed
+      expect(pending()).toBe(1)
+      acc.onData('L3\nL4')                           // more input → cancels defer
+      expect(pending()).toBe(0)
+      expect(acc.onLine('L3')).toBeNull()
+      // Real Enter ends it: bare chunk, empty line, content buffered → defer…
+      acc.onData('\r')
+      expect(acc.onLine('L4')).toBeNull()            // pushed L4
+      acc.onData('\r')
+      expect(acc.onLine('')).toBeNull()              // deferred final flush
+      elapse()
+      expect(submits).toEqual(['报错了：L1\nL2\nL3\nL4'])
+    })
+
+    it('flushes once the window elapses with no further input (real Enter)', () => {
+      const { acc, submits, elapse } = makeAcc()
+      acc.onData('a\nb\nc')                  // markerless paste, "c" buffered
+      expect(acc.onLine('a')).toBeNull()
+      expect(acc.onLine('b')).toBeNull()
+      acc.onData('\r')                       // user Enter
+      expect(acc.onLine('c')).toBeNull()     // deferred (prior content buffered)
+      elapse()                               // window passes, nothing cancelled
+      expect(submits).toEqual(['a\nb\nc'])
+    })
+
+    it('never defers a lone typed line (no prior buffered content)', () => {
+      const { acc, submits } = makeAcc()
+      acc.onData('\r')
+      // priorLines === 0 → synchronous flush, no timer, no deferred submit.
+      expect(acc.onLine('hello')).toBe('hello')
+      expect(submits).toEqual([])
+    })
+
+    it('once a bracketed marker is seen, the window is disabled (no latency)', () => {
+      const { acc, submits } = makeAcc()
+      // A bracketed paste in this session sets markerSeen.
+      acc.onData(PASTE_START + 'x\ny' + PASTE_END)
+      acc.onLine('x'); acc.onLine('y')
+      acc.onData('\r')
+      // Bare Enter now flushes synchronously (returns the value, not deferred).
+      expect(acc.onLine('')).toBe('x\ny')
+      expect(submits).toEqual([])
+    })
   })
 
   it('submits an empty line on a bare Enter', () => {

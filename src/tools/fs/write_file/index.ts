@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'fs/promises'
 import { dirname } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
-import { assertInsideWorkspace } from '../workspaceGuard.js'
+import { resolveInsideWorkspace } from '../workspaceGuard.js'
 
 const MAX_WRITE_BYTES = 5 * 1024 * 1024
 
@@ -23,15 +23,21 @@ export async function createWriteFileTool(): Promise<MetaAgentTool> {
       required: ['file_path', 'content'],
     },
     async call(input: Record<string, unknown>, _ctx: ToolCallContext): Promise<ToolResult> {
-      const filePath = input['file_path'] as string
+      const rawPath = input['file_path'] as string
       const content = input['content'] as string
-      if (!filePath) return { content: 'Error: file_path is required', isError: true }
-      const workspaceError = assertInsideWorkspace(filePath, _ctx.workspaceRoot)
-      if (workspaceError) return { content: workspaceError, isError: true }
+      if (!rawPath) return { content: 'Error: file_path is required', isError: true }
+      const resolved = resolveInsideWorkspace(rawPath, _ctx.workspaceRoot)
+      if (!resolved.ok) return { content: resolved.error, isError: true }
+      // Execute on the canonical absolute path the guard approved — never the
+      // raw input — so the byte we validated is the byte we write.
+      const filePath = resolved.path
       if (content === undefined || content === null) return { content: 'Error: content is required', isError: true }
       if (Buffer.byteLength(content, 'utf-8') > MAX_WRITE_BYTES) {
         return { content: `Error: content is too large to write safely (${Buffer.byteLength(content, 'utf-8')} bytes).`, isError: true }
       }
+      // Auto mode: serialise concurrent writers to the same path (no-op when the
+      // mutex is absent, i.e. non-auto sessions).
+      const release = _ctx.writeMutex ? await _ctx.writeMutex.acquire(filePath) : null
       try {
         await mkdir(dirname(filePath), { recursive: true })
         await writeFile(filePath, content, 'utf-8')
@@ -39,6 +45,8 @@ export async function createWriteFileTool(): Promise<MetaAgentTool> {
         return { content: `Successfully wrote ${lines} lines to ${filePath}`, isError: false }
       } catch (err) {
         return { content: `Error writing file: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+      } finally {
+        release?.()
       }
     },
   }

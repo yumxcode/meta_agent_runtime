@@ -1,7 +1,7 @@
 import { readFile, stat, writeFile } from 'fs/promises'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
-import { assertInsideWorkspace } from '../workspaceGuard.js'
+import { resolveInsideWorkspace } from '../workspaceGuard.js'
 
 const MAX_EDIT_BYTES = 5 * 1024 * 1024
 
@@ -24,11 +24,11 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
       required: ['file_path', 'old_string', 'new_string'],
     },
     async call(input: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolResult> {
-      const filePath = input['file_path'] as string
+      const rawPath = input['file_path'] as string
       const oldStr = input['old_string'] as string
       const newStr = input['new_string'] as string
       const replaceAll = input['replace_all'] === true
-      if (!filePath) return { content: 'Error: file_path is required', isError: true }
+      if (!rawPath) return { content: 'Error: file_path is required', isError: true }
       // H3: empty old_string would explode the file character-by-character
       // (split('').length === content.length+1) — reject up front.
       if (typeof oldStr !== 'string' || oldStr.length === 0) {
@@ -37,8 +37,16 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
       if (typeof newStr !== 'string') {
         return { content: 'Error: new_string must be a string', isError: true }
       }
-      const workspaceError = assertInsideWorkspace(filePath, ctx.workspaceRoot)
-      if (workspaceError) return { content: workspaceError, isError: true }
+      const resolved = resolveInsideWorkspace(rawPath, ctx.workspaceRoot)
+      if (!resolved.ok) return { content: resolved.error, isError: true }
+      // Canonical absolute path the guard approved — stat/read/write and the
+      // FileStateCache key all use THIS, never the raw input, so validation and
+      // execution can't resolve to different files under a non-workspace cwd.
+      const filePath = resolved.path
+      // Auto mode: hold the path lock across the whole read-modify-write so a
+      // concurrent sub-agent cannot interleave between our read and write
+      // (no-op when the mutex is absent).
+      const release = ctx.writeMutex ? await ctx.writeMutex.acquire(filePath) : null
       try {
         const fileStat = await stat(filePath)
         if (fileStat.size > MAX_EDIT_BYTES) {
@@ -83,6 +91,8 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
         return { content: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${filePath}`, isError: false }
       } catch (err) {
         return { content: `Error editing file: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+      } finally {
+        release?.()
       }
     },
   }

@@ -26,7 +26,7 @@ const DETAILED_ANALYSIS_INSTRUCTION = `
  * mode threads its profile through config.compact.promptProfile so the
  * summariser is asked for domain-appropriate sections.
  */
-export type CompactProfile = 'agentic' | 'robotics' | 'campaign'
+export type CompactProfile = 'agentic' | 'robotics' | 'campaign' | 'auto'
 
 export const DEFAULT_COMPACT_PROFILE: CompactProfile = 'agentic'
 
@@ -176,10 +176,29 @@ const SECTION_INSTRUCTIONS_CAMPAIGN = `
 ## 11. 阶段门状态（Phase Gate）
 记录当前所处阶段、各阶段门的达成/阻塞情况、以及通过下一道门所需的交付物与条件。`
 
+/**
+ * Auto — the agentic 9 sections plus an Autonomous Ledger (section 10): the
+ * sub-agents dispatched and the IRREVERSIBLE workspace changes already made.
+ * In an unattended run the model most easily "forgets what it already did" and
+ * then repeats work or self-conflicts; this section is the antidote.
+ */
+const SECTION_INSTRUCTIONS_AUTO = `${SECTION_INSTRUCTIONS_AGENTIC}
+
+## 10. 自主执行账本（Autonomous Ledger）
+本会话为无人值守的自主模式。务必保住以下两项——它们一旦丢失，后续极易重复劳动或自相冲突：
+
+**已派发子代理**：逐行列出本会话派发过的子代理及其产物/分支/状态：
+
+| task_id | 任务 | 产物 / 分支 | 状态(完成/失败/进行中) |
+|---------|------|------------|----------------------|
+
+**已对工作区做的不可逆变更**：列出已创建 / 覆盖 / 删除 / 替换的关键文件路径与动作（只记不可逆的写/删/替换，纯读取不算）。`
+
 const SECTION_INSTRUCTIONS_BY_PROFILE: Record<CompactProfile, string> = {
   agentic: SECTION_INSTRUCTIONS_AGENTIC,
   robotics: SECTION_INSTRUCTIONS_ROBOTICS,
   campaign: SECTION_INSTRUCTIONS_CAMPAIGN,
+  auto: SECTION_INSTRUCTIONS_AUTO,
 }
 
 const VOLATILE_CONTEXT_INSTRUCTION = `

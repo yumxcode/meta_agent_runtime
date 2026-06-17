@@ -37,7 +37,7 @@
 import Anthropic from '@anthropic-ai/sdk'
 import type { MetaAgentConfig, ResolvedConfig } from '../core/config.js'
 import { resolveConfig, isAnthropicProvider } from '../core/config.js'
-import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
+import type { AutonomyProfile, ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import { EMPTY_USAGE } from '../core/types.js'
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import { CampaignSession } from '../modes/CampaignSession.js'
@@ -47,7 +47,14 @@ import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
+import { updateAutoCheckpoint, readAutoCheckpoint, buildAutoResumePreamble } from '../core/auto/AutoCheckpointStore.js'
+import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
+import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
+import { createAutoExperienceStore, renderRecentExperiences, createAutoExperienceWriteTool } from '../core/auto/learn/AutoExperienceStore.js'
+import { getTodosForSession } from '../tools/ui/todo_write/index.js'
+import { AutoWorktreeCoordinator } from '../core/auto/AutoWorktreeCoordinator.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
+import { makeAutoWorktreeTools } from '../subagent/tools/auto_worktree.js'
 import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
 import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
 import { clearWebFetchCache, createWebFetchTool } from '../tools/network/web_fetch/index.js'
@@ -56,6 +63,7 @@ import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
 import type { RouterOptions, SessionMode, SessionModeHint } from './types.js'
 import { MODE_WEIGHT } from './types.js'
+import { MODE_PROFILES } from '../core/modes.js'
 
 // ── Formal TeamController interface (D2) ─────────────────────────────────────
 // Typed contract between SessionRouter and the CLI team commands.
@@ -129,6 +137,17 @@ export class SessionRouter {
    */
   private readonly _detectionClient: Anthropic | null
 
+  /**
+   * Shared plan-mode flag. ONE object drives both (a) the enter_plan_mode /
+   * exit_plan_mode tools the CLI registers and (b) the kernel permission gate
+   * inside whichever backend is built later. Exposed via `planModeRef` so the
+   * CLI can hand this exact object to createStandardTools({ system }), and
+   * injected into every backend via _cfgAsConfig() so the backend adopts it
+   * instead of minting its own — without this single source, the tools flipped
+   * a private ref the permission policy never read, and plan mode never gated.
+   */
+  private readonly _planModeRef: { active: boolean } = { active: false }
+
   /** Current active mode (null until first submit initialises the impl). */
   private _currentMode: SessionMode | null = null
   /** Underlying session backend (created lazily on first submit). */
@@ -138,9 +157,17 @@ export class SessionRouter {
   /** Ensures post-session memory extraction runs at most once. */
   private _memoryWriterDone = false
 
+  /** Auto mode: the first prompt, captured once as the durable goal anchor. */
+  private _autoGoal: string | null = null
+  /** Auto mode: sub-agent bridge ref, for checkpointing active sub-agent IDs. */
+  private _autoBridge: SubAgentBridge | null = null
+  /** Auto mode: turn counter for checkpoint observability. */
+  private _autoTurnCount = 0
+
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
     const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
-    this._hint = mode ?? 'auto'
+    // Default hint is 'detect' (run ModeDetector). 'auto' is now a real mode.
+    this._hint = mode ?? 'detect'
     this._debug = debugMode ?? false
     this._robot = robot
     this._explicitResume = explicitResume ?? false
@@ -257,7 +284,66 @@ export class SessionRouter {
       flashModel:  this._cfg.flashModel,
     })
     await this._ensureImpl(prompt)
-    yield* this._impl!.submit(prompt)
+
+    // Auto mode, first turn: remember the durable goal anchor, and — when this is
+    // an explicit --resume — re-inject the prior checkpoint (goal / done /
+    // pending / artifacts / in-flight sub-agents) into the model's context so the
+    // resumed run continues instead of restarting. The CLI banner is shown only
+    // to the human; this preamble is what the model actually sees.
+    let effectivePrompt = prompt
+    if (this._currentMode === 'auto' && this._autoGoal === null) {
+      if (this._explicitResume) {
+        const cp = readAutoCheckpoint(this._cfg.projectDir ?? process.cwd())
+        const preamble = buildAutoResumePreamble(cp)
+        if (preamble) {
+          effectivePrompt = `${preamble}\n\n[本次用户输入]\n${prompt}`
+          this._autoGoal = cp?.goal ?? prompt
+        }
+      }
+      // Fall back to the first prompt as the goal anchor when not resuming (or
+      // when the checkpoint had no usable goal).
+      if (this._autoGoal === null) this._autoGoal = prompt
+    }
+
+    let stopReason: string | undefined
+    try {
+      for await (const ev of this._impl!.submit(effectivePrompt)) {
+        if (ev.type === 'result') stopReason = (ev as { subtype?: string }).subtype
+        yield ev
+      }
+    } finally {
+      // Best-effort progress checkpoint after every auto turn — recoverable via
+      // --resume if the run later hits its budget/turn cap, the stall circuit,
+      // or a crash. Never throws (the store swallows I/O errors).
+      if (this._currentMode === 'auto') {
+        // Wholly best-effort: a checkpoint write (and the state-gathering calls
+        // that feed it) must never throw out of the finally and mask the real
+        // turn outcome / error propagating from the try block.
+        try {
+          const workspaceRoot = this._cfg.projectDir ?? process.cwd()
+          const sessionId = this._impl!.getSessionId()
+          this._autoTurnCount++
+          // Split the live to-do list into done / outstanding. Previously only
+          // the outstanding half was checkpointed, so the resume preamble's
+          // "已完成" section — and any drift check that reads the checkpoint —
+          // had no idea what was already finished. Both halves are recorded now
+          // so the checkpoint is a complete state record (drift relies on it).
+          const allTodos = getTodosForSession(sessionId)
+          const pendingTodos = allTodos.filter(t => t.status !== 'completed').map(t => t.content)
+          const completedSteps = allTodos.filter(t => t.status === 'completed').map(t => t.content)
+          const activeSubAgentIds = this._autoBridge?.getSchedulerStats().activeTaskIds ?? []
+          updateAutoCheckpoint(workspaceRoot, sessionId, {
+            goal: this._autoGoal ?? undefined,
+            completedSteps: completedSteps.length ? completedSteps : undefined,
+            pendingTodos: pendingTodos.length ? pendingTodos : undefined,
+            activeSubAgentIds: activeSubAgentIds.length ? activeSubAgentIds : undefined,
+            turnCount: this._autoTurnCount,
+            estimatedCostUsd: this.getEstimatedCost(),
+            stopReason,
+          })
+        } catch { /* best-effort checkpoint — never disrupt the turn result */ }
+      }
+    }
   }
 
   /**
@@ -372,6 +458,10 @@ export class SessionRouter {
         // Best-effort: memory extraction must never block shutdown.
       }
     }
+    // Auto mode: discard any worktrees the main agent never merged/discarded so
+    // they don't leak under .meta-agent/auto/worktrees. Best-effort.
+    try { await this._autoBridge?.getWorktreeCoordinator()?.cleanupAll() } catch { /* best-effort */ }
+    this._autoBridge = null
     if (impl?.dispose) {
       try { await impl.dispose() } catch { /* best-effort */ }
     }
@@ -467,6 +557,14 @@ export class SessionRouter {
     return null
   }
 
+  /** Drop the memoized R6 anchor section so newly committed anchors appear next turn. */
+  invalidateAnchors(): void {
+    const impl = this._impl as any
+    if (impl && typeof impl.invalidateAnchors === 'function') {
+      impl.invalidateAnchors()
+    }
+  }
+
   getRoboticsTeamController(): RoboticsTeamController | null {
     if (this._currentMode !== 'robotics') return null
     const impl = this._impl as RoboticsTeamController | undefined
@@ -520,6 +618,17 @@ export class SessionRouter {
    * before the first submit; we guard here anyway).
    */
   private _raiseMode(newMode: SessionMode): void {
+    // Explicit-mode lock: when the caller declared a concrete mode
+    // (hint !== 'detect'), that mode always wins and is never changed by
+    // weight-based raises. This is essential for 'auto', whose weight (1) equals
+    // 'agentic': without the lock, a pre-submit registerTool('agentic') would
+    // pin the session to agentic and the later raise to 'auto' (1 > 1 === false)
+    // would be ignored — dropping the jail. A campaign/robotics detection signal
+    // must likewise never upgrade an explicit auto session.
+    if (this._hint !== 'detect') {
+      this._currentMode = this._hint
+      return
+    }
     if (
       this._currentMode === null ||
       MODE_WEIGHT[newMode] > MODE_WEIGHT[this._currentMode]
@@ -549,33 +658,13 @@ export class SessionRouter {
    */
   private async _createImpl(mode: SessionMode): Promise<SessionImpl> {
     switch (mode) {
-      case 'agentic': {
-        const session = new MetaAgentSession({
-          ...this._cfgAsConfig(),
-          sessionId: this._resumeSessionId,
-        })
-        // ── Research sub-agent wiring (shared mechanism with robotics) ──────
-        // research_dispatch runs literature/web research in an ISOLATED
-        // sub-agent context, persists the report under <projectDir>/.meta-agent/
-        // research/, and hands the main agent only a conclusion + report path.
-        // The bridge's tool registry is the session's LIVE map, so tools
-        // registered later (CLI standard tools) are resolvable by sub-agents.
-        const projectDir = this._cfg.projectDir ?? process.cwd()
-        const bridge = new SubAgentBridge(session.getSessionId())
-        bridge.setToolRegistry(session.getToolRegistry())
-        // Sub-agents read full texts in their discarded-after-run context —
-        // override the main agent's budgeted web_fetch with the full variant.
-        bridge.setSubAgentToolOverrides([await createWebFetchTool()])
-        session.registerTool(createResearchDispatchTool({
-          dispatcher: bridge,
-          projectDir,
-          sessionId: session.getSessionId(),
-        }))
-        session.registerTool(makeGetSubAgentStatusTool(bridge))
-        // D11: completion/failure notifications flow into the volatile prefix.
-        session.setSubAgentBridge(bridge)
-        return session
-      }
+      case 'agentic':
+      case 'auto':
+        // Both run on the shared agentic backend (same loop + research wiring).
+        // AUTO differs only in its permission/sandbox posture (autonomous +
+        // config-locked workspace jail) and the AUTO prompt section — all carried
+        // by MODE_PROFILES[mode].agenticOverrides (undefined for plain agentic).
+        return this._createAgenticBackend(MODE_PROFILES[mode].agenticOverrides)
 
       case 'campaign': {
         return new CampaignSession({
@@ -604,6 +693,93 @@ export class SessionRouter {
   }
 
   /**
+   * Build the agentic backend: a MetaAgentSession plus the research sub-agent
+   * wiring. Shared by the AGENTIC and AUTO cases so the ~15-line wiring block is
+   * never duplicated — AUTO differs only via the `autonomy`/`agentMode` overrides.
+   *
+   *   research_dispatch runs literature/web research in an ISOLATED sub-agent
+   *   context, persists the report under <projectDir>/.meta-agent/research/, and
+   *   hands the main agent only a conclusion + report path. The bridge's tool
+   *   registry is the session's LIVE map, so tools registered later (CLI standard
+   *   tools) are resolvable by sub-agents.
+   */
+  private async _createAgenticBackend(
+    overrides?: { autonomy?: AutonomyProfile; promptMode?: import('../core/dynamicPrompt.js').AgentMode },
+  ): Promise<SessionImpl> {
+    const projectDir = this._cfg.projectDir ?? process.cwd()
+    // Auto mode: build the completion gate (Verify) BEFORE the session so it can
+    // be passed into the kernel config. Its dispatcher + goal are read LAZILY at
+    // gate-invocation time (deep in a later turn), so closing over this._autoBridge
+    // (assigned below) and this._autoGoal (set on first submit) is safe.
+    // A lazy dispatcher facade: the bridge is created AFTER the session, so both
+    // gates read this._autoBridge at invocation time (deep in a later turn).
+    const lazyDispatcher = {
+      spawnSubAgent: (o: Parameters<SubAgentBridge['spawnSubAgent']>[0]) => this._autoBridge!.spawnSubAgent(o),
+      getStatus: (id: Parameters<SubAgentBridge['getStatus']>[0]) => this._autoBridge!.getStatus(id),
+      cancelTask: (id: Parameters<SubAgentBridge['cancelTask']>[0], r?: string) => this._autoBridge!.cancelTask(id, r),
+    }
+    const verifyGate = overrides?.autonomy
+      ? makeAutoVerifyGate({ dispatcher: lazyDispatcher, projectDir, getGoal: () => this._autoGoal })
+      : undefined
+    // Auto mode Learn: one experience store powers both recall (main prompt) and
+    // the drift agent's writes. Drift gate judges goal+checkpoint and may persist
+    // lessons; recall surfaces them back into the main agent's prompt each turn.
+    const autoExperienceStore = overrides?.autonomy ? createAutoExperienceStore(projectDir) : null
+    const driftGate = overrides?.autonomy
+      ? makeAutoDriftGate({ dispatcher: lazyDispatcher, projectDir, getGoal: () => this._autoGoal })
+      : undefined
+    const getExperienceRecallBlock = autoExperienceStore
+      ? () => renderRecentExperiences(autoExperienceStore)
+      : undefined
+
+    const session = new MetaAgentSession({
+      ...this._cfgAsConfig(),
+      sessionId: this._resumeSessionId,
+      promptMode: overrides?.promptMode,
+      autonomy: overrides?.autonomy,
+      verifyGate,
+      driftGate,
+      getExperienceRecallBlock,
+    })
+    // Auto mode: conservative scheduler defaults (lower concurrency + a non-null
+    // total budget) as unattended safety/cost guards (env still overrides).
+    const bridge = new SubAgentBridge(session.getSessionId(),
+      overrides?.autonomy ? { conservativeAutoDefaults: true } : undefined)
+    bridge.setToolRegistry(session.getToolRegistry())
+    // Auto mode: extend the workspace jail to every spawned sub-agent (sandbox
+    // fail-closed + autonomy passthrough + projectDir bound to the jail root),
+    // arm failed-sub-agent retry, git-worktree isolation + serial merge tools.
+    if (overrides?.autonomy) {
+      this._autoBridge = bridge
+      bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides.autonomy })
+      const worktrees = new AutoWorktreeCoordinator(projectDir)
+      if (worktrees.enabled) {
+        bridge.setWorktreeCoordinator(worktrees)
+        for (const tool of makeAutoWorktreeTools(bridge)) session.registerTool(tool)
+      }
+    }
+    // Sub-agents read full texts in their discarded-after-run context —
+    // override the main agent's budgeted web_fetch with the full variant. In
+    // auto mode also expose experience_write to SUB-AGENTS ONLY (the drift agent
+    // uses it; the main agent must not write experiences directly).
+    bridge.setSubAgentToolOverrides([
+      await createWebFetchTool(),
+      ...(autoExperienceStore
+        ? [createAutoExperienceWriteTool(autoExperienceStore, session.getSessionId())]
+        : []),
+    ])
+    session.registerTool(createResearchDispatchTool({
+      dispatcher: bridge,
+      projectDir,
+      sessionId: session.getSessionId(),
+    }))
+    session.registerTool(makeGetSubAgentStatusTool(bridge))
+    // D11: completion/failure notifications flow into the volatile prefix.
+    session.setSubAgentBridge(bridge)
+    return session
+  }
+
+  /**
    * Convert the resolved internal config back into the shape accepted by
    * MetaAgentSession / CampaignSession constructors. We spread the full resolved
    * config and override `tools: []` — tools are injected separately via
@@ -613,6 +789,19 @@ export class SessionRouter {
    * added to ResolvedConfig automatically flow through without an edit here.
    */
   private _cfgAsConfig(): MetaAgentConfig {
-    return { ...this._cfg, tools: [] }
+    // planModeRef is injected explicitly (not relied upon from the spread) so
+    // the backend's permission policy and the CLI-registered plan-mode tools
+    // share THIS router's single ref object.
+    return { ...this._cfg, tools: [], planModeRef: this._planModeRef }
+  }
+
+  /**
+   * The shared plan-mode ref. The CLI wires this into the system tools it
+   * registers (`createStandardTools({ system: { planModeRef } })`) so
+   * enter_plan_mode / exit_plan_mode flip the same object the backend's kernel
+   * permission policy reads.
+   */
+  get planModeRef(): { active: boolean } {
+    return this._planModeRef
   }
 }

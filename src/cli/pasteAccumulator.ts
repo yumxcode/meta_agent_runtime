@@ -53,6 +53,40 @@ const PASTE_END = '\x1b[201~'
 /** Matches either bracketed-paste marker, for stripping from raw input. */
 const PASTE_MARKER_RE = /\x1b\[20[01]~/g
 
+/**
+ * Options for the fallback coalesce window. Only relevant to terminals that do
+ * NOT support bracketed paste (no 200~/201~ markers); see onLine() for why.
+ */
+export interface PasteAccumulatorOptions {
+  /**
+   * Milliseconds to wait, in MARKERLESS fallback mode only, before honouring a
+   * bare-Enter flush — long enough to absorb a paste-internal newline that the
+   * terminal happened to deliver as its own stdin chunk (which would otherwise
+   * split one paste into two messages). 0 (default) disables the window and
+   * keeps onLine() fully synchronous (legacy behaviour). The bracketed-paste
+   * and ordinary-typing paths are NEVER deferred regardless of this value.
+   */
+  coalesceMs?: number
+  /**
+   * Called when a deferred fallback flush actually fires (after coalesceMs with
+   * no further input). Required for the window to do anything — the CLI routes
+   * this to the same submit handler as a synchronous onLine() result.
+   */
+  onDeferredSubmit?: (message: string) => void
+  /** Injectable timer (tests). Defaults to setTimeout/clearTimeout. */
+  schedule?: (fn: () => void, ms: number) => unknown
+  cancel?: (handle: unknown) => void
+}
+
+export interface PasteDataInfo {
+  /** True when this raw stdin chunk is paste content, not ordinary typing. */
+  isPaste: boolean
+  /** Marker-free text content from the chunk, used only for paste display stats. */
+  text: string
+  /** Classification detail for UI decisions; submission semantics use isPaste. */
+  source: 'none' | 'bracketed' | 'markerless-multiline' | 'markerless-bare-newline'
+}
+
 export class PasteAccumulator {
   private lines: string[] = []
   private lastChunk = ''
@@ -60,6 +94,26 @@ export class PasteAccumulator {
   private pasteOpen = false
   /** True if the chunk behind the pending 'line' event(s) is pasted content. */
   private chunkIsPaste = false
+  /**
+   * True once ANY bracketed-paste marker has been seen this session. When true
+   * the terminal supports bracketed paste, so paste boundaries are precise and
+   * the fallback coalesce window is unnecessary (and never armed).
+   */
+  private markerSeen = false
+
+  private readonly coalesceMs: number
+  private readonly onDeferredSubmit?: (message: string) => void
+  private readonly schedule: (fn: () => void, ms: number) => unknown
+  private readonly cancel: (handle: unknown) => void
+  /** Pending deferred-flush timer handle, or null when none is armed. */
+  private pendingTimer: unknown = null
+
+  constructor(options: PasteAccumulatorOptions = {}) {
+    this.coalesceMs = options.coalesceMs ?? 0
+    this.onDeferredSubmit = options.onDeferredSubmit
+    this.schedule = options.schedule ?? ((fn, ms) => setTimeout(fn, ms))
+    this.cancel = options.cancel ?? ((h) => clearTimeout(h as ReturnType<typeof setTimeout>))
+  }
   /**
    * Trailing bytes held back from the previous chunk because they form the
    * *start* of a paste marker that may complete in the next chunk. A large
@@ -92,7 +146,11 @@ export class PasteAccumulator {
   }
 
   /** Record the raw stdin chunk preceding the next 'line' event(s). */
-  onData(chunk: string): void {
+  onData(chunk: string): PasteDataInfo {
+    // A fresh chunk means the previous bare-Enter (if we deferred it) was really
+    // a paste-internal newline split across reads — cancel the pending flush so
+    // the buffered lines keep accumulating instead of submitting early.
+    this.cancelPendingTimer()
     // Re-attach any partial-marker bytes carried over from the previous chunk so
     // a marker split across a stdin read boundary is still recognised, then hold
     // back a fresh partial-marker tail (if any) for the next chunk.
@@ -100,10 +158,15 @@ export class PasteAccumulator {
     const carryLen = PasteAccumulator.trailingPartialMarkerLen(buf)
     const scan = carryLen > 0 ? buf.slice(0, buf.length - carryLen) : buf
     this.carry = carryLen > 0 ? buf.slice(buf.length - carryLen) : ''
+    // Reassembled buffer reveals markers even when split across reads; once seen,
+    // the terminal supports bracketed paste so the coalesce window stays off.
+    const markerInBuf = buf.includes(PASTE_START) || buf.includes(PASTE_END)
+    if (markerInBuf) this.markerSeen = true
 
     // A chunk's lines are pasted if a paste was already open OR this chunk opens
     // one (markers and content can arrive together or split across chunks).
-    this.chunkIsPaste = this.pasteOpen || scan.includes(PASTE_START)
+    const wasPasteOpen = this.pasteOpen
+    this.chunkIsPaste = wasPasteOpen || scan.includes(PASTE_START)
     // Walk the markers in order to compute the open/closed state for the chunks
     // that follow this one.
     let i = 0
@@ -122,6 +185,26 @@ export class PasteAccumulator {
     // Keep a marker-free copy so the bare-Enter fallback test isn't fooled by
     // a lone marker sharing the chunk with the newline.
     this.lastChunk = scan.replace(PASTE_MARKER_RE, '')
+    const markerlessMultilinePaste =
+      !this.markerSeen &&
+      /[^\r\n]/.test(this.lastChunk) &&
+      /[\r\n]/.test(this.lastChunk)
+    const markerlessBareNewlineAfterBufferedPaste =
+      !this.markerSeen &&
+      this.lines.length > 0 &&
+      /^[\r\n]+$/.test(this.lastChunk)
+    const source = this.chunkIsPaste
+      ? 'bracketed'
+      : markerlessMultilinePaste
+        ? 'markerless-multiline'
+        : markerlessBareNewlineAfterBufferedPaste
+          ? 'markerless-bare-newline'
+          : 'none'
+    return {
+      isPaste: source !== 'none',
+      text: this.lastChunk,
+      source,
+    }
   }
 
   /**
@@ -133,6 +216,7 @@ export class PasteAccumulator {
     this.lastChunk = ''
     this.chunkIsPaste = false
     this.carry = ''
+    this.cancelPendingTimer()
   }
 
   /**
@@ -148,16 +232,53 @@ export class PasteAccumulator {
     }
     // Fallback: a chunk that is purely \r / \n is a user Enter.
     const isBareEnter = /^[\r\n]+$/.test(this.lastChunk)
+    // Count buffered lines BEFORE this one: a bare-Enter flush is only ambiguous
+    // (could be a paste-internal newline) when content was already accumulated
+    // from earlier chunks. A bare Enter with nothing buffered is an unambiguous
+    // single-line/empty submit and is never deferred.
+    const priorLines = this.lines.length
     // A bare Enter on an EMPTY line, when content is already buffered, is just
     // the submit keystroke terminating a newline-terminated paste — the empty
-    // line is the trigger, not content, so flush without appending it. (A bare
-    // Enter with nothing buffered is a genuine empty-message submit.)
-    if (isBareEnter && line === '' && this.lines.length > 0) {
-      return this.flush()
+    // line is the trigger, not content, so flush without appending it.
+    if (isBareEnter && line === '' && priorLines > 0) {
+      return this.maybeDeferFlush()
     }
     this.lines.push(line)
     if (!isBareEnter) return null
+    // Bare Enter that carried content: defer only when earlier content existed
+    // (the split-paste risk); a lone typed line (priorLines === 0) flushes now.
+    if (priorLines > 0) return this.maybeDeferFlush()
     return this.flush()
+  }
+
+  /**
+   * In markerless fallback mode with a coalesce window configured, hold the
+   * flush for coalesceMs so a paste-internal newline delivered as its own chunk
+   * doesn't split the paste; the next onData() cancels it. Otherwise (bracketed
+   * terminal, or window disabled) flush synchronously as before.
+   */
+  private maybeDeferFlush(): string | null {
+    if (this.coalesceMs > 0 && !this.markerSeen && this.onDeferredSubmit) {
+      this.armDeferredFlush()
+      return null
+    }
+    return this.flush()
+  }
+
+  private armDeferredFlush(): void {
+    this.cancelPendingTimer()
+    this.pendingTimer = this.schedule(() => {
+      this.pendingTimer = null
+      const combined = this.flush()
+      this.onDeferredSubmit?.(combined)
+    }, this.coalesceMs)
+  }
+
+  private cancelPendingTimer(): void {
+    if (this.pendingTimer !== null) {
+      this.cancel(this.pendingTimer)
+      this.pendingTimer = null
+    }
   }
 
   /**
@@ -177,6 +298,7 @@ export class PasteAccumulator {
     this.pasteOpen = false
     this.chunkIsPaste = false
     this.carry = ''
+    this.cancelPendingTimer()
   }
 
   /**
@@ -185,6 +307,7 @@ export class PasteAccumulator {
    * buffer at EOF (Ctrl+D) is not silently lost.
    */
   drain(): string | null {
+    this.cancelPendingTimer()
     if (this.lines.length === 0) return null
     return this.flush()
   }

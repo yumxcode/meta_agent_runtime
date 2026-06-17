@@ -3,7 +3,7 @@ import { homedir } from 'os'
 import { join, resolve } from 'path'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
-import type { ToolPermissionDeclaration } from '../../core/types.js'
+import type { AutonomyProfile, ToolPermissionDeclaration } from '../../core/types.js'
 import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
 import { isInsideWorkspace } from '../../tools/fs/workspaceGuard.js'
 
@@ -18,6 +18,15 @@ export interface PermissionPolicyOptions {
   planModeRef?: { active: boolean }
   askUser?: (question: string, choices?: string[]) => Promise<string>
   permissionConfig?: PermissionConfig
+  /**
+   * Autonomy profile (auto mode). When set, tightens the policy:
+   *   - lockWorkspace          → ignore permissions.json allowOutsideWorkspace
+   *   - autoApproveInWorkspace → sensitive in-workspace ops skip the confirm
+   *                              guard; out-of-workspace ops are still denied.
+   * The policy acts ONLY on these booleans — it never sees a SessionMode, so the
+   * mode→profile mapping stays in the routing layer.
+   */
+  autonomy?: AutonomyProfile
 }
 
 export interface PermissionConfig {
@@ -170,7 +179,10 @@ function findWorkspaceViolation(
 
   if (toolName === 'bash' || toolName === 'powershell') {
     const command = String(input['command'] ?? '')
-    const absPathPattern = /(?:^|\s|['"])(\/(?:[^\s'"`$;&|()<>]+\/?)+)/g
+    // The path may be glued to an option with `=` or `:` (e.g. `--output=/etc/x`,
+    // `dd of=/dev/sda`, `rsync src:/etc`). Treat those as boundaries too, otherwise
+    // such absolute paths slip past the scan entirely.
+    const absPathPattern = /(?:^|[\s'"=:])(\/(?:[^\s'"`$;&|()<>]+\/?)+)/g
     let match: RegExpExecArray | null
     while ((match = absPathPattern.exec(command)) !== null) {
       const candidate = match[1]!
@@ -207,6 +219,43 @@ function findWorkspaceViolation(
 function detectSensitiveBash(input: Record<string, unknown>): string | null {
   const command = String(input['command'] ?? '')
   return detectSensitiveShellCommand(command)
+}
+
+/**
+ * Autonomy-mode hardening: catch the RELATIVE workspace escapes that the
+ * absolute-path scan in findWorkspaceViolation cannot see — `~`, `$HOME`, and a
+ * leading `../` (or bare `..`) that climbs above the workspace root. Only used
+ * when autonomy.lockWorkspace is set, so non-auto modes are unaffected.
+ *
+ * Deliberately conservative: it flags the clear home/parent escapes the design
+ * calls out (`rm -rf ~`, `rm -rf $HOME`, `rm -rf ..`) without tripping on
+ * internal `a/../b` (which stays inside). When in doubt the caller denies, which
+ * for autonomous mode is the safe direction.
+ *
+ * It also catches the two filesystem-ROOT targets that the absolute-path scan in
+ * findWorkspaceViolation cannot see, because they have no named first component:
+ *   - a bare `/`   (e.g. `rm -rf /`, `cd /`)
+ *   - a root glob  (e.g. `rm -rf /*`, `chmod -R 777 /*`)
+ * Both clearly operate outside the workspace, so under the jail they are denied.
+ */
+function findBashRelativeEscape(input: Record<string, unknown>): string | null {
+  const command = String(input['command'] ?? '')
+  if (/(?:^|[\s'"=:(])~(?:\/|\s|$|['"])/.test(command)) {
+    return 'bash command references home (~) — outside workspace'
+  }
+  if (/\$\{?HOME\b/.test(command)) {
+    return 'bash command references $HOME — outside workspace'
+  }
+  if (/(?:^|[\s'"=:(])\.\.(?:\/|\s|$|['"])/.test(command)) {
+    return 'bash command references parent path (..) — may escape workspace'
+  }
+  // Filesystem root as a target: `/` or `/*` (optionally quoted). The leading
+  // boundary excludes in-workspace absolute paths like `/repo/src` (the char
+  // after `/` would be a letter, not `*`/space/end/quote).
+  if (/(?:^|[\s'"=:(])\/(?:\*|\s|$|['"])/.test(command)) {
+    return 'bash command targets filesystem root (/ or /*) — outside workspace'
+  }
+  return null
 }
 
 async function applyBeforeToolGuard(
@@ -249,7 +298,11 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
   const workspaceRoot = configuredRoot
     ? resolve(initialWorkspaceRoot ?? process.cwd(), configuredRoot)
     : initialWorkspaceRoot
-  const allowOutsideWorkspace = permissionConfig.workspace?.allowOutsideWorkspace === true
+  const autonomy = options.autonomy
+  // Auto-mode jail is absolute: lockWorkspace forces allowOutsideWorkspace off,
+  // overriding any permissions.json that tries to unlock the boundary.
+  const allowOutsideWorkspace =
+    !autonomy?.lockWorkspace && permissionConfig.workspace?.allowOutsideWorkspace === true
   const allowTmp = permissionConfig.workspace?.allowTmp !== false
 
   return async (
@@ -272,25 +325,50 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` }
     }
 
-    if (workspaceRoot && !allowOutsideWorkspace && permission.requiresWorkspace !== false) {
-      const violation = findWorkspaceViolation(tool, record, workspaceRoot, permission, allowTmp)
+    // jailActive: the workspace boundary is enforced for this tool, so any
+    // path/cwd/absolute-bash-path escape has already been denied below this
+    // point. Auto-approve (§autonomy) keys off this so it can only skip the
+    // confirm guard for operations we've proven stay inside the workspace.
+    const jailActive = !!workspaceRoot && !allowOutsideWorkspace && permission.requiresWorkspace !== false
+
+    if (jailActive) {
+      const violation = findWorkspaceViolation(tool, record, workspaceRoot!, permission, allowTmp)
       if (violation) return { behavior: 'deny', reason: violation }
+      // Auto-mode hardening: the absolute-path scan misses relative escapes
+      // (~, $HOME, leading ../) and bare filesystem-root targets (/, /*).
+      // Catch them before any auto-approve can fire.
+      if (autonomy?.lockWorkspace && (tool.name === 'bash' || tool.name === 'powershell')) {
+        const escape = findBashRelativeEscape(record)
+        if (escape) return { behavior: 'deny', reason: escape }
+      }
     }
 
     const sensitiveLabel = tool.name === 'bash' || tool.name === 'powershell'
       ? detectSensitiveBash(record)
       : null
     if (sensitiveLabel || (permission.sensitive === true && tool.name !== 'bash' && tool.name !== 'powershell')) {
-      const guard = await applyBeforeToolGuard(
-        tool.name,
-        record,
-        options,
-        context,
-        sensitiveLabel
-          ? `Tool "${tool.name}" requires approval for ${sensitiveLabel}.`
-          : `Tool "${tool.name}" requires approval.`,
-      )
-      if (guard.behavior !== 'allow') return guard
+      // Auto mode: a sensitive op that passed the jail's path checks is
+      // auto-approved without a prompt. jailActive means the absolute-path
+      // violation scan + relative/root-escape checks already ran, so the
+      // obvious escapes are denied before reaching here. This is best-effort
+      // defense-in-depth, NOT a proof of containment (a determined command can
+      // still obfuscate a path) — the real boundary is the fail-closed OS
+      // sandbox below. Out-of-workspace ops never reach here (denied above), and
+      // tools exempt from the jail (requiresWorkspace: false, e.g. config) are
+      // NOT auto-approved.
+      const autoApproveInWorkspace = autonomy?.autoApproveInWorkspace === true && jailActive
+      if (!autoApproveInWorkspace) {
+        const guard = await applyBeforeToolGuard(
+          tool.name,
+          record,
+          options,
+          context,
+          sensitiveLabel
+            ? `Tool "${tool.name}" requires approval for ${sensitiveLabel}.`
+            : `Tool "${tool.name}" requires approval.`,
+        )
+        if (guard.behavior !== 'allow') return guard
+      }
     }
 
     const isSafe = (() => {

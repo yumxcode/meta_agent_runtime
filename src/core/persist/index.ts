@@ -159,12 +159,19 @@ export async function withFileLock<T>(
   const timeoutMs = opts.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS
   await ensureParentDir(targetPath)
 
+  // M1: a unique owner token written into the lock file lets the release step
+  // verify the lock is still OURS before unlinking. Without it, a lock reclaimed
+  // as stale by another process (because our `fn` outran staleMs) would be
+  // deleted by our finally block — wiping the new holder's lock and letting two
+  // processes into the critical section.
+  const ownerToken = `${process.pid}.${randomUUID()}`
+
   const deadline = Date.now() + timeoutMs
   let acquired = false
   while (!acquired) {
     try {
       const handle = await open(lockPath, 'wx')
-      await handle.writeFile(`${process.pid} ${new Date().toISOString()}`)
+      await handle.writeFile(`${ownerToken} ${new Date().toISOString()}`)
       await handle.close()
       acquired = true
     } catch (err) {
@@ -203,7 +210,19 @@ export async function withFileLock<T>(
   try {
     return await fn()
   } finally {
-    await unlink(lockPath).catch(() => {})
+    // M1: only remove the lock if it is still the one WE created. If `fn` ran
+    // longer than staleMs another process may have reclaimed the lock and
+    // written its own token; unlinking unconditionally would delete that fresh
+    // lock. Read-then-unlink narrows the window to near-zero (a full atomic
+    // compare-and-delete isn't available on POSIX).
+    try {
+      const current = await readFile(lockPath, 'utf-8')
+      if (current.startsWith(ownerToken)) {
+        await unlink(lockPath).catch(() => {})
+      }
+    } catch {
+      // Lock already gone or unreadable — nothing to release.
+    }
   }
 }
 

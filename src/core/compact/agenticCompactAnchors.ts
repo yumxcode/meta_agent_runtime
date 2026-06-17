@@ -166,3 +166,22 @@ export function buildAgenticDeterministicAnchors(ctx: AgenticCompactContext): st
     sections.join('\n\n'),
   ].join('\n')
 }
+
+/**
+ * Auto-mode-only anchors appended (verbatim, model-independent) to every
+ * compaction so the autonomous posture cannot drift across nested summaries:
+ *   - the AUTO marker (you are unattended; don't ask for confirmation),
+ *   - the workspace jail root (every write/delete is confined here).
+ * Active/terminal sub-agent IDs are already covered by
+ * buildAgenticDeterministicAnchors above, so they are not duplicated here.
+ */
+export function buildAutoModeAnchors(workspaceRoot: string | undefined): string | null {
+  const lines = [
+    '## Auto-Mode Anchors (deterministic)',
+    '- 当前为 AUTO（无人值守自主）模式：对工作路径内的写/删/改（含不可逆操作）已获授权，无需逐次确认。',
+    '- 解决任务必须保证在工作区边界内；影响工作区之外或共享状态的操作（git push、对外发布等）不在授权内，会被系统拒绝。',
+    '- 持续推进直到目标达成或遇到真正阻塞；结束时交代已完成与未完成部分。',
+  ]
+  if (workspaceRoot) lines.push(`- 工作路径根（jail root）: ${workspaceRoot}`)
+  return lines.join('\n')
+}

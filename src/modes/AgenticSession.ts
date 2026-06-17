@@ -68,9 +68,19 @@ export class AgenticSession {
         planModeRef: config.planModeRef,
         askUser: config.askUser,
         permissionConfig: config.permissionConfig,
+        // Auto mode: autonomous (in-workspace ops skip the confirm guard) + hard
+        // jail (cannot be unlocked by permissions.json). Absent for other modes.
+        autonomy: config.autonomy,
       }),
       planModeRef: config.planModeRef,
       askUser: config.askUser,
+      // Auto mode: enable the unattended stall circuit (consecutive all-error turns).
+      autonomousMode: config.autonomy !== undefined,
+      // Auto mode: independent completion gate (Verify). Only consulted by the
+      // loop when autonomousMode is set; built by the router (owns goal+bridge).
+      verifyGate: config.verifyGate,
+      // Auto mode: mid-flight drift/reflection gate. Same gating + provenance.
+      driftGate: config.driftGate,
       maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
       maxOutputTokens: resolved.maxTokens,
@@ -90,6 +100,10 @@ export class AgenticSession {
         // forward 'robotics'/'agentic' through config.compact; bare agentic
         // sessions default to the generic 9-section template.
         promptProfile: config.compact?.promptProfile ?? 'agentic',
+        // Auto mode: enable the no-model structural-truncation fallback so an
+        // unattended run never grows into the blocking limit if the model
+        // compactor's circuit breaker opens.
+        autonomyFallback: config.autonomy !== undefined,
       },
       // Thinking on the primary model — sourced from resolved.thinkingConfig
       // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the

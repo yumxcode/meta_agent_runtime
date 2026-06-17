@@ -23,37 +23,23 @@
  *   campaign           — 保留全部内容（完整 V&V + 溯源 + 风险规则）。
  */
 
-/** 静态提示词所支持的模式类型（与 AgentMode 对应）。 */
-export type StaticPromptMode = 'agentic' | 'robotics' | 'campaign'
+/** 静态提示词所支持的模式类型 — 现为规范 SessionMode 的别名（core/modes.ts）。 */
+import { MODE_PROFILES } from './modes.js'
+import type { SessionMode } from './modes.js'
+export type StaticPromptMode = SessionMode
 
 // ─────────────────────────────────────────────────────────────────────────────
 // S1 — 身份定义（主 Agent）
 // ─────────────────────────────────────────────────────────────────────────────
 
 function getIdentitySection(mode: StaticPromptMode): string {
-  // Mode-specific identity line — describes the active mode precisely so the
-  // model knows what context it's in without reading a long preamble.
-  const modeDesc: Record<StaticPromptMode, string> = {
-    agentic:  '当前模式：**Agentic** — 专注于代码开发与软件工程任务。',
-    campaign: '当前模式：**Campaign** — 专注于工业工程项目开发，含 DOE 实验设计、多保真度仿真与 Pareto 优化。',
-    // 中性表述：多 Agent 编排仅在 multi 变体下激活（由 R1 节裁定），
-    // 此处用"可选"避免与 single 变体的 "Handle everything yourself" 矛盾。
-    robotics: '当前模式：**Robotics** — 专注于机器人算法开发与落地，含策略训练、仿真到实机迁移，并可选多 Agent 编排。',
-  }
-
-  const base = `\
-你是 Meta-Agent，一个自主工程 Agent，支持三种专项模式：\
-Agentic（代码开发）、Campaign（工业工程项目）、Robotics（机器人算法及落地）。\
-${modeDesc[mode]}`
-
-  // Campaign 模式：追加 V&V / 溯源 / 仿真保真度禁止绕过规则。
-  // Agentic / robotics 模式：这些管控对象（V&V 验证器、保真度升级）根本不存在，
-  // 保留该句只会引入不存在的概念，浪费约 40 token。
-  if (mode === 'campaign') {
-    return `${base}\n\n重要：严禁在未获用户明确批准的情况下绕过 V&V 验证器、修改溯源记录，\
-或提升仿真保真度（L0 → L1 → L2）。`
-  }
-  return base
+  // Identity line + optional suffix (campaign V&V hard rule) now come from the
+  // single MODE_PROFILES table. AUTO carries a goal-oriented identity there
+  // instead of a "当前模式：Agentic" line, so S1 never contradicts D4.
+  const profile = MODE_PROFILES[mode]
+  return profile.identitySuffix
+    ? `${profile.identityLine}\n\n${profile.identitySuffix}`
+    : profile.identityLine
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

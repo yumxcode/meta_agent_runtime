@@ -171,6 +171,15 @@ export interface ToolCallContext {
    * sandbox policy explicitly allows unsandboxed fallback.
    */
   sandboxHandle?: import('../sandbox/types.js').SandboxHandle
+
+  // ── Write mutex (auto mode) ────────────────────────────────────────────────
+  /**
+   * Process-global, path-keyed write lock injected by MetaAgentSession._wrapTool()
+   * only when the session is autonomous (auto mode). The fs write tools acquire
+   * it around their actual write so concurrent sub-agents cannot corrupt the same
+   * file. Undefined for non-auto sessions (tools then write without locking).
+   */
+  writeMutex?: import('./fs/WriteMutex.js').PathWriteMutex
 }
 
 export interface ToolResult {
@@ -223,6 +232,31 @@ export type ToolPermissionCategory =
   | 'network'
   | 'config'
   | 'state'
+
+/**
+ * Autonomy profile — the "auto mode" capability switches.
+ *
+ * Deliberately generic: the kernel PermissionPolicy and MetaAgentSession act on
+ * these booleans, NOT on a SessionMode string, so the routing layer is the only
+ * place that knows `mode === 'auto'`. This keeps the permission/sandbox layers
+ * decoupled from the mode enum (no `if (mode === 'auto')` below routing).
+ */
+export interface AutonomyProfile {
+  /**
+   * When true, sensitive operations whose paths are ALL inside the workspace are
+   * auto-approved without the interactive confirmation guard. Paths outside the
+   * workspace are still hard-denied (never prompted). This is the source of
+   * auto mode's "don't stop to ask" behaviour.
+   */
+  autoApproveInWorkspace?: boolean
+  /**
+   * When true, the workspace jail cannot be unlocked by configuration:
+   * `permissions.json`'s `allowOutsideWorkspace` is forced to false, and the OS
+   * sandbox is fail-closed (no silent unsandboxed fallback when bwrap /
+   * sandbox-exec is unavailable).
+   */
+  lockWorkspace?: boolean
+}
 
 export interface ToolPermissionDeclaration {
   /** Broad capability class used by the kernel permission policy. */

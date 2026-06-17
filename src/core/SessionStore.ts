@@ -398,6 +398,32 @@ export class SessionStore {
   }
 
   /**
+   * Delete a SPECIFIC set of sessions: filter them out of the index in one
+   * atomic read-modify-write (so concurrent single deletes can't race to a
+   * last-writer-wins loss) and remove their directories.
+   *
+   * This is what callers that have already scoped a list (e.g. "all sessions in
+   * the current workspace") must use — NOT deleteAllSessions(), which ignores
+   * the scope and wipes every workspace's history.
+   */
+  static async deleteSessions(sessionIds: string[]): Promise<void> {
+    if (sessionIds.length === 0) return
+    const ids = new Set(sessionIds)
+    try {
+      await withFileLock(INDEX_FILE, async () => {
+        const entries = await readIndex()
+        const filtered = entries.filter(e => !ids.has(e.sessionId))
+        await writeIndex(filtered)
+      })
+      await Promise.all(
+        [...ids].map(id => rm(sessionDir(id), { recursive: true, force: true })),
+      )
+    } catch {
+      // Best-effort
+    }
+  }
+
+  /**
    * Delete ALL sessions: clear index + remove every session directory.
    */
   static async deleteAllSessions(): Promise<void> {

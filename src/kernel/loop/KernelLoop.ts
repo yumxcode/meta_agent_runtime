@@ -7,6 +7,12 @@
 import type { KernelConfig } from '../types/KernelConfig.js'
 import type { KernelEvent, PermissionDenial } from '../types/KernelEvent.js'
 import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
+import {
+  AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
+  SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs,
+} from './AutoStallGuard.js'
+import { MAX_VERIFY_ROUNDS, buildVerifyRejectionPrompt } from './VerifyGate.js'
+import { DRIFT_TURN_INTERVAL, buildDriftCorrectionPrompt } from './DriftGate.js'
 import type { KernelToolContext } from '../types/KernelTool.js'
 import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
@@ -61,6 +67,7 @@ export type LoopTerminationReason =
   | 'aborted_streaming'
   | 'aborted_tools'
   | 'max_budget_usd'
+  | 'verify_exhausted'
   | 'error'
 
 export interface LoopResult {
@@ -527,6 +534,12 @@ export async function* runKernelLoop(
   let resultText = ''
   let lastToolRequestSignature = ''
   let repeatedToolRequestCount = 0
+  // Auto-mode stall circuit.
+  let consecutiveAllErrorTurns = 0   // every tool result errored, N turns running
+  let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
+  let autoSelfEvalInjected = false   // one-shot self-eval nudge per stall episode
+  let verifyRounds = 0               // auto-mode completion-gate rounds consumed
+  let turnsSinceDrift = 0            // turns since the last drift check fired
   const toolSignatureHistory: string[] = []
 
   // Helper: push messages and re-point state.messages at the live array.
@@ -542,7 +555,12 @@ export async function* runKernelLoop(
   // reference is therefore safe and removes the copy entirely.
   function append(...msgs: KernelMessage[]): void {
     mutableMessages.push(...msgs)
-    state = { ...state, messages: mutableMessages }
+    // L3: state.messages already aliases mutableMessages in the common case
+    // (only the compact path re-points it, then back again). Skip the per-append
+    // object spread unless the reference actually diverged.
+    if (state.messages !== mutableMessages) {
+      state = { ...state, messages: mutableMessages }
+    }
   }
 
   function done(reason: LoopTerminationReason): LoopResult {
@@ -642,12 +660,16 @@ export async function* runKernelLoop(
             originalUserGoal: ctx.originalUserGoal,
             messagesToKeep: messagesToKeepAfterCompact,
             promptProfile: config.compact?.promptProfile,
+            autonomyFallback: config.compact?.autonomyFallback,
             abortSignal: signal,
             maxRetries: config.maxRetries,
           },
         )
 
     state = { ...state, autoCompactTracking: compactResult.tracking }
+    // Auto drift trigger (primary): a compaction boundary this turn is a natural
+    // "a lot has accumulated — take stock" point.
+    const compactedThisTurn = compactResult.wasCompacted === true
     if (compactResult.failure) {
       yield {
         type: 'compact_failed',
@@ -1051,6 +1073,45 @@ export async function* runKernelLoop(
         return done('success')
       }
 
+      // ── Step 14d: auto-mode completion gate (Verify) ───────────────────────
+      // The model thinks it's done (no tool calls). In an unattended run we do
+      // NOT trust that judgment blindly — an INDEPENDENT judge (isolated
+      // context) checks whether the original goal is actually met. A negative
+      // verdict re-injects the concrete unfinished items and the loop continues;
+      // bounded by MAX_VERIFY_ROUNDS so verify→fix can't spin forever. The gate
+      // is fail-open (any internal error → done) so a broken verifier never
+      // wedges a finished run.
+      if (config.autonomousMode && config.verifyGate && verifyRounds < MAX_VERIFY_ROUNDS) {
+        verifyRounds++
+        let verdict
+        try {
+          verdict = await config.verifyGate({
+            workspaceRoot: ctx.cwd,
+            turnCount: state.turnCount,
+            round: verifyRounds,
+            signal,
+          })
+        } catch {
+          verdict = undefined   // fail-open: fall through to normal completion
+        }
+        if (signal.aborted) return done('aborted_tools')
+        if (verdict && !verdict.done) {
+          append(makeTextUserMessage(buildVerifyRejectionPrompt(verdict, verifyRounds), { isMeta: true }))
+          yield {
+            type: 'text_delta',
+            delta: `\n[verify] 第 ${verifyRounds}/${MAX_VERIFY_ROUNDS} 轮：未通过，剩余 ${verdict.unfinished.length} 项，继续推进…\n`,
+            sessionId,
+          }
+          continue
+        }
+      } else if (
+        config.autonomousMode && config.verifyGate && verifyRounds >= MAX_VERIFY_ROUNDS
+      ) {
+        // Exhausted the verify budget while still not passing — stop honestly
+        // rather than loop, leaving the last rejection visible in the summary.
+        return done('verify_exhausted')
+      }
+
       // 14e: normal completion
       return done('success')
     }
@@ -1133,6 +1194,74 @@ export async function* runKernelLoop(
       config.onPermissionDenial?.(denial)
     }
     append(...toolsResult.toolResultMessages, ...toolsResult.extraMessages)
+
+    // ── Auto-mode stall circuit ──────────────────────────────────────────────
+    // Unattended runs need protection the existing identical-signature /
+    // alternation guards don't give:
+    //   • all-error stall  — every tool result errors for several turns (even
+    //                        with DIFFERENT inputs). HARD-stops at the limit.
+    //   • no-FS-progress   — ran tools but changed no file for many turns.
+    //                        Only NUDGES (never hard-stops a legit read/plan phase).
+    // Before the hard stop, a one-shot self-eval message is injected so the model
+    // gets a chance to reconsider ("先注入自评估 turn，再不行则终止").
+    if (config.autonomousMode) {
+      const hadToolCalls = toolUseRequests.length > 0
+      const allErrored = allToolResultsErrored(toolsResult.toolResultMessages)
+      const mutatedFs  = turnMutatedFs(toolsResult.toolResultMessages, toolNameByUseId)
+
+      consecutiveAllErrorTurns = allErrored ? consecutiveAllErrorTurns + 1 : 0
+      if (mutatedFs) turnsSinceFsProgress = 0
+      else if (hadToolCalls) turnsSinceFsProgress++
+
+      // Real progress on either axis clears the one-shot nudge for the next episode.
+      if (consecutiveAllErrorTurns === 0 && turnsSinceFsProgress === 0) autoSelfEvalInjected = false
+
+      // Soft: first crossing of either threshold → inject one self-eval, continue.
+      const softTrip =
+        consecutiveAllErrorTurns === AUTO_STALL_SOFT_LIMIT ||
+        turnsSinceFsProgress === AUTO_NO_FS_PROGRESS_LIMIT
+      if (softTrip && !autoSelfEvalInjected) {
+        autoSelfEvalInjected = true
+        append(makeTextUserMessage(SELF_EVAL_PROMPT, { isMeta: true }))
+        yield { type: 'text_delta', delta: '\n[auto] 连续无进展，注入一次自评估…\n', sessionId }
+      }
+
+      // Hard: persistent all-error → stop instead of burning the whole budget.
+      if (consecutiveAllErrorTurns >= AUTO_STALL_FAILURE_LIMIT) {
+        resultText =
+          `Stopped (auto mode): every tool call failed for ${consecutiveAllErrorTurns} turns in a row — the agent appears stuck.`
+        yield { type: 'text_delta', delta: resultText, sessionId }
+        return done('no_progress')
+      }
+    }
+
+    // ── Auto-mode drift / reflection gate (Checkpoint + Learn) ────────────────
+    // Mid-flight, at coarse structural boundaries (a compaction this turn, or
+    // every DRIFT_TURN_INTERVAL turns), an independent agent checks whether the
+    // run is still heading at the goal and may persist a durable lesson. On a
+    // drift verdict, a one-shot corrective is injected for the next turn. The
+    // gate is fail-open (errors → no correction) so it can never derail a run.
+    if (config.autonomousMode && config.driftGate) {
+      turnsSinceDrift++
+      if (compactedThisTurn || turnsSinceDrift >= DRIFT_TURN_INTERVAL) {
+        turnsSinceDrift = 0
+        let drift
+        try {
+          drift = await config.driftGate({
+            workspaceRoot: ctx.cwd,
+            turnCount: state.turnCount,
+            reason: compactedThisTurn ? 'compaction_boundary' : 'turn_interval',
+            signal,
+          })
+        } catch {
+          drift = undefined   // fail-open
+        }
+        if (!signal.aborted && drift?.drifted) {
+          append(makeTextUserMessage(buildDriftCorrectionPrompt(drift), { isMeta: true }))
+          yield { type: 'text_delta', delta: '\n[drift] 检测到航向偏离，注入一次校正…\n', sessionId }
+        }
+      }
+    }
 
     // ── Step 16: abort after tools ───────────────────────────────────────────
     if (signal.aborted) {

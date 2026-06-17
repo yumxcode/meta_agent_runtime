@@ -36,3 +36,30 @@ export function isInsideWorkspace(path: string, workspaceRoot = process.cwd()): 
 export function assertInsideWorkspace(path: string, workspaceRoot = process.cwd()): string | null {
   return isInsideWorkspace(path, workspaceRoot) ? null : `Error: path is outside workspace: ${path}`
 }
+
+/**
+ * Validate AND canonicalise in one step — the single entry point FS/shell tools
+ * should use so the path they check is byte-for-byte the path they execute on.
+ *
+ * The historical split (validate `filePath` against `workspaceRoot`, then run
+ * `writeFile(filePath)`) diverges whenever `process.cwd() !== workspaceRoot`,
+ * because Node resolves a relative `filePath` against cwd while the guard
+ * resolved it against the workspace root. Returning the resolved absolute path
+ * here closes that gap: callers execute on `result.path`, never on the raw
+ * input.
+ *
+ * Returns `{ path }` (the workspace-relative-resolved real absolute path) when
+ * inside the workspace, or `{ error }` with a ready-to-surface message.
+ */
+export function resolveInsideWorkspace(
+  path: string,
+  workspaceRoot = process.cwd(),
+): { ok: true; path: string } | { ok: false; error: string } {
+  const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
+  const target = resolvePathForGuard(path, workspace)
+  const inside =
+    target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
+  return inside
+    ? { ok: true, path: target }
+    : { ok: false, error: `Error: path is outside workspace: ${path}` }
+}

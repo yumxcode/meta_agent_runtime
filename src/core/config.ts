@@ -13,12 +13,12 @@
  * Explicit config.apiKey / config.baseURL always take precedence over env vars.
  */
 
-import type { EngineeringDomain, MetaAgentTool } from './types.js'
+import type { AutonomyProfile, EngineeringDomain, MetaAgentTool } from './types.js'
 import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js'
 import type { ThinkingConfig } from '../kernel/index.js'
 import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
-import type { OutputStyle } from './dynamicPrompt.js'
+import type { AgentMode, OutputStyle } from './dynamicPrompt.js'
 import { loadModelConfigFile } from './modelConfigFile.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
 import type { Capabilities, Protocol } from '../providers/registry.js'
@@ -297,6 +297,50 @@ export interface MetaAgentConfig {
   /** Runtime permission overrides merged after global/project permissions.json. */
   permissionConfig?: PermissionConfig
 
+  /**
+   * Default agent execution mode used for dynamic prompt sections when submit()
+   * is called without an explicit mode (the SessionRouter path). Defaults to
+   * 'agentic'. The router sets 'auto' so the auto backend renders the AUTO D4
+   * section even though it reuses MetaAgentSession.
+   *
+   * NOTE: named `promptMode` (not `agentMode`) to avoid colliding with
+   * RoboticsSessionOptions.agentMode, which is a different concept
+   * (single/multi orchestration).
+   */
+  promptMode?: AgentMode
+
+  /**
+   * Autonomy profile (auto mode). Threaded into the kernel permission policy
+   * and the sandbox handle factory:
+   *   - autoApproveInWorkspace → in-workspace sensitive ops skip the confirm guard
+   *   - lockWorkspace          → jail cannot be unlocked by config; OS sandbox is
+   *                              fail-closed (no silent unsandboxed fallback)
+   * Absent = legacy behaviour (interactive guard, fail-open sandbox fallback).
+   */
+  autonomy?: AutonomyProfile
+
+  /**
+   * Auto mode completion gate. Forwarded verbatim to the kernel (see
+   * KernelConfig.verifyGate): at the moment the model declares itself done, an
+   * independent judge verifies the original goal is actually met. Built by the
+   * session/router layer (it owns the goal anchor + sub-agent dispatcher).
+   * Absent = the model's own "done" is trusted.
+   */
+  verifyGate?: import('../kernel/loop/VerifyGate.js').VerifyGateFn
+
+  /**
+   * Auto mode mid-flight drift/reflection gate (Checkpoint + Learn). Forwarded
+   * to the kernel (see KernelConfig.driftGate). Built by the router layer.
+   */
+  driftGate?: import('../kernel/loop/DriftGate.js').DriftGateFn
+
+  /**
+   * Auto mode experience recall. When set, MetaAgentSession appends the returned
+   * block (relevant prior lessons) to the stable system prompt each turn so the
+   * main agent benefits from accumulated experience. Returns null when empty.
+   */
+  getExperienceRecallBlock?: () => Promise<string | null>
+
   // ── Session resume ────────────────────────────────────────────────────────
   /**
    * Pre-load conversation history to resume a previous session.
@@ -336,6 +380,11 @@ export type ResolvedConfig = Required<
     | 'planModeRef'
     | 'askUser'
     | 'permissionConfig'
+    | 'promptMode'
+    | 'autonomy'
+    | 'verifyGate'
+    | 'driftGate'
+    | 'getExperienceRecallBlock'
     | 'initialMessages'
     | 'debugMode'
     | 'fallbackModel'
@@ -355,6 +404,16 @@ export type ResolvedConfig = Required<
   planModeRef?: MetaAgentConfig['planModeRef']
   askUser?: MetaAgentConfig['askUser']
   permissionConfig?: PermissionConfig
+  /** Default agent mode for prompt sections (absent → 'agentic'). */
+  promptMode?: AgentMode
+  /** Autonomy profile (auto mode); absent → legacy non-autonomous behaviour. */
+  autonomy?: AutonomyProfile
+  /** Auto mode completion gate (Verify); absent → trust the model's "done". */
+  verifyGate?: MetaAgentConfig['verifyGate']
+  /** Auto mode mid-flight drift gate; absent → no drift checking. */
+  driftGate?: MetaAgentConfig['driftGate']
+  /** Auto mode experience recall provider; absent → no recall injection. */
+  getExperienceRecallBlock?: MetaAgentConfig['getExperienceRecallBlock']
   initialMessages?: MetaAgentConfig['initialMessages']
   debugMode?: boolean
   fallbackModel?: string
@@ -451,6 +510,11 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     planModeRef:     config.planModeRef,
     askUser:         config.askUser,
     permissionConfig: config.permissionConfig,
+    promptMode:      config.promptMode,
+    autonomy:        config.autonomy,
+    verifyGate:      config.verifyGate,
+    driftGate:       config.driftGate,
+    getExperienceRecallBlock: config.getExperienceRecallBlock,
     initialMessages: config.initialMessages,
     debugMode:       config.debugMode,
     // projectDir: default to cwd so AGENT.md discovery works out-of-the-box

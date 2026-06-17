@@ -437,8 +437,16 @@ export class CampaignStateStore {
 
   /** Record the DOE-sampled points and transition IDLE → SAMPLING. */
   async setSampledPoints(points: DesignPoint[]): Promise<void> {
-    this._state.sampledPoints = points
-    await this._writeState()
+    // H2: serialise through the same lock + reload protocol as the other
+    // mutations. Writing without reload could clobber a concurrent Worker's
+    // task completion (lost update); omitting updatedAt also skewed the zombie
+    // detector's age calculation.
+    return this._withLock(async () => {
+      await this.reload()
+      this._state.sampledPoints = points
+      this._state.updatedAt = new Date().toISOString()
+      await this._writeState()
+    })
   }
 
   // ── Mutation: task registry ─────────────────────────────────────────────────
@@ -448,11 +456,17 @@ export class CampaignStateStore {
    * Called by the Coordinator just before spawning Workers.
    */
   async registerPendingTasks(taskIds: string[]): Promise<void> {
-    this._state.pendingTaskIds = [
-      ...new Set([...this._state.pendingTaskIds, ...taskIds]),
-    ]
-    this._state.updatedAt = new Date().toISOString()
-    await this._writeState()
+    // H2: serialise through the lock + reload so a Worker's concurrent
+    // completeTask()/failTask() (which run under the same lock) cannot be
+    // overwritten by a stale in-memory snapshot here (lost update).
+    return this._withLock(async () => {
+      await this.reload()
+      this._state.pendingTaskIds = [
+        ...new Set([...this._state.pendingTaskIds, ...taskIds]),
+      ]
+      this._state.updatedAt = new Date().toISOString()
+      await this._writeState()
+    })
   }
 
   /**
@@ -593,8 +607,10 @@ export class CampaignStateStore {
       CampaignStateStore._touchEvalCache(this.campaignId, cached)
     }
 
-    // Apply caller filters at query time
-    if (!filter) return allResults
+    // Apply caller filters at query time.
+    // M2: return a shallow copy so callers can't mutate (push/sort/splice) the
+    // array held inside the process-level static eval cache.
+    if (!filter) return [...allResults]
     return allResults.filter(r => {
       if (filter.feasibleOnly && !r.feasible) return false
       if (filter.fidelity !== undefined && r.fidelity !== filter.fidelity) return false

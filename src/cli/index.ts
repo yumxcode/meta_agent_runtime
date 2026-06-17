@@ -27,6 +27,7 @@ import { parseArgs } from 'node:util'
 import * as readline from 'node:readline'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
+import { Writable } from 'node:stream'
 import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
@@ -76,14 +77,25 @@ import type { RouterOptions } from '../routing/types.js'
 import type { MetaAgentEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
+import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js'
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
+import { CLI_VERSION } from './version.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
-const VERSION = '0.2.10'
+const VERSION = CLI_VERSION
 const DEFAULT_CLI_MAX_TURNS = 100
+const PASTE_FALLBACK_COALESCE_MS = 80
+const PASTE_NOTICE_DEBOUNCE_MS = 250
+const PASTE_NOTICE_MIN_CHARS = 80
+const PASTE_NOTICE_MIN_LINES = 3
+const SHIFT_ENTER_SEQUENCES = [
+  '\x1b[13;2u',
+  '\x1b[13;2~',
+  '\x1b[27;2;13~',
+]
 
 // ── ANSI colour helpers ───────────────────────────────────────────────────────
 
@@ -110,6 +122,63 @@ const red   = (s: string) => `${c.red}${s}${c.reset}`
 const yellow = (s: string) => `${c.yellow}${s}${c.reset}`
 const terminalText = (input: unknown) => sanitizeTerminalText(input)
 
+class ReadlineOutput extends Writable {
+  private muted = false
+  private muteDepth = 0
+  private passthroughDepth = 0
+  private unmuteScheduled = false
+  readonly isTTY: boolean | undefined
+
+  constructor(private readonly target: NodeJS.WriteStream) {
+    super()
+    this.isTTY = target.isTTY
+  }
+
+  get columns(): number | undefined { return this.target.columns }
+  get rows(): number | undefined { return this.target.rows }
+
+  beginMute(): void {
+    this.muteDepth++
+  }
+
+  endMute(): void {
+    this.muteDepth = Math.max(0, this.muteDepth - 1)
+  }
+
+  withPassthrough(fn: () => void): void {
+    this.passthroughDepth++
+    try {
+      fn()
+    } finally {
+      this.passthroughDepth = Math.max(0, this.passthroughDepth - 1)
+    }
+  }
+
+  muteForCurrentInput(): void {
+    this.muted = true
+    if (this.unmuteScheduled) return
+    this.unmuteScheduled = true
+    setImmediate(() => {
+      this.muted = false
+      this.unmuteScheduled = false
+    })
+  }
+
+  _write(
+    chunk: string | Buffer,
+    encoding: BufferEncoding,
+    callback: (error?: Error | null) => void,
+  ): void {
+    if (this.passthroughDepth === 0 && (this.muted || this.muteDepth > 0)) {
+      callback()
+      return
+    }
+    const done = (err?: Error | null) => callback(err ?? undefined)
+    if (this.target.write(chunk, encoding)) done()
+    else this.target.once('drain', done)
+  }
+}
+
 // ── Help text ─────────────────────────────────────────────────────────────────
 
 function printHelp(): void {
@@ -120,13 +189,16 @@ ${bold('USAGE')}
   meta-agent [options] [prompt]
 
 ${bold('MODES')}
-  ${cyan('auto')}       Detect mode from prompt context (default)
+  ${cyan('detect')}     Detect mode from prompt context (default)
   ${cyan('agentic')}    Full tool-use loop (default for all Q&A and engineering tasks)
+  ${cyan('auto')}       Autonomous: in-workspace writes/deletes auto-approved (no prompts),
+             all file changes hard-confined to the working directory
   ${cyan('campaign')}   DOE / multi-objective optimisation campaign
   ${cyan('robotics')}   Robotics session — ExperienceStore + workflow + hardware profiles
 
 ${bold('OPTIONS')}
-  -m, --mode <mode>       Session mode: auto|agentic|campaign|robotics
+  -m, --mode <mode>       Session mode: detect|agentic|auto|campaign|robotics
+      --yolo              Alias for --mode auto (autonomous + workspace jail)
   -w, --workspace <dir>   Working directory — agent ONLY operates within this folder
   -k, --api-key <key>     API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env var)
   -b, --base-url <url>    API base URL (default: auto-detected from key)
@@ -271,7 +343,8 @@ function parseCliArgs(): CliOptions {
     parsed = parseArgs({
       args: process.argv.slice(2),
       options: {
-        mode:         { type: 'string',  short: 'm', default: 'auto' },
+        mode:         { type: 'string',  short: 'm', default: 'detect' },
+        yolo:         { type: 'boolean', default: false },
         workspace:    { type: 'string',  short: 'w' },
         'api-key':    { type: 'string',  short: 'k' },
         'base-url':   { type: 'string',  short: 'b' },
@@ -298,8 +371,11 @@ function parseCliArgs(): CliOptions {
   if (parsed.values['help']) { printHelp(); process.exit(0) }
   if (parsed.values['version']) { console.log(`meta-agent v${VERSION}`); process.exit(0) }
 
-  const rawMode = (parsed.values['mode'] as string).toLowerCase()
-  const validModes = ['auto', 'agentic', 'campaign', 'robotics']
+  // --yolo is an alias for --mode auto (autonomous + hard workspace jail).
+  const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
+  // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
+  // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
+  const validModes = ['detect', 'auto', 'agentic', 'campaign', 'robotics']
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
@@ -330,7 +406,7 @@ function parseCliArgs(): CliOptions {
   }
 
   return {
-    mode:       rawMode === 'auto' ? 'auto' : rawMode as SessionModeHint,
+    mode:       rawMode as SessionModeHint,
     workspace,
     hardwareId: undefined,   // set later via interactive selection
     apiKey:     parsed.values['api-key']  as string | undefined,
@@ -892,7 +968,9 @@ function makeRouter(
   if (opts.baseUrl)    cfg.baseURL      = opts.baseUrl
   if (opts.model)      cfg.model        = opts.model
   if (opts.fallbackModel) cfg.fallbackModel = opts.fallbackModel
-  if (opts.mode !== 'auto') cfg.mode    = opts.mode
+  // 'detect' is the router's own default (run ModeDetector); only forward an
+  // explicit mode. 'auto' IS an explicit mode and must be forwarded.
+  if (opts.mode !== 'detect') cfg.mode  = opts.mode
 
   // Apply maxTurns: explicit flag wins; otherwise cap each user turn so a
   // single prompt cannot run for hours without a checkpoint.
@@ -1516,10 +1594,11 @@ async function streamPrompt(
           }
           const usage = event.usage
           const cost  = router.getEstimatedCost()
-          const mode  = router.mode ?? 'auto'
+          const mode  = router.mode ?? 'detect'
           const modeTag = mode === 'campaign' ? cyan(mode)
                         : mode === 'agentic'  ? green(mode)
                         : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
+                        : mode === 'auto'     ? yellow(mode)
                         : gray(mode)
           const thinkTag = meter.charCount > 0
             ? `  ${gray(`think:~${meter.tokenEstimate}`)}`
@@ -2913,6 +2992,22 @@ async function runRepl(opts: CliOptions): Promise<void> {
       }
       console.log(green(`✓ 工作目录: ${opts.workspace}\n`))
 
+      // ── Auto-mode resume banner ───────────────────────────────────────────
+      // Surface the prior auto checkpoint (goal / pending todos / active
+      // sub-agents) so a resumed unattended run shows where it left off.
+      if (opts.mode === 'auto' && opts.resume) {
+        const cp = readAutoCheckpoint(opts.workspace)
+        if (cp) {
+          const lines = [yellow('↻ 恢复 auto 会话 — 上次进度:')]
+          if (cp.goal) lines.push(`  目标: ${cp.goal.slice(0, 200)}`)
+          if (cp.stopReason) lines.push(`  上次停因: ${cp.stopReason}`)
+          if (cp.pendingTodos?.length) lines.push(`  待办(${cp.pendingTodos.length}): ${cp.pendingTodos.slice(0, 5).join('；')}`)
+          if (cp.activeSubAgentIds?.length) lines.push(`  活跃子代理: ${cp.activeSubAgentIds.join(', ')}`)
+          if (typeof cp.turnCount === 'number') lines.push(`  已进行轮次: ${cp.turnCount}`)
+          console.log(lines.join('\n') + '\n')
+        }
+      }
+
       // ── Hardware profile selection (robotics mode only) ───────────────────
       if (opts.mode === 'robotics') {
         const hp = new HardwareProfile()
@@ -2953,9 +3048,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // The guard hook uses this interface; creating it later would mean the first
   // router is built without a guard (before the first `/clear`).
   const PROMPT_YOU = `\n${bold(cyan('you'))} › `
+  const rlOutput = new ReadlineOutput(process.stdout)
   const rl = createInterface({
     input:  process.stdin,
-    output: process.stdout,
+    output: rlOutput,
     prompt: PROMPT_YOU,
     terminal: isTTY,
     historySize: 100,
@@ -3023,7 +3119,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // Robotics mode registers its own tools internally (RoboticsSession.init).
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
-      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
+      // planModeRef MUST be the router's shared ref so enter_plan_mode /
+      // exit_plan_mode flip the same object the backend's kernel permission
+      // policy reads — otherwise plan mode never gates writes.
+      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic'), planModeRef: router.planModeRef },
       // Main-session web_fetch is result-budgeted: full-text reading belongs in
       // isolated research sub-agents (research_dispatch), not the long-lived
       // main context. Sub-agents get an unbudgeted override via the bridge.
@@ -3227,7 +3326,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // and readline cannot tell those apart from the \n produced by pressing
   // Enter — so it fires a 'line' event for every embedded newline.  We
   // distinguish the two by inspecting the raw stdin chunk that triggered each
-  // 'line' event:
+  // 'line' event, with a short fallback coalesce window for terminals that
+  // split a markerless paste so a paste-internal newline arrives alone:
   //
   //   • Bare Enter  — the chunk is ONLY \r / \n.  Can only come from the user
   //                   pressing Enter → submit everything accumulated so far.
@@ -3238,15 +3338,291 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // in \n.  That timer raced the user: pausing >300 ms after a paste and then
   // typing more caused the paste to submit on its own and the typed tail to
   // submit as a second message (the "auto-replied before I pressed Enter /
-  // replied twice" bug).  Waiting for an explicit bare Enter removes the race
-  // entirely; normal typing is unaffected because its Enter is always its own
-  // bare-newline chunk.
+  // replied twice" bug). Waiting for an explicit bare Enter, then holding only
+  // ambiguous markerless flushes for a few milliseconds, removes the race while
+  // normal typing is unaffected because its first Enter is always an
+  // unambiguous bare-newline chunk with no buffered pasted content.
   //
   // We prepend the stdin 'data' listener so onData() records the chunk BEFORE
   // readline emits the resulting 'line' event(s) in the same call stack.
   // The SIGINT drain window (ignoreInputUntil) is honored in both handlers.
 
-  const _paste = new PasteAccumulator()
+  let _pendingOrderedSubmit: string | null = null
+  const _paste = new PasteAccumulator({
+    coalesceMs: PASTE_FALLBACK_COALESCE_MS,
+    onDeferredSubmit: (submit) => {
+      if (Date.now() < ignoreInputUntil) return
+      const orderedSubmit = _pendingOrderedSubmit ?? submit
+      finishPasteNotice()
+      restorePromptAfterPasteFlush()
+      _enqueueInput(orderedSubmit)
+    },
+  })
+  type PasteDisplaySegment = {
+    placeholder: string
+    chars: number
+    text: string
+    visibleTail: string
+  }
+
+  let _pasteNoticeChars = 0
+  let _pasteNoticeTimer: ReturnType<typeof setTimeout> | null = null
+  let _pasteOutputMuted = false
+  let _pasteApplySerial = 0
+  let _pasteCollecting = false
+  let _pendingPasteTail = ''
+  let _pendingPasteText = ''
+  let _activePasteSegment: PasteDisplaySegment | null = null
+  const _pasteSegments: PasteDisplaySegment[] = []
+
+  function beginPasteOutputMute(): void {
+    if (_pasteOutputMuted) return
+    rlOutput.beginMute()
+    _pasteOutputMuted = true
+  }
+
+  function endPasteOutputMute(): void {
+    if (!_pasteOutputMuted) return
+    rlOutput.endMute()
+    _pasteOutputMuted = false
+  }
+
+  function charCount(text: string): number {
+    return Array.from(text).length
+  }
+
+  function pasteTail(text: string): string {
+    const parts = text.split(/\r\n|\r|\n/)
+    return parts[parts.length - 1] ?? ''
+  }
+
+  function recordPasteDisplayText(text: string): void {
+    if (!_pasteCollecting) {
+      _pasteCollecting = true
+      _pasteNoticeChars = 0
+      _pendingPasteTail = ''
+      _pendingPasteText = ''
+      _activePasteSegment = null
+    }
+    _pasteNoticeChars += charCount(text)
+    _pendingPasteText += text
+    const nextTail = /[\r\n]/.test(text)
+      ? pasteTail(text)
+      : `${_pendingPasteTail}${text}`
+    _pendingPasteTail = nextTail
+    if (_activePasteSegment) {
+      _activePasteSegment.chars = _pasteNoticeChars
+      _activePasteSegment.text = _pendingPasteText
+      _activePasteSegment.visibleTail = nextTail
+    }
+  }
+
+  function ensureActivePasteSegment(): PasteDisplaySegment {
+    if (_activePasteSegment) return _activePasteSegment
+    const segment: PasteDisplaySegment = {
+      placeholder: '',
+      chars: _pasteNoticeChars,
+      text: _pendingPasteText,
+      visibleTail: _pendingPasteTail,
+    }
+    _pasteSegments.push(segment)
+    _activePasteSegment = segment
+    return segment
+  }
+
+  function lineBreakCount(text: string): number {
+    return (text.match(/\r\n|\r|\n/g) ?? []).length
+  }
+
+  function shouldShowPasteNotice(pasteInfo: { source: string; text: string }): boolean {
+    if (pasteInfo.source === 'none') return false
+    if (pasteInfo.source === 'markerless-bare-newline') return _pasteNoticeChars > 0
+    const textChars = charCount(pasteInfo.text)
+    if (_pasteNoticeChars >= PASTE_NOTICE_MIN_CHARS) return true
+    if (textChars >= PASTE_NOTICE_MIN_CHARS) return true
+    return lineBreakCount(pasteInfo.text) >= PASTE_NOTICE_MIN_LINES
+  }
+
+  function isPostPasteImeCommit(pasteInfo: { source: string; text: string }): boolean {
+    return _pasteSegments.length > 0 &&
+      !_pasteCollecting &&
+      !_pasteOutputMuted &&
+      pasteInfo.source === 'bracketed' &&
+      charCount(pasteInfo.text) < PASTE_NOTICE_MIN_CHARS &&
+      lineBreakCount(pasteInfo.text) === 0
+  }
+
+  function schedulePasteNotice(text: string): void {
+    if (charCount(text) === 0 && _pasteNoticeChars === 0) return
+    if (_activePasteSegment?.placeholder) {
+      const serial = ++_pasteApplySerial
+      setImmediate(() => {
+        if (serial === _pasteApplySerial && _activePasteSegment) {
+          applyPastePlaceholder(_activePasteSegment)
+        }
+      })
+      return
+    }
+    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+    _pasteNoticeTimer = setTimeout(() => { renderPasteNotice() }, PASTE_NOTICE_DEBOUNCE_MS)
+    _pasteNoticeTimer.unref?.()
+  }
+
+  function renderPasteNotice(): void {
+    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+    _pasteNoticeTimer = null
+    if (_pasteNoticeChars <= 0 || Date.now() < ignoreInputUntil) return
+    applyPastePlaceholder(ensureActivePasteSegment())
+  }
+
+  function applyPastePlaceholder(segment: PasteDisplaySegment): void {
+    const mutableRl = rl as readline.Interface & {
+      line?: string
+      cursor?: number
+      _refreshLine?: () => void
+    }
+    const current = mutableRl.line ?? ''
+    const nextPlaceholder = `[已粘贴${segment.chars}字]`
+    if (segment.placeholder && current.includes(segment.placeholder)) {
+      mutableRl.line = current.replace(segment.placeholder, nextPlaceholder)
+    } else {
+      let visiblePasteChars = 0
+      const max = Math.min(current.length, segment.visibleTail.length)
+      for (let len = max; len > 0; len--) {
+        if (current.slice(current.length - len) === segment.visibleTail.slice(0, len)) {
+          visiblePasteChars = len
+          break
+        }
+      }
+      const prefix = visiblePasteChars > 0
+        ? current.slice(0, current.length - visiblePasteChars)
+        : current
+      mutableRl.line = `${prefix}${nextPlaceholder}`
+    }
+    segment.placeholder = nextPlaceholder
+    mutableRl.cursor = mutableRl.line.length
+    rlOutput.withPassthrough(() => { mutableRl._refreshLine?.() })
+  }
+
+  function restoreHiddenPasteLine(line: string): string {
+    let restored = line
+    for (const segment of _pasteSegments) {
+      if (!segment.placeholder || !restored.includes(segment.placeholder)) continue
+      restored = restored.replace(segment.placeholder, segment.text)
+    }
+    return restored
+  }
+
+  function mutableReadline(): readline.Interface & {
+    line?: string
+    cursor?: number
+    _refreshLine?: () => void
+  } {
+    return rl as readline.Interface & {
+      line?: string
+      cursor?: number
+      _refreshLine?: () => void
+    }
+  }
+
+  function insertReadlineText(text: string): void {
+    const mutableRl = mutableReadline()
+    const line = mutableRl.line ?? ''
+    const cursor = mutableRl.cursor ?? line.length
+    mutableRl.line = `${line.slice(0, cursor)}${text}${line.slice(cursor)}`
+    mutableRl.cursor = cursor + text.length
+    mutableRl._refreshLine?.()
+  }
+
+  function removeShiftEnterSequencesFromReadline(): void {
+    const mutableRl = mutableReadline()
+    const line = mutableRl.line ?? ''
+    let cleaned = line
+    for (const seq of SHIFT_ENTER_SEQUENCES) cleaned = cleaned.split(seq).join('')
+    if (cleaned === line) return
+    mutableRl.line = cleaned
+    mutableRl.cursor = Math.min(mutableRl.cursor ?? cleaned.length, cleaned.length)
+  }
+
+  function handleShiftEnterChunk(chunk: string): boolean {
+    let count = 0
+    for (const seq of SHIFT_ENTER_SEQUENCES) {
+      let idx = chunk.indexOf(seq)
+      while (idx !== -1) {
+        count++
+        idx = chunk.indexOf(seq, idx + seq.length)
+      }
+    }
+    if (count === 0) return false
+    const before = mutableReadline()
+    const beforeLine = before.line ?? ''
+    const beforeCursor = before.cursor ?? beforeLine.length
+    rlOutput.muteForCurrentInput()
+    setImmediate(() => {
+      const mutableRl = mutableReadline()
+      mutableRl.line = beforeLine
+      mutableRl.cursor = beforeCursor
+      insertReadlineText('\n'.repeat(count))
+      removeShiftEnterSequencesFromReadline()
+    })
+    return true
+  }
+
+  function finishPasteNotice(): void {
+    if (pasteNoticeActive()) renderPasteNotice()
+    _pasteNoticeTimer = null
+    _pasteNoticeChars = 0
+    _pendingPasteTail = ''
+    _pendingPasteText = ''
+    _pasteCollecting = false
+    _activePasteSegment = null
+    _pasteSegments.length = 0
+    _pendingOrderedSubmit = null
+    _pasteApplySerial++
+    endPasteOutputMute()
+  }
+
+  function clearPasteNotice(): void {
+    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+    _pasteNoticeTimer = null
+    _pasteNoticeChars = 0
+    _pendingPasteTail = ''
+    _pendingPasteText = ''
+    _pasteCollecting = false
+    _activePasteSegment = null
+    _pasteSegments.length = 0
+    _pendingOrderedSubmit = null
+    _pasteApplySerial++
+    endPasteOutputMute()
+  }
+
+  function endCurrentPasteDisplaySegment(): void {
+    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+    _pasteNoticeTimer = null
+    _pasteNoticeChars = 0
+    _pendingPasteTail = ''
+    _pendingPasteText = ''
+    _pasteCollecting = false
+    _activePasteSegment = null
+    _pasteApplySerial++
+    endPasteOutputMute()
+  }
+
+  function discardCurrentPasteCandidate(): void {
+    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+    _pasteNoticeTimer = null
+    _pasteNoticeChars = 0
+    _pendingPasteTail = ''
+    _pendingPasteText = ''
+    _pasteCollecting = false
+    _activePasteSegment = null
+    _pasteApplySerial++
+    endPasteOutputMute()
+  }
+
+  function pasteNoticeActive(): boolean {
+    return _pasteNoticeTimer !== null || _pasteOutputMuted
+  }
 
   // Ask the terminal to wrap pastes in ESC[200~ / ESC[201~ markers so pasted
   // newlines can be told apart from a typed Enter with certainty. Restore the
@@ -3334,6 +3710,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
     return new Promise<string | null>(resolve => _inputResolvers.push(resolve))
   }
 
+  function restorePromptAfterPasteFlush(): void {
+    if (isTTY && !_steerInputActive && !interactiveInputActive) rl.setPrompt(PROMPT_YOU)
+  }
+
   // Inline confirmation reader for mid-turn prompts (e.g. multi-agent escalation).
   // Prints the question and reads the next line through the SAME shared queue the
   // main loop uses, so the keystroke is never lost to a competing raw-stdin read.
@@ -3386,7 +3766,30 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // natively. Touching the paste state or prompt here would overwrite the
     // question prompt with `you ›` and corrupt the accumulator.
     if (_wizardActive || isNativeQuestionActive(rl)) return
-    _paste.onData(buf.toString())
+    if (handleShiftEnterChunk(buf.toString())) {
+      _paste.resetChunk()
+      return
+    }
+    const pasteInfo = _paste.onData(buf.toString())
+    if (pasteInfo.isPaste) {
+      const postPasteImeCommit = isPostPasteImeCommit(pasteInfo)
+      if (postPasteImeCommit) {
+        _pasteApplySerial++
+        endPasteOutputMute()
+      } else {
+        recordPasteDisplayText(pasteInfo.text)
+      }
+      if (!postPasteImeCommit && shouldShowPasteNotice(pasteInfo)) {
+        beginPasteOutputMute()
+        rlOutput.muteForCurrentInput()
+        schedulePasteNotice(pasteInfo.text)
+      }
+    } else if (pasteNoticeActive()) {
+      renderPasteNotice()
+      endCurrentPasteDisplaySegment()
+    } else if (!_paste.buffering && _pasteCollecting) {
+      discardCurrentPasteCandidate()
+    }
     // While a multi-line paste is still being collected, blank readline's prompt
     // so the trailing partial line isn't redrawn with a second `you ›` prefix on
     // the next keystroke. Restored to PROMPT_YOU once the buffer flushes.
@@ -3406,12 +3809,16 @@ async function runRepl(opts: CliOptions): Promise<void> {
     if (_wizardActive || isNativeQuestionActive(rl)) return
     // Returns a complete message only on a bare Enter; null means "still a
     // paste in progress — accumulate and wait for the user's explicit Enter".
-    const submit = _paste.onLine(rawLine)
+    const restoredLine = restoreHiddenPasteLine(rawLine)
+    _pendingOrderedSubmit = _pasteSegments.length > 0 ? restoredLine : null
+    const submit = _paste.onLine(restoredLine)
     if (submit !== null) {
       // Buffer flushed — restore the normal prompt for the next turn (the data
       // handler blanked it while the paste was being collected).
-      if (isTTY && !_steerInputActive && !interactiveInputActive) rl.setPrompt(PROMPT_YOU)
-      _enqueueInput(submit)
+      const orderedSubmit = _pasteSegments.length > 0 ? restoredLine : submit
+      finishPasteNotice()
+      restorePromptAfterPasteFlush()
+      _enqueueInput(orderedSubmit)
     }
   })
 
@@ -3426,6 +3833,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // Clear any paste accumulator state so buffered content before the
     // interrupt is not submitted after the drain window expires.
     _paste.clear()
+    clearPasteNotice()
     if (isTTY) rl.setPrompt(PROMPT_YOU)   // paste-collection may have blanked it
     process.stdout.write(`\n${yellow('Interrupted')} ${dim('(press Ctrl+C again to exit)')}\n`)
     setTimeout(() => { ctrlCPressed = false }, 2000)
@@ -3434,6 +3842,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
 
   rl.on('close', () => {
     disableBracketedPaste()
+    clearPasteNotice()
     // Signal EOF to the accumulator queue so _nextInput() unblocks
     _rlClosed = true
     // Recover any paste left in the buffer at EOF (e.g. Ctrl+D after a paste).
@@ -3614,12 +4023,13 @@ async function runRepl(opts: CliOptions): Promise<void> {
             } else if (choiceTrimmed === 'all') {
               const confirm = await askQuestion(rl, `${yellow('⚠  确认删除当前 workspace 的全部 ')}${sessions.length}${yellow(' 条历史会话？[y/N] ')}`)
               if (confirm.trim().toLowerCase() === 'y') {
-                // Use deleteAllSessions() instead of concurrent deleteSession() calls.
-                // Concurrent calls each read → filter → write the same index file,
-                // causing a last-writer-wins race where only one session is removed.
-                // deleteAllSessions() clears the index in one atomic write.
-                await SessionStore.deleteAllSessions()
-                console.log(green(`\n✓ 已删除全部 ${sessions.length} 条历史会话。\n`))
+                // Delete ONLY the sessions we listed for THIS workspace. The
+                // earlier deleteAllSessions() wiped every workspace's history
+                // despite the "当前 workspace" prompt — deleteSessions() filters
+                // the index atomically (no last-writer-wins race) while staying
+                // scoped to the listed IDs.
+                await SessionStore.deleteSessions(sessions.map(s => s.sessionId))
+                console.log(green(`\n✓ 已删除当前 workspace 的 ${sessions.length} 条历史会话。\n`))
               } else {
                 console.log(dim('\n已取消。\n'))
               }
@@ -3692,42 +4102,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(`\n${dim('暂无待审经验。')}\n`)
             } else {
               const store = new ExperienceStore()
-              await reviewPendingExperiences(rl, pending, store, async id => {
-                // Recognition-before-generation: claim existing principles (+reinforce),
-                // else evaluate mechanism convergence across the global store.
-                type AnchorSig = { anchorId: string; verdict: 'corroborated' | 'contradicted' | 'neutral'; propagated?: string[] }
-                const outcome = await router.evaluatePromotionForExperience(id) as
-                  | { kind: 'reinforced'; principleIds: string[]; signal: 'observation' | 'contradiction'; anchorSignals?: AnchorSig[] }
-                  | { kind: 'proposed'; pendingId: string; clusterIds: string[]; anchorSignals?: AnchorSig[] }
-                  | { kind: 'rejected'; reason: string; anchorSignals?: AnchorSig[] }
-                  | { kind: 'none'; reason: string; anchorSignals?: AnchorSig[] }
-                  | null
-                if (!outcome) return
-                if (outcome.kind === 'reinforced') {
-                  const label = outcome.signal === 'observation'
-                    ? green('+1 佐证')
-                    : yellow('+1 反证（已降权，建议 /principle review 复核）')
-                  for (const pid of outcome.principleIds) {
-                    console.log(dim(`  ⟳ 原则 ${pid}: ${label}`))
-                  }
-                } else if (outcome.kind === 'proposed') {
-                  console.log(yellow(`  ⏸ 经验收敛，已生成待审原则 (pending ID: ${outcome.pendingId}, 簇 ${outcome.clusterIds.length} 条)`))
-                  console.log(dim(`  使用 /principle review 审核是否提交。`))
-                } else if (outcome.kind === 'rejected') {
-                  console.log(dim(`  ○ 该簇暂不足以成为原则：${outcome.reason}`))
-                }
-                // Physical anchor signals (validate/challenge + contradiction propagation).
-                for (const s of outcome.anchorSignals ?? []) {
-                  if (s.verdict === 'corroborated') {
-                    console.log(dim(`  ⚓ 锚点 ${s.anchorId}: ${green('+1 佐证')}`))
-                  } else if (s.verdict === 'contradicted') {
-                    console.log(dim(`  ⚓ 锚点 ${s.anchorId}: ${yellow('+1 反证（已降权）')}`))
-                    for (const pid of s.propagated ?? []) {
-                      console.log(dim(`    ⚠ 原则 ${pid} 因锚点反证连带降权，建议 /principle review 复核`))
-                    }
-                  }
-                }
-              })
+              // v1: commit only. Principle promotion / anchor claim / propagation
+              // are deferred (code retained, not wired) — see
+              // docs/knowledge-v1-experience-anchor.md.
+              await reviewPendingExperiences(rl, pending, store)
             }
           } else {
             const count = pending?.count ?? 0
@@ -3771,7 +4149,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
               console.log(yellow('\n/anchor review 仅在 robotics 模式下可用。\n'))
             } else {
               const store = new PhysicalAnchorStore()
-              await reviewPendingPhysicalAnchors(rl, pendingAnchors, store)
+              const committed = await reviewPendingPhysicalAnchors(rl, pendingAnchors, store)
+              // Newly committed anchors → refresh the memoized R6 set next turn.
+              if (committed > 0) router.invalidateAnchors()
             }
           } else {
             const count = pendingAnchors?.count ?? 0
@@ -3979,7 +4359,10 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   // Register standard tools (robotics registers its own)
   if (opts.mode !== 'robotics') {
     const tools = await createStandardTools({
-      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic') },
+      // planModeRef MUST be the router's shared ref so enter_plan_mode /
+      // exit_plan_mode flip the same object the backend's kernel permission
+      // policy reads — otherwise plan mode never gates writes.
+      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic'), planModeRef: router.planModeRef },
       // Main-session web_fetch is result-budgeted: full-text reading belongs in
       // isolated research sub-agents (research_dispatch), not the long-lived
       // main context. Sub-agents get an unbudgeted override via the bridge.

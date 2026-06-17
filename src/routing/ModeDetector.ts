@@ -2,7 +2,9 @@
  * ModeDetector — two-layer mode classification.
  *
  * Layer 1: Explicit hint (zero cost)
- *   If the caller passed mode !== 'auto', return immediately.
+ *   If the caller passed mode !== 'detect', return immediately. This is the ONLY
+ *   way to enter 'auto' mode — auto is never inferred from prompt wording (see
+ *   note below). Every other detection path resolves to agentic/campaign/robotics.
  *
  * Layer 2: Prompt classification
  *   Preferred: one-shot flash-model call when an Anthropic client is provided
@@ -26,6 +28,14 @@
  *   \b word-boundary anchors do NOT work for CJK characters (all CJK chars
  *   are \W, so \b never fires around them). All Chinese patterns use plain
  *   substring matching with no \b.
+ *
+ * Note on 'auto' mode:
+ *   'auto' (autonomous + workspace jail) is ENTERED EXPLICITLY ONLY, via the
+ *   caller passing mode='auto' (CLI `--mode auto`). There is deliberately NO
+ *   heuristic that infers auto from prompt wording such as "无人值守" or
+ *   "don't ask me": silently dropping a user into an unattended, auto-approving
+ *   posture based on a turn of phrase is surprising and unsafe. Phrasing like
+ *   that is treated as ordinary agentic intent.
  */
 
 import Anthropic from '@anthropic-ai/sdk'
@@ -274,13 +284,13 @@ export class ModeDetector {
    */
   static async detect(
     prompt: string,
-    hint: SessionModeHint = 'auto',
+    hint: SessionModeHint = 'detect',
     hasTools = false,
     client?: Anthropic,
     model = LLM_DETECTION_MODEL,
   ): Promise<ModeDetectionResult> {
     // Layer 1: explicit — bypass everything
-    if (hint !== 'auto') {
+    if (hint !== 'detect') {
       return {
         mode: hint,
         confidence: 'explicit',
@@ -289,9 +299,13 @@ export class ModeDetector {
     }
 
     // Layer 2: LLM classification (preferred) or heuristic fallback
+    //
+    // NOTE: 'auto' is intentionally unreachable from here. It is entered only
+    // via an explicit hint (handled by Layer 1 above). Neither the flash
+    // classifier nor the heuristics ever return 'auto'.
     const classification = client
       ? await ModeDetector._detectWithLLM(prompt, hasTools, client, model)
-      : ModeDetector.detectSync(prompt, 'auto', hasTools)
+      : ModeDetector.detectSync(prompt, 'detect', hasTools)
 
     return classification
   }
@@ -338,7 +352,7 @@ export class ModeDetector {
       }
     } catch {
       // Network error, timeout, rate limit — fall through to heuristics
-      return ModeDetector.detectSync(prompt, 'auto', hasTools)
+      return ModeDetector.detectSync(prompt, 'detect', hasTools)
     }
   }
 
@@ -347,11 +361,11 @@ export class ModeDetector {
    */
   static detectSync(
     prompt: string,
-    hint: SessionModeHint = 'auto',
+    hint: SessionModeHint = 'detect',
     hasTools = false,
   ): ModeDetectionResult {
     // Layer 1: explicit
-    if (hint !== 'auto') {
+    if (hint !== 'detect') {
       return {
         mode: hint,
         confidence: 'explicit',
@@ -364,6 +378,9 @@ export class ModeDetector {
     const toolSignal: ModeSignal | null = hasTools
       ? { mode: 'agentic', label: 'tools pre-registered → minimum agentic' }
       : null
+
+    // NOTE: there is deliberately no AUTO tier here. 'auto' mode is explicit-only
+    // (caller hint), never inferred from prompt wording — see the file header.
 
     // ── Tier 0: ROBOTICS_ALWAYS ──────────────────────────────────────────────
     const roboticsSignal = firstMatch(prompt, ROBOTICS_ALWAYS, 'robotics')

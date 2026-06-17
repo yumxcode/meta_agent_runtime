@@ -166,7 +166,7 @@ export function createRoboticsTools(opts: RoboticsToolsOptions): MetaAgentTool[]
   return [
     // ── Experience tools ─────────────────────────────────────────────────────
     createExperienceSearchTool(store),
-    createExperienceWriteTool(store, pendingStore, opts.flashClient, physicalAnchors, pendingPhysicalAnchors),
+    createExperienceWriteTool(store, pendingStore, opts.flashClient),
     createExperienceLoadTool(store),
     createExperienceDeleteTool(store),
     createPrincipleSearchTool(principles),

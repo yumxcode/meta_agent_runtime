@@ -5,6 +5,8 @@ import type { KernelTool, KernelToolContext } from './KernelTool.js'
 import type { KernelMessage } from './KernelMessage.js'
 import type { PermissionDenial } from './KernelEvent.js'
 import type { CompactProfile } from '../compact/CompactPrompt.js'
+import type { VerifyGateFn } from '../loop/VerifyGate.js'
+import type { DriftGateFn } from '../loop/DriftGate.js'
 
 export type ThinkingConfig =
   | { type: 'disabled' }
@@ -49,6 +51,12 @@ export interface CompactConfig {
    * provenance + phase gate). Each agent mode sets this at construction.
    */
   promptProfile?: CompactProfile
+  /**
+   * Auto mode only. Enables a no-model structural-truncation fallback when the
+   * model compactor fails / its circuit breaker is open, so an unattended
+   * session never grows into the blocking limit. See StructuralTruncate.
+   */
+  autonomyFallback?: boolean
   /** querySource tag — 'compact' to prevent recursion */
   querySource?: string
 }
@@ -175,6 +183,37 @@ export interface KernelConfig {
    * Default: 2.
    */
   maxStreamErrorRecoveries?: number
+
+  // ── Autonomy (auto mode) ───────────────────────────────────────────────────
+
+  /**
+   * Auto mode. Enables the unattended stall circuit (AutoStallGuard): if every
+   * tool result errors for AUTO_STALL_FAILURE_LIMIT consecutive turns, the loop
+   * terminates with no_progress instead of burning the whole budget on a stuck
+   * agent that keeps trying different failing commands. Off by default so other
+   * modes keep relying on their existing guards + budget/turn caps.
+   */
+  autonomousMode?: boolean
+
+  /**
+   * Auto mode completion gate. When set, the loop calls it at the moment the
+   * model stops issuing tool calls (i.e. "I'm done"): an INDEPENDENT judge
+   * decides whether the original goal is actually met. A `done: false` verdict
+   * re-injects the unfinished items and the loop continues, bounded by
+   * MAX_VERIFY_ROUNDS. Only consulted when autonomousMode is set. Absent =
+   * legacy behaviour (the model's own "done" is trusted).
+   */
+  verifyGate?: VerifyGateFn
+
+  /**
+   * Auto mode mid-flight drift/reflection gate. When set, the loop calls it at
+   * coarse structural boundaries (a compaction this turn, or every
+   * DRIFT_TURN_INTERVAL turns) to check whether the run has wandered off the
+   * goal and to let an independent agent persist any durable lesson. A
+   * `drifted: true` verdict re-injects corrective steps. Only consulted when
+   * autonomousMode is set. Absent = no mid-flight drift checking.
+   */
+  driftGate?: DriftGateFn
 
   // ── Compact ───────────────────────────────────────────────────────────────
 

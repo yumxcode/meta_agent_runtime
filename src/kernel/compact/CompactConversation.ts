@@ -75,6 +75,12 @@ export interface CompactOptions {
   messagesToKeep?: readonly KernelMessage[]
   /** Per-mode section-template selector for the summariser prompt. */
   promptProfile?: CompactProfile
+  /**
+   * Auto mode only. When true, a NO-MODEL structural-truncation fallback runs
+   * if the model compactor fails or its circuit breaker is open, so an
+   * unattended session never grows into the blocking limit. See StructuralTruncate.
+   */
+  autonomyFallback?: boolean
 }
 
 class CompactEmptyResponseError extends Error {

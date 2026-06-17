@@ -38,6 +38,7 @@ import {
   type ResolvedConfig,
 } from './config.js'
 import { createSandboxExecutor } from '../sandbox/index.js'
+import { getGlobalWriteMutex } from './fs/WriteMutex.js'
 import type { SandboxHandle, SandboxConfig } from '../sandbox/types.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import type {
@@ -48,6 +49,7 @@ import type {
 } from './types.js'
 import { SectionRegistry } from './systemPromptSections.js'
 import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, type StaticPromptMode } from './staticPrompt.js'
+import { MODE_PROFILES } from './modes.js'
 import {
   buildDynamicSections,
   buildVolatileContextSections,
@@ -59,6 +61,7 @@ import type { SubAgentRecord } from '../subagent/types.js'
 import {
   buildAgenticCompactInstructions,
   buildAgenticDeterministicAnchors,
+  buildAutoModeAnchors,
 } from './compact/agenticCompactAnchors.js'
 import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
 import { AgenticSession } from '../modes/AgenticSession.js'
@@ -110,8 +113,13 @@ export class MetaAgentSession {
   /**
    * Shared mutable ref — EnterPlanMode / ExitPlanMode tools flip .active.
    * Exposed as `readonly` so callers can read it but only tools write it.
+   *
+   * Adopted from config.planModeRef when the caller (e.g. SessionRouter) owns
+   * the ref and also hands it to the plan-mode tools; otherwise a private ref
+   * is minted. Assigned in the constructor so the injected object — not a fresh
+   * one — flows into the inner AgenticSession and the kernel permission policy.
    */
-  readonly _planModeRef: { active: boolean } = { active: false }
+  readonly _planModeRef: { active: boolean }
 
   // ── External attachments ──────────────────────────────────────────────────
   private _subAgentBridge: SubAgentBridge | undefined = undefined
@@ -126,6 +134,12 @@ export class MetaAgentSession {
    * async refresh completes before compaction reads the thunks.
    */
   private _subAgentTasksSnapshot: SubAgentRecord[] | null = null
+
+  // ── Default agent mode ────────────────────────────────────────────────────
+  // Used when submit() is called without an explicit mode (the SessionRouter
+  // path always calls submit(prompt)). 'auto' makes the auto backend render the
+  // AUTO prompt sections even though it reuses this class.
+  private readonly _defaultMode: AgentMode
 
   // ── Inner engine ──────────────────────────────────────────────────────────
   private readonly _inner: AgenticSession
@@ -158,7 +172,13 @@ export class MetaAgentSession {
       config.systemPrompt === undefined || config.systemPrompt === DEFAULT_SYSTEM_PROMPT
 
     this.config = resolveConfig(config)
+    this._defaultMode = config.promptMode ?? 'agentic'
     this._appendSuffix = config.appendSystemPrompt ?? ''
+    // Adopt the caller-owned plan-mode ref (SessionRouter shares one object
+    // across this session and the enter/exit_plan_mode tools) or mint a private
+    // one. Must be set before the inner AgenticSession is constructed below,
+    // which forwards this exact object into the kernel permission policy.
+    this._planModeRef = config.planModeRef ?? { active: false }
 
     if (!this.config.apiKey) {
       throw new Error(
@@ -206,16 +226,19 @@ export class MetaAgentSession {
           this._composeCompactValue(
             // Persisted research reports first: post-compaction the model must
             // re-READ those files, never re-RUN the research. Then the
-            // sub-agent/contract state anchors.
+            // sub-agent/contract state anchors, then (auto only) the autonomy +
+            // jail-root anchors so the autonomous posture survives compaction.
             [
               buildResearchArtifactAnchors(this.config.projectDir),
               buildAgenticDeterministicAnchors(this._agenticCompactContext()),
+              this._defaultMode === 'auto' ? buildAutoModeAnchors(this.config.projectDir) : null,
             ].filter(Boolean).join('\n\n') || null,
             config.compact?.deterministicAnchors,
           ),
-        // Forward the caller's profile (RoboticsSession passes 'robotics');
-        // plain MetaAgent/agentic sessions default to the generic template.
-        promptProfile: config.compact?.promptProfile ?? 'agentic',
+        // Forward the caller's profile (RoboticsSession passes 'robotics'); otherwise
+        // each mode's compact template comes from the single MODE_PROFILES table
+        // (auto → 9-section + Autonomous Ledger; agentic → generic).
+        promptProfile: config.compact?.promptProfile ?? MODE_PROFILES[this._defaultMode].compactProfile,
       },
     })
 
@@ -239,7 +262,7 @@ export class MetaAgentSession {
    */
   async *submit(
     prompt: string,
-    mode: AgentMode = 'agentic',
+    mode: AgentMode = this._defaultMode,
   ): AsyncGenerator<MetaAgentEvent, void, unknown> {
     if (this._submitInFlight) {
       throw new Error(
@@ -298,9 +321,9 @@ export class MetaAgentSession {
       // Build mode-specific static prompt lazily and cache per mode.
       // MetaAgentSession is only used for 'agentic' and 'robotics' modes;
       // 'campaign' would be a safety fallback (CampaignSession handles that path).
-      const staticMode: StaticPromptMode =
-        mode === 'robotics' ? 'robotics' :
-        mode === 'campaign' ? 'campaign' : 'agentic'
+      // StaticPromptMode is now an alias of the canonical mode union, so the
+      // mode maps to its static template directly — no per-mode ternary needed.
+      const staticMode: StaticPromptMode = mode
       let staticPrompt = this._staticPromptCache.get(staticMode)
       if (!staticPrompt) {
         staticPrompt = buildStaticSystemPrompt(staticMode)
@@ -308,6 +331,18 @@ export class MetaAgentSession {
       }
       fullStablePrompt = staticPrompt + SYSTEM_PROMPT_DYNAMIC_BOUNDARY + stablePrompt
       if (this._appendSuffix)  fullStablePrompt += '\n\n' + this._appendSuffix
+    }
+
+    // Auto mode (Learn · recall): append accumulated experience lessons so the
+    // main agent avoids repeating known pitfalls. Read fresh each submit (local
+    // JSON, cheap); the block only changes when a new experience is written, so
+    // the prompt stays byte-stable across turns in the common case (KV-cache
+    // friendly). Best-effort — a recall failure never blocks the turn.
+    if (this.config.getExperienceRecallBlock) {
+      try {
+        const recall = await this.config.getExperienceRecallBlock()
+        if (recall) fullStablePrompt += '\n\n' + recall
+      } catch { /* best-effort recall — never disrupt prompt assembly */ }
     }
 
     // Only call setAppendSystemPrompt when the content actually changed.
@@ -572,7 +607,14 @@ export class MetaAgentSession {
     const cached = this._sandboxHandles.get(cacheKey)
     if (cached) return cached
 
-    const config: SandboxConfig = policy === true ? {} : policy
+    const baseConfig: SandboxConfig = policy === true ? {} : policy
+    // Auto mode (lockWorkspace): the OS sandbox is fail-closed. The main-agent
+    // bash policy defaults to allowUnsandboxedFallback:true (degrade gracefully
+    // when bwrap/sandbox-exec is missing); under autonomy we force it false so
+    // an unattended run never silently executes shell commands unsandboxed.
+    const config: SandboxConfig = this.config.autonomy?.lockWorkspace
+      ? { ...baseConfig, allowUnsandboxedFallback: false }
+      : baseConfig
     const workspaceRoot = this.config.projectDir ?? process.cwd()
     const executor = createSandboxExecutor()
     if (executor.platform === 'noop' && !config.allowUnsandboxedFallback) {
@@ -603,6 +645,9 @@ export class MetaAgentSession {
     const hasRtx  = Boolean(this.config.runtimeContext)
     const facade  = this
     const sandboxPolicy = tool.permission?.sandbox
+    // Auto mode: hand fs tools the process-global write mutex so concurrent
+    // sub-agents writing the same path are serialised. Undefined otherwise.
+    const writeMutex = this.config.autonomy ? getGlobalWriteMutex() : undefined
 
     return {
       ...tool,
@@ -614,7 +659,10 @@ export class MetaAgentSession {
           let enrichedCtx = ctx
           if (sandboxPolicy !== undefined) {
             const sandboxHandle = await facade._getOrCreateSandboxHandle(sandboxPolicy)
-            enrichedCtx = { ...ctx, sandboxHandle }
+            enrichedCtx = { ...enrichedCtx, sandboxHandle }
+          }
+          if (writeMutex !== undefined) {
+            enrichedCtx = { ...enrichedCtx, writeMutex }
           }
 
           const result = await tool.call(input, enrichedCtx)
@@ -627,11 +675,5 @@ export class MetaAgentSession {
         }
       },
     }
-  }
-
-  /** Register a wrapped tool into the tool registry (for initial tools in constructor). */
-  private _registerWrapped(tool: MetaAgentTool): void {
-    const wrapped = this._wrapTool(tool)
-    this.toolRegistry.set(tool.name, wrapped)
   }
 }

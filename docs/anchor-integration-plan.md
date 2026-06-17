@@ -1,6 +1,9 @@
 # Physical Anchor 接入方案
 
-状态:设计草案
+> ⚠️ **状态:封存 / 未来升级(本期不运行)。** 当前主线是 `docs/knowledge-v1-experience-anchor.md`(只跑 experience + anchor 两条独立管线,无双边关联)。
+> 本文档描述的 anchor ↔ experience ↔ principle **双边关系**(认领回灌、三档 verdict、反证沿支撑边传播、anchor↔principle 回链、晋升接锚点)代码已实现但**主线不接线**,保留为未来升级路径。升级触发条件见 v1 文档文末。
+
+状态:已实现但封存(deferred)
 范围:`src/robotics/` 下 physical anchor ↔ experience / principle 的打通
 关联:`docs/principle-mechanism-improvement.md`(本方案镜像其管线)
 
