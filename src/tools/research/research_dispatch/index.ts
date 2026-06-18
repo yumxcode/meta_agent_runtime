@@ -99,6 +99,8 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
 
   return {
     name: 'research_dispatch',
+    abortSupport: 'cooperative',
+    permission: { category: 'state', checkpointBoundary: 'both' },
     // Opt out of the kernel per-tool timeout: this tool blocks on the
     // sub-agent, which is bounded by its own 10-min wall-clock cap.
     timeoutMs: 0,

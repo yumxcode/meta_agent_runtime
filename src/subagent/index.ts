@@ -31,6 +31,7 @@
 // ── Core types ─────────────────────────────────────────────────────────────
 export type {
   SubAgentTaskId,
+  SubAgentWorkspaceMode,
   SubAgentStatus,
   SubAgentConfig,
   SubAgentResult,
@@ -66,10 +67,12 @@ export { SubAgentRunner } from './SubAgentRunner.js'
 // ── Bridge ─────────────────────────────────────────────────────────────────
 export {
   SubAgentBridge,
-  buildSubAgentNotificationSection,
   type SubAgentBridgeOptions,
   type SpawnSubAgentOptions,
 } from './SubAgentBridge.js'
+// Prompt section builder now lives in its own module (separated from the
+// scheduler class); re-exported here so existing importers are unaffected.
+export { buildSubAgentNotificationSection } from './notificationSection.js'
 
 // ── Tools ──────────────────────────────────────────────────────────────────
 export {

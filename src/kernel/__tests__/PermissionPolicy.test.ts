@@ -124,4 +124,45 @@ describe('createPermissionPolicy', () => {
     const result = await canUseTool(powershellTool(), { command: 'Write-Output ok' }, 'a', 't', context())
     expect(result.behavior).toBe('allow')
   })
+
+  // ── Workspace-jail hardening in NON-auto modes (no autonomy profile) ───────
+  // The relative/home/root escape scan used to run only under autonomy.
+  // lockWorkspace; these assert it now applies to any jail-active bash so the
+  // jail is consistent with the absolute-path denial that always ran.
+  describe('bash relative/home escapes are denied without an autonomy profile', () => {
+    const cases: Array<[string, string]> = [
+      ['home (~)',     'cat ~/.ssh/id_rsa'],
+      ['$HOME',        'cat $HOME/.netrc'],
+      ['parent climb', 'cat ../../etc/passwd'],
+      ['filesystem root', 'rm -rf /*'],
+    ]
+    for (const [label, command] of cases) {
+      it(`denies: ${label}`, async () => {
+        const canUseTool = createPermissionPolicy({ workspaceRoot: process.cwd() })
+        const result = await canUseTool(bashTool(), { command }, 'a', 't', context())
+        expect(result.behavior).toBe('deny')
+      })
+    }
+
+    it('does NOT flag an internal ../ that stays inside (a/../b)', async () => {
+      const canUseTool = createPermissionPolicy({
+        workspaceRoot: process.cwd(),
+        beforeToolCall: async () => ({ action: 'allow' }),
+      })
+      const result = await canUseTool(bashTool(), { command: 'cat a/../b.txt' }, 'a', 't', context())
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('permits the escape when the workspace jail is unlocked via config', async () => {
+      // allowOutsideWorkspace:true turns jailActive off, so the escape scan is
+      // skipped — the documented opt-out for callers that need outside access.
+      const canUseTool = createPermissionPolicy({
+        workspaceRoot: process.cwd(),
+        beforeToolCall: async () => ({ action: 'allow' }),
+        permissionConfig: { workspace: { allowOutsideWorkspace: true } },
+      })
+      const result = await canUseTool(bashTool(), { command: 'cat ../sibling/notes.txt' }, 'a', 't', context())
+      expect(result.behavior).toBe('allow')
+    })
+  })
 })

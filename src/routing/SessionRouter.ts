@@ -44,14 +44,16 @@ import { CampaignSession } from '../modes/CampaignSession.js'
 import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
 import { prefetchRelevantMemories, getMemoryRecallTimeoutMs } from '../core/memory/findRelevantMemories.js'
 import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
-import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
-import { updateAutoCheckpoint, readAutoCheckpoint, buildAutoResumePreamble } from '../core/auto/AutoCheckpointStore.js'
+import { readAutoCheckpoint, buildAutoResumePreamble } from '../core/auto/AutoCheckpointStore.js'
+import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
 import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
 import { createAutoExperienceStore, renderRecentExperiences, createAutoExperienceWriteTool } from '../core/auto/learn/AutoExperienceStore.js'
-import { getTodosForSession } from '../tools/ui/todo_write/index.js'
+import { getTodosForSession, deleteTodosForSession } from '../tools/ui/todo_write/index.js'
+import { getProgressNoteForSession, deleteProgressNoteForSession } from '../tools/ui/progress_note/index.js'
+import { getArtifactsForSession, deleteArtifactsForSession } from '../tools/ui/artifacts_register/index.js'
 import { AutoWorktreeCoordinator } from '../core/auto/AutoWorktreeCoordinator.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { makeAutoWorktreeTools } from '../subagent/tools/auto_worktree.js'
@@ -65,41 +67,12 @@ import type { RouterOptions, SessionMode, SessionModeHint } from './types.js'
 import { MODE_WEIGHT } from './types.js'
 import { MODE_PROFILES } from '../core/modes.js'
 
-// ── Formal TeamController interface (D2) ─────────────────────────────────────
-// Typed contract between SessionRouter and the CLI team commands.
-// All methods are optional so the controller can be returned safely before the
-// RoboticsSession has fully initialised.
-
-export interface RoboticsTeamController {
-  // Lifecycle
-  teamInit?(github?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>
-  teamJoin?(github?: string, human?: string): Promise<import('../robotics/team/TeamStore.js').TeamState>
-  teamStatus?(): Promise<import('../robotics/team/TeamStore.js').TeamState | null>
-
-  // Task mutation (v2.0 collaboration log)
-  teamTaskAdd?(input: import('../robotics/team/TeamStore.js').TeamTaskAddInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamTake?(taskId: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamDrop?(taskId?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamSteal?(taskId: string, reason?: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; previousOwner?: string }>
-  teamNote?(input: import('../robotics/team/TeamStore.js').TeamNoteInput): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask; attempt: import('../robotics/team/TeamStore.js').TeamAttempt }>
-  teamFocus?(taskId: string): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-  teamOwnedTasks?(): Promise<{ owned: import('../robotics/team/TeamStore.js').TeamTask[]; focusId?: string }>
-  teamResolveOwnTaskId?(explicit?: string): Promise<string>
-  teamTaskStatus?(taskId: string, status: import('../robotics/team/TeamStore.js').TeamTaskStatus): Promise<{ state: import('../robotics/team/TeamStore.js').TeamState; task: import('../robotics/team/TeamStore.js').TeamTask }>
-
-  // Git transport
-  teamSync?(): Promise<import('../robotics/team/TeamStore.js').TeamSyncSummary>
-  teamPull?(): Promise<import('../robotics/team/TeamStore.js').TeamPullResult>
-  teamPush?(): Promise<import('../robotics/team/TeamStore.js').TeamPushResult>
-  teamPublishState?(): Promise<import('../robotics/team/TeamStore.js').TeamPublishState>
-  teamConflicts?(): Promise<import('../robotics/team/TeamStore.js').MergeConflictReport>
-  teamResolveTeamJson?(): Promise<import('../robotics/team/TeamStore.js').TeamJsonResolveResult>
-
-  // Prompt boundary + watcher
-  teamSetContextBoundary?(mode: 'background' | 'unrelated', taskId: string): Promise<void>
-  teamWatcherPoll?(): Promise<import('../robotics/team/TeamWatcher.js').TeamWatcherEvent[]>
-  teamWatcherEvents?(): import('../robotics/team/TeamWatcher.js').TeamWatcherEvent[]
-}
+// The robotics capability contracts live in the robotics package (so
+// RoboticsSession can `implements` them and the compiler verifies the surface).
+// Imported for internal use here and re-exported for backward compatibility —
+// cli/teamPlannerExecutor imports RoboticsTeamController from this module.
+import type { RoboticsCapabilities, RoboticsTeamController } from '../robotics/contracts.js'
+export type { RoboticsCapabilities, RoboticsTeamController }
 
 // ── Minimal interface shared by all backends ──────────────────────────────────
 
@@ -161,8 +134,8 @@ export class SessionRouter {
   private _autoGoal: string | null = null
   /** Auto mode: sub-agent bridge ref, for checkpointing active sub-agent IDs. */
   private _autoBridge: SubAgentBridge | null = null
-  /** Auto mode: turn counter for checkpoint observability. */
-  private _autoTurnCount = 0
+  /** Auto mode: single-writer durable checkpoint coordinator. */
+  private _autoCheckpointCoordinator: AutoCheckpointCoordinator | null = null
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
     const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
@@ -305,44 +278,8 @@ export class SessionRouter {
       if (this._autoGoal === null) this._autoGoal = prompt
     }
 
-    let stopReason: string | undefined
-    try {
-      for await (const ev of this._impl!.submit(effectivePrompt)) {
-        if (ev.type === 'result') stopReason = (ev as { subtype?: string }).subtype
-        yield ev
-      }
-    } finally {
-      // Best-effort progress checkpoint after every auto turn — recoverable via
-      // --resume if the run later hits its budget/turn cap, the stall circuit,
-      // or a crash. Never throws (the store swallows I/O errors).
-      if (this._currentMode === 'auto') {
-        // Wholly best-effort: a checkpoint write (and the state-gathering calls
-        // that feed it) must never throw out of the finally and mask the real
-        // turn outcome / error propagating from the try block.
-        try {
-          const workspaceRoot = this._cfg.projectDir ?? process.cwd()
-          const sessionId = this._impl!.getSessionId()
-          this._autoTurnCount++
-          // Split the live to-do list into done / outstanding. Previously only
-          // the outstanding half was checkpointed, so the resume preamble's
-          // "已完成" section — and any drift check that reads the checkpoint —
-          // had no idea what was already finished. Both halves are recorded now
-          // so the checkpoint is a complete state record (drift relies on it).
-          const allTodos = getTodosForSession(sessionId)
-          const pendingTodos = allTodos.filter(t => t.status !== 'completed').map(t => t.content)
-          const completedSteps = allTodos.filter(t => t.status === 'completed').map(t => t.content)
-          const activeSubAgentIds = this._autoBridge?.getSchedulerStats().activeTaskIds ?? []
-          updateAutoCheckpoint(workspaceRoot, sessionId, {
-            goal: this._autoGoal ?? undefined,
-            completedSteps: completedSteps.length ? completedSteps : undefined,
-            pendingTodos: pendingTodos.length ? pendingTodos : undefined,
-            activeSubAgentIds: activeSubAgentIds.length ? activeSubAgentIds : undefined,
-            turnCount: this._autoTurnCount,
-            estimatedCostUsd: this.getEstimatedCost(),
-            stopReason,
-          })
-        } catch { /* best-effort checkpoint — never disrupt the turn result */ }
-      }
+    for await (const ev of this._impl!.submit(effectivePrompt)) {
+      yield ev
     }
   }
 
@@ -437,7 +374,10 @@ export class SessionRouter {
    */
   async dispose(): Promise<void> {
     const impl = this._impl as (SessionImpl & { dispose?: () => Promise<void> }) | null
-    if (impl && !this._memoryWriterDone) {
+    // Global memory is read-only in auto mode. Skip both the post-session
+    // proposal writer and the pending-store flush so an unattended session
+    // never causes writes under ~/.meta-agent/memory.
+    if (impl && this._currentMode !== 'auto' && !this._memoryWriterDone) {
       this._memoryWriterDone = true
       try {
         await runPostSessionMemoryWriter({
@@ -458,10 +398,15 @@ export class SessionRouter {
         // Best-effort: memory extraction must never block shutdown.
       }
     }
-    // Auto mode: discard any worktrees the main agent never merged/discarded so
-    // they don't leak under .meta-agent/auto/worktrees. Best-effort.
-    try { await this._autoBridge?.getWorktreeCoordinator()?.cleanupAll() } catch { /* best-effort */ }
+    // Durable isolated-write worktrees intentionally survive dispose so a
+    // resumed session can finalize/merge/conflict-recover them.
+    if (impl && this._currentMode === 'auto') {
+      try {
+        await this._autoCheckpointCoordinator?.flushDispose(impl.getSessionId())
+      } catch { /* best-effort */ }
+    }
     this._autoBridge = null
+    this._autoCheckpointCoordinator = null
     if (impl?.dispose) {
       try { await impl.dispose() } catch { /* best-effort */ }
     }
@@ -469,6 +414,8 @@ export class SessionRouter {
     if (sessionId) {
       try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
       try { deleteJobsForSession(sessionId) } catch { /* best-effort */ }
+      try { deleteProgressNoteForSession(sessionId) } catch { /* best-effort */ }
+      try { deleteArtifactsForSession(sessionId) } catch { /* best-effort */ }
       // S6: kill any SubAgentBridge that was created for this session but
       // whose owner forgot to call destroy() (e.g. CampaignSession callers
       // who never dispose).  Idempotent — does nothing when already destroyed.
@@ -491,29 +438,34 @@ export class SessionRouter {
   }
 
   /**
+   * Narrow the active backend to the robotics capability surface, or null when
+   * the session is not in robotics mode (or no backend yet).
+   *
+   * ONE typed cast, guarded by mode, replaces the former per-accessor `as any`.
+   * Because `RoboticsSession implements RoboticsCapabilities`, the cast is
+   * compile-checked at the implementation site: removing/renaming a capability
+   * now fails the build instead of silently returning `undefined` at runtime.
+   */
+  private _roboticsImpl(): RoboticsCapabilities | null {
+    return this._currentMode === 'robotics' && this._impl
+      ? (this._impl as unknown as RoboticsCapabilities)
+      : null
+  }
+
+  /**
    * Return the robotics session's pending experience buffer (if mode=robotics).
    * Returns null in all other modes or before the first submit().
-   * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
    */
   getPendingExperiences(): import('../robotics/ExperiencePendingStore.js').ExperiencePendingStore | null {
-    const impl = this._impl as any
-    if (impl && typeof impl.pendingExperiences === 'object' && impl.pendingExperiences !== null) {
-      return impl.pendingExperiences
-    }
-    return null
+    return this._roboticsImpl()?.pendingExperiences ?? null
   }
 
   /**
    * Return the robotics session's pending physical anchor buffer (if mode=robotics).
    * Returns null in all other modes or before the first submit().
-   * Uses duck-typing so SessionRouter does not import RoboticsSession directly.
    */
   getPendingPhysicalAnchors(): import('../robotics/PhysicalAnchorPendingStore.js').PhysicalAnchorPendingStore | null {
-    const impl = this._impl as any
-    if (impl && typeof impl.pendingPhysicalAnchors === 'object' && impl.pendingPhysicalAnchors !== null) {
-      return impl.pendingPhysicalAnchors
-    }
-    return null
+    return this._roboticsImpl()?.pendingPhysicalAnchors ?? null
   }
 
   /**
@@ -521,54 +473,33 @@ export class SessionRouter {
    * Returns null in all other modes or before the first submit().
    */
   getPendingPrinciples(): import('../robotics/PrinciplePendingStore.js').PrinciplePendingStore | null {
-    const impl = this._impl as any
-    if (impl && typeof impl.pendingPrinciples === 'object' && impl.pendingPrinciples !== null) {
-      return impl.pendingPrinciples
-    }
-    return null
+    return this._roboticsImpl()?.pendingPrinciples ?? null
   }
 
   async proposePrincipleForExperience(
     experienceId: string,
     reason: 'confidence_threshold' | 'explicit_user_request',
   ): Promise<unknown | null> {
-    const impl = this._impl as any
-    if (impl && typeof impl.proposePrincipleForExperience === 'function') {
-      return impl.proposePrincipleForExperience(experienceId, reason)
-    }
-    return null
+    return this._roboticsImpl()?.proposePrincipleForExperience(experienceId, reason) ?? null
   }
 
   async reinforcePrinciplesFromExperience(
     experienceId: string,
   ): Promise<Array<{ principleId: string; signal: 'observation' | 'contradiction' }>> {
-    const impl = this._impl as any
-    if (impl && typeof impl.reinforcePrinciplesFromExperience === 'function') {
-      return impl.reinforcePrinciplesFromExperience(experienceId)
-    }
-    return []
+    return this._roboticsImpl()?.reinforcePrinciplesFromExperience(experienceId) ?? []
   }
 
   async evaluatePromotionForExperience(experienceId: string): Promise<unknown | null> {
-    const impl = this._impl as any
-    if (impl && typeof impl.evaluatePromotionForExperience === 'function') {
-      return impl.evaluatePromotionForExperience(experienceId)
-    }
-    return null
+    return this._roboticsImpl()?.evaluatePromotionForExperience(experienceId) ?? null
   }
 
   /** Drop the memoized R6 anchor section so newly committed anchors appear next turn. */
   invalidateAnchors(): void {
-    const impl = this._impl as any
-    if (impl && typeof impl.invalidateAnchors === 'function') {
-      impl.invalidateAnchors()
-    }
+    this._roboticsImpl()?.invalidateAnchors()
   }
 
   getRoboticsTeamController(): RoboticsTeamController | null {
-    if (this._currentMode !== 'robotics') return null
-    const impl = this._impl as RoboticsTeamController | undefined
-    return impl ?? null
+    return this._roboticsImpl()?.getTeamController() ?? null
   }
 
   // ── Internal ────────────────────────────────────────────────────────────────
@@ -707,6 +638,9 @@ export class SessionRouter {
     overrides?: { autonomy?: AutonomyProfile; promptMode?: import('../core/dynamicPrompt.js').AgentMode },
   ): Promise<SessionImpl> {
     const projectDir = this._cfg.projectDir ?? process.cwd()
+    const resumeCheckpoint = overrides?.autonomy && this._explicitResume
+      ? readAutoCheckpoint(projectDir)
+      : null
     // Auto mode: build the completion gate (Verify) BEFORE the session so it can
     // be passed into the kernel config. Its dispatcher + goal are read LAZILY at
     // gate-invocation time (deep in a later turn), so closing over this._autoBridge
@@ -732,6 +666,33 @@ export class SessionRouter {
       ? () => renderRecentExperiences(autoExperienceStore)
       : undefined
 
+    const checkpointCoordinator = overrides?.autonomy
+      ? new AutoCheckpointCoordinator({
+          projectDir,
+          initialRevision: resumeCheckpoint?.revision ?? 0,
+          initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
+          getSnapshot: sessionId => {
+            const allTodos = getTodosForSession(sessionId)
+            return {
+              goal: this._autoGoal ?? undefined,
+              completedSteps: allTodos
+                .filter(todo => todo.status === 'completed')
+                .map(todo => todo.content),
+              pendingTodos: allTodos
+                .filter(todo => todo.status !== 'completed')
+                .map(todo => todo.content),
+              note: getProgressNoteForSession(sessionId),
+              artifacts: getArtifactsForSession(sessionId) ?? [],
+              activeSubAgentIds: [...new Set([
+                ...(this._autoBridge?.getSchedulerStats().activeTaskIds ?? []),
+                ...(this._autoBridge?.getWorktreeCoordinator()?.activeTasks() ?? []),
+              ])],
+            }
+          },
+        })
+      : null
+    this._autoCheckpointCoordinator = checkpointCoordinator
+
     const session = new MetaAgentSession({
       ...this._cfgAsConfig(),
       sessionId: this._resumeSessionId,
@@ -740,6 +701,11 @@ export class SessionRouter {
       verifyGate,
       driftGate,
       getExperienceRecallBlock,
+      onCheckpointBoundary: checkpointCoordinator
+        ? event => checkpointCoordinator.flush(event)
+        : undefined,
+      initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
+      initialCheckpointRevision: resumeCheckpoint?.revision ?? 0,
     })
     // Auto mode: conservative scheduler defaults (lower concurrency + a non-null
     // total budget) as unattended safety/cost guards (env still overrides).
@@ -754,6 +720,9 @@ export class SessionRouter {
       bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides.autonomy })
       const worktrees = new AutoWorktreeCoordinator(projectDir)
       if (worktrees.enabled) {
+        // Restore durable task→branch mappings and roll back any interrupted
+        // merge transaction before new sub-agents can start.
+        await worktrees.reconcile()
         bridge.setWorktreeCoordinator(worktrees)
         for (const tool of makeAutoWorktreeTools(bridge)) session.registerTool(tool)
       }

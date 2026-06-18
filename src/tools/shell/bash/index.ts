@@ -249,6 +249,7 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
   })
   return {
     name: 'bash',
+    abortSupport: 'cooperative',
     description,
     permission: {
       category: 'execute',

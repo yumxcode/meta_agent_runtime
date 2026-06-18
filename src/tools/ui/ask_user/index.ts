@@ -5,6 +5,7 @@ export async function createAskUserTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'ask_user',
+    abortSupport: 'non_cooperative',
     description,
     inputSchema: {
       type: 'object',

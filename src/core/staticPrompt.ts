@@ -100,18 +100,8 @@ function getSystemRulesSection(mode: StaticPromptMode): string {
   const provenanceRule = `\n\n**溯源 ID**：每次经过仪表化的工具调用都会生成格式为 \`prov-xxx\` 的唯一 ID，\
 以 \`[provenance: prov-xxx]\` 形式附加在结果末尾。引用计算结果时必须标注此 ID。`
 
-  // V&V 结果格式（约 150 token）——仅 campaign 模式下 V&V pipeline 激活时需要。
-  // Agentic / robotics：无 V&V 验证器，模型永远不会看到这些前缀，注入只会制造困惑。
-  const vvFormatRules = `\n\n**V&V 工具结果格式**：
-- 成功：\`{output}\\n\\n[provenance: prov-xxx]\`
-- V&V 预调用中止：\`[V&V PRE-CALL ABORT] Tool "x" was blocked...\\n\\n[NEXT STEPS]...\\n[provenance: prov-xxx]\`
-- V&V 后调用中止：\`[V&V POST-CALL ABORT] Output of "x" failed validation...\\n\\n[NEXT STEPS]...\\n[provenance: prov-xxx]\`
-- V&V 警告：\`[V&V WARNING] Tool "x" completed but output raised non-fatal concerns.\\n...\\n{output}\\n\\n[provenance: prov-xxx]\``
-
-  if (mode === 'campaign') {
-    return base + provenanceRule + vvFormatRules +
-      `\n\n**会话溯源作用域**：历史会话的溯源记录可能出现在溯源查询中，但为只读。`
-  }
+  // (Campaign's V&V result-format rules lived here; campaign now assembles its
+  // own prompt and never reaches buildStaticSystemPrompt, so they were removed.)
   if (mode === 'agentic') {
     // Agentic 有溯源工具（带 runtimeContext 时），但无 V&V pipeline
     return base + provenanceRule
@@ -204,11 +194,8 @@ function getStyleRulesSection(mode: StaticPromptMode): string {
   const provenanceCitation = `\n\n**数值引用**：以 \`值 单位 [provenance: prov-xxx]\` 格式呈现结果。\
 对于派生结果，引用完整的来源 ID 链。`
 
-  // V&V 警告输出规则（约 50 token）——仅 campaign 有 V&V pipeline。
-  const vvWarningRule = `\n\n**V&V 警告**：报告带有 V&V 标记的结果时，始终注明\
-"⚠ 低置信度——详见 [prov-xxx] 的验证说明。"不得静默省略警告。`
-
-  if (mode === 'campaign') return base + provenanceCitation + vvWarningRule
+  // (Campaign's V&V warning-output rule lived here; campaign assembles its own
+  // prompt and never reaches this builder, so it was removed.)
   if (mode === 'agentic')  return base + provenanceCitation
   // Robotics：工程报告格式 + 对话规则，无溯源引用，无 V&V
   return base
@@ -256,7 +243,7 @@ export const SYSTEM_PROMPT_DYNAMIC_BOUNDARY =
  *
  * @param mode — 目标模式，默认 'campaign'（向后兼容历史调用方）。
  */
-export function buildStaticSystemPrompt(mode: StaticPromptMode = 'campaign'): string {
+export function buildStaticSystemPrompt(mode: StaticPromptMode = 'agentic'): string {
   const sections = [
     getIdentitySection(mode),
     getSystemRulesSection(mode),

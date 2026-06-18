@@ -14,6 +14,40 @@ const TRUNCATION_NOTICE =
 
 /** Default per-tool execution timeout — 3 minutes. */
 const DEFAULT_TOOL_TIMEOUT_MS = 180_000
+const DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS = 3
+
+const timedOutRunningBySession = new Map<string, number>()
+
+function getMaxTimedOutRunningTools(): number {
+  const raw = process.env['META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS']
+  if (raw === undefined) return DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS
+  const parsed = Number.parseInt(raw, 10)
+  if (!Number.isFinite(parsed)) return DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS
+  return Math.max(1, parsed)
+}
+
+function incrementTimedOutRunning(sessionId: string): void {
+  timedOutRunningBySession.set(
+    sessionId,
+    (timedOutRunningBySession.get(sessionId) ?? 0) + 1,
+  )
+}
+
+function decrementTimedOutRunning(sessionId: string): void {
+  const next = (timedOutRunningBySession.get(sessionId) ?? 1) - 1
+  if (next <= 0) timedOutRunningBySession.delete(sessionId)
+  else timedOutRunningBySession.set(sessionId, next)
+}
+
+/** Test/observability hook for the auto-mode timeout circuit. */
+export function getTimedOutRunningToolCount(sessionId: string): number {
+  return timedOutRunningBySession.get(sessionId) ?? 0
+}
+
+/** Drop a session's counter during teardown; late promises may safely decrement from zero. */
+export function clearTimedOutRunningTools(sessionId: string): void {
+  timedOutRunningBySession.delete(sessionId)
+}
 
 /**
  * Read META_AGENT_TOOL_TIMEOUT_MS lazily (mirrors getConcurrencyLimit pattern)
@@ -123,6 +157,41 @@ export async function executeToolCall(
   }
   const parsedInput = parseResult.data
 
+  if (
+    context.autonomousMode &&
+    (!tool.abortSupport || tool.abortSupport === 'non_cooperative')
+  ) {
+    return {
+      toolUseId,
+      toolName,
+      resultMessage: makeToolResultMessage(
+        toolUseId,
+        `Tool "${toolName}" does not have an auto-safe abortSupport contract ` +
+        `(${tool.abortSupport ?? 'undeclared'}) and is disabled in auto mode.`,
+        true,
+        assistantMessageUuid,
+      ),
+      extraMessages: [],
+    }
+  }
+
+  const maxTimedOutRunning = getMaxTimedOutRunningTools()
+  const timedOutRunning = getTimedOutRunningToolCount(context.sessionId)
+  if (context.autonomousMode && timedOutRunning >= maxTimedOutRunning) {
+    return {
+      toolUseId,
+      toolName,
+      resultMessage: makeToolResultMessage(
+        toolUseId,
+        `Auto tool circuit open: ${timedOutRunning} timed-out tool call(s) are still running ` +
+        `(limit ${maxTimedOutRunning}). Wait for them to settle or resume in a fresh process.`,
+        true,
+        assistantMessageUuid,
+      ),
+      extraMessages: [],
+    }
+  }
+
   // ── Execute (with per-tool timeout) ─────────────────────────────────────────
   // Per-tool timeout: tool.timeoutMs overrides; undefined → kernel default.
   // 0 / non-finite → no timeout (e.g. sub-agent-dispatch tools that await
@@ -134,6 +203,8 @@ export async function executeToolCall(
   let callContext = context
   let onParentAbort: (() => void) | undefined
   let timeoutController: AbortController | undefined
+  let registeredAsTimedOutRunning = false
+  let callSettled = false
 
   if (useTimeout) {
     // Combine the parent abort signal with a timeout-driven controller so the
@@ -151,6 +222,16 @@ export async function executeToolCall(
 
   try {
     const callPromise = tool.call(parsedInput, callContext)
+    void callPromise.then(
+      () => {
+        callSettled = true
+        if (registeredAsTimedOutRunning) decrementTimedOutRunning(context.sessionId)
+      },
+      () => {
+        callSettled = true
+        if (registeredAsTimedOutRunning) decrementTimedOutRunning(context.sessionId)
+      },
+    )
     // Observe the race loser: when the timeout wins, callPromise keeps running
     // in the background (non-abort-aware tools ignore the signal). If it later
     // rejects, that would surface as an unhandledRejection — which long-running
@@ -164,6 +245,10 @@ export async function executeToolCall(
           new Promise<never>((_, reject) => {
             timer = setTimeout(() => {
               timeoutController!.abort()
+              if (!callSettled) {
+                registeredAsTimedOutRunning = true
+                incrementTimedOutRunning(context.sessionId)
+              }
               reject(
                 new Error(
                   `Tool "${toolName}" timed out after ${effectiveTimeoutMs}ms ` +

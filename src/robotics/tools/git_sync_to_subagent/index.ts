@@ -1,5 +1,5 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
-import type { GitWorkspaceManager } from '../../git/GitWorkspaceManager.js'
+import type { GitWorkspaceManager } from '../../../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 import type { SubAgentTaskId } from '../../../subagent/types.js'
 

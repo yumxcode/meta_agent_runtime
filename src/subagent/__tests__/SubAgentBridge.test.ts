@@ -1,4 +1,8 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { execFileSync } from 'child_process'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import type { SubAgentRecord, SubAgentTaskId } from '../types.js'
 
 const mockState = vi.hoisted(() => {
@@ -72,6 +76,31 @@ vi.mock('../SubAgentRunner.js', () => ({
 }))
 
 import { SubAgentBridge } from '../SubAgentBridge.js'
+import { CampaignEventBus } from '../CampaignEventBus.js'
+import { AutoWorktreeCoordinator } from '../../core/auto/AutoWorktreeCoordinator.js'
+
+function git(cwd: string, args: string[]): string {
+  return execFileSync('git', args, {
+    cwd,
+    encoding: 'utf-8',
+    env: {
+      ...process.env,
+      GIT_AUTHOR_NAME: 'test',
+      GIT_AUTHOR_EMAIL: 'test@example.com',
+      GIT_COMMITTER_NAME: 'test',
+      GIT_COMMITTER_EMAIL: 'test@example.com',
+    },
+  })
+}
+
+function initRepo(dir: string): void {
+  git(dir, ['init', '-q', '-b', 'main'])
+  git(dir, ['config', 'user.email', 'test@example.com'])
+  git(dir, ['config', 'user.name', 'test'])
+  writeFileSync(join(dir, 'README.md'), 'base\n')
+  git(dir, ['add', '.'])
+  git(dir, ['commit', '-q', '-m', 'init'])
+}
 
 function waitFor(predicate: () => boolean, timeoutMs = 1000): Promise<void> {
   const start = Date.now()
@@ -185,5 +214,98 @@ describe('SubAgentBridge scheduler', () => {
         config: { taskDescription: 'second', maxBudgetUsd: 0.4 },
       }),
     ).rejects.toThrow(/budget exceeded/)
+  })
+
+  it('internal safety-gate tasks bypass the shared budget cap', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 1,
+      maxQueuedSubAgents: 4,
+      startDelayMs: 0,
+      maxTotalSubAgentBudgetUsd: 1,
+    })
+    // Consume almost the whole cap with a normal (research-style) task.
+    await bridge.spawnSubAgent({ config: { taskDescription: 'research', maxBudgetUsd: 0.9 } })
+    // A second normal task over the cap is rejected...
+    await expect(
+      bridge.spawnSubAgent({ config: { taskDescription: 'more research', maxBudgetUsd: 0.5 } }),
+    ).rejects.toThrow(/budget exceeded/)
+    // ...but an internal safety-gate task (verify/drift) still spawns — the
+    // completion gate must never be silently disabled by research spend.
+    const gate = await bridge.spawnSubAgent({
+      config: { taskDescription: 'verify', maxBudgetUsd: 0.5, internal: true },
+    })
+    expect(gate.taskId).toBeTruthy()
+  })
+
+  it('internal safety-gate tasks bypass the queue-full cap', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 1,
+      maxQueuedSubAgents: 1,
+      startDelayMs: 0,
+    })
+    await bridge.spawnSubAgent({ config: { taskDescription: 'first' } })
+    await bridge.spawnSubAgent({ config: { taskDescription: 'second' } })
+    // Normal task is rejected once running+queued capacity is exhausted...
+    await expect(
+      bridge.spawnSubAgent({ config: { taskDescription: 'third' } }),
+    ).rejects.toThrow(/queue is full/)
+    // ...but an internal gate task jumps the queue and is accepted.
+    const gate = await bridge.spawnSubAgent({
+      config: { taskDescription: 'verify', internal: true },
+    })
+    expect(gate.taskId).toBeTruthy()
+  })
+})
+
+describe('SubAgentBridge isolated-write contract', () => {
+  it('fails closed when isolated_write is requested without a git coordinator', async () => {
+    const bridge = new SubAgentBridge(`isolated-${crypto.randomUUID()}`)
+    try {
+      await expect(bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'write code',
+          workspaceMode: 'isolated_write',
+        },
+      })).rejects.toThrow(/requires an auto-mode git worktree coordinator/)
+    } finally {
+      await bridge.dispose()
+    }
+  })
+
+  it('automatically finalizes an isolated worktree on completion', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'bridge-isolated-'))
+    initRepo(repo)
+    const sessionId = `isolated-${crypto.randomUUID()}`
+    const bridge = new SubAgentBridge(sessionId, { startDelayMs: 0 })
+    const coordinator = new AutoWorktreeCoordinator(repo)
+    bridge.setWorktreeCoordinator(coordinator)
+    try {
+      const task = await bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'write code',
+          workspaceMode: 'isolated_write',
+        },
+      })
+      await waitFor(() => mockState.runners.some(r => r.taskId === task.taskId))
+      const record = mockState.tasks.get(task.taskId)!
+      writeFileSync(join(record.config.projectDir!, 'feature.txt'), 'done\n')
+      completeTask(task.taskId)
+      const completed = mockState.tasks.get(task.taskId)!.result!
+      CampaignEventBus.emit('subagent:completed', {
+        taskId: task.taskId,
+        parentSessionId: sessionId,
+        result: completed,
+      })
+
+      await waitFor(() =>
+        coordinator.recordFor(task.taskId)?.phase === 'awaiting_merge',
+      )
+      expect(coordinator.recordFor(task.taskId)?.finalizedCommit).toBeTruthy()
+      expect(git(record.config.projectDir!, ['status', '--porcelain'])).toBe('')
+      expect(bridge.drainNotifications().join('\n')).toContain('等待 auto_merge_subagent')
+    } finally {
+      await bridge.dispose()
+      rmSync(repo, { recursive: true, force: true })
+    }
   })
 })

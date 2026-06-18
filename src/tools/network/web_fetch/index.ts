@@ -346,6 +346,7 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'web_fetch',
+    abortSupport: 'cooperative',
     description,
     ...(options.maxResultSizeChars !== undefined
       ? { maxResultSizeChars: options.maxResultSizeChars }

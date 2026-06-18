@@ -12,18 +12,19 @@
  * write experiences) lives in core/auto/learn and is injected via
  * KernelConfig.driftGate. The kernel never imports it.
  *
- * Trigger policy (double safety, evaluated in the loop):
- *   • a compaction boundary just occurred this turn (primary — a natural,
- *     structural "a lot has accumulated, take stock" point), OR
- *   • DRIFT_TURN_INTERVAL turns have elapsed since the last drift check
- *     (fallback so a short-but-drifting run still gets examined).
+ * Trigger policy (double gate, evaluated in the loop):
+ *   • a durable checkpoint revision advanced since the previous drift; AND
+ *   • DRIFT_TURN_INTERVAL tool batches completed since the previous drift.
+ *
+ * Compaction has its own before/after checkpoint boundaries but does not trigger
+ * drift by itself.
  */
 
-/** Turn-count fallback trigger when no compaction boundary has fired. */
-export const DRIFT_TURN_INTERVAL = 5
+/** Completed tool batches required between drift checks. */
+export const DRIFT_TURN_INTERVAL = 30
 
 /** Why a drift check was triggered (observability + judge hint). */
-export type DriftReason = 'compaction_boundary' | 'turn_interval'
+export type DriftReason = 'turn_interval'
 
 /** Structured verdict returned by the drift agent. */
 export interface DriftVerdict {
@@ -37,6 +38,13 @@ export interface DriftVerdict {
   note?: string
   /** IDs of experiences the agent wrote this round (observability only). */
   experiencesWritten?: string[]
+  /**
+   * True when the gate did NOT actually run (fail-open): goal/checkpoint missing,
+   * drift agent could not spawn / timed out, or an internal error. `drifted` is
+   * false so a broken checker never derails a healthy run, but the loop surfaces
+   * a visible warning instead of silently skipping.
+   */
+  skipped?: boolean
 }
 
 /** Arguments the loop hands the drift gate. */

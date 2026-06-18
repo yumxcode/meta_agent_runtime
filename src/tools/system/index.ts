@@ -23,6 +23,7 @@ import { createSkillTool } from './skill/index.js'
 import { createConfigTool } from './config/index.js'
 import { createMemoryWriteTool } from './memory_write/index.js'
 import { createMemoryDeleteTool } from './memory_delete/index.js'
+import { AUTO_DENIED_TOOL_NAMES } from '../../core/modes.js'
 
 export interface SystemToolsOptions {
   /**
@@ -48,7 +49,7 @@ export interface SystemToolsOptions {
 
 export async function createSystemTools(options: SystemToolsOptions = {}): Promise<MetaAgentTool[]> {
   const planModeRef = options.planModeRef ?? { active: false }
-  return Promise.all([
+  const tools = await Promise.all([
     createSleepTool(),
     createCronCreateTool(),
     createCronDeleteTool(),
@@ -60,4 +61,7 @@ export async function createSystemTools(options: SystemToolsOptions = {}): Promi
     createMemoryWriteTool({ mode: options.mode ?? 'agentic', domain: options.domain }),
     createMemoryDeleteTool(),
   ])
+  if (options.mode !== 'auto') return tools
+  const denied = new Set<string>(AUTO_DENIED_TOOL_NAMES)
+  return tools.filter(tool => !denied.has(tool.name))
 }

@@ -23,13 +23,13 @@
  */
 
 import { readFile, unlink, mkdir } from 'fs/promises'
-import { atomicWriteJson } from '../persist/index.js'
+import { atomicWriteJson } from '../../core/persist/index.js'
 import { join, dirname } from 'path'
 import { homedir } from 'os'
-import { META_AGENT_HOME } from '../metaAgentHome.js'
+import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
 
-import { MetaAgentContextStore, CampaignStateStore } from '../../campaign/index.js'
+import { MetaAgentContextStore, CampaignStateStore } from '../index.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Types

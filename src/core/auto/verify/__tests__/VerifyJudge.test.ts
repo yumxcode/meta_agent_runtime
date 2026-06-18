@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
-import { parseVerdict } from '../VerifyJudge.js'
+import { mkdtempSync, rmSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
+import { makeAutoVerifyGate, parseVerdict } from '../VerifyJudge.js'
 import { buildVerifyRejectionPrompt } from '../../../../kernel/loop/VerifyGate.js'
+import type { ISubAgentDispatcher } from '../../../../subagent/ISubAgentDispatcher.js'
+import type { SubAgentRecord } from '../../../../subagent/types.js'
 
 describe('parseVerdict', () => {
   it('parses a fenced json verdict', () => {
@@ -64,5 +69,50 @@ describe('buildVerifyRejectionPrompt', () => {
     const p = buildVerifyRejectionPrompt({ done: false, unfinished: [], evidence: [] }, 1)
     expect(p).toContain('第 1 轮')
     expect(p).toContain('未给出具体项')
+  })
+})
+
+describe('makeAutoVerifyGate judge toolset', () => {
+  it('drops bash (read-only tools) when no git snapshot can be made', async () => {
+    // A non-git tmpdir: withReadonlySnapshot yields null, so the judge inspects
+    // the LIVE tree — where bash must NOT be available (the auto jail
+    // auto-approves in-workspace writes, so a bash-capable judge could mutate
+    // real source despite the read-only rubric).
+    const dir = mkdtempSync(join(tmpdir(), 'ma-verify-tools-'))
+    try {
+      const doneSummary = '```json\n{"done": true, "unfinished": [], "evidence": []}\n```'
+      let capturedAllowedTools: string[] | undefined
+      let capturedTask = ''
+      const completed = {
+        taskId: 't1',
+        status: 'completed',
+        result: { summary: doneSummary },
+      } as unknown as SubAgentRecord
+      const dispatcher: ISubAgentDispatcher = {
+        spawnSubAgent: async opts => {
+          capturedAllowedTools = opts.config.allowedTools
+          capturedTask = opts.config.taskDescription
+          return completed
+        },
+        getStatus: async () => completed,
+        cancelTask: async () => true,
+      }
+
+      const gate = makeAutoVerifyGate({ dispatcher, projectDir: dir, getGoal: () => 'do the thing' })
+      const verdict = await gate({
+        workspaceRoot: dir,
+        turnCount: 1,
+        round: 1,
+        signal: new AbortController().signal,
+      })
+
+      expect(capturedAllowedTools).toEqual(['read_file', 'grep', 'glob'])
+      expect(capturedAllowedTools).not.toContain('bash')
+      expect(capturedTask).not.toContain('确定性检查结果')
+      expect(capturedTask).not.toContain('typecheck')
+      expect(verdict.done).toBe(true)
+    } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
   })
 })

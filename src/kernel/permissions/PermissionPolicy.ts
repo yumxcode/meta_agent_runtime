@@ -3,7 +3,7 @@ import { homedir } from 'os'
 import { join, resolve } from 'path'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
-import type { AutonomyProfile, ToolPermissionDeclaration } from '../../core/types.js'
+import type { AutonomyProfile, ToolPermissionDeclaration } from '../types/Permissions.js'
 import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
 import { isInsideWorkspace } from '../../tools/fs/workspaceGuard.js'
 
@@ -222,15 +222,24 @@ function detectSensitiveBash(input: Record<string, unknown>): string | null {
 }
 
 /**
- * Autonomy-mode hardening: catch the RELATIVE workspace escapes that the
+ * Workspace-jail hardening: catch the RELATIVE workspace escapes that the
  * absolute-path scan in findWorkspaceViolation cannot see — `~`, `$HOME`, and a
- * leading `../` (or bare `..`) that climbs above the workspace root. Only used
- * when autonomy.lockWorkspace is set, so non-auto modes are unaffected.
+ * leading `../` (or bare `..`) that climbs above the workspace root.
+ *
+ * This runs for ANY jail-active bash/powershell call (see caller), not only auto
+ * mode: the absolute-path scan already hard-denies out-of-workspace absolute
+ * paths in every mode, so leaving the relative/home variants unchecked was a hole
+ * in that same jail (e.g. `cat ~/.ssh/id_rsa`, `cat ../../etc/passwd` slipped
+ * through in agentic/robotics). The jail is only active when the workspace is set
+ * and `allowOutsideWorkspace` is false — an operator who genuinely needs
+ * out-of-workspace access opts out via permissions.json
+ * (`workspace.allowOutsideWorkspace: true`), which disables jailActive and skips
+ * this check entirely.
  *
  * Deliberately conservative: it flags the clear home/parent escapes the design
  * calls out (`rm -rf ~`, `rm -rf $HOME`, `rm -rf ..`) without tripping on
  * internal `a/../b` (which stays inside). When in doubt the caller denies, which
- * for autonomous mode is the safe direction.
+ * is the safe direction for a workspace jail.
  *
  * It also catches the two filesystem-ROOT targets that the absolute-path scan in
  * findWorkspaceViolation cannot see, because they have no named first component:
@@ -325,6 +334,18 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` }
     }
 
+    // Autonomy capability boundary: some tools can mutate global/remote state
+    // that cannot be proven to stay inside the workspace jail. Deny them before
+    // any path checks or approval logic. This also covers tools manually
+    // registered by embedders, so filtering the standard toolset is not the
+    // only line of defence.
+    if (autonomy?.deniedTools?.includes(tool.name)) {
+      return {
+        behavior: 'deny',
+        reason: `Tool "${tool.name}" is unavailable in autonomous mode because its effects cannot be confined to the workspace.`,
+      }
+    }
+
     // jailActive: the workspace boundary is enforced for this tool, so any
     // path/cwd/absolute-bash-path escape has already been denied below this
     // point. Auto-approve (§autonomy) keys off this so it can only skip the
@@ -334,10 +355,13 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     if (jailActive) {
       const violation = findWorkspaceViolation(tool, record, workspaceRoot!, permission, allowTmp)
       if (violation) return { behavior: 'deny', reason: violation }
-      // Auto-mode hardening: the absolute-path scan misses relative escapes
-      // (~, $HOME, leading ../) and bare filesystem-root targets (/, /*).
-      // Catch them before any auto-approve can fire.
-      if (autonomy?.lockWorkspace && (tool.name === 'bash' || tool.name === 'powershell')) {
+      // Workspace-jail hardening (ALL modes, not just auto): the absolute-path
+      // scan misses relative escapes (~, $HOME, leading ../) and bare
+      // filesystem-root targets (/, /*). Catch them here so the jail is
+      // consistent with the absolute-path denial above, and before any
+      // auto-approve can fire. Opt out via workspace.allowOutsideWorkspace
+      // (which turns jailActive off and skips this block).
+      if (tool.name === 'bash' || tool.name === 'powershell') {
         const escape = findBashRelativeEscape(record)
         if (escape) return { behavior: 'deny', reason: escape }
       }

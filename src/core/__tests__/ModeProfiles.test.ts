@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest'
-import { MODE_PROFILES, MODE_WEIGHT, type SessionMode } from '../modes.js'
+import { AUTO_DENIED_TOOL_NAMES, MODE_PROFILES, MODE_WEIGHT, type SessionMode } from '../modes.js'
 import { buildStaticSystemPrompt } from '../staticPrompt.js'
 import { buildCurrentModeSection } from '../dynamicPrompt.js'
 import { SectionRegistry } from '../systemPromptSections.js'
@@ -35,6 +35,7 @@ describe('MODE_PROFILES single source of truth', () => {
     expect(MODE_PROFILES.auto.agenticOverrides?.autonomy).toMatchObject({
       autoApproveInWorkspace: true,
       lockWorkspace: true,
+      deniedTools: AUTO_DENIED_TOOL_NAMES,
     })
   })
 

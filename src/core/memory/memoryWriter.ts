@@ -149,6 +149,12 @@ export async function runPostSessionMemoryWriter(
     apiKey,
     baseURL,
   } = opts
+  // Auto mode treats the process-wide memory store as read-only. Memory recall
+  // still happens while building prompts, but unattended runs must never queue
+  // or persist global profile/feedback changes — even during shutdown.
+  if (mode === 'auto') {
+    return { attempted: false, queued: [], skipped: ['read_only_mode'] }
+  }
   // When the caller doesn't supply a store, use the process-wide global one and
   // make sure its persisted entries are loaded — otherwise an empty in-memory
   // array would clobber pending entries already on disk on the next persist.

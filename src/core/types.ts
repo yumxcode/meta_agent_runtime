@@ -156,6 +156,8 @@ export interface ToolCallContext {
    * the shared planModeRef on the session.
    */
   planMode?: boolean
+  /** True when invoked by an unattended auto-mode kernel loop. */
+  autonomousMode?: boolean
 
   // ── Sandbox ───────────────────────────────────────────────────────────────
   /**
@@ -225,73 +227,33 @@ export type ToolDescription =
   | string
   | ((ctx: ToolDescriptionContext) => Promise<string>)
 
-export type ToolPermissionCategory =
-  | 'read'
-  | 'write'
-  | 'execute'
-  | 'network'
-  | 'config'
-  | 'state'
-
-/**
- * Autonomy profile — the "auto mode" capability switches.
- *
- * Deliberately generic: the kernel PermissionPolicy and MetaAgentSession act on
- * these booleans, NOT on a SessionMode string, so the routing layer is the only
- * place that knows `mode === 'auto'`. This keeps the permission/sandbox layers
- * decoupled from the mode enum (no `if (mode === 'auto')` below routing).
- */
-export interface AutonomyProfile {
-  /**
-   * When true, sensitive operations whose paths are ALL inside the workspace are
-   * auto-approved without the interactive confirmation guard. Paths outside the
-   * workspace are still hard-denied (never prompted). This is the source of
-   * auto mode's "don't stop to ask" behaviour.
-   */
-  autoApproveInWorkspace?: boolean
-  /**
-   * When true, the workspace jail cannot be unlocked by configuration:
-   * `permissions.json`'s `allowOutsideWorkspace` is forced to false, and the OS
-   * sandbox is fail-closed (no silent unsandboxed fallback when bwrap /
-   * sandbox-exec is unavailable).
-   */
-  lockWorkspace?: boolean
-}
-
-export interface ToolPermissionDeclaration {
-  /** Broad capability class used by the kernel permission policy. */
-  category?: ToolPermissionCategory
-  /** Input fields that contain filesystem paths and must stay in workspace. */
-  pathFields?: string[]
-  /** Input field that contains a working directory, usually bash.cwd. */
-  cwdField?: string
-  /** Whether path/cwd fields are constrained to the workspace. Default: true for path-aware tools. */
-  requiresWorkspace?: boolean
-  /** Whether calls should go through interactive confirmation when available. */
-  sensitive?: boolean
-  /** Plan-mode behavior for this tool. Default: ask for non-concurrency-safe tools. */
-  planMode?: 'allow' | 'ask' | 'deny'
-  /**
-   * OS-level sandbox policy for this tool's execution.
-   *
-   * When set, MetaAgentSession._wrapTool() injects a SandboxHandle into the
-   * ToolCallContext before each call, and the tool reads ctx.sandboxHandle to
-   * wrap its subprocess execution.
-   *
-   * - true            → default policy: workspace root writable, network unrestricted
-   * - SandboxConfig   → custom policy (e.g. deny network, extra write paths)
-   * - undefined       → no OS-level sandbox (default)
-   *
-   * Tools that execute arbitrary shell commands (e.g. BashTool) should declare
-   * sandbox: true so they are automatically sandboxed even in the main agent
-   * session, not just inside isolated sub-agents.
-   */
-  sandbox?: true | import('../sandbox/types.js').SandboxConfig
-}
+// Permission/autonomy type contracts are OWNED by the kernel (the bottom layer
+// that enforces them) and re-exported here for backward compatibility. This
+// removes the former kernel→core type inversion: the kernel imports these from
+// its own kernel/types/Permissions.ts instead of reaching up into core.
+// See architecture-review-2026-06-18.md §1.3.
+// Imported (not just re-exported) so they are also usable locally below
+// (e.g. MetaAgentTool.permission).
+import type {
+  ToolPermissionCategory,
+  AutonomyProfile,
+  ToolPermissionDeclaration,
+} from '../kernel/types/Permissions.js'
+export type { ToolPermissionCategory, AutonomyProfile, ToolPermissionDeclaration }
 
 /** Base tool interface — Claude Code compatible */
 export interface MetaAgentTool {
   name: string
+  /**
+   * Abort contract for long-running hosts.
+   *
+   * - cooperative: the tool observes context.abortSignal and settles promptly.
+   * - bounded: the operation is intrinsically short/bounded and does not spawn
+   *   background work that can outlive the returned promise.
+   *
+   * Every tool must declare one. Auto mode rejects undeclared kernel tools.
+   */
+  abortSupport?: 'cooperative' | 'bounded' | 'non_cooperative'
   /**
    * Tool description sent to the model via the Anthropic `tools[]` parameter.
    *

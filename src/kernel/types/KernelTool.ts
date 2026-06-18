@@ -6,7 +6,7 @@
  */
 import type { KernelMessage } from './KernelMessage.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
-import type { ToolPermissionDeclaration } from '../../core/types.js'
+import type { ToolPermissionDeclaration } from './Permissions.js'
 
 // ── Tool description context ──────────────────────────────────────────────────
 
@@ -34,6 +34,8 @@ export interface KernelToolContext {
   messages: readonly KernelMessage[]                // current message history
   workspaceRoot?: string
   planMode?: boolean
+  /** True for unattended auto-mode loops. */
+  autonomousMode?: boolean
   askUser?: (question: string, choices?: string[]) => Promise<string>
   /** Escape hatch for mode-specific context (Campaign, Robotics, etc.) */
   extensions?: Record<string, unknown>
@@ -94,6 +96,8 @@ export interface KernelTool {
   /** JSON Schema version of the input — sent verbatim to the Anthropic API */
   readonly inputJSONSchema: ToolInputJSONSchema
   readonly permission?: ToolPermissionDeclaration
+  /** Explicit cancellation/lifetime contract; auto mode rejects undeclared tools. */
+  readonly abortSupport?: 'cooperative' | 'bounded' | 'non_cooperative'
 
   /**
    * Execute the tool.

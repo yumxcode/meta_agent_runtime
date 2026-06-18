@@ -32,11 +32,7 @@ export function createProgressNoteTool(projectDir: string, sessionId: string): M
         // Optionally update the current phase label in state
         const phase = input['current_phase'] as string | undefined
         if (phase) {
-          const state = await RoboticsProjectStore.findBySession(projectDir, sessionId)
-          if (state) {
-            state.currentPhase = phase
-            await RoboticsProjectStore.save(state)
-          }
+          await RoboticsProjectStore.setCurrentPhase(projectDir, sessionId, phase)
         }
 
         return {

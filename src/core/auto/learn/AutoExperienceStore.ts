@@ -17,7 +17,7 @@
  * turn is cheap and write is synchronous-ish.
  */
 import { join } from 'path'
-import { ExperienceStore } from '../../../robotics/ExperienceStore.js'
+import { ExperienceStore } from '../../../infra/knowledge/ExperienceStore.js'
 import type { MetaAgentTool, ToolResult } from '../../types.js'
 
 /** Auto experiences live under the project so they're per-workspace + inspectable. */
@@ -31,6 +31,14 @@ export function createAutoExperienceStore(projectDir: string): ExperienceStore {
 
 /** How many recent experiences to surface to the main agent each turn. */
 const RECALL_LIMIT = 8
+
+/**
+ * Hard cap on auto experiences kept per workspace. The drift agent may write on
+ * every check (~every few turns) over a long unattended run, so without a cap
+ * the store grows unbounded with low-signal, near-duplicate lessons. When the
+ * cap is exceeded after a write, the OLDEST entries are pruned.
+ */
+const MAX_STORED_EXPERIENCES = 60
 
 /**
  * Render the most relevant recent experiences as a system-prompt block, or null
@@ -87,22 +95,60 @@ interface AutoExperienceInput {
   tags?: string[]
 }
 
-/** Persist an auto experience directly (no pending-review queue). Returns the id. */
+/**
+ * Drop the oldest entries until the store is back under MAX_STORED_EXPERIENCES.
+ * Best-effort: any failure is swallowed (pruning must never break a write).
+ */
+async function pruneToCapacity(store: ExperienceStore): Promise<void> {
+  try {
+    const ids = await store.listIds()
+    if (ids.length <= MAX_STORED_EXPERIENCES) return
+    const entries = (
+      await Promise.all(ids.map(async id => ({ id, e: await store.load(id) })))
+    ).filter((x): x is { id: string; e: NonNullable<typeof x.e> } => x.e != null)
+    // Oldest first; delete the overflow.
+    entries.sort((a, b) => a.e.createdAt - b.e.createdAt)
+    const overflow = entries.length - MAX_STORED_EXPERIENCES
+    for (let i = 0; i < overflow; i++) {
+      await store.delete(entries[i]!.id).catch(() => undefined)
+    }
+  } catch {
+    /* best-effort capacity guard */
+  }
+}
+
+/**
+ * Persist an auto experience directly (no pending-review queue). Returns the id.
+ *
+ * Dedupes by title: the drift agent tends to re-derive the same lesson across
+ * checks, so if a recent entry already carries the same (trimmed) title we
+ * return that id instead of writing a near-duplicate. After a real write the
+ * store is pruned back under its capacity cap.
+ */
 export async function writeAutoExperience(
   store: ExperienceStore,
   input: AutoExperienceInput,
   sourceSessionId?: string,
 ): Promise<string> {
+  // Dedup: skip writing when an existing entry already has this exact title.
+  const title = input.title.slice(0, 80)
+  try {
+    const existing = await store.search({ keyword: title, limit: 20 })
+    const dup = existing.find(e => e.title === title)
+    if (dup) return dup.id
+  } catch {
+    /* dedup is best-effort; fall through to a normal write */
+  }
   // Fold the provenance note into evidenceRefs so it's always retained.
   const evidenceRefs = [
     ...(input.error_source ? [`source: ${input.error_source}`] : []),
     ...(input.evidence ?? []),
   ]
-  return store.write({
+  const id = await store.write({
     domain: 'general',
     tags: input.tags ?? [],
     difficulty: 'medium',
-    title: input.title.slice(0, 80),
+    title,
     problem: input.problem.slice(0, 500),
     solution: input.solution.slice(0, 800),
     outcome: {
@@ -116,6 +162,8 @@ export async function writeAutoExperience(
     evidenceRefs: evidenceRefs.length ? evidenceRefs : undefined,
     sourceSessionId,
   })
+  await pruneToCapacity(store)
+  return id
 }
 
 /**
@@ -138,7 +186,12 @@ export function createAutoExperienceWriteTool(
       '没有确凿来源就不要写，避免污染经验库。',
     inputSchema: {
       type: 'object',
-      required: ['title', 'problem', 'solution', 'success', 'outcome_summary', 'error_source'],
+      // error_source is NOT a hard requirement: the "must cite a source" rule is
+      // a SOFT constraint enforced by the drift rubric (and the description
+      // below), not a schema rejection. Listing it under `required` would let a
+      // schema-validating layer reject calls the implementation intends to
+      // accept (it records when present, nudges when absent).
+      required: ['title', 'problem', 'solution', 'success', 'outcome_summary'],
       properties: {
         title: { type: 'string', description: '一句话标题（≤80 字）' },
         problem: { type: 'string', description: '当时要解决的问题（≤500 字）' },

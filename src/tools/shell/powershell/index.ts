@@ -17,6 +17,7 @@ export async function createPowerShellTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'powershell',
+    abortSupport: 'cooperative',
     description,
     permission: {
       category: 'execute',

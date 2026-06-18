@@ -1,5 +1,5 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
-import type { GitWorkspaceManager } from '../../git/GitWorkspaceManager.js'
+import type { GitWorkspaceManager } from '../../../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 import type { SubAgentTaskId } from '../../../subagent/types.js'
 
@@ -60,9 +60,11 @@ export function createGitMergeSubAgentTool(
           commitHashes: input['commit_hashes'] as string[] | undefined,
         })
 
-        // Clean up the worktree after merge
+        // Clean up the worktree after merge. clearGitRefs drops the now-finalized
+        // task's subAgentBranches/forkPoints entries (read above) so per-project
+        // git state doesn't grow one entry per completed task (P1-3 residual).
         await gitMgr.removeWorktree(taskId, { deleteBranch: false })
-        await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId)
+        await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId, { clearGitRefs: true })
 
         return {
           content: [

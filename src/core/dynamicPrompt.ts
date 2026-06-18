@@ -44,8 +44,8 @@ import {
   type SystemPromptSection,
 } from './systemPromptSections.js'
 
-import { MetaAgentContextStore, USER_CHECKPOINT_PHASES, MACHINE_PHASES } from '../campaign/index.js'
-import { campaignRegistry } from '../campaign/registry.js'
+// Campaign-mode prompt sections (D4b/D8/D9/D10) now live in campaign/promptSections.ts
+// — the shared builder no longer imports campaign internals (architecture-review §1.1).
 import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './memory/paths.js'
 import {
@@ -54,7 +54,7 @@ import {
 } from './memory/memdir.js'
 import { findRelevantMemories } from './memory/findRelevantMemories.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { buildSubAgentNotificationSection } from '../subagent/SubAgentBridge.js'
+import { buildSubAgentNotificationSection } from '../subagent/notificationSection.js'
 import type { TaskContract } from './contract/types.js'
 import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/system/skill/index.js'
 
@@ -65,38 +65,6 @@ import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/
 import { MODE_PROFILES } from './modes.js'
 import type { SessionMode } from './modes.js'
 export type AgentMode = SessionMode
-
-// ─────────────────────────────────────────────────────────────────────────────
-// P2: D8/D10 micro-cache — 500 ms TTL
-//
-// MetaAgentContextStore already has a 2 s TTL cache, but both D8 and D10
-// call read() (or buildInjectionBlock()) independently within the same
-// submit() turn.  This module-level cache ensures both sections hit the same
-// in-process value without even touching MetaAgentContextStore's own cache.
-//
-// Invalidated whenever CampaignMonitor writes a new active-context.metaagent —
-// the 500 ms window means at most one extra stale turn before the update lands.
-// ─────────────────────────────────────────────────────────────────────────────
-
-const D8_D10_CACHE_TTL_MS = 500
-
-interface _CtxCacheEntry {
-  ctx: Awaited<ReturnType<typeof MetaAgentContextStore.read>>
-  ts:  number
-}
-
-let _ctxCache: _CtxCacheEntry | null = null
-
-/** Read MetaAgentContextStore with a 500 ms in-process TTL. */
-async function _readCtxCached() {
-  const now = Date.now()
-  if (_ctxCache && (now - _ctxCache.ts) < D8_D10_CACHE_TTL_MS) {
-    return _ctxCache.ctx
-  }
-  const ctx = await MetaAgentContextStore.read()
-  _ctxCache = { ctx, ts: now }
-  return ctx
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // D1b — Memory Content  [DANGEROUS_uncached]
@@ -512,7 +480,8 @@ export function buildOutputStyleSection(style?: OutputStyle): SystemPromptSectio
 
 export function buildEngineeringStandardsSection(mode: AgentMode): SystemPromptSection {
   return systemPromptSection('engineering_standards', () => {
-    if (mode !== 'agentic' && mode !== 'campaign') return null
+    // agentic only (campaign assembles its own prompt and never reaches here).
+    if (mode !== 'agentic') return null
     return `\
 ## Engineering Calculation Standards
 
@@ -568,30 +537,14 @@ const TOOL_PROVENANCE_RULES = `\
 
 **\`get_computation_lineage\`** — 追踪哪些计算影响了某个结果。`
 
-/** V&V response rules — campaign mode only. */
-const TOOL_VV_RULES = `\
-### V&V 响应
-
-**\`[V&V PRE-CALL ABORT]\`** — 工具**未执行**。
-- 修正触发违规的具体输入后重试。不得以相同输入重试。
-- 若输入看起来正确，调用 \`get_provenance(<id>)\` 查看完整验证详情。
-
-**\`[V&V POST-CALL ABORT]\`** — 工具**已执行**，但输出未通过验证。
-- 调用 \`get_provenance(<id>)\` 查看工具实际返回的内容。
-- 不得以相同输入重试——工具会产生相同的无效输出。
-
-**\`[V&V WARNING]\`** — 工具执行成功，但输出存在非致命问题。
-- 结果可用，但置信度较低。
-- 向用户呈现该结果时，始终注明"⚠ 低置信度结果——详见 [prov-xxx] 的验证说明。"`
-
 export function buildToolInvocationSection(mode: AgentMode): SystemPromptSection {
   return systemPromptSection('tool_invocation_protocol', () => {
     const parts: string[] = ['## 工具调用协议', '', '### 通用规则', '', TOOL_GENERAL_RULES]
 
+    // agentic gets provenance tool guidance. campaign (which also showed V&V
+    // response rules) assembles its own prompt and never reaches this builder.
     if (mode === 'agentic') {
       parts.push('', TOOL_PROVENANCE_RULES)
-    } else if (mode === 'campaign') {
-      parts.push('', TOOL_PROVENANCE_RULES, '', TOOL_VV_RULES)
     }
     // robotics: general rules only — no provenance tools, no V&V
 
@@ -599,50 +552,7 @@ export function buildToolInvocationSection(mode: AgentMode): SystemPromptSection
   })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// D4b — Campaign Domain Knowledge  [memoized per mode]
-//
-// Injected only in campaign mode.  Contains general DOE/campaign conceptual
-// knowledge (phase graph, fidelity levels, Pareto, escalation thresholds).
-// Per-session campaign state is in D8 (campaign_context); per-phase guidance
-// is in D10 (phase_guidance).
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function buildCampaignKnowledgeSection(mode: AgentMode): SystemPromptSection {
-  return systemPromptSection('campaign_knowledge', () => {
-    if (mode !== 'campaign') return null
-    return `\
-## Campaign Domain Knowledge
-
-**Campaign system**: Campaigns are plugin-based. Each plugin type (e.g. \`doe\`, \`paper-repro\`) \
-defines its own phase graph. The DOE phase graph is the default reference; \
-other plugins may use a subset or a different structure — always inspect \`campaignType\` before assuming DOE phases apply.
-
-**DOE campaign phases** (state machine):
-- \`IDLE\` → \`SAMPLING\` → \`EVALUATING_L0\` → \`PARETO_READY_L0\`
-- \`PARETO_READY_L0\` → \`ESCALATING_L1\` → \`PARETO_READY_L1\` (if L1 warranted)
-- \`PARETO_READY_L1\` → \`ESCALATING_L2\` → \`PARETO_READY_L2\` (if L2 warranted)
-- Any active phase → \`REPORTING\` → \`DONE\`
-- Any active phase → \`FAILED\` (on timeout, constraint violation, or explicit failure)
-
-**Fidelity levels**:
-- L0 (analytical): Fast closed-form or empirical models. Use for initial screening — 2–3 sig figs.
-- L1 (surrogate): Trained surrogate models. Higher accuracy, moderate compute — 3–4 sig figs.
-- L2 (high-fidelity): Full simulation (FEA, CFD, etc.). Slowest, highest accuracy — 4–5 sig figs.
-
-**Escalation thresholds** (PARETO_READY → ESCALATING):
-- Escalate L0 → L1 if: Pareto hypervolume improvement < 2 % across the last 3 iterations, \
-OR fewer than 5 non-dominated designs exist, OR a high-gradient region has < 3 evaluated points.
-- Escalate L1 → L2 if: top-3 Pareto designs are within 5 % of each other on all objectives \
-(L1 cannot disambiguate them) AND L2 cost is within budget.
-- Proceed to REPORTING if neither condition applies at the current fidelity level.
-- Always present Pareto evidence and receive explicit user acknowledgment before escalating.
-
-**Pareto front**: The set of non-dominated designs — no other design in the evaluated set \
-is strictly better on all objectives simultaneously. Improvement in Pareto hypervolume \
-across iterations signals that the design space is not yet fully explored.`
-  })
-}
+// D4b (Campaign Domain Knowledge) moved to campaign/promptSections.ts.
 
 // ─────────────────────────────────────────────────────────────────────────────
 // D7 — Summarise Tool Results
@@ -653,19 +563,9 @@ across iterations signals that the design space is not yet fully explored.`
 export function buildSummarizeToolResultsSection(mode: AgentMode = 'agentic'): SystemPromptSection {
   return systemPromptSection('summarize_tool_results', () => {
     // 关键结果的判定条件因模式而异：
-    //   campaign — 有 V&V 状态（⚠/✗）和溯源 ID，需全部标注
     //   agentic  — 有溯源 ID，无 V&V 状态
     //   robotics — 无溯源 ID，无 V&V；只需追踪数值结果用于后续步骤
-    if (mode === 'campaign') {
-      return (
-        `## 中间结果追踪\n\n` +
-        `工具调用产生关键结果时，必须在后续分析或最终报告中准确引用。` +
-        `以下情况视为"关键结果"：` +
-        `（a）用于后续计算，（b）将出现在最终报告中，（c）V&V 状态为 ⚠ 或 ✗。` +
-        `始终包含数值、单位和溯源 ID。` +
-        `不要复述无决策价值的普通工具输出。`
-      )
-    }
+    // (campaign assembles its own prompt and never reaches this builder.)
     if (mode === 'agentic') {
       return (
         `## 中间结果追踪\n\n` +
@@ -687,169 +587,6 @@ export function buildSummarizeToolResultsSection(mode: AgentMode = 'agentic'): S
   })
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// D8 — Campaign Context  [DANGEROUS_uncached]
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function buildCampaignContextSection(): SystemPromptSection {
-  return DANGEROUS_uncachedSystemPromptSection(
-    'campaign_context',
-    async () => {
-      // P2: Use micro-cached read so D8 and D10 share one disk round-trip per turn.
-      const ctx = await _readCtxCached()
-      if (!ctx || ctx.activeCampaigns.length === 0) return null
-      const blocks = ctx.activeCampaigns.map(c => c.contextBlock)
-      return ['## 活跃工程 Campaign', ...blocks].join('\n\n')
-    },
-    'Campaign state updates every few seconds during active runs; stale context ' +
-    'would cause the agent to miss phase transitions and act on outdated Pareto fronts.',
-  )
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// D9 — Session Provenance  [memoized, invalidated on new records]
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function buildSessionProvenanceSection(
-  rtx: RuntimeContext,
-  sessionStartMs: number,
-): SystemPromptSection {
-  return systemPromptSection('session_provenance', async () => {
-    try {
-      const records = await rtx.provenanceTracker.list({ since: sessionStartMs })
-      if (records.length === 0) return null
-
-      // Up to 10 records: aborts/warnings first (newest-first within each group),
-      // then successes (newest-first). Format mirrors compact Chapter 4:
-      //   [prov-xxx] tool_name(key=val, ...) → ✓/⚠/✗  fidelity=L0/L1/L2  HH:MMZ
-      // Use `list_recent_results` for the full session history.
-      type VVEntry = { passed: boolean; severity?: string }
-      const hasFailure = (r: { validationResults: VVEntry[] }) =>
-        r.validationResults.some(v => !v.passed)
-      const hasWarning = (r: { validationResults: VVEntry[] }) =>
-        r.validationResults.some(v => v.passed && v.severity === 'warning')
-      const isProblematic = (r: { validationResults: VVEntry[] }) =>
-        hasFailure(r) || hasWarning(r)
-      const problems  = records.filter(isProblematic).reverse()
-      const successes = records.filter(r => !isProblematic(r)).reverse()
-      const recent = [...problems, ...successes].slice(0, 10)
-      const lines = recent.map(r => {
-        const vv = hasFailure(r) ? '✗' : hasWarning(r) ? '⚠' : '✓'
-        // Compact timestamp: HH:MM UTC (date omitted — all records are this session)
-        const ts = new Date(r.timestamp).toISOString().slice(11, 16) + 'Z'
-        // Short input summary ≤ 50 chars  (key=val pairs, first 3 keys)
-        const inputStr = Object.entries(r.input ?? {})
-          .slice(0, 3)
-          .map(([k, v]) => `${k}=${JSON.stringify(v)}`)
-          .join(', ')
-        const inputSummary = inputStr.length > 50 ? inputStr.slice(0, 47) + '...' : inputStr
-        return `  [${r.id}] ${r.toolName}(${inputSummary}) → ${vv}  fidelity=L${r.fidelityLevel}  ${ts}`
-      })
-
-      return (
-        `## 本会话计算记录\n\n` +
-        lines.join('\n') +
-        `\n\n` +
-        `工具：\`get_provenance(<id>)\` 查看完整记录 · ` +
-        `\`get_computation_lineage\` 追踪派生链 · ` +
-        `\`find_duplicate_computation\` 重复检查`
-      )
-    } catch {
-      // Provenance listing is advisory; any error (missing store, corrupt record)
-      // silently skips the section rather than crashing the prompt assembly.
-      return null
-    }
-  })
-}
-
-// ─────────────────────────────────────────────────────────────────────────────
-// D10 — Phase Guidance  [DANGEROUS_uncached]
-//
-// Delegates to each campaign's plugin for phase-specific guidance strings.
-// No hardcoded DOE phase map here — each plugin owns its own guidance.
-// ─────────────────────────────────────────────────────────────────────────────
-
-export function buildPhaseGuidanceSection(): SystemPromptSection {
-  return DANGEROUS_uncachedSystemPromptSection(
-    'phase_guidance',
-    async () => {
-      try {
-        // P2: Re-use the same micro-cached read as D8 — zero extra disk I/O per turn.
-        const ctx = await _readCtxCached()
-        if (!ctx || ctx.activeCampaigns.length === 0) return null
-
-        const guidanceLines: string[] = []
-        for (const campaign of ctx.activeCampaigns) {
-          const phase      = campaign.phase as string
-          const pluginType = campaign.pluginType
-
-          // Look up the plugin — fall back gracefully if not registered
-          let guidance = ''
-          if (pluginType && campaignRegistry.has(pluginType)) {
-            const plugin = campaignRegistry.get(pluginType)
-            // Phase guidance doesn't need the full state — pass empty object
-            // for plugins that don't inspect state in buildPhaseGuidance()
-            try {
-              // eslint-disable-next-line @typescript-eslint/no-explicit-any
-              guidance = plugin.buildPhaseGuidance(phase as never, {} as any)
-            } catch {
-              // Plugin threw — skip guidance for this campaign
-            }
-          }
-
-          if (guidance) {
-            guidanceLines.push(
-              `**${campaign.projectName ?? campaign.campaignId}** (${phase}):\n${guidance}`,
-            )
-          }
-
-          // Phase-type reminders: check plugin's phase definitions if available
-          if (pluginType && campaignRegistry.has(pluginType)) {
-            const plugin = campaignRegistry.get(pluginType)
-            const isHuman  = (plugin.phases.humanCheckpoints as readonly string[]).includes(phase)
-            const isMachine = (plugin.phases.machinePhases as readonly string[]).includes(phase)
-
-            if (isHuman) {
-              guidanceLines.push(
-                `  ⏸ 等待你的决策，campaign 将在确认后继续。`,
-              )
-            } else if (isMachine) {
-              guidanceLines.push(
-                `  ⚙ 机器执行阶段——无需调用工具，后台任务正在运行。`,
-              )
-            }
-          } else {
-            // Fallback for legacy DOE campaigns without pluginType in context
-            if (USER_CHECKPOINT_PHASES.has(phase as never)) {
-              guidanceLines.push(`  ⏸ 等待你的决策，campaign 将在确认后继续。`)
-            }
-            if (MACHINE_PHASES.has(phase as never)) {
-              guidanceLines.push(`  ⚙ 机器执行阶段——无需调用工具，后台任务正在运行。`)
-            }
-          }
-        }
-
-        if (guidanceLines.length === 0) {
-          // Campaigns are active but no plugin produced guidance (unregistered plugin type
-          // or all plugins threw). Give the agent a minimal orientation hint.
-          const names = ctx.activeCampaigns
-            .map(c => `${c.projectName ?? c.campaignId} (${c.phase})`)
-            .join(', ')
-          return `## Campaign 阶段指导\n\n活跃 campaign：${names}。\n` +
-            `当前插件类型暂无阶段专属指导。` +
-            `可调用 \`get_campaign_status\` 查看详情，或调用 \`list_campaigns\` 检查状态。`
-        }
-        return `## Campaign 阶段指导\n\n${guidanceLines.join('\n\n')}`
-      } catch {
-        // Phase guidance is advisory; any error (plugin crash, store unavailable)
-        // silently omits the section rather than breaking the prompt assembly.
-        return null
-      }
-    },
-    'Phase guidance must reflect the current campaign phase, which can change ' +
-    'between turns as background jobs complete.',
-  )
-}
 
 // ─────────────────────────────────────────────────────────────────────────────
 // D0 — Task Contract  [memoized until contract changes]
@@ -1141,14 +878,9 @@ export function buildVolatileContextSections(opts: VolatileContextOptions): Syst
     sections.push(buildSubAgentNotificationsSection(opts.subAgentBridge))
   }
 
-  // Campaign assembly — D8/D9/D10 (campaign mode only)
-  if (opts.mode === 'campaign') {
-    sections.push(buildCampaignContextSection())
-    if (opts.rtx && opts.sessionStartMs !== undefined) {
-      sections.push(buildSessionProvenanceSection(opts.rtx, opts.sessionStartMs))
-    }
-    sections.push(buildPhaseGuidanceSection())
-  }
+  // Campaign D8/D9/D10 sections moved to campaign/promptSections.ts —
+  // CampaignSession owns its prompt assembly, so the shared builder no longer
+  // special-cases campaign (architecture-review §1.1).
 
   return sections
 }
@@ -1227,7 +959,6 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     buildLanguageSection(opts.language),
     buildCurrentModeSection(opts.mode),
     buildEngineeringStandardsSection(opts.mode),
-    buildCampaignKnowledgeSection(opts.mode),
     buildToolInvocationSection(opts.mode),
     // Rx: mode-specific STABLE extensions — injected here so they appear after the
     // shared tool protocol but before output preferences.

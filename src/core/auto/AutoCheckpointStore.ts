@@ -10,16 +10,29 @@
  * read is tolerant (returns null on missing/corrupt). It is independent of the
  * session/loop, so it is trivially testable and carries no coupling to modes.
  */
-import { existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'fs'
-import { dirname, join, resolve } from 'path'
+import { existsSync, readFileSync } from 'fs'
+import { readFile } from 'fs/promises'
+import { join, resolve } from 'path'
+import { atomicWriteJson } from '../../infra/persist/index.js'
 
-export const AUTO_CHECKPOINT_SCHEMA_VERSION = '1.0'
+export const AUTO_CHECKPOINT_SCHEMA_VERSION = '1.1'
+const MAX_GOAL_CHARS = 8_000
+const MAX_NOTE_CHARS = 4_000
+const MAX_ITEM_CHARS = 500
+const MAX_COMPLETED_STEPS = 200
+const MAX_PENDING_TODOS = 100
+const MAX_ACTIVE_SUBAGENTS = 100
+const MAX_ARTIFACTS = 200
 
 export interface AutoCheckpoint {
   schemaVersion: string
   sessionId: string
   /** Epoch ms of the last update. */
   updatedAt: number
+  /** Monotonic durable-write revision. */
+  revision?: number
+  /** Most recent execution boundary that produced this revision. */
+  lastBoundary?: string
   /** The original task — the first real user request, captured once. */
   goal?: string
   /** Short free-form progress note / latest summary. */
@@ -48,13 +61,13 @@ export function autoCheckpointPath(workspaceRoot: string): string {
  * Atomically write the checkpoint. Best-effort: never throws (returns false on
  * failure) so a checkpoint write can never crash the run it is protecting.
  */
-export function writeAutoCheckpoint(workspaceRoot: string, checkpoint: AutoCheckpoint): boolean {
+export async function writeAutoCheckpoint(
+  workspaceRoot: string,
+  checkpoint: AutoCheckpoint,
+): Promise<boolean> {
   try {
     const path = autoCheckpointPath(workspaceRoot)
-    mkdirSync(dirname(path), { recursive: true })
-    const tmp = `${path}.${process.pid}.tmp`
-    writeFileSync(tmp, JSON.stringify(checkpoint, null, 2), 'utf-8')
-    renameSync(tmp, path)
+    await atomicWriteJson(path, checkpoint)
     return true
   } catch {
     return false
@@ -109,19 +122,61 @@ export function readAutoCheckpoint(workspaceRoot: string): AutoCheckpoint | null
   }
 }
 
+async function readAutoCheckpointAsync(workspaceRoot: string): Promise<AutoCheckpoint | null> {
+  try {
+    const parsed = JSON.parse(
+      await readFile(autoCheckpointPath(workspaceRoot), 'utf-8'),
+    ) as unknown
+    if (!parsed || typeof parsed !== 'object') return null
+    const cp = parsed as Partial<AutoCheckpoint>
+    if (typeof cp.sessionId !== 'string' || typeof cp.updatedAt !== 'number') return null
+    return cp as AutoCheckpoint
+  } catch {
+    return null
+  }
+}
+
 /**
  * Merge an update into the existing checkpoint (or create a fresh one), bumping
  * updatedAt and unioning the append-only lists. Returns the written checkpoint.
  */
-export function updateAutoCheckpoint(
+export async function updateAutoCheckpoint(
   workspaceRoot: string,
   sessionId: string,
   patch: Partial<Omit<AutoCheckpoint, 'schemaVersion' | 'sessionId' | 'updatedAt'>>,
-): AutoCheckpoint {
-  const prior = readAutoCheckpoint(workspaceRoot)
-  const union = (a?: string[], b?: string[]): string[] | undefined => {
+): Promise<AutoCheckpoint> {
+  return (await updateAutoCheckpointWithStatus(workspaceRoot, sessionId, patch)).checkpoint
+}
+
+export interface AutoCheckpointUpdateResult {
+  checkpoint: AutoCheckpoint
+  written: boolean
+}
+
+/**
+ * Status-returning variant for callers whose control flow depends on durable
+ * persistence. A failed write returns the proposed checkpoint with
+ * `written: false`; callers must not advance their durable revision.
+ */
+export async function updateAutoCheckpointWithStatus(
+  workspaceRoot: string,
+  sessionId: string,
+  patch: Partial<Omit<AutoCheckpoint, 'schemaVersion' | 'sessionId' | 'updatedAt'>>,
+): Promise<AutoCheckpointUpdateResult> {
+  const priorOnDisk = await readAutoCheckpointAsync(workspaceRoot)
+  // A workspace keeps one current auto checkpoint. Starting a new session must
+  // not inherit append-only state from an unrelated prior session.
+  const prior = priorOnDisk?.sessionId === sessionId ? priorOnDisk : null
+  const bounded = (items: string[] | undefined, max: number): string[] | undefined => {
+    if (!items) return undefined
+    return items
+      .map(item => item.slice(0, MAX_ITEM_CHARS))
+      .filter(Boolean)
+      .slice(-max)
+  }
+  const union = (a: string[] | undefined, b: string[] | undefined, max: number): string[] | undefined => {
     if (!a && !b) return undefined
-    return [...new Set([...(a ?? []), ...(b ?? [])])]
+    return bounded([...new Set([...(a ?? []), ...(b ?? [])])], max)
   }
   const maxDefined = (a?: number, b?: number): number | undefined => {
     if (a === undefined) return b
@@ -132,19 +187,30 @@ export function updateAutoCheckpoint(
     schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
     sessionId,
     updatedAt: Date.now(),
-    goal: patch.goal ?? prior?.goal,
-    note: patch.note ?? prior?.note,
-    completedSteps: union(prior?.completedSteps, patch.completedSteps),
+    revision: (prior?.revision ?? 0) + 1,
+    lastBoundary: patch.lastBoundary ?? prior?.lastBoundary,
+    goal: (patch.goal ?? prior?.goal)?.slice(0, MAX_GOAL_CHARS),
+    note: (patch.note ?? prior?.note)?.slice(0, MAX_NOTE_CHARS),
+    completedSteps: union(prior?.completedSteps, patch.completedSteps, MAX_COMPLETED_STEPS),
     // pendingTodos / activeSubAgentIds reflect the latest state, not a union.
-    pendingTodos: patch.pendingTodos ?? prior?.pendingTodos,
-    activeSubAgentIds: patch.activeSubAgentIds ?? prior?.activeSubAgentIds,
-    artifacts: union(prior?.artifacts, patch.artifacts),
+    pendingTodos: bounded(
+      patch.pendingTodos !== undefined ? patch.pendingTodos : prior?.pendingTodos,
+      MAX_PENDING_TODOS,
+    ),
+    activeSubAgentIds:
+      bounded(
+        patch.activeSubAgentIds !== undefined ? patch.activeSubAgentIds : prior?.activeSubAgentIds,
+        MAX_ACTIVE_SUBAGENTS,
+      ),
+    artifacts: union(prior?.artifacts, patch.artifacts, MAX_ARTIFACTS),
     // turnCount is monotonic: a resumed run restarts its in-memory counter from
     // 1, so take the max to avoid regressing the accumulated total on resume.
     turnCount: maxDefined(prior?.turnCount, patch.turnCount),
     estimatedCostUsd: patch.estimatedCostUsd ?? prior?.estimatedCostUsd,
     stopReason: patch.stopReason ?? prior?.stopReason,
   }
-  writeAutoCheckpoint(workspaceRoot, next)
-  return next
+  return {
+    checkpoint: next,
+    written: await writeAutoCheckpoint(workspaceRoot, next),
+  }
 }

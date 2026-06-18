@@ -7,6 +7,7 @@ export async function createMcpCallTool(): Promise<MetaAgentTool> {
   return {
     name: 'mcp_call',
     description,
+    permission: { category: 'network', checkpointBoundary: 'both' },
     inputSchema: {
       type: 'object',
       properties: {

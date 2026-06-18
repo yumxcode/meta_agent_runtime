@@ -20,6 +20,7 @@ import { makeTextUserMessage } from './messages/MessageFactory.js'
 import { FileStateCache } from './session/FileStateCache.js'
 import { createBootstrapState } from './session/BootstrapState.js'
 import { runKernelLoop, buildMessagesToKeepAfterCompact, type LoopResult, type LoopTerminationReason } from './loop/KernelLoop.js'
+import { clearTimedOutRunningTools } from './tools/ToolExecution.js'
 import type { AutoCompactTrackingState } from './compact/AutoCompact.js'
 import { compactConversation } from './compact/CompactConversation.js'
 import { getMessagesAfterCompactBoundary } from './messages/MessageNormalizer.js'
@@ -166,6 +167,11 @@ export class KernelSession {
   private _totalCostUsd = 0
   private _fileCache: FileStateCache
   private _autoCompactTracking: AutoCompactTrackingState | undefined
+  /** Session-lifetime completed tool-batch count (survives submitMessage calls). */
+  private _toolBatchCount: number
+  private _checkpointRevision: number
+  private _lastDriftToolBatchCount: number
+  private _lastDriftCheckpointRevision: number
   private readonly _sessionId: string
   private readonly _cwd: string
   private _permissionDenials: PermissionDenial[] = []
@@ -199,6 +205,13 @@ export class KernelSession {
     // the restored history (best available source — pre-compact history is gone).
     this._originalUserGoalParts = collectOriginalUserGoalParts(this._messages)
     this._fileCache = new FileStateCache()
+    this._toolBatchCount = Math.max(0, config.initialToolBatchCount ?? 0)
+    this._checkpointRevision = Math.max(0, config.initialCheckpointRevision ?? 0)
+    // A resumed session starts a fresh 30-batch drift window from the durable
+    // recovery point. This avoids an immediate duplicate drift check caused by
+    // comparing restored cumulative counters against zero.
+    this._lastDriftToolBatchCount = this._toolBatchCount
+    this._lastDriftCheckpointRevision = this._checkpointRevision
     const bootstrap = createBootstrapState(config.cwd, config.sessionId)
     this._sessionId = bootstrap.sessionId
     this._cwd = bootstrap.cwd
@@ -264,6 +277,10 @@ export class KernelSession {
           cwd: this._cwd,
           cumulativeCostUsd: this._totalCostUsd,
           autoCompactTracking: this._autoCompactTracking,
+          initialToolBatchCount: this._toolBatchCount,
+          initialCheckpointRevision: this._checkpointRevision,
+          initialLastDriftToolBatchCount: this._lastDriftToolBatchCount,
+          initialLastDriftCheckpointRevision: this._lastDriftCheckpointRevision,
           drainSteering: () => this._steerQueue.splice(0),
           originalUserGoal: formatOriginalUserGoal(this._originalUserGoalParts) ?? undefined,
         })
@@ -279,6 +296,25 @@ export class KernelSession {
         loopError = err
       }
 
+      // Every natural loop exit is a hard checkpoint boundary. This runs before
+      // the result event is emitted so a consumer observing completion can rely
+      // on the durable state already being updated.
+      if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
+        try {
+          const boundary = await this._config.onCheckpointBoundary({
+            type: 'termination',
+            sessionId: this._sessionId,
+            toolBatchCount: loopResult?.toolBatchCount ?? this._toolBatchCount,
+            estimatedCostUsd: loopResult?.costUsd ?? this._totalCostUsd,
+            stopReason: loopResult?.reason ?? 'error',
+          })
+          this._checkpointRevision = Math.max(this._checkpointRevision, boundary.revision)
+          if (loopResult) loopResult.checkpointRevision = this._checkpointRevision
+        } catch {
+          // Best-effort: checkpoint failure must not replace the actual result.
+        }
+      }
+
       const resultEvent = this._buildResultEvent(loopResult, loopError)
       stripVolatileContextFromMessages(this._messages)
       stripThinkingBlocksFromMutableMessages(this._messages)
@@ -291,6 +327,10 @@ export class KernelSession {
         this._totalUsage = addUsage(this._totalUsage, loopResult.totalUsage)
         this._totalCostUsd = loopResult.costUsd
         this._autoCompactTracking = loopResult.autoCompactTracking
+        this._toolBatchCount = loopResult.toolBatchCount
+        this._checkpointRevision = loopResult.checkpointRevision
+        this._lastDriftToolBatchCount = loopResult.lastDriftToolBatchCount
+        this._lastDriftCheckpointRevision = loopResult.lastDriftCheckpointRevision
         this._permissionDenials.push(...loopResult.permissionDenials)
         // S16: cap the denial buffer so a long-running session that gets
         // repeatedly denied tools doesn't grow this array indefinitely.
@@ -353,6 +393,17 @@ export class KernelSession {
       assembleSystemPrompt(this._config.systemPrompt, this._config.appendSystemPrompt) ?? ''
 
     try {
+      if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
+        try {
+          const boundary = await this._config.onCheckpointBoundary({
+            type: 'compact_before',
+            sessionId: this._sessionId,
+            toolBatchCount: this._toolBatchCount,
+            estimatedCostUsd: this._totalCostUsd,
+          })
+          this._checkpointRevision = Math.max(this._checkpointRevision, boundary.revision)
+        } catch { /* best-effort */ }
+      }
       const result = await compactConversation(messagesForQuery, this._fileCache, {
         model: this._config.compact?.model,
         apiKey: this._config.apiKey,
@@ -374,6 +425,17 @@ export class KernelSession {
         consecutiveFailures: 0,
       }
       this._config.onMessagesUpdate?.(this._messages)
+      if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
+        try {
+          const boundary = await this._config.onCheckpointBoundary({
+            type: 'compact_after',
+            sessionId: this._sessionId,
+            toolBatchCount: this._toolBatchCount,
+            estimatedCostUsd: this._totalCostUsd,
+          })
+          this._checkpointRevision = Math.max(this._checkpointRevision, boundary.revision)
+        } catch { /* best-effort */ }
+      }
 
       return {
         compacted: true,
@@ -381,6 +443,17 @@ export class KernelSession {
         postTokens: tokenCountWithEstimation(getMessagesAfterCompactBoundary(this._messages)),
       }
     } catch (err) {
+      if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
+        try {
+          const boundary = await this._config.onCheckpointBoundary({
+            type: 'compact_after',
+            sessionId: this._sessionId,
+            toolBatchCount: this._toolBatchCount,
+            estimatedCostUsd: this._totalCostUsd,
+          })
+          this._checkpointRevision = Math.max(this._checkpointRevision, boundary.revision)
+        } catch { /* best-effort */ }
+      }
       return {
         compacted: false,
         reason: `压缩失败：${err instanceof Error ? err.message : String(err)}`,
@@ -464,8 +537,14 @@ export class KernelSession {
     this._fileCache.clear()
     // Detach external callback so the consumer's closure (UI, DB writer) no
     // longer keeps this session alive via the callback.
-    this._config = { ...this._config, tools: [], onMessagesUpdate: undefined }
+    this._config = {
+      ...this._config,
+      tools: [],
+      onMessagesUpdate: undefined,
+      onCheckpointBoundary: undefined,
+    }
     this._autoCompactTracking = undefined
+    clearTimedOutRunningTools(this._sessionId)
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
@@ -485,6 +564,8 @@ export class KernelSession {
         aborted_tools:     'error_during_execution',
         max_budget_usd:    'error_max_budget_usd',
         verify_exhausted:  'error_during_execution',
+        auto_runtime_limit: 'success',
+        auto_tool_batch_limit: 'success',
         error:             'error_during_execution',
       }
 
@@ -499,7 +580,10 @@ export class KernelSession {
         usage: addUsage(this._totalUsage, loopResult.totalUsage),
         costUsd: loopResult.costUsd,
         numTurns: loopResult.numTurns,
-        stopReason: null,
+        stopReason: loopResult.reason === 'auto_runtime_limit' ||
+          loopResult.reason === 'auto_tool_batch_limit'
+          ? loopResult.reason
+          : null,
         resultText: loopResult.resultText,
         permissionDenials: loopResult.permissionDenials,
       }

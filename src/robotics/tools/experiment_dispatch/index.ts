@@ -2,7 +2,7 @@ import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { makeSubAgentTaskId } from '../../../subagent/types.js'
 import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
-import type { GitWorkspaceManager } from '../../git/GitWorkspaceManager.js'
+import type { GitWorkspaceManager } from '../../../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 import type { ExperimentSpec } from '../../types.js'
 
@@ -42,6 +42,7 @@ export function createExperimentDispatchTool(
 ): MetaAgentTool {
   return {
     name: 'experiment_dispatch',
+    abortSupport: 'cooperative',
     // Opt out of the kernel's per-tool timeout: with await_completion=true this
     // blocks on the ExperimentAgent sub-agent, bounded by its own 5-min cap.
     timeoutMs: 0,

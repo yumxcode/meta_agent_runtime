@@ -13,6 +13,7 @@ import { withReturnResultHint } from './return_result.js'
 export function makeSpawnSubAgentTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
     name: 'spawn_sub_agent',
+    abortSupport: 'cooperative',
     description: `Delegate a sub-task to an isolated sub-agent.
 
 The sub-agent has its own conversation context (empty — does not inherit this session's history).
@@ -59,6 +60,12 @@ WHEN NOT TO USE:
         max_budget_usd: {
           type: 'number',
           description: 'Maximum cost in USD before force-stop. Default: 0.5.',
+        },
+        workspace_mode: {
+          type: 'string',
+          enum: ['shared_readonly', 'shared_write', 'isolated_write'],
+          description:
+            'Use isolated_write for code-producing tasks whose branch must be merged. Default: shared_write.',
         },
         require_human_approval: {
           type: 'boolean',
@@ -157,6 +164,13 @@ WHEN NOT TO USE:
             pollIntervalMs:        typeof input['poll_interval_ms'] === 'number' ? input['poll_interval_ms'] : 1_800_000,
             checkpointEveryNTurns: typeof input['checkpoint_every_n_turns'] === 'number' ? input['checkpoint_every_n_turns'] : 3,
             sandbox:               sandboxConfig,
+            workspaceMode:
+              input['workspace_mode'] === 'isolated_write'
+                ? 'isolated_write'
+                : input['workspace_mode'] === 'shared_readonly'
+                  ? 'shared_readonly'
+                  : 'shared_write',
+            isolateWorktree: input['workspace_mode'] === 'isolated_write',
           },
           abortSignal: ctx.abortSignal,
         })
@@ -176,6 +190,7 @@ WHEN NOT TO USE:
               max_budget_usd: record.config.maxBudgetUsd,
             },
             require_human_approval: record.config.requireHumanApproval,
+            workspace_mode: record.config.workspaceMode,
             message: `Sub-agent started. Task ID: ${record.taskId}. ` +
               (record.config.useEventDriven
                 ? 'You will see a notification in your next system prompt when it completes.'

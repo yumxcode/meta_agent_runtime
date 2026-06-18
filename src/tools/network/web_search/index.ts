@@ -151,6 +151,7 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'web_search',
+    abortSupport: 'cooperative',
     description,
     isConcurrencySafe: true,
     inputSchema: {
@@ -189,6 +190,12 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
         return callTavilySearch(query, tavilyKey, allowedDomains, blockedDomains, ctx.abortSignal)
       }
       if (pinned === 'glm') {
+        if (ctx.autonomousMode) {
+          return {
+            content: 'Error: GLM MCP web search is non-abortable and disabled in auto mode.',
+            isError: true,
+          }
+        }
         const glm = await callGlmSearch(query)
         return glm ?? { content: 'Error: META_AGENT_SEARCH_PROVIDER=glm but the web-search-prime MCP is not registered (set ZHIPU_API_KEY / mcp.json).', isError: true }
       }
@@ -206,9 +213,11 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
         failures.push(tavily.content)
       }
 
-      const glm = await callGlmSearch(query)
-      if (glm && !glm.isError) return glm
-      if (glm) failures.push(glm.content)
+      if (!ctx.autonomousMode) {
+        const glm = await callGlmSearch(query)
+        if (glm && !glm.isError) return glm
+        if (glm) failures.push(glm.content)
+      }
 
       if (anthropicKey) {
         const anthropic = await callAnthropicSearch(query, anthropicKey, model, input, ctx.abortSignal)

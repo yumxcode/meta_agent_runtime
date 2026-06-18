@@ -14,9 +14,9 @@
  */
 
 import type { RuntimeContext } from '../../runtime/RuntimeContext.js'
-import { MetaAgentContextStore } from '../../campaign/index.js'
+import { MetaAgentContextStore } from '../index.js'
 import type { CompactStateSnapshot } from './stateSnapshot.js'
-import type { TaskContract } from '../contract/types.js'
+import type { TaskContract } from '../../core/contract/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Shared blocks (identical purpose to CC's equivalents)

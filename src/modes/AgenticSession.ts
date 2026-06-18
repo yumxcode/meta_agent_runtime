@@ -81,6 +81,9 @@ export class AgenticSession {
       verifyGate: config.verifyGate,
       // Auto mode: mid-flight drift/reflection gate. Same gating + provenance.
       driftGate: config.driftGate,
+      onCheckpointBoundary: config.onCheckpointBoundary,
+      initialToolBatchCount: config.initialToolBatchCount,
+      initialCheckpointRevision: config.initialCheckpointRevision,
       maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
       maxOutputTokens: resolved.maxTokens,

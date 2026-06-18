@@ -1,31 +1,32 @@
 import { randomUUID } from 'crypto'
 
-// ── Domain taxonomy ───────────────────────────────────────────────────────────
-export type RoboticsDomain =
-  | 'motion_planning' | 'perception' | 'manipulation' | 'locomotion'
-  | 'navigation' | 'simulation' | 'hardware_interface' | 'deployment'
-  | 'calibration' | 'general'
+// ── Domain taxonomy + experience schema ───────────────────────────────────────
+// The experience-entry schema + domain/confidence taxonomy moved to neutral
+// infra (infra/knowledge/types.ts) so ExperienceStore — reused by auto mode —
+// no longer lives under robotics. Re-exported here under the historical names
+// (KnowledgeDomain → RoboticsDomain, KNOWLEDGE_DOMAINS → ROBOTICS_DOMAINS) so
+// every robotics call site is unchanged. See architecture-review §5.1 (#2b).
+import {
+  KNOWLEDGE_DOMAINS,
+  KNOWLEDGE_CONFIDENCE_TIERS,
+  makeExperienceId,
+} from '../infra/knowledge/types.js'
+import type {
+  KnowledgeDomain,
+  KnowledgeConfidenceTier,
+  ExperienceOutcome,
+  ExperienceEntry,
+  ExperienceSearchQuery,
+} from '../infra/knowledge/types.js'
 
-export const ROBOTICS_DOMAINS: RoboticsDomain[] = [
-  'motion_planning', 'perception', 'manipulation', 'locomotion',
-  'navigation', 'simulation', 'hardware_interface', 'deployment',
-  'calibration', 'general',
-]
+export { KNOWLEDGE_CONFIDENCE_TIERS, makeExperienceId }
+export type { KnowledgeConfidenceTier, ExperienceOutcome, ExperienceEntry, ExperienceSearchQuery }
+/** Robotics domain taxonomy — the project's name for the neutral KnowledgeDomain. */
+export type RoboticsDomain = KnowledgeDomain
+export const ROBOTICS_DOMAINS: RoboticsDomain[] = KNOWLEDGE_DOMAINS
 
 export type RoboticsAgentRole =
   | 'orchestrator' | 'paper_search' | 'experiment' | 'code' | 'analysis' | 'deployment'
-
-// ── Knowledge confidence ─────────────────────────────────────────────────────
-export type KnowledgeConfidenceTier =
-  | 'observed'      // Seen in this project/session/robotics run.
-  | 'reproduced'    // Confirmed across repeated observations.
-  | 'derived'       // Derived from physics, math, datasheets, or specs.
-  | 'reported'      // Reported by papers/docs/forums but not locally verified.
-  | 'hypothesis'    // Plausible but not yet verified.
-
-export const KNOWLEDGE_CONFIDENCE_TIERS: KnowledgeConfidenceTier[] = [
-  'observed', 'reproduced', 'derived', 'reported', 'hypothesis',
-]
 
 export type KnowledgeScope = 'global' | 'robot' | 'code'
 
@@ -79,72 +80,6 @@ export interface PrincipleSearchQuery {
   limit?: number
 }
 
-// ── Experience Store ──────────────────────────────────────────────────────────
-export interface ExperienceOutcome {
-  success: boolean
-  summary: string        // ≤ 200 chars, shown in index
-  failureReason?: string
-  workarounds?: string[]
-}
-
-export interface ExperienceEntry {
-  id: string             // 'exp_<timestamp>_<uuid8>'
-  schemaVersion: '1.0'
-  createdAt: number
-  updatedAt: number
-  domain: RoboticsDomain
-  algorithm?: string
-  tags: string[]
-  robot?: string
-  difficulty: 'low' | 'medium' | 'high'
-  title: string          // ≤ 80 chars
-  problem: string        // ≤ 500 chars
-  solution: string       // ≤ 800 chars
-  outcome: ExperienceOutcome
-  /**
-   * Same-domain abstract principle extracted by flash model at write time.
-   * Used for same-domain principle matching in ExperiencePatternChecker.
-   * Example: "Spatial resolution × map size determines peak memory; estimate before coding."
-   */
-  abstractPrinciple?: string
-  /** How strongly this experience should be trusted when retrieved. */
-  confidenceTier?: KnowledgeConfidenceTier
-  /** Experiment log, commit, report, paper, datasheet, or other supporting references. */
-  evidenceRefs?: string[]
-  /** Number of independent observations supporting this lesson. Defaults to 1. */
-  observationCount?: number
-  /** Number of later observations that contradicted this lesson. Defaults to 0. */
-  contradictionCount?: number
-  /** Assumptions this experience falsified. Especially important for failures. */
-  invalidatedAssumptions?: string[]
-  /** Last time the lesson was checked against observation or source evidence. */
-  lastVerifiedAt?: number
-  metrics?: Record<string, number | string>
-  sourceTaskId?: string
-  sourceSessionId?: string
-  /** Reviewed principles promoted from or linked to this concrete experience. */
-  principleIds?: string[]
-  /** Physical anchors this experience applied, validated, or contradicted. Usually empty. */
-  anchorIds?: string[]
-  relatedPapers?: string[]
-  fullReport?: string    // Markdown, loaded on demand only
-}
-
-export interface ExperienceSearchQuery {
-  domain?: RoboticsDomain
-  tags?: string[]
-  algorithm?: string
-  robot?: string
-  keyword?: string       // searches title + problem + solution
-  successOnly?: boolean
-  limit?: number         // default 10, max 20
-}
-
-export function makeExperienceId(): string {
-  const ts = Date.now().toString(36)
-  const uuid8 = randomUUID().replace(/-/g, '').slice(0, 8)
-  return `exp_${ts}_${uuid8}`
-}
 
 export function makePrincipleId(): string {
   const ts = Date.now().toString(36)
@@ -239,12 +174,13 @@ export interface HardwareProfileData {
 }
 
 // ── Git state (used in ProjectStore) ─────────────────────────────────────────
-export interface RoboticsGitState {
-  enabled: boolean
-  mainBranch: string
-  subAgentBranches: Record<string, string>   // taskId → branchName
-  forkPoints: Record<string, string>          // taskId → commitHash
-}
+// Git worktree state now lives in neutral infra (GitWorkspaceManager moved out
+// of robotics/ — see architecture-review-2026-06-18.md §1.2). Imported for local
+// use below (RoboticsProjectState.git) and re-exported under the original name
+// so existing robotics references keep working unchanged.
+import type { GitWorkspaceState } from '../infra/git/types.js'
+export type { GitWorkspaceState as RoboticsGitState }
+type RoboticsGitState = GitWorkspaceState
 
 // ── Active sub-agent record ───────────────────────────────────────────────────
 export interface ActiveSubAgentRecord {

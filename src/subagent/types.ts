@@ -20,6 +20,12 @@
 /** Format: `subtask-{uuid8}` */
 export type SubAgentTaskId = string
 
+export type SubAgentWorkspaceMode =
+  | 'shared_readonly'
+  | 'shared_write'
+  | 'isolated_write'
+  | 'ephemeral_snapshot'
+
 export function makeSubAgentTaskId(): SubAgentTaskId {
   const uuid8 = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
   return `subtask-${uuid8}`
@@ -148,6 +154,12 @@ export interface SubAgentConfig {
   projectDir?: string
 
   /**
+   * Declares how the task uses its workspace. Only `isolated_write` allocates
+   * a durable task worktree and enters the finalize/merge lifecycle.
+   */
+  workspaceMode?: SubAgentWorkspaceMode
+
+  /**
    * Auto mode retry bookkeeping: how many times this task has already been
    * retried (0 on first dispatch). Incremented on each automatic re-spawn.
    * Internal — callers don't set this.
@@ -163,6 +175,23 @@ export interface SubAgentConfig {
    * (protected by the write mutex). Default: false.
    */
   isolateWorktree?: boolean
+
+  /**
+   * Internal infrastructure sub-agent — used by the auto-mode SAFETY GATES
+   * (verify judge, drift reflection) which run as sub-agents but must never be
+   * starved by ordinary research/worker sub-agents that share the bridge.
+   *
+   * When true the bridge gives this task a reserved "side lane":
+   *   - it bypasses the per-bridge total-budget cap (so research spend can never
+   *     silently disable the completion gate — the documented failure mode), and
+   *     its cost is NOT counted toward that cap;
+   *   - it bypasses the outstanding-tasks (queue-full) cap; and
+   *   - it is enqueued at the FRONT of the start queue for priority.
+   * It still respects maxConcurrent and all per-task circuit breakers.
+   *
+   * Internal only — ordinary callers leave this unset. Default: false.
+   */
+  internal?: boolean
 }
 
 /** Defaults applied by SubAgentBridge.spawnSubAgent() */

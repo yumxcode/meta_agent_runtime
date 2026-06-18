@@ -207,7 +207,7 @@ export {
   createNetworkTools, createWebFetchTool, createWebSearchTool,
   createMcpTools, registerMcpClient, unregisterMcpClient, getRegisteredMcpServers,
   createMcpCallTool, createListMcpResourcesTool, createReadMcpResourceTool,
-  createUiTools, createAskUserTool, createTodoWriteTool, getTodosForSession, deleteTodosForSession, createSendMessageTool,
+  createUiTools, createAutoUiTools, createAskUserTool, createTodoWriteTool, getTodosForSession, deleteTodosForSession, createSendMessageTool, createProgressNoteTool, getProgressNoteForSession, deleteProgressNoteForSession, createArtifactsRegisterTool, getArtifactsForSession, deleteArtifactsForSession,
   createSystemTools, createSleepTool,
   createCronCreateTool, createCronDeleteTool, createCronListTool,
   createEnterPlanModeTool, createExitPlanModeTool,
@@ -242,8 +242,8 @@ export { RoboticsSession } from './robotics/RoboticsSession.js'
 export type { RoboticsSessionOptions } from './robotics/RoboticsSession.js'
 export { ExperienceStore } from './robotics/ExperienceStore.js'
 export { HardwareProfile } from './robotics/HardwareProfile.js'
-export { GitWorkspaceManager } from './robotics/git/GitWorkspaceManager.js'
-export type { GitWorktreeRecord, GitSyncResult } from './robotics/git/GitWorkspaceManager.js'
+export { GitWorkspaceManager } from './infra/git/GitWorkspaceManager.js'
+export type { GitWorktreeRecord, GitSyncResult } from './infra/git/GitWorkspaceManager.js'
 export { RoboticsProjectStore } from './robotics/persistence/RoboticsProjectStore.js'
 export {
   createRoboticsTools,
@@ -257,7 +257,7 @@ export {
   createHardwareProfileWriteTool,
   createExperimentDispatchTool,
   createPaperSearchTool,
-  createProgressNoteTool,
+  createProgressNoteTool as createRoboticsProgressNoteTool,
   createGitSyncToSubAgentTool,
   createGitMergeSubAgentTool,
   createGitDiffSubAgentTool,

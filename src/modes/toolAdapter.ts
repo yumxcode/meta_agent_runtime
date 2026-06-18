@@ -14,6 +14,65 @@ import type {
   ToolInputJSONSchema,
 } from '../kernel/index.js'
 
+const COOPERATIVE_ABORT_TOOLS = new Set([
+  'bash',
+  'experiment_dispatch',
+  'paper_search',
+  'powershell',
+  'research_dispatch',
+  'run_agent',
+  'sleep',
+  'spawn_sub_agent',
+  'web_fetch',
+  'web_search',
+])
+
+const NON_COOPERATIVE_ABORT_TOOLS = new Set([
+  // The current MCP client abstraction does not accept AbortSignal. Auto mode
+  // therefore fails closed instead of allowing timed-out MCP calls to pile up.
+  'mcp_call',
+  'read_mcp_resource',
+  'list_mcp_resources',
+  'ask_user',
+])
+
+/**
+ * Authoritative built-in abort declaration. Third-party tools must declare
+ * abortSupport on the tool object; unknown names deliberately remain undefined.
+ */
+export function resolveToolAbortSupport(
+  tool: Pick<MetaAgentTool, 'name' | 'abortSupport'>,
+): KernelTool['abortSupport'] {
+  if (tool.abortSupport) return tool.abortSupport
+  if (COOPERATIVE_ABORT_TOOLS.has(tool.name)) return 'cooperative'
+  if (NON_COOPERATIVE_ABORT_TOOLS.has(tool.name)) return 'non_cooperative'
+  // All remaining built-ins are local, bounded state/FS operations. Unknown
+  // external tools are not silently classified.
+  if (
+    tool.name.startsWith('auto_') ||
+    tool.name.startsWith('git_') ||
+    tool.name.startsWith('team_') ||
+    tool.name.startsWith('workflow_') ||
+    BUILTIN_BOUNDED_TOOLS.has(tool.name)
+  ) return 'bounded'
+  return undefined
+}
+
+const BUILTIN_BOUNDED_TOOLS = new Set([
+  'anchor_delete', 'artifacts_register', 'cancel_sub_agent', 'config',
+  'cron_create', 'cron_delete', 'cron_list', 'echo', 'edit_file',
+  'enter_plan_mode', 'exit_plan_mode', 'experience_delete', 'experience_load',
+  'experience_search', 'experience_write', 'find_duplicate_computation', 'glob',
+  'grep', 'get_computation_lineage', 'get_provenance',
+  'get_sub_agent_intermediate', 'get_sub_agent_status', 'hardware_profile_read',
+  'hardware_profile_write', 'list_recent_results', 'list_sub_agents',
+  'memory_delete', 'memory_write', 'notebook_edit', 'physical_anchor_load',
+  'physical_anchor_search', 'physical_anchor_write', 'principle_delete',
+  'principle_load', 'principle_promote', 'principle_search', 'progress_note',
+  'read_file', 'return_result', 'send_message', 'session_list', 'session_star',
+  'session_tag', 'skill', 'todo_write', 'write_file',
+])
+
 const DEFAULT_MAX_RESULT_SIZE_CHARS = 200 * 1024
 
 /**
@@ -172,6 +231,7 @@ function toToolCallContext(
     askUser:            ctx.askUser,
     onMessage:          ext['onMessage'] as ToolCallContext['onMessage'],
     planMode:           ctx.planMode,
+    autonomousMode:     ctx.autonomousMode,
   }
 }
 
@@ -203,6 +263,7 @@ export function toKernelTool(
     inputJSONSchema: tool.inputSchema as ToolInputJSONSchema,
 
     permission: tool.permission,
+    abortSupport: resolveToolAbortSupport(tool),
 
     async call(input: unknown, ctx: KernelToolContext): Promise<KernelToolResult> {
       const callCtx = toToolCallContext(ctx, extraExtensions)

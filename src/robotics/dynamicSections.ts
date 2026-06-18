@@ -19,7 +19,7 @@ import {
 import type { ExperienceStore } from './ExperienceStore.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import type { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
+import type { GitWorkspaceManager } from '../infra/git/GitWorkspaceManager.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import type { ContextPager } from '../context/ContextPager.js'
 import { ExperienceSource } from '../context/sources/ExperienceSource.js'

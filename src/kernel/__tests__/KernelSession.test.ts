@@ -270,6 +270,190 @@ describe('KernelSession — max turns', () => {
   })
 })
 
+describe('KernelSession — auto checkpoint and drift boundaries', () => {
+  function makeTool(name: string, checkpointBoundary?: 'before' | 'after' | 'both'): KernelTool {
+    return {
+      name,
+      description: name,
+      inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+      inputJSONSchema: { type: 'object' as const },
+      permission: checkpointBoundary
+        ? { category: 'state', checkpointBoundary }
+        : undefined,
+      abortSupport: 'bounded',
+      call: async () => ({ data: 'ok' }),
+      isConcurrencySafe: () => false,
+    }
+  }
+
+  it('runs drift only after a checkpoint revision advanced and 30 tool batches elapsed', async () => {
+    const boundaryOrder: string[] = []
+    let revision = 0
+    const driftGate = vi.fn(async () => {
+      boundaryOrder.push('drift')
+      return { drifted: false, corrective: [] }
+    })
+    const onCheckpointBoundary = vi.fn(async (event: { type: string; toolBatchCount: number }) => {
+      // Only the state-tool batch and the final hard termination boundary write.
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') {
+        revision++
+        boundaryOrder.push(`${event.type}:${event.toolBatchCount}`)
+        return { updated: true, revision }
+      }
+      return { updated: false, revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) {
+        yield* toolUseStream('todo-1', 'todo_write', { batch: 1 })
+      } else if (apiCall <= 30) {
+        yield* toolUseStream(`echo-${apiCall}`, 'echo', { batch: apiCall })
+      } else {
+        yield* textStream('done')
+      }
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 35,
+      tools: [makeTool('todo_write'), makeTool('echo')],
+      autonomousMode: true,
+      driftGate,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+
+    expect(events.find(e => e.type === 'result')?.subtype).toBe('success')
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(driftGate).toHaveBeenCalledWith(expect.objectContaining({
+      turnCount: 30,
+      reason: 'turn_interval',
+    }))
+    expect(boundaryOrder).toEqual([
+      'tool_batch_completed:1',
+      'drift',
+      'termination:30',
+    ])
+  })
+
+  it('does not run drift after 30 batches when no checkpoint revision advanced', async () => {
+    let revision = 0
+    const driftGate = vi.fn(async () => ({ drifted: false, corrective: [] }))
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'termination') revision++
+      return { updated: event.type === 'termination', revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall <= 30) {
+        yield* toolUseStream(`echo-${apiCall}`, 'echo', { batch: apiCall })
+      } else {
+        yield* textStream('done')
+      }
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 35,
+      tools: [makeTool('echo')],
+      autonomousMode: true,
+      driftGate,
+      onCheckpointBoundary,
+    }))
+    await collectEvents(session, 'run')
+
+    expect(driftGate).not.toHaveBeenCalled()
+    expect(onCheckpointBoundary).toHaveBeenCalledTimes(1)
+    expect(onCheckpointBoundary).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'termination',
+      toolBatchCount: 30,
+    }))
+  })
+
+  it('stops auto normally after the configured per-run tool-batch allowance', async () => {
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      yield* toolUseStream(crypto.randomUUID(), 'echo', { apiCall })
+    })
+    const onCheckpointBoundary = vi.fn(async () => ({ updated: true, revision: 1 }))
+    const session = new KernelSession(makeConfig({
+      maxTurns: 20,
+      tools: [makeTool('echo')],
+      autonomousMode: true,
+      autoMaxToolBatches: 3,
+      onCheckpointBoundary,
+    }))
+
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('success')
+    expect(result?.stopReason).toBe('auto_tool_batch_limit')
+    expect(onCheckpointBoundary).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'termination',
+      toolBatchCount: 3,
+      stopReason: 'auto_tool_batch_limit',
+    }))
+  })
+
+  it('stops auto normally after the configured wall-clock allowance', async () => {
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) yield* toolUseStream('slow-1', 'slow', {})
+      else yield* textStream('should not reach')
+    })
+    const slow = makeTool('slow')
+    slow.call = async () => {
+      await new Promise(resolve => setTimeout(resolve, 20))
+      return { data: 'ok' }
+    }
+    const session = new KernelSession(makeConfig({
+      maxTurns: 20,
+      tools: [slow],
+      autonomousMode: true,
+      autoMaxRuntimeMs: 5,
+    }))
+
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('success')
+    expect(result?.stopReason).toBe('auto_runtime_limit')
+  })
+
+  it('checkpoints long/non-idempotent external tools before and after execution', async () => {
+    const boundaries: string[] = []
+    let revision = 0
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      revision++
+      boundaries.push(event.type)
+      return { updated: true, revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) yield* toolUseStream('mcp-1', 'mcp_call', {})
+      else yield* textStream('done')
+    })
+
+    const session = new KernelSession(makeConfig({
+      tools: [makeTool('mcp_call', 'both')],
+      autonomousMode: true,
+      onCheckpointBoundary,
+    }))
+    await collectEvents(session, 'run')
+
+    expect(boundaries).toEqual([
+      'external_before',
+      'external_after',
+      'termination',
+    ])
+  })
+})
+
 describe('KernelSession — interrupt', () => {
   it('interrupt() can be called at any time without throwing', () => {
     const session = new KernelSession(makeConfig())

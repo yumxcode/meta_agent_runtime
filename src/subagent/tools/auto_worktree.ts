@@ -26,6 +26,7 @@ function taskId(input: Record<string, unknown>): string {
 export function makeAutoMergeWorktreeTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
     name: 'auto_merge_subagent',
+    permission: { category: 'state', checkpointBoundary: 'both' },
     description:
       'Auto mode: merge an isolated sub-agent\'s git worktree branch back into the main branch ' +
       '(squash by default). Review the diff first with auto_diff_subagent. Merges are serialised.',
@@ -49,7 +50,48 @@ export function makeAutoMergeWorktreeTool(bridge: SubAgentBridge): MetaAgentTool
         if (!result) return { content: `Error: no worktree found for task "${id}".`, isError: true }
         return { content: `Merged sub-agent ${id} (${strategy}) → ${result.commitHash}`, isError: false }
       } catch (err) {
-        return { content: `Merge failed (likely a conflict): ${err instanceof Error ? err.message : String(err)}. Use auto_discard_subagent to drop it.`, isError: true }
+        return {
+          content:
+            `Merge failed: ${err instanceof Error ? err.message : String(err)}. ` +
+            'The main workspace was rolled back when possible; the task branch is preserved for inspection/retry.',
+          isError: true,
+        }
+      }
+    },
+  }
+}
+
+export function makeAutoFinalizeWorktreeTool(bridge: SubAgentBridge): MetaAgentTool {
+  return {
+    name: 'auto_finalize_subagent',
+    permission: { category: 'state', checkpointBoundary: 'both' },
+    description:
+      'Finalize an isolated-write sub-agent worktree: detect dirty files, stage all changes, ' +
+      'and create an idempotent task commit. Usually automatic on completion and before merge.',
+    inputSchema: TASK_ID_SCHEMA,
+    async call(input: Record<string, unknown>): Promise<ToolResult> {
+      const id = taskId(input)
+      if (!id) return { content: 'Error: task_id is required', isError: true }
+      const coord = bridge.getWorktreeCoordinator()
+      if (!coord) {
+        return { content: 'Error: worktree isolation is not active in this session.', isError: true }
+      }
+      try {
+        const result = await coord.finalize(id)
+        return {
+          content: JSON.stringify({
+            task_id: id,
+            status: result.status,
+            commit_hash: result.commitHash,
+            changed_files: result.changedFiles,
+          }, null, 2),
+          isError: false,
+        }
+      } catch (err) {
+        return {
+          content: `Finalize failed: ${err instanceof Error ? err.message : String(err)}`,
+          isError: true,
+        }
       }
     },
   }
@@ -88,6 +130,7 @@ export function makeAutoDiscardWorktreeTool(bridge: SubAgentBridge): MetaAgentTo
 
 export function makeAutoWorktreeTools(bridge: SubAgentBridge): MetaAgentTool[] {
   return [
+    makeAutoFinalizeWorktreeTool(bridge),
     makeAutoMergeWorktreeTool(bridge),
     makeAutoDiffWorktreeTool(bridge),
     makeAutoDiscardWorktreeTool(bridge),

@@ -59,6 +59,22 @@ const SPECIALIST_PREAMBLE =
   '你是 Meta-Agent，一个自主工程 Agent，支持三种专项模式：' +
   'Agentic（代码开发）、Campaign（工业工程项目）、Robotics（机器人算法及落地）。'
 
+/**
+ * Capabilities whose effects cannot be confined to the auto workspace jail.
+ *
+ * Read-only counterparts remain available:
+ *   - memory is recalled into the prompt, but memory_write/delete are blocked;
+ *   - cron_list remains available, but scheduling/cancelling is blocked;
+ *   - MCP capabilities remain available by explicit product decision.
+ */
+export const AUTO_DENIED_TOOL_NAMES = [
+  'memory_write',
+  'memory_delete',
+  'cron_create',
+  'cron_delete',
+  'powershell',
+] as const
+
 export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
   agentic: {
     weight: 1,
@@ -80,11 +96,16 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
       '- **授权范围**：对**项目工作路径内**的写入、编辑、删除、替换等操作（含不可逆操作）你已获明确授权，无需逐次请求确认，直接执行即可。\n' +
       '- **边界约束**：解决任务必须保证在工作区边界内完成；影响工作区之外或共享状态的操作（如 git push、对外发布、改动他人环境）不在授权范围，会被系统直接拒绝——遇到这类需求时停下并在总结中说明，不要反复试探。\n' +
       '- **持续推进**：可自行判定的小决策直接做，不要为此停下等待；持续推进直到目标达成或遇到真正的阻塞。\n' +
+      '- **进展留痕**：及时使用 `todo_write` 记录任务分解和完成情况，使用 `progress_note` 更新进度摘要，使用 `artifacts_register` 标记关键产出文件——这些信息用于航向检查和会话恢复。\n' +
       '- **终止与总结**：完成或受阻时，给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
     compactProfile: 'auto',
     agenticOverrides: {
       promptMode: 'auto',
-      autonomy: { autoApproveInWorkspace: true, lockWorkspace: true },
+      autonomy: {
+        autoApproveInWorkspace: true,
+        lockWorkspace: true,
+        deniedTools: AUTO_DENIED_TOOL_NAMES,
+      },
     },
   },
 

@@ -1,8 +1,8 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
-import { parseDriftVerdict } from '../DriftAgent.js'
+import { makeAutoDriftGate, parseDriftVerdict } from '../DriftAgent.js'
 import { buildDriftCorrectionPrompt } from '../../../../kernel/loop/DriftGate.js'
 import {
   createAutoExperienceStore,
@@ -49,6 +49,38 @@ describe('buildDriftCorrectionPrompt', () => {
   })
 })
 
+describe('AutoDriftGate', () => {
+  let dir: string
+  beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ma-drift-')) })
+  afterEach(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* noop */ } })
+
+  it('skips the drift sub-agent when no checkpoint exists yet', async () => {
+    const spawnSubAgent = vi.fn()
+    const gate = makeAutoDriftGate({
+      dispatcher: {
+        spawnSubAgent,
+        getStatus: vi.fn(),
+        cancelTask: vi.fn(),
+      },
+      projectDir: dir,
+      getGoal: () => 'build a feature',
+    })
+
+    const verdict = await gate({
+      workspaceRoot: dir,
+      turnCount: 0,
+      reason: 'turn_interval',
+      signal: new AbortController().signal,
+    })
+
+    // Fail-open SKIP (no checkpoint to judge against): drifted:false so the run
+    // is never derailed, but skipped:true so the loop surfaces a visible warning
+    // rather than silently treating it as a genuine "on course" verdict.
+    expect(verdict).toEqual({ drifted: false, corrective: [], skipped: true })
+    expect(spawnSubAgent).not.toHaveBeenCalled()
+  })
+})
+
 describe('AutoExperienceStore', () => {
   let dir: string
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ma-exp-')) })
@@ -82,6 +114,20 @@ describe('AutoExperienceStore', () => {
     expect(okIdx).toBeGreaterThan(failIdx)
     expect(block).toContain('check API version')
   })
+
+  it('dedupes by title: re-writing the same lesson returns the existing id', async () => {
+    const store = createAutoExperienceStore(dir)
+    const id1 = await writeAutoExperience(store, {
+      title: 'same lesson', problem: 'p', solution: 's',
+      success: false, outcome_summary: 'o', error_source: 'verify reject',
+    })
+    const id2 = await writeAutoExperience(store, {
+      title: 'same lesson', problem: 'p2', solution: 's2',
+      success: false, outcome_summary: 'o2', error_source: 'verify reject again',
+    })
+    expect(id2).toBe(id1)
+    expect(await store.listIds()).toHaveLength(1)
+  })
 })
 
 describe('checkpoint completedSteps (drift input)', () => {
@@ -89,9 +135,9 @@ describe('checkpoint completedSteps (drift input)', () => {
   beforeEach(() => { dir = mkdtempSync(join(tmpdir(), 'ma-cp-')) })
   afterEach(() => { try { rmSync(dir, { recursive: true, force: true }) } catch { /* noop */ } })
 
-  it('records and unions completedSteps across turns', () => {
-    updateAutoCheckpoint(dir, 'sess-1', { goal: 'g', completedSteps: ['step A'], pendingTodos: ['B', 'C'] })
-    updateAutoCheckpoint(dir, 'sess-1', { completedSteps: ['step B'], pendingTodos: ['C'] })
+  it('records and unions completedSteps across turns', async () => {
+    await updateAutoCheckpoint(dir, 'sess-1', { goal: 'g', completedSteps: ['step A'], pendingTodos: ['B', 'C'] })
+    await updateAutoCheckpoint(dir, 'sess-1', { completedSteps: ['step B'], pendingTodos: ['C'] })
     const cp = readAutoCheckpoint(dir)
     expect(cp!.goal).toBe('g')
     expect(cp!.completedSteps).toEqual(['step A', 'step B'])  // append-only union

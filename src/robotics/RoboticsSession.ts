@@ -58,7 +58,7 @@ import { proposePrincipleFromExperience } from './PrinciplePromotion.js'
 import { evaluatePromotion, type EvaluatePromotionResult } from './PrincipleConvergence.js'
 import { extractKnowledgePostSession } from './postSessionExtract.js'
 import { HardwareProfile } from './HardwareProfile.js'
-import { GitWorkspaceManager } from './git/GitWorkspaceManager.js'
+import { GitWorkspaceManager } from '../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
 import { ContextPager } from '../context/ContextPager.js'
 import { estimateTokens } from '../context/TokenEstimator.js'
@@ -107,44 +107,16 @@ import { TeamStore, type TeamNoteInput, type TeamPublishState, type TeamPushResu
 import { TeamWatcher, type TeamWatcherEvent } from './team/TeamWatcher.js'
 import { buildTeamSection } from './team/dynamicSection.js'
 import { createTeamTools } from './tools/team/index.js'
+import { RoboticsTeamCoordinator } from './team/RoboticsTeamCoordinator.js'
+import { ExperienceWorkingSetManager } from './ExperienceWorkingSet.js'
+import type { RoboticsCapabilities, RoboticsTeamController } from './contracts.js'
 
 // ── Options ───────────────────────────────────────────────────────────────────
 
 const EXPERIENCE_SLOT_REF_RE = /\bexperience:([A-Za-z0-9_-]+)\b/g
 const EXPERIENCE_ID_REF_RE = /\b(exp_[0-9a-z]+_[0-9a-f]{8})\b/g
-const EXPERIENCE_TASK_SWITCH_RE = /\b(new task|switch task|different task|another task|unrelated)\b|换个|另一个|另外一个|新任务|重新开始/
-const EXPERIENCE_INJECTION_LIMIT = 4
-const EXPERIENCE_CANDIDATE_LIMIT = 18
-const EXPERIENCE_STRONG_APPLICABILITY_SCORE = 100
-
-const EXPERIENCE_RELEVANCE_SYSTEM = `\
-You select stored robotics experiences that should be injected into the current task context.
-
-Judge applicability by mechanism and abstract principle, not surface word overlap.
-Return JSON only: {"applicable":["id1","id2"]}
-
-Rules:
-- Include only experiences that materially constrain, warn, or guide this task.
-- Prefer same robot/domain/algorithm/mechanism, but allow cross-domain transfer only when the principle clearly applies.
-- Exclude weakly related memories; noisy context is worse than no context.
-- Return at most ${EXPERIENCE_INJECTION_LIMIT} IDs.
-- If none apply, return {"applicable":[]}.`
-
-interface SelectedExperience {
-  experience: ExperienceMatch
-  appliesBecause: string
-  localScore: number
-  hasApplicabilitySignal: boolean
-}
-
-interface ExperiencePreloadTrace {
-  queryHash: string
-  domains: string[]
-  keywords: string[]
-  candidateSource: 'store' | 'cache' | 'none'
-  candidateCount: number
-  injectedIds: string[]
-}
+// Experience candidate-selection constants, helpers and the SelectedExperience
+// type moved to ./ExperienceWorkingSet.ts (ExperienceWorkingSetManager).
 
 function assistantText(message: ConversationMessage): string {
   if (message.role !== 'assistant') return ''
@@ -170,40 +142,8 @@ function extractReferencedExperienceSlotIds(messages: readonly ConversationMessa
 
   return ids
 }
-
-function normalizeExperienceKeyword(keyword: string): string | null {
-  const normalized = keyword.trim().toLowerCase()
-  if (normalized.length < 3) return null
-  return normalized
-}
-
-function formatExperienceCandidate(e: ExperienceMatch): string {
-  return [
-    `ID: ${e.id}`,
-    `Domain: ${e.domain}`,
-    `Outcome: ${e.outcome}`,
-    `Confidence: ${e.confidenceTier ?? 'observed'} (${e.observationCount ?? 1} obs, ${e.contradictionCount ?? 0} contradictions)`,
-    `Title: ${e.title}`,
-    `Principle: ${e.abstractPrinciple}`,
-    ...(e.failureReason ? [`Failure: ${e.failureReason.slice(0, 160)}`] : []),
-    ...(e.workarounds?.length ? [`Workaround: ${e.workarounds[0]}`] : []),
-  ].join('\n')
-}
-
-function parseApplicableExperienceIds(raw: string, candidates: ExperienceMatch[]): Set<string> {
-  try {
-    const jsonMatch = raw.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) return new Set()
-    const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>
-    const validIds = new Set(candidates.map(c => c.id))
-    const ids = Array.isArray(parsed['applicable'])
-      ? parsed['applicable'].filter((id): id is string => typeof id === 'string' && validIds.has(id))
-      : []
-    return new Set(ids.slice(0, EXPERIENCE_INJECTION_LIMIT))
-  } catch {
-    return new Set()
-  }
-}
+// (normalizeExperienceKeyword / formatExperienceCandidate /
+//  parseApplicableExperienceIds moved to ./ExperienceWorkingSet.ts)
 
 export interface RoboticsSessionOptions extends MetaAgentConfig {
   /** Robot/platform name (e.g. 'go2', 'franka_panda'). Injected into R1 & R4. */
@@ -256,11 +196,20 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
 
 // ── RoboticsSession ───────────────────────────────────────────────────────────
 
-export class RoboticsSession {
+export class RoboticsSession implements RoboticsCapabilities {
   private readonly inner: AgenticSession
+  /** Team-collaboration half of the unit (extracted out of this class). */
+  private readonly teamController: RoboticsTeamCoordinator
   /** Last assembled R-section prompt, exposed for debugging. */
   private _lastSystemPrompt: string | null = null
-  private readonly bridge: SubAgentBridge
+  /**
+   * Sub-agent bridge. Created in init() (NOT the constructor) so a same-process
+   * re-resume of the same sessionId can first `await` disposal of any stale
+   * bridge still registered under that id — the SubAgentBridge constructor
+   * throws on a duplicate sessionId to prevent double-delivered notifications,
+   * and disposal is async so it cannot be awaited from a constructor.
+   */
+  private bridge!: SubAgentBridge
   private readonly store: ExperienceStore
   /** Session-scoped pending experience buffer. Exposed so the CLI can drive review UI. */
   readonly pendingExperiences: ExperiencePendingStore
@@ -297,12 +246,8 @@ export class RoboticsSession {
   private _resumedAt: number | null = null
   private _workflowDef: WorkflowDefinition | null = null
   private _workflowState: WorkflowState | null = null
-  private _experienceCandidatePool: ExperienceMatch[] = []
-  private _experienceWorkingSet: SelectedExperience[] = []
-  private _experienceWorkingSetDomains = new Set<string>()
-  private _experienceWorkingSetKeywords = new Set<string>()
-  private _forceExperienceCandidateLoad = true
-  private _lastExperiencePreloadTrace: ExperiencePreloadTrace | null = null
+  /** Experience-recall engine (candidate caching + ranking + flash selection). */
+  private readonly experienceWorkingSet: ExperienceWorkingSetManager
   /** Bumped on /anchor review commit; keys the memoized R6 section for incremental refresh. */
   private _anchorVersion = 0
   /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
@@ -324,12 +269,8 @@ export class RoboticsSession {
    * preserving the DeepSeek KV cache prefix across conversation turns.
    */
   private _lastStablePrompt: string | null = null
-  /**
-   * Plan B context boundary — set once after task claim when the session has prior history.
-   * Injected as the first section in _getRoboticsExtensions() to anchor the AI's perception
-   * of where this task starts.
-   */
-  private _teamContextBoundary: string | null = null
+  // Plan-B context-boundary state now lives on the team coordinator
+  // (this.teamController.contextBoundary).
 
   /** Mirrors MetaAgentSession.sessionId */
   readonly sessionId: string
@@ -416,7 +357,13 @@ export class RoboticsSession {
     this.gitMgr = new GitWorkspaceManager(this.projectDir)
     this.teamStore = new TeamStore(this.projectDir)
     this.teamWatcher = new TeamWatcher(this.teamStore)
-    this.bridge = new SubAgentBridge(this.sessionId)
+    this.teamController = new RoboticsTeamCoordinator(
+      this.teamStore,
+      this.teamWatcher,
+      section => this.sectionRegistry.invalidate(section),
+    )
+    // NOTE: this.bridge is created in init() (see comment on the field) so a
+    // stale bridge for the same resumed sessionId can be awaited-disposed first.
 
     // Context pager — initialise before runtimeContext so hooks can reference it
     this.contextPager = new ContextPager({ maxBudget: 1500 })
@@ -431,6 +378,13 @@ export class RoboticsSession {
     })
     this.queryAnalyzer = rtxResult.queryAnalyzer
     this._flashClient = rtxResult.flashClient
+
+    this.experienceWorkingSet = new ExperienceWorkingSetManager({
+      experienceSource: this.experienceSource,
+      contextPager:     this.contextPager,
+      flashClient:      this._flashClient,
+      robot:            this.robot,
+    })
 
     // Build inner session using AgenticSession directly — skips MetaAgentSession's
     // D-section assembly, which is superseded by the R1-R5 sections injected below.
@@ -485,6 +439,17 @@ export class RoboticsSession {
       this.pendingPhysicalAnchors.load(),
       this.pendingPrinciples.load(),
     ])
+
+    // ── 0. Sub-agent bridge ────────────────────────────────────────────────
+    // Bind the bridge here (not in the constructor): when the user re-resumes
+    // the SAME session in a still-running process, a previous RoboticsSession
+    // may still hold a bridge registered under this.sessionId. The bridge
+    // constructor throws on a duplicate sessionId (it would otherwise register a
+    // second CampaignEventBus listener and double-deliver notifications). Await
+    // disposal of the stale bridge first so the new one binds cleanly — async
+    // disposal is exactly why this can't live in the constructor.
+    await SubAgentBridge.getBridge(this.sessionId)?.dispose()
+    this.bridge = new SubAgentBridge(this.sessionId)
 
     // ── 1. Persistence: try to restore project state ─────────────────────
     //
@@ -661,7 +626,7 @@ export class RoboticsSession {
     // unit owns); team_take / team_mark_done are flagged sensitive by the CLI
     // guard so a human confirms each. All three error cleanly when team mode
     // is not initialised, so unconditional registration is safe.
-    for (const tool of createTeamTools(this)) {
+    for (const tool of createTeamTools(this.teamController)) {
       this.inner.registerTool(tool)
     }
 
@@ -812,7 +777,7 @@ export class RoboticsSession {
     return {
       state: this._state,
       hardwareSummary: this._hwSummary,
-      experienceWorkingSet: this._experienceWorkingSet.map(selection => ({
+      experienceWorkingSet: this.experienceWorkingSet.current.map(selection => ({
         id: selection.experience.id,
         title: selection.experience.title,
         appliesBecause: selection.appliesBecause,
@@ -901,9 +866,11 @@ export class RoboticsSession {
     }
     this.teamWatcher.stop()
 
-    // Cancel running sub-agents
+    // Cancel running sub-agents. The bridge is created in init(); guard with
+    // optional chaining so disposing a constructed-but-never-init()ed session
+    // (e.g. an init() failure path) doesn't throw on an undefined bridge.
     try {
-      await this.bridge.cancelAll()
+      await this.bridge?.cancelAll()
     } catch { /* best-effort */ }
 
     // Clean up active worktrees and purge state records
@@ -923,7 +890,7 @@ export class RoboticsSession {
       )
     }
 
-    await this.bridge.dispose().catch(() => undefined)
+    await this.bridge?.dispose().catch(() => undefined)
 
     // Post-session knowledge extraction (best-effort). One strict flash call
     // scans the transcript for durable experiences AND physical anchors; both
@@ -935,6 +902,15 @@ export class RoboticsSession {
       experiencePending: this.pendingExperiences,
       anchorPending: this.pendingPhysicalAnchors,
     }).catch(() => undefined)
+
+    // Release the inner AgenticSession/KernelSession LAST — after post-session
+    // knowledge extraction above, which reads this.inner.getMessages(). Mirrors
+    // MetaAgentSession.dispose(): frees the kernel message buffer, FileStateCache,
+    // tool closures, and the RuntimeContext/ProvenanceTracker/FlashClient that
+    // the tool instrumentation closures otherwise keep pinned for the process
+    // lifetime. Without this, a long-lived host that repeatedly opens and closes
+    // robotics sessions leaks the full session graph each time. Idempotent.
+    try { this.inner.dispose() } catch { /* best-effort */ }
   }
 
   /**
@@ -1002,7 +978,7 @@ export class RoboticsSession {
     // volatile section build so any pre-loaded pager slots appear in R2 this turn.
     const intent = await queryIntentPromise
 
-    await this._preloadExperienceWorkingSet(prompt, intent)
+    await this.experienceWorkingSet.preload(prompt, intent)
 
     // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
     // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
@@ -1030,7 +1006,7 @@ export class RoboticsSession {
         if (ev.type === 'compact_start') {
           this._refreshR5Snapshot()
           await this._refreshR4Snapshot()
-          this._forceExperienceCandidateLoad = true
+          this.experienceWorkingSet.forceReload()
         }
         yield ev
       }
@@ -1064,7 +1040,7 @@ export class RoboticsSession {
   async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
     this._refreshR5Snapshot()
     await this._refreshR4Snapshot()
-    this._forceExperienceCandidateLoad = true
+    this.experienceWorkingSet.forceReload()
     return this.inner.compactNow()
   }
 
@@ -1089,398 +1065,15 @@ export class RoboticsSession {
     return this.sessionId
   }
 
-  private async _preloadExperienceWorkingSet(prompt: string, intent: QueryIntent | null): Promise<void> {
-    if (!intent) {
-      this._lastExperiencePreloadTrace = {
-        queryHash: this._experienceQueryHash(prompt),
-        domains: [],
-        keywords: [],
-        candidateSource: 'none',
-        candidateCount: 0,
-        injectedIds: [],
-      }
-      return
-    }
-
-    const domains = intent.domains.filter(d => d !== 'general')
-    const keywords = intent.searchKeywords
-      .map(normalizeExperienceKeyword)
-      .filter((kw): kw is string => Boolean(kw))
-      .slice(0, 8)
-
-    const shouldLoad = this._shouldLoadExperienceCandidates(prompt, domains, keywords)
-    let candidateSource: ExperiencePreloadTrace['candidateSource'] = 'cache'
-
-    try {
-      let candidates = this._experienceCandidatePool
-      if (shouldLoad) {
-        candidates = await this.experienceSource.listExperiences({
-          domains: domains.length > 0 ? domains : undefined,
-          keywords,
-          robot: this.robot,
-          currentQuery: prompt,
-          limit: EXPERIENCE_CANDIDATE_LIMIT,
-        })
-        this._experienceCandidatePool = candidates
-        this._experienceWorkingSetDomains = new Set(domains)
-        this._experienceWorkingSetKeywords = new Set(keywords)
-        this._forceExperienceCandidateLoad = false
-        candidateSource = 'store'
-      }
-
-      const selected = await this._selectApplicableExperiences(prompt, intent, candidates)
-      this._experienceWorkingSet = selected
-      this._refreshExperienceSlots(selected)
-      this._lastExperiencePreloadTrace = {
-        queryHash: this._experienceQueryHash(prompt),
-        domains,
-        keywords,
-        candidateSource,
-        candidateCount: candidates.length,
-        injectedIds: selected.map(s => s.experience.id),
-      }
-    } catch {
-      this._lastExperiencePreloadTrace = {
-        queryHash: this._experienceQueryHash(prompt),
-        domains,
-        keywords,
-        candidateSource: 'none',
-        candidateCount: 0,
-        injectedIds: [],
-      }
-      // Experience preload is mandatory in shape but opportunistic in effect;
-      // failures must not block the user turn.
-    }
-  }
-
-  private _shouldLoadExperienceCandidates(
-    prompt: string,
-    domains: string[],
-    keywords: string[],
-  ): boolean {
-    if (this._forceExperienceCandidateLoad) return true
-    if (this._experienceCandidatePool.length === 0) return true
-
-    if (this._experienceWorkingSetDomains.size === 0 && this._experienceWorkingSetKeywords.size === 0) {
-      return true
-    }
-
-    const domainOverlap = domains.some(d => this._experienceWorkingSetDomains.has(d))
-    if (domains.length > 0 && this._experienceWorkingSetDomains.size > 0 && !domainOverlap) {
-      return true
-    }
-
-    const taskSwitch = EXPERIENCE_TASK_SWITCH_RE.test(prompt.toLowerCase())
-    if (!taskSwitch) return false
-
-    const keywordOverlap = keywords.some(kw => this._experienceWorkingSetKeywords.has(kw))
-    return keywords.length > 0 && this._experienceWorkingSetKeywords.size > 0 && !keywordOverlap
-  }
-
-  private async _selectApplicableExperiences(
-    prompt: string,
-    intent: QueryIntent,
-    candidates: ExperienceMatch[],
-  ): Promise<SelectedExperience[]> {
-    if (candidates.length === 0) return []
-
-    const locallyRanked = this._rankExperienceCandidates(prompt, intent, candidates)
-    const localFallback = locallyRanked
-      .filter(s => s.hasApplicabilitySignal && s.localScore >= EXPERIENCE_STRONG_APPLICABILITY_SCORE)
-      .slice(0, EXPERIENCE_INJECTION_LIMIT)
-
-    if (!this._flashClient) {
-      return localFallback
-    }
-
-    const raw = await this._flashClient.query({
-      system: EXPERIENCE_RELEVANCE_SYSTEM,
-      user: [
-        `User task:\n${prompt.slice(0, 800)}`,
-        `Intent: ${intent.intent}; risk=${intent.riskLevel}; domains=${intent.domains.join(', ')}`,
-        `Search keywords: ${intent.searchKeywords.join(', ')}`,
-        `Candidate experiences:\n${candidates.map(formatExperienceCandidate).join('\n\n')}`,
-      ].join('\n\n'),
-      maxTokens: 220,
-      timeoutMs: 30_000,
-      cacheKey: `experience-working-set:${createHash('sha256')
-        .update([
-          prompt.slice(0, 800),
-          intent.intent,
-          intent.riskLevel,
-          intent.domains.join(','),
-          intent.searchKeywords.join(','),
-          candidates.map(c => c.id).join(','),
-        ].join('\n'))
-        .digest('hex')}`,
-    })
-
-    if (!raw) return localFallback
-    const ids = parseApplicableExperienceIds(raw, candidates)
-    if (ids.size === 0) return localFallback
-
-    const byId = new Map(locallyRanked.map(s => [s.experience.id, s]))
-    return [...ids]
-      .map(id => byId.get(id))
-      .filter((s): s is SelectedExperience => Boolean(s))
-      .slice(0, EXPERIENCE_INJECTION_LIMIT)
-  }
-
-  private _rankExperienceCandidates(
-    prompt: string,
-    intent: QueryIntent,
-    candidates: ExperienceMatch[],
-  ): SelectedExperience[] {
-    const queryText = [
-      prompt,
-      ...intent.searchKeywords,
-      ...intent.domains,
-      this.robot ?? '',
-    ].join(' ').toLowerCase()
-    const domainSet = new Set<string>(intent.domains.filter(d => d !== 'general'))
-    const keywords = intent.searchKeywords
-      .map(normalizeExperienceKeyword)
-      .filter((kw): kw is string => Boolean(kw))
-
-    return candidates.map(experience => {
-      const searchable = [
-        experience.title,
-        experience.abstractPrinciple,
-        experience.failureReason ?? '',
-        experience.workarounds?.join(' ') ?? '',
-        experience.algorithm ?? '',
-        experience.robot ?? '',
-      ].join(' ').toLowerCase()
-
-      const matchingKeywords = keywords.filter(kw => searchable.includes(kw)).slice(0, 3)
-      const sameDomain = domainSet.has(experience.domain)
-      const sameRobot = Boolean(this.robot && experience.robot?.toLowerCase() === this.robot.toLowerCase())
-      const sameAlgorithm = Boolean(experience.algorithm && queryText.includes(experience.algorithm.toLowerCase()))
-      const hardwareMechanism = intent.hasHardware || intent.domains.includes('hardware_interface') || intent.domains.includes('deployment')
-        ? /\b(torque|force|velocity|joint|motor|actuator|sensor|limit|thermal|driver|can|gpio|gripper)\b/i.test(searchable)
-        : false
-
-      const confidence = experience.confidenceTier ?? 'observed'
-      const confidenceScore = confidence === 'reproduced' ? 90 :
-        confidence === 'observed' ? 70 :
-        confidence === 'derived' ? 60 :
-        confidence === 'reported' ? 30 :
-        confidence === 'hypothesis' ? -40 : 40
-      const evidenceBoost = experience.evidenceRefs?.length ? 30 : 0
-      const contradictionPenalty = Math.max(0, experience.contradictionCount ?? 0) * 45
-      const observationBoost = Math.min(Math.max(1, experience.observationCount ?? 1), 5) * 8
-
-      const applicabilityScore =
-        (sameDomain ? 120 : 0) +
-        (sameRobot ? 100 : 0) +
-        (sameAlgorithm ? 110 : 0) +
-        matchingKeywords.length * 55 +
-        (hardwareMechanism ? 75 : 0)
-
-      const reasons: string[] = []
-      if (sameDomain) reasons.push(`same ${experience.domain} domain`)
-      if (sameRobot) reasons.push(`same robot platform (${this.robot})`)
-      if (sameAlgorithm && experience.algorithm) reasons.push(`same algorithm (${experience.algorithm})`)
-      if (hardwareMechanism) reasons.push('same hardware constraint')
-      if (matchingKeywords.length > 0) reasons.push(`matching task terms (${matchingKeywords.join(', ')})`)
-      const hasApplicabilitySignal = reasons.length > 0
-
-      return {
-        experience,
-        appliesBecause: reasons.slice(0, 2).join('; ') || 'flash judged the stored principle applicable',
-        localScore: applicabilityScore + confidenceScore + evidenceBoost + observationBoost - contradictionPenalty,
-        hasApplicabilitySignal,
-      }
-    }).sort((a, b) => b.localScore - a.localScore)
-  }
-
-  private _refreshExperienceSlots(selections: SelectedExperience[]): void {
-    for (const selection of selections) {
-      const e = selection.experience
-      const icon = e.outcome === 'success' ? '✓' : '⚠️'
-      const lines = [
-        `### ${icon} Past Experience: ${e.title}`,
-        `**Domain:** ${e.domain}  **Outcome:** ${e.outcome}`,
-        `**Confidence:** ${e.confidenceTier ?? 'observed'}${e.observationCount ? ` (${e.observationCount} observation${e.observationCount === 1 ? '' : 's'})` : ''}`,
-        `**Applies because:** ${selection.appliesBecause}`,
-        `**Principle:** ${e.abstractPrinciple}`,
-        ...(e.failureReason ? [`**Failure detail:** ${e.failureReason}`] : []),
-        ...(e.workarounds?.length ? [`**Workarounds:** ${e.workarounds.join(' / ')}`] : []),
-      ]
-      const content = lines.join('\n')
-      this.contextPager.checkout({
-        id:       `experience:${e.id}`,
-        tag:      `${icon} [EXP] ${e.title.slice(0, 40)}`,
-        content,
-        tokenEst: estimateTokens(content),
-        priority: 'medium',
-        ttlTurns: 4,
-        source:   'experience',
-      })
-    }
-  }
-
-  private _experienceQueryHash(prompt: string): string {
-    return createHash('sha256').update(prompt.slice(0, 800)).digest('hex').slice(0, 12)
-  }
-
-  async teamInit(github?: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const state = await this.teamStore.init(github)
-    this.teamWatcher.start()
-    await this.teamWatcher.forceSync(false)
-    return state
-  }
-
-  async teamJoin(github?: string, human?: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const state = await this.teamStore.join(github, human)
-    this.teamWatcher.start()
-    await this.teamWatcher.forceSync(false)
-    return state
-  }
-
-  async teamStatus() {
-    return this.teamStore.status()
-  }
-
-  async teamTaskAdd(input: TeamTaskAddInput) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.addTask(input)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** Exclusively take a task; throws if owned by another unit. */
-  async teamTake(taskId: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.take(taskId)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** Release a task you own (no-op if you don't own it). */
-  async teamDrop(taskId?: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.drop(taskId)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** Force-take a task currently owned by someone else; records audit attempt. */
-  async teamSteal(taskId: string, reason?: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.steal(taskId, reason)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** Append a single direction+outcome attempt to a task you own. */
-  async teamNote(input: TeamNoteInput) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.note(input)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  async teamTaskStatus(taskId: string, status: TeamTaskStatus) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.updateTaskStatus(taskId, status)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  async teamSync(): Promise<TeamSyncSummary> {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    // /team sync is an explicit user request — bypass the fetch cooldown.
-    const summary = await this.teamStore.sync({ forceFetch: true })
-    await this.teamWatcher.forceSync(false)
-    return summary
-  }
-
-  async teamPull() {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.pullRemoteTeam()
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** Switch this unit's focus to a task it owns. */
-  async teamFocus(taskId: string) {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    const result = await this.teamStore.focus(taskId)
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** All active tasks this unit owns + the current focus id. */
-  async teamOwnedTasks() {
-    return this.teamStore.ownedActiveTasks()
-  }
-
-  /** Resolve a no-arg done/drop target: explicit → focus → single-owned → throw. */
-  async teamResolveOwnTaskId(explicit?: string): Promise<string> {
-    return this.teamStore.requireOwnTaskId(explicit)
-  }
-
-  /** Publish local team/ changes: stage team/ only, commit, push. */
-  async teamPush(): Promise<TeamPushResult> {
-    const result = await this.teamStore.push()
-    await this.teamWatcher.forceSync(false)
-    return result
-  }
-
-  /** What local team/ work teammates can't see yet (dirty + unpushed). */
-  async teamPublishState(): Promise<TeamPublishState> {
-    return this.teamStore.publishState()
-  }
-
-  /** True when team/team.json exists (team mode initialised for this project). */
-  async teamExists(): Promise<boolean> {
-    return this.teamStore.exists()
-  }
-
-  /** This unit's id (user-hostname) — the owner identity for take/note/done. */
-  teamUnitId(): string {
-    return this.teamStore.unitId
-  }
-
-  async teamConflicts() {
-    return this.teamStore.detectMergeConflicts()
-  }
-
-  async teamResolveTeamJson() {
-    this.sectionRegistry.invalidate('robotics_team_mode')
-    return this.teamStore.resolveTeamJsonConflict()
-  }
 
   /**
-   * Plan B: context boundary.
-   * Called once after task claim when the session has prior conversation history.
-   *
-   * mode='background' — prior conversation is the origin of this task; AI may reference it
-   *   as background context but must not describe it as task work-in-progress.
-   * mode='unrelated'  — prior conversation is unrelated; AI must not attribute it to this task.
+   * The team-collaboration controller for this unit. SessionRouter exposes it to
+   * the CLI; the agent-facing team tools use it as their host. The ~20 team
+   * operations live on the coordinator now, not this session (cohesion — see
+   * architecture-review-2026-06-18.md §3.1).
    */
-  async teamSetContextBoundary(mode: 'background' | 'unrelated', taskId: string): Promise<void> {
-    if (mode === 'background') {
-      this._teamContextBoundary = `[任务背景] 此 session 创建 ${taskId} 之前的对话，是本任务的直接起源。AI 可将其作为背景参考，但不应将其内容描述为"当前任务的工作进展"。`
-    } else {
-      this._teamContextBoundary = `[边界提示] ${taskId} 于此刻新建，以上对话内容与本任务无关，请不要将其归因为本任务的工作记录或进展。`
-    }
-    this.sectionRegistry.invalidate('team_context_boundary')
-  }
-
-  async teamWatcherPoll(): Promise<TeamWatcherEvent[]> {
-    // Background poll: let the TeamStore fetch cooldown decide whether a real
-    // `git fetch` runs.  Passing fetch=true here only means "attempt", not
-    // "force" — TeamStore.sync({fetch:true}) will no-op inside the cooldown.
-    await this.teamWatcher.forceSync(true)
-    return this.teamWatcher.getRecentEvents()
-  }
-
-  teamWatcherEvents(): TeamWatcherEvent[] {
-    return this.teamWatcher.getRecentEvents()
+  getTeamController(): RoboticsTeamController {
+    return this.teamController
   }
 
   /**
@@ -1570,8 +1163,8 @@ export class RoboticsSession {
 
     // Context boundary — prepend before other volatile sections so the model
     // reads the task scope immediately after <context>.
-    if (this._teamContextBoundary) {
-      const boundary = this._teamContextBoundary
+    const boundary = this.teamController.contextBoundary
+    if (boundary) {
       sections.unshift(DANGEROUS_uncachedSystemPromptSection(
         'team_context_boundary',
         () => boundary,
@@ -1725,9 +1318,11 @@ Reply with a JSON object: {"mode":"single"|"multi","reason":"<one sentence why>"
 
       if (this._state) {
         this._state.agentMode = classifiedMode
-        // Ensure sessionId in state reflects the store session (resume case)
-        this._state.sessionId = this._storeSessionId
-        await RoboticsProjectStore.save(this._state).catch(() => undefined)
+        await RoboticsProjectStore.setAgentMode(
+          this.projectDir,
+          this._storeSessionId,
+          classifiedMode,
+        ).catch(() => undefined)
       }
     } catch {
       // Network error, timeout — stay in single-agent mode (safe default)

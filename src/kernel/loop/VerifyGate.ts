@@ -36,6 +36,14 @@ export interface VerifyVerdict {
    * Surfaced to the human; never load-bearing for the loop decision.
    */
   note?: string
+  /**
+   * True when the gate did NOT actually verify (fail-open): goal missing, judge
+   * timed out / could not spawn (e.g. sub-agent budget exhausted), or an
+   * internal error. `done` is still true so a broken verifier never wedges a
+   * run, but the loop surfaces a visible warning instead of a silent pass so an
+   * operator knows the completion check was skipped (and why, via `note`).
+   */
+  skipped?: boolean
 }
 
 /**

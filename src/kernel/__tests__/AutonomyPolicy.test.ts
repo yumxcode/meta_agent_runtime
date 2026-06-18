@@ -9,7 +9,11 @@ import { FileStateCache } from '../session/FileStateCache.js'
 //   lockWorkspace          → jail cannot be unlocked by config; + bash relative-escape hardening
 
 const ROOT = process.cwd()
-const AUTO = { autoApproveInWorkspace: true, lockWorkspace: true } as const
+const AUTO = {
+  autoApproveInWorkspace: true,
+  lockWorkspace: true,
+  deniedTools: ['memory_write', 'memory_delete', 'cron_create', 'cron_delete', 'powershell'],
+} as const
 
 function bashTool(): KernelTool {
   return {
@@ -46,6 +50,17 @@ function configTool(): KernelTool {
     inputJSONSchema: { type: 'object', properties: {}, required: [] },
     permission: { category: 'config', pathFields: [], requiresWorkspace: false, sensitive: true },
     isConcurrencySafe: () => false,
+    call: async () => ({ data: 'ok' }),
+  }
+}
+
+function namedTool(name: string): KernelTool {
+  return {
+    name,
+    description: name,
+    inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+    inputJSONSchema: { type: 'object', properties: {}, required: [] },
+    isConcurrencySafe: () => true,
     call: async () => ({ data: 'ok' }),
   }
 }
@@ -111,6 +126,33 @@ describe('autonomy profile — out-of-workspace hard deny (no prompt)', () => {
     const canUseTool = createPermissionPolicy({ workspaceRoot: ROOT, autonomy: AUTO })
     const result = await canUseTool(bashTool(), { command: 'python --out=/etc/passwd run.py', cwd: ROOT }, 'a', 't', context())
     expect(result.behavior).toBe('deny')
+  })
+})
+
+describe('autonomy profile — denied capability boundary', () => {
+  for (const name of AUTO.deniedTools) {
+    it(`denies ${name} even when manually registered`, async () => {
+      const canUseTool = createPermissionPolicy({
+        workspaceRoot: ROOT,
+        autonomy: AUTO,
+        permissionConfig: { tools: { [name]: { enabled: true, sensitive: false } } },
+      })
+      const result = await canUseTool(namedTool(name), {}, 'a', 't', context())
+      expect(result.behavior).toBe('deny')
+      expect(result.reason).toContain('cannot be confined to the workspace')
+    })
+  }
+
+  it('does not apply the auto denylist outside autonomy mode', async () => {
+    const canUseTool = createPermissionPolicy({ workspaceRoot: ROOT })
+    const result = await canUseTool(namedTool('memory_write'), {}, 'a', 't', context())
+    expect(result.behavior).toBe('allow')
+  })
+
+  it('keeps mcp_call available in autonomy mode', async () => {
+    const canUseTool = createPermissionPolicy({ workspaceRoot: ROOT, autonomy: AUTO })
+    const result = await canUseTool(namedTool('mcp_call'), {}, 'a', 't', context())
+    expect(result.behavior).toBe('allow')
   })
 })
 

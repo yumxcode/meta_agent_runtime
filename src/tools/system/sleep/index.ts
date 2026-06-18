@@ -5,6 +5,7 @@ export async function createSleepTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'sleep',
+    abortSupport: 'cooperative',
     description,
     inputSchema: {
       type: 'object',

@@ -56,6 +56,7 @@ export function createPaperSearchTool(
 ): MetaAgentTool {
   return {
     name: 'paper_search',
+    abortSupport: 'cooperative',
     // Opt out of the kernel's per-tool timeout: this tool blocks while awaiting
     // the PaperSearchAgent sub-agent, which is bounded by its own 5-min cap.
     timeoutMs: 0,

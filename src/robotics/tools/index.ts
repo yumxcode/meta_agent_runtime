@@ -43,7 +43,7 @@ import { PhysicalAnchorPendingStore } from '../PhysicalAnchorPendingStore.js'
 import { PrincipleStore } from '../PrincipleStore.js'
 import { PrinciplePendingStore } from '../PrinciplePendingStore.js'
 import { HardwareProfile } from '../HardwareProfile.js'
-import { GitWorkspaceManager } from '../git/GitWorkspaceManager.js'
+import { GitWorkspaceManager } from '../../infra/git/GitWorkspaceManager.js'
 
 import { createExperienceSearchTool } from './experience_search/index.js'
 import { createExperienceWriteTool } from './experience_write/index.js'

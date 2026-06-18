@@ -56,6 +56,10 @@ import { getModelProtocol } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
+import type {
+  CheckpointBoundaryEvent,
+  CheckpointBoundaryResult,
+} from './CheckpointBoundary.js'
 
 // ── Return type ───────────────────────────────────────────────────────────────
 
@@ -68,6 +72,8 @@ export type LoopTerminationReason =
   | 'aborted_tools'
   | 'max_budget_usd'
   | 'verify_exhausted'
+  | 'auto_runtime_limit'
+  | 'auto_tool_batch_limit'
   | 'error'
 
 export interface LoopResult {
@@ -81,6 +87,12 @@ export interface LoopResult {
   permissionDenials: PermissionDenial[]
   finalMessages: KernelMessage[]
   autoCompactTracking: AutoCompactTrackingState | undefined
+  /** Session-lifetime number of completed tool batches. */
+  toolBatchCount: number
+  /** Latest durable checkpoint revision observed by the loop. */
+  checkpointRevision: number
+  lastDriftToolBatchCount: number
+  lastDriftCheckpointRevision: number
 }
 
 // ── Context passed in from KernelSession ─────────────────────────────────────
@@ -95,6 +107,10 @@ export interface KernelLoopContext {
   cwd: string
   cumulativeCostUsd: number
   autoCompactTracking?: AutoCompactTrackingState
+  initialToolBatchCount?: number
+  initialCheckpointRevision?: number
+  initialLastDriftToolBatchCount?: number
+  initialLastDriftCheckpointRevision?: number
   /**
    * Drain any pending mid-turn user corrections ("steering"). Called at the top
    * of every loop iteration. Returns the queued correction strings (and clears
@@ -481,6 +497,11 @@ function finaliseAccumulator(acc: StreamAccumulator): {
 }
 
 const NO_PROGRESS_REPEAT_LIMIT = 3
+const CHECKPOINT_STATE_TOOLS = new Set([
+  'todo_write',
+  'progress_note',
+  'artifacts_register',
+])
 
 /**
  * Window length for the A↔B oscillation guard: 6 entries = 3 full ABAB cycles.
@@ -523,6 +544,16 @@ export async function* runKernelLoop(
   const signal = abortController.signal
   const canUseTool = config.canUseTool ?? defaultCanUseTool
   const maxTurns = config.maxTurns ?? 100
+  const autoRunStartedAt = Date.now()
+  const autoInitialToolBatchCount = ctx.initialToolBatchCount ?? 0
+  const autoMaxRuntimeMs = config.autoMaxRuntimeMs ?? 2 * 60 * 60 * 1000
+  // Auto run bounds: the 2h wall-clock above AND a 300 completed-tool-batch cap.
+  // Whichever is hit first ends the run (with a checkpoint, so it can resume).
+  const autoMaxToolBatches = config.autoMaxToolBatches ?? 300
+  const autoRuntimeTimer = config.autonomousMode && autoMaxRuntimeMs > 0
+    ? setTimeout(() => abortController.abort('auto_runtime_limit'), autoMaxRuntimeMs)
+    : undefined
+  autoRuntimeTimer?.unref?.()
 
   // S3: pass the live mutableMessages reference into the initial loop state.
   // Both LoopState.messages and mutableMessages will stay in sync without
@@ -539,8 +570,31 @@ export async function* runKernelLoop(
   let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
   let autoSelfEvalInjected = false   // one-shot self-eval nudge per stall episode
   let verifyRounds = 0               // auto-mode completion-gate rounds consumed
-  let turnsSinceDrift = 0            // turns since the last drift check fired
+  let toolBatchCount = ctx.initialToolBatchCount ?? 0
+  let checkpointRevision = ctx.initialCheckpointRevision ?? 0
+  let lastDriftToolBatchCount = ctx.initialLastDriftToolBatchCount ?? 0
+  let lastDriftCheckpointRevision = ctx.initialLastDriftCheckpointRevision ?? 0
   const toolSignatureHistory: string[] = []
+
+  async function checkpoint(
+    event: Omit<CheckpointBoundaryEvent, 'sessionId' | 'toolBatchCount' | 'estimatedCostUsd'>,
+  ): Promise<CheckpointBoundaryResult> {
+    if (!config.autonomousMode || !config.onCheckpointBoundary) {
+      return { updated: false, revision: checkpointRevision }
+    }
+    try {
+      const result = await config.onCheckpointBoundary({
+        ...event,
+        sessionId,
+        toolBatchCount,
+        estimatedCostUsd: totalCost,
+      })
+      checkpointRevision = Math.max(checkpointRevision, result.revision)
+      return result
+    } catch {
+      return { updated: false, revision: checkpointRevision }
+    }
+  }
 
   // Helper: push messages and re-point state.messages at the live array.
   //
@@ -564,6 +618,7 @@ export async function* runKernelLoop(
   }
 
   function done(reason: LoopTerminationReason): LoopResult {
+    if (autoRuntimeTimer) clearTimeout(autoRuntimeTimer)
     return {
       reason,
       totalUsage,
@@ -575,10 +630,25 @@ export async function* runKernelLoop(
       permissionDenials: allPermissionDenials,
       finalMessages: [...mutableMessages],
       autoCompactTracking: state.autoCompactTracking,
+      toolBatchCount,
+      checkpointRevision,
+      lastDriftToolBatchCount,
+      lastDriftCheckpointRevision,
     }
   }
 
   while (true) {
+    if (
+      config.autonomousMode &&
+      autoMaxRuntimeMs > 0 &&
+      Date.now() - autoRunStartedAt >= autoMaxRuntimeMs
+    ) {
+      resultText =
+        `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+        'Progress was checkpointed; resume the session to continue.'
+      yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
+      return done('auto_runtime_limit')
+    }
     // ── Step 0: inject mid-turn user steering ────────────────────────────────
     // The user can submit a correction at any point during a turn (e.g. via a
     // CLI hotkey). We never abort the model; instead we drain the queue here, at
@@ -630,6 +700,7 @@ export async function* runKernelLoop(
     // Surface a "compacting…" indicator before the slow LLM-backed summarization
     // begins.
     if (willCompact) {
+      await checkpoint({ type: 'compact_before' })
       yield { type: 'compact_start', sessionId }
     }
 
@@ -667,9 +738,9 @@ export async function* runKernelLoop(
         )
 
     state = { ...state, autoCompactTracking: compactResult.tracking }
-    // Auto drift trigger (primary): a compaction boundary this turn is a natural
-    // "a lot has accumulated — take stock" point.
-    const compactedThisTurn = compactResult.wasCompacted === true
+    if (willCompact) {
+      await checkpoint({ type: 'compact_after' })
+    }
     if (compactResult.failure) {
       yield {
         type: 'compact_failed',
@@ -970,6 +1041,12 @@ export async function* runKernelLoop(
     if (signal.aborted) {
       const missingResults = buildMissingToolResultMessages(assistantMessages, 'Interrupted by user')
       append(...assistantMessages, ...missingResults)
+      if (signal.reason === 'auto_runtime_limit') {
+        resultText =
+          `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+          'Progress was checkpointed; resume the session to continue.'
+        return done('auto_runtime_limit')
+      }
       if (signal.reason !== 'interrupt') {
         append(makeInterruptionMessage(false))
       }
@@ -1009,7 +1086,11 @@ export async function* runKernelLoop(
         // Brief backoff before retrying — the provider layer already exhausted
         // its own HTTP retries, so give a transient gateway error a moment.
         await delay(Math.min(1000 * attempt, 3000), signal)
-        if (signal.aborted) return done('aborted_streaming')
+        if (signal.aborted) {
+          return done(signal.reason === 'auto_runtime_limit'
+            ? 'auto_runtime_limit'
+            : 'aborted_streaming')
+        }
         continue
       }
       // Recovery disabled or exhausted — preserve the original fail-fast path.
@@ -1094,15 +1175,32 @@ export async function* runKernelLoop(
         } catch {
           verdict = undefined   // fail-open: fall through to normal completion
         }
-        if (signal.aborted) return done('aborted_tools')
+        if (signal.aborted) {
+          return done(signal.reason === 'auto_runtime_limit'
+            ? 'auto_runtime_limit'
+            : 'aborted_tools')
+        }
         if (verdict && !verdict.done) {
           append(makeTextUserMessage(buildVerifyRejectionPrompt(verdict, verifyRounds), { isMeta: true }))
+          await checkpoint({ type: 'verify_rejected' })
           yield {
             type: 'text_delta',
             delta: `\n[verify] 第 ${verifyRounds}/${MAX_VERIFY_ROUNDS} 轮：未通过，剩余 ${verdict.unfinished.length} 项，继续推进…\n`,
             sessionId,
           }
           continue
+        }
+        // Fail-open visibility: the gate let the run finish but did NOT actually
+        // verify (goal missing, judge could not spawn / timed out, internal
+        // error). Surface a warning so an unattended run's completion is never
+        // silently rubber-stamped.
+        if (verdict?.skipped) {
+          yield {
+            type: 'system_message',
+            subtype: 'warning',
+            text: `[verify] 完成度审核被跳过（未实际校验）：${verdict.note ?? '未知原因'}`,
+            sessionId,
+          }
         }
       } else if (
         config.autonomousMode && config.verifyGate && verifyRounds >= MAX_VERIFY_ROUNDS
@@ -1163,7 +1261,21 @@ export async function* runKernelLoop(
       messages: state.messages,
       workspaceRoot: ctx.cwd,
       planMode: config.planModeRef?.active ?? false,
+      autonomousMode: config.autonomousMode === true,
       askUser: config.askUser,
+    }
+
+    const toolByName = new Map(config.tools.map(tool => [tool.name, tool]))
+    const externalBefore = [...new Set(
+      toolUseRequests
+        .filter(req => {
+          const boundary = toolByName.get(req.toolName)?.permission?.checkpointBoundary
+          return boundary === 'before' || boundary === 'both'
+        })
+        .map(req => req.toolName),
+    )]
+    if (externalBefore.length > 0) {
+      await checkpoint({ type: 'external_before', externalToolNames: externalBefore })
     }
 
     const toolsResult = await runTools(toolUseRequests, config.tools, toolCtx, canUseTool)
@@ -1194,6 +1306,54 @@ export async function* runKernelLoop(
       config.onPermissionDenial?.(denial)
     }
     append(...toolsResult.toolResultMessages, ...toolsResult.extraMessages)
+
+    // A kernel "turn" for checkpoint/drift purposes is one completed tool
+    // batch, regardless of how many tools the model issued in that batch.
+    state = { ...state, turnCount: state.turnCount + 1 }
+    toolBatchCount++
+
+    if (
+      config.autonomousMode &&
+      autoMaxToolBatches > 0 &&
+      toolBatchCount - autoInitialToolBatchCount >= autoMaxToolBatches
+    ) {
+      resultText =
+        `Auto run reached its ${autoMaxToolBatches} tool-batch limit. ` +
+        'Progress was checkpointed; resume the session to continue.'
+      yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
+      return done('auto_tool_batch_limit')
+    }
+
+    const successfulToolNames = new Set<string>()
+    for (const resultMsg of toolsResult.toolResultMessages) {
+      for (const block of resultMsg.content) {
+        if (block.type !== 'tool_result' || block.is_error === true) continue
+        const name = toolNameByUseId.get(block.tool_use_id)
+        if (name) successfulToolNames.add(name)
+      }
+    }
+
+    const externalAfter = [...new Set(
+      toolUseRequests
+        .filter(req => {
+          const boundary = toolByName.get(req.toolName)?.permission?.checkpointBoundary
+          return boundary === 'after' || boundary === 'both'
+        })
+        .map(req => req.toolName),
+    )]
+    if (externalAfter.length > 0) {
+      await checkpoint({ type: 'external_after', externalToolNames: externalAfter })
+    }
+
+    const successfulStateTools = [...successfulToolNames].filter(name =>
+      CHECKPOINT_STATE_TOOLS.has(name),
+    )
+    if (successfulStateTools.length > 0) {
+      await checkpoint({
+        type: 'tool_batch_completed',
+        successfulToolNames: successfulStateTools,
+      })
+    }
 
     // ── Auto-mode stall circuit ──────────────────────────────────────────────
     // Unattended runs need protection the existing identical-signature /
@@ -1236,21 +1396,23 @@ export async function* runKernelLoop(
     }
 
     // ── Auto-mode drift / reflection gate (Checkpoint + Learn) ────────────────
-    // Mid-flight, at coarse structural boundaries (a compaction this turn, or
-    // every DRIFT_TURN_INTERVAL turns), an independent agent checks whether the
-    // run is still heading at the goal and may persist a durable lesson. On a
-    // drift verdict, a one-shot corrective is injected for the next turn. The
-    // gate is fail-open (errors → no correction) so it can never derail a run.
+    // Drift is deliberately gated by BOTH durable progress and elapsed work:
+    //   1. checkpoint revision advanced since the previous drift check;
+    //   2. at least DRIFT_TURN_INTERVAL tool batches completed since then.
+    // Compaction alone never triggers drift.
     if (config.autonomousMode && config.driftGate) {
-      turnsSinceDrift++
-      if (compactedThisTurn || turnsSinceDrift >= DRIFT_TURN_INTERVAL) {
-        turnsSinceDrift = 0
+      const checkpointAdvanced = checkpointRevision > lastDriftCheckpointRevision
+      const enoughBatches =
+        toolBatchCount - lastDriftToolBatchCount >= DRIFT_TURN_INTERVAL
+      if (checkpointAdvanced && enoughBatches) {
+        lastDriftToolBatchCount = toolBatchCount
+        lastDriftCheckpointRevision = checkpointRevision
         let drift
         try {
           drift = await config.driftGate({
             workspaceRoot: ctx.cwd,
-            turnCount: state.turnCount,
-            reason: compactedThisTurn ? 'compaction_boundary' : 'turn_interval',
+            turnCount: toolBatchCount,
+            reason: 'turn_interval',
             signal,
           })
         } catch {
@@ -1258,13 +1420,28 @@ export async function* runKernelLoop(
         }
         if (!signal.aborted && drift?.drifted) {
           append(makeTextUserMessage(buildDriftCorrectionPrompt(drift), { isMeta: true }))
+          await checkpoint({ type: 'drift_corrected' })
           yield { type: 'text_delta', delta: '\n[drift] 检测到航向偏离，注入一次校正…\n', sessionId }
+        } else if (!signal.aborted && drift?.skipped) {
+          // Fail-open visibility: the drift gate could not actually run.
+          yield {
+            type: 'system_message',
+            subtype: 'warning',
+            text: `[drift] 航向检查被跳过（未实际运行）：${drift.note ?? '未知原因'}`,
+            sessionId,
+          }
         }
       }
     }
 
     // ── Step 16: abort after tools ───────────────────────────────────────────
     if (signal.aborted) {
+      if (signal.reason === 'auto_runtime_limit') {
+        resultText =
+          `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+          'Progress was checkpointed; resume the session to continue.'
+        return done('auto_runtime_limit')
+      }
       if (signal.reason !== 'interrupt') {
         append(makeInterruptionMessage(true))
       }
@@ -1272,7 +1449,6 @@ export async function* runKernelLoop(
     }
 
     // ── Step 18: max turns check ─────────────────────────────────────────────
-    state = { ...state, turnCount: state.turnCount + 1 }
     if (state.turnCount >= maxTurns) {
       return done('max_turns')
     }

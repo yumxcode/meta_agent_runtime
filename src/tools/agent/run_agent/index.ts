@@ -7,7 +7,9 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'run_agent',
+    abortSupport: 'cooperative',
     description,
+    permission: { category: 'state', checkpointBoundary: 'both' },
     inputSchema: {
       type: 'object',
       properties: {
@@ -16,6 +18,12 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
         allowed_tools: { type: 'array', items: { type: 'string' }, description: '(Optional) Tools the sub-agent may use.' },
         max_turns: { type: 'number', description: 'Max turns before force-stop. Default: 10.' },
         max_budget_usd: { type: 'number', description: 'Max cost in USD. Default: 0.5.' },
+        workspace_mode: {
+          type: 'string',
+          enum: ['shared_readonly', 'shared_write', 'isolated_write'],
+          description:
+            'Use isolated_write for code-producing tasks whose branch must be merged. Default: shared_write.',
+        },
       },
       required: ['task_description'],
     },
@@ -24,6 +32,12 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
       if (!taskDescription) return { content: 'Error: task_description is required', isError: true }
       const maxTurns = typeof input['max_turns'] === 'number' ? input['max_turns'] : 10
       const maxBudgetUsd = typeof input['max_budget_usd'] === 'number' ? input['max_budget_usd'] : 0.5
+      const workspaceMode =
+        input['workspace_mode'] === 'isolated_write'
+          ? 'isolated_write'
+          : input['workspace_mode'] === 'shared_readonly'
+            ? 'shared_readonly'
+            : 'shared_write'
       const MAX_WAIT_MS = maxTurns * 2 * 60 * 1000  // 2 min per turn upper bound
 
       try {
@@ -38,6 +52,8 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
             useEventDriven: false,
             pollIntervalMs: 500,
             checkpointEveryNTurns: 0,
+            workspaceMode,
+            isolateWorktree: workspaceMode === 'isolated_write',
           },
           abortSignal: ctx.abortSignal,
         })
@@ -97,6 +113,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
                 turns_used: status.result?.turnsUsed,
                 cost_usd: status.result?.costUsd,
                 duration_ms: status.result?.durationMs,
+                workspace_mode: status.config.workspaceMode,
               }, null, 2),
               isError: false,
             }

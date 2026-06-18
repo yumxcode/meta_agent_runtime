@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'fs/promises'
+import { access, mkdtemp, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -40,5 +40,34 @@ describe('ExperienceStore id validation', () => {
 
     expect(isExperienceId('../../outside')).toBe(false)
     await expect(store.load('../../outside')).resolves.toBeNull()
+  })
+
+  it('updates manifest/index incrementally without re-reading existing full records', async () => {
+    const dir = await tempDir()
+    const store = new ExperienceStore(dir)
+    const first = await store.write({
+      domain: 'general',
+      title: 'First',
+      tags: [],
+      difficulty: 'medium',
+      problem: 'P1',
+      solution: 'S1',
+      outcome: { success: true, summary: 'ok' },
+    })
+    await writeFile(join(dir, `${first}.json`), '{corrupt on purpose', 'utf-8')
+
+    await store.write({
+      domain: 'general',
+      title: 'Second',
+      tags: [],
+      difficulty: 'medium',
+      problem: 'P2',
+      solution: 'S2',
+      outcome: { success: true, summary: 'ok' },
+    })
+
+    const results = await store.search({ domain: 'general', limit: 10 })
+    expect(results.map(item => item.title)).toEqual(expect.arrayContaining(['First', 'Second']))
+    await expect(access(join(dir, `${first}.json.corrupt`))).rejects.toBeDefined()
   })
 })

@@ -243,6 +243,13 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private reservedBudgetUsd = 0
   private settledCostUsd = 0
   private readonly reservedBudgetByTask = new Map<SubAgentTaskId, number>()
+  /**
+   * Internal safety-gate task IDs (config.internal). Tracked so the budget
+   * accounting can exclude them entirely — they neither reserve nor settle
+   * against the shared cap, keeping the cap a measure of research/worker spend
+   * only and guaranteeing the gates can always spawn.
+   */
+  private readonly internalTaskIds = new Set<SubAgentTaskId>()
   private drainingStarts = false
   private destroyed = false
   /** Count of tasks that reached a terminal state (success or failure) since this bridge was created. */
@@ -291,25 +298,14 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     this._onCompleted = (e) => {
       if (e.parentSessionId !== this.parentSessionId) return
-      const ps = e.result.progressState
-      const progressSuffix = ps
-        ? ` | 工具调用: ${ps.toolCallsCompleted}` +
-          (ps.stepsCompleted > 0 ? ` 步: ${ps.stepsCompleted}` : '') +
-          (ps.provenanceIds.length > 0
-            ? ` | provenance: ${ps.provenanceIds.slice(0, 5).join(', ')}${ps.provenanceIds.length > 5 ? ` (+${ps.provenanceIds.length - 5})` : ''}`
-            : '')
-        : ''
-      this._enqueueNotification(
-        `[${e.taskId}] ✓ 已完成 | ` +
-        `${e.result.turnsUsed} 轮 / $${e.result.costUsd.toFixed(4)}${progressSuffix} | ` +
-        `摘要: ${e.result.summary.slice(0, 300)}${e.result.summary.length > 300 ? '…' : ''}`,
-      )
       this._clearPollTimer(e.taskId)
+      void this._handleCompleted(e)
     }
 
     this._onFailed = (e) => {
       if (e.parentSessionId !== this.parentSessionId) return
       this._clearPollTimer(e.taskId)
+      void this._worktreeCoordinator?.markFailed(e.taskId, e.error).catch(() => undefined)
       // Auto mode: retry transient failures with exponential backoff before
       // surfacing the failure to the main agent. Fire-and-forget.
       void this._maybeRetryFailed(e.taskId, e.error)
@@ -368,6 +364,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    */
   setWorktreeCoordinator(coord: import('../core/auto/AutoWorktreeCoordinator.js').AutoWorktreeCoordinator | null): void {
     this._worktreeCoordinator = coord
+    if (coord) void this._reconcileWorktreeTaskOutcomes(coord)
   }
 
   /** The armed worktree coordinator, if any (used by the auto worktree tools). */
@@ -451,6 +448,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     // the same session starts cleanly.
     this._finishedCount = 0
     this.pendingNotifications.length = 0
+    this.internalTaskIds.clear()
     SubAgentBridge._bridgesBySessionId.delete(this.parentSessionId)
   }
 
@@ -465,10 +463,24 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       ...DEFAULT_SUB_AGENT_CONFIG,
       ...opts.config,
     })
+    const isolatedWrite =
+      config.workspaceMode === 'isolated_write' || config.isolateWorktree === true
+    config = {
+      ...config,
+      workspaceMode: isolatedWrite
+        ? 'isolated_write'
+        : (config.workspaceMode ?? 'shared_write'),
+      isolateWorktree: isolatedWrite,
+    }
+
+    // Internal safety-gate tasks (verify/drift) get a reserved side lane: they
+    // bypass the queue-full and total-budget caps so ordinary research/worker
+    // sub-agents can never starve the gate that is supposed to police them.
+    const isInternal = config.internal === true
 
     const outstandingTasks = this.activeTaskIds.size + this.queuedStarts.size
     const maxOutstandingTasks = this.maxConcurrentSubAgents + this.maxQueuedSubAgents
-    if (outstandingTasks >= maxOutstandingTasks) {
+    if (!isInternal && outstandingTasks >= maxOutstandingTasks) {
       throw new Error(
         `[SubAgentBridge] Sub-agent queue is full ` +
         `(${outstandingTasks}/${maxOutstandingTasks} outstanding; ` +
@@ -479,6 +491,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     const requestedBudget = Math.max(0, config.maxBudgetUsd)
     if (
+      !isInternal &&
       this.maxTotalSubAgentBudgetUsd !== undefined &&
       this.settledCostUsd + this.reservedBudgetUsd + requestedBudget > this.maxTotalSubAgentBudgetUsd
     ) {
@@ -493,22 +506,20 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     const taskId = opts.taskId ?? makeSubAgentTaskId()
 
-    // Auto mode worktree isolation: when requested AND a git-backed coordinator
-    // is armed, give this sub-agent its own worktree+branch and bind its
-    // projectDir + sandbox writable root there, so its writes cannot race other
-    // concurrent sub-agents. Best-effort: on any git failure we fall back to the
-    // shared tree (still protected by the write mutex).
-    if (config.isolateWorktree && this._worktreeCoordinator?.enabled) {
-      try {
-        const wt = await this._worktreeCoordinator.allocate(taskId)
-        if (wt) {
-          config = {
-            ...config,
-            projectDir: wt.worktreePath,
-            sandbox: { ...config.sandbox, writeAllowPaths: [wt.worktreePath] },
-          }
-        }
-      } catch { /* fall back to shared tree */ }
+    // Explicit isolated-write requests fail closed. Silently falling back to
+    // the shared tree would reintroduce concurrent-write races while reporting
+    // a false isolation guarantee to the caller.
+    if (isolatedWrite) {
+      if (!this._worktreeCoordinator?.enabled) {
+        throw new Error('isolated_write requires an auto-mode git worktree coordinator')
+      }
+      const wt = await this._worktreeCoordinator.allocate(taskId, this.parentSessionId)
+      if (!wt) throw new Error('isolated_write requires a git workspace')
+      config = {
+        ...config,
+        projectDir: wt.worktreePath,
+        sandbox: { ...config.sandbox, writeAllowPaths: [wt.worktreePath] },
+      }
     }
 
     const record: SubAgentRecord = {
@@ -521,8 +532,17 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       pendingHumanApproval: false,
     }
 
-    await writeTask(record)
-    this._reserveBudget(taskId, requestedBudget)
+    try {
+      await writeTask(record)
+    } catch (err) {
+      if (isolatedWrite) {
+        await this._worktreeCoordinator?.discard(taskId).catch(() => undefined)
+      }
+      throw err
+    }
+    // Internal tasks neither reserve nor (later) settle against the shared cap.
+    if (isInternal) this.internalTaskIds.add(taskId)
+    else this._reserveBudget(taskId, requestedBudget)
 
     const abortController = new AbortController()
     // If parent is aborted, cancel this sub-agent.
@@ -547,7 +567,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
 
     this.queuedStarts.set(taskId, { record, abortController })
-    this.startQueue.push(taskId)
+    // Internal safety-gate tasks jump the queue so a backlog of research/worker
+    // tasks can't delay the gate; ordinary tasks keep FIFO order.
+    if (isInternal) this.startQueue.unshift(taskId)
+    else this.startQueue.push(taskId)
     this._scheduleDrain()
 
     return record
@@ -558,9 +581,26 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   /**
    * Read the current status of a sub-agent task.
    * Returns null when the taskId is unknown.
+   *
+   * This is a pure READ from the caller's perspective: it never throws and never
+   * lets a write side-effect break the read. For a completed isolated_write task
+   * it opportunistically finalizes the worktree, but the AUTHORITATIVE finalize
+   * already happens on the completion-event path (_handleCompleted), the poll
+   * path (_startPollTimer), and on coordinator (re)attach
+   * (_reconcileWorktreeTaskOutcomes). So a missing coordinator here is simply a
+   * no-op (not an error), and a finalize failure is swallowed — neither must turn
+   * a status query into a failed tool call.
    */
   async getStatus(taskId: SubAgentTaskId): Promise<SubAgentRecord | null> {
-    return readTask(taskId)
+    const record = await readTask(taskId)
+    if (
+      record?.status === 'completed' &&
+      record.config.workspaceMode === 'isolated_write' &&
+      this._worktreeCoordinator
+    ) {
+      await this._worktreeCoordinator.finalize(taskId).catch(() => undefined)
+    }
+    return record
   }
 
   /**
@@ -643,6 +683,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     await releaseWriteChain(taskId)
 
     if (written) {
+      await this._worktreeCoordinator?.markFailed(taskId, 'cancelled').catch(() => undefined)
       this._settleBudget(taskId, written.result?.costUsd)
       CampaignEventBus.emit('subagent:failed', {
         taskId,
@@ -749,7 +790,17 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     const timer = setTimeout(() => {
       this._retryTimers.delete(timer)
       if (this.destroyed) return
-      void this.spawnSubAgent({ config: { ...rec.config, retryCount: attempt + 1 } }).catch(() => {
+      void (async () => {
+        // Abandon the failed attempt's isolated worktree BEFORE re-spawning.
+        // The retry gets a fresh taskId → a fresh worktree; without this the
+        // failed worktree+branch only lingers until the next session-start
+        // reconcile, so a flapping isolated_write task would accumulate orphan
+        // worktrees across retries in a long unattended run.
+        if (rec.config.workspaceMode === 'isolated_write') {
+          await this._worktreeCoordinator?.discard(taskId).catch(() => undefined)
+        }
+        await this.spawnSubAgent({ config: { ...rec.config, retryCount: attempt + 1 } })
+      })().catch(() => {
         this._enqueueNotification(`[${taskId}] ✗ 重试派发失败；原始错误: ${error.slice(0, 120)}`)
       })
     }, delay)
@@ -767,6 +818,77 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       const overflowCount = this.pendingNotifications.length - (MAX_PENDING_NOTIFICATIONS - 1)
       const overflow = this.pendingNotifications.splice(0, overflowCount)
       this.pendingNotifications.unshift(mergeOverflowNotifications(overflow))
+    }
+  }
+
+  private async _handleCompleted(e: SubAgentCompletedEvent): Promise<void> {
+    let worktreeSuffix = ''
+    const record = await readTask(e.taskId).catch(() => null)
+    if (record?.config.workspaceMode === 'isolated_write') {
+      try {
+        const finalized = await this._worktreeCoordinator?.finalize(e.taskId)
+        worktreeSuffix = finalized
+          ? ` | worktree: ${finalized.status}` +
+            (finalized.commitHash ? ` ${finalized.commitHash.slice(0, 12)}` : '') +
+            '，等待 auto_merge_subagent'
+          : ' | worktree finalize unavailable'
+      } catch (err) {
+        worktreeSuffix =
+          ` | ⚠ worktree finalize 失败：${err instanceof Error ? err.message : String(err)}`
+      }
+    }
+
+    const ps = e.result.progressState
+    const progressSuffix = ps
+      ? ` | 工具调用: ${ps.toolCallsCompleted}` +
+        (ps.stepsCompleted > 0 ? ` 步: ${ps.stepsCompleted}` : '') +
+        (ps.provenanceIds.length > 0
+          ? ` | provenance: ${ps.provenanceIds.slice(0, 5).join(', ')}${ps.provenanceIds.length > 5 ? ` (+${ps.provenanceIds.length - 5})` : ''}`
+          : '')
+      : ''
+    this._enqueueNotification(
+      `[${e.taskId}] ✓ 已完成 | ` +
+      `${e.result.turnsUsed} 轮 / $${e.result.costUsd.toFixed(4)}${progressSuffix}${worktreeSuffix} | ` +
+      `摘要: ${e.result.summary.slice(0, 300)}${e.result.summary.length > 300 ? '…' : ''}`,
+    )
+  }
+
+  private async _reconcileWorktreeTaskOutcomes(
+    coordinator: import('../core/auto/AutoWorktreeCoordinator.js').AutoWorktreeCoordinator,
+  ): Promise<void> {
+    const tasks = await listTasksForSession(this.parentSessionId).catch(() => [])
+    const byId = new Map(tasks.map(task => [task.taskId, task]))
+    for (const taskId of coordinator.activeTasks()) {
+      const worktree = coordinator.recordFor(taskId)
+      if (!worktree) continue
+      const task = byId.get(taskId)
+      if (task?.status === 'completed') {
+        await coordinator.finalize(taskId).catch(() => undefined)
+      } else if (
+        task?.status === 'failed' ||
+        task?.status === 'cancelled' ||
+        (
+          task &&
+          (task.status === 'pending' || task.status === 'queued' || task.status === 'running') &&
+          task.createdAt < this.constructedAtMs
+        )
+      ) {
+        await coordinator.markFailed(
+          taskId,
+          task.result?.error ?? 'Process terminated before task completion',
+        ).catch(() => undefined)
+      }
+
+      const current = coordinator.recordFor(taskId)
+      if (current?.phase === 'awaiting_merge') {
+        this._enqueueNotification(
+          `[${taskId}] worktree 已恢复并等待 auto_merge_subagent：${current.branchName}`,
+        )
+      } else if (current?.phase === 'conflicted' || current?.phase === 'failed') {
+        this._enqueueNotification(
+          `[${taskId}] worktree ${current.phase}：${current.error ?? current.branchName}`,
+        )
+      }
     }
   }
 
@@ -791,6 +913,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       if (TERMINAL_STATUSES.has(record.status)) {
         let resultLine: string
         if (record.result?.success) {
+          if (record.config.workspaceMode === 'isolated_write') {
+            await this._worktreeCoordinator?.finalize(taskId).catch(() => undefined)
+          }
           const ps = record.result.progressState
           const progressSuffix = ps
             ? ` | 工具调用: ${ps.toolCallsCompleted}` +
@@ -851,6 +976,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   }
 
   private _settleBudget(taskId: SubAgentTaskId, actualCostUsd: number | undefined): void {
+    // Internal safety-gate tasks were never reserved and are excluded from the
+    // shared cap entirely — drop the marker and return without touching totals.
+    if (this.internalTaskIds.delete(taskId)) return
     const reserved = this.reservedBudgetByTask.get(taskId) ?? 0
     if (reserved > 0) {
       this.reservedBudgetUsd = Math.max(0, this.reservedBudgetUsd - reserved)
@@ -933,6 +1061,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         this.queuedStarts.delete(taskId)
         this.runners.set(taskId, runner)
         this.activeTaskIds.add(taskId)
+        await this._worktreeCoordinator?.markRunning(taskId).catch(() => undefined)
 
         void runner.start()
           .catch(() => undefined)
@@ -971,74 +1100,6 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   }
 }
 
-// ─────────────────────────────────────────────────────────────────────────────
-// Dynamic prompt section builder
-// ─────────────────────────────────────────────────────────────────────────────
-
-/**
- * Minimum queue age (ms) before a "tasks are waiting" warning is injected
- * into the system prompt.  Prevents noise on fast-start queues while ensuring
- * the AI knows about long-running backlogs.
- */
-const STALE_QUEUE_WARN_MS = 30_000
-
-/**
- * Build the D-SubAgent dynamic system prompt section.
- *
- * Called by MetaAgentSession / dynamicPrompt.ts before each submit() turn.
- * Returns empty string when there are no pending notifications and no notable
- * queue conditions.
- *
- * The section is injected as a volatile section (rebuilt every turn) because
- * notifications arrive asynchronously and must not be cached.
- *
- * Content:
- *   1. Queue status warning — emitted when tasks have been queued > 30 s, so
- *      the AI never mistakes "not yet started" for "already running".
- *   2. Terminal notifications — tasks that just completed or failed.
- */
-export function buildSubAgentNotificationSection(bridge: SubAgentBridge): string {
-  const notifications = bridge.drainNotifications()
-  const stats = bridge.getSchedulerStats()
-
-  const lines: string[] = []
-
-  // ── #12 Queue status warning ──────────────────────────────────────────────
-  // Show whenever there are queued or running tasks, but upgrade the warning
-  // to a prominent caution block when queued tasks have been waiting a while.
-  if (stats.queued > 0 || stats.running > 0) {
-    const oldestSec = Math.round(stats.oldestQueuedMs / 1_000)
-    if (stats.queued > 0 && stats.oldestQueuedMs >= STALE_QUEUE_WARN_MS) {
-      lines.push('## Sub-Agent Queue Status ⚠')
-      lines.push(
-        `- Running: ${stats.running}/${stats.maxConcurrent} | ` +
-        `Queued: ${stats.queued} (oldest: ${oldestSec}s)`,
-      )
-      lines.push(
-        '> Queued sub-agents have NOT started yet. ' +
-        'Do NOT treat them as running or assume any work has been done. ' +
-        'Wait or cancel before dispatching duplicates.',
-      )
-    } else {
-      lines.push(
-        `## Sub-Agent Status: ${stats.running} running, ${stats.queued} queued` +
-        (stats.queued > 0 && stats.oldestQueuedMs > 0 ? ` (oldest: ${oldestSec}s)` : ''),
-      )
-    }
-    lines.push('')
-  }
-
-  // ── Terminal notifications ─────────────────────────────────────────────────
-  if (notifications.length > 0) {
-    lines.push('## Sub-Agent Notifications (pending)')
-    lines.push(...notifications.map(n => `- ${n}`))
-    lines.push('')
-    lines.push(
-      '> These sub-tasks just reached terminal state. ' +
-      'Use `get_sub_agent_status` to retrieve full results. ' +
-      'If `pending_human_approval` is true, you MUST present the result to the user before proceeding.',
-    )
-  }
-
-  return lines.join('\n')
-}
+// The D-SubAgent prompt section builder (buildSubAgentNotificationSection) was
+// moved to ./notificationSection.ts — it is a prompt concern, not a scheduler
+// one. subagent/index.ts re-exports it from there, so importers are unchanged.

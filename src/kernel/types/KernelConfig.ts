@@ -7,6 +7,7 @@ import type { PermissionDenial } from './KernelEvent.js'
 import type { CompactProfile } from '../compact/CompactPrompt.js'
 import type { VerifyGateFn } from '../loop/VerifyGate.js'
 import type { DriftGateFn } from '../loop/DriftGate.js'
+import type { CheckpointBoundaryFn } from '../loop/CheckpointBoundary.js'
 
 export type ThinkingConfig =
   | { type: 'disabled' }
@@ -195,6 +196,16 @@ export interface KernelConfig {
    */
   autonomousMode?: boolean
 
+  /** Auto-mode wall-clock allowance per process run. Defaults to 2 hours. */
+  autoMaxRuntimeMs?: number
+
+  /**
+   * Auto-mode completed tool-batch allowance per process run. Defaults to 300.
+   * Works alongside the wall-clock (`autoMaxRuntimeMs`); whichever limit is hit
+   * first ends the run (with a checkpoint, so it can resume). Set 0 to disable.
+   */
+  autoMaxToolBatches?: number
+
   /**
    * Auto mode completion gate. When set, the loop calls it at the moment the
    * model stops issuing tool calls (i.e. "I'm done"): an INDEPENDENT judge
@@ -207,13 +218,25 @@ export interface KernelConfig {
 
   /**
    * Auto mode mid-flight drift/reflection gate. When set, the loop calls it at
-   * coarse structural boundaries (a compaction this turn, or every
-   * DRIFT_TURN_INTERVAL turns) to check whether the run has wandered off the
-   * goal and to let an independent agent persist any durable lesson. A
-   * `drifted: true` verdict re-injects corrective steps. Only consulted when
-   * autonomousMode is set. Absent = no mid-flight drift checking.
+   * most every DRIFT_TURN_INTERVAL completed tool batches, and only when a new
+   * durable checkpoint revision exists since the previous drift. Compaction
+   * does not trigger drift by itself. A `drifted: true` verdict re-injects
+   * corrective steps. Only consulted when autonomousMode is set. Absent = no
+   * mid-flight drift checking.
    */
   driftGate?: DriftGateFn
+
+  /**
+   * Consistent-boundary callback used by auto checkpointing. The kernel reports
+   * events only; session/router code owns state collection and persistence.
+   */
+  onCheckpointBoundary?: CheckpointBoundaryFn
+
+  /** Resume seed for the session-lifetime completed tool-batch counter. */
+  initialToolBatchCount?: number
+
+  /** Resume seed for the latest durable checkpoint revision. */
+  initialCheckpointRevision?: number
 
   // ── Compact ───────────────────────────────────────────────────────────────
 

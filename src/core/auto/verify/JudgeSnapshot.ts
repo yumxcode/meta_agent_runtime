@@ -24,9 +24,9 @@
  * the live tree (read-only tools only) — correctness is preserved, isolation is
  * just weaker, which we surface to the judge.
  */
-import { execFile } from 'child_process'
+import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { existsSync, mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 
@@ -44,7 +44,22 @@ async function git(projectDir: string, args: string[], extraEnv?: NodeJS.Process
 }
 
 function isGitRepo(projectDir: string): boolean {
-  return existsSync(join(projectDir, '.git'))
+  // Ask git, don't just look for a top-level `.git`. The previous existsSync
+  // check failed for the common cases where projectDir is a SUBDIRECTORY of the
+  // repo, or a linked worktree / submodule (where `.git` is a file or lives
+  // above projectDir). A false negative there silently dropped the read-only
+  // snapshot isolation and made the verify judge inspect the LIVE tree. This
+  // detection matches AutoWorktreeCoordinator's `--git-common-dir` approach.
+  try {
+    const out = execFileSync(
+      'git',
+      ['-C', projectDir, 'rev-parse', '--is-inside-work-tree'],
+      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS },
+    ).trim()
+    return out === 'true'
+  } catch {
+    return false
+  }
 }
 
 /**

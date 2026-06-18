@@ -3122,11 +3122,18 @@ async function runRepl(opts: CliOptions): Promise<void> {
       // planModeRef MUST be the router's shared ref so enter_plan_mode /
       // exit_plan_mode flip the same object the backend's kernel permission
       // policy reads — otherwise plan mode never gates writes.
-      system: { cwd: opts.workspace, mode: (opts.mode === 'campaign' ? 'campaign' : 'agentic'), planModeRef: router.planModeRef },
+      system: {
+        cwd: opts.workspace,
+        mode: opts.mode === 'detect' ? 'agentic' : opts.mode,
+        planModeRef: router.planModeRef,
+      },
       // Main-session web_fetch is result-budgeted: full-text reading belongs in
       // isolated research sub-agents (research_dispatch), not the long-lived
       // main context. Sub-agents get an unbudgeted override via the bridge.
       network: { webFetch: { maxResultSizeChars: 8_000 } },
+      // Mode-specific tool selection (auto mode excludes ask_user/send_message).
+      // Only pass the mode when it's a concrete SessionMode (not 'detect').
+      mode: opts.mode === 'detect' ? undefined : opts.mode as import('../core/modes.js').SessionMode,
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -4367,6 +4374,9 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
       // isolated research sub-agents (research_dispatch), not the long-lived
       // main context. Sub-agents get an unbudgeted override via the bridge.
       network: { webFetch: { maxResultSizeChars: 8_000 } },
+      // Apply the same auto capability boundary in non-interactive/single-turn
+      // runs as in the REPL.
+      mode: opts.mode === 'detect' ? undefined : opts.mode as import('../core/modes.js').SessionMode,
     })
     for (const tool of tools) {
       router.registerTool(tool)

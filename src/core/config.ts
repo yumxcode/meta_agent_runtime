@@ -334,6 +334,15 @@ export interface MetaAgentConfig {
    */
   driftGate?: import('../kernel/loop/DriftGate.js').DriftGateFn
 
+  /** Kernel execution-boundary hook used by auto checkpoint persistence. */
+  onCheckpointBoundary?: import('../kernel/loop/CheckpointBoundary.js').CheckpointBoundaryFn
+
+  /** Resume seed for the session-lifetime tool-batch counter. */
+  initialToolBatchCount?: number
+
+  /** Resume seed for the latest durable checkpoint revision. */
+  initialCheckpointRevision?: number
+
   /**
    * Auto mode experience recall. When set, MetaAgentSession appends the returned
    * block (relevant prior lessons) to the stable system prompt each turn so the
@@ -384,6 +393,9 @@ export type ResolvedConfig = Required<
     | 'autonomy'
     | 'verifyGate'
     | 'driftGate'
+    | 'onCheckpointBoundary'
+    | 'initialToolBatchCount'
+    | 'initialCheckpointRevision'
     | 'getExperienceRecallBlock'
     | 'initialMessages'
     | 'debugMode'
@@ -412,6 +424,9 @@ export type ResolvedConfig = Required<
   verifyGate?: MetaAgentConfig['verifyGate']
   /** Auto mode mid-flight drift gate; absent → no drift checking. */
   driftGate?: MetaAgentConfig['driftGate']
+  onCheckpointBoundary?: MetaAgentConfig['onCheckpointBoundary']
+  initialToolBatchCount?: number
+  initialCheckpointRevision?: number
   /** Auto mode experience recall provider; absent → no recall injection. */
   getExperienceRecallBlock?: MetaAgentConfig['getExperienceRecallBlock']
   initialMessages?: MetaAgentConfig['initialMessages']
@@ -514,6 +529,9 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     autonomy:        config.autonomy,
     verifyGate:      config.verifyGate,
     driftGate:       config.driftGate,
+    onCheckpointBoundary: config.onCheckpointBoundary,
+    initialToolBatchCount: config.initialToolBatchCount,
+    initialCheckpointRevision: config.initialCheckpointRevision,
     getExperienceRecallBlock: config.getExperienceRecallBlock,
     initialMessages: config.initialMessages,
     debugMode:       config.debugMode,

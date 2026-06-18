@@ -124,6 +124,10 @@ async function runDriftAgent(
       useEventDriven: false,
       pollIntervalMs: 500,
       checkpointEveryNTurns: 0,
+      // Reserved side lane (see VerifyJudge): never starved by research/worker
+      // sub-agents that share the bridge, nor blocked by the shared budget cap.
+      internal: true,
+      workspaceMode: 'shared_readonly',
     },
     abortSignal: signal,
   })
@@ -147,35 +151,37 @@ async function runDriftAgent(
 export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
   const store = createAutoExperienceStore(deps.projectDir)
   return async ({ signal }) => {
-    const noDrift = (): DriftVerdict => ({ drifted: false, corrective: [] })
+    // A fail-open SKIP (the agent could not run): unlike a genuine parsed
+    // "drifted:false" verdict (agent ran, judged the run on course), this is
+    // surfaced as a warning by the loop, so a healthy on-course run stays quiet.
+    const skip = (): DriftVerdict => ({ drifted: false, corrective: [], skipped: true })
 
     const goal = deps.getGoal()
-    if (!goal || !goal.trim()) return noDrift()
+    if (!goal || !goal.trim()) return skip()
 
     try {
       const cp = readAutoCheckpoint(deps.projectDir)
+      if (!cp) return skip()
       // Only feed the fields drift needs — keep it compact and goal-focused.
-      const checkpointJson = cp
-        ? JSON.stringify(
-            {
-              completedSteps: cp.completedSteps ?? [],
-              pendingTodos: cp.pendingTodos ?? [],
-              artifacts: cp.artifacts ?? [],
-              turnCount: cp.turnCount,
-              note: cp.note,
-            },
-            null,
-            2,
-          )
-        : '（暂无 checkpoint）'
+      const checkpointJson = JSON.stringify(
+        {
+          completedSteps: cp.completedSteps ?? [],
+          pendingTodos: cp.pendingTodos ?? [],
+          artifacts: cp.artifacts ?? [],
+          turnCount: cp.turnCount,
+          note: cp.note,
+        },
+        null,
+        2,
+      )
 
       const experienceBlock = await renderRecentExperiences(store)
       const task = buildDriftTask(goal, checkpointJson, experienceBlock)
       const summary = await runDriftAgent(deps.dispatcher, task, signal)
-      if (!summary) return noDrift()
-      return parseDriftVerdict(summary) ?? noDrift()
+      if (!summary) return skip()
+      return parseDriftVerdict(summary) ?? skip()
     } catch {
-      return noDrift()
+      return skip()
     }
   }
 }

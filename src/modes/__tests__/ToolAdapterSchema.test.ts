@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { toKernelTool } from '../toolAdapter.js'
+import { resolveToolAbortSupport, toKernelTool } from '../toolAdapter.js'
 import type { MetaAgentTool } from '../../core/types.js'
 
 function makeTool(inputSchema: Record<string, unknown>): MetaAgentTool {
@@ -12,6 +12,12 @@ function makeTool(inputSchema: Record<string, unknown>): MetaAgentTool {
 }
 
 describe('toolAdapter schema validator — extended constraints (M3)', () => {
+  it('declares built-in abort contracts and leaves unknown tools undeclared', () => {
+    expect(resolveToolAbortSupport({ name: 'bash' })).toBe('cooperative')
+    expect(resolveToolAbortSupport({ name: 'read_file' })).toBe('bounded')
+    expect(resolveToolAbortSupport({ name: 'mcp_call' })).toBe('non_cooperative')
+    expect(resolveToolAbortSupport({ name: 'third_party_unknown' })).toBeUndefined()
+  })
   it('enforces minLength / maxLength on strings', () => {
     const tool = toKernelTool(makeTool({
       type: 'object',

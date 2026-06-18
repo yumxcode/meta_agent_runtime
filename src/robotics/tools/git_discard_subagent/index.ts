@@ -1,5 +1,5 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
-import type { GitWorkspaceManager } from '../../git/GitWorkspaceManager.js'
+import type { GitWorkspaceManager } from '../../../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 import type { SubAgentTaskId } from '../../../subagent/types.js'
 
@@ -41,7 +41,9 @@ export function createGitDiscardSubAgentTool(
 
         const deleteBranch = Boolean(input['delete_branch'])
         await gitMgr.removeWorktree(taskId, { deleteBranch, branchName })
-        await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId)
+        // clearGitRefs: branch is finalized (discarded), so drop its
+        // subAgentBranches/forkPoints entries (read above) — P1-3 residual.
+        await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, taskId, { clearGitRefs: true })
 
         return {
           content: [

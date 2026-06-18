@@ -47,7 +47,9 @@ export type { McpClient } from './mcp/index.js'
 // ── UI / conversation tools ───────────────────────────────────────────────────
 export {
   createAskUserTool, createTodoWriteTool, getTodosForSession, deleteTodosForSession,
-  createSendMessageTool, createUiTools,
+  createSendMessageTool, createProgressNoteTool, getProgressNoteForSession, deleteProgressNoteForSession,
+  createArtifactsRegisterTool, getArtifactsForSession, deleteArtifactsForSession,
+  createUiTools, createAutoUiTools,
 } from './ui/index.js'
 export type { TodoItem } from './ui/index.js'
 
@@ -72,10 +74,11 @@ import { createFsTools } from './fs/index.js'
 import { createShellTools } from './shell/index.js'
 import { createNetworkTools } from './network/index.js'
 import { createMcpTools } from './mcp/index.js'
-import { createUiTools } from './ui/index.js'
+import { createUiTools, createAutoUiTools } from './ui/index.js'
 import { createSystemTools } from './system/index.js'
 import type { SystemToolsOptions } from './system/index.js'
 import { createAgentTools } from './agent/index.js'
+import { AUTO_DENIED_TOOL_NAMES, type SessionMode } from '../core/modes.js'
 
 export interface StandardToolsOptions {
   network?: import('./network/index.js').NetworkToolsOptions
@@ -84,6 +87,8 @@ export interface StandardToolsOptions {
   /** Options forwarded to createSystemTools (cwd, planModeRef). */
   system?: SystemToolsOptions
   include?: ('fs' | 'shell' | 'network' | 'mcp' | 'ui' | 'system' | 'agent')[]
+  /** Session mode for mode-specific tool selection (e.g., auto mode excludes ask_user/send_message). */
+  mode?: SessionMode
 }
 
 /**
@@ -99,9 +104,31 @@ export async function createStandardTools(options: StandardToolsOptions = {}): P
   if (include.includes('shell'))   groups.push(createShellTools())
   if (include.includes('network')) groups.push(createNetworkTools(options.network))
   if (include.includes('mcp'))     groups.push(createMcpTools())
-  if (include.includes('ui'))      groups.push(createUiTools())
-  if (include.includes('system'))  groups.push(createSystemTools(options.system))
+  if (include.includes('ui')) {
+    // Auto mode uses createAutoUiTools (excludes ask_user/send_message for unattended runs)
+    if (options.mode === 'auto') {
+      groups.push(createAutoUiTools())
+    } else {
+      groups.push(createUiTools())
+    }
+  }
+  if (include.includes('system')) {
+    groups.push(createSystemTools({
+      ...options.system,
+      // A top-level concrete mode is authoritative for mode-specific tool
+      // selection. This keeps direct createStandardTools({ mode: 'auto' })
+      // callers safe even when they omit system.mode.
+      mode: options.mode ?? options.system?.mode,
+    }))
+  }
   if (include.includes('agent') && options.agent) groups.push(createAgentTools(options.agent.bridge))
   const arrays = await Promise.all(groups)
-  return arrays.flat()
+  const tools = arrays.flat()
+  if (options.mode !== 'auto') return tools
+
+  // Defense in depth for the standard registry. PermissionPolicy enforces the
+  // same list at execution time, but removing these tools also prevents the
+  // model from seeing or attempting capabilities that auto can never use.
+  const denied = new Set<string>(AUTO_DENIED_TOOL_NAMES)
+  return tools.filter(tool => !denied.has(tool.name))
 }
