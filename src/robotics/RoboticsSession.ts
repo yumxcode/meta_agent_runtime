@@ -97,7 +97,8 @@ import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { createSkillTool } from '../tools/system/skill/index.js'
 import { createMemoryWriteTool } from '../tools/system/memory_write/index.js'
-import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
+import { makeSubAgentTools } from '../subagent/tools/index.js'
+import { createRunAgentTool } from '../tools/agent/run_agent/index.js'
 import { WorkflowLoader } from '../workflow/WorkflowLoader.js'
 import { WorkflowStateStore } from '../workflow/WorkflowStateStore.js'
 import type { WorkflowDefinition, WorkflowRepairInput, WorkflowState } from '../workflow/types.js'
@@ -587,7 +588,16 @@ export class RoboticsSession implements RoboticsCapabilities {
       this.inner.registerTool(tool)
     }
     this.inner.registerTool(await createBashTool())
-    this.inner.registerTool(makeGetSubAgentStatusTool(this.bridge))
+    // Generic delegation tools, parallel to robotics' domain dispatchers
+    // (experiment_dispatch / paper_search). run_agent is SYNCHRONOUS (blocks
+    // until done — use when the next step depends on the result); spawn_sub_agent
+    // is ASYNCHRONOUS (fan out several in one turn to run in parallel). The
+    // family also provides get_sub_agent_status / _intermediate / cancel / list,
+    // which experiment_dispatch's poll-and-collect flow already relies on.
+    this.inner.registerTool(await createRunAgentTool(this.bridge))
+    for (const tool of makeSubAgentTools(this.bridge)) {
+      this.inner.registerTool(tool)
+    }
     // Network tools — required by sub-agents (e.g. PaperSearchAgent) whose
     // allowedTools include 'web_fetch' / 'web_search'. Registering here also
     // makes them resolvable in the bridge's tool registry (wired below).

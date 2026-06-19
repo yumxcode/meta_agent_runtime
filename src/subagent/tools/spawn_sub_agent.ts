@@ -14,24 +14,37 @@ export function makeSpawnSubAgentTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
     name: 'spawn_sub_agent',
     abortSupport: 'cooperative',
-    description: `Delegate a sub-task to an isolated sub-agent.
+    // Enqueue-only: this call writes a queued task record and returns immediately
+    // without touching the workspace, so issuing several in ONE turn is safe and
+    // SHOULD run as a parallel batch. The actual sub-agents then run concurrently
+    // in the background (bounded by the bridge's maxConcurrent).
+    isConcurrencySafe: true,
+    description: `Delegate a sub-task to an isolated sub-agent — ASYNCHRONOUS (parallel) delegation.
 
-The sub-agent has its own conversation context (empty — does not inherit this session's history).
-It runs asynchronously; you will be notified on completion via system prompt notification
-(event-driven) or by calling get_sub_agent_status periodically (poll mode).
+Returns IMMEDIATELY with a task_id; the sub-agent runs in the background. To fan out
+work in parallel, issue SEVERAL spawn_sub_agent calls in the same turn — they run
+concurrently. You are NOT blocked: continue with other work, and you will be notified
+on completion via a "Sub-Agent Notifications" section at the top of a later system
+prompt (event-driven), or poll get_sub_agent_status. Retrieve the full result with
+get_sub_agent_status(task_id).
 
-After spawning, you may continue doing other work. When the sub-task is complete you will see
-a "Sub-Agent Notifications" section at the top of your next system prompt.
+The sub-agent has its OWN empty conversation context (it does NOT inherit this
+session's history) — put everything it needs into task_description.
 
-WHEN TO USE:
-- Long-running or parallelisable sub-tasks (e.g., L1 simulation while you do other work)
-- Sub-tasks requiring a different tool set than your current session
-- Tasks where you want optional human review before proceeding
+WHEN TO USE (async / parallel):
+- Independent sub-tasks that can run at the same time (e.g., research 3 options at once)
+- Long-running work you want to overlap with other work
+- Tasks whose failure should NOT block your main flow
 
-WHEN NOT TO USE:
-- Short tasks you can do inline (< 3 turns)
-- Tasks requiring your conversation history (sub-agent starts fresh)
-- Tasks that must complete before ANY other action`,
+WHEN NOT TO USE — use run_agent (synchronous) instead when:
+- The very next step depends on this result (you must wait for it)
+- The sub-tasks have a strict order / data dependency between them
+Or do it inline when it is short (< 3 turns).
+
+ISOLATION: defaults to shared_readonly (safe for concurrent reads/analysis). For a
+task that WRITES files, you MUST pass workspace_mode="isolated_write" so it runs in
+its own git branch (merge afterwards) — concurrent shared writes are NOT allowed and
+would corrupt the tree.`,
 
     inputSchema: {
       type: 'object' as const,
@@ -63,9 +76,14 @@ WHEN NOT TO USE:
         },
         workspace_mode: {
           type: 'string',
-          enum: ['shared_readonly', 'shared_write', 'isolated_write'],
+          enum: ['shared_readonly', 'isolated_write'],
           description:
-            'Use isolated_write for code-producing tasks whose branch must be merged. Default: shared_write.',
+            'shared_readonly (DEFAULT): the sub-agent may read the workspace but not write it — ' +
+            'safe to run many in parallel. Use for research, analysis, inspection. ' +
+            'isolated_write: the sub-agent gets its OWN git worktree+branch for code-producing ' +
+            'tasks; you merge the branch afterwards (auto_merge_subagent). Required for ANY task ' +
+            'that writes files. Concurrent shared writes are intentionally not offered here — ' +
+            'for a single in-place write that must block, use run_agent instead.',
         },
         require_human_approval: {
           type: 'boolean',
@@ -164,12 +182,13 @@ WHEN NOT TO USE:
             pollIntervalMs:        typeof input['poll_interval_ms'] === 'number' ? input['poll_interval_ms'] : 1_800_000,
             checkpointEveryNTurns: typeof input['checkpoint_every_n_turns'] === 'number' ? input['checkpoint_every_n_turns'] : 3,
             sandbox:               sandboxConfig,
+            // Default shared_readonly (concurrency-safe). Writes must opt into
+            // isolated_write so each concurrent writer gets its own git branch —
+            // shared_write is deliberately NOT exposed on this async tool.
             workspaceMode:
               input['workspace_mode'] === 'isolated_write'
                 ? 'isolated_write'
-                : input['workspace_mode'] === 'shared_readonly'
-                  ? 'shared_readonly'
-                  : 'shared_write',
+                : 'shared_readonly',
             isolateWorktree: input['workspace_mode'] === 'isolated_write',
           },
           abortSignal: ctx.abortSignal,

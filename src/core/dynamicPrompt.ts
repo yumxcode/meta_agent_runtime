@@ -552,6 +552,64 @@ export function buildToolInvocationSection(mode: AgentMode): SystemPromptSection
   })
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Delegation guidance — when to delegate SYNCHRONOUSLY vs ASYNCHRONOUSLY, and
+// how to run sub-agents in PARALLEL safely. Per-mode because each mode exposes a
+// different delegation tool surface. Empty for campaign (no sub-agent tools).
+// ─────────────────────────────────────────────────────────────────────────────
+
+export function buildDelegationGuidanceSection(mode: AgentMode): SystemPromptSection {
+  return systemPromptSection('delegation_guidance', () => {
+    if (mode === 'campaign') return ''
+
+    // Tool names differ per mode but the sync-vs-async decision is identical.
+    const asyncTool = mode === 'robotics' ? 'spawn_sub_agent / experiment_dispatch' : 'spawn_sub_agent'
+    const syncTool  = mode === 'robotics' ? 'run_agent / research_dispatch' : 'run_agent'
+
+    const parts: string[] = [
+      '## 子代理委派：同步 vs 异步（并发）',
+      '',
+      '把子任务派给隔离子代理前，先问两件事，据此选工具：',
+      '',
+      `1. **下一步是否依赖这个结果？** 依赖 → 用同步 \`${syncTool}\`（阻塞，等它跑完拿到结果再继续）。`,
+      `2. **多个子任务之间有依赖吗？** 无依赖 → 用异步 \`${asyncTool}\` 并发扇出：` +
+        '在同一轮发出多个调用，它们会并行执行；每次立即返回 task_id，你不被阻塞。',
+      '',
+      '异步完成后，你会在后续某轮系统提示顶部看到「Sub-Agent Notifications」段；' +
+        '用 `get_sub_agent_status(task_id)` 取完整结果，必要时 `get_sub_agent_intermediate` 看中途进度、' +
+        '`cancel_sub_agent` 取消跑偏的任务、`list_sub_agents` 查总览。',
+      '',
+      '**子代理是白纸**：它看不到你的对话历史，task_description 必须自带全部上下文。',
+      '',
+      '**写隔离（强制）**：',
+      '- 只读/分析类（调研、检查、抽取）→ 默认 `shared_readonly`，可放心并发。',
+      '- 任何会写文件的任务 → 必须 `workspace_mode="isolated_write"`，子代理在独立 git 分支里写，' +
+        '完成后你用 `auto_merge_subagent` 串行合并。**绝不允许多个子代理并发共享写同一棵树**——会互相覆盖。',
+      '- 若需在当前树就地写且必须等它完成，用同步 `run_agent` 单发，而非并发。',
+    ]
+
+    if (mode === 'auto') {
+      parts.push(
+        '',
+        '**无人值守约束**：并发数与总预算被收紧（默认 3 并发 / 共享预算上限）。' +
+          '优先把彼此独立的工作一次性异步扇出，让它们重叠跑完，而不是串行等待；' +
+          '但不要无谓地多发——每个子代理都消耗共享预算，超额会在入队前被拒绝。',
+      )
+    }
+
+    if (mode === 'robotics') {
+      parts.push(
+        '',
+        '**robotics 专用**：`experiment_dispatch`（异步）用于并行跑实验——连发多次即并发，' +
+          '每个实验在独立 worktree/分支提交，由你事后 merge；`paper_search` 异步检索文献；' +
+          '`research_dispatch`（同步）做需要全文的文献综述。通用 `spawn_sub_agent`/`run_agent` 用于非实验类子任务。',
+      )
+    }
+
+    return parts.join('\n')
+  })
+}
+
 // D4b (Campaign Domain Knowledge) moved to campaign/promptSections.ts.
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -960,6 +1018,10 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     buildCurrentModeSection(opts.mode),
     buildEngineeringStandardsSection(opts.mode),
     buildToolInvocationSection(opts.mode),
+    // Sub-agent delegation guidance (sync vs async/parallel + write isolation).
+    // Sits next to the tool protocol so the model learns how to use the
+    // delegation tools it was just told it has. Empty for campaign.
+    buildDelegationGuidanceSection(opts.mode),
     // Rx: mode-specific STABLE extensions — injected here so they appear after the
     // shared tool protocol but before output preferences.
     // Only pass memoized sections here; volatile mode sections go to modeExtensions

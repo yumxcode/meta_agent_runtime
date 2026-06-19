@@ -57,7 +57,8 @@ import { getArtifactsForSession, deleteArtifactsForSession } from '../tools/ui/a
 import { AutoWorktreeCoordinator } from '../core/auto/AutoWorktreeCoordinator.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { makeAutoWorktreeTools } from '../subagent/tools/auto_worktree.js'
-import { makeGetSubAgentStatusTool } from '../subagent/tools/get_sub_agent_status.js'
+import { makeSubAgentTools } from '../subagent/tools/index.js'
+import { createRunAgentTool } from '../tools/agent/run_agent/index.js'
 import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
 import { clearWebFetchCache, createWebFetchTool } from '../tools/network/web_fetch/index.js'
 import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js'
@@ -712,20 +713,26 @@ export class SessionRouter {
     const bridge = new SubAgentBridge(session.getSessionId(),
       overrides?.autonomy ? { conservativeAutoDefaults: true } : undefined)
     bridge.setToolRegistry(session.getToolRegistry())
-    // Auto mode: extend the workspace jail to every spawned sub-agent (sandbox
-    // fail-closed + autonomy passthrough + projectDir bound to the jail root),
-    // arm failed-sub-agent retry, git-worktree isolation + serial merge tools.
+    // Auto mode only: extend the workspace jail to every spawned sub-agent
+    // (sandbox fail-closed + autonomy passthrough + projectDir bound to the jail
+    // root) and arm failed-sub-agent retry. The jail is auto-specific safety;
+    // worktree isolation below is shared with agentic.
     if (overrides?.autonomy) {
       this._autoBridge = bridge
       bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides.autonomy })
-      const worktrees = new AutoWorktreeCoordinator(projectDir)
-      if (worktrees.enabled) {
-        // Restore durable task→branch mappings and roll back any interrupted
-        // merge transaction before new sub-agents can start.
-        await worktrees.reconcile()
-        bridge.setWorktreeCoordinator(worktrees)
-        for (const tool of makeAutoWorktreeTools(bridge)) session.registerTool(tool)
-      }
+    }
+    // Git-worktree isolation for isolated_write sub-agents — armed for BOTH
+    // agentic and auto so concurrent WRITE tasks each run on their own branch
+    // (no shared-tree races). When there is no git workspace it stays disabled
+    // and spawn_sub_agent(workspace_mode="isolated_write") fails closed with a
+    // clear error rather than silently sharing the tree.
+    const worktrees = new AutoWorktreeCoordinator(projectDir)
+    if (worktrees.enabled) {
+      // Restore durable task→branch mappings and roll back any interrupted
+      // merge transaction before new sub-agents can start.
+      await worktrees.reconcile()
+      bridge.setWorktreeCoordinator(worktrees)
+      for (const tool of makeAutoWorktreeTools(bridge)) session.registerTool(tool)
     }
     // Sub-agents read full texts in their discarded-after-run context —
     // override the main agent's budgeted web_fetch with the full variant. In
@@ -742,7 +749,16 @@ export class SessionRouter {
       projectDir,
       sessionId: session.getSessionId(),
     }))
-    session.registerTool(makeGetSubAgentStatusTool(bridge))
+    // Delegation tool surface (agentic + auto):
+    //   - run_agent           — SYNCHRONOUS: blocks until the sub-agent finishes.
+    //                           Use when the next step depends on the result.
+    //   - spawn_sub_agent     — ASYNCHRONOUS: returns a task_id immediately; fan
+    //                           out several in one turn to run them in parallel.
+    //   - get_sub_agent_status / _intermediate / cancel / list — async controls.
+    // makeSubAgentTools already includes get_sub_agent_status, so we no longer
+    // register it separately.
+    session.registerTool(await createRunAgentTool(bridge))
+    for (const tool of makeSubAgentTools(bridge)) session.registerTool(tool)
     // D11: completion/failure notifications flow into the volatile prefix.
     session.setSubAgentBridge(bridge)
     return session
