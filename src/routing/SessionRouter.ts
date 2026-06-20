@@ -46,7 +46,7 @@ import { prefetchRelevantMemories, getMemoryRecallTimeoutMs } from '../core/memo
 import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
-import { readAutoCheckpoint, buildAutoResumePreamble } from '../core/auto/AutoCheckpointStore.js'
+import { readAutoCheckpoint, writeAutoCheckpoint, buildAutoResumePreamble, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
 import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
@@ -90,6 +90,25 @@ interface SessionImpl {
 }
 
 // ── SessionRouter ─────────────────────────────────────────────────────────────
+
+/** Short continuation markers — a prompt asking to keep going, not a new goal. */
+const AUTO_CONTINUATION_MARKERS = [
+  '继续', '接着', '继续推进', '继续完成', '接着做', '接着干',
+  'continue', 'go on', 'keep going', 'carry on', 'proceed', 'resume',
+]
+
+/**
+ * Whether an auto-mode prompt is a "continue the current run" signal rather than
+ * a NEW goal. Empty input, or a short prompt that is exactly / starts with a
+ * continuation marker, counts as continuation. Anything longer is treated as a
+ * real new requirement so it becomes the goal.
+ */
+export function isAutoContinuationPrompt(prompt: string): boolean {
+  const p = prompt.trim().toLowerCase()
+  if (p === '') return true
+  if (p.length > 24) return false
+  return AUTO_CONTINUATION_MARKERS.some(m => p === m || p.startsWith(m))
+}
 
 export class SessionRouter {
   private readonly _cfg: ResolvedConfig
@@ -265,23 +284,77 @@ export class SessionRouter {
     // resumed run continues instead of restarting. The CLI banner is shown only
     // to the human; this preamble is what the model actually sees.
     let effectivePrompt = prompt
-    if (this._currentMode === 'auto' && this._autoGoal === null) {
-      if (this._explicitResume) {
+    if (this._currentMode === 'auto') {
+      const isFirstTurn = this._autoGoal === null
+      const isContinuation = isAutoContinuationPrompt(prompt)
+
+      if (isFirstTurn && this._explicitResume && isContinuation) {
+        // Resumed to CONTINUE: the user gave no new requirement (empty or a
+        // "继续"/"continue"-type prompt), so keep the prior goal and re-inject the
+        // progress snapshot so the run picks up where it stopped.
         const cp = readAutoCheckpoint(this._cfg.projectDir ?? process.cwd())
         const preamble = buildAutoResumePreamble(cp)
         if (preamble) {
           effectivePrompt = `${preamble}\n\n[本次用户输入]\n${prompt}`
-          this._autoGoal = cp?.goal ?? prompt
+          this._autoGoal = cp?.goal ?? null
         }
+        if (this._autoGoal === null) this._autoGoal = prompt
+      } else if (isFirstTurn) {
+        // Fresh session OR resumed-with-a-NEW-requirement: the user's input is
+        // the goal — NOT the old checkpoint's. On resume we additionally clear
+        // the prior run's durable state (todos + checkpoint) so verify/drift
+        // judge THIS goal cleanly; the prior conversation is already preloaded
+        // for context, so we deliberately skip the "continue the old goal"
+        // preamble that would otherwise mis-anchor the gates.
+        if (this._explicitResume) {
+          await this._reanchorAutoGoal(prompt)
+        } else {
+          this._autoGoal = prompt
+        }
+      } else if (!isContinuation) {
+        // NEW task in an already-running session. One submit() drives the auto
+        // KernelLoop to terminal before control returns here, so a fresh prompt
+        // is a NEW goal — re-anchor it. Without this, the verify and drift gates
+        // (which read the goal lazily via getGoal) keep judging against the
+        // FIRST task's goal. We also clear the run-scoped state they consult so
+        // the new task does not inherit the previous one's progress record.
+        await this._reanchorAutoGoal(prompt)
       }
-      // Fall back to the first prompt as the goal anchor when not resuming (or
-      // when the checkpoint had no usable goal).
-      if (this._autoGoal === null) this._autoGoal = prompt
+      // else: an in-session "继续"/"continue" prompt — keep the current goal and
+      // run state untouched so the model carries on the same task.
     }
 
     for await (const ev of this._impl!.submit(effectivePrompt)) {
       yield ev
     }
+  }
+
+  /**
+   * Re-anchor the auto-mode goal to a new top-level task and clear the
+   * run-scoped state that the verify/drift gates and checkpoint snapshot read,
+   * so a second task in the same session is judged on its own terms:
+   *   • _autoGoal      — the lazily-read goal the gates judge against.
+   *   • session todos  — the AutoCheckpoint snapshot is built from them; stale
+   *                      "completed" steps would otherwise leak into the new run.
+   *   • durable checkpoint — drift reads done/pending from disk; overwrite it
+   *                      immediately so a gate that fires before the new run's
+   *                      first flush sees the NEW goal with an empty record.
+   */
+  private async _reanchorAutoGoal(prompt: string): Promise<void> {
+    this._autoGoal = prompt
+    const sessionId = this.getSessionId()
+    try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
+    // Hard reset (not a merge): a fresh checkpoint with empty completedSteps /
+    // pendingTodos so drift never compares the NEW goal against the prior task's
+    // progress. updateAutoCheckpoint would union the old steps back in, so we
+    // overwrite the whole record here.
+    await writeAutoCheckpoint(this._cfg.projectDir ?? process.cwd(), {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId,
+      updatedAt: Date.now(),
+      revision: 0,
+      goal: prompt,
+    })
   }
 
   /**
