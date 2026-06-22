@@ -17,6 +17,7 @@
  *   -k, --api-key <key>     API key (or ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
+ *       --session-dir <dir> Persist one-shot session history under this folder
  *   -j, --json              Output raw JSON events (for piping)
  *   -y, --yes               Auto-approve sensitive tools in trusted scripts
  *   -v, --version           Show version
@@ -29,7 +30,7 @@ import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { Writable } from 'node:stream'
 import { isAbsolute, resolve, join } from 'node:path'
-import { existsSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { getModelProtocol } from '../providers/registry.js'
@@ -207,6 +208,7 @@ ${bold('OPTIONS')}
   -s, --system <text>   Custom system prompt
   -t, --max-turns <n>   Max agentic turns per message (default: 100; use "infinity" for no cap)
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
+      --session-dir <dir>  Persist one-shot session history under this folder
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
       --show-thinking   Show model thinking deltas in the terminal
@@ -335,6 +337,7 @@ interface CliOptions {
   prompt: string | null
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
+  sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
 }
 
 function parseCliArgs(): CliOptions {
@@ -353,6 +356,7 @@ function parseCliArgs(): CliOptions {
         system:       { type: 'string',  short: 's' },
         'max-turns':  { type: 'string',  short: 't' },
         resume:       { type: 'string',  short: 'r' },
+        'session-dir': { type: 'string' },
         yes:          { type: 'boolean', short: 'y', default: false },
         debug:        { type: 'boolean', short: 'd', default: false },
         'show-thinking': { type: 'boolean', default: false },
@@ -383,11 +387,20 @@ function parseCliArgs(): CliOptions {
 
   const promptParts = parsed.positionals
   const rawWorkspace = parsed.values['workspace'] as string | undefined
+  const rawSessionDir = parsed.values['session-dir'] as string | undefined
   let workspace: string | undefined
   if (rawWorkspace) {
     workspace = resolve(rawWorkspace)
     if (!existsSync(workspace) || !statSync(workspace).isDirectory()) {
       console.error(red(`Error: workspace "${workspace}" does not exist or is not a directory.`))
+      process.exit(1)
+    }
+  }
+  let sessionDir: string | undefined
+  if (rawSessionDir) {
+    sessionDir = resolve(rawSessionDir)
+    if (existsSync(sessionDir) && !statSync(sessionDir).isDirectory()) {
+      console.error(red(`Error: session-dir "${sessionDir}" exists but is not a directory.`))
       process.exit(1)
     }
   }
@@ -421,6 +434,7 @@ function parseCliArgs(): CliOptions {
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
     resume:     parsed.values['resume']   as string | undefined,
+    sessionDir,
   }
 }
 
@@ -1072,6 +1086,31 @@ function makeRouter(
     }
   }
 
+  // Wire the ask_user tool → terminal prompt. When the model calls ask_user, the
+  // CLI renders the question (+ numbered options) and reads the human's answer
+  // via the REPL's readline, feeding it straight back to the model. Without this
+  // the tool only returns a text placeholder (no prompt). Interactive TTY only
+  // (never --json/pipe). Independent of --yes: an explicit question to the human
+  // is not a "sensitive op" that auto-approve should silence.
+  if (rl && !opts.json && isTTY) {
+    cfg.askUser = async (question: string, options?: string[]) => {
+      const choices = options ?? []
+      process.stdout.write(
+        `\n${cyan('❓')}  ${bold('AI 需要你的输入')}\n${terminalText(question)}\n`,
+      )
+      if (choices.length > 0) {
+        process.stdout.write(
+          choices.map((o, i) => `  ${green(String(i + 1))}. ${terminalText(o)}`).join('\n') + '\n\n',
+        )
+        const ans = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `)
+        const n = Number.parseInt(ans, 10)
+        if (Number.isInteger(n) && n >= 1 && n <= choices.length) return choices[n - 1]!
+        return ans
+      }
+      return askQuestion(rl, `你的回答 > `)
+    }
+  }
+
   // Inject MCP server tool-name summary into D5 (progressive disclosure).
   if (_mcpServerInstructions.length > 0) {
     cfg.mcpServers = _mcpServerInstructions
@@ -1715,6 +1754,53 @@ function findSessionPreviewMessage(messages: readonly ConversationMessage[]): Co
     if (message.role !== 'user') return false
     return renderPromptContent(message.content).length > 0
   })
+}
+
+interface PersistSessionSnapshotOptions {
+  router: SessionRouter
+  opts: CliOptions
+  currentInput: string
+  savedMessageCount: number
+  sessionRoot?: string
+  skipJson?: boolean
+}
+
+async function persistSessionSnapshot({
+  router,
+  opts,
+  currentInput,
+  savedMessageCount,
+  sessionRoot,
+  skipJson = false,
+}: PersistSessionSnapshotOptions): Promise<number> {
+  if (skipJson && opts.json) return savedMessageCount
+  try {
+    const sessionId = router.getSessionId()
+    if (!sessionId) return savedMessageCount
+    const messages = router.getMessages()
+    const firstUserMsg = findSessionPreviewMessage(messages)
+    const firstPromptText = firstPromptFromMessage(firstUserMsg, currentInput)
+    const meta = {
+      mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
+      startTime:     Date.now(),
+      lastActivity:  Date.now(),
+      messageCount:  messages.length,
+      firstPrompt:   firstPromptText,
+      workspace:     opts.workspace,
+    }
+    const storeOptions = sessionRoot ? { rootDir: sessionRoot } : undefined
+    if (messages.length < savedMessageCount) {
+      await SessionStore.replace(sessionId, meta, messages, storeOptions)
+    } else if (messages.length > savedMessageCount) {
+      await SessionStore.append(sessionId, meta, messages, savedMessageCount, storeOptions)
+    } else {
+      return savedMessageCount
+    }
+    return messages.length
+  } catch {
+    // session save is best-effort — never crash the active run
+    return savedMessageCount
+  }
 }
 
 function renderPromptContent(content: unknown): string {
@@ -3241,32 +3327,13 @@ async function runRepl(opts: CliOptions): Promise<void> {
   // (set to true after the first prompt, even if the user skips it).
   let hardwareBindingPrompted = false
   const persistCurrentSession = async (currentInput: string): Promise<void> => {
-    if (opts.json) return
-    try {
-      const sessionId = router.getSessionId()
-      if (!sessionId) return
-      const messages = router.getMessages()
-      const firstUserMsg = findSessionPreviewMessage(messages)
-      const firstPromptText = firstPromptFromMessage(firstUserMsg, currentInput)
-      const meta = {
-        mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
-        startTime:     Date.now(),
-        lastActivity:  Date.now(),
-        messageCount:  messages.length,
-        firstPrompt:   firstPromptText,
-        workspace:     opts.workspace,
-      }
-      if (messages.length < savedMessageCount) {
-        await SessionStore.replace(sessionId, meta, messages)
-      } else if (messages.length > savedMessageCount) {
-        await SessionStore.append(sessionId, meta, messages, savedMessageCount)
-      } else {
-        return
-      }
-      savedMessageCount = messages.length
-    } catch {
-      // session save is best-effort — never crash the REPL
-    }
+    savedMessageCount = await persistSessionSnapshot({
+      router,
+      opts,
+      currentInput,
+      savedMessageCount,
+      skipJson: true,
+    })
   }
   let interactiveInputActive = false
   const setInteractiveActive = (v: boolean) => { interactiveInputActive = v }
@@ -4361,7 +4428,54 @@ async function runRepl(opts: CliOptions): Promise<void> {
 // ── Single-turn mode ──────────────────────────────────────────────────────────
 
 async function runSingleTurn(opts: CliOptions): Promise<void> {
-  const router = makeRouter(opts)
+  const storeOptions = opts.sessionDir ? { rootDir: opts.sessionDir } : undefined
+  let resumedMessages: ConversationMessage[] = []
+  let resumedSessionId: string | undefined
+  let savedMessageCount = 0
+
+  if (opts.resume) {
+    let targetId = opts.resume
+    if (targetId === 'last') {
+      const sessions = await SessionStore.listSessions(1, {
+        ...(opts.workspace ? { workspace: opts.workspace } : {}),
+        ...storeOptions,
+      })
+      targetId = sessions[0]?.sessionId ?? ''
+    }
+    if (targetId) {
+      const meta = await SessionStore.getSession(targetId, storeOptions)
+      if (meta && opts.workspace && meta.workspace && meta.workspace !== opts.workspace) {
+        throw new Error(
+          `Session ${targetId} belongs to another workspace. ` +
+          `current=${opts.workspace}; session=${meta.workspace}`,
+        )
+      }
+      resumedMessages = await SessionStore.loadHistory(targetId, storeOptions)
+      if (resumedMessages.length > 0) {
+        resumedSessionId = targetId
+        savedMessageCount = resumedMessages.length
+        if (
+          meta?.mode &&
+          meta.mode !== 'auto' &&
+          (opts.mode === 'detect' || opts.mode === 'auto')
+        ) {
+          opts.mode = meta.mode as CliOptions['mode']
+        }
+      } else if (!opts.json) {
+        process.stderr.write(`${yellow(`Warning: session ${targetId} was not found; starting a new one-shot session.`)}\n`)
+      }
+    }
+  }
+
+  const router = makeRouter(
+    opts,
+    undefined,
+    undefined,
+    resumedMessages.length > 0 ? resumedMessages : undefined,
+    undefined,
+    undefined,
+    resumedSessionId,
+  )
 
   // Register standard tools (robotics registers its own)
   if (opts.mode !== 'robotics') {
@@ -4390,6 +4504,15 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
     console.error(red(`Error: ${msg}`))
     process.exitCode = 1
   } finally {
+    if (opts.sessionDir || resumedSessionId) {
+      await persistSessionSnapshot({
+        router,
+        opts,
+        currentInput: opts.prompt!,
+        savedMessageCount,
+        sessionRoot: opts.sessionDir,
+      })
+    }
     await router.dispose().catch(() => undefined)
   }
 }
@@ -4420,8 +4543,13 @@ async function main(): Promise<void> {
   assertApiKeyConfigured(opts)
 
   if (opts.prompt !== null) {
+    if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })
     await runSingleTurn(opts)
   } else {
+    if (opts.sessionDir) {
+      console.error(red('Error: --session-dir is only supported for one-shot prompt runs.'))
+      process.exit(1)
+    }
     await runRepl(opts)
   }
 }

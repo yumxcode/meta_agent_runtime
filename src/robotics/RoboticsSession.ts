@@ -946,68 +946,68 @@ export class RoboticsSession implements RoboticsCapabilities {
     }
     this._submitInFlight = true
 
-    // ── First submit only: classify agent mode ────────────────────────────────
-    if (!this._modeClassified) {
-      await this._classifyAgentMode(prompt)
-    }
-
-    // ── QueryAnalyzer: fire in parallel with stable section building ──────────
-    // Heuristic + flash-model intent analysis (2 min timeout built in). Result
-    // drives proactive context pre-loading before the first tool call this turn.
-    const queryIntentPromise = this.queryAnalyzer
-      ? this.queryAnalyzer.analyze(prompt).catch(() => null)
-      : Promise.resolve(null)
-
-    // ── Stable system prompt (memoized sections) ──────────────────────────────
-    // Only R1 (domain identity), R4 (hardware profile), W1 (workflow phase if
-    // present), and the team section go here — all are memoized and change at
-    // most once per session (on mode classification, hardware write, workflow
-    // advance, or team operation).  Keeping these sections stable is what lets
-    // DeepSeek cache the entire conversation history prefix across turns.
-    const stableSections = buildDynamicSections({
-      mode:           'robotics',
-      modeExtensions: this._getStableRoboticsExtensions(),
-      sessionId:      this.sessionId,
-      sessionStartMs: this._sessionStartMs,
-      projectDir:     this.projectDir,
-      // currentQuery / subAgentBridge intentionally omitted — those drive
-      // D1b and D11 which are now in the volatile user prefix below.
-    })
-    const stablePrompt = await this.sectionRegistry.resolveToString(stableSections)
-    const fullStablePrompt = [stablePrompt, this._userAppendPrompt].filter(Boolean).join('\n\n')
-    this._lastSystemPrompt = fullStablePrompt
-
-    // Only update inner session's system message when content actually changed.
-    if (fullStablePrompt !== this._lastStablePrompt) {
-      this.inner.setAppendSystemPrompt(fullStablePrompt)
-      this._lastStablePrompt = fullStablePrompt
-    }
-
-    // ── Await QueryAnalyzer, pre-load intent-driven context ──────────────────
-    // Resolves concurrently with stable section rendering; must complete before
-    // volatile section build so any pre-loaded pager slots appear in R2 this turn.
-    const intent = await queryIntentPromise
-
-    await this.experienceWorkingSet.preload(prompt, intent)
-
-    // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
-    // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
-    // team_context_boundary, D1b (memory), and D11 (notifications) are resolved
-    // here and prepended to the user message as XML-tagged context blocks.
-    const volatileSections = buildVolatileContextSections({
-      currentQuery:       prompt,
-      mode:               'robotics',
-      subAgentBridge:     this.bridge,
-      volatileExtensions: this._getVolatileRoboticsExtensions(),
-    })
-    const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
-    const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
-
-    const effectivePrompt = volatilePrefix
-      ? `${volatilePrefix}\n\n---\n\n${prompt}`
-      : prompt
-
     try {
+      // ── First submit only: classify agent mode ────────────────────────────────
+      if (!this._modeClassified) {
+        await this._classifyAgentMode(prompt)
+      }
+
+      // ── QueryAnalyzer: fire in parallel with stable section building ──────────
+      // Heuristic + flash-model intent analysis (2 min timeout built in). Result
+      // drives proactive context pre-loading before the first tool call this turn.
+      const queryIntentPromise = this.queryAnalyzer
+        ? this.queryAnalyzer.analyze(prompt).catch(() => null)
+        : Promise.resolve(null)
+
+      // ── Stable system prompt (memoized sections) ──────────────────────────────
+      // Only R1 (domain identity), R4 (hardware profile), W1 (workflow phase if
+      // present), and the team section go here — all are memoized and change at
+      // most once per session (on mode classification, hardware write, workflow
+      // advance, or team operation).  Keeping these sections stable is what lets
+      // DeepSeek cache the entire conversation history prefix across turns.
+      const stableSections = buildDynamicSections({
+        mode:           'robotics',
+        modeExtensions: this._getStableRoboticsExtensions(),
+        sessionId:      this.sessionId,
+        sessionStartMs: this._sessionStartMs,
+        projectDir:     this.projectDir,
+        // currentQuery / subAgentBridge intentionally omitted — those drive
+        // D1b and D11 which are now in the volatile user prefix below.
+      })
+      const stablePrompt = await this.sectionRegistry.resolveToString(stableSections)
+      const fullStablePrompt = [stablePrompt, this._userAppendPrompt].filter(Boolean).join('\n\n')
+      this._lastSystemPrompt = fullStablePrompt
+
+      // Only update inner session's system message when content actually changed.
+      if (fullStablePrompt !== this._lastStablePrompt) {
+        this.inner.setAppendSystemPrompt(fullStablePrompt)
+        this._lastStablePrompt = fullStablePrompt
+      }
+
+      // ── Await QueryAnalyzer, pre-load intent-driven context ──────────────────
+      // Resolves concurrently with stable section rendering; must complete before
+      // volatile section build so any pre-loaded pager slots appear in R2 this turn.
+      const intent = await queryIntentPromise
+
+      await this.experienceWorkingSet.preload(prompt, intent)
+
+      // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
+      // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
+      // team_context_boundary, D1b (memory), and D11 (notifications) are resolved
+      // here and prepended to the user message as XML-tagged context blocks.
+      const volatileSections = buildVolatileContextSections({
+        currentQuery:       prompt,
+        mode:               'robotics',
+        subAgentBridge:     this.bridge,
+        volatileExtensions: this._getVolatileRoboticsExtensions(),
+      })
+      const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
+      const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
+
+      const effectivePrompt = volatilePrefix
+        ? `${volatilePrefix}\n\n---\n\n${prompt}`
+        : prompt
+
       for await (const ev of this.inner.submit(effectivePrompt)) {
         // Compaction is a session-start moment for R4 + R5: refresh both
         // snapshots so the post-compact system prompt reflects current state.
@@ -1025,7 +1025,11 @@ export class RoboticsSession implements RoboticsCapabilities {
     } finally {
       this._submitInFlight = false
       // Age TTL counters and evict expired context slots after each completed turn
-      this.contextPager.tick(extractReferencedExperienceSlotIds(this.getMessages()))
+      try {
+        this.contextPager.tick(extractReferencedExperienceSlotIds(this.getMessages()))
+      } catch {
+        // Best-effort cleanup must not mask the submit failure that triggered finally.
+      }
     }
   }
 

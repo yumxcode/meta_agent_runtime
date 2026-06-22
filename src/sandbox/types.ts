@@ -16,8 +16,16 @@
 
 export interface SandboxConfig {
   /**
+   * When true, the workspaceRoot is mounted/readable but not implicitly writable.
+   * Callers may still grant explicit writable paths via writeAllowPaths.
+   *
+   * Default: false (workspaceRoot is writable)
+   */
+  readonlyWorkspace?: boolean
+
+  /**
    * Additional absolute paths the sub-agent may write to.
-   * The workspaceRoot is always implicitly writable.
+   * The workspaceRoot is implicitly writable unless readonlyWorkspace is true.
    * Default: [] (only workspaceRoot is writable)
    */
   writeAllowPaths?: string[]
@@ -123,7 +131,7 @@ export interface SandboxExecutor {
    * Create a SandboxHandle for one sub-agent session.
    *
    * @param config         Declarative sandbox policy from SubAgentConfig.sandbox
-   * @param workspaceRoot  Absolute path to the sub-agent's workspace (always writable)
+   * @param workspaceRoot  Absolute path to the sub-agent's workspace
    */
   create(config: SandboxConfig, workspaceRoot: string): Promise<SandboxHandle>
 }

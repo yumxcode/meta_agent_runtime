@@ -336,6 +336,8 @@ export class SessionRouter {
    *   • _autoGoal      — the lazily-read goal the gates judge against.
    *   • session todos  — the AutoCheckpoint snapshot is built from them; stale
    *                      "completed" steps would otherwise leak into the new run.
+   *   • progress/artifacts — volatile user-facing state; stale notes or
+   *                      artifacts would otherwise be snapshotted into the new goal.
    *   • durable checkpoint — drift reads done/pending from disk; overwrite it
    *                      immediately so a gate that fires before the new run's
    *                      first flush sees the NEW goal with an empty record.
@@ -344,6 +346,8 @@ export class SessionRouter {
     this._autoGoal = prompt
     const sessionId = this.getSessionId()
     try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
+    try { deleteProgressNoteForSession(sessionId) } catch { /* best-effort */ }
+    try { deleteArtifactsForSession(sessionId) } catch { /* best-effort */ }
     // Hard reset (not a merge): a fresh checkpoint with empty completedSteps /
     // pendingTodos so drift never compares the NEW goal against the prior task's
     // progress. updateAutoCheckpoint would union the old steps back in, so we

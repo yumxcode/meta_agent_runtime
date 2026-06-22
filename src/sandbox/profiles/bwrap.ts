@@ -36,7 +36,7 @@ import type { SandboxConfig } from '../types.js'
  * The resulting array should be prepended to ['bash', '-c', command].
  *
  * @param config         Declarative sandbox policy
- * @param workspaceRoot  Absolute path always granted write access
+ * @param workspaceRoot  Absolute path to the sub-agent workspace
  */
 export function buildBwrapArgs(
   config: SandboxConfig,
@@ -54,9 +54,14 @@ export function buildBwrapArgs(
   args.push('--proc', '/proc')   // fresh /proc (required for many tools)
   args.push('--tmpfs', '/tmp')   // isolated /tmp — not shared with host
 
-  // ── Writable workspace ────────────────────────────────────────────────────
-  // workspaceRoot is the primary writable location.
-  args.push('--bind', workspaceRoot, workspaceRoot)
+  // ── Workspace mount ───────────────────────────────────────────────────────
+  // workspaceRoot is writable by default. readonlyWorkspace still gets an
+  // explicit ro-bind so workspaces under /tmp remain visible after --tmpfs /tmp.
+  if (config.readonlyWorkspace) {
+    args.push('--ro-bind', workspaceRoot, workspaceRoot)
+  } else {
+    args.push('--bind', workspaceRoot, workspaceRoot)
+  }
 
   // Extra write-allow paths from config
   for (const p of config.writeAllowPaths ?? []) {

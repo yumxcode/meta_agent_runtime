@@ -24,7 +24,6 @@ import type { ConversationMessage } from './types.js'
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SESSIONS_ROOT = join(homedir(), '.meta-agent', 'sessions')
-const INDEX_FILE    = join(SESSIONS_ROOT, 'index.json')
 const MAX_INDEX_ENTRIES = 50   // keep last 50 sessions in the index
 const MAX_RESUME_BYTES = 5 * 1024 * 1024
 const MAX_RESUME_MESSAGES = 200
@@ -51,16 +50,29 @@ export interface SessionMeta {
 
 export interface SessionListOptions {
   workspace?: string
+  rootDir?: string
+}
+
+export interface SessionStoreOptions {
+  rootDir?: string
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
 
-function sessionDir(sessionId: string): string {
-  return join(SESSIONS_ROOT, sessionId)
+function sessionsRoot(options: SessionStoreOptions = {}): string {
+  return options.rootDir ?? SESSIONS_ROOT
 }
 
-function historyPath(sessionId: string): string {
-  return join(sessionDir(sessionId), 'history.jsonl')
+function indexFile(options: SessionStoreOptions = {}): string {
+  return join(sessionsRoot(options), 'index.json')
+}
+
+function sessionDir(sessionId: string, options: SessionStoreOptions = {}): string {
+  return join(sessionsRoot(options), sessionId)
+}
+
+function historyPath(sessionId: string, options: SessionStoreOptions = {}): string {
+  return join(sessionDir(sessionId, options), 'history.jsonl')
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -234,9 +246,9 @@ function buildResumedHistory(parsed: readonly ConversationMessage[]): Conversati
   return summary ? [summary, ...recent] : recent
 }
 
-async function readIndex(): Promise<SessionMeta[]> {
+async function readIndex(options: SessionStoreOptions = {}): Promise<SessionMeta[]> {
   try {
-    const raw = await readFile(INDEX_FILE, 'utf-8')
+    const raw = await readFile(indexFile(options), 'utf-8')
     const parsed = JSON.parse(raw) as unknown
     if (!Array.isArray(parsed)) return []
     // Validate each entry; silently drop corrupt records so a partial migration
@@ -251,9 +263,9 @@ async function readIndex(): Promise<SessionMeta[]> {
   }
 }
 
-async function writeIndex(entries: SessionMeta[]): Promise<void> {
-  await ensureDir(SESSIONS_ROOT)
-  await atomicWriteJson(INDEX_FILE, entries)
+async function writeIndex(entries: SessionMeta[], options: SessionStoreOptions = {}): Promise<void> {
+  await ensureDir(sessionsRoot(options))
+  await atomicWriteJson(indexFile(options), entries)
 }
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
@@ -273,13 +285,14 @@ export class SessionStore {
     meta: Omit<SessionMeta, 'sessionId'>,
     messages: readonly ConversationMessage[],
     appendFrom: number,
+    options: SessionStoreOptions = {},
   ): Promise<void> {
     if (messages.length === 0 || appendFrom >= messages.length) return
     try {
-      await ensureDir(sessionDir(sessionId))
+      await ensureDir(sessionDir(sessionId, options))
       const lines = serializeMessages(messages.slice(appendFrom))
-      await appendFile(historyPath(sessionId), lines, 'utf-8')
-      await SessionStore._upsertIndex({ sessionId, ...meta })
+      await appendFile(historyPath(sessionId, options), lines, 'utf-8')
+      await SessionStore._upsertIndex({ sessionId, ...meta }, options)
     } catch {
       // Best-effort — never crash the session on a storage failure
     }
@@ -294,11 +307,12 @@ export class SessionStore {
     sessionId: string,
     meta: Omit<SessionMeta, 'sessionId'>,
     messages: readonly ConversationMessage[],
+    options: SessionStoreOptions = {},
   ): Promise<void> {
     try {
-      await ensureDir(sessionDir(sessionId))
-      await writeFile(historyPath(sessionId), serializeMessages(messages), 'utf-8')
-      await SessionStore._upsertIndex({ sessionId, ...meta })
+      await ensureDir(sessionDir(sessionId, options))
+      await writeFile(historyPath(sessionId, options), serializeMessages(messages), 'utf-8')
+      await SessionStore._upsertIndex({ sessionId, ...meta }, options)
     } catch {
       // Best-effort — never crash the session on a storage failure
     }
@@ -308,9 +322,12 @@ export class SessionStore {
    * Load the full conversation history for a session.
    * Returns [] if the history file doesn't exist.
    */
-  static async loadHistory(sessionId: string): Promise<ConversationMessage[]> {
+  static async loadHistory(
+    sessionId: string,
+    options: SessionStoreOptions = {},
+  ): Promise<ConversationMessage[]> {
     try {
-      const path = historyPath(sessionId)
+      const path = historyPath(sessionId, options)
       const info = await stat(path)
       let raw: string
       if (info.size > MAX_RESUME_BYTES) {
@@ -356,7 +373,7 @@ export class SessionStore {
    * @param limit  Maximum number of entries to return (default: 10).
    */
   static async listSessions(limit = 10, options: SessionListOptions = {}): Promise<SessionMeta[]> {
-    const index = await readIndex()
+    const index = await readIndex(options)
     const workspace = options.workspace
     const filtered = workspace
       ? index.filter(entry => entry.workspace === workspace)
@@ -367,31 +384,37 @@ export class SessionStore {
   /**
    * Return one session metadata record by ID, or null if it is not indexed.
    */
-  static async getSession(sessionId: string): Promise<SessionMeta | null> {
-    const index = await readIndex()
+  static async getSession(
+    sessionId: string,
+    options: SessionStoreOptions = {},
+  ): Promise<SessionMeta | null> {
+    const index = await readIndex(options)
     return index.find(entry => entry.sessionId === sessionId) ?? null
   }
 
   /**
    * Check whether a session directory exists (quick existence check).
    */
-  static sessionExists(sessionId: string): boolean {
-    return existsSync(historyPath(sessionId))
+  static sessionExists(sessionId: string, options: SessionStoreOptions = {}): boolean {
+    return existsSync(historyPath(sessionId, options))
   }
 
   /**
    * Delete a single session: remove from index + delete its directory.
    */
-  static async deleteSession(sessionId: string): Promise<void> {
+  static async deleteSession(
+    sessionId: string,
+    options: SessionStoreOptions = {},
+  ): Promise<void> {
     try {
       // Remove from index (read-modify-write under the cross-process lock)
-      await withFileLock(INDEX_FILE, async () => {
-        const entries = await readIndex()
+      await withFileLock(indexFile(options), async () => {
+        const entries = await readIndex(options)
         const filtered = entries.filter(e => e.sessionId !== sessionId)
-        await writeIndex(filtered)
+        await writeIndex(filtered, options)
       })
       // Remove directory (best-effort)
-      await rm(sessionDir(sessionId), { recursive: true, force: true })
+      await rm(sessionDir(sessionId, options), { recursive: true, force: true })
     } catch {
       // Best-effort
     }
@@ -406,17 +429,20 @@ export class SessionStore {
    * the current workspace") must use — NOT deleteAllSessions(), which ignores
    * the scope and wipes every workspace's history.
    */
-  static async deleteSessions(sessionIds: string[]): Promise<void> {
+  static async deleteSessions(
+    sessionIds: string[],
+    options: SessionStoreOptions = {},
+  ): Promise<void> {
     if (sessionIds.length === 0) return
     const ids = new Set(sessionIds)
     try {
-      await withFileLock(INDEX_FILE, async () => {
-        const entries = await readIndex()
+      await withFileLock(indexFile(options), async () => {
+        const entries = await readIndex(options)
         const filtered = entries.filter(e => !ids.has(e.sessionId))
-        await writeIndex(filtered)
+        await writeIndex(filtered, options)
       })
       await Promise.all(
-        [...ids].map(id => rm(sessionDir(id), { recursive: true, force: true })),
+        [...ids].map(id => rm(sessionDir(id, options), { recursive: true, force: true })),
       )
     } catch {
       // Best-effort
@@ -426,12 +452,12 @@ export class SessionStore {
   /**
    * Delete ALL sessions: clear index + remove every session directory.
    */
-  static async deleteAllSessions(): Promise<void> {
+  static async deleteAllSessions(options: SessionStoreOptions = {}): Promise<void> {
     try {
-      const entries = await readIndex()
-      await withFileLock(INDEX_FILE, () => writeIndex([]))
+      const entries = await readIndex(options)
+      await withFileLock(indexFile(options), () => writeIndex([], options))
       await Promise.all(
-        entries.map(e => rm(sessionDir(e.sessionId), { recursive: true, force: true })),
+        entries.map(e => rm(sessionDir(e.sessionId, options), { recursive: true, force: true })),
       )
     } catch {
       // Best-effort
@@ -446,14 +472,15 @@ export class SessionStore {
     sessionId: string,
     title: string,
     titleMessageCount: number,
+    options: SessionStoreOptions = {},
   ): Promise<void> {
     try {
-      await withFileLock(INDEX_FILE, async () => {
-        const entries = await readIndex()
+      await withFileLock(indexFile(options), async () => {
+        const entries = await readIndex(options)
         const idx = entries.findIndex(e => e.sessionId === sessionId)
         if (idx < 0) return
         entries[idx] = { ...entries[idx]!, title, titleMessageCount }
-        await writeIndex(entries)
+        await writeIndex(entries, options)
       })
     } catch {
       // Best-effort
@@ -462,13 +489,16 @@ export class SessionStore {
 
   // ── Private ────────────────────────────────────────────────────────────────
 
-  private static async _upsertIndex(meta: SessionMeta): Promise<void> {
+  private static async _upsertIndex(
+    meta: SessionMeta,
+    options: SessionStoreOptions = {},
+  ): Promise<void> {
     // M2-fix: the whole read→merge→write must be atomic ACROSS PROCESSES.
     // Two concurrent CLI sessions both rewrite index.json at every turn end;
     // without the lock, the slower writer silently drops the faster writer's
     // upsert (lost update) and sessions vanish from the picker.
-    await withFileLock(INDEX_FILE, async () => {
-      const entries = await readIndex()
+    await withFileLock(indexFile(options), async () => {
+      const entries = await readIndex(options)
       const idx = entries.findIndex(e => e.sessionId === meta.sessionId)
       if (idx >= 0) {
         // Merge-preserve: per-turn persists rebuild meta WITHOUT the title fields;
@@ -480,7 +510,7 @@ export class SessionStore {
       // Sort newest-first by lastActivity, then keep index bounded.
       // Sort before slice so the most-recently-active sessions always survive the cap.
       entries.sort((a, b) => b.lastActivity - a.lastActivity)
-      await writeIndex(entries.slice(0, MAX_INDEX_ENTRIES))
+      await writeIndex(entries.slice(0, MAX_INDEX_ENTRIES), options)
     })
   }
 }

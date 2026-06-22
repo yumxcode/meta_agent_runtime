@@ -4,6 +4,7 @@ import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { SubAgentRecord, SubAgentTaskId } from '../types.js'
+import type { MetaAgentTool } from '../../core/types.js'
 
 const mockState = vi.hoisted(() => {
   const tasks = new Map<string, SubAgentRecord>()
@@ -134,6 +135,16 @@ function completeTask(taskId: string, costUsd = 0): void {
   mockState.runners.find(r => r.taskId === taskId)?.resolve()
 }
 
+function tool(name: string, category?: MetaAgentTool['permission']['category']): MetaAgentTool {
+  return {
+    name,
+    description: name,
+    inputSchema: { type: 'object', properties: {} },
+    permission: category ? { category } : undefined,
+    call: async () => ({ content: 'ok' }),
+  }
+}
+
 describe('SubAgentBridge scheduler', () => {
   beforeEach(() => {
     mockState.tasks.clear()
@@ -254,6 +265,42 @@ describe('SubAgentBridge scheduler', () => {
       config: { taskDescription: 'verify', internal: true },
     })
     expect(gate.taskId).toBeTruthy()
+  })
+
+  it('removes write tools from shared_readonly sub-agents', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 1,
+      maxQueuedSubAgents: 4,
+      startDelayMs: 0,
+    })
+    bridge.setToolRegistry(new Map([
+      ['read_file', tool('read_file', 'read')],
+      ['write_file', tool('write_file', 'write')],
+      ['edit_file', tool('edit_file', 'write')],
+      ['experience_write', tool('experience_write')],
+      ['custom_mutator', tool('custom_mutator', 'write')],
+    ]))
+
+    const record = await bridge.spawnSubAgent({
+      config: {
+        taskDescription: 'inspect only',
+        workspaceMode: 'shared_readonly',
+        allowedTools: [
+          'read_file',
+          'write_file',
+          'edit_file',
+          'experience_write',
+          'custom_mutator',
+        ],
+      },
+    })
+
+    expect(record.config.allowedTools).toEqual(['read_file', 'experience_write'])
+    expect(record.config.sandbox).toMatchObject({
+      readonlyWorkspace: true,
+      writeAllowPaths: [],
+      allowUnsandboxedFallback: false,
+    })
   })
 })
 

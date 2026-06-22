@@ -53,6 +53,31 @@ const AUTO_MAX_CONCURRENT_SUB_AGENTS = 3
 const AUTO_DEFAULT_TOTAL_BUDGET_USD = 5
 
 const MERGED_NOTICE_RE = /^\[(\d+) 条更早的子代理通知已合并/
+const SHARED_READONLY_BLOCKED_WRITE_TOOLS = new Set([
+  'write_file',
+  'edit_file',
+  'notebook_edit',
+])
+const SHARED_READONLY_ALLOWED_WRITE_TOOLS = new Set([
+  // Auto Learn runs as a shared_readonly drift sub-agent: the workspace must be
+  // read-only, but it still needs to persist grounded lessons.
+  'experience_write',
+])
+
+function isSharedReadonlyWriteTool(toolName: string, tool?: MetaAgentTool): boolean {
+  if (SHARED_READONLY_ALLOWED_WRITE_TOOLS.has(toolName)) return false
+  if (tool?.permission?.category === 'write') return true
+  if (SHARED_READONLY_BLOCKED_WRITE_TOOLS.has(toolName)) return true
+  return toolName.endsWith('_write')
+}
+
+function filterSharedReadonlyTools(
+  allowedTools: readonly string[] | undefined,
+  registry: Map<string, MetaAgentTool>,
+): string[] | undefined {
+  if (!allowedTools) return undefined
+  return allowedTools.filter(name => !isSharedReadonlyWriteTool(name, registry.get(name)))
+}
 
 /**
  * Collapse a batch of overflow notifications into ONE summary line that
@@ -471,6 +496,18 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         ? 'isolated_write'
         : (config.workspaceMode ?? 'shared_write'),
       isolateWorktree: isolatedWrite,
+    }
+    if (config.workspaceMode === 'shared_readonly') {
+      config = {
+        ...config,
+        allowedTools: filterSharedReadonlyTools(config.allowedTools, this._effectiveToolRegistry()),
+        sandbox: {
+          ...config.sandbox,
+          readonlyWorkspace: true,
+          writeAllowPaths: [],
+          allowUnsandboxedFallback: false,
+        },
+      }
     }
 
     // Internal safety-gate tasks (verify/drift) get a reserved side lane: they

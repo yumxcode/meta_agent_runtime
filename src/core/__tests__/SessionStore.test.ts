@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdtemp, readFile, rm } from 'node:fs/promises'
+import { existsSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import type { ConversationMessage } from '../types.js'
@@ -127,6 +128,28 @@ describe('SessionStore', () => {
       content: [{ type: 'text', text: 'safe message 0' }],
     })
     expect(JSON.stringify(loaded.slice(1, 3))).not.toContain('tool_result')
+  })
+
+  it('can persist a session under a caller-provided root directory', async () => {
+    const { SessionStore } = await import('../SessionStore.js')
+    const rootDir = await mkdtemp(join(tmpdir(), 'meta-agent-one-shot-sessions-'))
+    try {
+      const messages: ConversationMessage[] = [
+        { role: 'user', content: [{ type: 'text', text: 'single turn prompt' }] },
+        { role: 'assistant', content: [{ type: 'text', text: 'single turn answer' }] },
+      ]
+
+      await SessionStore.append('one-shot-session', meta(messages.length), messages, 0, { rootDir })
+
+      const loaded = await SessionStore.loadHistory('one-shot-session', { rootDir })
+      expect(loaded).toEqual(messages)
+      const index = JSON.parse(await readFile(join(rootDir, 'index.json'), 'utf-8')) as unknown[]
+      expect(index).toHaveLength(1)
+      expect(index[0]).toMatchObject({ sessionId: 'one-shot-session', firstPrompt: 'first' })
+      expect(existsSync(join(homeDir, '.meta-agent', 'sessions', 'one-shot-session'))).toBe(false)
+    } finally {
+      await rm(rootDir, { recursive: true, force: true })
+    }
   })
 })
 

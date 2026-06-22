@@ -64,7 +64,7 @@ function regex(pattern: string): string {
  * Build a Seatbelt profile string from a SandboxConfig.
  *
  * @param config         Declarative sandbox policy
- * @param workspaceRoot  Absolute path always granted write access
+ * @param workspaceRoot  Absolute path to the sub-agent workspace
  */
 export function buildMacOSProfile(
   config: SandboxConfig,
@@ -99,9 +99,13 @@ export function buildMacOSProfile(
   lines.push(')')
   lines.push('')
 
-  // Workspace root — always writable
+  // Workspace root — writable unless the caller requested a true readonly workspace.
   lines.push(';; Sub-agent workspace.')
-  lines.push(`(allow file-write* ${subpath(workspaceRoot)})`)
+  if (config.readonlyWorkspace) {
+    lines.push(`(deny file-write* ${subpath(workspaceRoot)})`)
+  } else {
+    lines.push(`(allow file-write* ${subpath(workspaceRoot)})`)
+  }
   lines.push('')
 
   // Extra write-allow paths from config
