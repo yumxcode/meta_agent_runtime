@@ -51,6 +51,12 @@ export interface SubmitOptions {
   domain?: string
   fidelityLevel?: number
   agentId?: string
+  /**
+   * Per-job wall-clock budget (ms) forwarded to the executor watchdog. Omit to
+   * use the executor default; `0` disables the watchdog for this job. See
+   * {@link JobContext.timeoutMs}.
+   */
+  timeoutMs?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -274,6 +280,7 @@ export class JobManager {
       agentId: opts.agentId ?? 'unknown',
       domain: opts.domain ?? 'generic',
       fidelityLevel: opts.fidelityLevel ?? 0,
+      ...(opts.timeoutMs !== undefined && { timeoutMs: opts.timeoutMs }),
     }
 
     this.executor.submit(jobId, handler, input, executorCtx, callbacks)

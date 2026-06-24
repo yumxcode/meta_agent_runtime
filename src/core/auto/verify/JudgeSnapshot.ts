@@ -26,13 +26,34 @@
  */
 import { execFile, execFileSync } from 'child_process'
 import { promisify } from 'util'
-import { mkdtempSync, rmSync } from 'fs'
+import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 
 const execFileAsync = promisify(execFile)
 
 const GIT_TIMEOUT_MS = 60_000
+
+/** Filename of the materialised per-round patch, written into the snapshot worktree. */
+export const THIS_ROUND_DIFF_FILE = 'THIS_ROUND.diff'
+
+/** Cap the materialised patch so a huge refactor can't blow up the worktree / context. */
+const DIFF_PATCH_MAX_BYTES = 200 * 1024
+
+/**
+ * Pre-computed delta of "this round" (baseline HEAD → snapshot commit), produced
+ * OUTSIDE the judge's sandbox where git has full access. Handed to the judge as a
+ * ready-made artifact so it never has to reconstruct the diff via git inside a
+ * no-network, read-only, write-confined sandbox (which it cannot reliably do).
+ */
+export interface SnapshotDiff {
+  /** `git diff --stat baseline..snapshot` — compact per-file summary. */
+  stat: string
+  /** Full unified patch, truncated to DIFF_PATCH_MAX_BYTES. */
+  patch: string
+  /** True when `patch` was truncated. */
+  truncated: boolean
+}
 
 async function git(projectDir: string, args: string[], extraEnv?: NodeJS.ProcessEnv): Promise<string> {
   const { stdout } = await execFileAsync('git', ['-C', projectDir, ...args], {
@@ -72,10 +93,10 @@ function isGitRepo(projectDir: string): boolean {
  */
 export async function withReadonlySnapshot<T>(
   projectDir: string,
-  fn: (snapshotPath: string | null) => Promise<T>,
+  fn: (snapshotPath: string | null, diff: SnapshotDiff | null) => Promise<T>,
 ): Promise<T> {
   const root = resolve(projectDir)
-  if (!isGitRepo(root)) return fn(null)
+  if (!isGitRepo(root)) return fn(null, null)
 
   let worktreePath: string | null = null
   let tmpIndexDir: string | null = null
@@ -99,10 +120,20 @@ export async function withReadonlySnapshot<T>(
     await git(root, ['worktree', 'remove', '--force', worktreePath]).catch(() => undefined)
     await git(root, ['worktree', 'add', '--detach', worktreePath, commit])
 
-    return await fn(worktreePath)
+    // 3. Pre-compute THIS round's delta (baseline HEAD → snapshot commit) while
+    //    we still have full git access OUTSIDE the judge's sandbox. The auto
+    //    executor writes the working tree WITHOUT committing (see header), so
+    //    HEAD is the run baseline and head..commit is the whole round. Hand it
+    //    to the judge as a ready-made artifact + materialise THIS_ROUND.diff in
+    //    the throwaway worktree (the judge's writable root) so it can read the
+    //    full patch without reconstructing it via git. A diff failure never
+    //    blocks verification — the judge still gets the snapshot tree.
+    const diff = await computeSnapshotDiff(root, head, commit, worktreePath)
+
+    return await fn(worktreePath, diff)
   } catch {
     // Any git failure → degrade to live-tree inspection rather than blocking.
-    return await fn(null)
+    return await fn(null, null)
   } finally {
     if (worktreePath) {
       await git(root, ['worktree', 'remove', '--force', worktreePath]).catch(() => undefined)
@@ -112,5 +143,37 @@ export async function withReadonlySnapshot<T>(
     if (tmpIndexDir) {
       try { rmSync(tmpIndexDir, { recursive: true, force: true }) } catch { /* best-effort */ }
     }
+  }
+}
+
+/**
+ * Compute `git diff --stat` + full patch for baseline..commit and materialise
+ * the patch into the snapshot worktree as THIS_ROUND.diff. Returns null on any
+ * git failure (the diff is a bonus, never a hard dependency of verification).
+ */
+async function computeSnapshotDiff(
+  root: string,
+  baseline: string,
+  commit: string,
+  worktreePath: string,
+): Promise<SnapshotDiff | null> {
+  try {
+    const range = `${baseline}..${commit}`
+    const stat = await git(root, ['diff', '--stat', range])
+    const fullPatch = await git(root, ['diff', range])
+    const truncated = Buffer.byteLength(fullPatch, 'utf-8') > DIFF_PATCH_MAX_BYTES
+    const patch = truncated
+      ? fullPatch.slice(0, DIFF_PATCH_MAX_BYTES) + '\n[... patch truncated at 200KB — read the changed files directly for the rest ...]'
+      : fullPatch
+    // Materialise into the throwaway worktree so the judge can read_file it.
+    // Skip the write when there is nothing to write (empty patch).
+    if (patch.trim()) {
+      try {
+        writeFileSync(join(worktreePath, THIS_ROUND_DIFF_FILE), patch, 'utf-8')
+      } catch { /* best-effort: judge still has stat + the tree itself */ }
+    }
+    return { stat, patch, truncated }
+  } catch {
+    return null
   }
 }

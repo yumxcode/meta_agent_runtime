@@ -19,7 +19,7 @@
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { TERMINAL_STATUSES } from '../../../subagent/types.js'
 import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGate.js'
-import { withReadonlySnapshot } from './JudgeSnapshot.js'
+import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
 
 export interface AutoVerifyGateDeps {
   /** Spawns the isolated judge sub-agent. */
@@ -104,7 +104,7 @@ export function buildJudgeRubric(allowedTools: readonly string[]): string {
   const toolList = allowedTools.join(' / ')
   const hasBash = allowedTools.includes('bash')
   const toolLine = hasBash
-    ? `1. 你只有只读工具（${toolList}）。**不要修改任何文件**；bash 仅用于查看（cat/ls/grep/git log 等）。`
+    ? `1. 你只有只读工具（${toolList}）。**不要修改任何文件**；bash 仅用于查看（cat/ls/grep 等），git 命令必须带 -C 指向快照目录（如 \`git -C <快照路径> diff <基线> HEAD\`，cwd 已默认在快照内）。本轮改动已为你预先生成：优先用 read_file 读取快照内的 ${THIS_ROUND_DIFF_FILE}，无需自己跑 git diff。`
     : `1. 你只有只读工具（${toolList}）——**没有 bash/shell**。**不要修改任何文件**；用 grep（content 模式，返回匹配行）和 glob 检索，用 read_file 读取具体文件。`
   return `\
 你是一个独立的"完成度审核 Agent"。你处在一个隔离上下文中：你**没有**看到执行 Agent 的推理过程或它自称做了什么，这是刻意为之——你的判断必须独立。
@@ -130,20 +130,43 @@ ${toolLine}
 done=true 时 unfinished 必须为空数组。`
 }
 
-/** Build the judge's task: pure goal + where to inspect. */
-function buildJudgeTask(goal: string, snapshotPath: string | null): string {
+/** Build the judge's task: pure goal + where to inspect + pre-computed round diff. */
+function buildJudgeTask(goal: string, snapshotPath: string | null, diff: SnapshotDiff | null): string {
   const location = snapshotPath
     ? `待审核的代码位于这个只读快照目录（请只在此目录内取证）：\n  ${snapshotPath}`
     : `（无法创建 git 快照，请直接在工作区只读查证，切勿修改任何文件。）`
-  return [
+  const lines = [
     '【原始目标】',
     goal,
     '',
     '【取证位置】',
     location,
+  ]
+  // Pre-computed delta so the judge sees "what changed this round" with zero
+  // tool calls — critical for incremental goals ("继续开发并给出进展") where the
+  // round delta, not just the end state, is the thing under review.
+  if (diff && diff.stat.trim()) {
+    lines.push(
+      '',
+      '【本轮改动（已为你预先生成，无需自己跑 git）】',
+      '以下为本轮相对上一轮基线的改动摘要（git diff --stat）；' +
+        `完整 patch 见快照内 ${THIS_ROUND_DIFF_FILE}（用 read_file 读取）` +
+        (diff.truncated ? '，注意该 patch 已截断，超出部分请直接读改动文件。' : '。'),
+      '',
+      diff.stat.trim(),
+    )
+  } else if (diff) {
+    lines.push(
+      '',
+      '【本轮改动】',
+      '本轮相对上一轮基线没有任何文件改动（git diff 为空）——若目标要求有产出/改动，这本身即是重要证据。',
+    )
+  }
+  lines.push(
     '',
     '现在开始查证，并按要求只在最后输出 JSON 裁决。',
-  ].join('\n')
+  )
+  return lines.join('\n')
 }
 
 /** Extract the last JSON object from the judge's summary text. */
@@ -247,8 +270,8 @@ export function makeAutoVerifyGate(deps: AutoVerifyGateDeps): VerifyGateFn {
 
     try {
       // Isolated read-only snapshot + LLM judge. No typecheck/test/lint are run.
-      const summary = await withReadonlySnapshot(deps.projectDir, async snapshotPath => {
-        const task = buildJudgeTask(goal, snapshotPath)
+      const summary = await withReadonlySnapshot(deps.projectDir, async (snapshotPath, diff) => {
+        const task = buildJudgeTask(goal, snapshotPath, diff)
         return runJudge(deps, task, signal, snapshotPath)
       })
 

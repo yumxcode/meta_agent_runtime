@@ -1,4 +1,7 @@
 import { describe, it, expect } from 'vitest'
+import { mkdtempSync, mkdirSync, writeFileSync } from 'fs'
+import { tmpdir } from 'os'
+import { join } from 'path'
 import { createPermissionPolicy } from '../permissions/PermissionPolicy.js'
 import { detectSensitiveShellCommand } from '../permissions/SensitiveCommandPatterns.js'
 import type { KernelTool, KernelToolContext } from '../types/KernelTool.js'
@@ -163,6 +166,60 @@ describe('createPermissionPolicy', () => {
       })
       const result = await canUseTool(bashTool(), { command: 'cat ../sibling/notes.txt' }, 'a', 't', context())
       expect(result.behavior).toBe('allow')
+    })
+  })
+
+  // ── Hermeticity: ignoreUserConfig opt-out (#5) ─────────────────────────────
+  // On-disk permission configs (global ~/.meta-agent + project <ws>/.meta-agent)
+  // can override a tool's sensitivity. ignoreUserConfig skips them so tests/CI
+  // are deterministic regardless of the developer's local config. We drive this
+  // through the project-config path (a temp workspace we fully control), which
+  // shares the exact load+skip code path as the global config.
+  describe('ignoreUserConfig hermeticity opt-out', () => {
+    function tempWorkspaceWithConfig(toolConfig: Record<string, unknown>): string {
+      const ws = mkdtempSync(join(tmpdir(), 'perm-hermetic-'))
+      mkdirSync(join(ws, '.meta-agent'), { recursive: true })
+      writeFileSync(
+        join(ws, '.meta-agent', 'permissions.json'),
+        JSON.stringify({ tools: { write_file: toolConfig } }),
+        'utf-8',
+      )
+      return ws
+    }
+
+    function ctxIn(ws: string): KernelToolContext {
+      return { ...context(), workspaceRoot: ws }
+    }
+
+    // A permission-less write tool → falls back to DEFAULT write_file (sensitive:false).
+    const plainWrite = (): KernelTool => ({ ...writeTool(), permission: undefined })
+
+    it('reads project config by default (config flips write_file to sensitive → deny)', async () => {
+      const ws = tempWorkspaceWithConfig({ sensitive: true })
+      const canUseTool = createPermissionPolicy({ workspaceRoot: ws })
+      const result = await canUseTool(plainWrite(), { file_path: join(ws, 'x.txt') }, 'a', 't', ctxIn(ws))
+      expect(result.behavior).toBe('deny')
+    })
+
+    it('ignoreUserConfig skips the on-disk config (default sensitive:false → allow)', async () => {
+      const ws = tempWorkspaceWithConfig({ sensitive: true })
+      const canUseTool = createPermissionPolicy({ workspaceRoot: ws, ignoreUserConfig: true })
+      const result = await canUseTool(plainWrite(), { file_path: join(ws, 'x.txt') }, 'a', 't', ctxIn(ws))
+      expect(result.behavior).toBe('allow')
+    })
+
+    it('META_AGENT_IGNORE_USER_PERMISSIONS env var also forces hermetic mode', async () => {
+      const ws = tempWorkspaceWithConfig({ sensitive: true })
+      const prev = process.env['META_AGENT_IGNORE_USER_PERMISSIONS']
+      process.env['META_AGENT_IGNORE_USER_PERMISSIONS'] = '1'
+      try {
+        const canUseTool = createPermissionPolicy({ workspaceRoot: ws })
+        const result = await canUseTool(plainWrite(), { file_path: join(ws, 'x.txt') }, 'a', 't', ctxIn(ws))
+        expect(result.behavior).toBe('allow')
+      } finally {
+        if (prev === undefined) delete process.env['META_AGENT_IGNORE_USER_PERMISSIONS']
+        else process.env['META_AGENT_IGNORE_USER_PERMISSIONS'] = prev
+      }
     })
   })
 })

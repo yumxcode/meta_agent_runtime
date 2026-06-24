@@ -1,6 +1,6 @@
 import { existsSync, readFileSync } from 'fs'
-import { homedir } from 'os'
 import { join, resolve } from 'path'
+import { metaAgentPath } from '../../infra/metaAgentHome.js'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
 import type { AutonomyProfile, ToolPermissionDeclaration } from '../types/Permissions.js'
@@ -27,6 +27,15 @@ export interface PermissionPolicyOptions {
    * mode→profile mapping stays in the routing layer.
    */
   autonomy?: AutonomyProfile
+  /**
+   * Hermeticity escape hatch. When true, the on-disk permission configs
+   * (`~/.meta-agent/permissions.json` and `<workspace>/.meta-agent/permissions.json`)
+   * are NOT read — only `permissionConfig` passed here applies. This keeps tests
+   * and CI deterministic regardless of the developer's global config. Also
+   * forced on by the `META_AGENT_IGNORE_USER_PERMISSIONS` env var so a test
+   * runner can enable it process-wide without threading the flag everywhere.
+   */
+  ignoreUserConfig?: boolean
 }
 
 export interface PermissionConfig {
@@ -99,8 +108,28 @@ function mergePermissionConfig(base: PermissionConfig, override: PermissionConfi
   }
 }
 
-function loadPermissionConfig(workspaceRoot?: string, explicit: PermissionConfig = {}): PermissionConfig {
-  const globalConfig = readPermissionConfig(join(homedir(), '.meta-agent', 'permissions.json'))
+/** True when on-disk permission configs must be ignored (hermetic mode). */
+function shouldIgnoreUserConfig(ignoreUserConfig?: boolean): boolean {
+  if (ignoreUserConfig) return true
+  const env = process.env['META_AGENT_IGNORE_USER_PERMISSIONS']
+  return env === '1' || env === 'true'
+}
+
+function loadPermissionConfig(
+  workspaceRoot?: string,
+  explicit: PermissionConfig = {},
+  ignoreUserConfig?: boolean,
+): PermissionConfig {
+  // Hermetic mode: skip both global and project configs so only the explicit
+  // config decides — deterministic across machines / CI.
+  if (shouldIgnoreUserConfig(ignoreUserConfig)) {
+    return mergePermissionConfig({}, explicit)
+  }
+  // Route through metaAgentPath so the global config honours $META_AGENT_HOME —
+  // identical to ~/.meta-agent for real users, but redirected to an isolated
+  // temp dir under the test runner, so unit tests never inherit the developer's
+  // local permissions.json (the root cause of non-hermetic permission tests).
+  const globalConfig = readPermissionConfig(metaAgentPath('permissions.json'))
   const projectConfig = workspaceRoot
     ? readPermissionConfig(join(workspaceRoot, '.meta-agent', 'permissions.json'))
     : {}
@@ -302,7 +331,11 @@ async function applyBeforeToolGuard(
 
 export function createPermissionPolicy(options: PermissionPolicyOptions = {}): CanUseToolFn {
   const initialWorkspaceRoot = options.workspaceRoot ? resolve(options.workspaceRoot) : undefined
-  const permissionConfig = loadPermissionConfig(initialWorkspaceRoot, options.permissionConfig)
+  const permissionConfig = loadPermissionConfig(
+    initialWorkspaceRoot,
+    options.permissionConfig,
+    options.ignoreUserConfig,
+  )
   const configuredRoot = permissionConfig.workspace?.root
   const workspaceRoot = configuredRoot
     ? resolve(initialWorkspaceRoot ?? process.cwd(), configuredRoot)

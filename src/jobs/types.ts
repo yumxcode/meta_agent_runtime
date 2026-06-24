@@ -137,6 +137,14 @@ export interface JobContext {
   domain: string
   fidelityLevel: number
   abortSignal: AbortSignal
+  /**
+   * Optional per-job wall-clock budget (ms) enforced by the executor's
+   * watchdog. When the handler does not settle within this window the executor
+   * aborts the job's signal AND force-fails it, freeing the concurrency slot
+   * even if the handler ignores the abort. `undefined` → executor default;
+   * `0` → no watchdog for this job.
+   */
+  timeoutMs?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

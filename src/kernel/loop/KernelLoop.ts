@@ -637,6 +637,15 @@ export async function* runKernelLoop(
     }
   }
 
+  // Wrap the whole loop so the auto-runtime watchdog timer is cleared on EVERY
+  // exit path. done() already clears it on normal returns, but a throw (e.g.
+  // exhausted stream-error recovery at the `throw streamError` below, or any
+  // other unexpected throw) bypasses done(). The timer is unref'd so it never
+  // blocks process exit, but in a long-lived host that catches the throw and
+  // continues, the abandoned timer would otherwise linger until it fires (up to
+  // autoMaxRuntimeMs ≈ 2h). clearTimeout is idempotent, so the redundant clear
+  // in done() is harmless.
+  try {
   while (true) {
     if (
       config.autonomousMode &&
@@ -1459,5 +1468,8 @@ export async function* runKernelLoop(
     }
 
     // ── Step 19: continue ────────────────────────────────────────────────────
+  }
+  } finally {
+    if (autoRuntimeTimer) clearTimeout(autoRuntimeTimer)
   }
 }

@@ -276,7 +276,13 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
     async call(input: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolResult> {
       const command = input['command'] as string
       const timeoutMs = resolveTimeoutMs(input['timeout_ms'])
-      const rawCwd = (input['cwd'] as string | undefined) ?? process.cwd()
+      // Default cwd to the session's workspace root, NOT process.cwd(): sub-agents
+      // run inside the PARENT's Node process, so process.cwd() can sit OUTSIDE the
+      // sub-agent's own workspace (e.g. a verify snapshot is a SUBDIR of the launch
+      // cwd). That made every cwd-less bash call fail the workspace-jail check with
+      // "cwd is outside workspace" and silently crippled snapshot-bound judges.
+      // Falling back to workspaceRoot keeps the default cwd inside the jail.
+      const rawCwd = (input['cwd'] as string | undefined) ?? ctx.workspaceRoot ?? process.cwd()
       if (!command) return { content: 'Error: command is required', isError: true }
       const resolvedCwd = resolveInsideWorkspace(rawCwd, ctx.workspaceRoot)
       if (!resolvedCwd.ok) return { content: `Error: cwd is outside workspace: ${rawCwd}`, isError: true }
