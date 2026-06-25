@@ -12,6 +12,7 @@ import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
 import { executeToolCall, type ToolCallRequest, type ToolCallResult } from './ToolExecution.js'
+import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 
 /**
  * Read the concurrency limit lazily on each call so that:
@@ -21,11 +22,7 @@ import { executeToolCall, type ToolCallRequest, type ToolCallResult } from './To
  * Clamped to [1, 64] to match CC's behaviour.
  */
 function getConcurrencyLimit(): number {
-  const raw = process.env['CLAUDE_CODE_MAX_TOOL_USE_CONCURRENCY']
-  if (raw === undefined) return 10
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return 10
-  return Math.min(64, Math.max(1, parsed))
+  return RuntimeEnv.toolUseConcurrency(10)
 }
 
 // ── Batch types ───────────────────────────────────────────────────────────────

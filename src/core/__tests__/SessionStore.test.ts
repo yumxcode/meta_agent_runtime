@@ -81,7 +81,7 @@ describe('SessionStore', () => {
     expect(JSON.stringify(loaded)).not.toContain('old answer')
   })
 
-  it('summarizes older history and keeps the resumed window bounded', async () => {
+  it('loads the FULL history verbatim by default (no resume cap)', async () => {
     const { SessionStore } = await import('../SessionStore.js')
     const messages: ConversationMessage[] = [
       { role: 'user', content: [{ type: 'text', text: 'original long-running task' }] },
@@ -94,13 +94,44 @@ describe('SessionStore', () => {
     await SessionStore.append('session-c', meta(messages.length), messages, 0)
 
     const loaded = await SessionStore.loadHistory('session-c')
-    expect(loaded).toHaveLength(200)
-    expect(JSON.stringify(loaded[0])).toContain('[Local resume summary]')
-    expect(JSON.stringify(loaded[0])).toContain('original long-running task')
+    expect(loaded).toHaveLength(221)                       // every message, verbatim
+    expect(JSON.stringify(loaded)).not.toContain('[Local resume summary]')
+    expect(loaded[0]).toEqual(messages[0])                 // earliest message preserved
     expect(JSON.stringify(loaded)).toContain('recent-ish message 219')
   })
 
-  it('does not resume from an orphan tool_result boundary', async () => {
+  it('caps and summarizes when META_AGENT_MAX_RESUME_MESSAGES is set', async () => {
+    const prev = process.env['META_AGENT_MAX_RESUME_MESSAGES']
+    process.env['META_AGENT_MAX_RESUME_MESSAGES'] = '200'
+    try {
+      const { SessionStore } = await import('../SessionStore.js')
+      const messages: ConversationMessage[] = [
+        { role: 'user', content: [{ type: 'text', text: 'original long-running task' }] },
+        ...Array.from({ length: 220 }, (_, i): ConversationMessage => ({
+          role: i % 2 === 0 ? 'assistant' : 'user',
+          content: [{ type: 'text', text: `recent-ish message ${i}` }],
+        })),
+      ]
+
+      await SessionStore.append('session-c2', meta(messages.length), messages, 0)
+
+      const loaded = await SessionStore.loadHistory('session-c2')
+      expect(loaded).toHaveLength(200)
+      expect(JSON.stringify(loaded[0])).toContain('[Local resume summary]')
+      expect(JSON.stringify(loaded[0])).toContain('original long-running task')
+      expect(JSON.stringify(loaded)).toContain('recent-ish message 219')
+    } finally {
+      if (prev === undefined) delete process.env['META_AGENT_MAX_RESUME_MESSAGES']
+      else process.env['META_AGENT_MAX_RESUME_MESSAGES'] = prev
+    }
+  })
+
+  it('does not resume from an orphan tool_result boundary (when capped)', async () => {
+    // The orphan-boundary trim matters on the SUMMARY path (a capped window can
+    // start mid tool_use/tool_result pair). Exercise it with an explicit cap.
+    const prev = process.env['META_AGENT_MAX_RESUME_MESSAGES']
+    process.env['META_AGENT_MAX_RESUME_MESSAGES'] = '200'
+    try {
     const { SessionStore } = await import('../SessionStore.js')
     const messages: ConversationMessage[] = [
       { role: 'user', content: [{ type: 'text', text: 'initial request' }] },
@@ -128,6 +159,10 @@ describe('SessionStore', () => {
       content: [{ type: 'text', text: 'safe message 0' }],
     })
     expect(JSON.stringify(loaded.slice(1, 3))).not.toContain('tool_result')
+    } finally {
+      if (prev === undefined) delete process.env['META_AGENT_MAX_RESUME_MESSAGES']
+      else process.env['META_AGENT_MAX_RESUME_MESSAGES'] = prev
+    }
   })
 
   it('can persist a session under a caller-provided root directory', async () => {

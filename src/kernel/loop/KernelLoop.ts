@@ -55,6 +55,7 @@ import { parseCacheUsage } from '../utils/parseCacheUsage.js'
 import { getModelProtocol } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
+import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 import type {
   CheckpointBoundaryEvent,
@@ -1145,7 +1146,7 @@ export async function* runKernelLoop(
       if (isMaxOutputTokensStopReason(stopReason)) {
         if (
           state.maxOutputTokensOverride === undefined &&
-          !process.env['CLAUDE_CODE_MAX_OUTPUT_TOKENS']
+          !RuntimeEnv.maxOutputTokensPinned()
         ) {
           // Phase 1: escalate to 64k
           state = { ...state, maxOutputTokensOverride: ESCALATED_MAX_TOKENS }

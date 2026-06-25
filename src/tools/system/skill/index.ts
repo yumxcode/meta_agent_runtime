@@ -11,16 +11,12 @@ import { loadToolPrompt } from '../../util.js'
 //   1. <projectDir>/.meta-agent/skills/         — project-scoped (any mode)
 //   2. ~/.meta-agent/skills/<mode>/             — user global, mode-specific
 //   3. ~/.meta-agent/skills/                    — user global, all modes
-//
-// Legacy directory (.claude/skills/ relative to cwd) is still checked last
-// for backward compatibility but is not advertised.
 
 function skillDirs(cwd: string, mode: AgentMode): string[] {
   const projectLocal = join(resolve(cwd), '.meta-agent', 'skills')
   const userMode     = join(homedir(), '.meta-agent', 'skills', mode)
   const userGlobal   = join(homedir(), '.meta-agent', 'skills')
-  const legacy       = join(resolve(cwd), '.claude', 'skills')
-  return [projectLocal, userMode, userGlobal, legacy]
+  return [projectLocal, userMode, userGlobal]
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────

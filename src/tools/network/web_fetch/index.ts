@@ -5,6 +5,7 @@ import { request as httpsRequest } from 'node:https'
 import type { LookupAddress } from 'node:dns'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
+import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
 
 const MAX_CONTENT = 100 * 1024
 
@@ -21,7 +22,7 @@ const DEFAULT_USER_AGENT =
 
 function buildRequestHeaders(): Record<string, string> {
   return {
-    'User-Agent': process.env['META_AGENT_WEB_FETCH_UA'] || DEFAULT_USER_AGENT,
+    'User-Agent': RuntimeEnv.webFetchUserAgent(DEFAULT_USER_AGENT),
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
   }
@@ -104,7 +105,7 @@ const ALLOWED_PROTOCOLS = new Set(['http:', 'https:'])
  * connection and routes it to the real destination.  Without this opt-in the
  * SSRF check refuses the fake IP before the proxy gets a chance to intercept.
  */
-const TRUST_FAKE_IP = process.env['META_AGENT_TRUST_FAKE_IP'] === '1'
+const TRUST_FAKE_IP = RuntimeEnv.trustFakeIp()
 
 /** Returns null if the IP is allowed, otherwise a human-readable rejection. */
 function classifyIp(ip: string): string | null {

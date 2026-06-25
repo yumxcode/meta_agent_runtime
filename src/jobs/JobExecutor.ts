@@ -49,6 +49,7 @@ import type {
   ProgressReporter,
   DimensionalRecord,
 } from './types.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Executor interface (for future swap-in of subprocess / remote backends)
@@ -106,12 +107,10 @@ export class LocalExecutor implements Executor {
    */
   constructor(maxConcurrent = 4, defaultTimeoutMs?: number) {
     this.maxConcurrent = maxConcurrent
-    if (defaultTimeoutMs !== undefined && Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs >= 0) {
-      this.defaultTimeoutMs = defaultTimeoutMs
-    } else {
-      const envT = Number.parseInt(process.env['META_AGENT_JOB_TIMEOUT_MS'] ?? '', 10)
-      this.defaultTimeoutMs = Number.isFinite(envT) && envT >= 0 ? envT : DEFAULT_JOB_TIMEOUT_MS
-    }
+    this.defaultTimeoutMs =
+      defaultTimeoutMs !== undefined && Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs >= 0
+        ? defaultTimeoutMs
+        : RuntimeEnv.jobTimeoutMs(DEFAULT_JOB_TIMEOUT_MS)
   }
 
   submit(

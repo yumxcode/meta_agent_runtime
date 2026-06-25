@@ -19,7 +19,7 @@ import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js
 import type { ThinkingConfig } from '../kernel/index.js'
 import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 import type { AgentMode, OutputStyle } from './dynamicPrompt.js'
-import { loadModelConfigFile } from './modelConfigFile.js'
+import { loadModelConfig } from './config/ConfigService.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
 import type { Capabilities, Protocol } from '../providers/registry.js'
 
@@ -467,9 +467,11 @@ When performing calculations:
 When uncertain, say so clearly and suggest how to verify the result.`
 
 export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
-  // Global config file takes precedence over caller/CLI values, which in turn
-  // take precedence over built-in provider defaults:  file > CLI > default.
-  const file = loadModelConfigFile()
+  // Layered config (global ⊕ project ⊕ session, more-specific wins) takes
+  // precedence over caller/CLI values, which in turn take precedence over
+  // built-in provider defaults:  config-file > CLI > default. The project layer
+  // is read from <projectDir>/.meta-agent/config.json when projectDir is set.
+  const file = loadModelConfig({ projectDir: config.projectDir })
 
   // apiKey / baseURL / model fed into provider detection (file wins).
   const detectInput = {

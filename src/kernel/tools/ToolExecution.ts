@@ -7,6 +7,7 @@ import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
 import { makeToolResultMessage } from '../messages/MessageFactory.js'
+import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 
 const TRUNCATION_NOTICE =
   '\n\n[Content truncated: result exceeded maximum allowed size. ' +
@@ -19,11 +20,7 @@ const DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS = 3
 const timedOutRunningBySession = new Map<string, number>()
 
 function getMaxTimedOutRunningTools(): number {
-  const raw = process.env['META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS']
-  if (raw === undefined) return DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS
-  return Math.max(1, parsed)
+  return RuntimeEnv.maxTimedOutRunningTools(DEFAULT_MAX_TIMED_OUT_RUNNING_TOOLS)
 }
 
 function incrementTimedOutRunning(sessionId: string): void {
@@ -59,11 +56,7 @@ export function clearTimedOutRunningTools(sessionId: string): void {
  * propagates into sub-agent tool calls.
  */
 function getToolTimeoutMs(): number {
-  const raw = process.env['META_AGENT_TOOL_TIMEOUT_MS']
-  if (raw === undefined) return DEFAULT_TOOL_TIMEOUT_MS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return DEFAULT_TOOL_TIMEOUT_MS
-  return Math.max(0, parsed)
+  return RuntimeEnv.toolTimeoutMs(DEFAULT_TOOL_TIMEOUT_MS)
 }
 
 function truncateString(value: string, maxChars: number | undefined): string {

@@ -4,6 +4,7 @@ import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/t
 import { dynamicDescription } from '../../util.js'
 import { resolveInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
+import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
 
 const DEFAULT_MAX_OUT = 100 * 1024
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -15,11 +16,7 @@ const MIN_TIMEOUT_MS = 1_000
  * and immediately see the new value (no module-load-time snapshot).
  */
 function getMaxOut(): number {
-  const raw = process.env['META_AGENT_MAX_TOOL_OUTPUT_CHARS']
-  if (raw === undefined) return DEFAULT_MAX_OUT
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return DEFAULT_MAX_OUT
-  return Math.min(1024 * 1024, Math.max(1024, parsed))
+  return RuntimeEnv.maxToolOutputChars(DEFAULT_MAX_OUT)
 }
 
 /**

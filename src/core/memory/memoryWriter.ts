@@ -264,8 +264,18 @@ async function callMemoryWriterModel(opts: {
   user: string
 }): Promise<string> {
   if (getModelProtocol(opts.model, opts.baseURL) === 'openai') {
+    // Provider-boundary safety: OpenAI-protocol (DeepSeek) path → require a
+    // DeepSeek-compatible key. Never fall back to ANTHROPIC_API_KEY (that would
+    // leak an Anthropic credential to the DeepSeek baseURL and can't authenticate).
+    const apiKey = opts.apiKey ?? process.env['DEEPSEEK_API_KEY']
+    if (!apiKey) {
+      throw new Error(
+        'Memory writer via the OpenAI/DeepSeek protocol requires a DeepSeek-compatible API key ' +
+        '(set DEEPSEEK_API_KEY or pass apiKey).',
+      )
+    }
     const client = new OpenAI({
-      apiKey: opts.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
+      apiKey,
       baseURL: opts.baseURL ?? 'https://api.deepseek.com',
       maxRetries: 1,
       timeout: 30_000,

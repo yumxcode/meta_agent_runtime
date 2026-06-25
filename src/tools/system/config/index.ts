@@ -1,73 +1,29 @@
-import { mkdir, readFile, writeFile } from 'fs/promises'
-import { dirname, join, resolve } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
-
-const SETTINGS_FILE = join('.claude', 'settings.json')
-
-// ─────────────────────────────────────────────────────────────────────────────
-// Helpers
-// ─────────────────────────────────────────────────────────────────────────────
-
-function settingsPath(cwd?: string): string {
-  return join(resolve(cwd ?? process.cwd()), SETTINGS_FILE)
-}
-
-async function readSettings(path: string): Promise<Record<string, unknown>> {
-  try {
-    return JSON.parse(await readFile(path, 'utf-8')) as Record<string, unknown>
-  } catch {
-    return {}
-  }
-}
-
-async function writeSettings(path: string, data: Record<string, unknown>): Promise<void> {
-  await mkdir(dirname(path), { recursive: true })
-  await writeFile(path, JSON.stringify(data, null, 2) + '\n', 'utf-8')
-}
-
-/** Resolve a dot-notation key path to nested object access. */
-function getNestedValue(obj: Record<string, unknown>, key: string): unknown {
-  const parts = key.split('.')
-  let cur: unknown = obj
-  for (const p of parts) {
-    if (cur === null || typeof cur !== 'object') return undefined
-    cur = (cur as Record<string, unknown>)[p]
-  }
-  return cur
-}
-
-function setNestedValue(obj: Record<string, unknown>, key: string, value: unknown): void {
-  const parts = key.split('.')
-  let cur: Record<string, unknown> = obj
-  for (let i = 0; i < parts.length - 1; i++) {
-    const p = parts[i]!
-    if (typeof cur[p] !== 'object' || cur[p] === null) cur[p] = {}
-    cur = cur[p] as Record<string, unknown>
-  }
-  cur[parts[parts.length - 1]!] = value
-}
-
-function deleteNestedValue(obj: Record<string, unknown>, key: string): boolean {
-  const parts = key.split('.')
-  let cur: Record<string, unknown> = obj
-  for (let i = 0; i < parts.length - 1; i++) {
-    const p = parts[i]!
-    if (typeof cur[p] !== 'object' || cur[p] === null) return false
-    cur = cur[p] as Record<string, unknown>
-  }
-  const last = parts[parts.length - 1]!
-  if (!(last in cur)) return false
-  delete cur[last]
-  return true
-}
+import {
+  getValue,
+  setValue,
+  deleteValue,
+  listValues,
+  type ConfigScope,
+} from '../../../core/config/ConfigService.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool
 // ─────────────────────────────────────────────────────────────────────────────
 
+const VALID_SCOPES: ConfigScope[] = ['global', 'project', 'session']
+
+function parseScope(input: unknown): ConfigScope | undefined {
+  if (input === undefined) return undefined
+  const s = String(input).trim().toLowerCase()
+  return (VALID_SCOPES as string[]).includes(s) ? (s as ConfigScope) : undefined
+}
+
 export async function createConfigTool(cwd?: string): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
+  const projectDir = cwd ?? process.cwd()
+
   return {
     name: 'config',
     description,
@@ -82,10 +38,16 @@ export async function createConfigTool(cwd?: string): Promise<MetaAgentTool> {
         },
         key: {
           type: 'string',
-          description: 'Settings key (dot-notation). Required for get / set / delete.',
+          description: 'Config key (dot-notation, e.g. LLM.mainModel). Required for get / set / delete.',
         },
         value: {
           description: 'Value to set (any JSON-serialisable type). Required for action="set".',
+        },
+        scope: {
+          type: 'string',
+          enum: ['global', 'project', 'session'],
+          description:
+            'Layer to operate on. set/delete default to "project". For get/list, omit to see the merged effective value across all layers.',
         },
       },
       required: ['action'],
@@ -94,48 +56,55 @@ export async function createConfigTool(cwd?: string): Promise<MetaAgentTool> {
       const action = String(input['action'] ?? '').trim()
       const key = input['key'] ? String(input['key']).trim() : undefined
       const value = input['value']
-      const path = settingsPath(cwd)
+
+      if (input['scope'] !== undefined && parseScope(input['scope']) === undefined) {
+        return { content: `Error: unknown scope "${String(input['scope'])}". Use global / project / session.`, isError: true }
+      }
+      const scope = parseScope(input['scope'])
 
       try {
         if (action === 'list') {
-          const settings = await readSettings(path)
+          const obj = listValues({ projectDir, scope })
+          const label = scope ? `${scope} layer` : 'merged (effective)'
           return {
-            content: Object.keys(settings).length === 0
-              ? `Settings file is empty or does not exist (${path})`
-              : JSON.stringify(settings, null, 2),
+            content: Object.keys(obj).length === 0
+              ? `Config is empty (${label}).`
+              : `# ${label}\n${JSON.stringify(obj, null, 2)}`,
             isError: false,
           }
         }
 
         if (action === 'get') {
           if (!key) return { content: 'Error: key is required for action="get"', isError: true }
-          const settings = await readSettings(path)
-          const val = getNestedValue(settings, key)
-          if (val === undefined) {
-            return { content: `Key "${key}" not found in settings.`, isError: false }
-          }
+          const val = getValue(key, { projectDir, scope })
+          if (val === undefined) return { content: `Key "${key}" not found${scope ? ` in ${scope} layer` : ''}.`, isError: false }
           return { content: JSON.stringify(val, null, 2), isError: false }
         }
 
         if (action === 'set') {
           if (!key) return { content: 'Error: key is required for action="set"', isError: true }
           if (value === undefined) return { content: 'Error: value is required for action="set"', isError: true }
-          const settings = await readSettings(path)
-          setNestedValue(settings, key, value)
-          await writeSettings(path, settings)
+          const effectiveScope = scope ?? 'project'
+          setValue(key, value, { projectDir, scope: effectiveScope })
+          const note = key.startsWith('LLM.') || key.startsWith('web_search.')
+            ? ' (model/provider keys take effect on the NEXT session — the current one is already resolved)'
+            : ''
           return {
-            content: `Set "${key}" = ${JSON.stringify(value)} in ${path}`,
+            content: `Set "${key}" = ${JSON.stringify(value)} in the ${effectiveScope} layer.${note}`,
             isError: false,
           }
         }
 
         if (action === 'delete') {
           if (!key) return { content: 'Error: key is required for action="delete"', isError: true }
-          const settings = await readSettings(path)
-          const found = deleteNestedValue(settings, key)
-          if (!found) return { content: `Key "${key}" not found; nothing deleted.`, isError: false }
-          await writeSettings(path, settings)
-          return { content: `Deleted "${key}" from ${path}`, isError: false }
+          const effectiveScope = scope ?? 'project'
+          const found = deleteValue(key, { projectDir, scope: effectiveScope })
+          return {
+            content: found
+              ? `Deleted "${key}" from the ${effectiveScope} layer.`
+              : `Key "${key}" not found in the ${effectiveScope} layer; nothing deleted.`,
+            isError: false,
+          }
         }
 
         return { content: `Error: unknown action "${action}". Use get / set / list / delete.`, isError: true }

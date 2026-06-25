@@ -48,19 +48,12 @@ import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { ModeDetector } from './ModeDetector.js'
 import { readAutoCheckpoint, writeAutoCheckpoint, buildAutoResumePreamble, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
-import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
-import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
-import { createAutoExperienceStore, renderRecentExperiences, createAutoExperienceWriteTool } from '../core/auto/learn/AutoExperienceStore.js'
-import { getTodosForSession, deleteTodosForSession } from '../tools/ui/todo_write/index.js'
-import { getProgressNoteForSession, deleteProgressNoteForSession } from '../tools/ui/progress_note/index.js'
-import { getArtifactsForSession, deleteArtifactsForSession } from '../tools/ui/artifacts_register/index.js'
-import { AutoWorktreeCoordinator } from '../core/auto/AutoWorktreeCoordinator.js'
+import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
+import { deleteProgressNoteForSession } from '../tools/ui/progress_note/index.js'
+import { deleteArtifactsForSession } from '../tools/ui/artifacts_register/index.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { makeAutoWorktreeTools } from '../subagent/tools/auto_worktree.js'
-import { makeSubAgentTools } from '../subagent/tools/index.js'
-import { createRunAgentTool } from '../tools/agent/run_agent/index.js'
-import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
-import { clearWebFetchCache, createWebFetchTool } from '../tools/network/web_fetch/index.js'
+import { createAgenticBackend } from './AgenticBackendFactory.js'
+import { clearWebFetchCache } from '../tools/network/web_fetch/index.js'
 import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js'
 import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
@@ -125,8 +118,9 @@ export class SessionRouter {
   private readonly _onEscalationRequest: ((reason: string) => Promise<boolean>) | undefined
   /**
    * Lightweight Anthropic client used exclusively for one-shot mode detection.
-   * Separate from the backend session client: short timeout (3 s), 1 retry,
-   * always uses the configured apiKey/baseURL. Null if no apiKey is available.
+   * Separate from the backend session client: 30 s timeout, 1 retry, always
+   * uses the configured apiKey/baseURL. Null if no apiKey is available (or the
+   * provider isn't Anthropic-protocol — see the construction site below).
    */
   private readonly _detectionClient: Anthropic | null
 
@@ -702,142 +696,25 @@ export class SessionRouter {
   }
 
   /**
-   * Build the agentic backend: a MetaAgentSession plus the research sub-agent
-   * wiring. Shared by the AGENTIC and AUTO cases so the ~15-line wiring block is
-   * never duplicated — AUTO differs only via the `autonomy`/`agentMode` overrides.
-   *
-   *   research_dispatch runs literature/web research in an ISOLATED sub-agent
-   *   context, persists the report under <projectDir>/.meta-agent/research/, and
-   *   hands the main agent only a conclusion + report path. The bridge's tool
-   *   registry is the session's LIVE map, so tools registered later (CLI standard
-   *   tools) are resolvable by sub-agents.
+   * Build the agentic backend by delegating to {@link createAgenticBackend}.
+   * The Router only supplies its config/lifecycle inputs and stores the auto
+   * artifacts (bridge + checkpoint coordinator) it needs for later submit-time
+   * checkpointing and teardown — all the actual wiring lives in the factory.
    */
   private async _createAgenticBackend(
     overrides?: { autonomy?: AutonomyProfile; promptMode?: import('../core/dynamicPrompt.js').AgentMode },
   ): Promise<SessionImpl> {
     const projectDir = this._cfg.projectDir ?? process.cwd()
-    const resumeCheckpoint = overrides?.autonomy && this._explicitResume
-      ? readAutoCheckpoint(projectDir)
-      : null
-    // Auto mode: build the completion gate (Verify) BEFORE the session so it can
-    // be passed into the kernel config. Its dispatcher + goal are read LAZILY at
-    // gate-invocation time (deep in a later turn), so closing over this._autoBridge
-    // (assigned below) and this._autoGoal (set on first submit) is safe.
-    // A lazy dispatcher facade: the bridge is created AFTER the session, so both
-    // gates read this._autoBridge at invocation time (deep in a later turn).
-    const lazyDispatcher = {
-      spawnSubAgent: (o: Parameters<SubAgentBridge['spawnSubAgent']>[0]) => this._autoBridge!.spawnSubAgent(o),
-      getStatus: (id: Parameters<SubAgentBridge['getStatus']>[0]) => this._autoBridge!.getStatus(id),
-      cancelTask: (id: Parameters<SubAgentBridge['cancelTask']>[0], r?: string) => this._autoBridge!.cancelTask(id, r),
-    }
-    const verifyGate = overrides?.autonomy
-      ? makeAutoVerifyGate({ dispatcher: lazyDispatcher, projectDir, getGoal: () => this._autoGoal })
-      : undefined
-    // Auto mode Learn: one experience store powers both recall (main prompt) and
-    // the drift agent's writes. Drift gate judges goal+checkpoint and may persist
-    // lessons; recall surfaces them back into the main agent's prompt each turn.
-    const autoExperienceStore = overrides?.autonomy ? createAutoExperienceStore(projectDir) : null
-    const driftGate = overrides?.autonomy
-      ? makeAutoDriftGate({ dispatcher: lazyDispatcher, projectDir, getGoal: () => this._autoGoal })
-      : undefined
-    const getExperienceRecallBlock = autoExperienceStore
-      ? () => renderRecentExperiences(autoExperienceStore)
-      : undefined
-
-    const checkpointCoordinator = overrides?.autonomy
-      ? new AutoCheckpointCoordinator({
-          projectDir,
-          initialRevision: resumeCheckpoint?.revision ?? 0,
-          initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
-          getSnapshot: sessionId => {
-            const allTodos = getTodosForSession(sessionId)
-            return {
-              goal: this._autoGoal ?? undefined,
-              completedSteps: allTodos
-                .filter(todo => todo.status === 'completed')
-                .map(todo => todo.content),
-              pendingTodos: allTodos
-                .filter(todo => todo.status !== 'completed')
-                .map(todo => todo.content),
-              note: getProgressNoteForSession(sessionId),
-              artifacts: getArtifactsForSession(sessionId) ?? [],
-              activeSubAgentIds: [...new Set([
-                ...(this._autoBridge?.getSchedulerStats().activeTaskIds ?? []),
-                ...(this._autoBridge?.getWorktreeCoordinator()?.activeTasks() ?? []),
-              ])],
-            }
-          },
-        })
-      : null
-    this._autoCheckpointCoordinator = checkpointCoordinator
-
-    const session = new MetaAgentSession({
-      ...this._cfgAsConfig(),
-      sessionId: this._resumeSessionId,
-      promptMode: overrides?.promptMode,
-      autonomy: overrides?.autonomy,
-      verifyGate,
-      driftGate,
-      getExperienceRecallBlock,
-      onCheckpointBoundary: checkpointCoordinator
-        ? event => checkpointCoordinator.flush(event)
-        : undefined,
-      initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
-      initialCheckpointRevision: resumeCheckpoint?.revision ?? 0,
-    })
-    // Auto mode: conservative scheduler defaults (lower concurrency + a non-null
-    // total budget) as unattended safety/cost guards (env still overrides).
-    const bridge = new SubAgentBridge(session.getSessionId(),
-      overrides?.autonomy ? { conservativeAutoDefaults: true } : undefined)
-    bridge.setToolRegistry(session.getToolRegistry())
-    // Auto mode only: extend the workspace jail to every spawned sub-agent
-    // (sandbox fail-closed + autonomy passthrough + projectDir bound to the jail
-    // root) and arm failed-sub-agent retry. The jail is auto-specific safety;
-    // worktree isolation below is shared with agentic.
-    if (overrides?.autonomy) {
-      this._autoBridge = bridge
-      bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides.autonomy })
-    }
-    // Git-worktree isolation for isolated_write sub-agents — armed for BOTH
-    // agentic and auto so concurrent WRITE tasks each run on their own branch
-    // (no shared-tree races). When there is no git workspace it stays disabled
-    // and spawn_sub_agent(workspace_mode="isolated_write") fails closed with a
-    // clear error rather than silently sharing the tree.
-    const worktrees = new AutoWorktreeCoordinator(projectDir)
-    if (worktrees.enabled) {
-      // Restore durable task→branch mappings and roll back any interrupted
-      // merge transaction before new sub-agents can start.
-      await worktrees.reconcile()
-      bridge.setWorktreeCoordinator(worktrees)
-      for (const tool of makeAutoWorktreeTools(bridge)) session.registerTool(tool)
-    }
-    // Sub-agents read full texts in their discarded-after-run context —
-    // override the main agent's budgeted web_fetch with the full variant. In
-    // auto mode also expose experience_write to SUB-AGENTS ONLY (the drift agent
-    // uses it; the main agent must not write experiences directly).
-    bridge.setSubAgentToolOverrides([
-      await createWebFetchTool(),
-      ...(autoExperienceStore
-        ? [createAutoExperienceWriteTool(autoExperienceStore, session.getSessionId())]
-        : []),
-    ])
-    session.registerTool(createResearchDispatchTool({
-      dispatcher: bridge,
+    const { session, bridge, checkpointCoordinator } = await createAgenticBackend({
+      baseConfig: this._cfgAsConfig(),
       projectDir,
-      sessionId: session.getSessionId(),
-    }))
-    // Delegation tool surface (agentic + auto):
-    //   - run_agent           — SYNCHRONOUS: blocks until the sub-agent finishes.
-    //                           Use when the next step depends on the result.
-    //   - spawn_sub_agent     — ASYNCHRONOUS: returns a task_id immediately; fan
-    //                           out several in one turn to run them in parallel.
-    //   - get_sub_agent_status / _intermediate / cancel / list — async controls.
-    // makeSubAgentTools already includes get_sub_agent_status, so we no longer
-    // register it separately.
-    session.registerTool(await createRunAgentTool(bridge))
-    for (const tool of makeSubAgentTools(bridge)) session.registerTool(tool)
-    // D11: completion/failure notifications flow into the volatile prefix.
-    session.setSubAgentBridge(bridge)
+      resumeSessionId: this._resumeSessionId,
+      explicitResume: this._explicitResume,
+      overrides,
+      getGoal: () => this._autoGoal,
+    })
+    this._autoCheckpointCoordinator = checkpointCoordinator
+    if (overrides?.autonomy) this._autoBridge = bridge
     return session
   }
 

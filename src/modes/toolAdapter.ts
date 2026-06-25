@@ -13,6 +13,7 @@ import type {
   ZodCompatSchema,
   ToolInputJSONSchema,
 } from '../kernel/index.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 const COOPERATIVE_ABORT_TOOLS = new Set([
   'bash',
@@ -80,11 +81,7 @@ const DEFAULT_MAX_RESULT_SIZE_CHARS = 200 * 1024
  * module-load time, so tests can override the env var after importing this module.
  */
 function getMaxResultSizeChars(): number {
-  const raw = process.env['META_AGENT_MAX_TOOL_RESULT_CHARS']
-  if (raw === undefined) return DEFAULT_MAX_RESULT_SIZE_CHARS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return DEFAULT_MAX_RESULT_SIZE_CHARS
-  return Math.min(1024 * 1024, Math.max(1024, parsed))
+  return RuntimeEnv.maxToolResultChars(DEFAULT_MAX_RESULT_SIZE_CHARS)
 }
 
 // ── JSON Schema → Zod-compatible safeParse ────────────────────────────────────

@@ -1,6 +1,7 @@
 import { existsSync, readFileSync } from 'fs'
 import { join, resolve } from 'path'
 import { metaAgentPath } from '../../infra/metaAgentHome.js'
+import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
 import type { AutonomyProfile, ToolPermissionDeclaration } from '../types/Permissions.js'
@@ -110,9 +111,7 @@ function mergePermissionConfig(base: PermissionConfig, override: PermissionConfi
 
 /** True when on-disk permission configs must be ignored (hermetic mode). */
 function shouldIgnoreUserConfig(ignoreUserConfig?: boolean): boolean {
-  if (ignoreUserConfig) return true
-  const env = process.env['META_AGENT_IGNORE_USER_PERMISSIONS']
-  return env === '1' || env === 'true'
+  return ignoreUserConfig === true || RuntimeEnv.ignoreUserPermissions()
 }
 
 function loadPermissionConfig(

@@ -215,7 +215,7 @@ boundary 之前字节稳定以命中前缀 KV 缓存。
 `KernelLoop` 每轮调 `autoCompactIfNeeded`，按 token 估算判断：
 
 - 阈值 = **有效上下文窗口的 65%**（`AUTOCOMPACT_THRESHOLD_PCT = 0.65`，
-  可用 `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` 覆盖）；
+  可用 `META_AGENT_AUTOCOMPACT_PCT_OVERRIDE` 覆盖）；
 - 有效窗口 = 模型上下文窗口 − min(maxOutputTokens, 20k)；
 - 主模型与 compact 模型两个阈值取**或**；
 - 断路器：连续失败达 `MAX_CONSECUTIVE_AUTOCOMPACT_FAILURES = 3` 后**停掉**自动压缩；

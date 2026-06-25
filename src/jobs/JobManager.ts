@@ -42,6 +42,7 @@ import { makeJobId, TERMINAL_STATUSES } from './types.js'
 import { JobStore } from './JobStore.js'
 import { LocalExecutor } from './JobExecutor.js'
 import type { Executor, ExecutorCallbacks } from './JobExecutor.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Submit options
@@ -97,10 +98,7 @@ export class JobManager {
     this.sessionId = sessionId
     this.store = new JobStore(sessionId)
     this.executor = executor ?? new LocalExecutor()
-    const envCap = Number.parseInt(process.env['META_AGENT_KEEP_TERMINAL_JOBS'] ?? '', 10)
-    this._terminalJobCap = Number.isFinite(envCap) && envCap >= 0
-      ? envCap
-      : JobManager.DEFAULT_TERMINAL_JOB_CAP
+    this._terminalJobCap = RuntimeEnv.keepTerminalJobs(JobManager.DEFAULT_TERMINAL_JOB_CAP)
   }
 
   /**

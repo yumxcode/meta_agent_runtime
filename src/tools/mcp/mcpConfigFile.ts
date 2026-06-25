@@ -35,7 +35,7 @@ import { readFileSync } from 'fs'
 import { spawn } from 'child_process'
 import { join } from 'path'
 import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
-import { loadModelConfigFile } from '../../core/modelConfigFile.js'
+import { loadModelConfig } from '../../core/config/ConfigService.js'
 import { HttpMcpClient } from './HttpMcpClient.js'
 import { registerMcpClient, mcpClients } from './registry.js'
 import type { McpClient } from './registry.js'
@@ -90,7 +90,7 @@ function resolveVar(varName: string): string {
   if (envVal) return envVal
   // Fall back to config.json apiKey for known GLM aliases
   if (GLM_KEY_ALIASES.has(varName)) {
-    return loadModelConfigFile().apiKey ?? ''
+    return loadModelConfig().apiKey ?? ''
   }
   return ''
 }

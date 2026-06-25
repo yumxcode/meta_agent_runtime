@@ -21,7 +21,7 @@ import type { KernelMessage } from '../types/KernelMessage.js'
 
 describe('getContextWindowSize', () => {
   afterEach(() => {
-    delete process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW']
+    delete process.env['META_AGENT_AUTO_COMPACT_WINDOW']
   })
 
   it('returns 200_000 for known claude models', () => {
@@ -42,17 +42,17 @@ describe('getContextWindowSize', () => {
   })
 
   it('uses env override when set to valid number', () => {
-    process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'] = '50000'
+    process.env['META_AGENT_AUTO_COMPACT_WINDOW'] = '50000'
     expect(getContextWindowSize('claude-sonnet-4-6')).toBe(50_000)
   })
 
   it('ignores invalid env override and falls back to table', () => {
-    process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'] = 'not-a-number'
+    process.env['META_AGENT_AUTO_COMPACT_WINDOW'] = 'not-a-number'
     expect(getContextWindowSize('claude-sonnet-4-6')).toBe(200_000)
   })
 
   it('ignores zero/negative env override', () => {
-    process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW'] = '0'
+    process.env['META_AGENT_AUTO_COMPACT_WINDOW'] = '0'
     expect(getContextWindowSize('claude-sonnet-4-6')).toBe(200_000)
   })
 })
@@ -92,12 +92,12 @@ describe('tokenCountWithEstimation', () => {
 
 describe('calculateTokenWarningState', () => {
   beforeEach(() => {
-    delete process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE']
-    delete process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW']
+    delete process.env['META_AGENT_AUTOCOMPACT_PCT_OVERRIDE']
+    delete process.env['META_AGENT_AUTO_COMPACT_WINDOW']
   })
   afterEach(() => {
-    delete process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE']
-    delete process.env['CLAUDE_CODE_AUTO_COMPACT_WINDOW']
+    delete process.env['META_AGENT_AUTOCOMPACT_PCT_OVERRIDE']
+    delete process.env['META_AGENT_AUTO_COMPACT_WINDOW']
   })
 
   const MODEL = 'claude-sonnet-4-6'
@@ -140,20 +140,20 @@ describe('calculateTokenWarningState', () => {
     expect(isAtBlockingLimit).toBe(true)
   })
 
-  it('respects CLAUDE_AUTOCOMPACT_PCT_OVERRIDE', () => {
-    process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = '0.5'
+  it('respects META_AGENT_AUTOCOMPACT_PCT_OVERRIDE', () => {
+    process.env['META_AGENT_AUTOCOMPACT_PCT_OVERRIDE'] = '0.5'
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
     expect(state.autoCompactThreshold).toBe(Math.floor(EFFECTIVE * 0.5))
   })
 
-  it('ignores invalid CLAUDE_AUTOCOMPACT_PCT_OVERRIDE and uses default', () => {
-    process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = 'bad'
+  it('ignores invalid META_AGENT_AUTOCOMPACT_PCT_OVERRIDE and uses default', () => {
+    process.env['META_AGENT_AUTOCOMPACT_PCT_OVERRIDE'] = 'bad'
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
     expect(state.autoCompactThreshold).toBe(THRESHOLD)
   })
 
-  it('ignores out-of-range CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (>1)', () => {
-    process.env['CLAUDE_AUTOCOMPACT_PCT_OVERRIDE'] = '1.5'
+  it('ignores out-of-range META_AGENT_AUTOCOMPACT_PCT_OVERRIDE (>1)', () => {
+    process.env['META_AGENT_AUTOCOMPACT_PCT_OVERRIDE'] = '1.5'
     const state = calculateTokenWarningState(0, MODEL, MAX_OUT)
     expect(state.autoCompactThreshold).toBe(THRESHOLD)
   })

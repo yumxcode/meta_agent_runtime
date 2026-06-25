@@ -28,6 +28,7 @@ import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../core/persist/index.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 import type {
   CampaignContextCapsule,
   CampaignPhase,
@@ -98,10 +99,7 @@ export class CampaignStateStore {
     string,
     { offset: number; results: EvaluationResult[] }
   >()
-  private static readonly _EVAL_CACHE_MAX = (() => {
-    const raw = Number.parseInt(process.env['META_AGENT_CAMPAIGN_EVAL_CACHE'] ?? '', 10)
-    return Number.isFinite(raw) && raw > 0 ? raw : 32
-  })()
+  private static readonly _EVAL_CACHE_MAX = RuntimeEnv.campaignEvalCacheCap() ?? 32
 
   /**
    * S5: read with LRU touch — caller passes the cached entry to indicate it was

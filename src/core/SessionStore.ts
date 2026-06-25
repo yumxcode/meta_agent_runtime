@@ -20,13 +20,17 @@ import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import { homedir } from 'node:os'
 import type { ConversationMessage } from './types.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SESSIONS_ROOT = join(homedir(), '.meta-agent', 'sessions')
 const MAX_INDEX_ENTRIES = 50   // keep last 50 sessions in the index
-const MAX_RESUME_BYTES = 5 * 1024 * 1024
-const MAX_RESUME_MESSAGES = 200
+// Default 64 MiB read guard. Full history is loaded on resume by default (no
+// message-count cap); runtime auto-compaction shrinks it if it overflows the
+// model window. Override the message cap with META_AGENT_MAX_RESUME_MESSAGES
+// and this byte guard with META_AGENT_MAX_RESUME_BYTES.
+const DEFAULT_MAX_RESUME_BYTES = 64 * 1024 * 1024
 const RESUME_SUMMARY_RECENT_USER_LIMIT = 8
 const RESUME_SUMMARY_RECENT_ASSISTANT_LIMIT = 6
 const RESUME_SUMMARY_TEXT_LIMIT = 1_000
@@ -233,11 +237,15 @@ function trimToSafeResumeBoundary(messages: readonly ConversationMessage[]): Con
 }
 
 function buildResumedHistory(parsed: readonly ConversationMessage[]): ConversationMessage[] {
-  if (parsed.length <= MAX_RESUME_MESSAGES) {
+  // Default: unlimited → replay the FULL history verbatim. Only when an explicit
+  // META_AGENT_MAX_RESUME_MESSAGES cap is set (and exceeded) do we fold older
+  // history into a single local summary.
+  const cap = RuntimeEnv.resumeMaxMessages()
+  if (parsed.length <= cap) {
     return trimToSafeResumeBoundary(parsed)
   }
 
-  const recentLimit = MAX_RESUME_MESSAGES - 1
+  const recentLimit = cap - 1
   const recentRaw = parsed.slice(-recentLimit)
   const recent = trimToSafeResumeBoundary(recentRaw)
   const omitted = parsed.slice(0, parsed.length - recentRaw.length + (recentRaw.length - recent.length))
@@ -329,12 +337,13 @@ export class SessionStore {
     try {
       const path = historyPath(sessionId, options)
       const info = await stat(path)
+      const maxBytes = RuntimeEnv.resumeMaxBytes(DEFAULT_MAX_RESUME_BYTES)
       let raw: string
-      if (info.size > MAX_RESUME_BYTES) {
+      if (info.size > maxBytes) {
         const fh = await open(path, 'r')
         try {
-          const buffer = Buffer.alloc(MAX_RESUME_BYTES)
-          await fh.read(buffer, 0, MAX_RESUME_BYTES, info.size - MAX_RESUME_BYTES)
+          const buffer = Buffer.alloc(maxBytes)
+          await fh.read(buffer, 0, maxBytes, info.size - maxBytes)
           raw = buffer.toString('utf-8')
           const firstNewline = raw.indexOf('\n')
           if (firstNewline >= 0) raw = raw.slice(firstNewline + 1)

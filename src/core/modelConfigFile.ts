@@ -24,9 +24,8 @@
  * grouped values win when both are present. Internally everything is
  * flattened into the same ModelConfigFile shape, so consumers are unchanged.
  *
- * Location (global only, first existing file wins):
- *   1. ~/.meta-agent/config.json          (primary — matches memory/subtasks dir)
- *   2. ~/.claude/meta-agent/config.json   (legacy fallback — pre-migration data)
+ * Location (global only): `$META_AGENT_HOME/config.json` (defaults to
+ * ~/.meta-agent/config.json — the same root as memory/subtasks).
  *
  * Precedence applied by resolveConfig(): config file > CLI flags > built-in
  * provider defaults.  All fields are optional; an absent / malformed file is
@@ -34,7 +33,6 @@
  */
 
 import { readFileSync } from 'fs'
-import { homedir } from 'os'
 import { META_AGENT_HOME } from './metaAgentHome.js'
 import { join } from 'path'
 
@@ -64,11 +62,7 @@ let _pathsOverride: string[] | null = null
 /** Candidate paths, highest priority first. */
 export function modelConfigCandidatePaths(): string[] {
   if (_pathsOverride !== null) return _pathsOverride
-  const home = homedir()
-  return [
-    join(META_AGENT_HOME, 'config.json'),
-    join(home, '.claude', 'meta-agent', 'config.json'),
-  ]
+  return [join(META_AGENT_HOME, 'config.json')]
 }
 
 /** Test hook — override candidate paths. Pass null to restore the defaults. */
@@ -94,9 +88,14 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  *   - legacy flat:         all fields at the top level
  * Grouped values take precedence over flat ones when both exist.
  */
-function sanitize(raw: unknown, sourcePath: string): ModelConfigFile {
+/**
+ * Normalize an arbitrary parsed config object into a validated ModelConfigFile.
+ * Pure — used by both the global loader here and by ConfigService for the
+ * project / session layers, so all three layers parse identically.
+ */
+export function normalizeModelConfig(raw: unknown, sourceLabel = 'config.json'): ModelConfigFile {
   if (!isRecord(raw)) {
-    warnOnce(`meta-agent: ${sourcePath} must contain a JSON object — ignoring.`)
+    warnOnce(`meta-agent: ${sourceLabel} must contain a JSON object — ignoring.`)
     return {}
   }
   const llm = isRecord(raw['LLM']) ? raw['LLM'] : {}
@@ -109,7 +108,7 @@ function sanitize(raw: unknown, sourcePath: string): ModelConfigFile {
     const v = merged[field]
     if (v === undefined || v === null) continue
     if (typeof v !== 'string' || v.trim() === '') {
-      warnOnce(`meta-agent: ${sourcePath} field "${field}" must be a non-empty string — ignoring it.`)
+      warnOnce(`meta-agent: ${sourceLabel} field "${field}" must be a non-empty string — ignoring it.`)
       continue
     }
     out[field] = v.trim()
@@ -140,7 +139,7 @@ export function loadModelConfigFile(): ModelConfigFile {
       continue // file not present at this path — try next
     }
     try {
-      _cache = sanitize(JSON.parse(text), path)
+      _cache = normalizeModelConfig(JSON.parse(text), path)
     } catch {
       warnOnce(`meta-agent: failed to parse ${path} (invalid JSON) — ignoring.`)
       _cache = {}

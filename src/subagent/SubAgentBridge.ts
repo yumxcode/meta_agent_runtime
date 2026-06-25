@@ -19,6 +19,7 @@
  */
 
 import { randomUUID } from 'crypto'
+import { readIntEnvOr, readFloatEnv } from '../infra/env/RuntimeEnv.js'
 import { readTask, writeTask, mutateTask, releaseWriteChain, listTasksForSession, cleanupTerminalTasks } from './SubAgentTaskStore.js'
 import { SubAgentRunner } from './SubAgentRunner.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
@@ -111,11 +112,7 @@ export function shouldRetrySubAgent(attempt: number, limit: number, armed: boole
 }
 
 function envInt(name: string, fallback: number, min: number, max: number): number {
-  const raw = process.env[name]
-  if (raw === undefined) return fallback
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return fallback
-  return Math.min(max, Math.max(min, parsed))
+  return readIntEnvOr(name, fallback, min, max)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -999,11 +996,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   }
 
   private _envBudgetUsd(name: string): number | undefined {
-    const raw = process.env[name]
-    if (raw === undefined || raw.trim() === '') return undefined
-    const parsed = Number.parseFloat(raw)
-    if (!Number.isFinite(parsed) || parsed < 0) return undefined
-    return parsed
+    return readFloatEnv(name, { min: 0 })
   }
 
   private _reserveBudget(taskId: SubAgentTaskId, amountUsd: number): void {

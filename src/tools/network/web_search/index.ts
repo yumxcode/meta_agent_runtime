@@ -2,7 +2,8 @@ import Anthropic from '@anthropic-ai/sdk'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import { mcpClients } from '../../mcp/registry.js'
-import { loadModelConfigFile } from '../../../core/modelConfigFile.js'
+import { loadModelConfig } from '../../../core/config/ConfigService.js'
+import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
 
 export interface WebSearchToolOptions {
   /** Anthropic API key (last-resort provider). */
@@ -177,12 +178,14 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
       const tavilyKey =
         firstNonEmpty(
           options.tavilyApiKey,
-          process.env['TAVILY_API_KEY'],
-          loadModelConfigFile().tavilyApiKey,
+          RuntimeEnv.tavilyApiKey(),
+          loadModelConfig().tavilyApiKey,
         ) ?? ''
+      // ANTHROPIC_API_KEY here is a provider CREDENTIAL (last-resort search
+      // provider), not plain config — left at its source per RuntimeEnv's scope.
       const anthropicKey = options.apiKey ?? process.env['ANTHROPIC_API_KEY'] ?? ''
       const model = options.model ?? DEFAULT_WEB_SEARCH_MODEL
-      const pinned = (process.env['META_AGENT_SEARCH_PROVIDER'] ?? '').trim().toLowerCase()
+      const pinned = RuntimeEnv.searchProviderPin()
 
       // ── Pinned provider: exactly one attempt, no fallback ─────────────────
       if (pinned === 'tavily') {

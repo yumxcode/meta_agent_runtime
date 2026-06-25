@@ -34,6 +34,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { getModelProtocol } from '../providers/registry.js'
+import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
@@ -67,7 +68,7 @@ import type {
 import { isStaleClaim } from '../robotics/team/TeamStore.js'
 import { SessionStore, type SessionMeta } from '../core/SessionStore.js'
 import { detectProvider } from '../core/config.js'
-import { loadModelConfigFile } from '../core/modelConfigFile.js'
+import { loadModelConfig } from '../core/config/ConfigService.js'
 import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveCommandPatterns.js'
 import { executePlan } from './teamPlannerExecutor.js'
 import { resolveTemplate } from './hardwareTemplate.js'
@@ -188,6 +189,7 @@ ${bold('meta-agent')} — Engineering agent runtime CLI  ${dim(`v${VERSION}`)}
 
 ${bold('USAGE')}
   meta-agent [options] [prompt]
+  meta-agent env [--json]        Print env-var config (name, current value, default)
 
 ${bold('MODES')}
   ${cyan('detect')}     Detect mode from prompt context (default)
@@ -275,7 +277,7 @@ ${bold('ENVIRONMENT VARIABLES')}
   Priority: ZHIPU_API_KEY > DEEPSEEK_API_KEY > QWEN_API_KEY > ANTHROPIC_API_KEY
 
 ${bold('CONFIG FILE')}
-  ${cyan('~/.meta-agent/config.json')}  ${dim('(legacy: ~/.claude/meta-agent/config.json)')}
+  ${cyan('~/.meta-agent/config.json')}
   Pins model selection without env vars or flags. All fields optional:
     {
       "LLM": {
@@ -374,6 +376,13 @@ function parseCliArgs(): CliOptions {
 
   if (parsed.values['help']) { printHelp(); process.exit(0) }
   if (parsed.values['version']) { console.log(`meta-agent v${VERSION}`); process.exit(0) }
+
+  // `meta-agent env` — print the environment-variable config surface (name,
+  // current effective value, default, description) from the single registry.
+  if (parsed.positionals[0] === 'env') {
+    printEnvTable(parsed.values['json'] === true)
+    process.exit(0)
+  }
 
   // --yolo is an alias for --mode auto (autonomous + hard workspace jail).
   const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
@@ -501,7 +510,7 @@ function assertApiKeyConfigured(opts: CliOptions): void {
   // (~/.meta-agent/config.json) may supply apiKey / baseURL / model. Without
   // folding it in here, a valid config-file key would be wrongly rejected at the
   // startup gate even though the session would later resolve it fine.
-  const file = loadModelConfigFile()
+  const file = loadModelConfig({ projectDir: opts.workspace })
   const detected = detectProvider({
     apiKey:  file.apiKey  ?? explicitApiKey,
     baseURL: file.baseURL ?? opts.baseUrl,
@@ -1345,11 +1354,61 @@ function sessionDisplayTitle(s: SessionMeta, previewLimit: number): string {
 const DEFAULT_CLI_MAX_VISIBLE_CHARS = 50_000
 
 function getCliMaxVisibleChars(): number {
-  const raw = process.env['META_AGENT_CLI_MAX_VISIBLE_CHARS']
-  if (!raw) return DEFAULT_CLI_MAX_VISIBLE_CHARS
-  const parsed = Number.parseInt(raw, 10)
-  if (!Number.isFinite(parsed)) return DEFAULT_CLI_MAX_VISIBLE_CHARS
-  return Math.min(2_000_000, Math.max(10_000, parsed))
+  return RuntimeEnv.cliMaxVisibleChars(DEFAULT_CLI_MAX_VISIBLE_CHARS)
+}
+
+/** Mask credential-like values so `env` never prints a secret in full. */
+function maskEnvValue(name: string, value: string): string {
+  if (/KEY|TOKEN|SECRET|PASSWORD/i.test(name)) {
+    return value.length <= 4 ? '****' : `${value.slice(0, 2)}…${value.slice(-2)} (set)`
+  }
+  return value
+}
+
+/**
+ * Print the environment-variable config surface from ENV_REGISTRY: the single
+ * source of truth (name / type / current effective value / default / purpose).
+ * Env vars are read live from process.env — they are NOT stored in any file.
+ */
+function printEnvTable(asJson: boolean): void {
+  const rows = ENV_REGISTRY.map(e => {
+    const raw = process.env[e.name]
+    const current = raw === undefined || raw === '' ? null : maskEnvValue(e.name, raw)
+    return { name: e.name, type: e.type, current, default: e.default, description: e.description }
+  })
+
+  if (asJson) {
+    console.log(JSON.stringify(rows, null, 2))
+    return
+  }
+
+  const headers = ['ENV VAR', 'TYPE', 'CURRENT', 'DEFAULT', 'DESCRIPTION']
+  const data = rows.map(r => [r.name, r.type, r.current ?? '(unset)', r.default, r.description])
+  const widths = headers.map((h, i) =>
+    Math.max(h.length, ...data.map(row => row[i]!.length)),
+  )
+  // Pad on RAW strings (ANSI escapes would corrupt width math), THEN colorize.
+  const pad = (s: string, w: number): string => s + ' '.repeat(Math.max(0, w - s.length))
+
+  console.log(bold('meta-agent environment variables') +
+    dim('  (read live from process.env — not stored in any file)'))
+  console.log()
+  console.log(cyan(headers.map((h, i) => pad(h, widths[i]!)).join('  ').trimEnd()))
+  console.log(dim(widths.map(w => '─'.repeat(w)).join('  ')))
+  for (const row of data) {
+    const c = row.map((cell, i) => pad(cell!, widths[i]!))
+    const isSet = row[2] !== '(unset)'
+    console.log([
+      c[0],
+      dim(c[1]!),
+      isSet ? c[2] : dim(c[2]!),
+      c[3],
+      dim(c[4]!),
+    ].join('  ').trimEnd())
+  }
+  console.log()
+  console.log(dim('Set via the shell/launcher (e.g. export META_AGENT_TOOL_TIMEOUT_MS=60000). ' +
+    'Provider keys (ZHIPU_API_KEY, …) are resolved separately by the provider registry.'))
 }
 
 async function safeStdoutWrite(text: string): Promise<void> {

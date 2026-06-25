@@ -420,8 +420,21 @@ async function callCompactModelDeepSeek(
   model: string,
   options: CompactOptions,
 ): Promise<string> {
+  // Provider-boundary safety: this is the OpenAI-protocol (DeepSeek-compatible)
+  // path, so the key must be a DeepSeek-compatible one. Do NOT fall back to
+  // ANTHROPIC_API_KEY here — that would ship an Anthropic credential to the
+  // DeepSeek baseURL (a cross-provider key leak) and can never authenticate
+  // anyway. Fail fast with an actionable hint instead.
+  const apiKey = options.apiKey ?? process.env['DEEPSEEK_API_KEY']
+  if (!apiKey) {
+    throw new Error(
+      'Compact via the OpenAI/DeepSeek protocol requires a DeepSeek-compatible API key. ' +
+      'Set DEEPSEEK_API_KEY, pass compact.apiKey, or configure a compact model on an ' +
+      'Anthropic-protocol provider (GLM/Qwen/Anthropic).',
+    )
+  }
   const client = new OpenAI({
-    apiKey: options.apiKey ?? process.env['DEEPSEEK_API_KEY'] ?? process.env['ANTHROPIC_API_KEY'],
+    apiKey,
     baseURL: options.baseURL ?? 'https://api.deepseek.com',
     maxRetries: options.maxRetries ?? 2,
   })
