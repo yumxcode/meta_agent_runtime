@@ -15,6 +15,7 @@ export type {
   KernelConfig,
   CompactConfig,
   ThinkingConfig,
+  AutoGateFailurePolicy,
   CanUseToolFn,
   CanUseToolResult,
 } from './types/KernelConfig.js'

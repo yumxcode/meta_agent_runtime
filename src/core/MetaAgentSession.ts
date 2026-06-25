@@ -37,9 +37,6 @@ import {
   type MetaAgentConfig,
   type ResolvedConfig,
 } from './config.js'
-import { createSandboxExecutor } from '../sandbox/index.js'
-import { getGlobalWriteMutex } from './fs/WriteMutex.js'
-import type { SandboxHandle, SandboxConfig } from '../sandbox/types.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import type {
   ConversationMessage,
@@ -155,12 +152,6 @@ export class MetaAgentSession {
 
   // ── Concurrency guard ─────────────────────────────────────────────────────
   private _submitInFlight = false
-
-  // ── Per-session sandbox handle cache ──────────────────────────────────────
-  // Keyed by JSON.stringify(sandboxConfig) so tools with identical policies
-  // share one handle rather than each spawning their own executor.
-  // `true` policy is stored under the key '__default__'.
-  private _sandboxHandles = new Map<string, SandboxHandle>()
 
   // ─────────────────────────────────────────────────────────────────────────
   // Constructor
@@ -452,6 +443,11 @@ export class MetaAgentSession {
     return this._inner.steer(text)
   }
 
+  /** Replace the deterministic compact goal anchor for a new top-level task. */
+  reanchorOriginalGoal(goal: string): void {
+    this._inner.reanchorOriginalGoal(goal)
+  }
+
   /**
    * Manual compaction (/compact). Refreshes the sub-agent task snapshot first
    * so the compact thunks (deterministic anchors) read live state — mirrors
@@ -534,9 +530,6 @@ export class MetaAgentSession {
    * prompt cache.
    */
   async dispose(): Promise<void> {
-    const handles = [...this._sandboxHandles.values()]
-    this._sandboxHandles.clear()
-    await Promise.allSettled(handles.map(handle => handle.destroy()))
     try { this._inner.dispose() } catch { /* best-effort */ }
     this.toolRegistry.clear()
     this._staticPromptCache.clear()
@@ -590,52 +583,10 @@ export class MetaAgentSession {
   // ─────────────────────────────────────────────────────────────────────────
 
   /**
-   * Lazily create (or retrieve from cache) a SandboxHandle for the given policy.
-   *
-   * - `true`         → default policy: workspaceRoot writable, network unrestricted
-   * - SandboxConfig  → caller-specified policy
-   *
-   * Handles are cached per session by policy key so tools with identical
-   * policies reuse the same handle instance.  The Noop executor's handle is
-   * also cached, so the overhead is just one Map lookup per tool call.
-   */
-  private async _getOrCreateSandboxHandle(
-    policy: true | SandboxConfig,
-  ): Promise<SandboxHandle> {
-    const cacheKey = policy === true ? '__default__' : JSON.stringify(policy)
-
-    const cached = this._sandboxHandles.get(cacheKey)
-    if (cached) return cached
-
-    const baseConfig: SandboxConfig = policy === true ? {} : policy
-    // Auto mode (lockWorkspace): the OS sandbox is fail-closed. The main-agent
-    // bash policy defaults to allowUnsandboxedFallback:true (degrade gracefully
-    // when bwrap/sandbox-exec is missing); under autonomy we force it false so
-    // an unattended run never silently executes shell commands unsandboxed.
-    const config: SandboxConfig = this.config.autonomy?.lockWorkspace
-      ? { ...baseConfig, allowUnsandboxedFallback: false }
-      : baseConfig
-    const workspaceRoot = this.config.projectDir ?? process.cwd()
-    const executor = createSandboxExecutor()
-    if (executor.platform === 'noop' && !config.allowUnsandboxedFallback) {
-      throw new Error(
-        'Sandbox requested, but no supported sandbox backend is available. ' +
-        'Install sandbox-exec/bwrap or set sandbox.allowUnsandboxedFallback=true.',
-      )
-    }
-    const handle = await executor.create(config, workspaceRoot)
-
-    this._sandboxHandles.set(cacheKey, handle)
-    return handle
-  }
-
-  /**
-   * Wrap a MetaAgentTool's call() to apply:
-   *   1. Sandbox injection — if tool.permission.sandbox is set, a SandboxHandle
-   *      is lazily created and injected into ToolCallContext.sandboxHandle before
-   *      the tool's call() is invoked.  The tool reads ctx.sandboxHandle to wrap
-   *      its subprocess execution (see BashTool).
-   *   2. Provenance dirty-flag (triggers session_provenance refresh next turn)
+   * Wrap a MetaAgentTool's call() to apply the provenance dirty-flag. Runtime
+   * safety guards (sandboxHandle + auto write mutex) are applied by the inner
+   * AgenticSession so every backend, including RoboticsSession, shares the same
+   * tool execution protection.
    *
    * V&V/provenance instrumentation is applied by AgenticSession so direct
    * AgenticSession consumers and MetaAgentSession share one instrumentation path.
@@ -643,29 +594,13 @@ export class MetaAgentSession {
    */
   private _wrapTool(tool: MetaAgentTool): MetaAgentTool {
     const hasRtx  = Boolean(this.config.runtimeContext)
-    const facade  = this
-    const sandboxPolicy = tool.permission?.sandbox
-    // Auto mode: hand fs tools the process-global write mutex so concurrent
-    // sub-agents writing the same path are serialised. Undefined otherwise.
-    const writeMutex = this.config.autonomy ? getGlobalWriteMutex() : undefined
+    const facade = this
 
     return {
       ...tool,
       call: async (input, ctx) => {
         try {
-          // ── Sandbox context injection ──────────────────────────────────
-          // Enrich ctx with a sandboxHandle when the tool declares a sandbox
-          // policy.  The handle is created lazily and cached for the session.
-          let enrichedCtx = ctx
-          if (sandboxPolicy !== undefined) {
-            const sandboxHandle = await facade._getOrCreateSandboxHandle(sandboxPolicy)
-            enrichedCtx = { ...enrichedCtx, sandboxHandle }
-          }
-          if (writeMutex !== undefined) {
-            enrichedCtx = { ...enrichedCtx, writeMutex }
-          }
-
-          const result = await tool.call(input, enrichedCtx)
+          const result = await tool.call(input, ctx)
           // Mark provenance dirty on any completion (success or error)
           if (hasRtx) facade._provenanceDirty = true
           return result

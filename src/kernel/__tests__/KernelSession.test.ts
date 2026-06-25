@@ -372,7 +372,166 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
     }))
   })
 
-  it('stops auto normally after the configured per-run tool-batch allowance', async () => {
+  it('auto verify unavailable stops instead of reporting success', async () => {
+    mockStream.mockImplementation(() => textStream('done'))
+    const verifyGate = vi.fn(async () => ({
+      done: true,
+      unfinished: [],
+      evidence: [],
+      skipped: true,
+      note: 'goal missing',
+    }))
+    const onCheckpointBoundary = vi.fn(async () => ({ updated: true, revision: 1 }))
+
+    const session = new KernelSession(makeConfig({
+      autonomousMode: true,
+      verifyGate,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+
+    expect(verifyGate).toHaveBeenCalledTimes(2)
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.stopReason).toBe('auto_verify_unavailable')
+    expect(result?.resultText).toContain('could not be independently verified')
+    expect(onCheckpointBoundary).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'termination',
+      stopReason: 'auto_verify_unavailable',
+    }))
+  })
+
+  it('does not consult verify gates outside auto mode', async () => {
+    mockStream.mockImplementation(() => textStream('done'))
+    const verifyGate = vi.fn(async () => {
+      throw new Error('should not run')
+    })
+
+    const session = new KernelSession(makeConfig({ verifyGate }))
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+
+    expect(verifyGate).not.toHaveBeenCalled()
+    expect(result?.subtype).toBe('success')
+  })
+
+  it('auto drift fail_closed stops on the first unavailable drift check', async () => {
+    let revision = 0
+    const driftGate = vi.fn(async () => {
+      throw new Error('drift judge offline')
+    })
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') revision++
+      return { updated: event.type === 'tool_batch_completed' || event.type === 'termination', revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) yield* toolUseStream('todo-1', 'todo_write', { batch: 1 })
+      else yield* toolUseStream(`echo-${apiCall}`, 'echo', { batch: apiCall })
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 40,
+      tools: [makeTool('todo_write'), makeTool('echo')],
+      autonomousMode: true,
+      driftGate,
+      autoGateFailurePolicy: 'fail_closed',
+      autoGateMaxAttempts: 1,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.stopReason).toBe('auto_drift_unavailable')
+    expect(onCheckpointBoundary).toHaveBeenCalledWith(expect.objectContaining({
+      type: 'termination',
+      stopReason: 'auto_drift_unavailable',
+    }))
+  })
+
+  it('auto drift checkpoint_pause tolerates brief drift unavailability', async () => {
+    let revision = 0
+    const driftGate = vi.fn(async () => ({
+      drifted: false,
+      corrective: [],
+      skipped: true,
+      note: 'checkpoint temporarily unavailable',
+    }))
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') revision++
+      return { updated: event.type === 'tool_batch_completed' || event.type === 'termination', revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) yield* toolUseStream('todo-1', 'todo_write', { batch: 1 })
+      else if (apiCall <= 30) yield* toolUseStream(`echo-${apiCall}`, 'echo', { batch: apiCall })
+      else yield* textStream('done')
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 40,
+      tools: [makeTool('todo_write'), makeTool('echo')],
+      autonomousMode: true,
+      driftGate,
+      autoGateMaxAttempts: 1,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(events.some(e =>
+      e.type === 'system_message' &&
+      e.text.includes('[drift] 航向检查不可用')
+    )).toBe(true)
+    expect(result?.subtype).toBe('success')
+    expect(result?.stopReason).toBeNull()
+  })
+
+  it('auto drift checkpoint_pause stops after the configured consecutive failure limit', async () => {
+    let revision = 0
+    const driftGate = vi.fn(async () => ({
+      drifted: false,
+      corrective: [],
+      skipped: true,
+      note: 'checkpoint missing',
+    }))
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') revision++
+      return { updated: event.type === 'tool_batch_completed' || event.type === 'termination', revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall === 1) yield* toolUseStream('todo-1', 'todo_write', { batch: 1 })
+      else yield* toolUseStream(`echo-${apiCall}`, 'echo', { batch: apiCall })
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 40,
+      tools: [makeTool('todo_write'), makeTool('echo')],
+      autonomousMode: true,
+      driftGate,
+      autoGateMaxAttempts: 1,
+      autoDriftFailureLimit: 1,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+    const result = events.find(e => e.type === 'result')
+
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.stopReason).toBe('auto_drift_unavailable')
+  })
+
+  it('stops auto with an explicit error stopReason after the configured per-run tool-batch allowance', async () => {
     let apiCall = 0
     mockStream.mockImplementation(async function* () {
       apiCall++
@@ -389,7 +548,7 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
 
     const events = await collectEvents(session, 'run')
     const result = events.find(e => e.type === 'result')
-    expect(result?.subtype).toBe('success')
+    expect(result?.subtype).toBe('error_during_execution')
     expect(result?.stopReason).toBe('auto_tool_batch_limit')
     expect(onCheckpointBoundary).toHaveBeenCalledWith(expect.objectContaining({
       type: 'termination',
@@ -398,7 +557,7 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
     }))
   })
 
-  it('stops auto normally after the configured wall-clock allowance', async () => {
+  it('stops auto with an explicit error stopReason after the configured wall-clock allowance', async () => {
     let apiCall = 0
     mockStream.mockImplementation(async function* () {
       apiCall++
@@ -419,7 +578,7 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
 
     const events = await collectEvents(session, 'run')
     const result = events.find(e => e.type === 'result')
-    expect(result?.subtype).toBe('success')
+    expect(result?.subtype).toBe('error_during_execution')
     expect(result?.stopReason).toBe('auto_runtime_limit')
   })
 

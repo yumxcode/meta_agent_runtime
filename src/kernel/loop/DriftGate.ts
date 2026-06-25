@@ -39,10 +39,10 @@ export interface DriftVerdict {
   /** IDs of experiences the agent wrote this round (observability only). */
   experiencesWritten?: string[]
   /**
-   * True when the gate did NOT actually run (fail-open): goal/checkpoint missing,
-   * drift agent could not spawn / timed out, or an internal error. `drifted` is
-   * false so a broken checker never derails a healthy run, but the loop surfaces
-   * a visible warning instead of silently skipping.
+   * True when the gate did NOT actually run: goal/checkpoint missing, drift
+   * agent could not spawn / timed out, or an internal error. The kernel's
+   * autoGateFailurePolicy decides whether this warning is tolerated briefly,
+   * stops immediately, or preserves legacy fail-open behaviour.
    */
   skipped?: boolean
 }
@@ -60,9 +60,9 @@ export interface DriftGateArgs {
 }
 
 /**
- * The drift gate. Best-effort: implementations MUST resolve (never reject); on
- * any internal failure resolve to `{ drifted: false, corrective: [] }` so a
- * broken drift checker can never derail a healthy run (fail-open).
+ * The drift gate. Implementations should prefer resolving to a skipped verdict
+ * with a useful note on internal failure; the kernel handles retry, consecutive
+ * failure counting, and auto-only failure policy.
  */
 export type DriftGateFn = (args: DriftGateArgs) => Promise<DriftVerdict>
 

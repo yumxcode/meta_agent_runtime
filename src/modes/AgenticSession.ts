@@ -19,11 +19,13 @@ import { toKernelTool } from './toolAdapter.js'
 import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
 import { toKernelMessages } from './messageBridge.js'
+import { ToolRuntimeGuards } from './toolRuntimeGuards.js'
 
 export class AgenticSession {
   private readonly _engine: KernelSession
   private readonly _config: MetaAgentConfig
   private readonly _sessionId: string
+  private readonly _runtimeGuards: ToolRuntimeGuards
   private readonly _registeredTools: MetaAgentTool[] = []
   /** S1: guard against double dispose. */
   private _disposed = false
@@ -41,6 +43,10 @@ export class AgenticSession {
     const apiKey = resolved.apiKey
     const baseURL = resolved.baseURL
     const caps = resolved.capabilities
+    this._runtimeGuards = new ToolRuntimeGuards({
+      projectDir: resolved.projectDir ?? process.cwd(),
+      autonomy: config.autonomy,
+    })
     // Anthropic-format providers that don't accept the thinking param (e.g. Qwen)
     // must not receive it; OpenAI-protocol providers map thinking → reasoning_effort
     // downstream, so leave their config untouched.
@@ -81,6 +87,9 @@ export class AgenticSession {
       verifyGate: config.verifyGate,
       // Auto mode: mid-flight drift/reflection gate. Same gating + provenance.
       driftGate: config.driftGate,
+      autoGateFailurePolicy: config.autoGateFailurePolicy,
+      autoGateMaxAttempts: config.autoGateMaxAttempts,
+      autoDriftFailureLimit: config.autoDriftFailureLimit,
       onCheckpointBoundary: config.onCheckpointBoundary,
       initialToolBatchCount: config.initialToolBatchCount,
       initialCheckpointRevision: config.initialCheckpointRevision,
@@ -142,12 +151,14 @@ export class AgenticSession {
       this._registeredTools.push(tool)
     }
 
+    const guarded = this._runtimeGuards.wrapTool(tool)
+
     // Instrument with RuntimeContext if provided
     const wrapped = this._config.runtimeContext
-      ? instrumentTool(tool, this._config.runtimeContext, {
+      ? instrumentTool(guarded, this._config.runtimeContext, {
           systemPrompt: this._config.systemPrompt,
         })
-      : tool
+      : guarded
 
     // Build extensions for KernelToolContext
     const extensions: Record<string, unknown> = {}
@@ -214,6 +225,9 @@ export class AgenticSession {
   /** Inject a mid-turn user correction. See KernelSession.steer(). */
   steer(text: string): boolean { return this._engine.steer(text) }
 
+  /** Replace the deterministic compact goal anchor for a new top-level task. */
+  reanchorOriginalGoal(goal: string): void { this._engine.reanchorOriginalGoal(goal) }
+
   /** Manual compaction (/compact) — same pipeline as auto-compact, forced. */
   async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
     return this._engine.compactNow()
@@ -230,6 +244,7 @@ export class AgenticSession {
   dispose(): void {
     if (this._disposed) return
     this._disposed = true
+    void this._runtimeGuards.dispose()
     try { this._engine.dispose() } catch { /* best-effort */ }
     this._registeredTools.length = 0
   }

@@ -16,7 +16,7 @@
 import type { AutonomyProfile, EngineeringDomain, MetaAgentTool } from './types.js'
 import type { RuntimeContext } from '../runtime/RuntimeContext.js'
 import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js'
-import type { ThinkingConfig } from '../kernel/index.js'
+import type { AutoGateFailurePolicy, ThinkingConfig } from '../kernel/index.js'
 import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 import type { AgentMode, OutputStyle } from './dynamicPrompt.js'
 import { loadModelConfig } from './config/ConfigService.js'
@@ -334,6 +334,19 @@ export interface MetaAgentConfig {
    */
   driftGate?: import('../kernel/loop/DriftGate.js').DriftGateFn
 
+  /**
+   * Auto mode gate-failure policy. Default is kernel-side 'checkpoint_pause':
+   * verify unavailability cannot report success; drift unavailability is
+   * tolerated briefly, then pauses at a checkpoint. Non-auto sessions ignore it.
+   */
+  autoGateFailurePolicy?: AutoGateFailurePolicy
+
+  /** Attempts per verify/drift gate call when it throws or returns skipped. */
+  autoGateMaxAttempts?: number
+
+  /** Consecutive unavailable drift checks allowed under checkpoint_pause. */
+  autoDriftFailureLimit?: number
+
   /** Kernel execution-boundary hook used by auto checkpoint persistence. */
   onCheckpointBoundary?: import('../kernel/loop/CheckpointBoundary.js').CheckpointBoundaryFn
 
@@ -393,6 +406,9 @@ export type ResolvedConfig = Required<
     | 'autonomy'
     | 'verifyGate'
     | 'driftGate'
+    | 'autoGateFailurePolicy'
+    | 'autoGateMaxAttempts'
+    | 'autoDriftFailureLimit'
     | 'onCheckpointBoundary'
     | 'initialToolBatchCount'
     | 'initialCheckpointRevision'
@@ -424,6 +440,9 @@ export type ResolvedConfig = Required<
   verifyGate?: MetaAgentConfig['verifyGate']
   /** Auto mode mid-flight drift gate; absent → no drift checking. */
   driftGate?: MetaAgentConfig['driftGate']
+  autoGateFailurePolicy?: MetaAgentConfig['autoGateFailurePolicy']
+  autoGateMaxAttempts?: number
+  autoDriftFailureLimit?: number
   onCheckpointBoundary?: MetaAgentConfig['onCheckpointBoundary']
   initialToolBatchCount?: number
   initialCheckpointRevision?: number
@@ -531,6 +550,9 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     autonomy:        config.autonomy,
     verifyGate:      config.verifyGate,
     driftGate:       config.driftGate,
+    autoGateFailurePolicy: config.autoGateFailurePolicy,
+    autoGateMaxAttempts: config.autoGateMaxAttempts,
+    autoDriftFailureLimit: config.autoDriftFailureLimit,
     onCheckpointBoundary: config.onCheckpointBoundary,
     initialToolBatchCount: config.initialToolBatchCount,
     initialCheckpointRevision: config.initialCheckpointRevision,

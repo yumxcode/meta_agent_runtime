@@ -1,9 +1,14 @@
 import { readFile, stat, writeFile } from 'fs/promises'
+import { isAbsolute, resolve } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import { resolveInsideWorkspace } from '../workspaceGuard.js'
 
 const MAX_EDIT_BYTES = 5 * 1024 * 1024
+
+function rawWorkspacePath(rawPath: string, workspaceRoot = process.cwd()): string {
+  return isAbsolute(rawPath) ? resolve(rawPath) : resolve(workspaceRoot, rawPath)
+}
 
 export async function createEditFileTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
@@ -56,7 +61,10 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
         // refuse to edit when size or mtime has drifted since. Skip the check
         // when there's no recorded snapshot (first-time edit) so existing call
         // sites still work.
-        const cacheEntry = ctx.readFileState?.get?.(filePath)
+        const rawFilePath = rawWorkspacePath(rawPath, ctx.workspaceRoot)
+        const cacheEntry =
+          ctx.readFileState?.get?.(filePath) ??
+          (rawFilePath !== filePath ? ctx.readFileState?.get?.(rawFilePath) : undefined)
         if (cacheEntry) {
           const sizeChanged = cacheEntry.sizeBytes !== fileStat.size
           const mtimeChanged =
@@ -87,6 +95,9 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
         try {
           const after = await stat(filePath)
           ctx.readFileState?.record?.(filePath, after.size, after.mtimeMs)
+          if (rawFilePath !== filePath && ctx.readFileState?.has?.(rawFilePath)) {
+            ctx.readFileState.record(rawFilePath, after.size, after.mtimeMs)
+          }
         } catch { /* best-effort */ }
         return { content: `Replaced ${replaceAll ? occurrences : 1} occurrence(s) in ${filePath}`, isError: false }
       } catch (err) {

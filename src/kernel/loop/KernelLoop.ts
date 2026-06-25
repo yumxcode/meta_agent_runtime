@@ -12,7 +12,9 @@ import {
   SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs,
 } from './AutoStallGuard.js'
 import { MAX_VERIFY_ROUNDS, buildVerifyRejectionPrompt } from './VerifyGate.js'
+import type { VerifyVerdict } from './VerifyGate.js'
 import { DRIFT_TURN_INTERVAL, buildDriftCorrectionPrompt } from './DriftGate.js'
+import type { DriftVerdict } from './DriftGate.js'
 import type { KernelToolContext } from '../types/KernelTool.js'
 import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
@@ -73,6 +75,8 @@ export type LoopTerminationReason =
   | 'aborted_tools'
   | 'max_budget_usd'
   | 'verify_exhausted'
+  | 'auto_verify_unavailable'
+  | 'auto_drift_unavailable'
   | 'auto_runtime_limit'
   | 'auto_tool_batch_limit'
   | 'error'
@@ -122,9 +126,9 @@ export interface KernelLoopContext {
    */
   drainSteering?: () => string[]
   /**
-   * The session's original first user request, captured by KernelSession
-   * before any compaction. Forwarded into the compact pipeline so the
-   * "original session goal" deterministic anchor survives nested compactions.
+   * The session's current top-level goal, captured or re-anchored by
+   * KernelSession before compaction. Forwarded into the compact pipeline so the
+   * deterministic goal anchor survives nested compactions.
    */
   originalUserGoal?: string
 }
@@ -453,6 +457,15 @@ function buildStreamErrorRecoveryText(detail: string): string {
   )
 }
 
+/** Guidance message injected when a provider returns an empty successful turn. */
+function buildEmptyResponseRecoveryText(): string {
+  return (
+    `[系统] 上一步模型调用返回了空响应：没有可见文本，也没有工具调用。\n` +
+    `这通常是网络/网关瞬时波动或 provider 返回了异常的空 end_turn。` +
+    `请直接重试回答当前用户问题；如果已经掌握足够信息，请给出明确、可见的回复。`
+  )
+}
+
 function newAccumulator(): StreamAccumulator {
   return {
     blocks: [],
@@ -511,6 +524,8 @@ const CHECKPOINT_STATE_TOOLS = new Set([
  * period-2 cycles keeps legitimate re-reads (read → edit → re-read) safe.
  */
 const ALTERNATION_WINDOW = 6
+const AUTO_GATE_MAX_ATTEMPTS_DEFAULT = 2
+const AUTO_DRIFT_FAILURE_LIMIT_DEFAULT = 3
 
 /**
  * True when the last ALTERNATION_WINDOW turn signatures form a strict ABAB…
@@ -534,6 +549,14 @@ function stableStringify(value: unknown): string {
   if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
   const record = value as Record<string, unknown>
   return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
+}
+
+function errorNote(err: unknown): string {
+  return err instanceof Error ? err.message : String(err)
+}
+
+function boundedPositive(value: number | undefined, fallback: number): number {
+  return Math.max(1, Math.floor(value ?? fallback))
 }
 
 // ── Main loop ────────────────────────────────────────────────────────────────
@@ -571,11 +594,21 @@ export async function* runKernelLoop(
   let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
   let autoSelfEvalInjected = false   // one-shot self-eval nudge per stall episode
   let verifyRounds = 0               // auto-mode completion-gate rounds consumed
+  let consecutiveDriftGateFailures = 0
   let toolBatchCount = ctx.initialToolBatchCount ?? 0
   let checkpointRevision = ctx.initialCheckpointRevision ?? 0
   let lastDriftToolBatchCount = ctx.initialLastDriftToolBatchCount ?? 0
   let lastDriftCheckpointRevision = ctx.initialLastDriftCheckpointRevision ?? 0
   const toolSignatureHistory: string[] = []
+  const autoGateFailurePolicy = config.autoGateFailurePolicy ?? 'checkpoint_pause'
+  const autoGateMaxAttempts = boundedPositive(
+    config.autoGateMaxAttempts,
+    AUTO_GATE_MAX_ATTEMPTS_DEFAULT,
+  )
+  const autoDriftFailureLimit = boundedPositive(
+    config.autoDriftFailureLimit,
+    AUTO_DRIFT_FAILURE_LIMIT_DEFAULT,
+  )
 
   async function checkpoint(
     event: Omit<CheckpointBoundaryEvent, 'sessionId' | 'toolBatchCount' | 'estimatedCostUsd'>,
@@ -1164,31 +1197,107 @@ export async function* runKernelLoop(
         return done('success')
       }
 
+      // 14c: empty successful response recovery. A provider can occasionally
+      // return a syntactically valid end_turn with no visible text and no tool
+      // calls after a transient network/gateway disruption. Treating that as a
+      // normal success makes the CLI appear to "do nothing": only the footer is
+      // printed. Retry a bounded number of times, then stop with a visible error.
+      if (assistantText.trim() === '') {
+        const maxRecoveries = config.maxStreamErrorRecoveries ?? 2
+        if (maxRecoveries > 0 && state.emptyResponseRecoveryCount < maxRecoveries) {
+          const attempt = state.emptyResponseRecoveryCount + 1
+          yield {
+            type: 'system_message',
+            subtype: 'warning',
+            text:
+              `模型返回空响应（第 ${attempt}/${maxRecoveries} 次恢复）：` +
+              `没有可见文本，也没有工具调用。将注入提示并重试。`,
+            sessionId,
+          }
+          if (assistantMessages.length > 0) {
+            mutableMessages.splice(
+              Math.max(0, mutableMessages.length - assistantMessages.length),
+              assistantMessages.length,
+            )
+            state = { ...state, messages: mutableMessages }
+          }
+          append(makeTextUserMessage(buildEmptyResponseRecoveryText(), { isMeta: true }))
+          state = { ...state, emptyResponseRecoveryCount: attempt }
+          await delay(Math.min(1000 * attempt, 3000), signal)
+          if (signal.aborted) {
+            return done(signal.reason === 'auto_runtime_limit'
+              ? 'auto_runtime_limit'
+              : 'aborted_streaming')
+          }
+          continue
+        }
+
+        resultText =
+          `Stopped: the model returned an empty response without text or tool calls ` +
+          `after ${maxRecoveries} recovery attempt${maxRecoveries === 1 ? '' : 's'}.`
+        yield { type: 'text_delta', delta: resultText, sessionId }
+        return done('error')
+      }
+
+      if (state.emptyResponseRecoveryCount !== 0) {
+        state = { ...state, emptyResponseRecoveryCount: 0 }
+      }
+
       // ── Step 14d: auto-mode completion gate (Verify) ───────────────────────
       // The model thinks it's done (no tool calls). In an unattended run we do
       // NOT trust that judgment blindly — an INDEPENDENT judge (isolated
-      // context) checks whether the original goal is actually met. A negative
-      // verdict re-injects the concrete unfinished items and the loop continues;
-      // bounded by MAX_VERIFY_ROUNDS so verify→fix can't spin forever. The gate
-      // is fail-open (any internal error → done) so a broken verifier never
-      // wedges a finished run.
+      // context) checks whether the current top-level goal is actually met. A
+      // negative verdict re-injects concrete unfinished items and the loop
+      // continues; bounded by MAX_VERIFY_ROUNDS so verify→fix can't spin
+      // forever. If the gate is unavailable, auto mode does not report success
+      // unless the caller explicitly opts into the legacy fail-open policy.
       if (config.autonomousMode && config.verifyGate && verifyRounds < MAX_VERIFY_ROUNDS) {
         verifyRounds++
-        let verdict
-        try {
-          verdict = await config.verifyGate({
-            workspaceRoot: ctx.cwd,
-            turnCount: state.turnCount,
-            round: verifyRounds,
-            signal,
-          })
-        } catch {
-          verdict = undefined   // fail-open: fall through to normal completion
+        let verdict: VerifyVerdict | undefined
+        let unavailableNote: string | null = null
+        for (let attempt = 1; attempt <= autoGateMaxAttempts; attempt++) {
+          try {
+            const candidate = await config.verifyGate({
+              workspaceRoot: ctx.cwd,
+              turnCount: state.turnCount,
+              round: verifyRounds,
+              signal,
+            })
+            if (candidate.skipped) {
+              unavailableNote = candidate.note ?? 'verify gate returned skipped'
+              continue
+            }
+            verdict = candidate
+            unavailableNote = null
+            break
+          } catch (err) {
+            unavailableNote = errorNote(err)
+          }
+          if (signal.aborted) break
         }
         if (signal.aborted) {
           return done(signal.reason === 'auto_runtime_limit'
             ? 'auto_runtime_limit'
             : 'aborted_tools')
+        }
+        if (!verdict && unavailableNote !== null) {
+          const msg =
+            `[verify] 完成度审核不可用，已尝试 ${autoGateMaxAttempts} 次：${unavailableNote}`
+          yield {
+            type: 'system_message',
+            subtype: 'warning',
+            text: msg,
+            sessionId,
+          }
+          if (autoGateFailurePolicy === 'fail_open') {
+            // Legacy compatibility only: visible warning, then normal success.
+          } else {
+            resultText =
+              `Stopped (auto mode): completion could not be independently verified. ` +
+              `Reason: ${unavailableNote}`
+            yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
+            return done('auto_verify_unavailable')
+          }
         }
         if (verdict && !verdict.done) {
           append(makeTextUserMessage(buildVerifyRejectionPrompt(verdict, verifyRounds), { isMeta: true }))
@@ -1200,23 +1309,12 @@ export async function* runKernelLoop(
           }
           continue
         }
-        // Fail-open visibility: the gate let the run finish but did NOT actually
-        // verify (goal missing, judge could not spawn / timed out, internal
-        // error). Surface a warning so an unattended run's completion is never
-        // silently rubber-stamped.
-        if (verdict?.skipped) {
-          yield {
-            type: 'system_message',
-            subtype: 'warning',
-            text: `[verify] 完成度审核被跳过（未实际校验）：${verdict.note ?? '未知原因'}`,
-            sessionId,
-          }
-        }
       } else if (
         config.autonomousMode && config.verifyGate && verifyRounds >= MAX_VERIFY_ROUNDS
       ) {
         // Exhausted the verify budget while still not passing — stop honestly
         // rather than loop, leaving the last rejection visible in the summary.
+        resultText = 'Stopped (auto mode): completion verification did not pass within the verify round limit.'
         return done('verify_exhausted')
       }
 
@@ -1417,29 +1515,60 @@ export async function* runKernelLoop(
       if (checkpointAdvanced && enoughBatches) {
         lastDriftToolBatchCount = toolBatchCount
         lastDriftCheckpointRevision = checkpointRevision
-        let drift
-        try {
-          drift = await config.driftGate({
-            workspaceRoot: ctx.cwd,
-            turnCount: toolBatchCount,
-            reason: 'turn_interval',
-            signal,
-          })
-        } catch {
-          drift = undefined   // fail-open
+        let drift: DriftVerdict | undefined
+        let unavailableNote: string | null = null
+        for (let attempt = 1; attempt <= autoGateMaxAttempts; attempt++) {
+          try {
+            const candidate = await config.driftGate({
+              workspaceRoot: ctx.cwd,
+              turnCount: toolBatchCount,
+              reason: 'turn_interval',
+              signal,
+            })
+            if (candidate.skipped) {
+              unavailableNote = candidate.note ?? 'drift gate returned skipped'
+              continue
+            }
+            drift = candidate
+            unavailableNote = null
+            break
+          } catch (err) {
+            unavailableNote = errorNote(err)
+          }
+          if (signal.aborted) break
+        }
+        if (!signal.aborted && !drift && unavailableNote !== null) {
+          consecutiveDriftGateFailures++
+          const msg =
+            `[drift] 航向检查不可用，已尝试 ${autoGateMaxAttempts} 次` +
+            `（连续 ${consecutiveDriftGateFailures}/${autoDriftFailureLimit}）：${unavailableNote}`
+          yield {
+            type: 'system_message',
+            subtype: 'warning',
+            text: msg,
+            sessionId,
+          }
+          const shouldStop =
+            autoGateFailurePolicy === 'fail_closed' ||
+            (
+              autoGateFailurePolicy === 'checkpoint_pause' &&
+              consecutiveDriftGateFailures >= autoDriftFailureLimit
+            )
+          if (shouldStop) {
+            resultText =
+              `Stopped (auto mode): drift checks were unavailable for ` +
+              `${consecutiveDriftGateFailures} consecutive scheduled check(s). ` +
+              `Reason: ${unavailableNote}`
+            yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
+            return done('auto_drift_unavailable')
+          }
+        } else if (!signal.aborted && drift) {
+          consecutiveDriftGateFailures = 0
         }
         if (!signal.aborted && drift?.drifted) {
           append(makeTextUserMessage(buildDriftCorrectionPrompt(drift), { isMeta: true }))
           await checkpoint({ type: 'drift_corrected' })
           yield { type: 'text_delta', delta: '\n[drift] 检测到航向偏离，注入一次校正…\n', sessionId }
-        } else if (!signal.aborted && drift?.skipped) {
-          // Fail-open visibility: the drift gate could not actually run.
-          yield {
-            type: 'system_message',
-            subtype: 'warning',
-            text: `[drift] 航向检查被跳过（未实际运行）：${drift.note ?? '未知原因'}`,
-            sessionId,
-          }
         }
       }
     }

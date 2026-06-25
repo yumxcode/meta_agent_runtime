@@ -75,6 +75,18 @@ export type CanUseToolResult =
   | { behavior: 'deny'; reason: string }
   | { behavior: 'redirect'; message: string }
 
+export type AutoGateFailurePolicy =
+  /**
+   * Recommended auto default. A verify gate that cannot actually verify stops
+   * the run instead of reporting success. A drift gate can miss a small number
+   * of checks, but repeated unavailability pauses the run at a checkpoint.
+   */
+  | 'checkpoint_pause'
+  /** Stop on the first unavailable verify/drift gate. */
+  | 'fail_closed'
+  /** Legacy compatibility: warn and continue/succeed when a gate is unavailable. */
+  | 'fail_open'
+
 export interface KernelConfig {
   // ── API ──────────────────────────────────────────────────────────────────
 
@@ -225,6 +237,27 @@ export interface KernelConfig {
    * mid-flight drift checking.
    */
   driftGate?: DriftGateFn
+
+  /**
+   * Auto mode gate-failure policy. Only read when autonomousMode is true.
+   *
+   * Default: 'checkpoint_pause'. This preserves continuity for transient drift
+   * failures while preventing unverified completion from being reported as
+   * success. Non-auto sessions are unaffected because gates are not consulted.
+   */
+  autoGateFailurePolicy?: AutoGateFailurePolicy
+
+  /**
+   * Maximum attempts for a single verify/drift gate invocation when it throws or
+   * returns `skipped`. Defaults to 2. Values <1 are treated as 1.
+   */
+  autoGateMaxAttempts?: number
+
+  /**
+   * Consecutive unavailable drift checks allowed under 'checkpoint_pause'
+   * before the run pauses. Defaults to 3. Values <1 are treated as 1.
+   */
+  autoDriftFailureLimit?: number
 
   /**
    * Consistent-boundary callback used by auto checkpointing. The kernel reports

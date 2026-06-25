@@ -37,11 +37,10 @@ export interface VerifyVerdict {
    */
   note?: string
   /**
-   * True when the gate did NOT actually verify (fail-open): goal missing, judge
-   * timed out / could not spawn (e.g. sub-agent budget exhausted), or an
-   * internal error. `done` is still true so a broken verifier never wedges a
-   * run, but the loop surfaces a visible warning instead of a silent pass so an
-   * operator knows the completion check was skipped (and why, via `note`).
+   * True when the gate did NOT actually verify: goal missing, judge timed out /
+   * could not spawn (e.g. sub-agent budget exhausted), or an internal error.
+   * The kernel's autoGateFailurePolicy decides whether this stops the run
+   * (default) or preserves legacy fail-open behaviour.
    */
   skipped?: boolean
 }
@@ -66,10 +65,9 @@ export interface VerifyGateArgs {
 
 /**
  * The verify gate. Returns a verdict; the loop continues (re-injecting the
- * unfinished items) when `done === false`. Implementations MUST be best-effort:
- * on any internal failure they should resolve to `{ done: true, ... }` so a
- * broken verifier can never wedge a finished run (fail-open). The note field
- * should carry the failure reason for the human.
+ * unfinished items) when `done === false`. Implementations should prefer
+ * resolving to a skipped verdict with a useful note on internal failure; the
+ * kernel handles retry and auto-only failure policy.
  */
 export type VerifyGateFn = (args: VerifyGateArgs) => Promise<VerifyVerdict>
 

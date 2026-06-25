@@ -61,11 +61,11 @@ export interface CompactOptions {
    */
   deterministicAnchors?: string | (() => string | null | undefined)
   /**
-   * The session's original goal — the first few real user requests (captured
-   * before any compaction, pre-formatted into one string by KernelSession).
-   * Emitted as a protected "Original session goal" line in the deterministic
-   * continuity anchors of every summary path, so the goal cannot drift across
-   * nested compactions ("telephone game" through summary-of-summary chains).
+   * The current top-level goal — normally the first few real user requests,
+   * but auto mode may explicitly re-anchor it when a new task starts in the
+   * same session. Emitted as a protected deterministic continuity anchor in
+   * every summary path, so the active goal cannot drift across nested
+   * compactions ("telephone game" through summary-of-summary chains).
    */
   originalUserGoal?: string
   thinkingConfig?: ThinkingConfig

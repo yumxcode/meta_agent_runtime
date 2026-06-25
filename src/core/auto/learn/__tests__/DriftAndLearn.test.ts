@@ -73,10 +73,15 @@ describe('AutoDriftGate', () => {
       signal: new AbortController().signal,
     })
 
-    // Fail-open SKIP (no checkpoint to judge against): drifted:false so the run
-    // is never derailed, but skipped:true so the loop surfaces a visible warning
-    // rather than silently treating it as a genuine "on course" verdict.
-    expect(verdict).toEqual({ drifted: false, corrective: [], skipped: true })
+    // SKIP (no checkpoint to judge against): drifted:false distinguishes it
+    // from a real drift verdict, while skipped:true + note lets KernelLoop apply
+    // the configured gate-failure policy with a visible reason.
+    expect(verdict).toEqual({
+      drifted: false,
+      corrective: [],
+      skipped: true,
+      note: 'checkpoint missing',
+    })
     expect(spawnSubAgent).not.toHaveBeenCalled()
   })
 })

@@ -31,6 +31,14 @@ async function* textStream(text = 'ok'): AsyncGenerator<import('../api/Anthropic
   yield { type: 'message_stop' }
 }
 
+async function* emptyEndTurnStream(): AsyncGenerator<import('../api/AnthropicClient.js').StreamEvent> {
+  yield { type: 'message_start', usage: { input_tokens: 50 } }
+  yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } as any }
+  yield { type: 'content_block_stop', index: 0 }
+  yield { type: 'message_delta', delta: { stop_reason: 'end_turn', stop_sequence: null }, usage: { output_tokens: 1 } }
+  yield { type: 'message_stop' }
+}
+
 async function collectEvents(session: KernelSession, prompt: string) {
   const events = []
   for await (const e of session.submitMessage(prompt)) events.push(e)
@@ -117,5 +125,43 @@ describe('KernelLoop — stream error recovery', () => {
     expect(call).toBe(1)
     const result = events.find(e => e.type === 'result')
     expect(result?.subtype).toBe('error_during_execution')
+  })
+
+  it('recovers from a transient empty end_turn response', async () => {
+    let call = 0
+    mockStream.mockImplementation(async function* () {
+      call++
+      if (call === 1) yield* emptyEndTurnStream()
+      else yield* textStream('visible response')
+    })
+
+    const session = new KernelSession(makeConfig())
+    const events = await collectEvents(session, 'Hello')
+
+    expect(call).toBe(2)
+    expect(events.some(e =>
+      e.type === 'system_message' &&
+      'text' in e &&
+      String(e.text).includes('模型返回空响应'),
+    )).toBe(true)
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('success')
+    expect(result?.resultText).toBe('visible response')
+  })
+
+  it('does not silently succeed when empty end_turn recovery is exhausted', async () => {
+    let call = 0
+    mockStream.mockImplementation(async function* () {
+      call++
+      yield* emptyEndTurnStream()
+    })
+
+    const session = new KernelSession(makeConfig({ maxStreamErrorRecoveries: 2 }))
+    const events = await collectEvents(session, 'Hello')
+
+    expect(call).toBe(3)
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.resultText).toContain('empty response')
   })
 })

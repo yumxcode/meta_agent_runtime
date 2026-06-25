@@ -75,6 +75,7 @@ interface SessionImpl {
   registerTool(tool: MetaAgentTool): void
   interrupt(): void
   steer?(text: string): boolean
+  reanchorOriginalGoal?(goal: string): void
   compactNow?(): Promise<import('../kernel/index.js').ManualCompactResult>
   getMessages(): readonly ConversationMessage[]
   getUsage(): TokenUsage
@@ -338,6 +339,7 @@ export class SessionRouter {
    */
   private async _reanchorAutoGoal(prompt: string): Promise<void> {
     this._autoGoal = prompt
+    this._impl?.reanchorOriginalGoal?.(prompt)
     const sessionId = this.getSessionId()
     try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
     try { deleteProgressNoteForSession(sessionId) } catch { /* best-effort */ }

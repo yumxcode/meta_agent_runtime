@@ -327,7 +327,7 @@ export function accumulateUsage(a: TokenUsage, b: Partial<TokenUsage>): TokenUsa
  * ConversationMessage had no corresponding fields and toKernelMessages() only
  * mapped role/content. Losing them breaks compact-boundary slicing and lets
  * compact summaries / keep-set clones be mistaken for real user messages —
- * poisoning the original-goal anchor on resumed sessions (review F-1/F-3).
+ * poisoning the top-level goal anchor on resumed sessions (review F-1/F-3).
  */
 export interface MessageKernelMeta {
   /** Original kernel uuid; preserved across persist/resume when present. */

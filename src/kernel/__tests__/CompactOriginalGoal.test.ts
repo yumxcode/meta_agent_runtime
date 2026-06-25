@@ -1,5 +1,5 @@
 /**
- * Tests for the "original session goal" deterministic compact anchor —
+ * Tests for the current top-level goal deterministic compact anchor —
  * the goal captured before any compaction must appear in every summary path.
  */
 import { describe, it, expect } from 'vitest'
@@ -8,6 +8,7 @@ import {
   buildFallbackCompactSummary,
 } from '../compact/CompactPrompt.js'
 import {
+  KernelSession,
   collectOriginalUserGoalParts,
   formatOriginalUserGoal,
   ORIGINAL_GOAL_MESSAGE_COUNT,
@@ -23,13 +24,13 @@ function assistant(text: string): KernelMessage {
 
 const GOAL = '训练 X1 机器人在 isaac-gym 中的平滑落地策略,最终合并到 v9-smooth-landing 分支'
 
-describe('original session goal anchor', () => {
+describe('top-level goal anchor', () => {
   it('is emitted in the rich-summary enrichment path', () => {
     const longSummary = 'S'.repeat(3000) // ≥ rich threshold → recent detail omitted
     const out = enrichCompactSummaryWithContinuity(longSummary, [user('latest request')], {
       originalUserGoal: GOAL,
     })
-    expect(out).toContain('Original session goal')
+    expect(out).toContain('Current top-level goal')
     expect(out).toContain(GOAL)
   })
 
@@ -44,7 +45,7 @@ describe('original session goal anchor', () => {
     const out = buildFallbackCompactSummary([user('latest'), assistant('working')], {
       originalUserGoal: GOAL,
     })
-    expect(out).toContain('Original session goal')
+    expect(out).toContain('Current top-level goal')
     expect(out).toContain(GOAL)
   })
 
@@ -65,7 +66,7 @@ describe('original session goal anchor', () => {
 
   it('omits the goal line when no goal was captured', () => {
     const out = enrichCompactSummaryWithContinuity('terse', [user('q')], {})
-    expect(out).not.toContain('Original session goal')
+    expect(out).not.toContain('Current top-level goal')
   })
 })
 
@@ -124,5 +125,17 @@ describe('multi-message original goal capture', () => {
     })
     expect(out).toContain('[user message 1] 先看抖动问题')
     expect(out).toContain('[user message 2] 再合并 v9 分支')
+  })
+})
+
+describe('original goal re-anchor', () => {
+  it('replaces captured goal parts with a sanitized current top-level goal', () => {
+    const session = new KernelSession({ model: 'test-model', tools: [] })
+    const prompt = '<context>\nvolatile state\n</context>\n\n---\n\n新的 auto 任务'
+
+    session.reanchorOriginalGoal(prompt)
+
+    const internal = session as unknown as { _originalUserGoalParts: string[] }
+    expect(internal._originalUserGoalParts).toEqual(['新的 auto 任务'])
   })
 })

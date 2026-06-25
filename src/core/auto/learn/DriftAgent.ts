@@ -147,21 +147,22 @@ async function runDriftAgent(
   return latest.result?.summary ?? null
 }
 
-/** Build the drift gate for an auto session. Always resolves (fail-open). */
+/** Build the drift gate for an auto session. Skips are handled by KernelLoop policy. */
 export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
   const store = createAutoExperienceStore(deps.projectDir)
   return async ({ signal }) => {
-    // A fail-open SKIP (the agent could not run): unlike a genuine parsed
-    // "drifted:false" verdict (agent ran, judged the run on course), this is
-    // surfaced as a warning by the loop, so a healthy on-course run stays quiet.
-    const skip = (): DriftVerdict => ({ drifted: false, corrective: [], skipped: true })
+    // A SKIP (the agent could not run): unlike a genuine parsed "drifted:false"
+    // verdict (agent ran, judged the run on course), this is handled by the
+    // loop's gate-failure policy, so a healthy on-course run stays quiet.
+    const skip = (note: string): DriftVerdict =>
+      ({ drifted: false, corrective: [], skipped: true, note })
 
     const goal = deps.getGoal()
-    if (!goal || !goal.trim()) return skip()
+    if (!goal || !goal.trim()) return skip('goal missing')
 
     try {
       const cp = readAutoCheckpoint(deps.projectDir)
-      if (!cp) return skip()
+      if (!cp) return skip('checkpoint missing')
       // Only feed the fields drift needs — keep it compact and goal-focused.
       const checkpointJson = JSON.stringify(
         {
@@ -178,10 +179,10 @@ export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
       const experienceBlock = await renderRecentExperiences(store)
       const task = buildDriftTask(goal, checkpointJson, experienceBlock)
       const summary = await runDriftAgent(deps.dispatcher, task, signal)
-      if (!summary) return skip()
-      return parseDriftVerdict(summary) ?? skip()
-    } catch {
-      return skip()
+      if (!summary) return skip('drift agent returned no summary')
+      return parseDriftVerdict(summary) ?? skip('drift agent returned an unparsable verdict')
+    } catch (err) {
+      return skip(err instanceof Error ? err.message : String(err))
     }
   }
 }

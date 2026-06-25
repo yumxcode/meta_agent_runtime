@@ -473,12 +473,10 @@ export interface ContinuityEnrichOptions {
    */
   extraAnchors?: string
   /**
-   * The session's ORIGINAL goal — the first few real user requests (up to
-   * ORIGINAL_GOAL_MESSAGE_COUNT, pre-formatted into one string), captured by
-   * KernelSession before any compaction ran. The in-window "first explicit
-   * user request" anchor degrades after the first compaction (the window then
-   * starts at the keep-set's cloned last-user-message); this field restores
-   * the true session goal deterministically in every summary path.
+   * The current top-level goal. For ordinary sessions this is the first few
+   * real user requests captured by KernelSession before any compaction ran; auto
+   * mode may explicitly re-anchor it when the user starts a new task in the same
+   * session. This avoids carrying stale goals across nested compactions.
    */
   originalUserGoal?: string
   /**
@@ -589,7 +587,7 @@ export function buildFallbackCompactSummary(
     '## 1. Primary Request and Intent',
     '- Local fallback summary generated because the compact model did not produce a usable high-fidelity summary.',
     ...(options.originalUserGoal
-      ? [`- Original session goal (verbatim earliest user messages, captured at session start — may reflect the user's original objective; later explicit user redirections prevail): ${clip(options.originalUserGoal, FALLBACK_MAX_ANCHOR_CHARS)}`]
+      ? [`- Current top-level goal (deterministic runtime anchor; auto mode may re-anchor this when the user starts a new task): ${clip(options.originalUserGoal, FALLBACK_MAX_ANCHOR_CHARS)}`]
       : []),
     `- First explicit user request: ${firstUserText}`,
     ...(extraAnchors
@@ -715,14 +713,12 @@ function buildCompactContinuityAnchors(
     '- Treat exact file contents and exact command output as stale unless re-read or re-run.',
     '',
     '### Durable Objective Anchors',
-    // The original goal is captured pre-compaction by KernelSession. It guards
-    // against SUMMARY paraphrase drift (after compaction #1 the in-window
-    // "first" user message is merely the cloned keep-set anchor, not the
-    // session's actual goal) — but the label deliberately defers to later
-    // EXPLICIT user redirections: the anchor must never override a legitimate
-    // mid-session goal change by the user.
+    // The goal is captured pre-compaction by KernelSession, and auto mode can
+    // explicitly re-anchor it on a new top-level task. It guards against summary
+    // paraphrase drift without making the stale first message override a later
+    // legitimate goal change.
     ...(options.originalUserGoal
-      ? [`- Original session goal (verbatim earliest user messages, captured at session start — they LIKELY reflect the user's original objective. Trust them over any paraphrase in summaries; but if the user later EXPLICITLY changed the goal, the user's later instruction prevails): ${clip(options.originalUserGoal, CONTINUITY_MAX_ANCHOR_CHARS)}`]
+      ? [`- Current top-level goal (deterministic runtime anchor; auto mode may re-anchor this when the user starts a new task): ${clip(options.originalUserGoal, CONTINUITY_MAX_ANCHOR_CHARS)}`]
       : []),
     // P4: when the window contains a single real user message, first==latest —
     // emit ONE line instead of duplicating the same text twice.

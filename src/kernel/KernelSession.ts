@@ -42,16 +42,17 @@ export interface ManualCompactResult {
 }
 
 /**
- * Cap for the captured original-goal anchor text. Long enough to keep a
- * detailed first request verbatim, short enough that the anchor can never
- * meaningfully contribute to context pressure.
+ * Cap for the captured top-level goal anchor text. Long enough to keep a
+ * detailed request verbatim, short enough that the anchor can never meaningfully
+ * contribute to context pressure.
  */
 const ORIGINAL_GOAL_MAX_CHARS = 2_000
 /**
  * How many of the session's earliest real user messages are captured into the
- * "original session goal" anchor. The first message alone often under-specifies
+ * default top-level goal anchor. The first message alone often under-specifies
  * the goal (e.g. "帮我看个问题" followed by the actual task in message 2-3), so
- * the first few messages are kept together.
+ * the first few messages are kept together. Auto mode may replace this anchor
+ * when a new task is explicitly detected in the same backend session.
  */
 export const ORIGINAL_GOAL_MESSAGE_COUNT = 3
 /**
@@ -186,15 +187,12 @@ export class KernelSession {
   /** S1: guard against double dispose. */
   private _disposed = false
   /**
-   * The first ORIGINAL_GOAL_MESSAGE_COUNT real user requests seen by this
-   * session, captured BEFORE any compaction can fold them into a summary.
-   * Multiple messages are kept because the first message alone often
-   * under-specifies the goal (greeting/context first, actual task in message
-   * 2-3). Passed into the compact pipeline as a deterministic "original
-   * session goal" anchor so the goal survives any number of nested
-   * compactions verbatim — the in-history "first user message" anchor
-   * degrades after compaction #1 (it then points at the cloned
-   * last-user-message from the keep-set, not the session's original goal).
+   * The durable top-level user-goal anchor captured before compaction can fold
+   * it into a summary. Normal sessions keep the initial goal for the kernel
+   * lifetime; auto mode can explicitly re-anchor this when a user starts a new
+   * task in the same backend session. Multiple initial messages are kept
+   * because the first message alone often under-specifies the goal
+   * (greeting/context first, actual task in message 2-3).
    */
   private _originalUserGoalParts: string[] = []
 
@@ -202,7 +200,7 @@ export class KernelSession {
     this._config = { ...config }
     this._messages = [...(config.initialMessages ?? [])]
     // Resume path: recover the goal from the earliest real user messages in
-    // the restored history (best available source — pre-compact history is gone).
+    // the restored history (best available source; pre-compact history is gone).
     this._originalUserGoalParts = collectOriginalUserGoalParts(this._messages)
     this._fileCache = new FileStateCache()
     this._toolBatchCount = Math.max(0, config.initialToolBatchCount ?? 0)
@@ -366,10 +364,23 @@ export class KernelSession {
   }
 
   /**
+   * Replace the deterministic compact goal anchor with a new top-level task.
+   *
+   * Auto mode calls this when the user starts a NEW goal in an existing session
+   * so verify/drift/checkpoint and compaction all agree on the same current
+   * objective. Normal agentic/robotics sessions never call it; they keep the
+   * initial-goal behaviour.
+   */
+  reanchorOriginalGoal(goal: string): void {
+    const sanitized = extractUserGoalText(makeTextUserMessage(goal))
+    this._originalUserGoalParts = sanitized ? [sanitized] : []
+  }
+
+  /**
    * Manual (user-initiated) compaction — `/compact`.
    *
    * Runs the SAME pipeline as auto-compact (summary side-call, keep-set,
-   * deterministic anchors, original-goal anchor, quality gate + fallback) but
+   * deterministic anchors, top-level goal anchor, quality gate + fallback) but
    * bypasses the token-threshold check: the user decides WHEN, the pipeline
    * decides HOW. Refuses while a turn is in flight — compaction mutates the
    * message history the loop is iterating.
@@ -564,8 +575,10 @@ export class KernelSession {
         aborted_tools:     'error_during_execution',
         max_budget_usd:    'error_max_budget_usd',
         verify_exhausted:  'error_during_execution',
-        auto_runtime_limit: 'success',
-        auto_tool_batch_limit: 'success',
+        auto_verify_unavailable: 'error_during_execution',
+        auto_drift_unavailable: 'error_during_execution',
+        auto_runtime_limit: 'error_during_execution',
+        auto_tool_batch_limit: 'error_during_execution',
         error:             'error_during_execution',
       }
 
@@ -580,10 +593,7 @@ export class KernelSession {
         usage: addUsage(this._totalUsage, loopResult.totalUsage),
         costUsd: loopResult.costUsd,
         numTurns: loopResult.numTurns,
-        stopReason: loopResult.reason === 'auto_runtime_limit' ||
-          loopResult.reason === 'auto_tool_batch_limit'
-          ? loopResult.reason
-          : null,
+        stopReason: loopResult.reason === 'success' ? null : loopResult.reason,
         resultText: loopResult.resultText,
         permissionDenials: loopResult.permissionDenials,
       }

@@ -8,7 +8,7 @@
  * isCompactBoundary / isMeta / isSteering / isKeepSetClone ride along in
  * persistence and are restored here. Without them, a resumed session treats
  * compact summaries and keep-set clones as real user messages — breaking
- * boundary slicing and poisoning the original-goal anchor.
+ * boundary slicing and poisoning the top-level goal anchor.
  */
 import type { ConversationMessage } from '../core/types.js'
 import type { KernelMessage } from '../kernel/index.js'

@@ -28,6 +28,14 @@ export interface LoopState {
    */
   streamErrorRecoveryCount: number
 
+  /**
+   * How many CONSECUTIVE empty assistant end_turn responses have been recovered
+   * from in this turn. Some providers can transiently return an empty success
+   * envelope after gateway/network disruption; treating that as success leaves
+   * the CLI with only a footer and no visible answer.
+   */
+  emptyResponseRecoveryCount: number
+
   /** Number of completed agentic turns */
   turnCount: number
 
@@ -53,6 +61,7 @@ export function initialLoopState(
     maxOutputTokensOverride: undefined,
     hasAttemptedReactiveCompact: false,
     streamErrorRecoveryCount: 0,
+    emptyResponseRecoveryCount: 0,
     turnCount: 0,
     currentModel: model,
     fallbackTriggered: false,

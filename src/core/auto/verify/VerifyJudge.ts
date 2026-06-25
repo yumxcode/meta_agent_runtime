@@ -256,9 +256,8 @@ async function runJudge(
 }
 
 /**
- * Build the verify gate for an auto session. Returns undefined inputs handled
- * via fail-open: the gate always resolves (never rejects), defaulting to
- * done:true with an explanatory note whenever it cannot reach a real verdict.
+ * Build the verify gate for an auto session. Returns skipped verdicts when it
+ * cannot reach a real verdict; KernelLoop applies the auto gate-failure policy.
  */
 export function makeAutoVerifyGate(deps: AutoVerifyGateDeps): VerifyGateFn {
   return async ({ signal }) => {
