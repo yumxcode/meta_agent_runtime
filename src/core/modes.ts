@@ -23,7 +23,7 @@ import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 
 // ── Canonical mode union ───────────────────────────────────────────────────────
 
-export type SessionMode = 'agentic' | 'auto' | 'campaign' | 'robotics'
+export type SessionMode = 'agentic' | 'auto' | 'campaign' | 'robotics' | 'auto-orch'
 
 // Compile-time guarantee that the kernel-layer CompactProfile (which cannot
 // import this core module without inverting layering) stays in lockstep with
@@ -128,6 +128,34 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
       '是否启用子 Agent 编排以 "Robotics 开发模式" 节为准。' +
       '优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
     compactProfile: 'robotics',
+  },
+
+  // auto-orch is auto's autonomous + jailed executor PLUS an orchestration layer:
+  // an AI-authored plan graph (C) of executor/role nodes, and intra-turn phase
+  // hooks (B). Same weight/jail/autonomy as auto (it is a flavour, not heavier);
+  // the orchestration wiring is additive and lives outside the permission cage.
+  'auto-orch': {
+    weight: 1,
+    identityLine:
+      '你是 Meta-Agent，一个自主运行且具备自我编排能力的工程 Agent，专注于目标的达成与复杂任务的拆解执行。' +
+      '面对一个复杂目标，你会先规划出由多个子 Agent（执行者与审查角色，如校验、航向、复核）组成的协作流程，' +
+      '在工作区边界内持续自主推进，并在结束时清晰交代已完成与未完成的部分。',
+    currentModeText:
+      'AUTO-ORCH — 无人值守自主编排模式：在 AUTO 的全部授权与边界约束之上，额外启用多 Agent 编排。\n' +
+      '- **授权与边界**：与 AUTO 一致 —— 工作区内的写/删/改已获授权无需逐次确认；越界操作（git push、对外发布、改动他人环境）会被系统直接拒绝。\n' +
+      '- **自主编排**：面对复杂任务，可将其拆分为子任务并编排多个子 Agent 并行/串行执行；可为关键节点挂载审查角色（校验完成度、检查航向、复核产出）。\n' +
+      '- **编排即数据**：编排方案是一张受校验与硬上限约束的计划图，由固定引擎解释执行，而非自由代码；非法或越界的编排会被拒绝并回退到默认自主循环。\n' +
+      '- **进展留痕**：及时使用 `todo_write` / `progress_note` / `artifacts_register` 记录分解、进度与关键产出，用于航向检查与会话恢复。\n' +
+      '- **终止与总结**：完成或受阻时给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
+    compactProfile: 'auto-orch',
+    agenticOverrides: {
+      promptMode: 'auto-orch',
+      autonomy: {
+        autoApproveInWorkspace: true,
+        lockWorkspace: true,
+        deniedTools: AUTO_DENIED_TOOL_NAMES,
+      },
+    },
   },
 }
 

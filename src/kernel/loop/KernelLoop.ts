@@ -79,6 +79,7 @@ export type LoopTerminationReason =
   | 'auto_drift_unavailable'
   | 'auto_runtime_limit'
   | 'auto_tool_batch_limit'
+  | 'phase_hook_abort'
   | 'error'
 
 export interface LoopResult {
@@ -630,6 +631,40 @@ export async function* runKernelLoop(
     }
   }
 
+  // Phase-hook dispatch (auto-orch, B). No-op unless config.phaseHooks is set,
+  // so every existing mode makes ZERO extra calls (zero regression). The hook is
+  // advisory: it may inject meta user messages (applied at the next natural
+  // boundary, same as drift corrections) and/or request a clean abort. Fail-open:
+  // a throwing/hanging hook is swallowed and treated as an empty outcome.
+  // Returns true when the loop should terminate after this transition.
+  async function runPhaseHook(
+    point: import('./PhaseHooks.js').PhaseHookPoint,
+    extra?: { toolNames?: readonly string[]; erroredToolNames?: readonly string[] },
+  ): Promise<boolean> {
+    if (!config.phaseHooks) return false
+    try {
+      const outcome = await config.phaseHooks({
+        point,
+        workspaceRoot: config.cwd ?? process.cwd(),
+        state: {
+          turnCount: toolBatchCount,
+          estimatedCostUsd: totalCost,
+          toolNames: extra?.toolNames,
+          erroredToolNames: extra?.erroredToolNames,
+        },
+        signal,
+      })
+      if (outcome.inject?.length) {
+        for (const text of outcome.inject) {
+          append(makeTextUserMessage(text, { isMeta: true }))
+        }
+      }
+      return outcome.abort === true
+    } catch {
+      return false
+    }
+  }
+
   // Helper: push messages and re-point state.messages at the live array.
   //
   // S3: previously we did `state = { ...state, messages: [...mutableMessages] }`
@@ -833,6 +868,14 @@ export async function* runKernelLoop(
       resultText = PROMPT_TOO_LONG_ERROR_MESSAGE
       yield { type: 'text_delta', delta: PROMPT_TOO_LONG_ERROR_MESSAGE, sessionId }
       return done('blocking_limit')
+    }
+
+    // ── Phase hook: pre_query (auto-orch B) ───────────────────────────────────
+    // Fires right before the model is queried, after any injected messages are
+    // already appended so the hook's own inject lands on THIS turn.
+    if (await runPhaseHook('pre_query')) {
+      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort before query.'
+      return done('phase_hook_abort')
     }
 
     // ── Steps 7+8: stream API + accumulate messages ───────────────────────────
@@ -1149,6 +1192,14 @@ export async function* runKernelLoop(
     // Commit assistant messages to history
     append(...assistantMessages)
 
+    // ── Phase hook: post_query (auto-orch B) ──────────────────────────────────
+    // Fires after the assistant turn is committed, before tool execution. Lets a
+    // policy react to what the model just said / decided.
+    if (await runPhaseHook('post_query')) {
+      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort after query.'
+      return done('phase_hook_abort')
+    }
+
     // ── Collect tool_use blocks ──────────────────────────────────────────────
     const toolUseRequests = assistantMessages.flatMap(msg =>
       msg.content
@@ -1386,6 +1437,13 @@ export async function* runKernelLoop(
       await checkpoint({ type: 'external_before', externalToolNames: externalBefore })
     }
 
+    // ── Phase hook: pre_tool (auto-orch B) ────────────────────────────────────
+    const batchToolNames = toolUseRequests.map(req => req.toolName)
+    if (await runPhaseHook('pre_tool', { toolNames: batchToolNames })) {
+      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort before tool execution.'
+      return done('phase_hook_abort')
+    }
+
     const toolsResult = await runTools(toolUseRequests, config.tools, toolCtx, canUseTool)
     const toolNameByUseId = new Map(toolUseRequests.map(req => [req.toolUseId, req.toolName]))
 
@@ -1414,6 +1472,22 @@ export async function* runKernelLoop(
       config.onPermissionDenial?.(denial)
     }
     append(...toolsResult.toolResultMessages, ...toolsResult.extraMessages)
+
+    // ── Phase hook: post_tool (auto-orch B) ───────────────────────────────────
+    // Fires after the tool batch's results are committed. Surfaces which tools
+    // ran and which errored so a policy can react (e.g. inject a recovery hint).
+    const erroredToolNameSet = new Set<string>()
+    for (const resultMsg of toolsResult.toolResultMessages) {
+      for (const block of resultMsg.content) {
+        if (block.type !== 'tool_result' || block.is_error !== true) continue
+        const name = toolNameByUseId.get(block.tool_use_id)
+        if (name) erroredToolNameSet.add(name)
+      }
+    }
+    if (await runPhaseHook('post_tool', { toolNames: batchToolNames, erroredToolNames: [...erroredToolNameSet] })) {
+      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort after tool execution.'
+      return done('phase_hook_abort')
+    }
 
     // A kernel "turn" for checkpoint/drift purposes is one completed tool
     // batch, regardless of how many tools the model issued in that batch.

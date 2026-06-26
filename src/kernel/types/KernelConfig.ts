@@ -8,6 +8,7 @@ import type { CompactProfile } from '../compact/CompactPrompt.js'
 import type { VerifyGateFn } from '../loop/VerifyGate.js'
 import type { DriftGateFn } from '../loop/DriftGate.js'
 import type { CheckpointBoundaryFn } from '../loop/CheckpointBoundary.js'
+import type { PhaseHookFn } from '../loop/PhaseHooks.js'
 
 export type ThinkingConfig =
   | { type: 'disabled' }
@@ -237,6 +238,15 @@ export interface KernelConfig {
    * mid-flight drift checking.
    */
   driftGate?: DriftGateFn
+
+  /**
+   * Auto-orch main-loop phase hooks (B). When present, the loop calls this at the
+   * four intra-turn transitions (pre_query/post_query/pre_tool/post_tool) so an
+   * injected orchestration policy can observe and minimally steer (inject meta
+   * messages or abort). Absent = ZERO extra calls, so every existing mode is
+   * byte-for-byte unchanged. See loop/PhaseHooks.ts for the contract.
+   */
+  phaseHooks?: PhaseHookFn
 
   /**
    * Auto mode gate-failure policy. Only read when autonomousMode is true.

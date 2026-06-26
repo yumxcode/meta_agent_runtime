@@ -586,6 +586,9 @@ export class KernelSession {
         auto_drift_unavailable: 'error_during_execution',
         auto_runtime_limit: 'error_during_execution',
         auto_tool_batch_limit: 'error_during_execution',
+        // A phase hook requesting abort is an INTENTIONAL clean stop by the
+        // orchestration layer, not a failure — surface it as success.
+        phase_hook_abort:  'success',
         error:             'error_during_execution',
       }
 

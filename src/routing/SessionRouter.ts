@@ -104,6 +104,16 @@ export function isAutoContinuationPrompt(prompt: string): boolean {
   return AUTO_CONTINUATION_MARKERS.some(m => p === m || p.startsWith(m))
 }
 
+/**
+ * Autonomous modes share goal-capture, resume-preamble and dispose-flush
+ * behaviour: both run the jailed autonomous executor. auto-orch only adds the
+ * orchestration layer on top, so it must be treated as auto everywhere those
+ * lifecycle concerns are keyed off the mode.
+ */
+export function isAutonomousMode(mode: SessionMode | null): boolean {
+  return mode === 'auto' || mode === 'auto-orch'
+}
+
 export class SessionRouter {
   private readonly _cfg: ResolvedConfig
   private readonly _hint: SessionModeHint
@@ -279,7 +289,7 @@ export class SessionRouter {
     // resumed run continues instead of restarting. The CLI banner is shown only
     // to the human; this preamble is what the model actually sees.
     let effectivePrompt = prompt
-    if (this._currentMode === 'auto') {
+    if (isAutonomousMode(this._currentMode)) {
       const isFirstTurn = this._autoGoal === null
       const isContinuation = isAutoContinuationPrompt(prompt)
 
@@ -484,7 +494,7 @@ export class SessionRouter {
     }
     // Durable isolated-write worktrees intentionally survive dispose so a
     // resumed session can finalize/merge/conflict-recover them.
-    if (impl && this._currentMode === 'auto') {
+    if (impl && isAutonomousMode(this._currentMode)) {
       try {
         await this._autoCheckpointCoordinator?.flushDispose(impl.getSessionId())
       } catch { /* best-effort */ }
@@ -675,10 +685,13 @@ export class SessionRouter {
     switch (mode) {
       case 'agentic':
       case 'auto':
-        // Both run on the shared agentic backend (same loop + research wiring).
-        // AUTO differs only in its permission/sandbox posture (autonomous +
-        // config-locked workspace jail) and the AUTO prompt section — all carried
-        // by MODE_PROFILES[mode].agenticOverrides (undefined for plain agentic).
+      case 'auto-orch':
+        // All three run on the shared agentic backend (same loop + research
+        // wiring). AUTO adds the autonomous + config-locked workspace jail and
+        // the AUTO prompt section; AUTO-ORCH adds the same jail PLUS the
+        // orchestration layer (phase hooks + plan graph). The per-mode posture is
+        // carried by MODE_PROFILES[mode].agenticOverrides (undefined for plain
+        // agentic).
         return this._createAgenticBackend(MODE_PROFILES[mode].agenticOverrides)
 
       case 'campaign': {

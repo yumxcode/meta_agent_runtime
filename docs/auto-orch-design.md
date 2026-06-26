@@ -1,0 +1,169 @@
+# Auto-Orch Mode 设计文档
+
+> **状态：🚧 骨架已落地（本分支 `auto_orchestration`）**
+> 新增第五种模式 `auto-orch`，定位为 **`auto` 的自我编排变体**：在 `auto` 的自主执行 + 工作区硬牢笼之上，
+> 叠加 **(B) 主循环相位钩子** 与 **(C) AI 可编排的计划图**，让 AI 面对复杂任务时能自主构建一个
+> 由多个执行/审查 Agent 协作的 loop，而编排本身是**受校验的数据**、由固定引擎解释执行。
+>
+> 本分支已落地：新模式全链路注册（`tsc --noEmit` 通过）、B 的内核相位事件 + HookRegistry、
+> C 的 Loop IR + 统一 Verdict + PlanRunner，以及 17 条单测（全绿），且 `src/kernel` 310 条既有单测零回归。
+>
+> 关联文档：[auto-mode-design.md](auto-mode-design.md)
+
+---
+
+## 1. 定位与设计原则
+
+### 1.1 一句话定位
+
+`auto-orch` = `auto`（自主放行 + 文件系统硬牢笼）**＋ (B) 相位钩子中间件 ＋ (C) AI 编排的计划图**。
+
+与 `auto` 的唯一增量：面对复杂目标，AI 不再只作为单执行器线性推进，而是先产出一张
+**编排计划图**（执行节点 + 审查角色节点 + 条件边，可成环），由固定的 `PlanRunner` 解释执行；
+图内每个节点运行时还可挂载 **相位钩子**，在 `pre_query/post_query/pre_tool/post_tool` 四个
+回合内转换点上做最小干预（注入/中止）。
+
+### 1.2 三条贯穿全文的原则（继承 auto）
+
+| 原则 | 落地方式 |
+|------|---------|
+| **低耦合** | 内核只认 `PhaseHookFn` 契约，不 import 编排实现；模式→开关映射在 `MODE_PROFILES` 与 `SessionRouter` |
+| **零回归** | B 的相位事件是 *additive*：未配置 `phaseHooks` 时内核**零额外调用**，`agentic/auto/campaign/robotics` 字节不变 |
+| **编排即数据** | AI 产出的 loop 是可校验、可封顶、可重放的**数据图**，绝非自由代码；非法编排被拒并回退默认自主循环 |
+
+---
+
+## 2. 两层架构
+
+```
+┌─ (C) 编排层：AI 产出 OrchPlan(数据图) ──────────────────────────┐
+│   PlanRunner 解释：从 entry 走图 → 每节点跑一个 kernel session   │
+│   → 读统一 Verdict → 按条件边跳转（可成环）→ 硬上限封顶          │
+│        节点 = executor(干活) | role(verify/drift/reviewer/…)     │
+└───────────────────────────────────────────────────────────────┘
+            │ 每个节点运行时挂载 ↓
+┌─ (B) 相位钩子层：HookRegistry 实现内核 PhaseHookFn 契约 ────────┐
+│   pre_query / post_query / pre_tool / post_tool 四个回合内转换点 │
+│   每个钩子 = {point, when(谓词DSL), handler→Verdict}            │
+│   折叠为内核可消费的 {inject?, abort?}                          │
+└───────────────────────────────────────────────────────────────┘
+            │ 注入式 DI ↓
+┌─ 内核 KernelLoop（固定、battle-tested、不被 AI 改写）───────────┐
+│   query → (verify) → tools → (stall) → (drift) → loop          │
+└───────────────────────────────────────────────────────────────┘
+```
+
+要点：**内核循环固定且确定**，AI 只在外层（图）和钩子（数据谓词）两个受约束的维度上编排，
+永远跑在内核的牢笼、预算、并发、fail-open 之内。
+
+---
+
+## 3. (B) 主循环相位钩子
+
+### 3.1 内核契约（`src/kernel/loop/PhaseHooks.ts`）
+
+`PhaseHookFn = (event) => Promise<PhaseHookOutcome>`，沿用 `DriftGateFn`/`VerifyGateFn` 的纯 DI 模式。
+
+- **四个相位点**：`pre_query`（查询模型前）、`post_query`（助手回合落库后、执行工具前）、
+  `pre_tool`（工具批执行前）、`post_tool`（工具批结果落库后）。
+- **最小动作面**：钩子只能 (a) `inject` 元消息（在下一个自然边界注入，与 drift 校正同机制）
+  或 (b) `abort`（干净终止）。**不能**改历史、调工具、改写模型输出 —— 执行权始终在内核。
+- **零回归**：`KernelConfig.phaseHooks` 缺省时，`runPhaseHook` 直接 return，无任何额外调用。
+- **fail-open**：钩子抛错/超时被吞掉，按空结果处理。
+
+### 3.2 新增终止原因
+
+`LoopTerminationReason` 增加 `'phase_hook_abort'`，在 `KernelSession` 的 subtype 表里映射为
+`'success'`（编排层主动停机是**有意的干净停止**，非失败）。
+
+### 3.3 HookRegistry（`src/core/auto-orch/HookRegistry.ts`）
+
+把内核的两个写死 gate 槽，泛化为**开放注册表**：
+
+```ts
+reg.register({ id, point, when?: Predicate, handler: (ctx) => OrchVerdict, role? })
+const phaseHooks = reg.toPhaseHookFn()   // 即内核 PhaseHookFn
+```
+
+`toPhaseHookFn` 在每个相位点求值 `when` 谓词 → 顺序跑命中的钩子 → 折叠 verdict（inject 去重合并，
+任一 abort 即 abort）。drift/verify 在这套体系里只是「挂在结构边界上的两个角色」的特例。
+
+---
+
+## 4. (C) AI 编排的计划图
+
+### 4.1 Loop IR（`src/core/auto-orch/LoopIR.ts`）
+
+AI Planner 产出的 **数据图**：
+
+- `OrchNode`：`{ id, kind: 'executor'|'role', role?, taskDescription, allowedTools?, maxTurns?,
+  maxBudgetUsd?, workspaceMode?, hooks? }`。写文件的 executor **必须** `workspaceMode: 'isolated_write'`
+  （校验强制）。`hooks` 是只在该节点运行时生效的相位钩子（B 挂进 C）。
+- `OrchEdge`：`{ from, to, when? }`，条件 `always | verdictLabel | verdictAction`。**回边即循环**
+  （verify fail → 回到 gen 就是 generate→verify→fix 环）。
+- `OrchBounds`：`maxNodeVisits / maxTotalSteps / maxTotalCostUsd / maxWallClockMs` —— AI 工作的硬墙。
+- `validatePlan`：唯一 id、entry 存在、边引用合法、谓词合法、写节点隔离 —— **非法计划绝不执行**。
+
+### 4.2 统一 Verdict（`src/core/auto-orch/Verdict.ts`）
+
+图与钩子都消费同一个 `OrchVerdict`，动作集闭合为五种：
+`continue | inject | reject | branch | done | abort`。
+提供 `fromDrift` / `fromVerify` 适配器，让既有 drift/verify Agent 不改写就能接入。
+
+### 4.3 谓词 DSL（`src/core/auto-orch/predicates.ts`）
+
+触发谓词是**纯数据**（`turnInterval / atPoint / onBoundary / verdictLabel / anyToolErrored /
+counterAtLeast / costAtLeast / and|or|not`），`evalPredicate` 全函数、无副作用。
+这是「AI 组合主循环过程钩子却不执行任意逻辑」的关键。
+
+### 4.4 PlanRunner（`src/core/auto-orch/PlanRunner.ts`）
+
+固定解释器：校验 → 从 entry 走图 → 每节点经注入的 `NodeRunner` 执行 → 读 verdict → 选首个命中
+的出边跳转 → 直到无命中边（终止）或 `abort`。全程封顶（visits/steps/cost/wall-clock），
+**永不抛异常**：任何失败路径都落成 `PlanRunResult{status}`，host 据此回退默认固定循环。
+
+`NodeRunner` 是接口，单测用 stub，**实盘 drop-in** 是「经 `ISubAgentDispatcher` spawn 一个 kernel
+子 session」。
+
+---
+
+## 5. 模式注册（全链路）
+
+| 文件 | 改动 |
+|------|------|
+| `src/core/modes.ts` | `SessionMode` += `'auto-orch'`；`MODE_PROFILES['auto-orch']`（weight 1，编排身份/模式文案，`compactProfile: 'auto-orch'`，`agenticOverrides` 复用 auto 的 autonomy 牢笼 + `promptMode: 'auto-orch'`）。`MODE_WEIGHT` 自动派生。 |
+| `src/kernel/compact/CompactPrompt.ts` | `CompactProfile` += `'auto-orch'`（compile-time `Exact<SessionMode,CompactProfile>` 要求对齐）；`SECTION_INSTRUCTIONS_BY_PROFILE['auto-orch']` 复用 auto 模板。 |
+| `src/routing/SessionRouter.ts` | `_createImpl` 的 `case 'auto-orch'` 走共享 agentic backend；新增 `isAutonomousMode()` helper，把 goal 捕获 / resume / dispose-flush 三处 `=== 'auto'` 收敛为「auto 与 auto-orch 同列」。 |
+| `src/kernel/KernelSession.ts` | `subtypeMap` 补 `phase_hook_abort: 'success'`。 |
+
+---
+
+## 6. 文件清单
+
+**新增**
+- `src/kernel/loop/PhaseHooks.ts` — B 的内核契约
+- `src/core/auto-orch/{Verdict,predicates,HookRegistry,LoopIR,PlanRunner,index}.ts` — B+C 实现
+- `src/core/auto-orch/__tests__/autoOrch.test.ts` — 17 条单测
+- `docs/auto-orch-design.md` — 本文档
+
+**修改**
+- `src/kernel/types/KernelConfig.ts` — `phaseHooks?: PhaseHookFn`
+- `src/kernel/loop/KernelLoop.ts` — `runPhaseHook` helper + 四个相位发火点 + `phase_hook_abort`
+- `src/kernel/KernelSession.ts`、`src/kernel/compact/CompactPrompt.ts`、`src/core/modes.ts`、`src/routing/SessionRouter.ts`
+
+---
+
+## 7. 实现状态与未开发项
+
+**已实现（本分支）**
+- ✅ B：内核四相位事件 + HookRegistry + 谓词 DSL + 统一 Verdict（含 drift/verify 适配器）
+- ✅ C：Loop IR + `validatePlan` + PlanRunner（成环、硬封顶、fail-open）
+- ✅ 新模式 `auto-orch` 全链路注册，`tsc --noEmit` 通过
+- ✅ 17 条单测全绿；`src/kernel` 310 条既有单测零回归
+
+**未开发（标 TODO，后续 PR）**
+1. **Planner Agent**：让 LLM 产出 `OrchPlan` 的角色 + 工具（输出 JSON 计划，复用子 Agent「输出 JSON 代码块」范式 + `validatePlan` 把关）。
+2. **实盘 NodeRunner**：把 `NodeRunner.run` 接到 `ISubAgentDispatcher.spawnSubAgent`（executor → isolated_write 分支 + 事后 merge；role → 只读快照），并把每节点 `hooks` 装配进该子 session 的 `KernelConfig.phaseHooks`。
+3. **AgenticBackendFactory 装配**：`auto-orch` 时构造默认 HookRegistry 并注入 `phaseHooks`；把 drift/verify 也改写成注册到 registry 的角色（替掉两个固定槽）。
+4. **Blackboard**：节点间共享通道（按 plan_id/task_id 寻址），支撑真正的兄弟间并行协作（见 auto-mode 讨论中「当前只有父子无兄弟」一项）。
+5. **闭环重规划**：在结构边界回调 Planner 改图，受 `replan-depth` 上限约束。
