@@ -19,8 +19,10 @@
  *   AUTO     — AGENTIC + autonomous execution (no per-tool confirmation) + a
  *              hard workspace jail (write/delete/replace strictly confined to
  *              the project working path; the jail cannot be unlocked by config).
- *              A sibling "flavour" of AGENTIC, not a heavier mode. Activated
- *              explicitly (--mode auto) or on strong autonomy-intent signals.
+ *              A sibling "flavour" of AGENTIC, not a heavier mode. Entered
+ *              EXPLICITLY ONLY (--mode auto); never inferred from prompt wording
+ *              or autonomy-intent signals (see ModeDetector and the explicit lock
+ *              below) — auto-inference would silently drop the jail.
  *
  * Mode upgrade path (within a session):
  *   AGENTIC → CAMPAIGN   (never downgrade)

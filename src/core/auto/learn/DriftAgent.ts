@@ -46,8 +46,10 @@ const DRIFT_RUBRIC = `\
 
 A. 判断是否偏离目标
 - 对照原始目标与进度快照，判断当前推进方向是否仍然正确。
+- 快照里的 editDigest（若有）是最近一段文件改动的自动摘要——当执行 Agent 长时间只改代码、没写 todo/progress 时，它是你判断方向的主要线索。优先据此用 git diff / 阅读相关文件核对改动是否贴合目标。
 - 可用只读工具（read_file/grep/glob/bash）到工作区核对实际状态，但**不要修改任何文件**。
 - "偏离"指：在做与目标无关的事、纠缠于次要细节、朝错误方案越走越远、或快照显示的已完成项与目标南辕北辙。正常的中途状态不算偏离。
+- 结合 runHealth 判断运行轨迹（不只是当前状态）：driftCorrections 已多次（尤其紧邻 lastDriftCorrectionTurn 后进展仍无变化）说明前几次纠偏无效、可能在打转，应判为 major 并给出更强或换向的纠偏；lastVerifyRejectTurn 临近 currentTurn 说明刚被 verify 驳回，应重点核对是否在补齐被驳回的缺口，而非又开新支线；compactions 较多说明上下文被多次压缩、易丢失目标，应更严格地核对目标对齐。
 
 B. 沉淀经验（严格）
 - 只有当你掌握**确凿证据**时，才调用 experience_write 写入一条经验。
@@ -171,6 +173,20 @@ export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
           artifacts: cp.artifacts ?? [],
           turnCount: cp.turnCount,
           note: cp.note,
+          // Auto-generated recap of recent file edits — present when the agent
+          // edited for a long stretch without an explicit todo/progress update.
+          editDigest: cp.autoEditSummary,
+          // Run-health: trajectory signals. Repeated corrections without progress
+          // = stalling; a recent verify rejection = claimed-done-but-wasn't; a
+          // compaction = possible loss of goal context.
+          runHealth: {
+            verifyRejections: cp.verifyRejections ?? 0,
+            driftCorrections: cp.driftCorrections ?? 0,
+            compactions: cp.compactions ?? 0,
+            lastVerifyRejectTurn: cp.lastVerifyRejectTurn,
+            lastDriftCorrectionTurn: cp.lastDriftCorrectionTurn,
+            currentTurn: cp.turnCount,
+          },
         },
         null,
         2,

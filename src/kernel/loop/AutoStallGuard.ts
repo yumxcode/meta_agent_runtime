@@ -26,7 +26,7 @@ export const AUTO_STALL_SOFT_LIMIT = 3
 export const AUTO_NO_FS_PROGRESS_LIMIT = 12
 
 /** Tools that constitute real filesystem progress when they succeed. */
-const FS_MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'notebook_edit'])
+export const FS_MUTATING_TOOLS = new Set(['write_file', 'edit_file', 'notebook_edit'])
 
 /** The self-eval prompt injected when a soft stall threshold is first crossed. */
 export const SELF_EVAL_PROMPT =

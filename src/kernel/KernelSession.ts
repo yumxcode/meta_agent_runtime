@@ -374,6 +374,13 @@ export class KernelSession {
   reanchorOriginalGoal(goal: string): void {
     const sanitized = extractUserGoalText(makeTextUserMessage(goal))
     this._originalUserGoalParts = sanitized ? [sanitized] : []
+    // A NEW top-level task starts a fresh drift window from the current durable
+    // point: the new goal must produce its OWN checkpoint advance + 30 new tool
+    // batches before drift fires, instead of inheriting the prior task's drift
+    // cadence (which could fire immediately or never). Mirrors the resume-path
+    // baseline reset in the constructor. Revision itself stays monotonic.
+    this._lastDriftToolBatchCount = this._toolBatchCount
+    this._lastDriftCheckpointRevision = this._checkpointRevision
   }
 
   /**

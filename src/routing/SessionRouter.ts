@@ -344,15 +344,25 @@ export class SessionRouter {
     try { deleteTodosForSession(sessionId) } catch { /* best-effort */ }
     try { deleteProgressNoteForSession(sessionId) } catch { /* best-effort */ }
     try { deleteArtifactsForSession(sessionId) } catch { /* best-effort */ }
+    // Clear the coordinator's in-memory run-scoped state (run-health counters, FS
+    // digest streak, pending digest) so the prior task's signals are not written
+    // back into the new goal's checkpoint on the next flush.
+    this._autoCheckpointCoordinator?.resetRunScopedState()
     // Hard reset (not a merge): a fresh checkpoint with empty completedSteps /
     // pendingTodos so drift never compares the NEW goal against the prior task's
     // progress. updateAutoCheckpoint would union the old steps back in, so we
     // overwrite the whole record here.
+    //
+    // CRITICAL: keep the revision MONOTONIC (use the coordinator's current value,
+    // not 0). Zeroing it desyncs from KernelSession's persisted checkpointRevision
+    // — the next flush would write rev 1, Math.max(oldLarge, 1) stays oldLarge,
+    // so drift's checkpointAdvanced gate stays false for ~oldLarge checkpoints
+    // (drift starvation on the new task).
     await writeAutoCheckpoint(this._cfg.projectDir ?? process.cwd(), {
       schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
       sessionId,
       updatedAt: Date.now(),
-      revision: 0,
+      revision: this._autoCheckpointCoordinator?.latestRevision ?? 0,
       goal: prompt,
     })
   }

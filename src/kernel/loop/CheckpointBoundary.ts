@@ -26,6 +26,11 @@ export interface CheckpointBoundaryEvent {
   estimatedCostUsd: number
   /** Successful tools in the just-completed batch, when applicable. */
   successfulToolNames?: string[]
+  /**
+   * Workspace file paths mutated by successful FS tools in this batch. Used by
+   * the host to accumulate an edit digest over long code-editing stretches.
+   */
+  mutatedPaths?: string[]
   /** Tool names requiring a before/after external-operation boundary. */
   externalToolNames?: string[]
   /** Termination reason for terminal boundaries. */

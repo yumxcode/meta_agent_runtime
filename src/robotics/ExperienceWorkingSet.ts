@@ -56,8 +56,11 @@ interface ExperiencePreloadTrace {
 
 function normalizeExperienceKeyword(keyword: string): string | null {
   const normalized = keyword.trim().toLowerCase()
-  if (normalized.length < 3) return null
-  return normalized
+  if (normalized.length >= 3) return normalized
+  // Accept 2-char CJK terms — Chinese technical terms (步态/标定/力矩) are often
+  // exactly two characters and would otherwise be dropped before store search.
+  if (normalized.length === 2 && /[一-鿿]/.test(normalized)) return normalized
+  return null
 }
 
 function formatExperienceCandidate(e: ExperienceMatch): string {
@@ -243,7 +246,7 @@ export class ExperienceWorkingSetManager {
       system: EXPERIENCE_RELEVANCE_SYSTEM,
       user: [
         `User task:\n${prompt.slice(0, 800)}`,
-        `Intent: ${intent.intent}; risk=${intent.riskLevel}; domains=${intent.domains.join(', ')}`,
+        `Intent: ${intent.intent}; domains=${intent.domains.join(', ')}`,
         `Search keywords: ${intent.searchKeywords.join(', ')}`,
         `Candidate experiences:\n${candidates.map(formatExperienceCandidate).join('\n\n')}`,
       ].join('\n\n'),
@@ -253,7 +256,6 @@ export class ExperienceWorkingSetManager {
         .update([
           prompt.slice(0, 800),
           intent.intent,
-          intent.riskLevel,
           intent.domains.join(','),
           intent.searchKeywords.join(','),
           candidates.map(c => c.id).join(','),

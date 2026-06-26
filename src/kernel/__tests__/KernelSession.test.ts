@@ -372,6 +372,93 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
     }))
   })
 
+  it('runs drift during a pure code-editing stretch (FS-mutating tools advance the checkpoint)', async () => {
+    // Regression: edit_file/write_file are not state tools, but a long editing
+    // run with no todo/progress updates must still advance the checkpoint
+    // revision so the drift gate can fire mid-task.
+    let revision = 0
+    const driftGate = vi.fn(async () => ({ drifted: false, corrective: [] }))
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') {
+        revision++
+        return { updated: true, revision }
+      }
+      return { updated: false, revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall <= 30) {
+        yield* toolUseStream(`edit-${apiCall}`, 'edit_file', { batch: apiCall })
+      } else {
+        yield* textStream('done')
+      }
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 35,
+      tools: [makeTool('edit_file')],
+      autonomousMode: true,
+      driftGate,
+      onCheckpointBoundary,
+    }))
+    const events = await collectEvents(session, 'run')
+
+    expect(events.find(e => e.type === 'result')?.subtype).toBe('success')
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(driftGate).toHaveBeenCalledWith(expect.objectContaining({
+      turnCount: 30,
+      reason: 'turn_interval',
+    }))
+  })
+
+  it('reanchorOriginalGoal resets the drift baseline to the current durable point', async () => {
+    let revision = 0
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      if (event.type === 'tool_batch_completed' || event.type === 'termination') {
+        revision++
+        return { updated: true, revision }
+      }
+      return { updated: false, revision }
+    })
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall <= 3) {
+        yield* toolUseStream(`t-${apiCall}`, 'todo_write', { batch: apiCall })
+      } else {
+        yield* textStream('done')
+      }
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 10,
+      tools: [makeTool('todo_write')],
+      autonomousMode: true,
+      driftGate: vi.fn(async () => ({ drifted: false, corrective: [] })),
+      onCheckpointBoundary,
+    }))
+    await collectEvents(session, 'task one')
+
+    const s = session as unknown as {
+      _checkpointRevision: number
+      _toolBatchCount: number
+      _lastDriftCheckpointRevision: number
+      _lastDriftToolBatchCount: number
+    }
+    // The short run advanced the revision but never fired drift (< 30 batches),
+    // so the drift baseline lags behind the current durable point.
+    expect(s._checkpointRevision).toBeGreaterThan(0)
+    expect(s._lastDriftCheckpointRevision).toBeLessThan(s._checkpointRevision)
+
+    // Re-anchoring to a new goal must sync the baseline so the new task needs its
+    // OWN checkpoint advance + 30 batches (no inherited cadence, no starvation).
+    session.reanchorOriginalGoal('task two')
+    expect(s._lastDriftCheckpointRevision).toBe(s._checkpointRevision)
+    expect(s._lastDriftToolBatchCount).toBe(s._toolBatchCount)
+  })
+
   it('auto verify unavailable stops instead of reporting success', async () => {
     mockStream.mockImplementation(() => textStream('done'))
     const verifyGate = vi.fn(async () => ({

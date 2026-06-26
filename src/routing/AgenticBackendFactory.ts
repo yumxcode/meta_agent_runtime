@@ -24,6 +24,7 @@ import type { AutonomyProfile } from '../core/types.js'
 import type { AgentMode } from '../core/dynamicPrompt.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
+import { FlashClient } from '../core/flash/FlashClient.js'
 import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
 import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
 import {
@@ -102,11 +103,41 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     ? () => renderRecentExperiences(autoExperienceStore)
     : undefined
 
+  // Edit-digest summarizer (auto only): one cheap flash side-call, fired by the
+  // checkpoint coordinator at most once per N FS-only checkpoints, to recap a
+  // long code-editing stretch when the agent never wrote a todo/progress update.
+  const editDigestFlash = isAuto ? new FlashClient(baseConfig) : null
+  const summarizeEdits = editDigestFlash
+    ? async (paths: string[]): Promise<string | null> =>
+        editDigestFlash.query({
+          system:
+            '你是一个代码改动摘要器。根据最近被修改的文件路径列表，用一句话（≤60字）概括这段时间大致在做什么改动。' +
+            '只输出这一句话，不要解释、不要列表。',
+          user: `最近修改的文件（去重）:\n${paths.slice(0, 40).join('\n')}`,
+          maxTokens: 120,
+          // Fire-and-forget (never blocks the kernel), so a generous timeout just
+          // raises the digest's success rate on a slow provider.
+          timeoutMs: 30_000,
+        })
+    : undefined
+
   const checkpointCoordinator = isAuto
     ? new AutoCheckpointCoordinator({
         projectDir,
         initialRevision: resumeCheckpoint?.revision ?? 0,
         initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
+        // Carry the monotonic run-health counters across resume so trajectory
+        // signals (rejections / corrections / compactions) are not lost.
+        initialRunHealth: resumeCheckpoint
+          ? {
+              verifyRejections: resumeCheckpoint.verifyRejections,
+              driftCorrections: resumeCheckpoint.driftCorrections,
+              compactions: resumeCheckpoint.compactions,
+              lastVerifyRejectTurn: resumeCheckpoint.lastVerifyRejectTurn,
+              lastDriftCorrectionTurn: resumeCheckpoint.lastDriftCorrectionTurn,
+            }
+          : undefined,
+        summarizeEdits,
         getSnapshot: sessionId => {
           const allTodos = getTodosForSession(sessionId)
           return {

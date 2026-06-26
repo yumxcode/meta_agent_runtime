@@ -37,6 +37,12 @@ export interface AutoCheckpoint {
   goal?: string
   /** Short free-form progress note / latest summary. */
   note?: string
+  /**
+   * Auto-generated one-line digest of recent file edits, produced when the agent
+   * mutates files for a long stretch without writing a todo/progress update.
+   * Gives the drift gate a real anchor when the explicit state fields are empty.
+   */
+  autoEditSummary?: string
   /** Steps already completed (durable, append-only across turns). */
   completedSteps?: string[]
   /** Outstanding to-dos at checkpoint time. */
@@ -50,6 +56,21 @@ export interface AutoCheckpoint {
   estimatedCostUsd?: number
   /** Why the run stopped, when known (e.g. 'max_budget_usd', 'max_turns'). */
   stopReason?: string
+  // ── Run-health counters (monotonic, deterministic) ────────────────────────
+  // Lifecycle signals the drift gate uses to judge run TRAJECTORY, not just the
+  // current state: repeated corrections with no progress = stalling; a recent
+  // verify rejection = the agent thought it was done but wasn't; a compaction =
+  // possible loss of goal context. All incremented in the coordinator, no LLM.
+  /** How many times the verify gate rejected a "done" claim. */
+  verifyRejections?: number
+  /** How many times the drift gate injected a course correction. */
+  driftCorrections?: number
+  /** How many compactions occurred (counted once per compaction). */
+  compactions?: number
+  /** turnCount at the most recent verify rejection (recency for drift). */
+  lastVerifyRejectTurn?: number
+  /** turnCount at the most recent drift correction (recency for drift). */
+  lastDriftCorrectionTurn?: number
 }
 
 /** Absolute path of the auto checkpoint file for a workspace. */
@@ -191,6 +212,9 @@ export async function updateAutoCheckpointWithStatus(
     lastBoundary: patch.lastBoundary ?? prior?.lastBoundary,
     goal: (patch.goal ?? prior?.goal)?.slice(0, MAX_GOAL_CHARS),
     note: (patch.note ?? prior?.note)?.slice(0, MAX_NOTE_CHARS),
+    // Latest-wins: a fresh edit digest replaces the old one; otherwise it persists
+    // so the drift gate always sees the most recent recap of file edits.
+    autoEditSummary: (patch.autoEditSummary ?? prior?.autoEditSummary)?.slice(0, MAX_NOTE_CHARS),
     completedSteps: union(prior?.completedSteps, patch.completedSteps, MAX_COMPLETED_STEPS),
     // pendingTodos / activeSubAgentIds reflect the latest state, not a union.
     pendingTodos: bounded(
@@ -208,6 +232,15 @@ export async function updateAutoCheckpointWithStatus(
     turnCount: maxDefined(prior?.turnCount, patch.turnCount),
     estimatedCostUsd: patch.estimatedCostUsd ?? prior?.estimatedCostUsd,
     stopReason: patch.stopReason ?? prior?.stopReason,
+    // Run-health counters use latest-wins, not max: the coordinator always writes
+    // its absolute current value (so they climb monotonically during a task), and
+    // a re-anchor deliberately resets them to 0 for the new goal — which max would
+    // wrongly block. A write that omits them keeps the prior value.
+    verifyRejections: patch.verifyRejections ?? prior?.verifyRejections,
+    driftCorrections: patch.driftCorrections ?? prior?.driftCorrections,
+    compactions: patch.compactions ?? prior?.compactions,
+    lastVerifyRejectTurn: patch.lastVerifyRejectTurn ?? prior?.lastVerifyRejectTurn,
+    lastDriftCorrectionTurn: patch.lastDriftCorrectionTurn ?? prior?.lastDriftCorrectionTurn,
   }
   return {
     checkpoint: next,

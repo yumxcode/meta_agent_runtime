@@ -15,8 +15,11 @@ const MAX_CANDIDATE_POOL = 60
 
 function normalizeKeyword(keyword: string): string | null {
   const normalized = keyword.trim().toLowerCase()
-  if (normalized.length < 3) return null
-  return normalized
+  if (normalized.length >= 3) return normalized
+  // Accept 2-char CJK terms — Chinese technical terms (步态/标定/力矩) are often
+  // exactly two characters; substring search (title+problem+solution) matches them.
+  if (normalized.length === 2 && /[一-鿿]/.test(normalized)) return normalized
+  return null
 }
 
 function keywordHitCount(entry: ExperienceEntry, keywords: string[]): number {

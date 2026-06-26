@@ -753,6 +753,30 @@ export class RoboticsSession implements RoboticsCapabilities {
   }
 
   /**
+   * Re-hydrate the in-memory _state snapshot from disk.
+   *
+   * The store-mutating tools (experiment_dispatch / paper_search / progress_note)
+   * write ONLY the on-disk state via RoboticsProjectStore static methods; they
+   * never touch this._state. Disk is the single source of truth, so the SYNC
+   * consumers of _state — R3 render (buildR3Section getter), the compact anchor
+   * thunks (_compactContext), and dispose() worktree cleanup — must re-read it
+   * at their async checkpoints or they observe a stale snapshot loaded at init().
+   *
+   * Re-hydration is lossless: every in-memory write to _state (agentMode in
+   * _classifyAgentMode, the fresh-create path) is mirrored to disk, so reloading
+   * never drops a mutation. No-op when the read returns null (outside the resume
+   * window — kept fresh by the heartbeat — or a transient miss) so a bad read
+   * never clobbers a good in-memory copy.
+   */
+  private async _refreshState(): Promise<void> {
+    if (!this._storeSessionId) return
+    const fresh = await RoboticsProjectStore
+      .findBySession(this.projectDir, this._storeSessionId)
+      .catch(() => null)
+    if (fresh) this._state = fresh
+  }
+
+  /**
    * Build the robotics compact instructions synchronously from live state.
    *
    * Wired into the kernel via config.compact.customInstructions as a thunk, so
@@ -883,7 +907,10 @@ export class RoboticsSession implements RoboticsCapabilities {
       await this.bridge?.cancelAll()
     } catch { /* best-effort */ }
 
-    // Clean up active worktrees and purge state records
+    // Clean up active worktrees and purge state records. Re-hydrate first so
+    // worktrees registered by tools AFTER init() (which only wrote disk) are
+    // visible here and actually removed instead of leaked.
+    await this._refreshState()
     const state = this._state
     if (state && state.activeSubAgentTasks.length > 0) {
       await Promise.allSettled(
@@ -952,9 +979,17 @@ export class RoboticsSession implements RoboticsCapabilities {
         await this._classifyAgentMode(prompt)
       }
 
+      // ── Re-hydrate _state from disk ───────────────────────────────────────────
+      // The store-mutating tools only write disk; reload so this turn's R3
+      // (subagent_tasks) reflects tasks dispatched on the previous turn instead
+      // of the snapshot captured at init().
+      await this._refreshState()
+
       // ── QueryAnalyzer: fire in parallel with stable section building ──────────
-      // Heuristic + flash-model intent analysis (2 min timeout built in). Result
-      // drives proactive context pre-loading before the first tool call this turn.
+      // Heuristic + flash-model intent analysis. analyze() self-bounds its wait
+      // (~5s) and returns heuristics if flash is slow, so this await can never
+      // stall the turn on provider latency. Result drives proactive context
+      // pre-loading before the first tool call this turn.
       const queryIntentPromise = this.queryAnalyzer
         ? this.queryAnalyzer.analyze(prompt).catch(() => null)
         : Promise.resolve(null)
@@ -1014,6 +1049,14 @@ export class RoboticsSession implements RoboticsCapabilities {
         // The refreshed snapshots are applied on the next submit's stable prompt
         // assembly (config is captured at submit time).
         if (ev.type === 'compact_start') {
+          // Refresh _state BEFORE the R4/R5 snapshots and before control returns
+          // to autoCompactIfNeeded, which synchronously invokes the compact
+          // anchor thunks (_buildCompactInstructions / _buildDeterministicCompactAnchors
+          // → _compactContext reads this._state). The inner generator is suspended
+          // on the compact_start yield (KernelLoop.ts:747) at this point, so this
+          // refresh is guaranteed to land before the thunks fire — task_id /
+          // on_complete then survive compaction.
+          await this._refreshState()
           this._refreshR5Snapshot()
           await this._refreshR4Snapshot()
           this.experienceWorkingSet.forceReload()
@@ -1052,6 +1095,7 @@ export class RoboticsSession implements RoboticsCapabilities {
    * reload so the post-compact stable prompt reflects current state.
    */
   async compactNow(): Promise<import('../kernel/index.js').ManualCompactResult> {
+    await this._refreshState()
     this._refreshR5Snapshot()
     await this._refreshR4Snapshot()
     this.experienceWorkingSet.forceReload()

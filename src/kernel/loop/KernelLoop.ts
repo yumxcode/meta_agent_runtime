@@ -9,7 +9,7 @@ import type { KernelEvent, PermissionDenial } from '../types/KernelEvent.js'
 import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
 import {
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
-  SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs,
+  SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
 } from './AutoStallGuard.js'
 import { MAX_VERIFY_ROUNDS, buildVerifyRejectionPrompt } from './VerifyGate.js'
 import type { VerifyVerdict } from './VerifyGate.js'
@@ -1433,11 +1433,21 @@ export async function* runKernelLoop(
     }
 
     const successfulToolNames = new Set<string>()
+    const inputByUseId = new Map(toolUseRequests.map(req => [req.toolUseId, req.input]))
+    const mutatedPaths: string[] = []
     for (const resultMsg of toolsResult.toolResultMessages) {
       for (const block of resultMsg.content) {
         if (block.type !== 'tool_result' || block.is_error === true) continue
         const name = toolNameByUseId.get(block.tool_use_id)
-        if (name) successfulToolNames.add(name)
+        if (!name) continue
+        successfulToolNames.add(name)
+        // Collect the path a successful FS-mutating tool wrote, so the host can
+        // accumulate an edit digest across long code-editing stretches.
+        if (FS_MUTATING_TOOLS.has(name)) {
+          const input = inputByUseId.get(block.tool_use_id) as Record<string, unknown> | undefined
+          const path = input?.['file_path'] ?? input?.['notebook_path']
+          if (typeof path === 'string' && path) mutatedPaths.push(path)
+        }
       }
     }
 
@@ -1453,13 +1463,22 @@ export async function* runKernelLoop(
       await checkpoint({ type: 'external_after', externalToolNames: externalAfter })
     }
 
-    const successfulStateTools = [...successfulToolNames].filter(name =>
-      CHECKPOINT_STATE_TOOLS.has(name),
+    // Durable-progress checkpoint. A batch represents durable progress worth a
+    // checkpoint when it either updated explicit state (todo/progress/artifacts)
+    // OR successfully mutated a workspace file. The FS arm matters because the
+    // auto drift gate below requires the checkpoint revision to advance; without
+    // it, a long code-editing stretch that never touches todo/progress would
+    // never advance the revision, so mid-task drift/course-correction would never
+    // run. Drift cadence stays bounded by DRIFT_TURN_INTERVAL, and the
+    // checkpoint-advanced gate still suppresses drift during pure read/plan phases.
+    const durableProgressTools = [...successfulToolNames].filter(name =>
+      CHECKPOINT_STATE_TOOLS.has(name) || FS_MUTATING_TOOLS.has(name),
     )
-    if (successfulStateTools.length > 0) {
+    if (durableProgressTools.length > 0) {
       await checkpoint({
         type: 'tool_batch_completed',
-        successfulToolNames: successfulStateTools,
+        successfulToolNames: durableProgressTools,
+        mutatedPaths: mutatedPaths.length > 0 ? [...new Set(mutatedPaths)] : undefined,
       })
     }
 
