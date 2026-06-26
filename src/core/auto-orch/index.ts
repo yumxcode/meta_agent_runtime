@@ -59,3 +59,11 @@ export type {
   PlanRunResult,
 } from './PlanRunner.js'
 export { PlanRunner, DEFAULT_BOUNDS } from './PlanRunner.js'
+
+// ── C: planner (graph authoring) ───────────────────────────────────────────────
+export type { AutoOrchPlannerDeps, PlannerOutcome } from './PlannerAgent.js'
+export {
+  makeAutoOrchPlanner,
+  parseOrchPlan,
+  singleExecutorPlan,
+} from './PlannerAgent.js'
