@@ -50,6 +50,44 @@ function stubDispatcher(summary: string | null): ISubAgentDispatcher {
   }
 }
 
+/** A dispatcher that yields a DIFFERENT canned summary per spawn (FIFO), so we
+ * can exercise the planner's retry loop (invalid plan → re-plan → valid). */
+function queueStub(summaries: (string | null)[]): ISubAgentDispatcher {
+  const recs = new Map<string, SubAgentRecord>()
+  return {
+    async spawnSubAgent() {
+      const summary = summaries.shift() ?? null
+      const taskId = makeSubAgentTaskId()
+      const rec: SubAgentRecord = {
+        schemaVersion: '1.0',
+        taskId,
+        parentSessionId: 'parent',
+        status: 'completed',
+        config: { taskDescription: 'plan' } as SubAgentRecord['config'],
+        createdAt: Date.now(),
+        completedAt: Date.now(),
+        pendingHumanApproval: false,
+        result: summary === null ? undefined : {
+          success: true, summary, turnsUsed: 1, inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 1,
+        },
+      }
+      recs.set(taskId, rec)
+      return rec
+    },
+    async getStatus(id) { return recs.get(id) ?? null },
+    async cancelTask() { return true },
+  }
+}
+
+const TRAPPED_PLAN_JSON = '```json\n' + JSON.stringify({
+  entry: 'A',
+  nodes: [
+    { id: 'A', kind: 'executor', taskDescription: 'a' },
+    { id: 'B', kind: 'executor', taskDescription: 'b' },
+  ],
+  edges: [{ from: 'A', to: 'B' }, { from: 'B', to: 'A' }], // unconditional cycle → no exit
+}) + '\n```'
+
 const VALID_PLAN_JSON = '```json\n' + JSON.stringify({
   id: 'p1',
   entry: 'gen',
@@ -117,10 +155,11 @@ describe('makeAutoOrchPlanner', () => {
     expect(validatePlan(out.plan)).toHaveLength(0)
   })
 
-  it('falls back on unparsable output', async () => {
+  it('falls back on unparsable output (after retries)', async () => {
     const out = await makeAutoOrchPlanner(deps('I could not produce a plan.'))(signal())
     expect(out.source).toBe('fallback')
-    expect(out.note).toContain('parseable')
+    expect(out.note).toContain('within 2 attempts')
+    expect((out.errors ?? []).join(' ')).toContain('parseable')
   })
 
   it('falls back on an invalid plan and surfaces validation errors', async () => {
@@ -135,9 +174,27 @@ describe('makeAutoOrchPlanner', () => {
     expect(validatePlan(out.plan)).toHaveLength(0) // fallback is still runnable
   })
 
-  it('falls back when the agent returns no summary', async () => {
+  it('falls back when the agent returns no summary (after retries)', async () => {
     const out = await makeAutoOrchPlanner(deps(null))(signal())
     expect(out.source).toBe('fallback')
-    expect(out.note).toContain('no summary')
+    expect((out.errors ?? []).join(' ')).toContain('no summary')
+    expect(validatePlan(out.plan)).toHaveLength(0)
+  })
+
+  it('re-plans after an invalid plan and accepts the corrected one', async () => {
+    // attempt 1: a trapped (no-exit) cycle → rejected; attempt 2: valid plan.
+    const dispatcher = queueStub([TRAPPED_PLAN_JSON, VALID_PLAN_JSON])
+    const out = await makeAutoOrchPlanner({ dispatcher, projectDir: '/tmp', getGoal: () => 'g' })(signal())
+    expect(out.source).toBe('planner')
+    expect(out.note).toContain('attempt 2')
+    expect(validatePlan(out.plan)).toHaveLength(0)
+  })
+
+  it('falls back after exhausting retries on a persistently trapped cycle', async () => {
+    const dispatcher = queueStub([TRAPPED_PLAN_JSON, TRAPPED_PLAN_JSON])
+    const out = await makeAutoOrchPlanner({ dispatcher, projectDir: '/tmp', getGoal: () => 'g', maxAttempts: 2 })(signal())
+    expect(out.source).toBe('fallback')
+    expect((out.errors ?? []).join(' ')).toContain('graceful exit')
+    expect(validatePlan(out.plan)).toHaveLength(0) // fallback still runnable
   })
 })

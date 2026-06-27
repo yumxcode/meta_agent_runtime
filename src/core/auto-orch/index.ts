@@ -50,7 +50,7 @@ export type {
   OrchBounds,
   OrchPlan,
 } from './LoopIR.js'
-export { validatePlan } from './LoopIR.js'
+export { validatePlan, detectUnterminableCycles } from './LoopIR.js'
 export type {
   PlanRunContext,
   NodeRunner,

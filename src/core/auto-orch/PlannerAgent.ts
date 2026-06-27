@@ -26,6 +26,12 @@ export interface AutoOrchPlannerDeps {
   projectDir: string
   /** Lazily reads the pure frozen goal (SessionRouter._autoGoal). */
   getGoal: () => string | null
+  /**
+   * How many planning attempts before falling back. On a validation failure the
+   * errors are fed BACK to the planner and it is asked to re-create the plan.
+   * Default 2 (one initial + one retry). Values < 1 are treated as 1.
+   */
+  maxAttempts?: number
 }
 
 /** Outcome of a planning attempt. `plan` is ALWAYS a valid, runnable plan. */
@@ -60,6 +66,11 @@ const PLANNER_RUBRIC = `\
 - 关键产出后挂一个 role:"verify" 节点校验是否达成目标；长流程中可挂 role:"drift" 审查航向。
 - 图要尽量小而清晰；不要为简单目标过度拆分（简单目标一个 executor + 一个 verify 即可）。
 
+**优雅终止（硬性要求，否则计划会被拒绝并要求你重做）：每一个环都必须能在某种 verdict 下离开。**
+- 推荐做法：环上挂一个 verify 节点，它的 "pass" 路由到环外节点或不连任何出边（不匹配出边即自然终止），"fail" 才连回去重做。
+- 反面例子（会被拒）：A→B→A 全是 {"on":"always"} 的无条件边——永远出不来，只能撞上限。
+- 一句话：每个环里至少要有「一条带条件的逃逸边离开环」或「一个节点在完成时不匹配任何出边而终止」。
+
 输出（关键）：只在最后一条消息里输出一个 JSON 代码块，形如：
 \`\`\`json
 {
@@ -84,6 +95,24 @@ function buildPlannerTask(goal: string): string {
     goal,
     '',
     '请先（必要时）用只读工具了解工作区，然后设计计划图，最后只输出一个 OrchPlan 的 JSON 代码块。',
+  ].join('\n')
+}
+
+/** Re-plan task: hand the previous output + the exact validation errors back. */
+function buildPlannerRetryTask(goal: string, previousSummary: string, errors: string[]): string {
+  return [
+    '【需要编排的目标】',
+    goal,
+    '',
+    '你上一次产出的计划【未通过校验】。请根据下面的错误修正，并重新输出**完整**的 OrchPlan JSON 代码块。',
+    '',
+    '【本次必须修复的校验错误】',
+    errors.map(e => `- ${e}`).join('\n'),
+    '',
+    '【你上一次的产出（供参考，请勿原样照抄错误部分）】',
+    previousSummary.length > 1500 ? previousSummary.slice(0, 1500) + '…' : previousSummary,
+    '',
+    '只输出修正后的完整 JSON 代码块，不要解释。',
   ].join('\n')
 }
 
@@ -254,17 +283,42 @@ export function makeAutoOrchPlanner(
 
     if (!goal || !goal.trim()) return fallback('goal missing')
 
+    const maxAttempts = Math.max(1, deps.maxAttempts ?? 2)
+    let lastErrors: string[] = []
+    let lastSummary = ''
+
     try {
-      const summary = await runPlannerAgent(deps.dispatcher, buildPlannerTask(goal), signal)
-      if (!summary) return fallback('planner agent returned no summary')
+      for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+        // First attempt plans fresh; later attempts hand back the previous output
+        // + the exact validation errors so the LLM RE-CREATES a corrected plan.
+        const task = attempt === 1
+          ? buildPlannerTask(goal)
+          : buildPlannerRetryTask(goal, lastSummary, lastErrors)
 
-      const parsed = parseOrchPlan(summary)
-      if (!parsed) return fallback('planner output had no parseable OrchPlan')
+        const summary = await runPlannerAgent(deps.dispatcher, task, signal)
+        if (!summary) {
+          lastErrors = ['planner agent returned no summary']
+          continue
+        }
+        lastSummary = summary
 
-      const errors = validatePlan(parsed)
-      if (errors.length) return fallback('planner produced an invalid plan', errors)
+        const parsed = parseOrchPlan(summary)
+        if (!parsed) {
+          lastErrors = ['no parseable OrchPlan JSON code block was found in your output']
+          continue
+        }
 
-      return { plan: parsed, source: 'planner' }
+        const errors = validatePlan(parsed)
+        if (errors.length === 0) {
+          return {
+            plan: parsed,
+            source: 'planner',
+            note: attempt > 1 ? `accepted on attempt ${attempt}` : undefined,
+          }
+        }
+        lastErrors = errors // feed back on the next attempt
+      }
+      return fallback(`planner did not produce a valid plan within ${maxAttempts} attempts`, lastErrors)
     } catch (err) {
       return fallback(err instanceof Error ? err.message : String(err))
     }

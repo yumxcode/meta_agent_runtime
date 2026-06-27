@@ -20,7 +20,7 @@ import {
 } from '../predicates.js'
 import { fromDrift, fromVerify, continueVerdict, type OrchVerdict } from '../Verdict.js'
 import { HookRegistry } from '../HookRegistry.js'
-import { validatePlan, type OrchPlan, type OrchNode } from '../LoopIR.js'
+import { validatePlan, detectUnterminableCycles, type OrchPlan, type OrchNode } from '../LoopIR.js'
 import { PlanRunner, type NodeRunner } from '../PlanRunner.js'
 import type { PhaseHookEvent } from '../../../kernel/loop/PhaseHooks.js'
 
@@ -160,6 +160,84 @@ describe('validatePlan', () => {
     expect(errs.some(e => e.includes('entry'))).toBe(true)
     expect(errs.some(e => e.includes('ghost'))).toBe(true)
     expect(errs.some(e => e.includes('isolated_write'))).toBe(true)
+  })
+})
+
+// ── Graceful-termination (cycle escape) check ───────────────────────────────────
+
+describe('detectUnterminableCycles', () => {
+  const exec = (id: string): OrchNode => ({ id, kind: 'executor', taskDescription: id })
+
+  it('accepts generate→verify→fix (verify pass terminates via no-match)', () => {
+    const plan: OrchPlan = {
+      entry: 'gen',
+      nodes: [exec('gen'), { id: 'verify', kind: 'role', role: 'verify', taskDescription: 'v' }],
+      edges: [
+        { from: 'gen', to: 'verify' },
+        { from: 'verify', to: 'gen', when: { on: 'verdictLabel', label: 'fail' } },
+      ],
+    }
+    expect(detectUnterminableCycles(plan)).toHaveLength(0)
+  })
+
+  it('accepts a branch+cycle graph with a conditional escape (B error → D)', () => {
+    const plan: OrchPlan = {
+      entry: 'A',
+      nodes: [exec('A'), exec('B'), exec('C'), exec('D')],
+      edges: [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'C', when: { on: 'verdictLabel', label: 'ok' } },
+        { from: 'B', to: 'D', when: { on: 'verdictLabel', label: 'error' } },
+        { from: 'C', to: 'A', when: { on: 'verdictLabel', label: 'loop' } },
+      ],
+    }
+    expect(detectUnterminableCycles(plan)).toHaveLength(0)
+  })
+
+  it('REJECTS a trapped cycle where every edge is unconditional (A↔B always)', () => {
+    const plan: OrchPlan = {
+      entry: 'A',
+      nodes: [exec('A'), exec('B')],
+      edges: [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'A' },
+      ],
+    }
+    const errs = detectUnterminableCycles(plan)
+    expect(errs).toHaveLength(1)
+    expect(errs[0]).toContain('no graceful exit')
+    // and validatePlan surfaces it too
+    expect(validatePlan(plan).some(e => e.includes('no graceful exit'))).toBe(true)
+  })
+
+  it('REJECTS an unconditional self-loop but ACCEPTS a conditional one', () => {
+    const trapped: OrchPlan = {
+      entry: 'A',
+      nodes: [exec('A')],
+      edges: [{ from: 'A', to: 'A' }],
+    }
+    expect(detectUnterminableCycles(trapped)).toHaveLength(1)
+
+    const ok: OrchPlan = {
+      entry: 'A',
+      nodes: [exec('A')],
+      edges: [{ from: 'A', to: 'A', when: { on: 'verdictLabel', label: 'retry' } }],
+    }
+    expect(detectUnterminableCycles(ok)).toHaveLength(0) // 'done' verdict → terminates
+  })
+
+  it('REJECTS when an always edge shadows the only escape', () => {
+    // B→A (always) fires first and stays in the cycle; B→C (conditional) is dead.
+    const plan: OrchPlan = {
+      entry: 'A',
+      nodes: [exec('A'), exec('B'), exec('C')],
+      edges: [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'A' }, // always, declared first → shadows the escape
+        { from: 'B', to: 'C', when: { on: 'verdictLabel', label: 'pass' } },
+      ],
+    }
+    expect(detectUnterminableCycles(plan)).toHaveLength(1)
   })
 })
 

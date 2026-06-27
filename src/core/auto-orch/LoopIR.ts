@@ -155,6 +155,100 @@ export function validatePlan(plan: OrchPlan): string[] {
     }
   }
 
+  // Graceful-termination check — only meaningful once the structure is sound
+  // (edges reference real nodes), so it runs last and only on a clean plan.
+  if (errs.length === 0) errs.push(...detectUnterminableCycles(plan))
+
+  return errs
+}
+
+/**
+ * Graceful-termination check: every cycle must have a way to leave it under SOME
+ * verdict, otherwise the loop can only ever stop by hitting a hard bound
+ * (bounds_exceeded), never `completed`. We REJECT such plans so the Planner is
+ * forced to add an exit (and the LLM gets a precise reason to re-plan).
+ *
+ * Soundness (does NOT reject correct terminating graphs): a node can leave its
+ * strongly-connected cycle under some verdict iff —
+ *   (a) a REACHABLE out-edge (not shadowed by an earlier unconditional edge)
+ *       targets a node OUTSIDE the cycle, OR
+ *   (b) the node has NO unconditional (`always`) out-edge, so some verdict
+ *       matches nothing and the run terminates at that node.
+ * The canonical generate→verify→fix loop passes via (b): verify's only edge is
+ * the conditional `fail`→gen back-edge, so a `pass` verdict terminates.
+ *
+ * An `always` edge shadows everything declared after it (PlanRunner picks the
+ * first matching edge), so only edges up to and including the first `always` are
+ * "reachable" — that is exactly what (a) inspects.
+ */
+export function detectUnterminableCycles(plan: OrchPlan): string[] {
+  const errs: string[] = []
+  const nodeIds = new Set((plan.nodes ?? []).map(n => n.id))
+  const isAlways = (e: OrchEdge): boolean => !e.when || e.when.on === 'always'
+
+  // Adjacency in declaration order, restricted to edges between real nodes.
+  const adj = new Map<string, { to: string; always: boolean }[]>()
+  for (const id of nodeIds) adj.set(id, [])
+  for (const e of plan.edges ?? []) {
+    if (nodeIds.has(e.from) && nodeIds.has(e.to)) adj.get(e.from)!.push({ to: e.to, always: isAlways(e) })
+  }
+
+  // Tarjan's strongly-connected components.
+  const index = new Map<string, number>()
+  const low = new Map<string, number>()
+  const onStack = new Set<string>()
+  const stack: string[] = []
+  let idx = 0
+  const sccs: string[][] = []
+  const strongconnect = (v: string): void => {
+    index.set(v, idx)
+    low.set(v, idx)
+    idx++
+    stack.push(v)
+    onStack.add(v)
+    for (const { to: w } of adj.get(v)!) {
+      if (!index.has(w)) {
+        strongconnect(w)
+        low.set(v, Math.min(low.get(v)!, low.get(w)!))
+      } else if (onStack.has(w)) {
+        low.set(v, Math.min(low.get(v)!, index.get(w)!))
+      }
+    }
+    if (low.get(v) === index.get(v)) {
+      const comp: string[] = []
+      let w: string
+      do {
+        w = stack.pop()!
+        onStack.delete(w)
+        comp.push(w)
+      } while (w !== v)
+      sccs.push(comp)
+    }
+  }
+  for (const id of nodeIds) if (!index.has(id)) strongconnect(id)
+
+  for (const comp of sccs) {
+    const inScc = new Set(comp)
+    const cyclic = comp.length > 1 || adj.get(comp[0]!)!.some(e => e.to === comp[0])
+    if (!cyclic) continue
+
+    const escapable = comp.some(n => {
+      const edges = adj.get(n)!
+      const firstAlways = edges.findIndex(e => e.always)
+      const reachable = firstAlways === -1 ? edges : edges.slice(0, firstAlways + 1)
+      // (a) a reachable edge leaves the cycle, OR (b) no always edge → can terminate.
+      return reachable.some(e => !inScc.has(e.to)) || firstAlways === -1
+    })
+
+    if (!escapable) {
+      errs.push(
+        `cycle [${comp.join(' → ')}] has no graceful exit: every node is forced back into the loop, ` +
+        `so it can only stop by hitting a hard bound. Add a CONDITIONAL out-edge that leaves the cycle ` +
+        `(e.g. a verify node whose 'pass' routes to a node outside the loop), or remove an unconditional ` +
+        `('always') edge so some verdict can terminate the run.`,
+      )
+    }
+  }
   return errs
 }
 
