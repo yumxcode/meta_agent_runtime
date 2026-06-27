@@ -26,3 +26,4 @@ dist/
 # Local runtime state
 .meta-agent/
 permissions.json
+_tmp_branchcycle.removed
