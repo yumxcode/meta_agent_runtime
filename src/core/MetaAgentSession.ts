@@ -46,7 +46,7 @@ import type {
 } from './types.js'
 import { SectionRegistry } from './systemPromptSections.js'
 import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, type StaticPromptMode } from './staticPrompt.js'
-import { MODE_PROFILES } from './modes.js'
+import { MODE_PROFILES, isAutonomousMode } from './modes.js'
 import {
   buildDynamicSections,
   buildVolatileContextSections,
@@ -222,7 +222,7 @@ export class MetaAgentSession {
             [
               buildResearchArtifactAnchors(this.config.projectDir),
               buildAgenticDeterministicAnchors(this._agenticCompactContext()),
-              this._defaultMode === 'auto' ? buildAutoModeAnchors(this.config.projectDir) : null,
+              isAutonomousMode(this._defaultMode) ? buildAutoModeAnchors(this.config.projectDir) : null,
             ].filter(Boolean).join('\n\n') || null,
             config.compact?.deterministicAnchors,
           ),
