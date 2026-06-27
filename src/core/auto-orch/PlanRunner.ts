@@ -165,7 +165,16 @@ export class PlanRunner {
           return finalize('completed', verdict.note ?? 'node requested abort')
         }
 
-        currentId = this.selectNext(currentId, verdict)
+        // Topology-derived addressing (target-addressed blackboard): a verdict
+        // carrying corrective messages (e.g. a verify 'fail') is routed to the
+        // node its edge points to, and the correctives are posted ADDRESSED to
+        // that node — so feedback for B reaches B, never some unrelated node.
+        const fromId = currentId
+        const nextId = this.selectNext(fromId, verdict)
+        if (nextId && verdict.messages && verdict.messages.length > 0) {
+          this.blackboard.postCorrective({ from: fromId, to: nextId, messages: verdict.messages })
+        }
+        currentId = nextId
       }
 
       return finalize('completed')

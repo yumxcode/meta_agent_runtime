@@ -68,9 +68,10 @@ export class KernelNodeRunner implements NodeRunner {
   }
 
   private async runExecutor(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
-    // Blackboard: consume any pending reviewer feedback and prepend it so this
-    // re-run actually fixes the cited gaps (closing the generate→verify→fix loop).
-    const preface = ctx.blackboard?.takeCorrectivePreface() ?? ''
+    // Blackboard: consume reviewer feedback ADDRESSED TO THIS NODE and prepend it
+    // so this re-run fixes the cited gaps (closing the generate→verify→fix loop).
+    // Addressing (vs a global queue) keeps node B's feedback from leaking to C.
+    const preface = ctx.blackboard?.takeCorrectivePrefaceFor(node.id) ?? ''
     const taskDescription = preface ? `${preface}\n${node.taskDescription}` : node.taskDescription
     const rec = await spawnAndWait(
       this.dispatcher,
@@ -109,13 +110,10 @@ export class KernelNodeRunner implements NodeRunner {
       projectDir: this.projectDir,
       getGoal: this.getGoal,
     })
-    const verdict = await handler({ criteria: node.taskDescription, signal: ctx.signal })
-    // Blackboard: a failing reviewer's concrete gaps are posted so the NEXT
-    // executor (reached via a back-edge) reads and fixes them.
-    if (verdict.action === 'branch' && verdict.label === 'fail' && verdict.messages?.length) {
-      ctx.blackboard?.postCorrective(role, verdict.messages)
-    }
-    return verdict
+    // Posting correctives is the orchestrator's job (PlanRunner), since only it
+    // knows the topology to address them to the right successor node. Here we
+    // just return the verdict; its `messages` become addressed feedback there.
+    return handler({ criteria: node.taskDescription, signal: ctx.signal })
   }
 
   private spawnOpts(): SpawnWaitOptions {

@@ -314,4 +314,48 @@ describe('PlanRunner', () => {
     expect(result.status).toBe('failed')
     expect(result.note).toContain('kaboom')
   })
+
+  it('addresses corrective messages to the back-edge target node (topology-derived)', async () => {
+    // Two independent review loops; each verify must address its fix to ITS OWN
+    // executor — never the other one (the cross-contamination the addressing fixes).
+    const plan: OrchPlan = {
+      entry: 'buildAuth',
+      nodes: [
+        { id: 'buildAuth', kind: 'executor', taskDescription: 'auth' },
+        { id: 'verifyAuth', kind: 'role', role: 'verify', taskDescription: 'va' },
+        { id: 'buildApi', kind: 'executor', taskDescription: 'api' },
+        { id: 'verifyApi', kind: 'role', role: 'verify', taskDescription: 'vp' },
+      ],
+      edges: [
+        { from: 'buildAuth', to: 'verifyAuth' },
+        { from: 'verifyAuth', to: 'buildApi', when: { on: 'verdictLabel', label: 'pass' } },
+        { from: 'verifyAuth', to: 'buildAuth', when: { on: 'verdictLabel', label: 'fail' } },
+        { from: 'buildApi', to: 'verifyApi' },
+        { from: 'verifyApi', to: 'buildApi', when: { on: 'verdictLabel', label: 'fail' } },
+      ],
+    }
+    // verifyAuth fails once (→ buildAuth), then passes; verifyApi passes.
+    let vaCalls = 0
+    const runner: NodeRunner = {
+      async run(node): Promise<OrchVerdict> {
+        if (node.id === 'verifyAuth') {
+          vaCalls++
+          return vaCalls < 2
+            ? { action: 'branch', label: 'fail', messages: ['fix token expiry'] }
+            : { action: 'done', label: 'pass' }
+        }
+        if (node.id === 'verifyApi') return { action: 'done', label: 'pass' }
+        return { action: 'branch', label: 'ok' } // executors
+      },
+    }
+    const pr = new PlanRunner(plan, runner)
+    const result = await pr.run(new AbortController().signal)
+    expect(result.status).toBe('completed')
+
+    const bb = pr.getBlackboard()
+    // the auth fix was addressed to buildAuth, and reaches ONLY buildAuth
+    expect(bb.entries().some(e => e.kind === 'corrective' && e.to === 'buildAuth')).toBe(true)
+    expect(bb.hasCorrectivesFor('buildApi')).toBe(false) // no cross-contamination
+    expect(bb.takeCorrectivesFor('buildAuth')).toEqual([{ from: 'verifyAuth', messages: ['fix token expiry'] }])
+  })
 })
