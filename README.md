@@ -2,13 +2,13 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.3.6` · Node.js `>= 18`
+> 当前版本:`0.4.1` · Node.js `>= 18`
 
 ---
 
 ## 特性概览
 
-- **四种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。外加 `detect` 哨兵按提示词与环境自动选择。
+- **五种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。外加 `detect` 哨兵按提示词与环境自动选择。
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
@@ -134,6 +134,9 @@ meta-agent --workspace ~/projects/demo "重构数据处理模块"
 # 无人值守自治(工作区内写/删自动批准,全程硬监狱)
 meta-agent --mode auto "把构建跑绿,修掉所有失败用例"      # 或 --yolo
 
+# 轻量无人值守(同款工作区监狱,但不启用 checkpoint/drift/verify,适合简单短任务)
+meta-agent --mode simple_auto "把 README 里的死链接都修掉"
+
 # 其它模式
 meta-agent --mode campaign "做一次 x=[0,10], y=[0,5] 的 DOE 参数扫描"
 meta-agent --mode robotics --workspace ~/robot-project "调试导航模块的路径抖动"
@@ -154,6 +157,7 @@ CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-
 | `detect` | 默认哨兵 | 按提示词与环境推断到 agentic(auto 仅显式进入) |
 | `agentic` | 通用工程任务与问答 | 多轮工具调用、文件修改、命令执行、上下文压缩、同步/异步子代理 |
 | `auto` | 无人值守自治 | 工作区硬监狱、verify/drift 关卡、断路器、checkpoint/恢复、失败重试、收紧的并发与预算 |
+| `simple_auto` | 轻量无人值守 | 同款工作区硬监狱与自动批准,但**去掉 checkpoint / drift / verify**;面向简单、短链路任务 |
 | `campaign` | 长周期实验/优化 | DOE、多保真度、并行评估、Pareto、论文复现、人工检查点、溯源 |
 | `robotics` | 机器人开发 | 硬件档案、三层知识库、工作流阶段、并行实验、Git 工作树、Team 协作 |
 
@@ -174,6 +178,17 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 | `META_AGENT_VERIFY_MAX_TURNS` | 40 | 判定子代理最大轮次 |
 | `META_AGENT_VERIFY_MAX_BUDGET_USD` | 100 | 判定子代理最大花费(美元) |
 | `META_AGENT_VERIFY_MAX_DURATION_MS` | 600000 | 判定子代理墙钟上限(ms) |
+
+### simple_auto 轻量自治模式
+
+`simple_auto` 与 `auto` 共享同一套执行后端与**工作区硬监狱**(工作目录内写/删自动批准、配置层无法解锁、同样下发给子代理),但刻意去掉了 `auto` 的三套自监督机制,专注于简单、短链路的无人值守任务:
+
+- **无 checkpoint**:不写 durable checkpoint,也不读旧 checkpoint——本模式不面向"中断后 `--resume` 续跑"的长任务。
+- **无 drift 关卡**:不在结构性边界起独立子代理做目标漂移校正。
+- **无 verify 关卡**:模型声明完成即视为完成,不再起独立判定子代理做完成度核验。
+- **无经验库注入**:不装配 auto 的经验召回/写入。
+
+实现上,内核循环对 checkpoint/drift/verify 三者都是"配置钩子缺失即跳过",`simple_auto` 只是让后端工厂不挂载这些钩子(见 `AgenticBackendFactory` 的 `wantsGates` 开关),因此得到的是"`auto` 的自治与监狱、但没有自监督开销"。和 `auto` 一样,`simple_auto` 仅能**显式进入**(`--mode simple_auto`),绝不会被提示词措辞推断出来。任务一旦变复杂或高风险,建议改用 `auto`。
 
 ---
 
@@ -424,4 +439,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.3.6`。
+当前包版本:`0.4.1`。

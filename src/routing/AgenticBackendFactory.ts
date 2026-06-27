@@ -12,6 +12,13 @@
  * experience store, durable checkpoint coordinator, and the workspace jail. The
  * `overrides.autonomy` presence is the single switch for all of that here.
  *
+ * SIMPLE_AUTO: a lightweight unattended flavour for simple, short tasks. It keeps
+ * the workspace jail (it still carries an `autonomy` profile) but DROPS the
+ * verify gate, drift gate, experience store, and durable checkpoint coordinator.
+ * `wantsGates` (= isAuto && !isSimpleAuto) is the single switch that separates the
+ * two: when false, those gate hooks are left undefined and the kernel loop no-ops
+ * each one. The result is auto's autonomy/jail with none of the self-supervision.
+ *
  * Lazy gate dispatcher: the verify/drift gates are constructed BEFORE the
  * SubAgentBridge (the bridge needs the session id, which needs the session). The
  * gates therefore talk to the bridge through a tiny facade that reads a local
@@ -85,8 +92,16 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // auto-orch shares auto's autonomy jail (isAuto stays true) and ADDS the
   // orchestration layer. Detected via the prompt mode the router passed.
   const isAutoOrch = overrides?.promptMode === 'auto-orch'
+  // simple_auto shares auto's autonomy jail (isAuto stays true) but deliberately
+  // DROPS the heavyweight self-supervision machinery: no durable checkpoints, no
+  // drift gate, no completion-verify gate, and no auto experience store. It is
+  // the lightweight unattended mode for simple, short tasks. `wantsGates` is the
+  // single switch that turns all of that on for plain auto / auto-orch but off
+  // for simple_auto.
+  const isSimpleAuto = overrides?.promptMode === 'simple_auto'
+  const wantsGates = isAuto && !isSimpleAuto
 
-  const resumeCheckpoint = isAuto && explicitResume ? readAutoCheckpoint(projectDir) : null
+  const resumeCheckpoint = wantsGates && explicitResume ? readAutoCheckpoint(projectDir) : null
 
   // Lazy dispatcher facade — the bridge is created after the session below, so
   // the gates read this local ref at invocation time (deep in a later turn).
@@ -102,12 +117,12 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // gates and the auto-orch graph nodes share one role definition surface.
   const roleCatalog = defaultRoleCatalog()
   const roleCtx = { dispatcher: lazyDispatcher, projectDir, getGoal }
-  const verifyGate = isAuto ? roleCatalog.buildVerifyGate(roleCtx) : undefined
+  const verifyGate = wantsGates ? roleCatalog.buildVerifyGate(roleCtx) : undefined
 
   // Auto Learn: one experience store powers both recall (main prompt) and the
-  // drift agent's writes.
-  const autoExperienceStore = isAuto ? createAutoExperienceStore(projectDir) : null
-  const driftGate = isAuto ? roleCatalog.buildDriftGate(roleCtx) : undefined
+  // drift agent's writes. Skipped for simple_auto (no drift gate to write).
+  const autoExperienceStore = wantsGates ? createAutoExperienceStore(projectDir) : null
+  const driftGate = wantsGates ? roleCatalog.buildDriftGate(roleCtx) : undefined
   const getExperienceRecallBlock = autoExperienceStore
     ? () => renderRecentExperiences(autoExperienceStore)
     : undefined
@@ -137,7 +152,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // Edit-digest summarizer (auto only): one cheap flash side-call, fired by the
   // checkpoint coordinator at most once per N FS-only checkpoints, to recap a
   // long code-editing stretch when the agent never wrote a todo/progress update.
-  const editDigestFlash = isAuto ? new FlashClient(baseConfig) : null
+  const editDigestFlash = wantsGates ? new FlashClient(baseConfig) : null
   const summarizeEdits = editDigestFlash
     ? async (paths: string[]): Promise<string | null> =>
         editDigestFlash.query({
@@ -152,7 +167,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
         })
     : undefined
 
-  const checkpointCoordinator = isAuto
+  const checkpointCoordinator = wantsGates
     ? new AutoCheckpointCoordinator({
         projectDir,
         initialRevision: resumeCheckpoint?.revision ?? 0,

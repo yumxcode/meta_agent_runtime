@@ -33,6 +33,7 @@ import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { isAutonomousMode } from '../core/modes.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
@@ -196,12 +197,14 @@ ${bold('MODES')}
   ${cyan('agentic')}    Full tool-use loop (default for all Q&A and engineering tasks)
   ${cyan('auto')}       Autonomous: in-workspace writes/deletes auto-approved (no prompts),
              all file changes hard-confined to the working directory
+  ${cyan('simple_auto')} Lightweight autonomous: same workspace jail as auto, but without
+             checkpoint / drift / verify — for simple, short unattended tasks
   ${cyan('auto-orch')}  Autonomous + AI-authored multi-agent orchestration graph
   ${cyan('campaign')}   DOE / multi-objective optimisation campaign
   ${cyan('robotics')}   Robotics session — ExperienceStore + workflow + hardware profiles
 
 ${bold('OPTIONS')}
-  -m, --mode <mode>       Session mode: detect|agentic|auto|auto-orch|campaign|robotics
+  -m, --mode <mode>       Session mode: detect|agentic|auto|simple_auto|auto-orch|campaign|robotics
       --yolo              Alias for --mode auto (autonomous + workspace jail)
   -w, --workspace <dir>   Working directory — agent ONLY operates within this folder
   -k, --api-key <key>     API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env var)
@@ -389,7 +392,7 @@ function parseCliArgs(): CliOptions {
   const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
   // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
   // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
-  const validModes = ['detect', 'auto', 'auto-orch', 'agentic', 'campaign', 'robotics']
+  const validModes = ['detect', 'auto', 'simple_auto', 'auto-orch', 'agentic', 'campaign', 'robotics']
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
@@ -1698,6 +1701,7 @@ async function streamPrompt(
                         : mode === 'agentic'  ? green(mode)
                         : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
                         : mode === 'auto'     ? yellow(mode)
+                        : mode === 'simple_auto' ? yellow(mode)
                         : gray(mode)
           const thinkTag = meter.charCount > 0
             ? `  ${gray(`think:~${meter.tokenEstimate}`)}`
@@ -3228,8 +3232,13 @@ async function runRepl(opts: CliOptions): Promise<void> {
         } else {
           resumedMessages = await SessionStore.loadHistory(targetId)
           resumedSessionId = targetId
-          // Restore the mode from the saved session.
-          if (meta && opts.mode === 'auto' && meta.mode && meta.mode !== 'auto') {
+          // Restore the mode from the saved session. An autonomous mode (auto /
+          // simple_auto / auto-orch) must never run over a history produced in a
+          // NON-autonomous mode (agentic / campaign / robotics): the workspace
+          // jail, auto-approval, and tool-set posture differ from what the saved
+          // turns assumed. Use isAutonomousMode on BOTH sides so the rule covers
+          // every autonomous flavour, not just 'auto'.
+          if (meta && isAutonomousMode(opts.mode) && meta.mode && !isAutonomousMode(meta.mode)) {
             opts.mode = meta.mode as CliOptions['mode']
           }
         }
@@ -3249,7 +3258,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
           resumedSessionId = resumed.sessionId
           // Restore the mode from the saved session so the router starts in the
           // correct mode instead of re-detecting it from the first user message.
-          if (opts.mode === 'auto' && resumed.mode && resumed.mode !== 'auto') {
+          // Same rule as above: never run an autonomous mode (auto / simple_auto /
+          // auto-orch) over a non-autonomous history.
+          if (isAutonomousMode(opts.mode) && resumed.mode && !isAutonomousMode(resumed.mode)) {
             opts.mode = resumed.mode as CliOptions['mode']
           }
         }
@@ -4514,10 +4525,15 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
       if (resumedMessages.length > 0) {
         resumedSessionId = targetId
         savedMessageCount = resumedMessages.length
+        // Restore the saved mode when (a) the caller let mode auto-detect, or
+        // (b) the caller asked for an autonomous mode (auto / simple_auto /
+        // auto-orch) but the saved history is non-autonomous — running a jailed,
+        // auto-approving loop over agentic/campaign/robotics history is exactly
+        // what this guard prevents. isAutonomousMode covers every flavour.
         if (
           meta?.mode &&
-          meta.mode !== 'auto' &&
-          (opts.mode === 'detect' || opts.mode === 'auto')
+          !isAutonomousMode(meta.mode) &&
+          (opts.mode === 'detect' || isAutonomousMode(opts.mode))
         ) {
           opts.mode = meta.mode as CliOptions['mode']
         }

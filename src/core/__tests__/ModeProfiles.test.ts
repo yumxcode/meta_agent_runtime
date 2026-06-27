@@ -4,7 +4,7 @@ import { buildStaticSystemPrompt } from '../staticPrompt.js'
 import { buildCurrentModeSection } from '../dynamicPrompt.js'
 import { SectionRegistry } from '../systemPromptSections.js'
 
-const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'campaign', 'robotics', 'auto-orch']
+const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'simple_auto', 'campaign', 'robotics', 'auto-orch']
 
 async function render(section: ReturnType<typeof buildCurrentModeSection>): Promise<string> {
   const [t] = await new SectionRegistry().resolve([section])

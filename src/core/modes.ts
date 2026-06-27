@@ -23,7 +23,7 @@ import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 
 // ── Canonical mode union ───────────────────────────────────────────────────────
 
-export type SessionMode = 'agentic' | 'auto' | 'campaign' | 'robotics' | 'auto-orch'
+export type SessionMode = 'agentic' | 'auto' | 'simple_auto' | 'campaign' | 'robotics' | 'auto-orch'
 
 // Compile-time guarantee that the kernel-layer CompactProfile (which cannot
 // import this core module without inverting layering) stays in lockstep with
@@ -109,6 +109,38 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
     },
   },
 
+  // simple_auto is a stripped-down sibling of auto for SIMPLE, short unattended
+  // tasks: same autonomy jail (auto-approve writes inside the workspace, locked
+  // workspace, denied tools) and the same goal-oriented loop, but WITHOUT the
+  // heavyweight self-supervision machinery — no durable checkpoints, no drift
+  // (course-correction) gate, and no independent completion-verify gate. Those
+  // gates are simply left unwired by the backend factory for this mode (the
+  // kernel loop already no-ops each one when its config hook is absent). Equal
+  // weight to agentic/auto so an explicit selection is never clobbered.
+  simple_auto: {
+    weight: 1,
+    identityLine:
+      '你是 Meta-Agent，一个自主运行的工程 Agent，专注于目标的达成与任务的解决。' +
+      '你会在工作区边界内持续自主推进，直到目标达成或遇到真正的阻塞才停下，' +
+      '并在结束时清晰交代已完成与未完成的部分。',
+    currentModeText:
+      'SIMPLE-AUTO — 轻量无人值守自主执行模式：面向简单、短链路任务，多轮工具调用已启用。\n' +
+      '- **授权范围**：对**项目工作路径内**的写入、编辑、删除、替换等操作（含不可逆操作）你已获明确授权，无需逐次请求确认，直接执行即可。\n' +
+      '- **边界约束**：解决任务必须保证在工作区边界内完成；影响工作区之外或共享状态的操作（如 git push、对外发布、改动他人环境）不在授权范围，会被系统直接拒绝——遇到这类需求时停下并在总结中说明，不要反复试探。\n' +
+      '- **持续推进**：可自行判定的小决策直接做，不要为此停下等待；持续推进直到目标达成或遇到真正的阻塞。\n' +
+      '- **轻量模式**：本模式不启用检查点、航向校正与独立完成度审核——请专注于直接、高效地完成简单任务；若任务变复杂或高风险，建议改用 AUTO 模式。\n' +
+      '- **终止与总结**：完成或受阻时，给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
+    compactProfile: 'simple_auto',
+    agenticOverrides: {
+      promptMode: 'simple_auto',
+      autonomy: {
+        autoApproveInWorkspace: true,
+        lockWorkspace: true,
+        deniedTools: AUTO_DENIED_TOOL_NAMES,
+      },
+    },
+  },
+
   campaign: {
     weight: 2,
     identityLine: `${SPECIALIST_PREAMBLE}当前模式：**Campaign** — 专注于工业工程项目开发，含 DOE 实验设计、多保真度仿真与 Pareto 优化。`,
@@ -162,8 +194,8 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
 /** Modes that run unattended inside the auto workspace jail. */
 export function isAutonomousMode(
   mode: SessionMode | string | null | undefined,
-): mode is 'auto' | 'auto-orch' {
-  return mode === 'auto' || mode === 'auto-orch'
+): mode is 'auto' | 'auto-orch' | 'simple_auto' {
+  return mode === 'auto' || mode === 'auto-orch' || mode === 'simple_auto'
 }
 
 /** Numeric weight per mode, derived from the profile table. */
