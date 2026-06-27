@@ -131,6 +131,13 @@ export function buildR1Section(
 获取已完成子 Agent 的结果：调用 **\`get_sub_agent_status task_id="<id>"\`**。
 该调用返回的 ExperimentSummary **就是结果**——不要等它出现在经验库里。
 
+### 并行派发与等待屏障
+- 要并行探索多个独立假设/参数/实验：在同一轮派发多个子 Agent，使用 \`await_completion=false\`（默认异步）。
+- 如果下一步依赖所有子 Agent 的结果：不要把多个派发都设为 \`await_completion=true\`；先收集所有 \`task_id\`，
+  再逐个调用 \`get_sub_agent_status\`，直到每个任务进入 \`completed\` / \`failed\` / \`cancelled\`。
+- 所有结果收齐后再综合判断、决定 merge/discard 或下一轮实验；结果没收齐前不得假装已完成。
+- 只有严格串行依赖（必须先知道一个结果才能派发下一个）时，才使用 \`await_completion=true\`。
+
 ### 原理层（Principle Layer）
 - \`principle_search\` 检索经过审核、带第一性原理支撑和适用/不适用边界的可迁移原理
 - 仅当用户明确要求把已批准经验抽象为原理时，\`principle_promote\` 才入队新候选

@@ -59,7 +59,8 @@ import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
 import type { RouterOptions, SessionMode, SessionModeHint } from './types.js'
 import { MODE_WEIGHT } from './types.js'
-import { MODE_PROFILES } from '../core/modes.js'
+import { MODE_PROFILES, isAutonomousMode } from '../core/modes.js'
+export { isAutonomousMode } from '../core/modes.js'
 
 // The robotics capability contracts live in the robotics package (so
 // RoboticsSession can `implements` them and the compiler verifies the surface).
@@ -102,16 +103,6 @@ export function isAutoContinuationPrompt(prompt: string): boolean {
   if (p === '') return true
   if (p.length > 24) return false
   return AUTO_CONTINUATION_MARKERS.some(m => p === m || p.startsWith(m))
-}
-
-/**
- * Autonomous modes share goal-capture, resume-preamble and dispose-flush
- * behaviour: both run the jailed autonomous executor. auto-orch only adds the
- * orchestration layer on top, so it must be treated as auto everywhere those
- * lifecycle concerns are keyed off the mode.
- */
-export function isAutonomousMode(mode: SessionMode | null): boolean {
-  return mode === 'auto' || mode === 'auto-orch'
 }
 
 export class SessionRouter {
@@ -471,7 +462,7 @@ export class SessionRouter {
     // Global memory is read-only in auto mode. Skip both the post-session
     // proposal writer and the pending-store flush so an unattended session
     // never causes writes under ~/.meta-agent/memory.
-    if (impl && this._currentMode !== 'auto' && !this._memoryWriterDone) {
+    if (impl && !isAutonomousMode(this._currentMode) && !this._memoryWriterDone) {
       this._memoryWriterDone = true
       try {
         await runPostSessionMemoryWriter({

@@ -79,6 +79,20 @@ export class KernelBranchOps implements BranchOps {
       try {
         const fin = await wt.finalize(rec.taskId)
         changedFiles = fin.changedFiles
+        const outOfScope = filesOutsideWriteScope(changedFiles, branch.writeScope ?? [])
+        if (outOfScope.length > 0) {
+          try { await wt.discard(rec.taskId) } catch { /* best-effort */ }
+          return {
+            id: branch.id,
+            success: false,
+            changedFiles: [],
+            error:
+              `branch ${branch.id} modified files outside declared writeScope: ` +
+              outOfScope.join(', '),
+            costUsd: cost,
+            isWriter,
+          }
+        }
         this.worktreePathByBranch.set(branch.id, wt.recordFor(rec.taskId)?.worktreePath)
       } catch (err) {
         return { id: branch.id, success: false, changedFiles: [], error: `finalize failed: ${msg(err)}`, costUsd: cost, isWriter }
@@ -157,4 +171,43 @@ export class KernelBranchOps implements BranchOps {
 
 function msg(err: unknown): string {
   return err instanceof Error ? err.message : String(err)
+}
+
+/** Files not covered by the branch's declared write-scope. Empty scope covers nothing. */
+export function filesOutsideWriteScope(files: readonly string[], scope: readonly string[]): string[] {
+  const matchers = scope.map(globToRegExp)
+  return files.filter(file => {
+    const paths = expandGitStatusPath(file).map(normalizePathForScope)
+    return paths.some(path => !matchers.some(re => re.test(path)))
+  })
+}
+
+function expandGitStatusPath(file: string): string[] {
+  const trimmed = file.trim()
+  if (!trimmed.includes(' -> ')) return [trimmed]
+  return trimmed.split(' -> ').map(s => s.trim()).filter(Boolean)
+}
+
+function normalizePathForScope(path: string): string {
+  return path.replace(/\\/g, '/').replace(/^\.\//, '').replace(/^\/+/, '')
+}
+
+function globToRegExp(glob: string): RegExp {
+  const g = normalizePathForScope(glob.trim()).replace(/\/+$/, '')
+  if (!g || g === '**' || g === '*') return /^.*$/
+  let out = '^'
+  for (let i = 0; i < g.length; i++) {
+    const ch = g[i]!
+    if (ch === '*') {
+      if (g[i + 1] === '*') {
+        out += '.*'
+        i++
+      } else {
+        out += '[^/]*'
+      }
+    } else {
+      out += ch.replace(/[\\^$+?.()|[\]{}]/g, '\\$&')
+    }
+  }
+  return new RegExp(out + '$')
 }

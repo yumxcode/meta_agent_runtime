@@ -13,7 +13,7 @@
  *   meta-agent --mode campaign "run a DOE sweep"
  *
  * Options:
- *   -m, --mode <mode>       Session mode: auto|agentic|campaign|robotics (default: auto)
+ *   -m, --mode <mode>       Session mode: detect|auto|auto-orch|agentic|campaign|robotics (default: detect)
  *   -k, --api-key <key>     API key (or ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
@@ -196,11 +196,12 @@ ${bold('MODES')}
   ${cyan('agentic')}    Full tool-use loop (default for all Q&A and engineering tasks)
   ${cyan('auto')}       Autonomous: in-workspace writes/deletes auto-approved (no prompts),
              all file changes hard-confined to the working directory
+  ${cyan('auto-orch')}  Autonomous + AI-authored multi-agent orchestration graph
   ${cyan('campaign')}   DOE / multi-objective optimisation campaign
   ${cyan('robotics')}   Robotics session — ExperienceStore + workflow + hardware profiles
 
 ${bold('OPTIONS')}
-  -m, --mode <mode>       Session mode: detect|agentic|auto|campaign|robotics
+  -m, --mode <mode>       Session mode: detect|agentic|auto|auto-orch|campaign|robotics
       --yolo              Alias for --mode auto (autonomous + workspace jail)
   -w, --workspace <dir>   Working directory — agent ONLY operates within this folder
   -k, --api-key <key>     API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env var)
@@ -388,7 +389,7 @@ function parseCliArgs(): CliOptions {
   const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
   // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
   // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
-  const validModes = ['detect', 'auto', 'agentic', 'campaign', 'robotics']
+  const validModes = ['detect', 'auto', 'auto-orch', 'agentic', 'campaign', 'robotics']
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
@@ -3174,7 +3175,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
       : ''
     console.log(
       `${bold('meta-agent')}  ${dim(`v${VERSION}`)}\n` +
-      `Mode: ${cyan(opts.mode === 'auto' ? 'auto-detect' : opts.mode)}` +
+      `Mode: ${cyan(opts.mode)}` +
       (opts.hardwareId ? `  ${dim('hw:')} ${cyan(opts.hardwareId)}` : '') +
       (opts.yes ? `  ${yellow('[AUTO-APPROVE]')}` : '') +
       (opts.debug ? `  ${yellow('[DEBUG]')}` : '') +

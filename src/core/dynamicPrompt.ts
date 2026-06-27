@@ -62,7 +62,7 @@ import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/
 
 // Alias of the canonical SessionMode (core/modes.ts) — kept as a named export so
 // the many AgentMode importers are unchanged, while there is only ONE mode union.
-import { MODE_PROFILES } from './modes.js'
+import { MODE_PROFILES, isAutonomousMode } from './modes.js'
 import type { SessionMode } from './modes.js'
 export type AgentMode = SessionMode
 
@@ -588,7 +588,7 @@ export function buildDelegationGuidanceSection(mode: AgentMode): SystemPromptSec
       '- 若需在当前树就地写且必须等它完成，用同步 `run_agent` 单发，而非并发。',
     ]
 
-    if (mode === 'auto') {
+    if (isAutonomousMode(mode)) {
       parts.push(
         '',
         '**无人值守约束**：并发数与总预算被收紧（默认 3 并发 / 共享预算上限）。' +

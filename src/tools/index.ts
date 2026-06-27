@@ -78,7 +78,7 @@ import { createUiTools, createAutoUiTools } from './ui/index.js'
 import { createSystemTools } from './system/index.js'
 import type { SystemToolsOptions } from './system/index.js'
 import { createAgentTools } from './agent/index.js'
-import { AUTO_DENIED_TOOL_NAMES, type SessionMode } from '../core/modes.js'
+import { AUTO_DENIED_TOOL_NAMES, isAutonomousMode, type SessionMode } from '../core/modes.js'
 
 export interface StandardToolsOptions {
   network?: import('./network/index.js').NetworkToolsOptions
@@ -87,7 +87,7 @@ export interface StandardToolsOptions {
   /** Options forwarded to createSystemTools (cwd, planModeRef). */
   system?: SystemToolsOptions
   include?: ('fs' | 'shell' | 'network' | 'mcp' | 'ui' | 'system' | 'agent')[]
-  /** Session mode for mode-specific tool selection (e.g., auto mode excludes ask_user/send_message). */
+  /** Session mode for mode-specific tool selection (e.g., autonomous modes exclude ask_user/send_message). */
   mode?: SessionMode
 }
 
@@ -105,8 +105,8 @@ export async function createStandardTools(options: StandardToolsOptions = {}): P
   if (include.includes('network')) groups.push(createNetworkTools(options.network))
   if (include.includes('mcp'))     groups.push(createMcpTools())
   if (include.includes('ui')) {
-    // Auto mode uses createAutoUiTools (excludes ask_user/send_message for unattended runs)
-    if (options.mode === 'auto') {
+    // Autonomous modes use createAutoUiTools (excludes ask_user/send_message for unattended runs)
+    if (isAutonomousMode(options.mode)) {
       groups.push(createAutoUiTools())
     } else {
       groups.push(createUiTools())
@@ -124,7 +124,7 @@ export async function createStandardTools(options: StandardToolsOptions = {}): P
   if (include.includes('agent') && options.agent) groups.push(createAgentTools(options.agent.bridge))
   const arrays = await Promise.all(groups)
   const tools = arrays.flat()
-  if (options.mode !== 'auto') return tools
+  if (!isAutonomousMode(options.mode)) return tools
 
   // Defense in depth for the standard registry. PermissionPolicy enforces the
   // same list at execution time, but removing these tools also prevents the

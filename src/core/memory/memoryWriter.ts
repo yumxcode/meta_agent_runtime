@@ -15,6 +15,7 @@ import { mkdir, readFile } from 'fs/promises'
 import { join } from 'path'
 import type { ConversationMessage, ContentBlock } from '../types.js'
 import type { AgentMode } from '../dynamicPrompt.js'
+import { isAutonomousMode } from '../modes.js'
 import { ensureMemoryDirExists, loadMemoryIndex } from './memdir.js'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
 import { allowedTypesForMode, normalizeMemoryProposal, type RawMemoryProposal } from './memoryProposal.js'
@@ -152,7 +153,7 @@ export async function runPostSessionMemoryWriter(
   // Auto mode treats the process-wide memory store as read-only. Memory recall
   // still happens while building prompts, but unattended runs must never queue
   // or persist global profile/feedback changes — even during shutdown.
-  if (mode === 'auto') {
+  if (isAutonomousMode(mode)) {
     return { attempted: false, queued: [], skipped: ['read_only_mode'] }
   }
   // When the caller doesn't supply a store, use the process-wide global one and

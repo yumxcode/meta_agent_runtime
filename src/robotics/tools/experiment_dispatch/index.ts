@@ -176,6 +176,7 @@ Rules:
           taskId,
           config: {
             taskDescription: withReturnResultHint(taskDescription),
+            ...(worktreePath ? { projectDir: worktreePath } : {}),
             allowedTools: (input['allowed_tools'] as string[] | undefined) ?? [
               'bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep', 'experience_write',
             ],

@@ -19,6 +19,7 @@ import {
 import { Blackboard } from '../Blackboard.js'
 import { parseOrchPlan } from '../PlannerAgent.js'
 import type { PlanRunContext } from '../PlanRunner.js'
+import { filesOutsideWriteScope } from '../KernelBranchOps.js'
 
 function planWith(node: OrchNode): OrchPlan {
   return { entry: node.id, nodes: [node], edges: [] }
@@ -75,6 +76,29 @@ describe('writeScopesOverlap', () => {
     expect(writeScopesOverlap(['src/**'], ['src/auth/**'])).toBe(true) // nested
     expect(writeScopesOverlap(['src/auth/x.ts'], ['src/auth/x.ts'])).toBe(true) // equal
     expect(writeScopesOverlap(['**'], ['anything/**'])).toBe(true) // root
+  })
+})
+
+describe('filesOutsideWriteScope', () => {
+  it('accepts files covered by exact, star, and globstar scopes', () => {
+    expect(filesOutsideWriteScope(
+      ['src/auth/index.ts', 'src/api.ts', 'README.md'],
+      ['src/auth/**', 'src/*.ts', 'README.md'],
+    )).toEqual([])
+  })
+
+  it('reports files outside the declared branch scope', () => {
+    expect(filesOutsideWriteScope(
+      ['src/auth/index.ts', 'src/billing/index.ts'],
+      ['src/auth/**'],
+    )).toEqual(['src/billing/index.ts'])
+  })
+
+  it('checks both sides of git rename status paths', () => {
+    expect(filesOutsideWriteScope(
+      ['src/auth/old.ts -> src/auth/new.ts', 'src/auth/old.ts -> src/billing/new.ts'],
+      ['src/auth/**'],
+    )).toEqual(['src/auth/old.ts -> src/billing/new.ts'])
   })
 })
 

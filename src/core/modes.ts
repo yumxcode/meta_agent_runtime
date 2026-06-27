@@ -159,6 +159,13 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
   },
 }
 
+/** Modes that run unattended inside the auto workspace jail. */
+export function isAutonomousMode(
+  mode: SessionMode | string | null | undefined,
+): mode is 'auto' | 'auto-orch' {
+  return mode === 'auto' || mode === 'auto-orch'
+}
+
 /** Numeric weight per mode, derived from the profile table. */
 export const MODE_WEIGHT: Record<SessionMode, number> = Object.fromEntries(
   Object.entries(MODE_PROFILES).map(([mode, p]) => [mode, p.weight]),
