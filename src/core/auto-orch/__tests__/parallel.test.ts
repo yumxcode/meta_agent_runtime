@@ -275,3 +275,45 @@ describe('parseOrchPlan (parallel)', () => {
     expect(validatePlan(plan!)).toHaveLength(0)
   })
 })
+
+// ── rubric examples must parse + validate (locks the prompt's correctness) ───────
+
+describe('PLANNER_RUBRIC examples', () => {
+  it('example B (conditional branch A→B→C/D) parses and validates', () => {
+    const json = '```json\n' + JSON.stringify({
+      entry: 'A',
+      nodes: [
+        { id: 'A', kind: 'executor', taskDescription: '...' },
+        { id: 'B', kind: 'executor', taskDescription: '...' },
+        { id: 'C', kind: 'executor', taskDescription: '...' },
+        { id: 'D', kind: 'executor', taskDescription: '修复 B 的失败' },
+      ],
+      edges: [
+        { from: 'A', to: 'B' },
+        { from: 'B', to: 'C', when: { on: 'verdictLabel', label: 'ok' } },
+        { from: 'B', to: 'D', when: { on: 'verdictLabel', label: 'error' } },
+      ],
+    }) + '\n```'
+    const plan = parseOrchPlan(json)
+    expect(plan).not.toBeNull()
+    expect(validatePlan(plan!)).toHaveLength(0)
+  })
+
+  it('parallel-write example (disjoint scopes) parses and validates', () => {
+    const json = '```json\n' + JSON.stringify({
+      id: 'plan', entry: 'build',
+      nodes: [{
+        id: 'build', kind: 'parallel', taskDescription: '并行实现各模块', join: 'all', integrator: 'integrator',
+        branches: [
+          { id: 'auth', taskDescription: '实现鉴权模块', allowedTools: ['read_file', 'edit_file', 'bash'], workspaceMode: 'isolated_write', writeScope: ['src/auth/**'] },
+          { id: 'api', taskDescription: '实现API模块', allowedTools: ['read_file', 'edit_file', 'bash'], workspaceMode: 'isolated_write', writeScope: ['src/api/**'] },
+        ],
+      }],
+      edges: [],
+    }) + '\n```'
+    const plan = parseOrchPlan(json)
+    expect(plan).not.toBeNull()
+    expect(plan!.nodes[0]!.kind).toBe('parallel')
+    expect(validatePlan(plan!)).toHaveLength(0)
+  })
+})
