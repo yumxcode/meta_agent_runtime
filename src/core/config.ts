@@ -335,6 +335,13 @@ export interface MetaAgentConfig {
   driftGate?: import('../kernel/loop/DriftGate.js').DriftGateFn
 
   /**
+   * Auto-orch main-loop phase hooks (B). Forwarded verbatim to the kernel (see
+   * KernelConfig.phaseHooks). Built by the router layer (auto-orch only). Absent
+   * = no intra-turn phase hooks, so every other mode is unaffected.
+   */
+  phaseHooks?: import('../kernel/loop/PhaseHooks.js').PhaseHookFn
+
+  /**
    * Auto mode gate-failure policy. Default is kernel-side 'checkpoint_pause':
    * verify unavailability cannot report success; drift unavailability is
    * tolerated briefly, then pauses at a checkpoint. Non-auto sessions ignore it.
@@ -406,6 +413,7 @@ export type ResolvedConfig = Required<
     | 'autonomy'
     | 'verifyGate'
     | 'driftGate'
+    | 'phaseHooks'
     | 'autoGateFailurePolicy'
     | 'autoGateMaxAttempts'
     | 'autoDriftFailureLimit'
@@ -440,6 +448,8 @@ export type ResolvedConfig = Required<
   verifyGate?: MetaAgentConfig['verifyGate']
   /** Auto mode mid-flight drift gate; absent → no drift checking. */
   driftGate?: MetaAgentConfig['driftGate']
+  /** Auto-orch main-loop phase hooks (B); absent → no intra-turn phase hooks. */
+  phaseHooks?: MetaAgentConfig['phaseHooks']
   autoGateFailurePolicy?: MetaAgentConfig['autoGateFailurePolicy']
   autoGateMaxAttempts?: number
   autoDriftFailureLimit?: number
@@ -550,6 +560,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     autonomy:        config.autonomy,
     verifyGate:      config.verifyGate,
     driftGate:       config.driftGate,
+    phaseHooks:      config.phaseHooks,
     autoGateFailurePolicy: config.autoGateFailurePolicy,
     autoGateMaxAttempts: config.autoGateMaxAttempts,
     autoDriftFailureLimit: config.autoDriftFailureLimit,

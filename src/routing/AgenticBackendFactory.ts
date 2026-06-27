@@ -27,6 +27,7 @@ import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinato
 import { FlashClient } from '../core/flash/FlashClient.js'
 import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
 import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
+import { AutoOrchController, buildAutoOrchLaunchHooks } from '../core/auto-orch/index.js'
 import {
   createAutoExperienceStore,
   renderRecentExperiences,
@@ -67,6 +68,8 @@ export interface AgenticBackend {
   bridge: SubAgentBridge
   /** Non-null only in AUTO mode. The Router holds it for durable checkpointing. */
   checkpointCoordinator: AutoCheckpointCoordinator | null
+  /** Non-null only in AUTO-ORCH mode. The end-to-end orchestration driver. */
+  orchController: AutoOrchController | null
 }
 
 /**
@@ -77,6 +80,9 @@ export interface AgenticBackend {
 export async function createAgenticBackend(input: AgenticBackendInput): Promise<AgenticBackend> {
   const { baseConfig, projectDir, resumeSessionId, explicitResume, overrides, getGoal } = input
   const isAuto = overrides?.autonomy !== undefined
+  // auto-orch shares auto's autonomy jail (isAuto stays true) and ADDS the
+  // orchestration layer. Detected via the prompt mode the router passed.
+  const isAutoOrch = overrides?.promptMode === 'auto-orch'
 
   const resumeCheckpoint = isAuto && explicitResume ? readAutoCheckpoint(projectDir) : null
 
@@ -102,6 +108,16 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   const getExperienceRecallBlock = autoExperienceStore
     ? () => renderRecentExperiences(autoExperienceStore)
     : undefined
+
+  // AUTO-ORCH: the end-to-end orchestration driver (Planner → PlanRunner →
+  // KernelNodeRunner), plus the launch phase hook (B) that boots it on the first
+  // pre_query and surfaces its summary as the result. Both read the same lazy
+  // dispatcher facade. phaseHooks stays undefined for every other mode, so the
+  // kernel makes zero extra calls (zero regression).
+  const orchController = isAutoOrch
+    ? new AutoOrchController({ dispatcher: lazyDispatcher, projectDir, getGoal })
+    : null
+  const phaseHooks = orchController ? buildAutoOrchLaunchHooks(orchController) : undefined
 
   // Edit-digest summarizer (auto only): one cheap flash side-call, fired by the
   // checkpoint coordinator at most once per N FS-only checkpoints, to recap a
@@ -166,6 +182,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     autonomy: overrides?.autonomy,
     verifyGate,
     driftGate,
+    phaseHooks,
     getExperienceRecallBlock,
     onCheckpointBoundary: checkpointCoordinator
       ? event => checkpointCoordinator.flush(event)
@@ -221,5 +238,5 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // Completion/failure notifications flow into the volatile prefix.
   session.setSubAgentBridge(bridge)
 
-  return { session, bridge, checkpointCoordinator }
+  return { session, bridge, checkpointCoordinator, orchController }
 }

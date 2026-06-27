@@ -4,7 +4,7 @@ import { buildStaticSystemPrompt } from '../staticPrompt.js'
 import { buildCurrentModeSection } from '../dynamicPrompt.js'
 import { SectionRegistry } from '../systemPromptSections.js'
 
-const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'campaign', 'robotics']
+const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'campaign', 'robotics', 'auto-orch']
 
 async function render(section: ReturnType<typeof buildCurrentModeSection>): Promise<string> {
   const [t] = await new SectionRegistry().resolve([section])
@@ -29,10 +29,17 @@ describe('MODE_PROFILES single source of truth', () => {
     for (const m of ALL_MODES) expect(MODE_PROFILES[m].compactProfile).toBe(m)
   })
 
-  it('only auto carries agenticOverrides (autonomy + auto prompt)', () => {
+  it('auto + auto-orch carry agenticOverrides (autonomy jail); agentic does not', () => {
     expect(MODE_PROFILES.agentic.agenticOverrides).toBeUndefined()
     expect(MODE_PROFILES.auto.agenticOverrides?.promptMode).toBe('auto')
     expect(MODE_PROFILES.auto.agenticOverrides?.autonomy).toMatchObject({
+      autoApproveInWorkspace: true,
+      lockWorkspace: true,
+      deniedTools: AUTO_DENIED_TOOL_NAMES,
+    })
+    // auto-orch reuses the same autonomy jail (it is a flavour of auto).
+    expect(MODE_PROFILES['auto-orch'].agenticOverrides?.promptMode).toBe('auto-orch')
+    expect(MODE_PROFILES['auto-orch'].agenticOverrides?.autonomy).toMatchObject({
       autoApproveInWorkspace: true,
       lockWorkspace: true,
       deniedTools: AUTO_DENIED_TOOL_NAMES,

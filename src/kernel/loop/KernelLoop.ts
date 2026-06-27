@@ -636,12 +636,14 @@ export async function* runKernelLoop(
   // advisory: it may inject meta user messages (applied at the next natural
   // boundary, same as drift corrections) and/or request a clean abort. Fail-open:
   // a throwing/hanging hook is swallowed and treated as an empty outcome.
-  // Returns true when the loop should terminate after this transition.
+  // Returns { abort, note } — abort requests clean termination; note (when the
+  // hook supplied one and asked to abort) becomes the surfaced result text, so an
+  // orchestration launch hook can report its summary as the session result.
   async function runPhaseHook(
     point: import('./PhaseHooks.js').PhaseHookPoint,
     extra?: { toolNames?: readonly string[]; erroredToolNames?: readonly string[] },
-  ): Promise<boolean> {
-    if (!config.phaseHooks) return false
+  ): Promise<{ abort: boolean; note?: string }> {
+    if (!config.phaseHooks) return { abort: false }
     try {
       const outcome = await config.phaseHooks({
         point,
@@ -659,9 +661,9 @@ export async function* runKernelLoop(
           append(makeTextUserMessage(text, { isMeta: true }))
         }
       }
-      return outcome.abort === true
+      return { abort: outcome.abort === true, note: outcome.note }
     } catch {
-      return false
+      return { abort: false }
     }
   }
 
@@ -872,10 +874,16 @@ export async function* runKernelLoop(
 
     // ── Phase hook: pre_query (auto-orch B) ───────────────────────────────────
     // Fires right before the model is queried, after any injected messages are
-    // already appended so the hook's own inject lands on THIS turn.
-    if (await runPhaseHook('pre_query')) {
-      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort before query.'
-      return done('phase_hook_abort')
+    // already appended so the hook's own inject lands on THIS turn. This is the
+    // auto-orch launch point: the orchestration runs here and aborts the shell
+    // executor, surfacing its summary (the hook note) as the result text.
+    {
+      const ph = await runPhaseHook('pre_query')
+      if (ph.abort) {
+        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort before query.'
+        yield { type: 'text_delta', delta: resultText, sessionId }
+        return done('phase_hook_abort')
+      }
     }
 
     // ── Steps 7+8: stream API + accumulate messages ───────────────────────────
@@ -1195,9 +1203,12 @@ export async function* runKernelLoop(
     // ── Phase hook: post_query (auto-orch B) ──────────────────────────────────
     // Fires after the assistant turn is committed, before tool execution. Lets a
     // policy react to what the model just said / decided.
-    if (await runPhaseHook('post_query')) {
-      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort after query.'
-      return done('phase_hook_abort')
+    {
+      const ph = await runPhaseHook('post_query')
+      if (ph.abort) {
+        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort after query.'
+        return done('phase_hook_abort')
+      }
     }
 
     // ── Collect tool_use blocks ──────────────────────────────────────────────
@@ -1439,9 +1450,12 @@ export async function* runKernelLoop(
 
     // ── Phase hook: pre_tool (auto-orch B) ────────────────────────────────────
     const batchToolNames = toolUseRequests.map(req => req.toolName)
-    if (await runPhaseHook('pre_tool', { toolNames: batchToolNames })) {
-      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort before tool execution.'
-      return done('phase_hook_abort')
+    {
+      const ph = await runPhaseHook('pre_tool', { toolNames: batchToolNames })
+      if (ph.abort) {
+        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort before tool execution.'
+        return done('phase_hook_abort')
+      }
     }
 
     const toolsResult = await runTools(toolUseRequests, config.tools, toolCtx, canUseTool)
@@ -1484,9 +1498,12 @@ export async function* runKernelLoop(
         if (name) erroredToolNameSet.add(name)
       }
     }
-    if (await runPhaseHook('post_tool', { toolNames: batchToolNames, erroredToolNames: [...erroredToolNameSet] })) {
-      resultText = resultText || 'Stopped (auto-orch): a phase hook requested abort after tool execution.'
-      return done('phase_hook_abort')
+    {
+      const ph = await runPhaseHook('post_tool', { toolNames: batchToolNames, erroredToolNames: [...erroredToolNameSet] })
+      if (ph.abort) {
+        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort after tool execution.'
+        return done('phase_hook_abort')
+      }
     }
 
     // A kernel "turn" for checkpoint/drift purposes is one completed tool

@@ -87,6 +87,9 @@ export class AgenticSession {
       verifyGate: config.verifyGate,
       // Auto mode: mid-flight drift/reflection gate. Same gating + provenance.
       driftGate: config.driftGate,
+      // Auto-orch: main-loop phase hooks (B). Inert unless set, so other modes
+      // are unaffected.
+      phaseHooks: config.phaseHooks,
       autoGateFailurePolicy: config.autoGateFailurePolicy,
       autoGateMaxAttempts: config.autoGateMaxAttempts,
       autoDriftFailureLimit: config.autoDriftFailureLimit,

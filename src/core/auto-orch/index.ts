@@ -67,3 +67,15 @@ export {
   parseOrchPlan,
   singleExecutorPlan,
 } from './PlannerAgent.js'
+
+// ── C: live node execution ─────────────────────────────────────────────────────
+export type { KernelNodeRunnerOptions } from './KernelNodeRunner.js'
+export { KernelNodeRunner, parseRoleVerdict } from './KernelNodeRunner.js'
+
+// ── C: end-to-end controller ───────────────────────────────────────────────────
+export type { AutoOrchControllerDeps, OrchestrationResult } from './AutoOrchController.js'
+export {
+  AutoOrchController,
+  makeAutoOrchController,
+  buildAutoOrchLaunchHooks,
+} from './AutoOrchController.js'
