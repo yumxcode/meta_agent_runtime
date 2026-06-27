@@ -10,9 +10,30 @@ import type { SubAgentRecord, SubAgentStatus } from '../../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../../subagent/types.js'
 import { KernelNodeRunner, parseRoleVerdict } from '../KernelNodeRunner.js'
 import { AutoOrchController, buildAutoOrchLaunchHooks } from '../AutoOrchController.js'
+import { RoleCatalog } from '../RoleRegistry.js'
+import { runReviewer } from '../reviewer.js'
 import type { OrchNode } from '../LoopIR.js'
 import type { PlanRunContext } from '../PlanRunner.js'
 import type { PhaseHookEvent } from '../../../kernel/loop/PhaseHooks.js'
+
+/**
+ * A catalogue where verify/drift resolve to the GENERIC reviewer (pass/fail
+ * rubric) so stub-driven tests stay hermetic — the real verify/drift gates need
+ * git-snapshot + judge infra exercised by the kernel suites, not here. This
+ * also proves the catalogue is injectable/overridable.
+ */
+function reviewerCatalog(): RoleCatalog {
+  const asReviewer = (name: string) => ({
+    name,
+    buildHandler: (ctx: { dispatcher: ISubAgentDispatcher }) =>
+      ({ criteria, signal }: { criteria: string; signal: AbortSignal }) =>
+        runReviewer(ctx.dispatcher, { role: name, criteria, signal }),
+  })
+  return new RoleCatalog()
+    .register(asReviewer('verify'))
+    .register(asReviewer('drift'))
+    .register(asReviewer('reviewer'))
+}
 
 interface Canned {
   summary: string
@@ -80,7 +101,8 @@ describe('parseRoleVerdict', () => {
 
 describe('KernelNodeRunner', () => {
   const exec: OrchNode = { id: 'gen', kind: 'executor', taskDescription: 'do', workspaceMode: 'isolated_write' }
-  const role: OrchNode = { id: 'verify', kind: 'role', role: 'verify', taskDescription: 'check' }
+  // 'reviewer' resolves to the generic read-only reviewer in the default catalogue.
+  const role: OrchNode = { id: 'verify', kind: 'role', role: 'reviewer', taskDescription: 'check' }
 
   it('maps a successful executor to branch:ok with cost', async () => {
     const runner = new KernelNodeRunner(queueDispatcher([{ summary: 'built it', success: true, costUsd: 0.2 }]))
@@ -135,7 +157,7 @@ describe('AutoOrchController', () => {
       { summary: 'generated', success: true, costUsd: 0.3 },
       { summary: '{"label":"pass","messages":[]}', costUsd: 0.1 },
     ])
-    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X' })
+    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X', nodeRunnerOptions: { roleCatalog: reviewerCatalog() } })
     const result = await controller.run(new AbortController().signal)
     expect(result.planSource).toBe('planner')
     expect(result.run.status).toBe('completed')
@@ -152,7 +174,7 @@ describe('AutoOrchController', () => {
       { summary: 'attempt 2', success: true },         // gen again
       { summary: '{"label":"pass","messages":[]}' },   // verify → pass
     ])
-    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X' })
+    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X', nodeRunnerOptions: { roleCatalog: reviewerCatalog() } })
     const result = await controller.run(new AbortController().signal)
     expect(result.run.status).toBe('completed')
     expect(result.run.visitedPath).toEqual(['gen', 'verify', 'gen', 'verify'])
@@ -164,7 +186,7 @@ describe('AutoOrchController', () => {
       { summary: 'did the work', success: true },      // execute
       { summary: '{"label":"pass","messages":[]}' },   // verify
     ])
-    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X' })
+    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X', nodeRunnerOptions: { roleCatalog: reviewerCatalog() } })
     const result = await controller.run(new AbortController().signal)
     expect(result.planSource).toBe('fallback')
     expect(result.run.status).toBe('completed')
@@ -190,7 +212,7 @@ describe('buildAutoOrchLaunchHooks', () => {
       { summary: 'generated', success: true },
       { summary: '{"label":"pass","messages":[]}' },
     ])
-    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'g' })
+    const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'g', nodeRunnerOptions: { roleCatalog: reviewerCatalog() } })
     const fn = buildAutoOrchLaunchHooks(controller)
 
     const first = await fn(event())

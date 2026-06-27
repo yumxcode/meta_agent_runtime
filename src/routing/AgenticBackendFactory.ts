@@ -25,9 +25,11 @@ import type { AgentMode } from '../core/dynamicPrompt.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { FlashClient } from '../core/flash/FlashClient.js'
-import { makeAutoVerifyGate } from '../core/auto/verify/VerifyJudge.js'
-import { makeAutoDriftGate } from '../core/auto/learn/DriftAgent.js'
-import { AutoOrchController, buildAutoOrchLaunchHooks } from '../core/auto-orch/index.js'
+import {
+  AutoOrchController,
+  buildAutoOrchLaunchHooks,
+  defaultRoleCatalog,
+} from '../core/auto-orch/index.js'
 import {
   createAutoExperienceStore,
   renderRecentExperiences,
@@ -95,16 +97,17 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     cancelTask: (id: Parameters<SubAgentBridge['cancelTask']>[0], r?: string) => bridgeRef!.cancelTask(id, r),
   }
 
-  const verifyGate = isAuto
-    ? makeAutoVerifyGate({ dispatcher: lazyDispatcher, projectDir, getGoal })
-    : undefined
+  // Role catalogue: the single source of truth for review roles. drift/verify
+  // are now obtained THROUGH it (it delegates to the same makers), so the kernel
+  // gates and the auto-orch graph nodes share one role definition surface.
+  const roleCatalog = defaultRoleCatalog()
+  const roleCtx = { dispatcher: lazyDispatcher, projectDir, getGoal }
+  const verifyGate = isAuto ? roleCatalog.buildVerifyGate(roleCtx) : undefined
 
   // Auto Learn: one experience store powers both recall (main prompt) and the
   // drift agent's writes.
   const autoExperienceStore = isAuto ? createAutoExperienceStore(projectDir) : null
-  const driftGate = isAuto
-    ? makeAutoDriftGate({ dispatcher: lazyDispatcher, projectDir, getGoal })
-    : undefined
+  const driftGate = isAuto ? roleCatalog.buildDriftGate(roleCtx) : undefined
   const getExperienceRecallBlock = autoExperienceStore
     ? () => renderRecentExperiences(autoExperienceStore)
     : undefined
@@ -115,7 +118,14 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // dispatcher facade. phaseHooks stays undefined for every other mode, so the
   // kernel makes zero extra calls (zero regression).
   const orchController = isAutoOrch
-    ? new AutoOrchController({ dispatcher: lazyDispatcher, projectDir, getGoal })
+    ? new AutoOrchController({
+        dispatcher: lazyDispatcher,
+        projectDir,
+        getGoal,
+        // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
+        // came from — verify/drift/reviewer are defined once.
+        nodeRunnerOptions: { roleCatalog },
+      })
     : null
   const phaseHooks = orchController ? buildAutoOrchLaunchHooks(orchController) : undefined
 

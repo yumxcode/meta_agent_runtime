@@ -72,6 +72,16 @@ export {
 export type { KernelNodeRunnerOptions } from './KernelNodeRunner.js'
 export { KernelNodeRunner, parseRoleVerdict } from './KernelNodeRunner.js'
 
+// ── Role catalogue (unifies drift/verify with auto-orch roles) ──────────────────
+export type {
+  RoleContext,
+  RoleHandler,
+  RoleHandlerInput,
+  RoleDefinition,
+} from './RoleRegistry.js'
+export { RoleCatalog, defaultRoleCatalog } from './RoleRegistry.js'
+export { runReviewer, roleSystemPrompt } from './reviewer.js'
+
 // ── C: end-to-end controller ───────────────────────────────────────────────────
 export type { AutoOrchControllerDeps, OrchestrationResult } from './AutoOrchController.js'
 export {

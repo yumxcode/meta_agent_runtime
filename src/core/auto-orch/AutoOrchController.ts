@@ -41,7 +41,13 @@ export class AutoOrchController {
 
   constructor(deps: AutoOrchControllerDeps) {
     this.plan = makeAutoOrchPlanner(deps)
-    this.nodeRunner = new KernelNodeRunner(deps.dispatcher, deps.nodeRunnerOptions)
+    // Forward workspace + goal so role nodes ('verify'/'drift') resolved from the
+    // catalogue get the real jail root and frozen goal they judge against.
+    this.nodeRunner = new KernelNodeRunner(deps.dispatcher, {
+      projectDir: deps.projectDir,
+      getGoal: deps.getGoal,
+      ...deps.nodeRunnerOptions,
+    })
   }
 
   /**
