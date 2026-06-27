@@ -49,8 +49,17 @@ export type {
   OrchEdge,
   OrchBounds,
   OrchPlan,
+  JoinPolicy,
+  ParallelBranch,
+  BranchChange,
+  MergePlan,
 } from './LoopIR.js'
-export { validatePlan, detectUnterminableCycles } from './LoopIR.js'
+export {
+  validatePlan,
+  detectUnterminableCycles,
+  planMerge,
+  writeScopesOverlap,
+} from './LoopIR.js'
 export type {
   PlanRunContext,
   NodeRunner,

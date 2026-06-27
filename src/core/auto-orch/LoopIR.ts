@@ -26,9 +26,34 @@ export type NodeKind =
   | 'executor'
   /** A reviewing role (verify / drift / reviewer / cost_guard / …). */
   | 'role'
+  /** A fan-out group: run `branches` concurrently, then join + merge. */
+  | 'parallel'
 
 /** Where a node's writes land. Mirrors SpawnSubAgentOptions.workspace_mode. */
 export type NodeWorkspaceMode = 'shared_readonly' | 'isolated_write'
+
+/** Join policy for a parallel node — when is the group considered done. */
+export type JoinPolicy = 'all' | 'any' | 'quorum'
+
+/** One concurrent branch of a `parallel` node (its own sub-agent + git branch). */
+export interface ParallelBranch {
+  /** Unique id within the parallel node. */
+  id: string
+  /** Self-contained task for this branch's sub-agent. */
+  taskDescription: string
+  systemPrompt?: string
+  allowedTools?: string[]
+  maxTurns?: number
+  maxBudgetUsd?: number
+  /** Writers MUST be isolated_write; readers default to shared_readonly. */
+  workspaceMode?: NodeWorkspaceMode
+  /**
+   * L1 write-scope: path globs (workspace-relative) this branch may write.
+   * REQUIRED for writers — runtime enforcement confines the branch to it, and
+   * the static disjointness check uses it to guarantee conflict-free merges.
+   */
+  writeScope?: string[]
+}
 
 /** A phase-hook attachment declared on a node (B mounted inside C). */
 export interface NodeHookSpec {
@@ -64,6 +89,19 @@ export interface OrchNode {
   workspaceMode?: NodeWorkspaceMode
   /** Phase hooks active only while this node runs. */
   hooks?: NodeHookSpec[]
+  // ── Parallel-node fields (kind === 'parallel') ──────────────────────────────
+  /** Concurrent branches to fan out. */
+  branches?: ParallelBranch[]
+  /** When the group is done. Default 'all'. */
+  join?: JoinPolicy
+  /** Required success count when join === 'quorum'. */
+  quorum?: number
+  /**
+   * Role used to resolve merge conflicts between overlapping write-scopes
+   * (L3(c) LLM 3-way merge). Default 'integrator'. Only consulted when branch
+   * write-scopes can overlap; disjoint scopes never need it.
+   */
+  integrator?: string
 }
 
 /** Condition under which an edge is taken after its `from` node returns. */
@@ -142,6 +180,7 @@ export function validatePlan(plan: OrchPlan): string[] {
       if (!h.role) errs.push(`node[${n.id}].hook[${h.id ?? '?'}] needs a role`)
       if (h.when) errs.push(...validatePredicate(h.when, `node[${n.id}].hook[${h.id}].when`))
     }
+    if (n.kind === 'parallel') errs.push(...validateParallelNode(n))
   }
 
   if (!plan.entry) errs.push('plan.entry is required')
@@ -254,3 +293,147 @@ export function detectUnterminableCycles(plan: OrchPlan): string[] {
 
 /** FS-mutating tool names — used to enforce the isolated-write rule for writers. */
 const FS_WRITE_TOOLS = new Set(['write_file', 'edit_file', 'notebook_edit'])
+
+/** A branch is a "writer" if it may mutate files (isolated_write or a write tool). */
+function isWriterBranch(b: ParallelBranch): boolean {
+  return b.workspaceMode === 'isolated_write' || (b.allowedTools?.some(t => FS_WRITE_TOOLS.has(t)) ?? false)
+}
+
+/**
+ * Validate a parallel node: branch ids unique + self-contained, writers declare
+ * a write-scope (L1), quorum sane, and — the heart of L1 — any two WRITER
+ * branches whose declared write-scopes can OVERLAP require an integrator role to
+ * be declared (otherwise their merge could conflict with nothing to resolve it).
+ * Disjoint scopes need no integrator and merge clean by construction.
+ */
+function validateParallelNode(n: OrchNode): string[] {
+  const errs: string[] = []
+  const branches = n.branches ?? []
+  if (branches.length === 0) {
+    errs.push(`parallel node[${n.id}] needs at least one branch`)
+    return errs
+  }
+  const seen = new Set<string>()
+  const writers: ParallelBranch[] = []
+  for (const b of branches) {
+    if (!b.id) errs.push(`parallel node[${n.id}] has a branch without an id`)
+    else if (seen.has(b.id)) errs.push(`parallel node[${n.id}] duplicate branch id: ${b.id}`)
+    else seen.add(b.id)
+    if (!b.taskDescription) errs.push(`parallel node[${n.id}].branch[${b.id}] needs a taskDescription`)
+    if (isWriterBranch(b)) {
+      if (b.workspaceMode !== 'isolated_write') {
+        errs.push(`parallel node[${n.id}].branch[${b.id}] writes files but is not workspaceMode=isolated_write`)
+      }
+      if (!b.writeScope || b.writeScope.length === 0) {
+        errs.push(`parallel node[${n.id}].branch[${b.id}] is a writer and must declare a writeScope (L1)`)
+      }
+      writers.push(b)
+    }
+  }
+
+  // L1 static disjointness: overlapping writer scopes are allowed ONLY with an
+  // integrator declared to resolve potential merge conflicts.
+  for (let i = 0; i < writers.length; i++) {
+    for (let j = i + 1; j < writers.length; j++) {
+      if (
+        !n.integrator &&
+        writeScopesOverlap(writers[i]!.writeScope ?? [], writers[j]!.writeScope ?? [])
+      ) {
+        errs.push(
+          `parallel node[${n.id}] writer branches '${writers[i]!.id}' and '${writers[j]!.id}' have ` +
+          `overlapping write-scopes — make them disjoint, or declare an 'integrator' role to resolve merges.`,
+        )
+      }
+    }
+  }
+
+  if (n.join === 'quorum') {
+    if (n.quorum === undefined || n.quorum < 1 || n.quorum > branches.length) {
+      errs.push(`parallel node[${n.id}] join='quorum' needs quorum in 1..${branches.length}`)
+    }
+  }
+  return errs
+}
+
+/** Conservative glob overlap: true unless the two scope sets are clearly disjoint. */
+export function writeScopesOverlap(a: string[], b: string[]): boolean {
+  for (const ga of a) for (const gb of b) if (globsOverlap(ga, gb)) return true
+  return false
+}
+
+/**
+ * Conservative single-glob overlap. We err on the side of "may overlap" (safe:
+ * forces an integrator) rather than risk a false "disjoint". Two globs overlap
+ * when, after stripping a trailing `/**` or `/*`, one prefix path contains the
+ * other (or they're equal). Different top-level segments → disjoint.
+ */
+function globsOverlap(a: string, b: string): boolean {
+  const norm = (g: string): string =>
+    g.replace(/\/\*\*?$/, '').replace(/\/+$/, '').replace(/^\.\//, '').trim()
+  const pa = norm(a)
+  const pb = norm(b)
+  if (pa === '' || pb === '') return true // root scope → overlaps everything
+  if (pa === pb) return true
+  const segA = pa.split('/')
+  const segB = pb.split('/')
+  const n = Math.min(segA.length, segB.length)
+  for (let i = 0; i < n; i++) {
+    const x = segA[i]!
+    const y = segB[i]!
+    if (x === '*' || y === '*' || x === '**' || y === '**') continue // wildcard segment → may match
+    if (x !== y) return false // diverged on a concrete segment → disjoint
+  }
+  return true // one path is a prefix of the other → nested → overlap
+}
+
+// ── L2: merge planning (changed-file intersection precheck) ─────────────────────
+
+/** A branch's actual changed files (from finalize) used to plan the merge. */
+export interface BranchChange {
+  id: string
+  changedFiles: string[]
+}
+
+/** What to do per branch at the join: clean merge, or hand to the integrator. */
+export interface MergePlan {
+  /** Deterministic merge order (branch declaration order). */
+  order: string[]
+  /** Branches whose changed files don't overlap anything merged before them. */
+  cleanMerges: string[]
+  /** Branches that overlap earlier ones → need the integrator role (L3c). */
+  conflicts: { branch: string; overlapsWith: string[]; files: string[] }[]
+}
+
+/**
+ * L2 precheck: from each branch's ACTUAL changed files, decide — without trying
+ * a textual merge — which branches merge clean and which overlap an
+ * already-merged branch and therefore need integration. Deterministic: merges in
+ * declaration order, accumulating the merged-file set.
+ */
+export function planMerge(branches: BranchChange[]): MergePlan {
+  const order: string[] = []
+  const cleanMerges: string[] = []
+  const conflicts: MergePlan['conflicts'] = []
+  // file -> first branch that touched it (for reporting who you conflict with)
+  const owner = new Map<string, string>()
+
+  for (const b of branches) {
+    order.push(b.id)
+    const files = b.changedFiles ?? []
+    const overlapFiles: string[] = []
+    const overlapsWith = new Set<string>()
+    for (const f of files) {
+      const prev = owner.get(f)
+      if (prev !== undefined && prev !== b.id) {
+        overlapFiles.push(f)
+        overlapsWith.add(prev)
+      }
+    }
+    if (overlapFiles.length === 0) cleanMerges.push(b.id)
+    else conflicts.push({ branch: b.id, overlapsWith: [...overlapsWith], files: overlapFiles })
+    // record ownership (first writer keeps ownership for reporting)
+    for (const f of files) if (!owner.has(f)) owner.set(f, b.id)
+  }
+
+  return { order, cleanMerges, conflicts }
+}
