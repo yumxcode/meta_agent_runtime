@@ -117,14 +117,19 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // pre_query and surfaces its summary as the result. Both read the same lazy
   // dispatcher facade. phaseHooks stays undefined for every other mode, so the
   // kernel makes zero extra calls (zero regression).
+  // Git-worktree isolation coordinator — created early so auto-orch parallel
+  // writers can merge through it; the bridge wiring/reconcile happens below.
+  const worktrees = new AutoWorktreeCoordinator(projectDir)
+
   const orchController = isAutoOrch
     ? new AutoOrchController({
         dispatcher: lazyDispatcher,
         projectDir,
         getGoal,
         // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
-        // came from — verify/drift/reviewer are defined once.
-        nodeRunnerOptions: { roleCatalog },
+        // came from — verify/drift/reviewer are defined once. Parallel writers
+        // merge via the shared worktree coordinator.
+        nodeRunnerOptions: { roleCatalog, worktrees },
       })
     : null
   const phaseHooks = orchController ? buildAutoOrchLaunchHooks(orchController) : undefined
@@ -219,7 +224,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
 
   // Git-worktree isolation for isolated_write sub-agents — armed for BOTH
   // agentic and auto so concurrent WRITE tasks each run on their own branch.
-  const worktrees = new AutoWorktreeCoordinator(projectDir)
+  // (Coordinator instance hoisted above so the orchestration controller shares it.)
   if (worktrees.enabled) {
     await worktrees.reconcile()
     bridge.setWorktreeCoordinator(worktrees)

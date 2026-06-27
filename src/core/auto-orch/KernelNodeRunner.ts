@@ -20,6 +20,9 @@ import type { OrchNode } from './LoopIR.js'
 import type { OrchVerdict } from './Verdict.js'
 import { RoleCatalog, defaultRoleCatalog } from './RoleRegistry.js'
 import { spawnAndWait, type SpawnWaitOptions } from './reviewer.js'
+import { runParallelNode, type BranchOps } from './ParallelBranchRunner.js'
+import { KernelBranchOps } from './KernelBranchOps.js'
+import type { AutoWorktreeCoordinator } from '../auto/AutoWorktreeCoordinator.js'
 
 // Re-exported for back-compat (and because they belong to the role surface).
 export { parseRoleVerdict } from './reviewer.js'
@@ -35,6 +38,10 @@ export interface KernelNodeRunnerOptions {
   projectDir?: string
   /** Live goal accessor, forwarded to role handlers. */
   getGoal?: () => string | null
+  /** IO ops for `parallel` nodes. Default = KernelBranchOps over the dispatcher. */
+  branchOps?: BranchOps
+  /** Worktree coordinator for parallel writers' isolated branches + merges. */
+  worktrees?: AutoWorktreeCoordinator | null
 }
 
 export class KernelNodeRunner implements NodeRunner {
@@ -43,6 +50,7 @@ export class KernelNodeRunner implements NodeRunner {
   private readonly roleCatalog: RoleCatalog
   private readonly projectDir: string
   private readonly getGoal: () => string | null
+  private readonly branchOps: BranchOps
 
   constructor(
     private readonly dispatcher: ISubAgentDispatcher,
@@ -53,10 +61,17 @@ export class KernelNodeRunner implements NodeRunner {
     this.roleCatalog = opts?.roleCatalog ?? defaultRoleCatalog()
     this.projectDir = opts?.projectDir ?? process.cwd()
     this.getGoal = opts?.getGoal ?? (() => null)
+    this.branchOps = opts?.branchOps ?? new KernelBranchOps({
+      dispatcher,
+      worktrees: opts?.worktrees ?? null,
+      pollMs: this.pollMs,
+      maxWaitMs: this.maxWaitMs,
+    })
   }
 
   async run(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
     try {
+      if (node.kind === 'parallel') return await runParallelNode(this.branchOps, node, ctx)
       return node.kind === 'role'
         ? await this.runRole(node, ctx)
         : await this.runExecutor(node, ctx)

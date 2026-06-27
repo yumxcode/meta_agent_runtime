@@ -17,7 +17,14 @@
  */
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import { TERMINAL_STATUSES } from '../../subagent/types.js'
-import { validatePlan, type OrchPlan, type OrchNode, type OrchEdge } from './LoopIR.js'
+import {
+  validatePlan,
+  type OrchPlan,
+  type OrchNode,
+  type OrchEdge,
+  type ParallelBranch,
+  type JoinPolicy,
+} from './LoopIR.js'
 
 export interface AutoOrchPlannerDeps {
   /** Spawns the isolated planning sub-agent. */
@@ -181,7 +188,7 @@ function normalisePlan(obj: Record<string, unknown>): OrchPlan | null {
 
   const nodes: OrchNode[] = (obj['nodes'] as unknown[]).map(n => {
     const o = (n ?? {}) as Record<string, unknown>
-    const kind = o['kind'] === 'role' ? 'role' : 'executor'
+    const kind = o['kind'] === 'role' ? 'role' : o['kind'] === 'parallel' ? 'parallel' : 'executor'
     const node: OrchNode = {
       id: String(o['id'] ?? ''),
       kind,
@@ -195,6 +202,7 @@ function normalisePlan(obj: Record<string, unknown>): OrchPlan | null {
     if (o['workspaceMode'] === 'isolated_write' || o['workspaceMode'] === 'shared_readonly') {
       node.workspaceMode = o['workspaceMode']
     }
+    if (kind === 'parallel') normaliseParallel(node, o)
     return node
   })
 
@@ -223,6 +231,31 @@ function normalisePlan(obj: Record<string, unknown>): OrchPlan | null {
     }
   }
   return plan
+}
+
+/** Parse the parallel-specific fields (branches/join/quorum/integrator) onto a node. */
+function normaliseParallel(node: OrchNode, o: Record<string, unknown>): void {
+  if (Array.isArray(o['branches'])) {
+    node.branches = (o['branches'] as unknown[]).map(x => {
+      const b = (x ?? {}) as Record<string, unknown>
+      const branch: ParallelBranch = {
+        id: String(b['id'] ?? ''),
+        taskDescription: String(b['taskDescription'] ?? ''),
+      }
+      if (typeof b['systemPrompt'] === 'string') branch.systemPrompt = b['systemPrompt']
+      if (Array.isArray(b['allowedTools'])) branch.allowedTools = (b['allowedTools'] as unknown[]).map(String)
+      if (typeof b['maxTurns'] === 'number') branch.maxTurns = b['maxTurns']
+      if (typeof b['maxBudgetUsd'] === 'number') branch.maxBudgetUsd = b['maxBudgetUsd']
+      if (b['workspaceMode'] === 'isolated_write' || b['workspaceMode'] === 'shared_readonly') {
+        branch.workspaceMode = b['workspaceMode']
+      }
+      if (Array.isArray(b['writeScope'])) branch.writeScope = (b['writeScope'] as unknown[]).map(String)
+      return branch
+    })
+  }
+  if (o['join'] === 'all' || o['join'] === 'any' || o['join'] === 'quorum') node.join = o['join'] as JoinPolicy
+  if (typeof o['quorum'] === 'number') node.quorum = o['quorum']
+  if (typeof o['integrator'] === 'string') node.integrator = o['integrator']
 }
 
 /** Spawn the planner agent and block until terminal; return its summary text. */

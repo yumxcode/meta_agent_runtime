@@ -81,6 +81,16 @@ export {
 export type { KernelNodeRunnerOptions } from './KernelNodeRunner.js'
 export { KernelNodeRunner, parseRoleVerdict } from './KernelNodeRunner.js'
 
+// ── C: parallel node execution ──────────────────────────────────────────────────
+export type {
+  BranchRunResult,
+  MergeOutcome,
+  BranchOps,
+} from './ParallelBranchRunner.js'
+export { runParallelNode, branchIsWriter, DEFAULT_INTEGRATOR_ROLE } from './ParallelBranchRunner.js'
+export type { KernelBranchOpsDeps } from './KernelBranchOps.js'
+export { KernelBranchOps, INTEGRATOR_RUBRIC } from './KernelBranchOps.js'
+
 // ── Role catalogue (unifies drift/verify with auto-orch roles) ──────────────────
 export type {
   RoleContext,
