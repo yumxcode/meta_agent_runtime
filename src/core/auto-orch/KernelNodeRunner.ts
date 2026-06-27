@@ -58,8 +58,8 @@ export class KernelNodeRunner implements NodeRunner {
   async run(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
     try {
       return node.kind === 'role'
-        ? await this.runRole(node, ctx.signal)
-        : await this.runExecutor(node, ctx.signal)
+        ? await this.runRole(node, ctx)
+        : await this.runExecutor(node, ctx)
     } catch (err) {
       // Defensive: surface as a routable error verdict rather than throwing, so a
       // single flaky node doesn't abort the whole plan via PlanRunner's catch.
@@ -67,11 +67,15 @@ export class KernelNodeRunner implements NodeRunner {
     }
   }
 
-  private async runExecutor(node: OrchNode, signal: AbortSignal): Promise<OrchVerdict> {
+  private async runExecutor(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
+    // Blackboard: consume any pending reviewer feedback and prepend it so this
+    // re-run actually fixes the cited gaps (closing the generate→verify→fix loop).
+    const preface = ctx.blackboard?.takeCorrectivePreface() ?? ''
+    const taskDescription = preface ? `${preface}\n${node.taskDescription}` : node.taskDescription
     const rec = await spawnAndWait(
       this.dispatcher,
       {
-        taskDescription: node.taskDescription,
+        taskDescription,
         systemPrompt: node.systemPrompt,
         allowedTools: node.allowedTools ?? [],
         maxTurns: node.maxTurns ?? 12,
@@ -83,7 +87,7 @@ export class KernelNodeRunner implements NodeRunner {
         // Writers MUST be isolated (validatePlan enforces this); default readonly.
         workspaceMode: node.workspaceMode ?? 'shared_readonly',
       },
-      signal,
+      ctx.signal,
       this.spawnOpts(),
     )
     const cost = rec?.result?.costUsd ?? 0
@@ -98,14 +102,20 @@ export class KernelNodeRunner implements NodeRunner {
     }
   }
 
-  private async runRole(node: OrchNode, signal: AbortSignal): Promise<OrchVerdict> {
+  private async runRole(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
     const role = node.role ?? 'reviewer'
     const handler = this.roleCatalog.buildHandler(role, {
       dispatcher: this.dispatcher,
       projectDir: this.projectDir,
       getGoal: this.getGoal,
     })
-    return handler({ criteria: node.taskDescription, signal })
+    const verdict = await handler({ criteria: node.taskDescription, signal: ctx.signal })
+    // Blackboard: a failing reviewer's concrete gaps are posted so the NEXT
+    // executor (reached via a back-edge) reads and fixes them.
+    if (verdict.action === 'branch' && verdict.label === 'fail' && verdict.messages?.length) {
+      ctx.blackboard?.postCorrective(role, verdict.messages)
+    }
+    return verdict
   }
 
   private spawnOpts(): SpawnWaitOptions {

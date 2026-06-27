@@ -14,6 +14,7 @@
  */
 import type { OrchVerdict } from './Verdict.js'
 import { validatePlan, type OrchNode, type OrchPlan, type OrchEdge } from './LoopIR.js'
+import { Blackboard } from './Blackboard.js'
 
 /** Per-run context handed to the node runner and used for bound accounting. */
 export interface PlanRunContext {
@@ -25,6 +26,11 @@ export interface PlanRunContext {
   totalSteps: number
   /** Cumulative cost so far. */
   costUsd: number
+  /**
+   * Run-scoped shared channel. PlanRunner always supplies one; it is optional on
+   * the type so lightweight test stubs and non-blackboard runners stay valid.
+   */
+  blackboard?: Blackboard
 }
 
 /** Runs a single node and returns its unified verdict. */
@@ -71,10 +77,20 @@ export const DEFAULT_BOUNDS = {
 } as const
 
 export class PlanRunner {
+  private readonly blackboard: Blackboard
+
   constructor(
     private readonly plan: OrchPlan,
     private readonly runner: NodeRunner,
-  ) {}
+    opts?: { blackboard?: Blackboard },
+  ) {
+    this.blackboard = opts?.blackboard ?? new Blackboard()
+  }
+
+  /** The run-scoped shared channel (observability / post-run inspection). */
+  getBlackboard(): Blackboard {
+    return this.blackboard
+  }
 
   /** Validate without running. */
   validate(): { ok: boolean; errors: string[] } {
@@ -133,7 +149,7 @@ export class PlanRunner {
 
         let verdict: OrchVerdict
         try {
-          verdict = await this.runner.run(node, { signal, visits, totalSteps, costUsd })
+          verdict = await this.runner.run(node, { signal, visits, totalSteps, costUsd, blackboard: this.blackboard })
         } catch (err) {
           return finalize('failed', `node ${currentId} runner threw: ${(err as Error).message}`)
         }

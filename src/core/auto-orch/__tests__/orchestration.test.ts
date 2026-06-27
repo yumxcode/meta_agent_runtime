@@ -42,11 +42,14 @@ interface Canned {
   costUsd?: number
 }
 
-/** A dispatcher that returns the next canned record per spawn (FIFO). */
-function queueDispatcher(queue: Canned[]): ISubAgentDispatcher {
+/** A dispatcher that returns the next canned record per spawn (FIFO). When a
+ * `captured` array is supplied, each spawn's taskDescription is recorded so a
+ * test can assert what a re-run executor actually received (e.g. correctives). */
+function queueDispatcher(queue: Canned[], captured?: string[]): ISubAgentDispatcher {
   const records = new Map<string, SubAgentRecord>()
   return {
     async spawnSubAgent({ config }) {
+      captured?.push(config.taskDescription)
       const c = queue.shift() ?? { summary: '', success: false, status: 'failed' }
       const taskId = makeSubAgentTaskId()
       const rec: SubAgentRecord = {
@@ -166,18 +169,28 @@ describe('AutoOrchController', () => {
     expect(result.summary).toContain('gen → verify')
   })
 
-  it('drives a generate→verify→fix cycle (fail then pass)', async () => {
+  it('drives a generate→verify→fix cycle and flows correctives via the blackboard', async () => {
+    const captured: string[] = []
     const dispatcher = queueDispatcher([
       { summary: PLAN },
       { summary: 'attempt 1', success: true },         // gen
-      { summary: '{"label":"fail","messages":["fix bug"]}' }, // verify → fail → back to gen
-      { summary: 'attempt 2', success: true },         // gen again
+      { summary: '{"label":"fail","messages":["fix the null check"]}' }, // verify → fail → back to gen
+      { summary: 'attempt 2', success: true },         // gen again (should see the corrective)
       { summary: '{"label":"pass","messages":[]}' },   // verify → pass
-    ])
+    ], captured)
     const controller = new AutoOrchController({ dispatcher, projectDir: '/tmp', getGoal: () => 'build X', nodeRunnerOptions: { roleCatalog: reviewerCatalog() } })
     const result = await controller.run(new AbortController().signal)
     expect(result.run.status).toBe('completed')
     expect(result.run.visitedPath).toEqual(['gen', 'verify', 'gen', 'verify'])
+
+    // captured spawns: [planner, gen1, verify1, gen2, verify2]
+    const gen1Task = captured[1]
+    const gen2Task = captured[3]
+    expect(gen1Task).not.toContain('fix the null check')      // first pass: no feedback yet
+    expect(gen2Task).toContain('fix the null check')          // re-run: corrective injected
+    expect(gen2Task).toContain('上一轮审查反馈')
+    // surfaced in the summary
+    expect(result.summary).toContain('审查纠偏轮数：1')
   })
 
   it('falls back to a single-executor plan when planning is unparsable, and still runs', async () => {

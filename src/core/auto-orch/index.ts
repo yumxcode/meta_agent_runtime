@@ -82,6 +82,10 @@ export type {
 export { RoleCatalog, defaultRoleCatalog } from './RoleRegistry.js'
 export { runReviewer, roleSystemPrompt } from './reviewer.js'
 
+// ── C: shared channel (blackboard) ─────────────────────────────────────────────
+export type { BlackboardEntry } from './Blackboard.js'
+export { Blackboard } from './Blackboard.js'
+
 // ── C: end-to-end controller ───────────────────────────────────────────────────
 export type { AutoOrchControllerDeps, OrchestrationResult } from './AutoOrchController.js'
 export {

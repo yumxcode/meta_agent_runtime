@@ -16,6 +16,7 @@ import type { PhaseHookFn } from '../../kernel/loop/PhaseHooks.js'
 import { makeAutoOrchPlanner, type AutoOrchPlannerDeps, type PlannerOutcome } from './PlannerAgent.js'
 import { KernelNodeRunner, type KernelNodeRunnerOptions } from './KernelNodeRunner.js'
 import { PlanRunner, type PlanRunResult } from './PlanRunner.js'
+import { Blackboard } from './Blackboard.js'
 import { HookRegistry } from './HookRegistry.js'
 import { continueVerdict } from './Verdict.js'
 
@@ -57,13 +58,14 @@ export class AutoOrchController {
    */
   async run(signal: AbortSignal): Promise<OrchestrationResult> {
     const planned = await this.plan(signal)
-    const runner = new PlanRunner(planned.plan, this.nodeRunner)
+    const blackboard = new Blackboard()
+    const runner = new PlanRunner(planned.plan, this.nodeRunner, { blackboard })
     const run = await runner.run(signal)
     return {
       planSource: planned.source,
       run,
       planNote: planned.note,
-      summary: renderSummary(planned, run),
+      summary: renderSummary(planned, run, blackboard.correctiveRounds()),
     }
   }
 }
@@ -106,13 +108,14 @@ export function makeAutoOrchController(
   return new AutoOrchController({ dispatcher, projectDir, getGoal, nodeRunnerOptions })
 }
 
-function renderSummary(planned: PlannerOutcome, run: PlanRunResult): string {
+function renderSummary(planned: PlannerOutcome, run: PlanRunResult, correctiveRounds: number): string {
   const lines: string[] = []
   lines.push(
     `[auto-orch] 编排${planned.source === 'planner' ? '计划' : '回退（单执行器）'}执行${statusZh(run.status)}。`,
   )
   if (planned.source === 'fallback' && planned.note) lines.push(`规划回退原因：${planned.note}`)
   if (run.visitedPath.length) lines.push(`执行路径：${run.visitedPath.join(' → ')}`)
+  if (correctiveRounds > 0) lines.push(`审查纠偏轮数：${correctiveRounds}`)
   lines.push(`累计成本：约 $${run.costUsd.toFixed(3)}`)
   if (run.note) lines.push(`说明：${run.note}`)
   return lines.join('\n')
