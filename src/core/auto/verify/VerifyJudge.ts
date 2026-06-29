@@ -55,9 +55,13 @@ const JUDGE_TOOLS_READONLY = ['read_file', 'grep', 'glob']
 // beyond setting the variable), keeping the knobs out of code.
 export const VERIFY_JUDGE_DEFAULTS = {
   /** Max tool-batch turns before the judge is force-stopped. */
-  maxTurns: 40,
-  /** Max spend (USD) before the judge is force-stopped. */
-  maxBudgetUsd: 100,
+  maxTurns: 30,
+  /**
+   * Max spend (USD) before the judge is force-stopped. Left unbounded for now;
+   * pin to a concrete cap before real deployment (or via
+   * META_AGENT_VERIFY_MAX_BUDGET_USD).
+   */
+  maxBudgetUsd: Number.POSITIVE_INFINITY,
   /** Wall-clock cap (ms) for a single judge run. */
   maxDurationMs: 600_000,
 } as const
@@ -82,8 +86,8 @@ function verifyEnvFloat(name: string, fallback: number, min: number, max: number
  * Resolve the judge's circuit-breaker limits, applying env-var overrides over
  * the defaults. Read per-invocation so config can change without a code change.
  *
- *   META_AGENT_VERIFY_MAX_TURNS        (int,   default 40)
- *   META_AGENT_VERIFY_MAX_BUDGET_USD   (float, default 100)
+ *   META_AGENT_VERIFY_MAX_TURNS        (int,   default 30)
+ *   META_AGENT_VERIFY_MAX_BUDGET_USD   (float, default unbounded)
  *   META_AGENT_VERIFY_MAX_DURATION_MS  (int,   default 600000)
  */
 export function resolveJudgeLimits(): { maxTurns: number; maxBudgetUsd: number; maxDurationMs: number } {

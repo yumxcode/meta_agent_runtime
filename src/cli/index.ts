@@ -90,6 +90,10 @@ import { CLI_VERSION } from './version.js'
 
 const VERSION = CLI_VERSION
 const DEFAULT_CLI_MAX_TURNS = 100
+// Auto-series (auto / simple_auto / auto-orch) run unattended and bound
+// themselves via checkpoint + drift/verify gates + AutoStallGuard + budget, so
+// they get a much higher per-message turn cap than attended modes.
+const AUTO_CLI_MAX_TURNS = 1000
 const PASTE_FALLBACK_COALESCE_MS = 80
 const PASTE_NOTICE_DEBOUNCE_MS = 250
 const PASTE_NOTICE_MIN_CHARS = 80
@@ -1000,8 +1004,13 @@ function makeRouter(
   if (opts.mode !== 'detect') cfg.mode  = opts.mode
 
   // Apply maxTurns: explicit flag wins; otherwise cap each user turn so a
-  // single prompt cannot run for hours without a checkpoint.
-  cfg.maxTurns = opts.maxTurns ?? DEFAULT_CLI_MAX_TURNS
+  // single prompt cannot run for hours without a checkpoint. Auto-series modes
+  // run unattended (no human to "continue" at the cap) and already have their
+  // own bounds (checkpoint + drift/verify gates + AutoStallGuard + budget), so
+  // they get a much higher default; attended modes (incl. robotics/campaign)
+  // stay at 100.
+  cfg.maxTurns =
+    opts.maxTurns ?? (isAutonomousMode(cfg.mode) ? AUTO_CLI_MAX_TURNS : DEFAULT_CLI_MAX_TURNS)
 
   // Debug mode
   if (opts.debug) cfg.debugMode = true

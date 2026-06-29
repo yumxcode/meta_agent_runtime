@@ -160,9 +160,9 @@ describe('resolveJudgeLimits — env-overridable budget', () => {
   beforeEach(() => { for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k] } })
   afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k] } })
 
-  it('falls back to the documented defaults (40 turns / $100 / 10min)', () => {
-    expect(resolveJudgeLimits()).toEqual({ maxTurns: 40, maxBudgetUsd: 100, maxDurationMs: 600_000 })
-    expect(VERIFY_JUDGE_DEFAULTS).toEqual({ maxTurns: 40, maxBudgetUsd: 100, maxDurationMs: 600_000 })
+  it('falls back to the documented defaults (30 turns / unbounded budget / 10min)', () => {
+    expect(resolveJudgeLimits()).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 600_000 })
+    expect(VERIFY_JUDGE_DEFAULTS).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 600_000 })
   })
 
   it('applies env overrides', () => {
@@ -173,10 +173,10 @@ describe('resolveJudgeLimits — env-overridable budget', () => {
   })
 
   it('ignores garbage and clamps out-of-range overrides', () => {
-    process.env['META_AGENT_VERIFY_MAX_TURNS'] = 'abc'      // → default 40
+    process.env['META_AGENT_VERIFY_MAX_TURNS'] = 'abc'      // → default 30
     process.env['META_AGENT_VERIFY_MAX_BUDGET_USD'] = '-5'  // → clamped to min 0.01
     const r = resolveJudgeLimits()
-    expect(r.maxTurns).toBe(40)
+    expect(r.maxTurns).toBe(30)
     expect(r.maxBudgetUsd).toBe(0.01)
   })
 })

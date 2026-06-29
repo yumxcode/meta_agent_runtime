@@ -43,8 +43,20 @@ const SENSITIVE_ENV_PATTERN =
   /(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|SESSION_KEY|ACCESS_KEY|REFRESH_TOKEN|AUTH)$/i
 const EXPLICIT_ENV_BLOCKLIST = new Set([
   'ANTHROPIC_API_KEY', 'DEEPSEEK_API_KEY', 'QWEN_API_KEY', 'OPENAI_API_KEY',
-  'GITHUB_TOKEN', 'GH_TOKEN', 'NPM_TOKEN',
+  'NPM_TOKEN',
   'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
+])
+
+/**
+ * Git remote credentials are deliberately allowed through the 'filtered' policy
+ * so auto-mode `git push` over HTTPS works. These names take precedence over
+ * BOTH the explicit blocklist and the SENSITIVE_ENV_PATTERN below (which would
+ * otherwise strip anything ending in _TOKEN). Scope is intentionally narrow:
+ * only git-remote auth — npm / AWS / model-provider keys stay stripped, and SSH
+ * key auth (~/.ssh) is unaffected since it never travels through the env.
+ */
+const GIT_CREDENTIAL_ALLOWLIST = new Set([
+  'GITHUB_TOKEN', 'GH_TOKEN', 'GIT_TOKEN', 'GITLAB_TOKEN',
 ])
 const MINIMAL_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'TMPDIR', 'TEMP', 'TMP']
 
@@ -63,8 +75,12 @@ function buildShellEnv(policy: ShellEnvPolicy): NodeJS.ProcessEnv {
   // 'filtered' (default)
   const out: NodeJS.ProcessEnv = {}
   for (const [key, value] of Object.entries(src)) {
-    if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue
-    if (SENSITIVE_ENV_PATTERN.test(key)) continue
+    // Git remote credentials are allowed through (see GIT_CREDENTIAL_ALLOWLIST):
+    // checked first so the blocklist / sensitive-pattern below cannot strip them.
+    if (!GIT_CREDENTIAL_ALLOWLIST.has(key)) {
+      if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue
+      if (SENSITIVE_ENV_PATTERN.test(key)) continue
+    }
     out[key] = value
   }
   return out

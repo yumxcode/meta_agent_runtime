@@ -120,8 +120,9 @@ async function runDriftAgent(
       taskDescription,
       systemPrompt: DRIFT_RUBRIC,
       allowedTools: DRIFT_TOOLS,
-      maxTurns: 10,
-      maxBudgetUsd: 0.3,
+      maxTurns: 30,
+      // Budget left unbounded for now; pin to a concrete cap before real deploy.
+      maxBudgetUsd: Number.POSITIVE_INFINITY,
       requireHumanApproval: false,
       useEventDriven: false,
       pollIntervalMs: 500,

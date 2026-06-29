@@ -29,7 +29,7 @@ describe('bash tool — regression fixes (H4 / H5)', () => {
     expect(String(result.content)).toContain('hi')
   })
 
-  it('H5: filtered env policy strips API_KEY / TOKEN variables', async () => {
+  it('H5: filtered env policy strips API_KEY / TOKEN variables but allows git credentials', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'bash-test-'))
     const prevAnthropic = process.env['ANTHROPIC_API_KEY']
     const prevGh = process.env['GH_TOKEN']
@@ -45,10 +45,10 @@ describe('bash tool — regression fixes (H4 / H5)', () => {
       expect(result.isError).toBe(false)
       const output = String(result.content)
       expect(output).toContain('AK=empty')
-      expect(output).toContain('GH=empty')
+      // GH_TOKEN is a git remote credential — allowed through for `git push`.
+      expect(output).toContain('GH=gh-secret')
       expect(output).toContain('CUST=empty')
       expect(output).not.toContain('sk-anthropic-secret')
-      expect(output).not.toContain('gh-secret')
       expect(output).not.toContain('custom-secret')
     } finally {
       if (prevAnthropic === undefined) delete process.env['ANTHROPIC_API_KEY']

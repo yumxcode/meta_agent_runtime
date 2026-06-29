@@ -179,7 +179,8 @@ export function buildAutoModeAnchors(workspaceRoot: string | undefined): string 
   const lines = [
     '## Auto-Mode Anchors (deterministic)',
     '- 当前为 AUTO（无人值守自主）模式：对工作路径内的写/删/改（含不可逆操作）已获授权，无需逐次确认。',
-    '- 解决任务必须保证在工作区边界内；影响工作区之外或共享状态的操作（git push、对外发布等）不在授权内，会被系统拒绝。',
+    '- 文件的读/写/删/编辑限定在工作区边界内；联网与 git 操作（git pull / git push，HTTP 与 SSH 均支持）已获授权，可直接执行。仅对工作区之外文件的读/写/删会被系统拒绝。',
+    '- 深度学习/强化学习训练不在本地进行：本地只核验语法与 test，训练尝试调用外部训练环境。',
     '- 持续推进直到目标达成或遇到真正阻塞；结束时交代已完成与未完成部分。',
   ]
   if (workspaceRoot) lines.push(`- 工作路径根（jail root）: ${workspaceRoot}`)
