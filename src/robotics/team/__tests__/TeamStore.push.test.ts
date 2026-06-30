@@ -96,6 +96,33 @@ describe('TeamStore.publishState / push', () => {
     expect(second.pushed).toBe(false)
     expect(second.message).toContain('没有需要发布的变更')
   })
+
+  it('refuses pull when local team commits are unpushed and remote team changed', async () => {
+    const { work, bare } = await makeRepoWithRemote()
+    const local = new TeamStore(work, 'unit-a')
+    await local.init('https://github.com/acme/demo')
+    await local.addTask({ id: 'TASK-001', title: 'local-only task' })
+    await git(work, 'add', '--', 'team')
+    await git(work, 'commit', '-m', 'team: local only')
+
+    const peer = await tempDir('meta-agent-team-peer-')
+    await git(work, 'clone', bare, peer)
+    await git(peer, 'config', 'user.email', 'peer@example.com')
+    await git(peer, 'config', 'user.name', 'Peer Unit')
+    const remote = new TeamStore(peer, 'unit-b')
+    await remote.init('https://github.com/acme/demo')
+    await remote.addTask({ id: 'TASK-002', title: 'remote task' })
+    const pushed = await remote.push()
+    expect(pushed.pushed).toBe(true)
+
+    const result = await local.pullRemoteTeam()
+    expect(result.applied).toBe(false)
+    expect(result.reason).toContain('unpushed team commit')
+
+    const raw = await readFile(join(work, 'team', 'team.json'), 'utf8')
+    expect(raw).toContain('local-only task')
+    expect(raw).not.toContain('remote task')
+  })
 })
 
 describe('TeamTask.kind lane tag', () => {

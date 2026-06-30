@@ -43,12 +43,13 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
+    "@meta-agent/runtime": "file:meta-agent-runtime-0.4.1.tgz",
     "openai": "^6.39.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {
-    "esbuild": "^0.28.0",
     "@types/node": "^25.6.0",
+    "esbuild": "^0.28.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",
     "vitest": "^4.1.6"

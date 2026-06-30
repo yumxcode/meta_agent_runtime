@@ -36,6 +36,10 @@ function describeAction(a: TeamPlannerAction): string {
   }
 }
 
+function requiresHumanConfirmation(a: TeamPlannerAction): boolean {
+  return a.type !== 'show_board' || a.requiresConfirmation
+}
+
 async function runAction(controller: RoboticsTeamController, a: TeamPlannerAction): Promise<void> {
   switch (a.type) {
     case 'show_board':
@@ -104,7 +108,7 @@ export async function executePlan(
   if (plan.actions.length === 0) return report
 
   for (const action of plan.actions) {
-    if (action.requiresConfirmation && !options.autoApprove) {
+    if (requiresHumanConfirmation(action) && !options.autoApprove) {
       const reasonNote = action.reason ? ` (${action.reason})` : ''
       const answer = (await ask(`  执行 "${describeAction(action)}"?${reasonNote} [y/N] `)).trim().toLowerCase()
       if (!/^(y|yes|是|确认)$/.test(answer)) {

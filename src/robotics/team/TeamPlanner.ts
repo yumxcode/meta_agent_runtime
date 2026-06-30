@@ -57,6 +57,28 @@ export interface TeamPlannerSnapshot {
   events: unknown[]
 }
 
+const TEAM_PLANNER_ACTION_TYPES: readonly TeamPlannerActionType[] = [
+  'show_board',
+  'take_task',
+  'add_note',
+  'drop_task',
+  'mark_done',
+  'mark_paused',
+  'steal_task',
+  'sync_team',
+  'pull_team',
+  'push_team',
+  'set_focus',
+]
+
+function isTeamPlannerActionType(value: unknown): value is TeamPlannerActionType {
+  return typeof value === 'string' && TEAM_PLANNER_ACTION_TYPES.includes(value as TeamPlannerActionType)
+}
+
+function requiresConfirmationForAction(type: TeamPlannerActionType, modelFlag: unknown): boolean {
+  return type === 'show_board' ? Boolean(modelFlag) : true
+}
+
 export const TEAM_PLANNER_SYSTEM = `你是 meta-agent robot mode 的 TeamPlanner（v2.0 协作日志模型）。
 
 模型只有三类对象：unit / task / attempt。task 有 owner（排他锁），attempts[] 是 append-only 的方向+结果记录。
@@ -114,17 +136,21 @@ export function parseTeamPlannerPlan(text: string): TeamPlannerPlan | null {
     const parsed = JSON.parse(raw) as Partial<TeamPlannerPlan>
     if (!parsed || typeof parsed !== 'object') return null
     const rawActions: unknown[] = Array.isArray(parsed.actions) ? parsed.actions as unknown[] : []
-    const actions = rawActions
-      .filter((a): a is Record<string, unknown> => Boolean(a) && typeof a === 'object')
-      .map(a => ({
-        type: String(a.type ?? 'show_board') as TeamPlannerActionType,
+    const actions: TeamPlannerAction[] = rawActions.flatMap(action => {
+      if (!action || typeof action !== 'object') return []
+      const a = action as Record<string, unknown>
+      if (!isTeamPlannerActionType(a.type)) return []
+      const type = a.type
+      return [{
+        type,
         taskId:    typeof a.taskId === 'string' ? a.taskId : undefined,
         direction: typeof a.direction === 'string' ? a.direction : undefined,
         outcome:   typeof a.outcome === 'string' ? a.outcome : undefined,
         ref:       typeof a.ref === 'string' ? a.ref : undefined,
         reason:    typeof a.reason === 'string' ? a.reason : '',
-        requiresConfirmation: Boolean(a.requiresConfirmation),
-      }))
+        requiresConfirmation: requiresConfirmationForAction(type, a.requiresConfirmation),
+      }]
+    })
     return {
       intent: String(parsed.intent ?? 'none') as TeamPlannerIntent,
       risk: parsed.risk === 'blocked' || parsed.risk === 'needs_confirmation' ? parsed.risk : 'safe',

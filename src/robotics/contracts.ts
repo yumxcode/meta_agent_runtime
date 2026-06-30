@@ -16,7 +16,7 @@ import type { PhysicalAnchorPendingStore } from './PhysicalAnchorPendingStore.js
 import type { PrinciplePendingStore } from './PrinciplePendingStore.js'
 import type { proposePrincipleFromExperience } from './PrinciplePromotion.js'
 import type { EvaluatePromotionResult } from './PrincipleConvergence.js'
-import type { TeamState, TeamTask, TeamTaskAddInput, TeamNoteInput, TeamAttempt, TeamTaskStatus, TeamSyncSummary, TeamPullResult, TeamPushResult, TeamPublishState, MergeConflictReport, TeamJsonResolveResult } from './team/TeamStore.js'
+import type { TeamState, TeamTask, TeamTaskAddInput, TeamNoteInput, TeamAttempt, TeamTaskStatus, TeamSyncOptions, TeamSyncSummary, TeamPullResult, TeamPushResult, TeamPublishState, MergeConflictReport, TeamJsonResolveResult } from './team/TeamStore.js'
 import type { TeamWatcherEvent } from './team/TeamWatcher.js'
 
 /**
@@ -72,7 +72,7 @@ export interface RoboticsTeamController {
   teamTaskStatus?(taskId: string, status: TeamTaskStatus): Promise<{ state: TeamState; task: TeamTask }>
 
   // Git transport
-  teamSync?(): Promise<TeamSyncSummary>
+  teamSync?(options?: TeamSyncOptions): Promise<TeamSyncSummary>
   teamPull?(): Promise<TeamPullResult>
   teamPush?(): Promise<TeamPushResult>
   teamPublishState?(): Promise<TeamPublishState>

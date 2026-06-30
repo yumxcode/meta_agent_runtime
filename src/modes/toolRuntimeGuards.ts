@@ -6,6 +6,16 @@ import type { SandboxConfig, SandboxHandle } from '../sandbox/types.js'
 export interface ToolRuntimeGuardsOptions {
   projectDir?: string
   autonomy?: AutonomyProfile
+  /**
+   * Extra absolute host paths the OS sandbox should mount WRITABLE for every
+   * sandboxed tool (bash). Sourced from config.json `sandbox.writeAllowPaths`.
+   * Use for host-local stores the agent legitimately needs to read/write but
+   * that live outside the workspace — e.g. account-pool's SQLite DB dir
+   * (~/.account-pool), a shared credential store, etc. Callers should expand
+   * `~` and drop non-existent paths before passing them (bwrap fails if a bind
+   * source is missing).
+   */
+  extraWriteAllowPaths?: string[]
 }
 
 /**
@@ -53,14 +63,20 @@ export class ToolRuntimeGuards {
   }
 
   private async getOrCreateSandboxHandle(policy: true | SandboxConfig): Promise<SandboxHandle> {
-    const cacheKey = policy === true ? '__default__' : JSON.stringify(policy)
+    const baseConfig: SandboxConfig = policy === true ? {} : policy
+    // Merge operator-configured extra writable paths (config.json
+    // sandbox.writeAllowPaths) into the policy's own writeAllowPaths.
+    const extra = this.options.extraWriteAllowPaths ?? []
+    const withExtra: SandboxConfig = extra.length
+      ? { ...baseConfig, writeAllowPaths: [...(baseConfig.writeAllowPaths ?? []), ...extra] }
+      : baseConfig
+    const config: SandboxConfig = this.options.autonomy?.lockWorkspace
+      ? { ...withExtra, allowUnsandboxedFallback: false }
+      : withExtra
+    // Cache by the FULLY-resolved config so the merged paths participate in the key.
+    const cacheKey = JSON.stringify(config)
     const cached = this.sandboxHandles.get(cacheKey)
     if (cached) return cached
-
-    const baseConfig: SandboxConfig = policy === true ? {} : policy
-    const config: SandboxConfig = this.options.autonomy?.lockWorkspace
-      ? { ...baseConfig, allowUnsandboxedFallback: false }
-      : baseConfig
     const workspaceRoot = this.options.projectDir ?? process.cwd()
     const executor = createSandboxExecutor()
     if (executor.platform === 'noop' && !config.allowUnsandboxedFallback) {

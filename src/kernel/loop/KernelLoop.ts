@@ -9,7 +9,9 @@ import type { KernelEvent, PermissionDenial } from '../types/KernelEvent.js'
 import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
 import {
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
+  AUTO_RECURRING_ERROR_LIMIT, RECURRING_ERROR_WINDOW,
   SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
+  collectTurnErrors, buildRecurringErrorReflection,
 } from './AutoStallGuard.js'
 import { MAX_VERIFY_ROUNDS, buildVerifyRejectionPrompt } from './VerifyGate.js'
 import type { VerifyVerdict } from './VerifyGate.js'
@@ -594,6 +596,12 @@ export async function* runKernelLoop(
   let consecutiveAllErrorTurns = 0   // every tool result errored, N turns running
   let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
   let autoSelfEvalInjected = false   // one-shot self-eval nudge per stall episode
+  // Recurring-error axis (soft-only): sliding window of recent error signatures
+  // + the set already reflected on, so each recurring failure mode triggers at
+  // most one reflection. Survives interleaved successes / varied inputs because
+  // it keys on the normalized error, not the tool input or all-error state.
+  const recentErrorSignatures: string[] = []
+  const recurringErrorNudged = new Set<string>()
   let verifyRounds = 0               // auto-mode completion-gate rounds consumed
   let consecutiveDriftGateFailures = 0
   let toolBatchCount = ctx.initialToolBatchCount ?? 0
@@ -1602,6 +1610,31 @@ export async function* runKernelLoop(
         autoSelfEvalInjected = true
         append(makeTextUserMessage(SELF_EVAL_PROMPT, { isMeta: true }))
         yield { type: 'text_delta', delta: '\n[auto] 连续无进展，注入一次自评估…\n', sessionId }
+      }
+
+      // Recurring-error axis (SOFT-ONLY): the SAME normalized error signature
+      // recurring ≥ AUTO_RECURRING_ERROR_LIMIT times within the recent window —
+      // catches debug/retry loops the all-error & no-FS axes miss (a successful
+      // edit each turn resets those). One reflection per signature; never stops.
+      {
+        const turnErrors = collectTurnErrors(toolsResult.toolResultMessages, toolNameByUseId)
+        for (const e of turnErrors) recentErrorSignatures.push(e.signature)
+        while (recentErrorSignatures.length > RECURRING_ERROR_WINDOW) recentErrorSignatures.shift()
+        // Re-arm a signature once it has fully aged out of the window, so a
+        // genuinely new later recurrence can reflect again.
+        for (const sig of [...recurringErrorNudged]) {
+          if (!recentErrorSignatures.includes(sig)) recurringErrorNudged.delete(sig)
+        }
+        for (const e of turnErrors) {
+          if (recurringErrorNudged.has(e.signature)) continue
+          const count = recentErrorSignatures.filter(s => s === e.signature).length
+          if (count >= AUTO_RECURRING_ERROR_LIMIT) {
+            recurringErrorNudged.add(e.signature)
+            append(makeTextUserMessage(buildRecurringErrorReflection(e.sample, count), { isMeta: true }))
+            yield { type: 'text_delta', delta: `\n[auto] 同一错误反复出现（×${count}），注入一次反思…\n`, sessionId }
+            break // at most one recurring-error reflection per turn
+          }
+        }
       }
 
       // Hard: persistent all-error → stop instead of burning the whole budget.

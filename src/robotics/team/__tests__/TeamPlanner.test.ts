@@ -14,7 +14,7 @@ const validPlan: TeamPlannerPlan = {
   guidance: '/team use TASK-001 并切到任务分支',
   actions: [
     {
-      type: 'claim_task',
+      type: 'take_task',
       taskId: 'TASK-001',
       reason: '用户表达想接任务',
       requiresConfirmation: true,
@@ -31,13 +31,13 @@ describe('TEAM_PLANNER_SYSTEM', () => {
 
 describe('buildTeamPlannerUserMessage', () => {
   it('embeds input and snapshot JSON', () => {
-    const snapshot: TeamPlannerSnapshot = { state: { foo: 'bar' }, conflicts: null, onboarding: null, events: [] }
+    const snapshot: TeamPlannerSnapshot = { state: { foo: 'bar' }, recentAttempts: [], events: [] }
     const msg = buildTeamPlannerUserMessage('接个任务', snapshot)
     expect(msg).toContain('用户输入:\n接个任务')
     expect(msg).toContain('"foo": "bar"')
   })
   it('truncates pathologically large snapshots', () => {
-    const huge = { state: { tasks: Array.from({ length: 10_000 }, (_, i) => ({ id: `T${i}`, payload: 'x'.repeat(200) })) }, conflicts: null, onboarding: null, events: [] }
+    const huge = { state: { tasks: Array.from({ length: 10_000 }, (_, i) => ({ id: `T${i}`, payload: 'x'.repeat(200) })) }, recentAttempts: [], events: [] }
     const msg = buildTeamPlannerUserMessage('ping', huge)
     // 18_000 char snapshot cap + input prefix; allow some slack but must not be unbounded.
     expect(msg.length).toBeLessThan(20_000)
@@ -48,7 +48,7 @@ describe('parseTeamPlannerPlan', () => {
   it('parses a raw JSON object', () => {
     const plan = parseTeamPlannerPlan(JSON.stringify(validPlan))
     expect(plan?.intent).toBe('start_work')
-    expect(plan?.actions[0]?.type).toBe('claim_task')
+    expect(plan?.actions[0]?.type).toBe('take_task')
     expect(plan?.continueToAgent).toBe(false)
   })
 
@@ -84,18 +84,24 @@ describe('parseTeamPlannerPlan', () => {
     expect(parseTeamPlannerPlan(JSON.stringify({ risk: 'needs_confirmation' }))?.risk).toBe('needs_confirmation')
   })
 
-  it('drops actions that are not objects', () => {
+  it('drops actions that are not objects or not known action types', () => {
     const plan = parseTeamPlannerPlan(JSON.stringify({
       actions: [null, 'not-an-action', 42, { type: 'show_status', reason: 'ok' }],
     }))
-    expect(plan?.actions.length).toBe(1)
-    expect(plan?.actions[0]?.type).toBe('show_status')
+    expect(plan?.actions.length).toBe(0)
   })
 
-  it('coerces requiresConfirmation to boolean', () => {
+  it('forces mutating actions to require confirmation even when the model says otherwise', () => {
     const plan = parseTeamPlannerPlan(JSON.stringify({
-      actions: [{ type: 'sync_team', reason: 'x', requiresConfirmation: 'yes' }],
+      actions: [{ type: 'sync_team', reason: 'x', requiresConfirmation: false }],
     }))
     expect(plan?.actions[0]?.requiresConfirmation).toBe(true)
+  })
+
+  it('keeps show_board non-confirming by default', () => {
+    const plan = parseTeamPlannerPlan(JSON.stringify({
+      actions: [{ type: 'show_board', reason: 'x', requiresConfirmation: false }],
+    }))
+    expect(plan?.actions[0]?.requiresConfirmation).toBe(false)
   })
 })

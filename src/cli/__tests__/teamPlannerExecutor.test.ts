@@ -61,6 +61,18 @@ describe('executePlan (v2.0)', () => {
     expect(r.executed).toHaveLength(1)
   })
 
+  it('asks before mutating actions even if requiresConfirmation is false', async () => {
+    const teamTake = vi.fn().mockResolvedValue({ task: { id: 'TASK-001' }, state: {} })
+    const ask = vi.fn().mockResolvedValue('y')
+    await executePlan(
+      { teamTake } as unknown as RoboticsTeamController,
+      makePlan({ actions: [{ type: 'take_task', taskId: 'TASK-001', reason: 'model omitted confirmation', requiresConfirmation: false }] }),
+      ask,
+    )
+    expect(ask).toHaveBeenCalledOnce()
+    expect(teamTake).toHaveBeenCalledWith('TASK-001')
+  })
+
   it('skips when user declines', async () => {
     const teamTake = vi.fn()
     const r = await executePlan(

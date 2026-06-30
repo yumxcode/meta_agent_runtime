@@ -1258,6 +1258,93 @@ async function streamExperienceSummary(
   } catch { /* best-effort — side-call failure must NEVER crash the REPL */ }
 }
 
+// ── Abnormal-termination diagnosis (flash side-call) ─────────────────────────
+//
+// When an unattended (auto-series) run ends in a NON-success terminal state
+// (max_turns / budget / verify-exhausted / no-progress / runtime error), a bare
+// reason code like "max turns" is useless to the operator — especially when the
+// CLI is driven programmatically and nobody is watching the stream. We fire one
+// isolated LLM call to turn the goal + termination reason + the agent's recent
+// activity into a concrete "what happened / root cause / what's needed next"
+// diagnosis. Same isolation as streamExperienceSummary: separate client, never
+// touches the main session history, fully best-effort (returns null on any
+// failure so the caller can fall back to the raw reason).
+
+const TERMINATION_DIAGNOSIS_SYSTEM = `你是一个自主 Agent 运行的"终态诊断助手"。一次无人值守(auto)运行异常结束了。请基于【原始目标】【终止原因】【Agent 最近输出与工具轨迹】，给出简洁、可执行的诊断，而不是复述错误码。
+
+用中文输出三段，每段 1-3 句：
+1. 发生了什么：一句话说清实际卡点（不是错误码字面意思）。
+2. 根因：为什么这样结束——方法在死循环、缺少外部输入(凭证/账号/权限/网络)、任务过大超步数、verify 未通过，还是真的失败。
+3. 下一步：给用户最小可行动作（需要提供什么、或如何调整指令/参数重跑）。
+
+具体、克制，不要空话，不要复述本提示或原始数据。总长控制在 200 字以内。`
+
+/** Human-readable label for a non-success result subtype, used in the diagnosis prompt. */
+function terminationReasonLabel(subtype: string): string {
+  switch (subtype) {
+    case 'error_max_turns':      return '达到最大步数上限（max_turns）'
+    case 'error_max_budget_usd': return '超出预算/费用上限（max_budget）'
+    case 'error_blocking_limit': return '达到阻塞操作上限（blocking_limit）'
+    case 'error_during_execution':
+      return '执行中止（可能是无进展死循环、verify 未通过、被外部依赖阻塞，或运行时错误）'
+    default: return subtype
+  }
+}
+
+/**
+ * Run a one-shot LLM diagnosis of an abnormal termination. Returns the analysis
+ * text, or null if no client is available / the call fails. Prints nothing — the
+ * caller decides how to surface it (text block vs JSON event).
+ */
+async function analyzeAbnormalTermination(
+  router: SessionRouter,
+  opts: { goal: string; subtype: string; recentText: string; toolTrail: string[] },
+): Promise<string | null> {
+  try {
+    const { apiKey, baseURL, flashModel } = router.getProviderConfig()
+    if (!apiKey) return null
+
+    const trail = opts.toolTrail.length ? opts.toolTrail.slice(-30).join('\n') : '（无）'
+    const recent = opts.recentText.trim() ? opts.recentText.slice(-4000) : '（无可见输出）'
+    const userMessage =
+      `【原始目标】\n${opts.goal.slice(0, 2000)}\n\n` +
+      `【终止原因】\n${terminationReasonLabel(opts.subtype)}\n\n` +
+      `【Agent 最近输出（截断）】\n${recent}\n\n` +
+      `【最近工具调用轨迹（截断）】\n${trail}`
+
+    let text = ''
+    if (getModelProtocol(flashModel, baseURL) === 'openai') {
+      const OpenAI = (await import('openai')).default
+      const client = new OpenAI({ apiKey, baseURL: baseURL ?? 'https://api.deepseek.com', maxRetries: 1, timeout: 30_000 })
+      const res = await client.chat.completions.create({
+        model: flashModel,
+        max_tokens: 600,
+        messages: [
+          { role: 'system', content: TERMINATION_DIAGNOSIS_SYSTEM },
+          { role: 'user', content: userMessage },
+        ],
+      })
+      text = res.choices[0]?.message?.content ?? ''
+    } else {
+      let client = router.getSideCallClient()
+      if (!client) {
+        client = new (await import('@anthropic-ai/sdk')).default({ apiKey, baseURL, timeout: 30_000, maxRetries: 1 })
+      }
+      const res = await client.messages.create({
+        model: flashModel,
+        max_tokens: 600,
+        system: TERMINATION_DIAGNOSIS_SYSTEM,
+        messages: [{ role: 'user', content: userMessage }],
+      })
+      text = res.content.map(b => (b.type === 'text' ? b.text : '')).join('')
+    }
+    const safe = terminalText(text).trim()
+    return safe || null
+  } catch {
+    return null // best-effort — diagnosis failure must NEVER crash the run
+  }
+}
+
 // ── Session title generation (flash side-call) ───────────────────────────────
 //
 // The session picker previously showed the raw first user prompt (often a long
@@ -1479,6 +1566,12 @@ async function streamPrompt(
   const steering = steerHooks ?? null
   let hasText = false
   let thinkingOpen = false   // whether we're currently inside a thinking block
+  // Captured for abnormal-termination diagnosis (auto-series): the agent's
+  // recent narration + a compact trail of tool calls, fed to a one-shot LLM
+  // analysis when the run ends in a non-success terminal state. Accumulated in
+  // BOTH json and text paths (see the event loop below).
+  let recentAgentText = ''
+  const recentToolTrail: string[] = []
   let visibleChars = 0
   let visibleTruncated = false
   const visibleLimit = getCliMaxVisibleChars()
@@ -1593,8 +1686,39 @@ async function streamPrompt(
       if (step.done) break
       const event = step.value
       pending = gen.next()
+
+      // Accumulate recent agent activity for abnormal-termination diagnosis
+      // (runs in BOTH json and text modes, before any mode-specific handling).
+      if (event.type === 'text') {
+        recentAgentText += event.text
+        if (recentAgentText.length > 8000) recentAgentText = recentAgentText.slice(-8000)
+      } else if (event.type === 'tool_use') {
+        recentToolTrail.push(`${event.toolName} ${JSON.stringify(event.toolInput).slice(0, 80)}`)
+        if (recentToolTrail.length > 40) recentToolTrail.shift()
+      }
+
       if (jsonMode) {
         console.log(JSON.stringify(event))
+        // Programmatic callers (e.g. a remote orchestrator) otherwise get only a
+        // bare reason code on abnormal exit. Emit a follow-up diagnosis event so
+        // they receive the same LLM analysis a human would see.
+        if (
+          event.type === 'result' && event.subtype !== 'success' &&
+          isAutonomousMode(router.mode)
+        ) {
+          const analysis = await analyzeAbnormalTermination(router, {
+            goal: prompt, subtype: event.subtype,
+            recentText: recentAgentText, toolTrail: recentToolTrail,
+          })
+          if (analysis) {
+            console.log(JSON.stringify({
+              type: 'termination_analysis',
+              subtype: event.subtype,
+              analysis,
+              sessionId: event.sessionId,
+            }))
+          }
+        }
         continue
       }
       switch (event.type) {
@@ -1702,6 +1826,21 @@ async function streamPrompt(
               `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
               (errDetails ? `${red('  错误详情：')} ${errDetails}\n` : ''),
             )
+          }
+          // Auto-series abnormal exit: replace the bare reason with an actual
+          // LLM diagnosis (what happened / root cause / what's needed next).
+          if (event.subtype !== 'success' && isAutonomousMode(router.mode)) {
+            const analysis = await analyzeAbnormalTermination(router, {
+              goal: prompt, subtype: event.subtype,
+              recentText: recentAgentText, toolTrail: recentToolTrail,
+            })
+            if (analysis) {
+              await safeStdoutWrite(
+                `\n${dim('─── 终态诊断 (LLM) ───────────────────────────────────────────')}\n` +
+                `${analysis}\n` +
+                `${dim('─────────────────────────────────────────────────────────────')}\n`,
+              )
+            }
           }
           const usage = event.usage
           const cost  = router.getEstimatedCost()
@@ -2891,7 +3030,7 @@ async function handleTeamCommand(
         // Double-claim guard: fetch remote state first; if the remote team/
         // has changes we haven't pulled, a teammate may already own this task.
         process.stdout.write(dim('领取前同步远端 team 状态…'))
-        const preSync = await controller.teamSync?.().catch(() => undefined)
+        const preSync = await controller.teamSync?.({ updatePresence: false }).catch(() => undefined)
         process.stdout.write('\r')
         if (preSync && preSync.remoteTeamChanges.length > 0) {
           console.log(

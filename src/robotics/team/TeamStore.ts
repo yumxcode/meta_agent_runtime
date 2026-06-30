@@ -603,7 +603,10 @@ export class TeamStore {
     }
     const state = await this.ensure()
     const task = this.requireTask(state, taskId)
-    if (task.ownerUnit && task.ownerUnit !== this.unitId) {
+    if (!task.ownerUnit) {
+      throw new Error(`${task.id} 当前无人持有；先 /team take ${task.id} 再更改状态。`)
+    }
+    if (task.ownerUnit !== this.unitId) {
       throw new Error(`${task.id} 属于 ${task.ownerUnit}，无法更改状态。`)
     }
     const originalUpdatedAt = state.updatedAt
@@ -788,6 +791,17 @@ export class TeamStore {
 
     if (before.remoteTeamChanges.length === 0) {
       return { applied: true, upstreamBranch, changedFiles: [], sync: before, state: before.state }
+    }
+
+    const publish = await this.publishState()
+    if (publish.unpushedCommits > 0) {
+      return {
+        applied: false,
+        reason:
+          `Local branch has ${publish.unpushedCommits} unpushed team commit(s). ` +
+          'Run /team push first, or merge/rebase manually before /team pull.',
+        upstreamBranch, changedFiles: before.remoteTeamChanges, sync: before, state: before.state,
+      }
     }
 
     try {

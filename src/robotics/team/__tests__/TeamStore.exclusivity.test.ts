@@ -188,6 +188,25 @@ describe('TeamStore.note — attempts log', () => {
     expect(task.ownerUnit).toBeUndefined()
     expect(state.units.find(u => u.id === 'alice')?.currentTask).toBeUndefined()
   })
+
+  it('refuses to change status on an un-owned task', async () => {
+    const dir = await tempDir()
+    const alice = new TeamStore(dir, 'alice')
+    await alice.init('https://github.com/acme/demo')
+    await alice.addTask({ id: 'TASK-001', title: 'demo' })
+    await expect(alice.updateTaskStatus('TASK-001', 'done')).rejects.toThrow(/无人持有/)
+  })
+
+  it('refuses to change status on a task owned by another unit', async () => {
+    const dir = await tempDir()
+    const alice = new TeamStore(dir, 'alice')
+    await alice.init('https://github.com/acme/demo')
+    await alice.addTask({ id: 'TASK-001', title: 'demo' })
+    await alice.take('TASK-001')
+
+    const bob = new TeamStore(dir, 'bob')
+    await expect(bob.updateTaskStatus('TASK-001', 'done')).rejects.toThrow(/alice/)
+  })
 })
 
 describe('isStaleClaim', () => {

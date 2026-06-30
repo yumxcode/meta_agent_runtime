@@ -21,6 +21,7 @@ import type {
   TeamNoteInput,
   TeamTaskAddInput,
   TeamTaskStatus,
+  TeamSyncOptions,
   TeamSyncSummary,
   TeamPushResult,
   TeamPublishState,
@@ -112,10 +113,10 @@ export class RoboticsTeamCoordinator implements RoboticsTeamController, TeamTool
     return result
   }
 
-  async teamSync(): Promise<TeamSyncSummary> {
+  async teamSync(options: TeamSyncOptions = {}): Promise<TeamSyncSummary> {
     this.invalidate('robotics_team_mode')
     // /team sync is an explicit user request — bypass the fetch cooldown.
-    const summary = await this.teamStore.sync({ forceFetch: true })
+    const summary = await this.teamStore.sync({ ...options, forceFetch: options.forceFetch ?? true })
     await this.teamWatcher.forceSync(false)
     return summary
   }
