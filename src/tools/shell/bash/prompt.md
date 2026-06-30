@@ -6,4 +6,5 @@ Usage:
 - cwd: working directory (default: process.cwd())
 - Large outputs are truncated to 100KB
 - Avoid interactive commands requiring stdin
-- 对耗时命令（大体积 pip/npm 安装、编译构建、大文件下载等）务必显式传 `timeout_ms`（可至 120000）；默认 30000 会在命令中途杀掉进程。
+- For long-running commands (large pip/npm installs, compilation/builds, big downloads, etc.) always pass an explicit `timeout_ms` (up to 120000); the default 30000 will kill the process mid-command.
+- For `git pull` / `git push`, prefer SSH over HTTPS — SSH is faster.

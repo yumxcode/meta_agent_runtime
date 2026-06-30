@@ -1,0 +1,1 @@
+Propose deletion of a committed memory entry (user profile / feedback). The memory is NOT deleted immediately — it is queued for the user to approve via `/memory delete review`. Use only when a memory is clearly wrong, obsolete, or the user explicitly asked to forget it. Identify the target by its topic filename from the MEMORY.md index.

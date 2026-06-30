@@ -8,7 +8,7 @@
  * (b) the review screen can show a meaningful label.
  */
 
-import type { MetaAgentTool, ToolResult } from '../types.js'
+import type { MetaAgentTool, ToolResult, ToolDescription } from '../types.js'
 import {
   ensurePendingDeletionsLoaded,
   getPendingDeletionStore,
@@ -25,8 +25,9 @@ export interface DeleteToolConfig {
   idField?: string
   /** Schema description for the ID field. */
   idDescription: string
-  /** Full tool description handed to the model. */
-  description: string
+  /** Full tool description handed to the model. Accepts a static string or a
+   *  dynamic ToolDescription (e.g. dynamicDescription loading a prompt.md). */
+  description: ToolDescription
   /**
    * Resolve the committed entry's display label.
    * Return null when no committed entry matches (nothing will be queued).

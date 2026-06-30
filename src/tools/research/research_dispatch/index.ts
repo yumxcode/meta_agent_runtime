@@ -20,6 +20,7 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { ResearchStore } from '../../../research/ResearchStore.js'
+import { dynamicDescription } from '../../util.js'
 
 export const RESEARCH_MAX_DURATION_MS = 600_000 // 10 minutes
 const POLL_INTERVAL_MS = 2_000
@@ -104,13 +105,7 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
     // Opt out of the kernel per-tool timeout: this tool blocks on the
     // sub-agent, which is bounded by its own 10-min wall-clock cap.
     timeoutMs: 0,
-    description:
-      'Dispatch a ResearchAgent sub-agent to research a question: it searches, reads sources in full, ' +
-      'extracts per your extraction_spec, and synthesizes a report — all in an ISOLATED context, so large ' +
-      'paper/web content never enters your context. The report is SAVED TO DISK and you get back a one-line ' +
-      'conclusion + report path. Use this for ALL literature/paper research instead of fetching papers yourself. ' +
-      'After a compaction, re-READ the saved report file (read_file) — do NOT dispatch the same research again. ' +
-      'Synchronous: blocks until done (up to 10 minutes).',
+    description: dynamicDescription(import.meta.url, base => base),
     inputSchema: {
       type: 'object',
       required: ['question'],
