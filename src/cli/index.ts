@@ -13,13 +13,14 @@
  *   meta-agent --mode campaign "run a DOE sweep"
  *
  * Options:
- *   -m, --mode <mode>       Session mode: detect|auto|auto-orch|agentic|campaign|robotics (default: detect)
+ *   -m, --mode <mode>       Session mode: detect|auto|auto_orch|agentic|campaign|robotics (default: detect)
  *   -k, --api-key <key>     API key (or ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
  *       --session-dir <dir> Persist one-shot session history under this folder
  *   -j, --json              Output raw JSON events (for piping)
  *   -y, --yes               Auto-approve sensitive tools in trusted scripts
+ *       --auto-orch-review-plan  Review auto_orch planner graph before execution
  *   -v, --version           Show version
  *   -h, --help              Show help
  */
@@ -85,14 +86,16 @@ import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { CLI_VERSION } from './version.js'
+import type { AutoOrchEvent } from '../core/auto_orch/index.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
 const VERSION = CLI_VERSION
 const DEFAULT_CLI_MAX_TURNS = 100
-// Auto-series (auto / simple_auto / auto-orch) run unattended and bound
-// themselves via checkpoint + drift/verify gates + AutoStallGuard + budget, so
-// they get a much higher per-message turn cap than attended modes.
+// Auto-series (auto / simple_auto / auto_orch) run unattended and carry their
+// own bounds (stall guards, budgets, and for plain auto only checkpoint +
+// drift/verify gates), so they get a much higher per-message turn cap than
+// attended modes.
 const AUTO_CLI_MAX_TURNS = 1000
 const PASTE_FALLBACK_COALESCE_MS = 80
 const PASTE_NOTICE_DEBOUNCE_MS = 250
@@ -203,12 +206,12 @@ ${bold('MODES')}
              all file changes hard-confined to the working directory
   ${cyan('simple_auto')} Lightweight autonomous: same workspace jail as auto, but without
              checkpoint / drift / verify — for simple, short unattended tasks
-  ${cyan('auto-orch')}  Autonomous + AI-authored multi-agent orchestration graph
+  ${cyan('auto_orch')}  Autonomous + AI-authored multi-agent orchestration graph
   ${cyan('campaign')}   DOE / multi-objective optimisation campaign
   ${cyan('robotics')}   Robotics session — ExperienceStore + workflow + hardware profiles
 
 ${bold('OPTIONS')}
-  -m, --mode <mode>       Session mode: detect|agentic|auto|simple_auto|auto-orch|campaign|robotics
+  -m, --mode <mode>       Session mode: detect|agentic|auto|simple_auto|auto_orch|campaign|robotics
       --yolo              Alias for --mode auto (autonomous + workspace jail)
   -w, --workspace <dir>   Working directory — agent ONLY operates within this folder
   -k, --api-key <key>     API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env var)
@@ -222,6 +225,7 @@ ${bold('OPTIONS')}
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
       --show-thinking   Show model thinking deltas in the terminal
+      --auto-orch-review-plan  Planner-only interactive review before auto_orch executes
   -j, --json            Output raw JSON events
   -v, --version         Print version
   -h, --help            Show this help
@@ -344,6 +348,7 @@ interface CliOptions {
   debug: boolean                  // --debug: log full prompts + responses to stderr
   showThinking: boolean           // --show-thinking: stream thinking deltas to terminal
   yes: boolean                    // --yes: auto-approve sensitive tool calls
+  autoOrchReviewPlan: boolean     // --auto-orch-review-plan: review planner graph before execution
   prompt: string | null
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
@@ -370,6 +375,7 @@ function parseCliArgs(): CliOptions {
         yes:          { type: 'boolean', short: 'y', default: false },
         debug:        { type: 'boolean', short: 'd', default: false },
         'show-thinking': { type: 'boolean', default: false },
+        'auto-orch-review-plan': { type: 'boolean', default: false },
         json:         { type: 'boolean', short: 'j', default: false },
         version:      { type: 'boolean', short: 'v', default: false },
         help:         { type: 'boolean', short: 'h', default: false },
@@ -396,7 +402,7 @@ function parseCliArgs(): CliOptions {
   const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
   // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
   // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
-  const validModes = ['detect', 'auto', 'simple_auto', 'auto-orch', 'agentic', 'campaign', 'robotics']
+  const validModes = ['detect', 'auto', 'simple_auto', 'auto_orch', 'agentic', 'campaign', 'robotics']
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
@@ -448,6 +454,7 @@ function parseCliArgs(): CliOptions {
     debug:      parsed.values['debug']    as boolean,
     showThinking: parsed.values['show-thinking'] as boolean,
     yes:        parsed.values['yes']      as boolean,
+    autoOrchReviewPlan: parsed.values['auto-orch-review-plan'] as boolean,
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
     resume:     parsed.values['resume']   as string | undefined,
@@ -970,6 +977,78 @@ async function confirmToolCall(
   return { action: 'allow' }
 }
 
+function formatAutoOrchEvent(event: AutoOrchEvent): string {
+  switch (event.type) {
+    case 'planner_started':
+      return `[auto_orch] planner started: invalid<=${event.maxInvalidAttempts ?? event.maxAttempts}, total<=${event.maxAttempts}, review=${event.reviewEnabled ? 'on' : 'off'}`
+    case 'planner_attempt_started':
+      return `[auto_orch] planner attempt ${event.attempt}/${event.maxAttempts}: ${event.reason}`
+    case 'planner_attempt_failed': {
+      const errors = event.errors.map(e => sanitizeTerminalPreview(e, 80)).join('; ')
+      return `[auto_orch] planner attempt ${event.attempt} failed: ${errors}`
+    }
+    case 'planner_subagent_event': {
+      if (event.eventType === 'runner_started') return `[auto_orch] planner graph planning started`
+      if (event.eventType === 'model_call_started') return `[auto_orch] planner model call started`
+      if (event.eventType === 'tool_use') {
+        return `[auto_orch] planner inspecting workspace${event.toolName ? `: ${event.toolName}` : ''}`
+      }
+      if (event.eventType === 'result') {
+        const preview = event.preview ? `: ${sanitizeTerminalPreview(event.preview, 120)}` : ''
+        return `[auto_orch] planner model call finished${preview}`
+      }
+      const err = event.isError ? ' error' : ''
+      const preview = event.preview ? `: ${sanitizeTerminalPreview(event.preview, 120)}` : ''
+      return `[auto_orch] planner ${event.eventType}${err}${preview}`
+    }
+    case 'planner_completed':
+      return `[auto_orch] planner ${event.source}${event.note ? `: ${sanitizeTerminalPreview(event.note, 120)}` : ''}`
+    case 'plan_started':
+      return `[auto_orch] plan started: entry=${event.entry}, nodes=${event.nodeCount}, edges=${event.edgeCount}`
+    case 'node_started':
+      return `[auto_orch] node start: ${event.nodeId} (${event.nodeKind}), step=${event.step}, visit=${event.visit}`
+    case 'node_finished': {
+      const outcome = event.label ?? event.action
+      const cost = event.costUsd > 0 ? `, cost=$${event.costUsd.toFixed(3)}` : ''
+      const note = event.note ? `, note=${sanitizeTerminalPreview(event.note, 120)}` : ''
+      return `[auto_orch] node done: ${event.nodeId} -> ${outcome}${cost}${note}`
+    }
+    case 'edge_selected': {
+      const trigger = event.label ?? event.action
+      return event.to
+        ? `[auto_orch] edge: ${event.from} --${trigger}--> ${event.to}`
+        : `[auto_orch] edge: ${event.from} --${trigger}--> terminal`
+    }
+    case 'run_paused': {
+      const delay = durationFromResumeHandle(event.resumeHandle)
+      const node = event.nodeId ? ` at ${event.nodeId}` : ''
+      const note = event.note ? `, note=${sanitizeTerminalPreview(event.note, 120)}` : ''
+      return `[auto_orch] paused${node}${delay ? `, next check in ${delay}` : ''}${note}`
+    }
+    case 'run_resumed': {
+      const external = event.externalRunId ? `, external=${event.externalRunId}` : ''
+      return `[auto_orch] resumed: node=${event.nodeId}, subtask=${event.subTaskId}${external}`
+    }
+    case 'run_completed': {
+      const path = event.visitedPath.length ? `, path=${event.visitedPath.join(' -> ')}` : ''
+      const note = event.note ? `, note=${sanitizeTerminalPreview(event.note, 120)}` : ''
+      return `[auto_orch] run ${event.status}${path}, cost=$${event.costUsd.toFixed(3)}${note}`
+    }
+    default:
+      return ''
+  }
+}
+
+function durationFromResumeHandle(handle: Record<string, unknown> | undefined): string | null {
+  const raw = handle?.['nextCheckAfterMs']
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return null
+  const minutes = Math.round(raw / 60_000)
+  if (minutes < 60) return `${minutes}m`
+  const hours = Math.floor(minutes / 60)
+  const rem = minutes % 60
+  return rem === 0 ? `${hours}h` : `${hours}h${rem}m`
+}
+
 // ── Router factory ────────────────────────────────────────────────────────────
 
 function makeRouter(
@@ -1014,6 +1093,21 @@ function makeRouter(
 
   // Debug mode
   if (opts.debug) cfg.debugMode = true
+  const explicitAutoOrch = opts.mode === 'auto_orch'
+  const interactiveAutoOrch = explicitAutoOrch && !opts.json && isTTY
+  if (opts.autoOrchReviewPlan || (interactiveAutoOrch && !opts.yes)) {
+    cfg.autoOrchPlannerReview = { enabled: true, maxRounds: 3 }
+  }
+  if (interactiveAutoOrch) {
+    cfg.autoOrchObserver = async event => {
+      const suppressPlannerMeter = isAutoOrchPlannerEvent(event)
+      if (suppressPlannerMeter) setActiveThinkingMeterSuppressed(true)
+      else pauseActiveThinkingMeter()
+      const line = formatAutoOrchEvent(event)
+      if (line) await safeStdoutWrite(`\n${dim(line)}\n`)
+      if (event.type === 'planner_completed') setActiveThinkingMeterSuppressed(false)
+    }
+  }
 
   // Robot hardware binding — forwarded to RoboticsSession so it can load the
   // hardware profile JSON and inject it via the R4 dynamic section.
@@ -1551,8 +1645,24 @@ interface SteerHooks {
 // meter here so any mid-turn prompt reader can pause the spinner first; the
 // stream's own event handlers re-show it when the next model event arrives.
 let _activeThinkingMeter: ThinkingMeter | null = null
+let _suppressActiveThinkingMeter = false
 function pauseActiveThinkingMeter(): void {
   _activeThinkingMeter?.hide()
+}
+function setActiveThinkingMeterSuppressed(suppressed: boolean): void {
+  _suppressActiveThinkingMeter = suppressed
+  if (suppressed) pauseActiveThinkingMeter()
+}
+function canShowActiveThinkingMeter(): boolean {
+  return !_suppressActiveThinkingMeter
+}
+
+function isAutoOrchPlannerEvent(event: AutoOrchEvent): boolean {
+  return event.type === 'planner_started' ||
+    event.type === 'planner_attempt_started' ||
+    event.type === 'planner_attempt_failed' ||
+    event.type === 'planner_subagent_event' ||
+    event.type === 'planner_completed'
 }
 
 async function streamPrompt(
@@ -1588,8 +1698,10 @@ async function streamPrompt(
   const meter = new ThinkingMeter({ enabled: meterEnabled })
   let meterTimer: ReturnType<typeof setInterval> | null = null
   if (meterEnabled) {
-    meter.show()
-    meterTimer = setInterval(() => meter.tick(), 120)
+    if (canShowActiveThinkingMeter()) meter.show()
+    meterTimer = setInterval(() => {
+      if (canShowActiveThinkingMeter()) meter.tick()
+    }, 120)
     if (typeof meterTimer.unref === 'function') meterTimer.unref()
   }
   // Expose this turn's meter so mid-turn interactive prompts can pause the
@@ -1678,7 +1790,7 @@ async function streamPrompt(
         } else {
           await safeStdoutWrite(`${dim('已取消，继续。')}\n`)
         }
-        if (meterEnabled) meter.show()
+        if (meterEnabled && canShowActiveThinkingMeter()) meter.show()
         continue
       }
 
@@ -1730,7 +1842,7 @@ async function streamPrompt(
             await writeVisible(dim(event.delta))
           } else {
             // Keep the compact live indicator visible (it now shows a token count).
-            meter.show()
+            if (canShowActiveThinkingMeter()) meter.show()
           }
           break
         }
@@ -1873,6 +1985,7 @@ async function streamPrompt(
     if (meterTimer) clearInterval(meterTimer)
     meter.hide()
     if (_activeThinkingMeter === meter) _activeThinkingMeter = null
+    setActiveThinkingMeterSuppressed(false)
   }
 }
 
@@ -3293,8 +3406,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
       // ── Auto-mode resume banner ───────────────────────────────────────────
       // Surface the prior auto checkpoint (goal / pending todos / active
       // sub-agents) so a resumed unattended run shows where it left off.
-      if (opts.mode === 'auto' && opts.resume) {
-        const cp = readAutoCheckpoint(opts.workspace)
+      if (opts.mode === 'auto' && opts.resume && opts.resume !== 'last') {
+        const cp = readAutoCheckpoint(opts.workspace, opts.resume)
         if (cp) {
           const lines = [yellow('↻ 恢复 auto 会话 — 上次进度:')]
           if (cp.goal) lines.push(`  目标: ${cp.goal.slice(0, 200)}`)
@@ -3381,7 +3494,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           resumedMessages = await SessionStore.loadHistory(targetId)
           resumedSessionId = targetId
           // Restore the mode from the saved session. An autonomous mode (auto /
-          // simple_auto / auto-orch) must never run over a history produced in a
+          // simple_auto / auto_orch) must never run over a history produced in a
           // NON-autonomous mode (agentic / campaign / robotics): the workspace
           // jail, auto-approval, and tool-set posture differ from what the saved
           // turns assumed. Use isAutonomousMode on BOTH sides so the rule covers
@@ -3407,7 +3520,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           // Restore the mode from the saved session so the router starts in the
           // correct mode instead of re-detecting it from the first user message.
           // Same rule as above: never run an autonomous mode (auto / simple_auto /
-          // auto-orch) over a non-autonomous history.
+          // auto_orch) over a non-autonomous history.
           if (isAutonomousMode(opts.mode) && resumed.mode && !isAutonomousMode(resumed.mode)) {
             opts.mode = resumed.mode as CliOptions['mode']
           }
@@ -4675,7 +4788,7 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
         savedMessageCount = resumedMessages.length
         // Restore the saved mode when (a) the caller let mode auto-detect, or
         // (b) the caller asked for an autonomous mode (auto / simple_auto /
-        // auto-orch) but the saved history is non-autonomous — running a jailed,
+        // auto_orch) but the saved history is non-autonomous — running a jailed,
         // auto-approving loop over agentic/campaign/robotics history is exactly
         // what this guard prevents. isAutonomousMode covers every flavour.
         if (

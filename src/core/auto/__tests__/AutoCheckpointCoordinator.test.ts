@@ -40,7 +40,7 @@ describe('AutoCheckpointCoordinator', () => {
 
       expect(first).toEqual({ updated: true, revision: 1 })
       expect(second).toEqual({ updated: true, revision: 2 })
-      expect(readAutoCheckpoint(dir)).toMatchObject({
+      expect(readAutoCheckpoint(dir, 's1')).toMatchObject({
         revision: 2,
         lastBoundary: 'termination',
         pendingTodos: [],
@@ -108,14 +108,14 @@ describe('AutoCheckpointCoordinator', () => {
       await fsFlush(2, 'b.ts')
       await fsFlush(3, 'c.ts')                  // threshold reached → digest fired (async)
       // Digest not ready yet, so the threshold write carries no summary.
-      expect(readAutoCheckpoint(dir)?.autoEditSummary).toBeUndefined()
+      expect(readAutoCheckpoint(dir, 's1')?.autoEditSummary).toBeUndefined()
 
       await new Promise(r => setTimeout(r, 20))  // let the fire-and-forget digest resolve
       expect(calls).toHaveLength(1)
       expect(calls[0]).toEqual(['a.ts', 'b.ts', 'c.ts'])  // unioned paths of the streak
 
       await fsFlush(4, 'd.ts')                  // next write folds in the pending digest
-      expect(readAutoCheckpoint(dir)?.autoEditSummary).toBe('EDIT_DIGEST')
+      expect(readAutoCheckpoint(dir, 's1')?.autoEditSummary).toBe('EDIT_DIGEST')
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -174,7 +174,7 @@ describe('AutoCheckpointCoordinator', () => {
       await flush('compact_after', 10)   // must NOT double-count the compaction
       await flush('verify_rejected', 12)
 
-      expect(readAutoCheckpoint(dir)).toMatchObject({
+      expect(readAutoCheckpoint(dir, 's1')).toMatchObject({
         verifyRejections: 2,
         driftCorrections: 1,
         compactions: 1,
@@ -202,7 +202,7 @@ describe('AutoCheckpointCoordinator', () => {
         estimatedCostUsd: 0,
       })
 
-      expect(readAutoCheckpoint(dir)).toMatchObject({
+      expect(readAutoCheckpoint(dir, 's1')).toMatchObject({
         verifyRejections: 3,             // carried from resume, untouched
         driftCorrections: 3,             // 2 (seed) + 1
         compactions: 1,
@@ -243,7 +243,7 @@ describe('AutoCheckpointCoordinator', () => {
       // The new task's first durable write must advance the revision (no drift
       // starvation) and carry NONE of the prior task's run-health.
       await coordinator.flush({ type: 'tool_batch_completed', sessionId: 's1', toolBatchCount: 9, estimatedCostUsd: 0, successfulToolNames: ['edit_file'] })
-      const cp = readAutoCheckpoint(dir)
+      const cp = readAutoCheckpoint(dir, 's1')
       expect(cp?.revision).toBe(rev + 1)            // monotonic advance, NOT reset to 1
       expect(cp?.goal).toBe('task two')
       expect(cp?.verifyRejections ?? 0).toBe(0)
@@ -278,7 +278,7 @@ describe('AutoCheckpointCoordinator', () => {
 
       // The stale digest about old files must not land on the new goal's write.
       await fs(3, 'new1.ts')
-      expect(readAutoCheckpoint(dir)?.autoEditSummary).toBeUndefined()
+      expect(readAutoCheckpoint(dir, 's1')?.autoEditSummary).toBeUndefined()
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }
@@ -314,7 +314,7 @@ describe('AutoCheckpointCoordinator', () => {
       ])
       expect(before.revision).toBe(1)
       expect(after.revision).toBe(1)
-      expect(readAutoCheckpoint(dir)).toMatchObject({
+      expect(readAutoCheckpoint(dir, 's1')).toMatchObject({
         revision: 1,
         lastBoundary: 'external_after',
         estimatedCostUsd: 0.2,

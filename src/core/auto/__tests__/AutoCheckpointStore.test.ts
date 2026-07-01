@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   autoCheckpointPath,
+  legacyAutoCheckpointPath,
   readAutoCheckpoint,
   writeAutoCheckpoint,
   updateAutoCheckpoint,
@@ -17,7 +18,7 @@ describe('AutoCheckpointStore', () => {
   afterEach(() => { rmSync(ws, { recursive: true, force: true }) })
 
   it('returns null when no checkpoint exists', () => {
-    expect(readAutoCheckpoint(ws)).toBeNull()
+    expect(readAutoCheckpoint(ws, 's1')).toBeNull()
   })
 
   it('writes then reads a checkpoint round-trip', async () => {
@@ -28,17 +29,36 @@ describe('AutoCheckpointStore', () => {
       goal: 'build the thing',
     })
     expect(ok).toBe(true)
-    expect(existsSync(autoCheckpointPath(ws))).toBe(true)
-    const cp = readAutoCheckpoint(ws)
+    expect(existsSync(autoCheckpointPath(ws, 's1'))).toBe(true)
+    expect(existsSync(legacyAutoCheckpointPath(ws))).toBe(false)
+    const cp = readAutoCheckpoint(ws, 's1')
     expect(cp?.sessionId).toBe('s1')
     expect(cp?.goal).toBe('build the thing')
+    expect(readAutoCheckpoint(ws, 'other-session')).toBeNull()
   })
 
   it('returns null on corrupt JSON', async () => {
     await writeAutoCheckpoint(ws, { schemaVersion: '1.0', sessionId: 's', updatedAt: 1 })
     // Corrupt it
-    require('fs').writeFileSync(autoCheckpointPath(ws), '{not json', 'utf-8')
-    expect(readAutoCheckpoint(ws)).toBeNull()
+    require('fs').writeFileSync(autoCheckpointPath(ws, 's'), '{not json', 'utf-8')
+    expect(readAutoCheckpoint(ws, 's')).toBeNull()
+  })
+
+  it('reads a matching legacy workspace checkpoint but rejects non-matching legacy sessions', () => {
+    require('fs').mkdirSync(join(ws, '.meta-agent', 'auto'), { recursive: true })
+    require('fs').writeFileSync(
+      legacyAutoCheckpointPath(ws),
+      JSON.stringify({
+        schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+        sessionId: 'legacy-session',
+        updatedAt: 123,
+        goal: 'legacy goal',
+      }),
+      'utf-8',
+    )
+
+    expect(readAutoCheckpoint(ws, 'legacy-session')?.goal).toBe('legacy goal')
+    expect(readAutoCheckpoint(ws, 'other-session')).toBeNull()
   })
 
   it('update merges: unions completedSteps/artifacts, replaces todos, bumps updatedAt', async () => {

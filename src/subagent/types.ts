@@ -47,6 +47,9 @@ export const TERMINAL_STATUSES = new Set<SubAgentStatus>([
   'completed', 'failed', 'cancelled',
 ])
 
+/** Default wall-clock cap for any SubAgentRunner-backed task: 30 minutes. */
+export const DEFAULT_SUB_AGENT_MAX_DURATION_MS = 30 * 60 * 1000
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Configuration
 // ─────────────────────────────────────────────────────────────────────────────
@@ -57,6 +60,21 @@ export interface SubAgentConfig {
   taskDescription: string
   /** Sub-agent system prompt.  Defaults to DEFAULT_SYSTEM_PROMPT when omitted. */
   systemPrompt?: string
+  /**
+   * Auto-orch-only resumable session metadata. Ordinary sub-agent callers leave
+   * this unset and keep the existing one-shot isolated-session behaviour.
+   */
+  autoOrch?: {
+    resumable: true
+    orchestrationTaskId: string
+    nodeId: string
+    agentSessionId?: string
+  }
+  /**
+   * Auto-orch resume seed. Only used together with autoOrch.resumable; ordinary
+   * sub-agents still start with empty conversation history.
+   */
+  initialMessages?: import('../core/types.js').ConversationMessage[]
   /**
    * Names of tools the sub-agent may call.  The SubAgentRunner looks these up
    * in the tool registry passed at spawn time.  When omitted the sub-agent
@@ -71,7 +89,7 @@ export interface SubAgentConfig {
   maxBudgetUsd: number
   /**
    * Maximum wall-clock duration in ms before the sub-agent is force-stopped.
-   * Default: 300_000 (5 min). 0 disables the cap. On timeout the runner
+   * Default: 1_800_000 (30 min). 0 disables the cap. On timeout the runner
    * interrupts the inner session and writes a terminal 'failed' state.
    */
   maxDurationMs?: number
@@ -200,7 +218,7 @@ export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> =
   allowedTools:            undefined,
   maxTurns:                10,
   maxBudgetUsd:            0.5,
-  maxDurationMs:           300_000,
+  maxDurationMs:           DEFAULT_SUB_AGENT_MAX_DURATION_MS,
   useEventDriven:          true,
   pollIntervalMs:          1_800_000,
   requireHumanApproval:    false,

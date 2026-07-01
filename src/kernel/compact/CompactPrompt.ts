@@ -26,7 +26,7 @@ const DETAILED_ANALYSIS_INSTRUCTION = `
  * mode threads its profile through config.compact.promptProfile so the
  * summariser is asked for domain-appropriate sections.
  */
-export type CompactProfile = 'agentic' | 'robotics' | 'campaign' | 'auto' | 'simple_auto' | 'auto-orch'
+export type CompactProfile = 'agentic' | 'robotics' | 'campaign' | 'auto' | 'simple_auto' | 'auto_orch'
 
 export const DEFAULT_COMPACT_PROFILE: CompactProfile = 'agentic'
 
@@ -203,9 +203,10 @@ const SECTION_INSTRUCTIONS_BY_PROFILE: Record<CompactProfile, string> = {
   // checkpoint/drift/verify machinery; the generic agentic sections are the right
   // fit (no autonomous-ledger section needed for a lightweight run).
   simple_auto: SECTION_INSTRUCTIONS_AGENTIC,
-  // auto-orch shares auto's goal-oriented compaction profile: it is the same
-  // autonomous + jailed executor, only with an orchestration layer on top.
-  'auto-orch': SECTION_INSTRUCTIONS_AUTO,
+  // auto_orch uses the same lightweight execution base as simple_auto. The
+  // orchestration graph owns explicit verify/drift/review nodes, so the compact
+  // prompt should not add auto's autonomous-ledger/checkpoint posture.
+  'auto_orch': SECTION_INSTRUCTIONS_AGENTIC,
 }
 
 const VOLATILE_CONTEXT_INSTRUCTION = `

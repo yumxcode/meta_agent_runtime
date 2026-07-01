@@ -34,6 +34,8 @@ export interface AutoDriftGateDeps {
   projectDir: string
   /** Lazily reads the pure frozen goal (SessionRouter._autoGoal). */
   getGoal: () => string | null
+  /** Lazily reads the current session id, used to load the session checkpoint. */
+  getSessionId?: () => string | undefined
 }
 
 /** Read-only investigation tools + the direct experience writer. */
@@ -164,7 +166,9 @@ export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
     if (!goal || !goal.trim()) return skip('goal missing')
 
     try {
-      const cp = readAutoCheckpoint(deps.projectDir)
+      const sessionId = deps.getSessionId?.()
+      if (!sessionId) return skip('session id missing')
+      const cp = readAutoCheckpoint(deps.projectDir, sessionId)
       if (!cp) return skip('checkpoint missing')
       // Only feed the fields drift needs — keep it compact and goal-focused.
       const checkpointJson = JSON.stringify(

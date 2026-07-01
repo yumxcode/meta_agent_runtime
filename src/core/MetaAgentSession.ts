@@ -530,7 +530,7 @@ export class MetaAgentSession {
    * prompt cache.
    */
   async dispose(): Promise<void> {
-    try { this._inner.dispose() } catch { /* best-effort */ }
+    try { await this._inner.dispose() } catch { /* best-effort */ }
     this.toolRegistry.clear()
     this._staticPromptCache.clear()
     this.sectionRegistry.clear()

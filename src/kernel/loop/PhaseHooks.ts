@@ -1,5 +1,5 @@
 /**
- * PhaseHooks — kernel-side contract for the auto-orch main-loop phase hooks (B).
+ * PhaseHooks — kernel-side contract for the auto_orch main-loop phase hooks (B).
  *
  * Verify/Drift answer "is the run done / on-goal" at coarse structural points.
  * Phase hooks are FINER: they let an injected policy observe and minimally steer
@@ -12,7 +12,7 @@
  *   • post_tool   — after the tool batch completed.
  *
  * Like VerifyGate / DriftGate, this module holds ONLY the kernel-side contract;
- * the registry/middleware implementation lives in core/auto-orch and is injected
+ * the registry/middleware implementation lives in core/auto_orch and is injected
  * via KernelConfig.phaseHooks. The kernel never imports the implementation.
  *
  * Design invariants (mirrors the gate contracts):
@@ -66,6 +66,13 @@ export interface PhaseHookOutcome {
   inject?: string[]
   /** When true, the loop terminates cleanly after applying any inject. */
   abort?: boolean
+  /**
+   * When true (together with `abort`), the termination is a FAILURE, not a clean
+   * stop — the kernel maps it to an error result subtype rather than success.
+   * Used by the auto_orch launch hook to surface a failed/invalid/bounds-exceeded
+   * orchestration run as an error instead of a deceptive success.
+   */
+  failed?: boolean
   /** Free-text reason for observability; never load-bearing. */
   note?: string
 }

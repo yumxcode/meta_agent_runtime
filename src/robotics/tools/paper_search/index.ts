@@ -1,5 +1,6 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ISubAgentDispatcher } from "../../../subagent/ISubAgentDispatcher.js"
+import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { RoboticsProjectStore } from '../../persistence/RoboticsProjectStore.js'
 
 const PAPER_SEARCH_SYSTEM = `\
@@ -116,7 +117,7 @@ export function createPaperSearchTool(
             taskDescription,
             allowedTools: ['web_search', 'web_fetch', 'mcp_call', 'list_mcp_resources', 'experience_write', 'return_result'],
             maxTurns,
-            maxDurationMs: 300_000,
+            maxDurationMs: DEFAULT_SUB_AGENT_MAX_DURATION_MS,
           },
           abortSignal: ctx.abortSignal,
         })

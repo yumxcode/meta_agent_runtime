@@ -26,6 +26,7 @@ import { CampaignEventBus } from './CampaignEventBus.js'
 import {
   makeSubAgentTaskId,
   DEFAULT_SUB_AGENT_CONFIG,
+  DEFAULT_SUB_AGENT_MAX_DURATION_MS,
   TERMINAL_STATUSES,
   type SubAgentConfig,
   type SubAgentRecord,
@@ -34,7 +35,7 @@ import {
   type SubAgentFailedEvent,
 } from './types.js'
 import type { ISubAgentDispatcher } from './ISubAgentDispatcher.js'
-import type { MetaAgentTool } from '../core/types.js'
+import type { MetaAgentEvent, MetaAgentTool } from '../core/types.js'
 
 const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
@@ -135,7 +136,18 @@ export interface SpawnSubAgentOptions {
    * is interrupted mid-turn, sub-agents spawned in that turn are cancelled.
    */
   abortSignal?: AbortSignal
+  /**
+   * Optional non-persistent runtime observer for callers that own a sub-agent
+   * and want live diagnostics. This is intentionally not stored in
+   * SubAgentRecord.config because task records are JSON persisted.
+   */
+  onRuntimeEvent?: (event: SubAgentRuntimeEvent) => void | Promise<void>
 }
+
+export type SubAgentRuntimeEvent =
+  | { type: 'runner_started'; taskId: SubAgentTaskId }
+  | { type: 'session_submit_started'; taskId: SubAgentTaskId }
+  | { type: 'session_event'; taskId: SubAgentTaskId; event: MetaAgentEvent }
 
 export interface SubAgentBridgeOptions {
   /** Maximum number of sub-agent sessions running at once. */
@@ -157,6 +169,7 @@ export interface SubAgentBridgeOptions {
 interface QueuedSubAgent {
   record: SubAgentRecord
   abortController: AbortController
+  onRuntimeEvent?: SpawnSubAgentOptions['onRuntimeEvent']
 }
 
 export interface SubAgentSchedulerStats {
@@ -494,6 +507,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         : (config.workspaceMode ?? 'shared_write'),
       isolateWorktree: isolatedWrite,
     }
+    if (config.autoOrch?.resumable && !config.autoOrch.agentSessionId) {
+      config = {
+        ...config,
+        autoOrch: {
+          ...config.autoOrch,
+          agentSessionId: `auto-orch-subagent-${randomUUID()}`,
+        },
+      }
+    }
     if (config.workspaceMode === 'shared_readonly') {
       config = {
         ...config,
@@ -600,7 +622,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       this._startPollTimer(taskId, config.pollIntervalMs, config.maxDurationMs)
     }
 
-    this.queuedStarts.set(taskId, { record, abortController })
+    this.queuedStarts.set(taskId, { record, abortController, onRuntimeEvent: opts.onRuntimeEvent })
     // Internal safety-gate tasks jump the queue so a backlog of research/worker
     // tasks can't delay the gate; ordinary tasks keep FIFO order.
     if (isInternal) this.startQueue.unshift(taskId)
@@ -937,7 +959,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     // stop polling instead of leaking this interval for the host's lifetime.
     // Generous slack over the runner's own wall-clock cap so a legitimately
     // slow task is never cut off early.
-    const maxAgeMs = Math.max((maxDurationMs ?? 300_000) * 4, intervalMs * 4)
+    const maxAgeMs = Math.max((maxDurationMs ?? DEFAULT_SUB_AGENT_MAX_DURATION_MS) * 4, intervalMs * 4)
     const timer = setInterval(async () => {
       const record = await readTask(taskId)
       if (!record) {
@@ -1087,6 +1109,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
           queued.record,
           this._effectiveToolRegistry(),
           queued.abortController.signal,
+          queued.onRuntimeEvent,
         )
         this.queuedStarts.delete(taskId)
         this.runners.set(taskId, runner)

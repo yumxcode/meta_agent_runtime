@@ -1,9 +1,9 @@
 /**
- * SimpleAutoBackend — verifies that simple_auto is auto WITHOUT the heavyweight
- * self-supervision machinery.
+ * SimpleAutoBackend — verifies that lightweight autonomous modes keep the auto
+ * jail WITHOUT the heavyweight self-supervision machinery.
  *
- * simple_auto must keep auto's autonomy jail (auto-approve writes inside the
- * workspace, locked workspace, denied tools) but MUST NOT wire:
+ * simple_auto and auto_orch must keep auto's autonomy jail (auto-approve writes
+ * inside the workspace, locked workspace, denied tools) but MUST NOT wire:
  *   - the durable checkpoint coordinator (onCheckpointBoundary),
  *   - the drift (course-correction) gate (driftGate),
  *   - the completion-verify gate (verifyGate),
@@ -35,6 +35,7 @@ vi.mock('../../core/MetaAgentSession.js', () => ({
     getToolRegistry(): unknown { return {} }
     registerTool(): void {}
     setSubAgentBridge(): void {}
+    async dispose(): Promise<void> {}
   },
 }))
 
@@ -53,18 +54,23 @@ vi.mock('../../subagent/SubAgentBridge.js', () => ({
 import { createAgenticBackend } from '../AgenticBackendFactory.js'
 import { MODE_PROFILES } from '../../core/modes.js'
 import { resolveConfig } from '../../core/config.js'
+import { writeAutoCheckpoint, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../../core/auto/AutoCheckpointStore.js'
 
 function tmpProjectDir(): string {
   return mkdtempSync(join(tmpdir(), 'meta-agent-simple-auto-'))
 }
 
-async function buildBackend(promptModeKey: 'auto' | 'simple_auto') {
-  const projectDir = tmpProjectDir()
+async function buildBackend(
+  promptModeKey: 'auto' | 'simple_auto' | 'auto_orch',
+  opts: { projectDir?: string; explicitResume?: boolean; resumeSessionId?: string } = {},
+) {
+  const projectDir = opts.projectDir ?? tmpProjectDir()
   const baseConfig = resolveConfig({ projectDir })
   const backend = await createAgenticBackend({
     baseConfig,
     projectDir,
-    explicitResume: false,
+    explicitResume: opts.explicitResume ?? false,
+    resumeSessionId: opts.resumeSessionId,
     overrides: MODE_PROFILES[promptModeKey].agenticOverrides,
     getGoal: () => null,
   })
@@ -116,7 +122,67 @@ describe('simple_auto backend wiring', () => {
     expect(config['driftGate']).toBeTypeOf('function')
     expect(config['onCheckpointBoundary']).toBeTypeOf('function')
     expect(config['getExperienceRecallBlock']).toBeTypeOf('function')
-    // auto (not auto-orch) carries the jail but no orchestration phase hooks.
+    // auto (not auto_orch) carries the jail but no orchestration phase hooks.
     expect(backend.orchController).toBeNull()
+  })
+
+  it('auto_orch uses the lightweight base plus orchestration hooks', async () => {
+    const { backend, config } = await buildBackend('auto_orch')
+
+    expect(config['promptMode']).toBe('auto_orch')
+    expect(config['autonomy']).toMatchObject({
+      autoApproveInWorkspace: true,
+      lockWorkspace: true,
+    })
+
+    // auto_orch is NOT plain auto with hidden gates. Its verify/drift semantics
+    // are explicit plan-graph role nodes, so the outer loop must not wire the
+    // implicit auto self-supervision hooks.
+    expect(backend.checkpointCoordinator).toBeNull()
+    expect(config['verifyGate']).toBeUndefined()
+    expect(config['driftGate']).toBeUndefined()
+    expect(config['onCheckpointBoundary']).toBeUndefined()
+    expect(config['getExperienceRecallBlock']).toBeUndefined()
+
+    // The orchestration layer remains enabled.
+    expect(backend.orchController).not.toBeNull()
+    expect(backend.orchScheduler).not.toBeNull()
+    expect(config['phaseHooks']).toBeTypeOf('function')
+
+    await backend.session.dispose()
+  })
+
+  it('only restores auto checkpoint counters for the matching resumed session', async () => {
+    const projectDir = tmpProjectDir()
+    await writeAutoCheckpoint(projectDir, {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId: 'other-session',
+      updatedAt: Date.now(),
+      revision: 9,
+      turnCount: 42,
+    })
+
+    const mismatched = await buildBackend('auto', {
+      projectDir,
+      explicitResume: true,
+      resumeSessionId: 'target-session',
+    })
+    expect(mismatched.config['initialCheckpointRevision']).toBe(0)
+    expect(mismatched.config['initialToolBatchCount']).toBe(0)
+
+    await writeAutoCheckpoint(projectDir, {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId: 'target-session',
+      updatedAt: Date.now(),
+      revision: 7,
+      turnCount: 13,
+    })
+    const matched = await buildBackend('auto', {
+      projectDir,
+      explicitResume: true,
+      resumeSessionId: 'target-session',
+    })
+    expect(matched.config['initialCheckpointRevision']).toBe(7)
+    expect(matched.config['initialToolBatchCount']).toBe(13)
   })
 })

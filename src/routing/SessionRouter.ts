@@ -284,14 +284,17 @@ export class SessionRouter {
       const isFirstTurn = this._autoGoal === null
       const isContinuation = isAutoContinuationPrompt(prompt)
 
-      if (isFirstTurn && this._explicitResume && isContinuation && this._currentMode !== 'simple_auto') {
+      if (isFirstTurn && this._explicitResume && isContinuation && this._autoCheckpointCoordinator) {
         // Resumed to CONTINUE: the user gave no new requirement (empty or a
         // "继续"/"continue"-type prompt), so keep the prior goal and re-inject the
         // progress snapshot so the run picks up where it stopped.
-        // simple_auto disables the checkpoint mechanism entirely, so it never
-        // takes this path — it can carry no durable progress snapshot and falls
-        // through to treat the prompt as the goal.
-        const cp = readAutoCheckpoint(this._cfg.projectDir ?? process.cwd())
+        // Lightweight autonomous modes (simple_auto and auto_orch) disable the
+        // checkpoint mechanism entirely, so they never take this path — they can
+        // carry no durable auto progress snapshot and fall through to treat the
+        // prompt as the goal.
+        const cp = this._resumeSessionId
+          ? readAutoCheckpoint(this._cfg.projectDir ?? process.cwd(), this._resumeSessionId)
+          : null
         const preamble = buildAutoResumePreamble(cp)
         if (preamble) {
           effectivePrompt = `${preamble}\n\n[本次用户输入]\n${prompt}`
@@ -352,10 +355,10 @@ export class SessionRouter {
     // digest streak, pending digest) so the prior task's signals are not written
     // back into the new goal's checkpoint on the next flush.
     this._autoCheckpointCoordinator?.resetRunScopedState()
-    // simple_auto has no checkpoint coordinator (checkpoint/drift/verify are all
-    // disabled), so there is no durable checkpoint to reset — re-anchoring the
-    // in-memory goal above is sufficient. Skip the disk write entirely so the
-    // lightweight mode never creates a checkpoint file.
+    // Lightweight autonomous modes have no checkpoint coordinator
+    // (checkpoint/drift/verify are all disabled), so there is no durable
+    // checkpoint to reset — re-anchoring the in-memory goal above is sufficient.
+    // Skip the disk write entirely so those modes never create a checkpoint file.
     if (!this._autoCheckpointCoordinator) return
     // Hard reset (not a merge): a fresh checkpoint with empty completedSteps /
     // pendingTodos so drift never compares the NEW goal against the prior task's
@@ -685,13 +688,14 @@ export class SessionRouter {
       case 'agentic':
       case 'auto':
       case 'simple_auto':
-      case 'auto-orch':
+      case 'auto_orch':
         // All four run on the shared agentic backend (same loop + research
         // wiring). AUTO adds the autonomous + config-locked workspace jail and
-        // the AUTO prompt section; SIMPLE_AUTO adds the same jail but skips the
-        // checkpoint/drift/verify machinery (see AgenticBackendFactory); AUTO-ORCH
-        // adds the AUTO jail PLUS the orchestration layer (phase hooks + plan
-        // graph). The per-mode posture is carried by
+        // implicit checkpoint/drift/verify machinery; SIMPLE_AUTO adds the same
+        // jail but skips that machinery; AUTO-ORCH uses the same lightweight
+        // execution base as SIMPLE_AUTO plus the orchestration layer (phase hooks
+        // + plan graph). verify/drift in AUTO-ORCH are explicit graph role nodes,
+        // not hidden runtime gates. The per-mode posture is carried by
         // MODE_PROFILES[mode].agenticOverrides (undefined for plain agentic).
         return this._createAgenticBackend(MODE_PROFILES[mode].agenticOverrides)
 

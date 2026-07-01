@@ -64,6 +64,7 @@ describe('AutoDriftGate', () => {
       },
       projectDir: dir,
       getGoal: () => 'build a feature',
+      getSessionId: () => 'sess-1',
     })
 
     const verdict = await gate({
@@ -143,7 +144,7 @@ describe('checkpoint completedSteps (drift input)', () => {
   it('records and unions completedSteps across turns', async () => {
     await updateAutoCheckpoint(dir, 'sess-1', { goal: 'g', completedSteps: ['step A'], pendingTodos: ['B', 'C'] })
     await updateAutoCheckpoint(dir, 'sess-1', { completedSteps: ['step B'], pendingTodos: ['C'] })
-    const cp = readAutoCheckpoint(dir)
+    const cp = readAutoCheckpoint(dir, 'sess-1')
     expect(cp!.goal).toBe('g')
     expect(cp!.completedSteps).toEqual(['step A', 'step B'])  // append-only union
     expect(cp!.pendingTodos).toEqual(['C'])                   // latest snapshot

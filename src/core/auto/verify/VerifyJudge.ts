@@ -17,7 +17,7 @@
  *                       broken verifier can never wedge a finished run.
  */
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
-import { TERMINAL_STATUSES } from '../../../subagent/types.js'
+import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES } from '../../../subagent/types.js'
 import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGate.js'
 import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
 
@@ -63,7 +63,7 @@ export const VERIFY_JUDGE_DEFAULTS = {
    */
   maxBudgetUsd: Number.POSITIVE_INFINITY,
   /** Wall-clock cap (ms) for a single judge run. */
-  maxDurationMs: 600_000,
+  maxDurationMs: DEFAULT_SUB_AGENT_MAX_DURATION_MS,
 } as const
 
 function verifyEnvInt(name: string, fallback: number, min: number, max: number): number {
@@ -88,7 +88,7 @@ function verifyEnvFloat(name: string, fallback: number, min: number, max: number
  *
  *   META_AGENT_VERIFY_MAX_TURNS        (int,   default 30)
  *   META_AGENT_VERIFY_MAX_BUDGET_USD   (float, default unbounded)
- *   META_AGENT_VERIFY_MAX_DURATION_MS  (int,   default 600000)
+ *   META_AGENT_VERIFY_MAX_DURATION_MS  (int,   default 1800000)
  */
 export function resolveJudgeLimits(): { maxTurns: number; maxBudgetUsd: number; maxDurationMs: number } {
   return {

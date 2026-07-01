@@ -27,3 +27,4 @@ dist/
 .meta-agent/
 permissions.json
 _tmp_branchcycle.removed
+__trash_stale_auto_orch/

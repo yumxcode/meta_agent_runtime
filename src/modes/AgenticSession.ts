@@ -279,11 +279,15 @@ export class AgenticSession {
    * with their potentially heavy closures — become unreachable.
    *
    * Safe to call multiple times.  Once called the session must not be reused.
+   *
+   * Async so the caller can AWAIT sandbox/runtime-guard teardown — the runtime
+   * guards release sandbox handles asynchronously, and a fire-and-forget here
+   * would let handles leak when the process exits quickly or sessions churn.
    */
-  dispose(): void {
+  async dispose(): Promise<void> {
     if (this._disposed) return
     this._disposed = true
-    void this._runtimeGuards.dispose()
+    try { await this._runtimeGuards.dispose() } catch { /* best-effort */ }
     try { this._engine.dispose() } catch { /* best-effort */ }
     this._registeredTools.length = 0
   }

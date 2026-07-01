@@ -82,6 +82,7 @@ export type LoopTerminationReason =
   | 'auto_runtime_limit'
   | 'auto_tool_batch_limit'
   | 'phase_hook_abort'
+  | 'phase_hook_fail'
   | 'error'
 
 export interface LoopResult {
@@ -577,6 +578,14 @@ export async function* runKernelLoop(
   // Auto run bounds: the 2h wall-clock above AND a 300 completed-tool-batch cap.
   // Whichever is hit first ends the run (with a checkpoint, so it can resume).
   const autoMaxToolBatches = config.autoMaxToolBatches ?? 300
+  // #6 fix: only claim "checkpointed; resume" when durable checkpointing is
+  // actually wired (onCheckpointBoundary). simple_auto runs autonomously but
+  // intentionally has NO checkpoint coordinator, so its limit messages must not
+  // promise a resume that can't happen.
+  const checkpointsEnabled = config.autonomousMode === true && !!config.onCheckpointBoundary
+  const autoResumeHint = checkpointsEnabled
+    ? 'Progress was checkpointed; resume the session to continue.'
+    : 'This run was not checkpointed and will not resume; re-run to continue.'
   const autoRuntimeTimer = config.autonomousMode && autoMaxRuntimeMs > 0
     ? setTimeout(() => abortController.abort('auto_runtime_limit'), autoMaxRuntimeMs)
     : undefined
@@ -639,7 +648,7 @@ export async function* runKernelLoop(
     }
   }
 
-  // Phase-hook dispatch (auto-orch, B). No-op unless config.phaseHooks is set,
+  // Phase-hook dispatch (auto_orch, B). No-op unless config.phaseHooks is set,
   // so every existing mode makes ZERO extra calls (zero regression). The hook is
   // advisory: it may inject meta user messages (applied at the next natural
   // boundary, same as drift corrections) and/or request a clean abort. Fail-open:
@@ -650,7 +659,7 @@ export async function* runKernelLoop(
   async function runPhaseHook(
     point: import('./PhaseHooks.js').PhaseHookPoint,
     extra?: { toolNames?: readonly string[]; erroredToolNames?: readonly string[] },
-  ): Promise<{ abort: boolean; note?: string }> {
+  ): Promise<{ abort: boolean; failed?: boolean; note?: string }> {
     if (!config.phaseHooks) return { abort: false }
     try {
       const outcome = await config.phaseHooks({
@@ -669,7 +678,7 @@ export async function* runKernelLoop(
           append(makeTextUserMessage(text, { isMeta: true }))
         }
       }
-      return { abort: outcome.abort === true, note: outcome.note }
+      return { abort: outcome.abort === true, failed: outcome.failed === true, note: outcome.note }
     } catch {
       return { abort: false }
     }
@@ -733,7 +742,7 @@ export async function* runKernelLoop(
     ) {
       resultText =
         `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
-        'Progress was checkpointed; resume the session to continue.'
+        autoResumeHint
       yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
       return done('auto_runtime_limit')
     }
@@ -880,17 +889,17 @@ export async function* runKernelLoop(
       return done('blocking_limit')
     }
 
-    // ── Phase hook: pre_query (auto-orch B) ───────────────────────────────────
+    // ── Phase hook: pre_query (auto_orch B) ───────────────────────────────────
     // Fires right before the model is queried, after any injected messages are
     // already appended so the hook's own inject lands on THIS turn. This is the
-    // auto-orch launch point: the orchestration runs here and aborts the shell
+    // auto_orch launch point: the orchestration runs here and aborts the shell
     // executor, surfacing its summary (the hook note) as the result text.
     {
       const ph = await runPhaseHook('pre_query')
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort before query.'
+        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort before query.'
         yield { type: 'text_delta', delta: resultText, sessionId }
-        return done('phase_hook_abort')
+        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
 
@@ -1146,7 +1155,7 @@ export async function* runKernelLoop(
       if (signal.reason === 'auto_runtime_limit') {
         resultText =
           `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
-          'Progress was checkpointed; resume the session to continue.'
+          autoResumeHint
         return done('auto_runtime_limit')
       }
       if (signal.reason !== 'interrupt') {
@@ -1208,14 +1217,14 @@ export async function* runKernelLoop(
     // Commit assistant messages to history
     append(...assistantMessages)
 
-    // ── Phase hook: post_query (auto-orch B) ──────────────────────────────────
+    // ── Phase hook: post_query (auto_orch B) ──────────────────────────────────
     // Fires after the assistant turn is committed, before tool execution. Lets a
     // policy react to what the model just said / decided.
     {
       const ph = await runPhaseHook('post_query')
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort after query.'
-        return done('phase_hook_abort')
+        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort after query.'
+        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
 
@@ -1456,13 +1465,13 @@ export async function* runKernelLoop(
       await checkpoint({ type: 'external_before', externalToolNames: externalBefore })
     }
 
-    // ── Phase hook: pre_tool (auto-orch B) ────────────────────────────────────
+    // ── Phase hook: pre_tool (auto_orch B) ────────────────────────────────────
     const batchToolNames = toolUseRequests.map(req => req.toolName)
     {
       const ph = await runPhaseHook('pre_tool', { toolNames: batchToolNames })
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort before tool execution.'
-        return done('phase_hook_abort')
+        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort before tool execution.'
+        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
 
@@ -1495,7 +1504,7 @@ export async function* runKernelLoop(
     }
     append(...toolsResult.toolResultMessages, ...toolsResult.extraMessages)
 
-    // ── Phase hook: post_tool (auto-orch B) ───────────────────────────────────
+    // ── Phase hook: post_tool (auto_orch B) ───────────────────────────────────
     // Fires after the tool batch's results are committed. Surfaces which tools
     // ran and which errored so a policy can react (e.g. inject a recovery hint).
     const erroredToolNameSet = new Set<string>()
@@ -1509,8 +1518,8 @@ export async function* runKernelLoop(
     {
       const ph = await runPhaseHook('post_tool', { toolNames: batchToolNames, erroredToolNames: [...erroredToolNameSet] })
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto-orch): a phase hook requested abort after tool execution.'
-        return done('phase_hook_abort')
+        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort after tool execution.'
+        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
 
@@ -1526,7 +1535,7 @@ export async function* runKernelLoop(
     ) {
       resultText =
         `Auto run reached its ${autoMaxToolBatches} tool-batch limit. ` +
-        'Progress was checkpointed; resume the session to continue.'
+        autoResumeHint
       yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
       return done('auto_tool_batch_limit')
     }
@@ -1721,7 +1730,7 @@ export async function* runKernelLoop(
       if (signal.reason === 'auto_runtime_limit') {
         resultText =
           `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
-          'Progress was checkpointed; resume the session to continue.'
+          autoResumeHint
         return done('auto_runtime_limit')
       }
       if (signal.reason !== 'interrupt') {

@@ -2,13 +2,13 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.4.1` · Node.js `>= 18`
+> 当前版本:`0.5.1` · Node.js `>= 18`
 
 ---
 
 ## 特性概览
 
-- **六种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`auto-orch`(在 auto 之上叠加多 Agent 自我编排)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。外加 `detect` 哨兵按提示词与环境自动选择。
+- **六种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`auto_orch`(simple_auto 执行基座 + 多 Agent 编排图,verify/drift 由显式图节点表达)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。外加 `detect` 哨兵按提示词与环境自动选择。
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
@@ -103,7 +103,7 @@ npm install @meta-agent/runtime
 import { SessionRouter, createStandardTools } from '@meta-agent/runtime'
 
 const router = new SessionRouter({
-  mode: 'agentic',          // 'detect' | 'agentic' | 'auto' | 'simple_auto' | 'auto-orch' | 'campaign' | 'robotics'
+  mode: 'agentic',          // 'detect' | 'agentic' | 'auto' | 'simple_auto' | 'auto_orch' | 'campaign' | 'robotics'
   projectDir: process.cwd(),
   maxTurns: 30,
 })
@@ -137,8 +137,8 @@ meta-agent --mode auto "把构建跑绿,修掉所有失败用例"      # 或 --y
 # 轻量无人值守(同款工作区监狱,但不启用 checkpoint/drift/verify,适合简单短任务)
 meta-agent --mode simple_auto "把 README 里的死链接都修掉"
 
-# 自治编排(auto 之上叠加多 Agent 自我编排,适合可拆解为多子任务的复杂目标)
-meta-agent --mode auto-orch "把整个数据管线重写为流式架构,并补齐单测与文档"
+# 自治编排(simple_auto 执行基座 + 编排图,审查由显式节点保证)
+meta-agent --mode auto_orch "把整个数据管线重写为流式架构,并补齐单测与文档"
 
 # 其它模式
 meta-agent --mode campaign "做一次 x=[0,10], y=[0,5] 的 DOE 参数扫描"
@@ -161,7 +161,7 @@ CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-
 | `agentic` | 通用工程任务与问答 | 多轮工具调用、文件修改、命令执行、上下文压缩、同步/异步子代理 |
 | `auto` | 无人值守自治 | 工作区硬监狱、verify/drift 关卡、断路器、checkpoint/恢复、失败重试、收紧的并发与预算 |
 | `simple_auto` | 轻量无人值守 | 同款工作区硬监狱与自动批准,但**去掉 checkpoint / drift / verify**;面向简单、短链路任务 |
-| `auto-orch` | 自治 + 多 Agent 编排 | 在 `auto` 全部能力之上叠加 AI 自编排的计划图(执行节点 + 校验/航向/复核审查角色)与阶段钩子 |
+| `auto_orch` | 轻量自治 + 多 Agent 编排 | `simple_auto` 执行基座 + AI 自编排计划图(执行节点 + 校验/航向/复核审查角色)与阶段钩子;verify/drift 由显式图节点保证 |
 | `campaign` | 长周期实验/优化 | DOE、多保真度、并行评估、Pareto、论文复现、人工检查点、溯源 |
 | `robotics` | 机器人开发 | 硬件档案、三层知识库、工作流阶段、并行实验、Git 工作树、Team 协作 |
 
@@ -194,16 +194,19 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 实现上,内核循环对 checkpoint/drift/verify 三者都是"配置钩子缺失即跳过",`simple_auto` 只是让后端工厂不挂载这些钩子(见 `AgenticBackendFactory` 的 `wantsGates` 开关),因此得到的是"`auto` 的自治与监狱、但没有自监督开销"。和 `auto` 一样,`simple_auto` 仅能**显式进入**(`--mode simple_auto`),绝不会被提示词措辞推断出来。任务一旦变复杂或高风险,建议改用 `auto`。
 
-### auto-orch 自治编排模式
+### auto_orch 自治编排模式
 
-`auto-orch` 是 `auto` 的**超集**:在 `auto` 的全部授权、工作区硬监狱与 verify/drift 关卡之上,额外叠加一层**多 Agent 自我编排**,适合需要拆解为多个子任务、并配审查角色把关的复杂目标。
+`auto_orch` 是 `simple_auto` 执行基座之上的**多 Agent 自我编排**:保留工作区硬监狱、自动批准、断路器与子代理调度,但不启用 `auto` 的隐式 checkpoint / drift / verify 关卡。复杂目标的校验、航向检查与复核由计划图中的显式角色节点表达和保证。
 
 - **自主编排**:面对复杂目标,主代理先规划出一张由多个子代理节点组成的协作流程——执行节点负责干活,审查角色节点(校验完成度 / 检查航向 / 复核产出)负责把关,节点间可并行或串行。
-- **编排即数据**:编排方案是一张**受校验与硬上限约束的计划图(plan graph)**,由固定引擎解释执行,而非模型自由生成并直接运行的代码;非法或越界的编排会被拒绝并回退到 `auto` 的默认自主循环,因此编排层永远绕不过权限牢笼。
-- **阶段钩子**:在每一轮的阶段边界可挂载钩子,让编排层在轮内对执行体做引导/校正。
-- **与 `auto` 一致的边界**:工作区监狱、自动批准、verify/drift 关卡、断路器、checkpoint/恢复、`maxTurns` 等与 `auto` **完全相同**——`auto-orch` 只是额外多了编排能力,编排逻辑活在权限牢笼之外。
+- **计划审核**:交互式 CLI 中显式进入 `--mode auto_orch` 时,planner 生成的候选图会先在终端展示节点、边与 bounds,用户可批准、要求修改或取消;`--yes` / `--json` 下不打断执行。也可用 `--auto-orch-review-plan` 显式开启。
+- **编排即数据**:编排方案是一张**受校验与硬上限约束的计划图(plan graph)**,由固定引擎解释执行,而非模型自由生成并直接运行的代码;非法或越界的编排会被拒绝并回退到单执行器 + 显式 verify 的安全计划,因此编排层永远绕不过权限牢笼。
+- **阶段钩子**:启动编排图并在阶段边界承载编排层控制;默认不再额外注入外层 drift/verify。
+- **终端可观测**:执行图时终端会打印 `plan_started`、`node_started`、`node_finished`、`edge_selected`、`run_paused`、`run_resumed`、`run_completed` 对应的进度行,包括节点 id、label、选边、暂停恢复信息与执行路径。
+- **显式审查**:计划图需要审查时必须放置 role 节点(如 `verify` / `drift` / `reviewer`)并通过边表达返工路径;节点内部不依赖隐藏的 auto gate 兜底。
+- **轻量执行基座**:工作区监狱、自动批准、断路器、`maxTurns`、子代理 jail 透传等与 `simple_auto` 一致;不写/读 auto durable checkpoint,不装配 auto 经验召回/写入。
 
-实现上,`auto-orch` 与 `auto` 共享同一条自治后端(`isAuto` 为真、复用工作区 jail),并额外接上规划器(`PlannerAgent` 生成计划图)、角色注册表与阶段钩子(见 `AgenticBackendFactory` / `core/auto-orch`)。和 `auto` / `simple_auto` 一样,`auto-orch` 仅能**显式进入**(`--mode auto-orch`),绝不会被提示词措辞推断出来。
+实现上,`auto_orch` 与 `simple_auto` 使用同一套轻量自治执行基座(`isAuto` 为真、复用工作区 jail,但不挂载 `wantsGates` 对应的 checkpoint/drift/verify/experience hooks),并额外接上规划器(`PlannerAgent` 生成计划图)、角色注册表与阶段钩子(见 `AgenticBackendFactory` / `core/auto_orch`)。和 `auto` / `simple_auto` 一样,`auto_orch` 仅能**显式进入**(`--mode auto_orch`),绝不会被提示词措辞推断出来。
 
 ---
 
@@ -454,4 +457,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.4.1`。
+当前包版本:`0.5.1`。

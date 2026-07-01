@@ -589,6 +589,10 @@ export class KernelSession {
         // A phase hook requesting abort is an INTENTIONAL clean stop by the
         // orchestration layer, not a failure — surface it as success.
         phase_hook_abort:  'success',
+        // A phase hook flagging FAILURE (e.g. auto_orch launch when the plan run
+        // did not complete) is a real error — surface it as such so callers that
+        // inspect result.subtype don't mistake a failed orchestration for success.
+        phase_hook_fail:   'error_during_execution',
         error:             'error_during_execution',
       }
 

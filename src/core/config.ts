@@ -294,6 +294,24 @@ export interface MetaAgentConfig {
   /** Optional user prompt function consumed by the kernel permission policy. */
   askUser?: (question: string, choices?: string[]) => Promise<string>
 
+  /**
+   * auto_orch planner-only interactive review. Default off. When enabled and an
+   * askUser callback is available, the Planner's validated draft graph is shown
+   * to the user before code materialisation/execution. Executor / role /
+   * code_author / code nodes remain unattended.
+   */
+  autoOrchPlannerReview?: boolean | {
+    enabled?: boolean
+    maxRounds?: number
+  }
+
+  /**
+   * auto_orch graph execution observer. Intended for CLIs/UIs to render live
+   * plan/node/edge/pause/resume progress. Best-effort only: observer failures do
+   * not affect graph execution.
+   */
+  autoOrchObserver?: import('./auto_orch/Observer.js').AutoOrchObserver
+
   /** Runtime permission overrides merged after global/project permissions.json. */
   permissionConfig?: PermissionConfig
 
@@ -336,7 +354,7 @@ export interface MetaAgentConfig {
 
   /**
    * Auto-orch main-loop phase hooks (B). Forwarded verbatim to the kernel (see
-   * KernelConfig.phaseHooks). Built by the router layer (auto-orch only). Absent
+   * KernelConfig.phaseHooks). Built by the router layer (auto_orch only). Absent
    * = no intra-turn phase hooks, so every other mode is unaffected.
    */
   phaseHooks?: import('../kernel/loop/PhaseHooks.js').PhaseHookFn
@@ -408,6 +426,8 @@ export type ResolvedConfig = Required<
     | 'beforeToolCall'
     | 'planModeRef'
     | 'askUser'
+    | 'autoOrchPlannerReview'
+    | 'autoOrchObserver'
     | 'permissionConfig'
     | 'promptMode'
     | 'autonomy'
@@ -439,6 +459,8 @@ export type ResolvedConfig = Required<
   beforeToolCall?: MetaAgentConfig['beforeToolCall']
   planModeRef?: MetaAgentConfig['planModeRef']
   askUser?: MetaAgentConfig['askUser']
+  autoOrchPlannerReview?: MetaAgentConfig['autoOrchPlannerReview']
+  autoOrchObserver?: MetaAgentConfig['autoOrchObserver']
   permissionConfig?: PermissionConfig
   /** Default agent mode for prompt sections (absent → 'agentic'). */
   promptMode?: AgentMode
@@ -555,6 +577,8 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     beforeToolCall:  config.beforeToolCall,
     planModeRef:     config.planModeRef,
     askUser:         config.askUser,
+    autoOrchPlannerReview: config.autoOrchPlannerReview,
+    autoOrchObserver: config.autoOrchObserver,
     permissionConfig: config.permissionConfig,
     promptMode:      config.promptMode,
     autonomy:        config.autonomy,

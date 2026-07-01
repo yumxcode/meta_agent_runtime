@@ -2,13 +2,16 @@
  * AutoCheckpointStore — durable progress snapshot for auto (unattended) sessions.
  *
  * An auto run can hit its budget/turn cap, the stall circuit, or a crash with no
- * human watching. A checkpoint at `<workspace>/.meta-agent/auto/checkpoint.json`
- * lets a later `--resume` recover the goal, what's done, what's pending, and
- * which sub-agents were in flight — instead of starting from zero.
+ * human watching. A checkpoint at
+ * `<workspace>/.meta-agent/auto/checkpoints/<sessionId>.json` lets a later
+ * `--resume` recover the goal, what's done, what's pending, and which sub-agents
+ * were in flight — instead of starting from zero.
  *
  * This module is pure I/O over one JSON file: write is atomic (tmp + rename),
  * read is tolerant (returns null on missing/corrupt). It is independent of the
  * session/loop, so it is trivially testable and carries no coupling to modes.
+ * The older workspace-singleton path is read only as a legacy fallback when its
+ * embedded sessionId matches the requested session.
  */
 import { existsSync, readFileSync } from 'fs'
 import { readFile } from 'fs/promises'
@@ -73,8 +76,23 @@ export interface AutoCheckpoint {
   lastDriftCorrectionTurn?: number
 }
 
-/** Absolute path of the auto checkpoint file for a workspace. */
-export function autoCheckpointPath(workspaceRoot: string): string {
+function checkpointFilename(sessionId: string): string {
+  return encodeURIComponent(sessionId)
+}
+
+/** Absolute path of a session-scoped auto checkpoint file. */
+export function autoCheckpointPath(workspaceRoot: string, sessionId: string): string {
+  return join(
+    resolve(workspaceRoot),
+    '.meta-agent',
+    'auto',
+    'checkpoints',
+    `${checkpointFilename(sessionId)}.json`,
+  )
+}
+
+/** Legacy workspace-singleton checkpoint path used by older runtime versions. */
+export function legacyAutoCheckpointPath(workspaceRoot: string): string {
   return join(resolve(workspaceRoot), '.meta-agent', 'auto', 'checkpoint.json')
 }
 
@@ -87,7 +105,7 @@ export async function writeAutoCheckpoint(
   checkpoint: AutoCheckpoint,
 ): Promise<boolean> {
   try {
-    const path = autoCheckpointPath(workspaceRoot)
+    const path = autoCheckpointPath(workspaceRoot, checkpoint.sessionId)
     await atomicWriteJson(path, checkpoint)
     return true
   } catch {
@@ -128,30 +146,52 @@ export function buildAutoResumePreamble(cp: AutoCheckpoint | null): string | nul
   )
 }
 
-/** Read the checkpoint, or null when missing / unreadable / wrong shape. */
-export function readAutoCheckpoint(workspaceRoot: string): AutoCheckpoint | null {
+function isAutoCheckpoint(value: unknown): value is AutoCheckpoint {
+  if (!value || typeof value !== 'object') return false
+  const cp = value as Partial<AutoCheckpoint>
+  return typeof cp.sessionId === 'string' && typeof cp.updatedAt === 'number'
+}
+
+/** Read this session's checkpoint, or null when missing / unreadable / wrong shape. */
+export function readAutoCheckpoint(workspaceRoot: string, sessionId: string): AutoCheckpoint | null {
   try {
-    const path = autoCheckpointPath(workspaceRoot)
-    if (!existsSync(path)) return null
+    const path = autoCheckpointPath(workspaceRoot, sessionId)
+    if (!existsSync(path)) {
+      const legacyPath = legacyAutoCheckpointPath(workspaceRoot)
+      if (!existsSync(legacyPath)) return null
+      const legacy = JSON.parse(readFileSync(legacyPath, 'utf-8')) as unknown
+      // Backward-compatible migration read: only accept the old workspace-level
+      // checkpoint when it belongs to the requested session.
+      return isAutoCheckpoint(legacy) && legacy.sessionId === sessionId
+        ? legacy
+        : null
+    }
     const parsed = JSON.parse(readFileSync(path, 'utf-8')) as unknown
-    if (!parsed || typeof parsed !== 'object') return null
-    const cp = parsed as Partial<AutoCheckpoint>
-    if (typeof cp.sessionId !== 'string' || typeof cp.updatedAt !== 'number') return null
-    return cp as AutoCheckpoint
+    return isAutoCheckpoint(parsed) && parsed.sessionId === sessionId
+      ? parsed
+      : null
   } catch {
     return null
   }
 }
 
-async function readAutoCheckpointAsync(workspaceRoot: string): Promise<AutoCheckpoint | null> {
+async function readAutoCheckpointAsync(workspaceRoot: string, sessionId: string): Promise<AutoCheckpoint | null> {
   try {
+    const path = autoCheckpointPath(workspaceRoot, sessionId)
+    if (!existsSync(path)) {
+      const legacy = JSON.parse(
+        await readFile(legacyAutoCheckpointPath(workspaceRoot), 'utf-8'),
+      ) as unknown
+      return isAutoCheckpoint(legacy) && legacy.sessionId === sessionId
+        ? legacy
+        : null
+    }
     const parsed = JSON.parse(
-      await readFile(autoCheckpointPath(workspaceRoot), 'utf-8'),
+      await readFile(path, 'utf-8'),
     ) as unknown
-    if (!parsed || typeof parsed !== 'object') return null
-    const cp = parsed as Partial<AutoCheckpoint>
-    if (typeof cp.sessionId !== 'string' || typeof cp.updatedAt !== 'number') return null
-    return cp as AutoCheckpoint
+    return isAutoCheckpoint(parsed) && parsed.sessionId === sessionId
+      ? parsed
+      : null
   } catch {
     return null
   }
@@ -184,9 +224,9 @@ export async function updateAutoCheckpointWithStatus(
   sessionId: string,
   patch: Partial<Omit<AutoCheckpoint, 'schemaVersion' | 'sessionId' | 'updatedAt'>>,
 ): Promise<AutoCheckpointUpdateResult> {
-  const priorOnDisk = await readAutoCheckpointAsync(workspaceRoot)
-  // A workspace keeps one current auto checkpoint. Starting a new session must
-  // not inherit append-only state from an unrelated prior session.
+  const priorOnDisk = await readAutoCheckpointAsync(workspaceRoot, sessionId)
+  // Checkpoints are session-scoped. Keep the sessionId check as
+  // defense-in-depth for legacy fallback/corrupt manual edits.
   const prior = priorOnDisk?.sessionId === sessionId ? priorOnDisk : null
   const bounded = (items: string[] | undefined, max: number): string[] | undefined => {
     if (!items) return undefined

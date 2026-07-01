@@ -160,9 +160,9 @@ describe('resolveJudgeLimits — env-overridable budget', () => {
   beforeEach(() => { for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k] } })
   afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k] } })
 
-  it('falls back to the documented defaults (30 turns / unbounded budget / 10min)', () => {
-    expect(resolveJudgeLimits()).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 600_000 })
-    expect(VERIFY_JUDGE_DEFAULTS).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 600_000 })
+  it('falls back to the documented defaults (30 turns / unbounded budget / 30min)', () => {
+    expect(resolveJudgeLimits()).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 1_800_000 })
+    expect(VERIFY_JUDGE_DEFAULTS).toEqual({ maxTurns: 30, maxBudgetUsd: Number.POSITIVE_INFINITY, maxDurationMs: 1_800_000 })
   })
 
   it('applies env overrides', () => {

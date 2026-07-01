@@ -3,6 +3,7 @@ import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import type { MetaAgentEvent } from '../../core/types.js'
+import { writeAutoCheckpoint, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../../core/auto/AutoCheckpointStore.js'
 
 const mockState = vi.hoisted(() => ({
   reanchorOriginalGoal: vi.fn(),
@@ -24,7 +25,11 @@ vi.mock('../AgenticBackendFactory.js', () => ({
       getSessionId: vi.fn(() => 'auto-goal-reanchor-test'),
     },
     bridge: null,
-    checkpointCoordinator: null,
+    checkpointCoordinator: {
+      latestRevision: 0,
+      resetRunScopedState: vi.fn(),
+      flushDispose: vi.fn(),
+    },
   })),
 }))
 
@@ -60,6 +65,51 @@ describe('SessionRouter auto goal re-anchor', () => {
     await drain(router.submit('继续'))
 
     expect(mockState.reanchorOriginalGoal).not.toHaveBeenCalled()
+  })
+
+  it('does not inject a resume preamble from another session checkpoint', async () => {
+    const projectDir = tmpProjectDir()
+    await writeAutoCheckpoint(projectDir, {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId: 'other-session',
+      updatedAt: Date.now(),
+      goal: 'WRONG GOAL FROM OTHER SESSION',
+      pendingTodos: ['wrong todo'],
+    })
+    const router = new SessionRouter({
+      mode: 'auto',
+      explicitResume: true,
+      resumeSessionId: 'target-session',
+      projectDir,
+    })
+
+    await drain(router.submit('继续'))
+
+    expect(mockState.submitPrompts).toEqual(['继续'])
+    expect(mockState.submitPrompts.join('\n')).not.toContain('WRONG GOAL')
+  })
+
+  it('injects the matching session checkpoint preamble on resumed continuation', async () => {
+    const projectDir = tmpProjectDir()
+    await writeAutoCheckpoint(projectDir, {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId: 'target-session',
+      updatedAt: Date.now(),
+      goal: 'MATCHING GOAL',
+      pendingTodos: ['finish matching todo'],
+    })
+    const router = new SessionRouter({
+      mode: 'auto',
+      explicitResume: true,
+      resumeSessionId: 'target-session',
+      projectDir,
+    })
+
+    await drain(router.submit('继续'))
+
+    expect(mockState.submitPrompts).toHaveLength(1)
+    expect(mockState.submitPrompts[0]).toContain('MATCHING GOAL')
+    expect(mockState.submitPrompts[0]).toContain('finish matching todo')
   })
 
   it('re-anchors a resumed session when the first prompt is a new requirement', async () => {

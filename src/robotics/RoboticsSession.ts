@@ -452,6 +452,11 @@ export class RoboticsSession implements RoboticsCapabilities {
     await SubAgentBridge.getBridge(this.sessionId)?.dispose()
     this.bridge = new SubAgentBridge(this.sessionId)
 
+    // #6 fix: once the bridge is registered (static map + CampaignEventBus
+    // listener), any later failure in init() must dispose it — the router only
+    // stores this session on a SUCCESSFUL init(), so on a half-failure nothing
+    // else holds a reference to tear the bridge down. Guard the remainder here.
+    try {
     // ── 1. Persistence: try to restore project state ─────────────────────
     //
     // Resume path: when a specific resumeSessionId was supplied, bind to THAT
@@ -723,6 +728,12 @@ export class RoboticsSession implements RoboticsCapabilities {
       resumed: Boolean(existing),
       sessionAgeMs: existing ? Date.now() - existing.lastActiveAt : undefined,
     }
+    } catch (err) {
+      // Half-failed init: dispose the bridge we registered above so its static
+      // map entry and event listener don't leak, then rethrow for the caller.
+      try { await this.bridge?.dispose() } catch { /* best-effort */ }
+      throw err
+    }
   }
 
   /**
@@ -947,7 +958,7 @@ export class RoboticsSession implements RoboticsCapabilities {
     // the tool instrumentation closures otherwise keep pinned for the process
     // lifetime. Without this, a long-lived host that repeatedly opens and closes
     // robotics sessions leaks the full session graph each time. Idempotent.
-    try { this.inner.dispose() } catch { /* best-effort */ }
+    try { await this.inner.dispose() } catch { /* best-effort */ }
   }
 
   /**

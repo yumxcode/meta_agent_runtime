@@ -1,6 +1,7 @@
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
+import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
 
 export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<MetaAgentTool> {
@@ -38,7 +39,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
           : input['workspace_mode'] === 'shared_readonly'
             ? 'shared_readonly'
             : 'shared_write'
-      const MAX_WAIT_MS = maxTurns * 2 * 60 * 1000  // 2 min per turn upper bound
+      const MAX_WAIT_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS + 60_000
 
       try {
         const record = await bridge.spawnSubAgent({

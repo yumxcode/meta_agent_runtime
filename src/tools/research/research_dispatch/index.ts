@@ -13,16 +13,17 @@
  *      file rather than re-RUN the research (soft constraint, no dedupe).
  *
  * Synchronous by design: blocks until the sub-agent reaches terminal state.
- * Wall-clock cap: 10 minutes (RESEARCH_MAX_DURATION_MS).
+ * Wall-clock cap: 30 minutes (RESEARCH_MAX_DURATION_MS).
  * Shared by robotics and agentic modes — only ISubAgentDispatcher is required.
  */
 
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
+import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { ResearchStore } from '../../../research/ResearchStore.js'
 import { dynamicDescription } from '../../util.js'
 
-export const RESEARCH_MAX_DURATION_MS = 600_000 // 10 minutes
+export const RESEARCH_MAX_DURATION_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS
 const POLL_INTERVAL_MS = 2_000
 const DEFAULT_MAX_TURNS = 60
 const CONCLUSION_HANDLE_MAX = 300

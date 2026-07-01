@@ -17,11 +17,13 @@
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import type { MetaAgentTool } from '../core/types.js'
+import { SessionStore } from '../core/SessionStore.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
 import { writeTask, readTask, mutateTask, releaseWriteChain } from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
   TERMINAL_STATUSES,
+  DEFAULT_SUB_AGENT_MAX_DURATION_MS,
   type SubAgentRecord,
   type SubAgentResult,
   type SubAgentProgressState,
@@ -31,12 +33,14 @@ import { createSandboxExecutor } from '../sandbox/index.js'
 import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
+import { makeAutoOrchPauseExternalTool } from '../core/auto_orch/AutoOrchPauseTool.js'
+import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SUMMARY_MAX_CHARS = 8_000
+const SUMMARY_MAX_CHARS = 12_000
 const ERROR_MAX_CHARS   = 500
 
 function truncate(s: string, max: number): string {
@@ -152,6 +156,7 @@ export class SubAgentRunner {
     /** All tools available in the runtime — runner filters by config.allowedTools */
     toolRegistry: Map<string, MetaAgentTool>,
     abortSignal: AbortSignal,
+    private readonly runtimeObserver?: (event: SubAgentRuntimeEvent) => void | Promise<void>,
   ) {
     this.record          = { ...record }   // local copy — mutated as status progresses
     this.toolRegistry    = toolRegistry
@@ -235,6 +240,7 @@ export class SubAgentRunner {
     this.record.status    = 'running'
     this.record.startedAt = Date.now()
     await writeTask(this.record)
+    this._emitRuntime({ type: 'runner_started', taskId: this.taskId })
 
     const cfg = this.record.config
     const startMs = Date.now()
@@ -315,7 +321,17 @@ export class SubAgentRunner {
     // chatty the run was. Injected on top of the resolved tools so it never masks
     // the "no tools resolved" guard above.
     const returnResultTool = makeReturnResultTool(r => { this._returnedResult = r })
-    const sessionTools = [...tools, returnResultTool]
+    const autoOrchPauseTool = cfg.autoOrch?.resumable
+      ? makeAutoOrchPauseExternalTool(payload => {
+          this._returnedResult = {
+            summary: `Paused auto_orch sub-agent: ${payload.reason}`,
+            data: { auto_orch_pause: payload },
+          }
+        })
+      : null
+    const sessionTools = autoOrchPauseTool
+      ? [...tools, returnResultTool, autoOrchPauseTool]
+      : [...tools, returnResultTool]
 
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
@@ -333,14 +349,20 @@ export class SubAgentRunner {
       // permission policy + bind its jail root. Absent for non-auto parents.
       ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
       ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
+      ...(cfg.autoOrch?.resumable && cfg.autoOrch.agentSessionId !== undefined
+        ? { sessionId: cfg.autoOrch.agentSessionId }
+        : {}),
+      ...(cfg.autoOrch?.resumable && cfg.initialMessages !== undefined
+        ? { initialMessages: cfg.initialMessages }
+        : {}),
     }
 
     this.session = new MetaAgentSession(sessionConfig)
 
-    // Wall-clock cap (default 5 min): force-stop a sub-agent that runs too long
+    // Wall-clock cap (default 30 min): force-stop a sub-agent that runs too long
     // — e.g. an inner web_fetch that never returns. Interrupting the session
     // ends the submit() generator; _timedOut steers terminal handling below.
-    const maxDurationMs = cfg.maxDurationMs ?? 300_000
+    const maxDurationMs = cfg.maxDurationMs ?? DEFAULT_SUB_AGENT_MAX_DURATION_MS
     durationTimer = maxDurationMs > 0
       ? setTimeout(() => {
           this._timedOut = true
@@ -370,8 +392,10 @@ export class SubAgentRunner {
 
       // Run the agentic loop — consume the generator
       const gen = this.session.submit(cfg.taskDescription)
+      this._emitRuntime({ type: 'session_submit_started', taskId: this.taskId })
 
       for await (const event of gen) {
+        this._emitRuntime({ type: 'session_event', taskId: this.taskId, event })
         // Accumulate text
         if (event.type === 'text') {
           lastText += event.text
@@ -483,6 +507,7 @@ export class SubAgentRunner {
       if (durationTimer) clearTimeout(durationTimer)
       this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
+      await this._persistAutoOrchSessionHistory().catch(() => undefined)
       await this.session?.dispose().catch(() => undefined)
       // Always release the sandbox handle, even if _writeTerminal or the loop
       // threw an unexpected error.  destroy() is a no-op for Noop/macOS handles
@@ -572,6 +597,26 @@ export class SubAgentRunner {
       case 'error_during_execution': return 'Error during execution'
       default: return `Stopped: ${subtype}`
     }
+  }
+
+  private async _persistAutoOrchSessionHistory(): Promise<void> {
+    const autoOrch = this.record.config.autoOrch
+    if (!autoOrch?.resumable || !this.session) return
+    const sessionId = autoOrch.agentSessionId ?? this.session.getSessionId()
+    const messages = this.session.getMessages()
+    await SessionStore.replace(sessionId, {
+      mode: 'auto_orch_subagent',
+      startTime: this.record.createdAt,
+      lastActivity: Date.now(),
+      messageCount: messages.length,
+      firstPrompt: this.record.config.taskDescription.slice(0, 80),
+      workspace: this.record.config.projectDir,
+    }, messages)
+  }
+
+  private _emitRuntime(event: SubAgentRuntimeEvent): void {
+    if (!this.runtimeObserver) return
+    void Promise.resolve(this.runtimeObserver(event)).catch(() => undefined)
   }
 
   /**
