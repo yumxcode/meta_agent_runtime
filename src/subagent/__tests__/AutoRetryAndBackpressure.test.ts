@@ -3,6 +3,7 @@ import {
   mergeOverflowNotifications,
   retryBackoffMs,
   shouldRetrySubAgent,
+  shouldRetrySubAgentConfig,
 } from '../SubAgentBridge.js'
 
 describe('mergeOverflowNotifications', () => {
@@ -32,6 +33,17 @@ describe('retry policy helpers', () => {
     expect(shouldRetrySubAgent(2, 2, true)).toBe(false) // exhausted
     expect(shouldRetrySubAgent(0, 2, false)).toBe(false) // not armed
     expect(shouldRetrySubAgent(0, 0, true)).toBe(false) // retries disabled
+  })
+
+  it('shouldRetrySubAgentConfig: never bridge-retries auto_orch graph tasks', () => {
+    expect(shouldRetrySubAgentConfig({
+      autoOrch: {
+        resumable: true,
+        orchestrationTaskId: 'orch-1',
+        nodeId: 'choose_direction',
+      },
+    }, 0, 2, true)).toBe(false)
+    expect(shouldRetrySubAgentConfig({}, 0, 2, true)).toBe(true)
   })
 
   it('retryBackoffMs grows exponentially and caps at 30s', () => {

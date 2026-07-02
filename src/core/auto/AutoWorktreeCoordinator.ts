@@ -79,6 +79,16 @@ export interface AutoWorktreeReconcileResult {
   orphansRemoved: string[]
 }
 
+export type AutoWorktreeCleanupStrategy = 'preserve' | 'safe' | 'aggressive'
+
+export interface AutoWorktreeCleanupResult {
+  strategy: AutoWorktreeCleanupStrategy
+  reconciled?: AutoWorktreeReconcileResult
+  removed: string[]
+  preserved: Array<{ taskId: string; phase: AutoWorktreePhase; reason: string }>
+  errors: Array<{ taskId: string; error: string }>
+}
+
 export class AutoWorktreeCoordinator {
   private readonly gwm: GitWorkspaceManager
   private readonly projectDir: string
@@ -409,6 +419,65 @@ export class AutoWorktreeCoordinator {
     for (const id of ids) await this.discard(id).catch(() => undefined)
   }
 
+  async cleanup(strategy: AutoWorktreeCleanupStrategy = 'safe'): Promise<AutoWorktreeCleanupResult> {
+    if (strategy === 'preserve') {
+      const reconciled = await this.reconcile()
+      return this._exclusive(async () => ({
+        strategy,
+        reconciled,
+        removed: [],
+        preserved: [...this.records.values()].map(record => ({
+          taskId: record.taskId,
+          phase: record.phase,
+          reason: 'preserve strategy',
+        })),
+        errors: [],
+      }))
+    }
+
+    const reconciled = strategy === 'safe' ? await this.reconcile() : undefined
+    return this._exclusive(async () => {
+      const result: AutoWorktreeCleanupResult = {
+        strategy,
+        reconciled,
+        removed: [],
+        preserved: [],
+        errors: [],
+      }
+
+      for (const record of [...this.records.values()]) {
+        if (strategy === 'safe') {
+          const decision = await this._safeCleanupDecision(record)
+          if (!decision.remove) {
+            result.preserved.push({
+              taskId: record.taskId,
+              phase: record.phase,
+              reason: decision.reason,
+            })
+            continue
+          }
+        }
+
+        if (await this._removeWorktreeAndBranch(record)) {
+          this.records.delete(record.taskId)
+          result.removed.push(record.taskId)
+        } else {
+          result.errors.push({
+            taskId: record.taskId,
+            error: 'Could not remove worktree or branch',
+          })
+          await this._updateRecord(record, {
+            phase: 'failed',
+            error: 'Could not remove worktree or branch during cleanup',
+          })
+        }
+      }
+
+      await this._requireRegistryPersist()
+      return result
+    })
+  }
+
   async reconcile(): Promise<AutoWorktreeReconcileResult> {
     return this._exclusive(async () => {
       const result: AutoWorktreeReconcileResult = {
@@ -524,6 +593,48 @@ export class AutoWorktreeCoordinator {
     } catch {
       return false
     }
+  }
+
+  private async _safeCleanupDecision(
+    record: AutoWorktreeRecord,
+  ): Promise<{ remove: true; reason: string } | { remove: false; reason: string }> {
+    switch (record.phase) {
+      case 'merged':
+        return { remove: true, reason: 'already merged' }
+      case 'awaiting_merge': {
+        if (record.finalizedCommit) return { remove: false, reason: 'finalized commit awaits merge' }
+        const hasChanges = await this._recordHasRecoverableChanges(record).catch(() => true)
+        return hasChanges
+          ? { remove: false, reason: 'unmerged changes remain' }
+          : { remove: true, reason: 'awaiting merge with no changes' }
+      }
+      case 'failed': {
+        const hasChanges = await this._recordHasRecoverableChanges(record).catch(() => true)
+        return hasChanges
+          ? { remove: false, reason: 'failed worktree still has recoverable changes' }
+          : { remove: true, reason: 'failed worktree has no recoverable changes' }
+      }
+      case 'allocated':
+      case 'running':
+      case 'finalizing':
+      case 'merging':
+      case 'conflicted':
+        return { remove: false, reason: `${record.phase} is resumable or in-flight` }
+      default:
+        return { remove: false, reason: 'unknown phase' }
+    }
+  }
+
+  private async _recordHasRecoverableChanges(record: AutoWorktreeRecord): Promise<boolean> {
+    if (!existsSync(record.worktreePath)) return Boolean(record.finalizedCommit)
+    const sourcePaths = ['--', '.', ':(exclude).meta-agent/**']
+    const status = await this._gitIn(record.worktreePath, ['status', '--porcelain', ...sourcePaths])
+    if (status.trim()) return true
+    const commitCount = Number(await this._gitIn(
+      record.worktreePath,
+      ['rev-list', '--count', `${record.forkPoint}..HEAD`],
+    ))
+    return commitCount > 0
   }
 
   private async _dropStashByCommit(commit: string): Promise<void> {

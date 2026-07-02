@@ -19,6 +19,7 @@ import type { PermissionConfig } from '../kernel/permissions/PermissionPolicy.js
 import type { AutoGateFailurePolicy, ThinkingConfig } from '../kernel/index.js'
 import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 import type { AgentMode, OutputStyle } from './dynamicPrompt.js'
+import type { AutoWorktreeCleanupStrategy } from './auto/AutoWorktreeCoordinator.js'
 import { loadModelConfig } from './config/ConfigService.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
 import type { Capabilities, Protocol } from '../providers/registry.js'
@@ -305,6 +306,20 @@ export interface MetaAgentConfig {
     maxRounds?: number
   }
 
+  /** Saved auto_orch plan id/version to load instead of planning from scratch. */
+  autoOrchPlanRef?: string
+
+  /** Optional instruction for revising autoOrchPlanRef before execution. */
+  autoOrchPlanRevision?: string
+
+  /**
+   * Cleanup policy for auto-series isolated-write worktrees.
+   * - preserve: keep tracked worktrees for manual recovery/resume.
+   * - safe: remove only no-change/empty failed worktrees and orphan runtime dirs.
+   * - aggressive: discard every tracked auto worktree.
+   */
+  autoWorktreeCleanup?: AutoWorktreeCleanupStrategy
+
   /**
    * auto_orch graph execution observer. Intended for CLIs/UIs to render live
    * plan/node/edge/pause/resume progress. Best-effort only: observer failures do
@@ -427,6 +442,9 @@ export type ResolvedConfig = Required<
     | 'planModeRef'
     | 'askUser'
     | 'autoOrchPlannerReview'
+    | 'autoOrchPlanRef'
+    | 'autoOrchPlanRevision'
+    | 'autoWorktreeCleanup'
     | 'autoOrchObserver'
     | 'permissionConfig'
     | 'promptMode'
@@ -460,6 +478,9 @@ export type ResolvedConfig = Required<
   planModeRef?: MetaAgentConfig['planModeRef']
   askUser?: MetaAgentConfig['askUser']
   autoOrchPlannerReview?: MetaAgentConfig['autoOrchPlannerReview']
+  autoOrchPlanRef?: MetaAgentConfig['autoOrchPlanRef']
+  autoOrchPlanRevision?: MetaAgentConfig['autoOrchPlanRevision']
+  autoWorktreeCleanup?: MetaAgentConfig['autoWorktreeCleanup']
   autoOrchObserver?: MetaAgentConfig['autoOrchObserver']
   permissionConfig?: PermissionConfig
   /** Default agent mode for prompt sections (absent → 'agentic'). */
@@ -578,6 +599,9 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     planModeRef:     config.planModeRef,
     askUser:         config.askUser,
     autoOrchPlannerReview: config.autoOrchPlannerReview,
+    autoOrchPlanRef: config.autoOrchPlanRef,
+    autoOrchPlanRevision: config.autoOrchPlanRevision,
+    autoWorktreeCleanup: config.autoWorktreeCleanup,
     autoOrchObserver: config.autoOrchObserver,
     permissionConfig: config.permissionConfig,
     promptMode:      config.promptMode,

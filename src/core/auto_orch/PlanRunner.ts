@@ -248,6 +248,9 @@ export class PlanRunner {
           label: verdict.label,
           action: verdict.action,
         })
+        if (!nextId && isTerminalError(node, verdict)) {
+          return finalize('failed', verdict.note ?? `terminal error node reached: ${fromId}`)
+        }
         currentId = nextId
       }
 
@@ -296,4 +299,9 @@ function numeric(v: unknown): number {
 
 function objectRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === 'object' ? v as Record<string, unknown> : undefined
+}
+
+function isTerminalError(node: OrchNode, verdict: OrchVerdict): boolean {
+  if (verdict.label === 'error') return true
+  return /(^|[_-])error([_-]|$)|error_writer|error_stop/.test(node.id)
 }

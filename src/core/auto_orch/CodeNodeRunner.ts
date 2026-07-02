@@ -45,6 +45,7 @@ async function atomicWrite(path, contents) {
 }
 
 const api = {
+  nowIso: payload.nowIso,
   state: {
     async readJson(path) {
       assertCap('state.read')
@@ -113,6 +114,7 @@ export class CodeNodeRunner {
         sourceHash: node.sourceHash,
         input: node.input ?? {},
         capabilities: node.capabilities ?? [],
+        nowIso: new Date().toISOString(),
       }
       const raw = await runWrapper(payload, {
         signal,

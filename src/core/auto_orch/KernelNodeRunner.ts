@@ -38,9 +38,14 @@ export { parseRoleVerdict } from './reviewer.js'
 // hollow, fall back to a standard read+write+shell toolset. Planner-emitted
 // nodes always carry their own allowedTools; this only catches omissions.
 const DEFAULT_EXECUTOR_TOOLS = ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash']
+const DEFAULT_EXECUTOR_MAX_TURNS = 30
 const AUTO_ORCH_PAUSE_HINT = `\
 如果你启动或发现了需要等待外部结果的长任务（例如训练任务、远程评测、批处理实验），不要阻塞等待。
 请调用 auto_orch_pause_external，提供 externalRunId、建议的 nextCheckAfterMs 和恢复时需要遵循的 resumeInstruction。`
+const EXECUTOR_RESULT_CONTRACT = `\
+你是 auto_orch 图中的 executor 节点。完成时必须调用 return_result，并在 data 中写入：
+{"label":"ok"|"error","note":"一句话说明"}
+只有当节点任务真实完成且下游可继续时才返回 ok；缺少必要输入、状态文件不合法、或无法继续时返回 error。`
 
 export interface KernelNodeRunnerOptions {
   /** Max wall-clock to wait for a single node's sub-agent. Default 24 min. */
@@ -116,9 +121,9 @@ export class KernelNodeRunner implements NodeRunner {
       this.dispatcher,
       {
         taskDescription,
-        systemPrompt: node.systemPrompt,
+        systemPrompt: [node.systemPrompt, EXECUTOR_RESULT_CONTRACT].filter(Boolean).join('\n\n'),
         allowedTools: node.allowedTools && node.allowedTools.length > 0 ? node.allowedTools : DEFAULT_EXECUTOR_TOOLS,
-        maxTurns: node.maxTurns ?? 12,
+        maxTurns: node.maxTurns ?? DEFAULT_EXECUTOR_MAX_TURNS,
         maxBudgetUsd: node.maxBudgetUsd ?? 0.5,
         requireHumanApproval: false,
         useEventDriven: false,
@@ -172,7 +177,11 @@ export class KernelNodeRunner implements NodeRunner {
       }
     }
     if (rec?.status === 'completed' && rec.result?.success) {
-      return { action: 'branch', label: 'ok', note: truncate(rec.result.summary), data: { costUsd: cost } }
+      const parsed = parseExecutorVerdict(rec.result.output, rec.result.summary)
+      if (parsed?.label === 'error') {
+        return { action: 'branch', label: 'error', note: parsed.note ?? truncate(rec.result.summary), data: { costUsd: cost } }
+      }
+      return { action: 'branch', label: 'ok', note: parsed?.note ?? truncate(rec.result.summary), data: { costUsd: cost } }
     }
     return {
       action: 'branch',
@@ -202,4 +211,51 @@ export class KernelNodeRunner implements NodeRunner {
 
 function truncate(s: string, n = 500): string {
   return s.length > n ? s.slice(0, n) + '…' : s
+}
+
+function parseExecutorVerdict(
+  output: unknown,
+  summary: string,
+): { label: 'ok' | 'error'; note?: string } | null {
+  const fromObject = parseExecutorVerdictObject(output)
+  if (fromObject) return fromObject
+
+  const fences = [...summary.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(m => m[1] ?? '')
+  const candidates = fences.length ? [...fences] : []
+  const lastBrace = summary.lastIndexOf('{')
+  if (lastBrace !== -1) candidates.push(summary.slice(lastBrace))
+  for (let i = candidates.length - 1; i >= 0; i--) {
+    try {
+      const parsed = JSON.parse(candidates[i]!.trim())
+      const verdict = parseExecutorVerdictObject(parsed)
+      if (verdict) return verdict
+    } catch {
+      // next candidate
+    }
+  }
+
+  if (/^\s*(返回\s*)?error(?:[。:：\s]|$)/i.test(summary)) {
+    return { label: 'error', note: truncate(summary) }
+  }
+  if (/^\s*(返回\s*)?ok(?:[。:：\s]|$)/i.test(summary)) {
+    return { label: 'ok', note: truncate(summary) }
+  }
+  return null
+}
+
+function parseExecutorVerdictObject(value: unknown): { label: 'ok' | 'error'; note?: string } | null {
+  if (!value || typeof value !== 'object') return null
+  const obj = value as Record<string, unknown>
+  const nested = parseExecutorVerdictObject(obj['verdict'])
+  if (nested) return nested
+  const raw = obj['label'] ?? obj['status']
+  if (raw !== 'ok' && raw !== 'error') return null
+  return {
+    label: raw,
+    note: typeof obj['note'] === 'string'
+      ? obj['note']
+      : typeof obj['summary'] === 'string'
+        ? obj['summary']
+        : undefined,
+  }
 }

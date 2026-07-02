@@ -92,4 +92,17 @@ describe('resolveConfig — model config file', () => {
     expect(r.model).toBe('glm-4.7')          // from file
     expect(r.fallbackModel).toBe('cli-fallback') // from caller (file omitted it)
   })
+
+  it('preserves auto_orch saved-plan options', () => {
+    process.env['ZHIPU_API_KEY'] = 'zk'
+    setModelConfigPathsForTest([path])
+    const r = resolveConfig({
+      autoOrchPlanRef: 'latest',
+      autoOrchPlanRevision: 'add review node',
+      autoWorktreeCleanup: 'safe',
+    })
+    expect(r.autoOrchPlanRef).toBe('latest')
+    expect(r.autoOrchPlanRevision).toBe('add review node')
+    expect(r.autoWorktreeCleanup).toBe('safe')
+  })
 })

@@ -81,6 +81,17 @@ export {
   writeCodeNodeArtifact,
   readCodeNodeSource,
 } from './CodeNodeStore.js'
+export type {
+  AutoOrchStoredPlanRef,
+  AutoOrchPlanManifest,
+  AutoOrchLoadedPlan,
+} from './PlanStore.js'
+export {
+  saveApprovedAutoOrchPlan,
+  saveMaterializedAutoOrchPlan,
+  appendAutoOrchPlanRun,
+  loadAutoOrchPlan,
+} from './PlanStore.js'
 export type { CodeNodeMaterializeDeps, CodeNodeMaterializeResult } from './CodeNodeAuthor.js'
 export { materializeCodeNodes, reviewCodeNodeSource } from './CodeNodeAuthor.js'
 export type { CodeNodeRunnerOptions } from './CodeNodeRunner.js'

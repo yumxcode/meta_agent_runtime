@@ -22,6 +22,7 @@ const CODE_AUTHOR_SYSTEM = `\
 - source 必须导出 async function main(input, api) 或 function main(input, api)。
 - 不要 import/require 任何模块；不要访问 process、globalThis、eval、Function、网络、shell、计时器或随机数。
 - 所有状态读写只能通过 api.state.readJson/writeJson/appendJsonl/readText/writeText。
+- 如需当前 ISO 时间戳，只能读取 api.nowIso 字符串；禁止使用 Date.now() 或 new Date()。
 - 返回值必须是 OrchVerdict JSON 对象，如 {"action":"branch","label":"healthy","data":{...}}。
 - 遇到输入缺失或状态不合法，返回 {"action":"branch","label":"error","note":"..."}，不要抛未处理异常。
 `
@@ -70,25 +71,30 @@ export async function materializeCodeNodes(
       nodes.push(node)
       continue
     }
+    let nextNode = node
     try {
-      const authored = await authorCodeNode(node, deps, signal)
-      const reviewErrors = reviewCodeNodeSource(authored.source)
-      if (reviewErrors.length) {
-        errors.push(`code node[${node.id}] failed review: ${reviewErrors.join('; ')}`)
-        nodes.push(node)
-        continue
+      let previousReviewErrors: string[] = []
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        const authored = await authorCodeNode(node, deps, signal, previousReviewErrors)
+        const reviewErrors = reviewCodeNodeSource(authored.source)
+        if (reviewErrors.length) {
+          previousReviewErrors = reviewErrors
+          if (attempt === 2) errors.push(`code node[${node.id}] failed review: ${reviewErrors.join('; ')}`)
+          continue
+        }
+        const artifact = await writeCodeNodeArtifact(deps.projectDir, node.id, authored.source, authored.note)
+        nextNode = {
+          ...node,
+          codeRef: artifact.codeRef,
+          sourceHash: artifact.sourceHash,
+        }
+        materialized++
+        break
       }
-      const artifact = await writeCodeNodeArtifact(deps.projectDir, node.id, authored.source, authored.note)
-      nodes.push({
-        ...node,
-        codeRef: artifact.codeRef,
-        sourceHash: artifact.sourceHash,
-      })
-      materialized++
     } catch (err) {
       errors.push(`code node[${node.id}] materialization failed: ${err instanceof Error ? err.message : String(err)}`)
-      nodes.push(node)
     }
+    nodes.push(nextNode)
   }
 
   return { plan: { ...plan, nodes }, materialized, errors }
@@ -98,11 +104,12 @@ async function authorCodeNode(
   node: OrchNode,
   deps: CodeNodeMaterializeDeps,
   signal: AbortSignal,
+  previousReviewErrors: string[] = [],
 ): Promise<{ source: string; note?: string }> {
   const rec = await spawnAndWait(
     deps.dispatcher,
     {
-      taskDescription: buildAuthorTask(node),
+      taskDescription: buildAuthorTask(node, previousReviewErrors),
       systemPrompt: CODE_AUTHOR_SYSTEM,
       allowedTools: [],
       maxTurns: 8,
@@ -124,8 +131,8 @@ async function authorCodeNode(
   return parsed
 }
 
-function buildAuthorTask(node: OrchNode): string {
-  return [
+function buildAuthorTask(node: OrchNode, previousReviewErrors: string[] = []): string {
+  const lines = [
     '为下面的 auto_orch code 节点生成确定性 JavaScript 源码。',
     '',
     '【节点 id】',
@@ -142,7 +149,17 @@ function buildAuthorTask(node: OrchNode): string {
     '',
     '【capabilities】',
     JSON.stringify(node.capabilities ?? [], null, 2),
-  ].join('\n')
+  ]
+  if (previousReviewErrors.length) {
+    lines.push(
+      '',
+      '【上一版源码未通过安全审查】',
+      previousReviewErrors.join('; '),
+      '',
+      '请重新生成完整 source。若需要写 updated_at/日志时间戳，使用 api.nowIso，不要使用 Date.now() 或 new Date()。',
+    )
+  }
+  return lines.join('\n')
 }
 
 function parseAuthorOutput(text: string): { source: string; note?: string } | null {

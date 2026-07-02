@@ -270,6 +270,37 @@ describe('AutoWorktreeCoordinator', () => {
     expect(coord.activeTasks()).toEqual([])
   })
 
+  it('safe cleanup removes no-change finalized worktrees and preserves unmerged commits', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const empty = await coord.allocate('task-empty')
+    const changed = await coord.allocate('task-changed')
+    writeFileSync(join(changed!.worktreePath, 'feature.txt'), 'keep me\n')
+
+    await coord.finalize('task-empty')
+    await coord.finalize('task-changed')
+
+    const result = await coord.cleanup('safe')
+    expect(result.removed).toContain('task-empty')
+    expect(result.preserved.map(p => p.taskId)).toContain('task-changed')
+    expect(existsSync(empty!.worktreePath)).toBe(false)
+    expect(existsSync(changed!.worktreePath)).toBe(true)
+    expect(coord.activeTasks()).toEqual(['task-changed'])
+  })
+
+  it('aggressive cleanup discards tracked worktrees even when commits await merge', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const handle = await coord.allocate('task-changed')
+    writeFileSync(join(handle!.worktreePath, 'feature.txt'), 'discard me\n')
+    await coord.finalize('task-changed')
+
+    const result = await coord.cleanup('aggressive')
+    expect(result.removed).toContain('task-changed')
+    expect(coord.activeTasks()).toEqual([])
+    expect(existsSync(handle!.worktreePath)).toBe(false)
+  })
+
   it('cleanupAll is a no-op when nothing is tracked', async () => {
     initRepo(repo)
     const coord = new AutoWorktreeCoordinator(repo)

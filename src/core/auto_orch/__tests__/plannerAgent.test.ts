@@ -9,6 +9,9 @@
  *   • parseOrchPlan + singleExecutorPlan behave as specified.
  */
 import { describe, it, expect } from 'vitest'
+import { mkdtemp } from 'fs/promises'
+import { join } from 'path'
+import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentRecord } from '../../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../../subagent/types.js'
@@ -18,6 +21,7 @@ import {
   singleExecutorPlan,
 } from '../PlannerAgent.js'
 import { validatePlan } from '../LoopIR.js'
+import { loadAutoOrchPlan, saveApprovedAutoOrchPlan, saveMaterializedAutoOrchPlan } from '../PlanStore.js'
 
 /** A dispatcher whose spawned agent "completes" with a fixed summary string. */
 function stubDispatcher(summary: string | null): ISubAgentDispatcher {
@@ -332,6 +336,63 @@ describe('makeAutoOrchPlanner', () => {
     })(signal())
     expect(out.source).toBe('planner')
     expect(out.plan.id).toBe('p1')
+    expect(out.approvedByUser).toBe(true)
+  })
+
+  it('loads a saved plan by ref without spawning a planner', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-plan-load-'))
+    const plan = parseOrchPlan(VALID_PLAN_JSON)!
+    await saveApprovedAutoOrchPlan(projectDir, {
+      goal: 'g',
+      plan,
+      source: 'planner',
+      approvedByUser: true,
+    })
+    let spawns = 0
+    const out = await makeAutoOrchPlanner({
+      dispatcher: {
+        async spawnSubAgent() { spawns++; throw new Error('planner should not spawn') },
+        async getStatus() { return null },
+        async cancelTask() { return true },
+      },
+      projectDir,
+      getGoal: () => 'g',
+      planRef: 'p1',
+    })(signal())
+
+    expect(spawns).toBe(0)
+    expect(out.source).toBe('saved')
+    expect(out.plan.id).toBe('p1')
+    expect(out.seedPlanRef).toMatchObject({ planId: 'p1', version: 1 })
+  })
+
+  it('loads the approved graph before a prior materialized graph', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-approved-first-'))
+    const approved = parseOrchPlan(VALID_PLAN_JSON)!
+    const materialized: typeof approved = {
+      ...approved,
+      id: 'p1',
+      entry: 'mat',
+      nodes: [
+        {
+          id: 'mat',
+          kind: 'executor',
+          task: 'materialized task',
+          labels: ['ok'],
+        },
+      ],
+      edges: [],
+    }
+    const ref = await saveApprovedAutoOrchPlan(projectDir, {
+      goal: 'g',
+      plan: approved,
+      source: 'planner',
+      approvedByUser: true,
+    })
+    await saveMaterializedAutoOrchPlan(projectDir, ref, materialized)
+
+    const loaded = await loadAutoOrchPlan(projectDir, 'p1')
+    expect(loaded?.plan.entry).toBe(approved.entry)
   })
 
   it('planner review can request a revision and feed the feedback into the next planner attempt', async () => {

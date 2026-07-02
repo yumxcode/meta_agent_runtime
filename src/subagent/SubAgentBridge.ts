@@ -112,6 +112,17 @@ export function shouldRetrySubAgent(attempt: number, limit: number, armed: boole
   return armed && limit > 0 && attempt < limit
 }
 
+/** auto_orch graph edges own retry/error routing; bridge-level retries would leak background tasks. */
+export function shouldRetrySubAgentConfig(
+  config: Pick<SubAgentConfig, 'autoOrch'> | undefined,
+  attempt: number,
+  limit: number,
+  armed: boolean,
+): boolean {
+  if (config?.autoOrch) return false
+  return shouldRetrySubAgent(attempt, limit, armed)
+}
+
 function envInt(name: string, fallback: number, min: number, max: number): number {
   return readIntEnvOr(name, fallback, min, max)
 }
@@ -834,7 +845,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     if (this.destroyed) return
     const rec = await readTask(taskId).catch(() => null)
     const attempt = rec?.config.retryCount ?? 0
-    if (!rec || !shouldRetrySubAgent(attempt, this._autoRetryLimit, this._autonomyJail !== null)) {
+    if (!rec || !shouldRetrySubAgentConfig(rec.config, attempt, this._autoRetryLimit, this._autonomyJail !== null)) {
       surfaceFailure()
       return
     }

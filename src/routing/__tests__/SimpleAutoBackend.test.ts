@@ -24,6 +24,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 const mockState = vi.hoisted(() => ({
   // Constructor config captured from each MetaAgentSession instantiation.
   configs: [] as Array<Record<string, unknown>>,
+  autonomyJailCalls: [] as Array<{ jail: unknown; opts: unknown }>,
 }))
 
 vi.mock('../../core/MetaAgentSession.js', () => ({
@@ -43,7 +44,9 @@ vi.mock('../../subagent/SubAgentBridge.js', () => ({
   SubAgentBridge: class {
     constructor(_sessionId: string, _opts?: unknown) {}
     setToolRegistry(): void {}
-    setAutonomyJail(): void {}
+    setAutonomyJail(jail: unknown, opts?: unknown): void {
+      mockState.autonomyJailCalls.push({ jail, opts })
+    }
     setWorktreeCoordinator(): void {}
     setSubAgentToolOverrides(): void {}
     getWorktreeCoordinator(): unknown { return null }
@@ -81,6 +84,7 @@ async function buildBackend(
 describe('simple_auto backend wiring', () => {
   beforeEach(() => {
     mockState.configs.length = 0
+    mockState.autonomyJailCalls.length = 0
   })
 
   afterEach(() => {
@@ -148,6 +152,7 @@ describe('simple_auto backend wiring', () => {
     expect(backend.orchController).not.toBeNull()
     expect(backend.orchScheduler).not.toBeNull()
     expect(config['phaseHooks']).toBeTypeOf('function')
+    expect(mockState.autonomyJailCalls.at(-1)?.opts).toMatchObject({ retryLimit: 0 })
 
     await backend.session.dispose()
   })

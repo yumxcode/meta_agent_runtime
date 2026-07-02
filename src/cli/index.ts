@@ -21,6 +21,7 @@
  *   -j, --json              Output raw JSON events (for piping)
  *   -y, --yes               Auto-approve sensitive tools in trusted scripts
  *       --auto-orch-review-plan  Review auto_orch planner graph before execution
+ *       --auto-worktree-cleanup <preserve|safe|aggressive> Auto worktree cleanup policy
  *   -v, --version           Show version
  *   -h, --help              Show help
  */
@@ -35,6 +36,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { isAutonomousMode } from '../core/modes.js'
+import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
@@ -226,6 +228,9 @@ ${bold('OPTIONS')}
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
       --show-thinking   Show model thinking deltas in the terminal
       --auto-orch-review-plan  Planner-only interactive review before auto_orch executes
+      --auto-orch-plan <id[@vN]|latest>  Reuse a saved auto_orch plan
+      --auto-orch-revise <text>  Revise the saved auto_orch plan before execution
+      --auto-worktree-cleanup <preserve|safe|aggressive>  Auto worktree cleanup policy
   -j, --json            Output raw JSON events
   -v, --version         Print version
   -h, --help            Show this help
@@ -349,6 +354,9 @@ interface CliOptions {
   showThinking: boolean           // --show-thinking: stream thinking deltas to terminal
   yes: boolean                    // --yes: auto-approve sensitive tool calls
   autoOrchReviewPlan: boolean     // --auto-orch-review-plan: review planner graph before execution
+  autoOrchPlan: string | undefined
+  autoOrchRevise: string | undefined
+  autoWorktreeCleanup: AutoWorktreeCleanupStrategy | undefined
   prompt: string | null
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
@@ -376,6 +384,9 @@ function parseCliArgs(): CliOptions {
         debug:        { type: 'boolean', short: 'd', default: false },
         'show-thinking': { type: 'boolean', default: false },
         'auto-orch-review-plan': { type: 'boolean', default: false },
+        'auto-orch-plan': { type: 'string' },
+        'auto-orch-revise': { type: 'string' },
+        'auto-worktree-cleanup': { type: 'string' },
         json:         { type: 'boolean', short: 'j', default: false },
         version:      { type: 'boolean', short: 'v', default: false },
         help:         { type: 'boolean', short: 'h', default: false },
@@ -428,6 +439,15 @@ function parseCliArgs(): CliOptions {
     }
   }
   const rawMaxTurns = parsed.values['max-turns'] as string | undefined
+  if (parsed.values['auto-orch-revise'] && !parsed.values['auto-orch-plan']) {
+    console.error(red('Error: --auto-orch-revise requires --auto-orch-plan.'))
+    process.exit(1)
+  }
+  const rawCleanup = parsed.values['auto-worktree-cleanup'] as string | undefined
+  if (rawCleanup && !['preserve', 'safe', 'aggressive'].includes(rawCleanup)) {
+    console.error(red(`Error: --auto-worktree-cleanup must be preserve, safe, or aggressive (got "${rawCleanup}")`))
+    process.exit(1)
+  }
   let maxTurns: number | undefined
   if (rawMaxTurns) {
     if (rawMaxTurns.toLowerCase() === 'infinity' || rawMaxTurns === '∞') {
@@ -455,6 +475,9 @@ function parseCliArgs(): CliOptions {
     showThinking: parsed.values['show-thinking'] as boolean,
     yes:        parsed.values['yes']      as boolean,
     autoOrchReviewPlan: parsed.values['auto-orch-review-plan'] as boolean,
+    autoOrchPlan: parsed.values['auto-orch-plan'] as string | undefined,
+    autoOrchRevise: parsed.values['auto-orch-revise'] as string | undefined,
+    autoWorktreeCleanup: rawCleanup as AutoWorktreeCleanupStrategy | undefined,
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
     resume:     parsed.values['resume']   as string | undefined,
@@ -1002,7 +1025,7 @@ function formatAutoOrchEvent(event: AutoOrchEvent): string {
       return `[auto_orch] planner ${event.eventType}${err}${preview}`
     }
     case 'planner_completed':
-      return `[auto_orch] planner ${event.source}${event.note ? `: ${sanitizeTerminalPreview(event.note, 120)}` : ''}`
+      return `[auto_orch] planner completed: source=${event.source}${event.note ? `, ${sanitizeTerminalPreview(event.note, 120)}` : ''}`
     case 'plan_started':
       return `[auto_orch] plan started: entry=${event.entry}, nodes=${event.nodeCount}, edges=${event.edgeCount}`
     case 'node_started':
@@ -1095,7 +1118,10 @@ function makeRouter(
   if (opts.debug) cfg.debugMode = true
   const explicitAutoOrch = opts.mode === 'auto_orch'
   const interactiveAutoOrch = explicitAutoOrch && !opts.json && isTTY
-  if (opts.autoOrchReviewPlan || (interactiveAutoOrch && !opts.yes)) {
+  if (opts.autoOrchPlan) cfg.autoOrchPlanRef = opts.autoOrchPlan
+  if (opts.autoOrchRevise) cfg.autoOrchPlanRevision = opts.autoOrchRevise
+  if (opts.autoWorktreeCleanup) cfg.autoWorktreeCleanup = opts.autoWorktreeCleanup
+  if (opts.autoOrchReviewPlan || !!opts.autoOrchRevise || (interactiveAutoOrch && !opts.yes)) {
     cfg.autoOrchPlannerReview = { enabled: true, maxRounds: 3 }
   }
   if (interactiveAutoOrch) {

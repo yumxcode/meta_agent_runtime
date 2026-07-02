@@ -45,7 +45,10 @@ import {
 import { getTodosForSession } from '../tools/ui/todo_write/index.js'
 import { getProgressNoteForSession } from '../tools/ui/progress_note/index.js'
 import { getArtifactsForSession } from '../tools/ui/artifacts_register/index.js'
-import { AutoWorktreeCoordinator } from '../core/auto/AutoWorktreeCoordinator.js'
+import {
+  AutoWorktreeCoordinator,
+  type AutoWorktreeCleanupStrategy,
+} from '../core/auto/AutoWorktreeCoordinator.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { makeAutoWorktreeTools } from '../subagent/tools/auto_worktree.js'
 import { makeSubAgentTools } from '../subagent/tools/index.js'
@@ -90,16 +93,18 @@ export interface AgenticBackend {
  */
 export async function createAgenticBackend(input: AgenticBackendInput): Promise<AgenticBackend> {
   const { baseConfig, projectDir, resumeSessionId, explicitResume, overrides, getGoal } = input
-  const isAuto = overrides?.autonomy !== undefined
-  // auto_orch shares auto's autonomy jail (isAuto stays true) and ADDS the
-  // orchestration layer. Its review semantics come from explicit graph nodes,
-  // not from auto's implicit outer-loop gates.
+  const hasAutonomyJail = overrides?.autonomy !== undefined
+  // auto_orch uses the simple_auto execution base: autonomy jail + lightweight
+  // kernel loop, then ADDS the orchestration layer. Its review semantics come
+  // from explicit graph nodes, not from auto's implicit outer-loop gates.
   const isAutoOrch = overrides?.promptMode === 'auto_orch'
   // Only plain auto wires the heavyweight self-supervision machinery. simple_auto
   // and auto_orch deliberately run on the lightweight execution base: no durable
   // checkpoints, no drift gate, no completion-verify gate, and no auto experience
   // store. The kernel loop no-ops those mechanisms whenever the hooks are absent.
-  const wantsGates = isAuto && overrides?.promptMode === 'auto'
+  const wantsGates = hasAutonomyJail && overrides?.promptMode === 'auto'
+  const worktreeCleanupStrategy =
+    baseConfig.autoWorktreeCleanup ?? defaultWorktreeCleanupStrategy(overrides?.promptMode)
 
   const resumeCheckpoint = wantsGates && explicitResume && resumeSessionId
     ? readAutoCheckpoint(projectDir, resumeSessionId)
@@ -156,8 +161,14 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
         projectDir,
         getGoal,
         plannerReview: buildPlannerReviewConfig(baseConfig.autoOrchPlannerReview, baseConfig.askUser),
+        planRef: baseConfig.autoOrchPlanRef,
+        planRevision: baseConfig.autoOrchPlanRevision,
         scheduler: orchScheduler ?? undefined,
         observer: baseConfig.autoOrchObserver,
+        worktreeCleanup: {
+          coordinator: worktrees,
+          strategy: worktreeCleanupStrategy,
+        },
         // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
         // came from — verify/drift/reviewer are defined once. Parallel writers
         // merge via the shared worktree coordinator.
@@ -243,7 +254,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // total budget) as unattended safety/cost guards (env still overrides).
   const bridge = new SubAgentBridge(
     session.getSessionId(),
-    isAuto ? { conservativeAutoDefaults: true } : undefined,
+    hasAutonomyJail ? { conservativeAutoDefaults: true } : undefined,
   )
   bridgeRef = bridge
   bridge.setToolRegistry(session.getToolRegistry())
@@ -252,8 +263,11 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // Auto mode only: extend the workspace jail to every spawned sub-agent
   // (sandbox fail-closed + autonomy passthrough + projectDir bound to the jail
   // root). The jail is auto-specific safety; worktree isolation below is shared.
-  if (isAuto) {
-    bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides!.autonomy! })
+  if (hasAutonomyJail) {
+    bridge.setAutonomyJail(
+      { workspaceRoot: projectDir, autonomy: overrides!.autonomy! },
+      { retryLimit: isAutoOrch ? 0 : undefined },
+    )
   }
 
   // Git-worktree isolation for isolated_write sub-agents — armed for BOTH
@@ -287,15 +301,27 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // Completion/failure notifications flow into the volatile prefix.
   session.setSubAgentBridge(bridge)
 
-  if (orchScheduler) {
-    const disposeSession = session.dispose.bind(session)
-    session.dispose = async () => {
-      orchScheduler.stop(true)
-      await disposeSession()
+  const disposeSession = session.dispose.bind(session)
+  session.dispose = async () => {
+    orchScheduler?.stop(true)
+    await disposeSession()
+    if (worktrees.enabled && worktreeCleanupStrategy !== 'preserve') {
+      await worktrees.cleanup(worktreeCleanupStrategy).catch(() => undefined)
     }
   }
 
   return { session, bridge, checkpointCoordinator, orchController, orchScheduler }
+}
+
+function defaultWorktreeCleanupStrategy(mode: AgentMode | undefined): AutoWorktreeCleanupStrategy {
+  switch (mode) {
+    case 'simple_auto':
+    case 'auto_orch':
+      return 'safe'
+    case 'auto':
+    default:
+      return 'preserve'
+  }
 }
 
 function buildPlannerReviewConfig(

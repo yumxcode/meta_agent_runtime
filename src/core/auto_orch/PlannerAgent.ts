@@ -20,6 +20,7 @@ import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES } from '../../subagent/types.js'
 import type { SubAgentRuntimeEvent } from '../../subagent/SubAgentBridge.js'
 import type { MetaAgentEvent } from '../types.js'
+import { SessionStore } from '../SessionStore.js'
 import { notifyAutoOrchObserver, type AutoOrchObserver } from './Observer.js'
 import {
   validatePlan,
@@ -30,6 +31,8 @@ import {
   type JoinPolicy,
   type CodeNodeSpec,
 } from './LoopIR.js'
+import { randomUUID } from 'crypto'
+import { loadAutoOrchPlan, type AutoOrchStoredPlanRef } from './PlanStore.js'
 
 export interface AutoOrchPlannerDeps {
   /** Spawns the isolated planning sub-agent. */
@@ -48,6 +51,10 @@ export interface AutoOrchPlannerDeps {
   plannerReview?: AutoOrchPlannerReviewConfig
   /** Optional observability sink for planner attempts. */
   observer?: AutoOrchObserver
+  /** Optional saved plan id/version to reuse as the starting graph. */
+  planRef?: string
+  /** Optional instruction to revise the saved plan before execution. */
+  planRevision?: string
 }
 
 export interface AutoOrchPlannerReviewConfig {
@@ -61,7 +68,11 @@ export interface PlannerOutcome {
   /** A validated plan — either the planner's, or the degenerate fallback. */
   plan: OrchPlan
   /** Where the plan came from. */
-  source: 'planner' | 'fallback'
+  source: 'planner' | 'saved' | 'fallback'
+  /** True only when an interactive user explicitly approved the graph. */
+  approvedByUser?: boolean
+  /** Saved plan ref used as the seed, when present. */
+  seedPlanRef?: AutoOrchStoredPlanRef
   /** Free-text reason, esp. when falling back. */
   note?: string
   /** Validation errors that triggered the fallback (observability only). */
@@ -77,6 +88,8 @@ const PLANNER_RUBRIC = `\
 
 ## 节点 node（三种 kind）
 每个 node 必须有唯一 id 和**自包含**的 taskDescription（子 Agent 看不到你的上下文，所需信息都要写进去）。
+**taskDescription 长度硬性限制**：每个节点限 2-3 句话（合计 ≤200 字）。只写核心指令 + 必要约束（要读写哪些文件、产出什么、禁止什么）。
+**不要**在 taskDescription 里写完整的操作手册、代码分析步骤或论文摘要——子 Agent 执行时会自行探查工作区。
 - "executor"：干活（写代码/研究/改文件）。写文件的 executor **必须** "workspaceMode":"isolated_write"，否则被校验拒绝；只读用 "shared_readonly"。
 - "role"：审查角色，role 取 "verify"（完成度审查）或 "reviewer"（通用只读复核）。审查节点只读，不产出代码。
 - "parallel"：**并发组**——需要**同时**跑的多个独立子任务放进**一个** parallel 节点的 branches 里（见下）。
@@ -130,7 +143,12 @@ code 节点在规划输出里不要包含 codeRef/sourceHash；这些由框架�
 - 图小而清晰；简单目标一个 executor + 一个 verify 即可，不要过度拆分。
 - entry=入口 id；bounds（建议）={maxNodeVisits,maxTotalSteps,maxTotalCostUsd,maxWallClockMs} 给循环设上限。
 
-## 输出（只输出一个 JSON 代码块，不要任何解释）
+## 输出（必须用 return_result 提交完整 OrchPlan）
+完成后，**必须调用 return_result 工具**提交结果：
+- \`data\` 参数 = **OrchPlan JSON 对象本身**（完整的 {entry,nodes,edges,bounds} 结构，不是字符串、不是描述）——它是权威通道，不会被截断。
+- \`summary\` 参数 = 一句话概述（如"16 节点研究循环，含训练+审查+pivot"）。
+
+OrchPlan 的 JSON 结构范例（最终出现在 return_result.data 里的就是这种结构）：
 范例 A（修正环）：
 \`\`\`json
 {"id":"plan","entry":"gen","nodes":[
@@ -177,6 +195,25 @@ function buildPlannerRetryTask(goal: string, previousSummary: string, errors: st
     '',
     '【你上一次的产出（供参考，请勿原样照抄错误部分）】',
     previousSummary.length > 1500 ? previousSummary.slice(0, 1500) + '…' : previousSummary,
+    '',
+    '只输出修正后的完整 JSON 代码块，不要解释。',
+  ].join('\n')
+}
+
+/**
+ * Resume retry task: used when the previous conversation history is injected via
+ * initialMessages. The model already has its full prior context (exploration +
+ * previous output), so we only need to tell it what went wrong and ask it to fix.
+ */
+function buildPlannerResumeTask(errors: string[]): string {
+  return [
+    '你上一次的输出未通过校验。请根据下面的错误修正，并重新输出**完整**的 OrchPlan JSON 代码块。',
+    '',
+    '【本次必须修复的校验错误】',
+    errors.map(e => `- ${e}`).join('\n'),
+    '',
+    '注意：你可以看到之前的完整对话历史（包括你对工作区的探查结果）。',
+    '请基于已有理解直接修正输出，不要重复探查工作区。',
     '',
     '只输出修正后的完整 JSON 代码块，不要解释。',
   ].join('\n')
@@ -262,6 +299,28 @@ export function parseOrchPlan(text: string): OrchPlan | null {
   return null
 }
 
+/**
+ * Extract an OrchPlan from a planner sub-agent's result. Prefers the structured
+ * `output` (from return_result.data — up to 512KB, never truncated) over the
+ * `summary` text (truncated to SUMMARY_MAX_CHARS). This is critical for large
+ * plans whose JSON alone exceeds the summary cap and gets head-truncated.
+ */
+function parsePlannerResult(summary: string | null, output?: unknown): OrchPlan | null {
+  // 1. Structured output: return_result.data is already a parsed JSON object.
+  //    Call normalisePlan directly — no string parsing needed.
+  if (output && typeof output === 'object' && !Array.isArray(output)) {
+    const plan = normalisePlan(output as Record<string, unknown>)
+    if (plan && plan.nodes.length > 0) return plan
+  }
+  // 2. Output as string: might be a JSON string of the plan.
+  if (typeof output === 'string' && output.trim()) {
+    const parsed = parseOrchPlan(output)
+    if (parsed) return parsed
+  }
+  // 3. Fall back to summary text (may be truncated — best effort).
+  if (summary) return parseOrchPlan(summary)
+  return null
+}
 function normalisePlan(obj: Record<string, unknown>): OrchPlan | null {
   if (!obj || typeof obj !== 'object') return null
   if (typeof obj['entry'] !== 'string') return null
@@ -373,14 +432,27 @@ function normaliseParallel(node: OrchNode, o: Record<string, unknown>): void {
   if (typeof o['integrator'] === 'string') node.integrator = o['integrator']
 }
 
-/** Spawn the planner agent and block until terminal; return its summary text. */
+/**
+ * Spawn the planner agent and block until terminal; return its summary text.
+ *
+ * On the FIRST attempt `plannerSessionId` is generated by the caller and set in
+ * the spawn config as `autoOrch.agentSessionId` so SubAgentRunner persists the
+ * full conversation history to SessionStore when the run finishes.
+ *
+ * On a RETRY the caller loads that history and passes it as `initialMessages`,
+ * so the new sub-agent starts with the complete previous context (exploration,
+ * reasoning, prior output) — the model can fix its output without re-exploring
+ * the codebase. The retry `taskDescription` is the error feedback message.
+ */
 async function runPlannerAgent(
   dispatcher: ISubAgentDispatcher,
   taskDescription: string,
   signal: AbortSignal,
   observer: AutoOrchObserver | undefined,
   attempt: number,
-): Promise<{ summary: string | null; error?: string }> {
+  plannerSessionId: string,
+  initialMessages?: import('../types.js').ConversationMessage[],
+): Promise<{ summary: string | null; output?: unknown; error?: string }> {
   if (signal.aborted) return { summary: null, error: 'planner aborted before start' }
   const rec = await dispatcher.spawnSubAgent({
     config: {
@@ -397,6 +469,15 @@ async function runPlannerAgent(
       // worker sub-agents sharing the bridge, nor blocked by the shared budget.
       internal: true,
       workspaceMode: 'shared_readonly',
+      // Mark resumable + assign a stable session id so SubAgentRunner persists
+      // the full conversation history. On retry we reload it as initialMessages.
+      autoOrch: {
+        resumable: true,
+        orchestrationTaskId: plannerSessionId,
+        nodeId: 'planner',
+        agentSessionId: plannerSessionId,
+      },
+      ...(initialMessages ? { initialMessages } : {}),
     },
     abortSignal: signal,
     onRuntimeEvent: event => {
@@ -425,10 +506,13 @@ async function runPlannerAgent(
       error: latest.result?.error ?? `planner sub-agent ${latest.status}`,
     }
   }
-  if (!latest.result?.summary) {
+  if (!latest.result?.summary && latest.result?.output === undefined) {
     return { summary: null, error: latest.result?.error ?? 'planner agent returned no summary' }
   }
-  return { summary: latest.result.summary }
+  // Return BOTH summary (text, may be truncated) and output (structured data from
+  // return_result, up to 512KB, never truncated). The caller prefers output for
+  // plan parsing so large plans survive intact.
+  return { summary: latest.result.summary, output: latest.result.output }
 }
 
 function formatPlannerSubAgentEvent(event: SubAgentRuntimeEvent, attempt: number) {
@@ -520,6 +604,7 @@ export function makeAutoOrchPlanner(
     })
 
     if (!goal || !goal.trim()) return fallback('goal missing')
+    const trimmedGoal = goal.trim()
 
     const maxAttempts = Math.max(1, deps.maxAttempts ?? 2)
     const review = normaliseReviewConfig(deps.plannerReview)
@@ -527,6 +612,12 @@ export function makeAutoOrchPlanner(
     let lastSummary = ''
     let revisionTask: string | null = null
     let invalidAttempts = 0
+    let seedPlanRef: AutoOrchStoredPlanRef | undefined
+    // Stable session id for resume: the first attempt's conversation history is
+    // persisted to SessionStore; retries reload it so the model keeps its prior
+    // exploration context instead of starting from scratch each time.
+    const plannerSessionId = `auto-orch-planner-${randomUUID()}`
+    let firstAttemptDone = false
 
     try {
       const totalAttempts = maxAttempts + (review.enabled ? review.maxRounds : 0)
@@ -536,18 +627,69 @@ export function makeAutoOrchPlanner(
         maxInvalidAttempts: maxAttempts,
         reviewEnabled: review.enabled,
       })
+      if (deps.planRef) {
+        const loaded = await loadAutoOrchPlan(deps.projectDir, deps.planRef)
+        if (!loaded) return fallback(`saved auto_orch plan not found: ${deps.planRef}`)
+        const seedErrors = validatePlan(loaded.plan, { allowUnmaterializedCode: true })
+        if (seedErrors.length) {
+          return fallback(`saved auto_orch plan is invalid: ${seedErrors.join('; ')}`, seedErrors)
+        }
+        seedPlanRef = loaded.ref
+        if (deps.planRevision?.trim()) {
+          revisionTask = buildPlannerRevisionTask(trimmedGoal, loaded.plan, deps.planRevision.trim())
+        } else {
+          const reviewDecision = await reviewPlanIfRequested(loaded.plan, trimmedGoal, review)
+          if (reviewDecision.action === 'cancel') return fallback('saved plan review cancelled by user')
+          if (reviewDecision.action === 'revise') {
+            revisionTask = buildPlannerRevisionTask(trimmedGoal, loaded.plan, reviewDecision.feedback)
+          } else {
+            const out: PlannerOutcome = {
+              plan: loaded.plan,
+              source: 'saved',
+              approvedByUser: reviewDecision.approvedByUser,
+              seedPlanRef,
+              note: `loaded saved plan ${loaded.ref.planId}@v${loaded.ref.version}`,
+            }
+            await notifyAutoOrchObserver(deps.observer, {
+              type: 'planner_completed',
+              source: out.source,
+              note: out.note,
+            })
+            return out
+          }
+        }
+      }
       for (let attempt = 1; attempt <= totalAttempts; attempt++) {
         if (signal.aborted) return fallback('planner aborted by user', lastErrors)
-        // First attempt plans fresh; later attempts hand back the previous output
-        // + the exact validation errors so the LLM RE-CREATES a corrected plan.
+
+        // Resume: on retry (attempt > 1), reload the first attempt's full
+        // conversation history from SessionStore and inject it as initialMessages
+        // so the model starts with all its prior exploration — it only needs to
+        // fix its output format, not re-read the entire codebase.
+        let initialMessages: import('../types.js').ConversationMessage[] | undefined
+        if (firstAttemptDone) {
+          try {
+            initialMessages = await SessionStore.loadHistory(plannerSessionId)
+          } catch {
+            // History unavailable — fall back to a fresh spawn (original behaviour)
+          }
+        }
+        const resumed = !!initialMessages
+
         const reason = revisionTask
           ? 'user_revision'
           : attempt === 1
             ? 'initial'
-            : 'validation_retry'
+            : resumed
+              ? 'validation_retry'
+              : 'validation_retry'
+        // When resuming, use the lean resume task (model already has full context);
+        // otherwise use the full retry task (includes truncated previous output).
         const task = revisionTask ?? (attempt === 1
           ? buildPlannerTask(goal)
-          : buildPlannerRetryTask(goal, lastSummary, lastErrors))
+          : resumed
+            ? buildPlannerResumeTask(lastErrors)
+            : buildPlannerRetryTask(goal, lastSummary, lastErrors))
         revisionTask = null
         await notifyAutoOrchObserver(deps.observer, {
           type: 'planner_attempt_started',
@@ -556,7 +698,11 @@ export function makeAutoOrchPlanner(
           reason,
         })
 
-        const plannerRun = await runPlannerAgent(deps.dispatcher, task, signal, deps.observer, attempt)
+        const plannerRun = await runPlannerAgent(
+          deps.dispatcher, task, signal, deps.observer, attempt,
+          plannerSessionId, initialMessages,
+        )
+        firstAttemptDone = true
         const summary = plannerRun.summary
         if (signal.aborted) return fallback('planner aborted by user', lastErrors)
         if (!summary) {
@@ -580,7 +726,9 @@ export function makeAutoOrchPlanner(
         }
         lastSummary = summary
 
-        const parsed = parseOrchPlan(summary)
+        // Prefer the structured output (return_result.data, untruncated) over
+        // the summary text (may be head-truncated for large plans).
+        const parsed = parsePlannerResult(summary, plannerRun.output)
         if (!parsed) {
           lastErrors = ['no parseable OrchPlan JSON code block was found in your output']
           invalidAttempts++
@@ -616,6 +764,8 @@ export function makeAutoOrchPlanner(
           const out: PlannerOutcome = {
             plan: parsed,
             source: 'planner',
+            approvedByUser: reviewDecision.approvedByUser,
+            seedPlanRef,
             note: attempt > 1 ? `accepted on attempt ${attempt}` : undefined,
           }
           await notifyAutoOrchObserver(deps.observer, {
@@ -676,8 +826,10 @@ async function reviewPlanIfRequested(
   plan: OrchPlan,
   goal: string,
   review: { enabled: boolean; maxRounds: number; askUser?: (question: string, choices?: string[]) => Promise<string>; rounds: number },
-): Promise<{ action: 'approve' } | { action: 'revise'; feedback: string } | { action: 'cancel' }> {
-  if (!review.enabled || !review.askUser || review.rounds >= review.maxRounds) return { action: 'approve' }
+): Promise<{ action: 'approve'; approvedByUser: boolean } | { action: 'revise'; feedback: string } | { action: 'cancel' }> {
+  if (!review.enabled || !review.askUser || review.rounds >= review.maxRounds) {
+    return { action: 'approve', approvedByUser: false }
+  }
   review.rounds++
   const answer = await review.askUser(
     renderPlanForReview(plan, goal, review.rounds, review.maxRounds),
@@ -689,19 +841,21 @@ async function reviewPlanIfRequested(
     const feedback = await review.askUser('请描述希望 planner 如何修改这张 auto_orch 图。')
     return feedback.trim()
       ? { action: 'revise', feedback: feedback.trim() }
-      : { action: 'approve' }
+      : { action: 'approve', approvedByUser: true }
   }
-  return { action: 'approve' }
+  return { action: 'approve', approvedByUser: true }
 }
 
 export function renderPlanForReview(plan: OrchPlan, goal: string, round: number, maxRounds: number): string {
   const lines: string[] = []
   lines.push(`auto_orch planner 已生成一张候选图（review ${round}/${maxRounds}）。`)
   lines.push('')
-  lines.push('【目标】')
-  lines.push(goal.slice(0, 1200))
+  lines.push('【目标摘要】')
+  lines.push(compactLine(goal, 500))
   lines.push('')
-  lines.push('【节点】')
+  lines.push(`【图摘要】nodes=${plan.nodes.length}, edges=${plan.edges.length}, entry=${plan.entry}`)
+  lines.push('')
+  lines.push('【节点摘要】')
   for (const n of plan.nodes) {
     const extra = n.kind === 'role'
       ? ` role=${n.role ?? 'reviewer'}`
@@ -710,7 +864,7 @@ export function renderPlanForReview(plan: OrchPlan, goal: string, round: number,
         : n.kind === 'parallel'
           ? ` branches=${n.branches?.length ?? 0} join=${n.join ?? 'all'}`
           : ''
-    lines.push(`- ${n.id}: ${n.kind}${extra} — ${n.taskDescription.slice(0, 180)}`)
+    lines.push(`- ${n.id}: ${n.kind}${extra} — ${compactLine(n.taskDescription, 100)}`)
   }
   lines.push('')
   lines.push('【边】')
@@ -731,4 +885,9 @@ export function renderPlanForReview(plan: OrchPlan, goal: string, round: number,
   lines.push('')
   lines.push('请选择批准执行、要求 planner 修改，或取消本次 auto_orch 运行。')
   return lines.join('\n')
+}
+
+function compactLine(text: string, maxChars: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length > maxChars ? `${oneLine.slice(0, maxChars)}...` : oneLine
 }

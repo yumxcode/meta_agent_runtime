@@ -31,7 +31,7 @@ export type AutoOrchEvent =
     }
   | {
       type: 'planner_completed'
-      source: 'planner' | 'fallback'
+      source: 'planner' | 'saved' | 'fallback'
       note?: string
     }
   | {

@@ -244,7 +244,7 @@ export async function main(input, api) {
   const stale = evalResult.newFindingsCount <= 0 || evalResult.metricDelta < 0
   const staleCount = stale ? (progress.stale_count || 0) + 1 : 0
   const status = staleCount >= 4 ? 'attention_required' : staleCount >= 2 ? 'pivot_required' : stale ? 'stale' : 'healthy'
-  await api.state.writeJson(input.progressPath, { ...progress, stale_count: staleCount, status })
+  await api.state.writeJson(input.progressPath, { ...progress, stale_count: staleCount, status, updated_at: api.nowIso })
   return { action: 'branch', label: status, data: { stale_count: staleCount } }
 }`
     const artifact = await writeCodeNodeArtifact(projectDir, 'reduce', source)
@@ -261,6 +261,7 @@ export async function main(input, api) {
     expect(verdict).toMatchObject({ action: 'branch', label: 'pivot_required' })
     const updated = JSON.parse(await readFile(join(projectDir, 'state', 'progress.json'), 'utf-8'))
     expect(updated).toMatchObject({ stale_count: 2, status: 'pivot_required' })
+    expect(updated.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/)
   })
 })
 
@@ -436,6 +437,18 @@ describe('PlanRunner', () => {
     const result = await new PlanRunner(genVerifyFix, runner).run(new AbortController().signal)
     expect(result.status).toBe('completed')
     expect(result.note).toBe('stop now')
+  })
+
+  it('marks terminal error handler nodes as failed, not completed', async () => {
+    const plan: OrchPlan = {
+      entry: 'error_writer',
+      nodes: [{ id: 'error_writer', kind: 'code', taskDescription: 'record error', codeRef: 'x', sourceHash: 'y' }],
+      edges: [],
+    }
+    const runner: NodeRunner = { async run() { return { action: 'branch', label: 'ok' } } }
+    const result = await new PlanRunner(plan, runner).run(new AbortController().signal)
+    expect(result.status).toBe('failed')
+    expect(result.note).toContain('error_writer')
   })
 
   it('treats a paused verdict as a legal run stop with a resume handle', async () => {

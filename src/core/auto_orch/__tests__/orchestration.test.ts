@@ -5,7 +5,7 @@
  * records so the whole pipeline runs deterministically without a live LLM.
  */
 import { describe, it, expect } from 'vitest'
-import { mkdtemp } from 'fs/promises'
+import { mkdtemp, readFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
@@ -126,6 +126,25 @@ describe('KernelNodeRunner', () => {
     expect(v).toMatchObject({ action: 'branch', label: 'error' })
   })
 
+  it('maps an executor return_result error label to branch:error', async () => {
+    const runner = new KernelNodeRunner(queueDispatcher([{
+      summary: 'missing state',
+      success: true,
+      output: { label: 'error', note: 'state files are missing' },
+    }]))
+    const v = await runner.run(exec, ctx())
+    expect(v).toMatchObject({ action: 'branch', label: 'error', note: 'state files are missing' })
+  })
+
+  it('maps legacy executor summaries that start with error to branch:error', async () => {
+    const runner = new KernelNodeRunner(queueDispatcher([{
+      summary: '返回 error。无法完成任务：所需 state 文件缺失。',
+      success: true,
+    }]))
+    const v = await runner.run(exec, ctx())
+    expect(v).toMatchObject({ action: 'branch', label: 'error' })
+  })
+
   it('maps an auto_orch pause payload to branch:paused with a resume handle', async () => {
     const runner = new KernelNodeRunner(queueDispatcher([{
       summary: 'paused',
@@ -186,6 +205,34 @@ describe('materializeCodeNodes', () => {
     expect(out.plan.nodes[0].codeRef).toMatch(/^code_nodes\//)
     expect(out.plan.nodes[0].sourceHash).toHaveLength(64)
   })
+
+  it('retries code authoring with review feedback after forbidden source', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-retry-'))
+    const badSource = 'export async function main() { return { action: "branch", label: "healthy", data: { at: new Date().toISOString() } } }'
+    const fixedSource = 'export async function main(input, api) { return { action: "branch", label: "healthy", data: { at: api.nowIso } } }'
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([
+      { summary: '```json\n' + JSON.stringify({ source: badSource, note: 'uses Date' }) + '\n```' },
+      { summary: '```json\n' + JSON.stringify({ source: fixedSource, note: 'uses api.nowIso' }) + '\n```' },
+    ], captured)
+
+    const out = await materializeCodeNodes({
+      entry: 'reduce',
+      nodes: [{
+        id: 'reduce',
+        kind: 'code',
+        taskDescription: 'reduce',
+        codeSpec: { description: 'return healthy with a timestamp', labels: ['healthy'] },
+      }],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(1)
+    expect(captured).toHaveLength(2)
+    expect(captured[1]).toContain('source uses forbidden construct')
+    expect(captured[1]).toContain('api.nowIso')
+  })
 })
 
 // ── AutoOrchController (end-to-end) ────────────────────────────────────────────
@@ -218,6 +265,33 @@ describe('AutoOrchController', () => {
     expect(result.run.visitedPath).toEqual(['gen', 'verify'])
     expect(result.run.costUsd).toBeCloseTo(0.4, 5)
     expect(result.summary).toContain('gen → verify')
+  })
+
+  it('persists an explicitly approved graph, materialized plan, and run record', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-approved-plan-'))
+    const dispatcher = queueDispatcher([
+      { summary: PLAN },
+      { summary: 'generated', success: true },
+      { summary: '{"label":"pass","messages":[]}' },
+    ])
+    const controller = new AutoOrchController({
+      dispatcher,
+      projectDir,
+      getGoal: () => 'build X',
+      plannerReview: { enabled: true, askUser: async () => 'Approve plan' },
+      nodeRunnerOptions: { roleCatalog: reviewerCatalog() },
+    })
+
+    const result = await controller.run(new AbortController().signal)
+
+    expect(result.run.status).toBe('completed')
+    const latest = JSON.parse(await readFile(join(projectDir, '.meta-agent/auto_orch/plans/latest.json'), 'utf-8'))
+    const dir = join(projectDir, '.meta-agent/auto_orch/plans', latest.planId, `v${String(latest.version).padStart(4, '0')}`)
+    const manifest = JSON.parse(await readFile(join(dir, 'manifest.json'), 'utf-8'))
+    await expect(readFile(join(dir, 'approved.plan.json'), 'utf-8')).resolves.toContain('"entry"')
+    await expect(readFile(join(dir, 'materialized.plan.json'), 'utf-8')).resolves.toContain('"entry"')
+    await expect(readFile(join(dir, 'runs.jsonl'), 'utf-8')).resolves.toContain('"status":"completed"')
+    expect(manifest).toMatchObject({ approvedByUser: true, latestRunAt: expect.any(Number) })
   })
 
   it('drives a generate→verify→fix cycle and flows correctives via the blackboard', async () => {

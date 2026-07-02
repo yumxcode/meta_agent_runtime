@@ -22,6 +22,16 @@ import { continueVerdict } from './Verdict.js'
 import type { AutoOrchScheduler } from './AutoOrchScheduler.js'
 import { materializeCodeNodes } from './CodeNodeAuthor.js'
 import type { AutoOrchObserver } from './Observer.js'
+import {
+  appendAutoOrchPlanRun,
+  saveApprovedAutoOrchPlan,
+  saveMaterializedAutoOrchPlan,
+  type AutoOrchStoredPlanRef,
+} from './PlanStore.js'
+import type {
+  AutoWorktreeCleanupStrategy,
+  AutoWorktreeCoordinator,
+} from '../auto/AutoWorktreeCoordinator.js'
 
 export interface AutoOrchControllerDeps extends AutoOrchPlannerDeps {
   /** Per-node sub-agent wait/poll tuning, forwarded to the KernelNodeRunner. */
@@ -30,6 +40,11 @@ export interface AutoOrchControllerDeps extends AutoOrchPlannerDeps {
   scheduler?: AutoOrchScheduler
   /** Optional observability sink for graph execution events. */
   observer?: AutoOrchObserver
+  /** Best-effort cleanup for auto-series isolated-write worktrees after terminal runs. */
+  worktreeCleanup?: {
+    coordinator: AutoWorktreeCoordinator
+    strategy: AutoWorktreeCleanupStrategy
+  }
 }
 
 export interface OrchestrationResult {
@@ -50,6 +65,8 @@ export class AutoOrchController {
   private readonly dispatcher: ISubAgentDispatcher
   private readonly projectDir: string
   private readonly observer?: AutoOrchObserver
+  private readonly getGoal: () => string | null
+  private readonly worktreeCleanup?: AutoOrchControllerDeps['worktreeCleanup']
 
   constructor(deps: AutoOrchControllerDeps) {
     this.plan = makeAutoOrchPlanner(deps)
@@ -57,6 +74,8 @@ export class AutoOrchController {
     this.dispatcher = deps.dispatcher
     this.projectDir = deps.projectDir
     this.observer = deps.observer
+    this.getGoal = deps.getGoal
+    this.worktreeCleanup = deps.worktreeCleanup
     // Forward workspace + goal so role nodes ('verify'/'drift') resolved from the
     // catalogue get the real jail root and frozen goal they judge against.
     this.nodeRunner = new KernelNodeRunner(deps.dispatcher, {
@@ -73,6 +92,7 @@ export class AutoOrchController {
    */
   async run(signal: AbortSignal): Promise<OrchestrationResult> {
     const planned = await this.plan(signal)
+    let storedPlanRef: AutoOrchStoredPlanRef | undefined
     if (signal.aborted) {
       const run: PlanRunResult = {
         status: 'aborted',
@@ -87,6 +107,16 @@ export class AutoOrchController {
         planNote: planned.note,
         summary: renderSummary(planned, run, 0),
       }
+    }
+    if (planned.approvedByUser) {
+      const goal = this.safeGoal()
+      storedPlanRef = await saveApprovedAutoOrchPlan(this.projectDir, {
+        goal,
+        plan: planned.plan,
+        source: planned.source,
+        approvedByUser: true,
+        note: planned.note,
+      }).catch(() => undefined)
     }
     const materialized = await materializeCodeNodes(
       planned.plan,
@@ -108,20 +138,42 @@ export class AutoOrchController {
         summary: renderSummary(planned, run, 0),
       }
     }
+    if (storedPlanRef) {
+      await saveMaterializedAutoOrchPlan(this.projectDir, storedPlanRef, materialized.plan).catch(() => undefined)
+    }
     const blackboard = new Blackboard()
     const runner = new PlanRunner(materialized.plan, this.nodeRunner, { blackboard, observer: this.observer })
     const run = await runner.run(signal)
+    if (storedPlanRef) {
+      await appendAutoOrchPlanRun(this.projectDir, storedPlanRef, run).catch(() => undefined)
+    }
     if (run.status === 'paused' && this.scheduler) {
       await this.scheduler.schedulePausedRun(materialized.plan, run).catch(() => undefined)
     } else if (this.scheduler) {
       await this.scheduler.cancelAll(`auto_orch run ended: ${run.status}`).catch(() => undefined)
     }
+    if (run.status !== 'paused') await this.cleanupWorktrees()
     return {
       planSource: planned.source,
       run,
       planNote: planned.note,
       summary: renderSummary(planned, run, blackboard.correctiveRounds()),
     }
+  }
+
+  private safeGoal(): string {
+    try {
+      return this.getGoal()?.trim() || '继续推进当前目标。'
+    } catch {
+      return '继续推进当前目标。'
+    }
+  }
+
+  private async cleanupWorktrees(): Promise<void> {
+    if (!this.worktreeCleanup) return
+    await this.worktreeCleanup.coordinator
+      .cleanup(this.worktreeCleanup.strategy)
+      .catch(() => undefined)
   }
 }
 
@@ -170,8 +222,13 @@ export function makeAutoOrchController(
 
 function renderSummary(planned: PlannerOutcome, run: PlanRunResult, correctiveRounds: number): string {
   const lines: string[] = []
+  const sourceZh = planned.source === 'planner'
+    ? '计划'
+    : planned.source === 'saved'
+      ? '已保存计划'
+      : '回退（单执行器）'
   lines.push(
-    `[auto_orch] 编排${planned.source === 'planner' ? '计划' : '回退（单执行器）'}执行${statusZh(run.status)}。`,
+    `[auto_orch] 编排${sourceZh}执行${statusZh(run.status)}。`,
   )
   if (planned.source === 'fallback' && planned.note) lines.push(`规划回退原因：${planned.note}`)
   if (run.visitedPath.length) lines.push(`执行路径：${run.visitedPath.join(' → ')}`)

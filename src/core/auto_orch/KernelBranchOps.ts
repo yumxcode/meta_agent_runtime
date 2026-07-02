@@ -23,6 +23,8 @@ import type { ParallelBranch } from './LoopIR.js'
 import { spawnAndWait } from './reviewer.js'
 import { branchIsWriter, type BranchOps, type BranchRunResult, type MergeOutcome } from './ParallelBranchRunner.js'
 
+const DEFAULT_BRANCH_MAX_TURNS = 20
+
 export interface KernelBranchOpsDeps {
   dispatcher: ISubAgentDispatcher
   /** Worktree coordinator for isolated branches + merges. Absent → no real merge. */
@@ -56,7 +58,7 @@ export class KernelBranchOps implements BranchOps {
         taskDescription: this.scopedTask(branch),
         systemPrompt: branch.systemPrompt,
         allowedTools: branch.allowedTools ?? [],
-        maxTurns: branch.maxTurns ?? 12,
+        maxTurns: branch.maxTurns ?? DEFAULT_BRANCH_MAX_TURNS,
         maxBudgetUsd: branch.maxBudgetUsd ?? 0.5,
         requireHumanApproval: false,
         useEventDriven: false,
