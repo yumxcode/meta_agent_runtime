@@ -25,6 +25,10 @@ import { runParallelNode, type BranchOps } from './ParallelBranchRunner.js'
 import { KernelBranchOps } from './KernelBranchOps.js'
 import type { AutoWorktreeCoordinator } from '../auto/AutoWorktreeCoordinator.js'
 import { randomUUID } from 'crypto'
+import { execFile } from 'child_process'
+import { copyFile, mkdir } from 'fs/promises'
+import { dirname, relative, resolve } from 'path'
+import { promisify } from 'util'
 import { isAutoOrchPauseOutput } from './AutoOrchPauseTool.js'
 import { writeAutoOrchSubAgentSession } from './AutoOrchSubAgentSessionStore.js'
 import { CodeNodeRunner } from './CodeNodeRunner.js'
@@ -39,6 +43,7 @@ export { parseRoleVerdict } from './reviewer.js'
 // nodes always carry their own allowedTools; this only catches omissions.
 const DEFAULT_EXECUTOR_TOOLS = ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash']
 const DEFAULT_EXECUTOR_MAX_TURNS = 30
+const execFileAsync = promisify(execFile)
 const AUTO_ORCH_PAUSE_HINT = `\
 如果你启动或发现了需要等待外部结果的长任务（例如训练任务、远程评测、批处理实验），不要阻塞等待。
 请调用 auto_orch_pause_external，提供 externalRunId、建议的 nextCheckAfterMs 和恢复时需要遵循的 resumeInstruction。`
@@ -62,6 +67,8 @@ export interface KernelNodeRunnerOptions {
   branchOps?: BranchOps
   /** Worktree coordinator for parallel writers' isolated branches + merges. */
   worktrees?: AutoWorktreeCoordinator | null
+  /** Optional global override for executor sub-agent turn limits. */
+  executorMaxTurns?: number
 }
 
 export class KernelNodeRunner implements NodeRunner {
@@ -73,6 +80,8 @@ export class KernelNodeRunner implements NodeRunner {
   private readonly branchOps: BranchOps
   private readonly orchestrationTaskId: string
   private readonly codeRunner: CodeNodeRunner
+  private readonly worktrees: AutoWorktreeCoordinator | null
+  private readonly executorMaxTurns?: number
 
   constructor(
     private readonly dispatcher: ISubAgentDispatcher,
@@ -85,9 +94,11 @@ export class KernelNodeRunner implements NodeRunner {
     this.getGoal = opts?.getGoal ?? (() => null)
     this.orchestrationTaskId = `auto-orch-${randomUUID()}`
     this.codeRunner = new CodeNodeRunner({ projectDir: this.projectDir })
+    this.worktrees = opts?.worktrees ?? null
+    this.executorMaxTurns = opts?.executorMaxTurns
     this.branchOps = opts?.branchOps ?? new KernelBranchOps({
       dispatcher,
-      worktrees: opts?.worktrees ?? null,
+      worktrees: this.worktrees,
       pollMs: this.pollMs,
       maxWaitMs: this.maxWaitMs,
     })
@@ -123,7 +134,7 @@ export class KernelNodeRunner implements NodeRunner {
         taskDescription,
         systemPrompt: [node.systemPrompt, EXECUTOR_RESULT_CONTRACT].filter(Boolean).join('\n\n'),
         allowedTools: node.allowedTools && node.allowedTools.length > 0 ? node.allowedTools : DEFAULT_EXECUTOR_TOOLS,
-        maxTurns: node.maxTurns ?? DEFAULT_EXECUTOR_MAX_TURNS,
+        maxTurns: this.executorMaxTurns ?? node.maxTurns ?? DEFAULT_EXECUTOR_MAX_TURNS,
         maxBudgetUsd: node.maxBudgetUsd ?? 0.5,
         requireHumanApproval: false,
         useEventDriven: false,
@@ -181,6 +192,10 @@ export class KernelNodeRunner implements NodeRunner {
       if (parsed?.label === 'error') {
         return { action: 'branch', label: 'error', note: parsed.note ?? truncate(rec.result.summary), data: { costUsd: cost } }
       }
+      const merge = await this.mergeSequentialExecutor(node, rec.taskId)
+      if (!merge.ok) {
+        return { action: 'branch', label: 'error', note: merge.note, data: { costUsd: cost } }
+      }
       return { action: 'branch', label: 'ok', note: parsed?.note ?? truncate(rec.result.summary), data: { costUsd: cost } }
     }
     return {
@@ -207,6 +222,76 @@ export class KernelNodeRunner implements NodeRunner {
   private spawnOpts(): SpawnWaitOptions {
     return { pollMs: this.pollMs, maxWaitMs: this.maxWaitMs }
   }
+
+  private async mergeSequentialExecutor(
+    node: OrchNode,
+    taskId: string,
+  ): Promise<{ ok: true } | { ok: false; note: string }> {
+    if (node.workspaceMode !== 'isolated_write' || !this.worktrees?.enabled) return { ok: true }
+    try {
+      const record = this.worktrees.recordFor(taskId)
+      const finalized = await this.worktrees.finalize(taskId)
+      const changedFiles = finalized.changedFiles.length || !record
+        ? finalized.changedFiles
+        : await committedChangedFiles(record.worktreePath, record.forkPoint)
+      if (record && stateOnlyChanges(changedFiles)) {
+        await syncStateFiles(record.worktreePath, this.projectDir, changedFiles)
+        await this.worktrees.discard(taskId)
+        return { ok: true }
+      }
+      const result = await this.worktrees.merge(taskId, {
+        message: `meta-agent: auto_orch merge ${node.id}`,
+      })
+      if (result?.merged === false) {
+        return { ok: false, note: `isolated worktree merge failed for ${node.id}` }
+      }
+      return { ok: true }
+    } catch (err) {
+      return {
+        ok: false,
+        note: `isolated worktree merge failed for ${node.id}: ${err instanceof Error ? err.message : String(err)}`,
+      }
+    }
+  }
+}
+
+function stateOnlyChanges(files: readonly string[]): boolean {
+  return files.length > 0 && files.every(file => normalizeChangedFile(file).startsWith('state/'))
+}
+
+async function committedChangedFiles(worktreePath: string, forkPoint: string): Promise<string[]> {
+  const { stdout } = await execFileAsync('git', ['diff', '--name-only', `${forkPoint}..HEAD`, '--'], {
+    cwd: worktreePath,
+    maxBuffer: 10 * 1024 * 1024,
+  })
+  return stdout.split('\n').map(s => s.trim()).filter(Boolean)
+}
+
+async function syncStateFiles(fromRoot: string, toRoot: string, files: readonly string[]): Promise<void> {
+  for (const raw of files) {
+    const rel = normalizeChangedFile(raw)
+    if (!rel.startsWith('state/')) continue
+    const from = safeJoin(fromRoot, rel)
+    const to = safeJoin(toRoot, rel)
+    await mkdir(dirname(to), { recursive: true })
+    await copyFile(from, to)
+  }
+}
+
+function normalizeChangedFile(file: string): string {
+  const trimmed = file.trim()
+  const path = trimmed.includes(' -> ') ? trimmed.split(' -> ').pop()!.trim() : trimmed
+  return path.replace(/\\/g, '/').replace(/^\/+/, '')
+}
+
+function safeJoin(root: string, relPath: string): string {
+  const absRoot = resolve(root)
+  const abs = resolve(absRoot, relPath)
+  const rel = relative(absRoot, abs)
+  if (rel.startsWith('..') || rel === '' || rel.startsWith('/')) {
+    throw new Error(`path escapes workspace: ${relPath}`)
+  }
+  return abs
 }
 
 function truncate(s: string, n = 500): string {

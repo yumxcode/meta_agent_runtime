@@ -227,6 +227,21 @@ describe('SubAgentBridge scheduler', () => {
     ).rejects.toThrow(/budget exceeded/)
   })
 
+  it('uses a $10 total budget for conservative auto defaults', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      conservativeAutoDefaults: true,
+      startDelayMs: 0,
+    })
+
+    await expect(
+      bridge.spawnSubAgent({ config: { taskDescription: 'expensive research', maxBudgetUsd: 6 } }),
+    ).resolves.toMatchObject({ config: { maxBudgetUsd: 6 } })
+
+    await expect(
+      bridge.spawnSubAgent({ config: { taskDescription: 'too much', maxBudgetUsd: 5 } }),
+    ).rejects.toThrow(/limit \$10\.0000/)
+  })
+
   it('internal safety-gate tasks bypass the shared budget cap', async () => {
     const bridge = new SubAgentBridge(crypto.randomUUID(), {
       maxConcurrentSubAgents: 1,

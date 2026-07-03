@@ -32,6 +32,8 @@ import type {
   AutoWorktreeCleanupStrategy,
   AutoWorktreeCoordinator,
 } from '../auto/AutoWorktreeCoordinator.js'
+import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises'
+import { dirname, join, relative, resolve } from 'path'
 
 export interface AutoOrchControllerDeps extends AutoOrchPlannerDeps {
   /** Per-node sub-agent wait/poll tuning, forwarded to the KernelNodeRunner. */
@@ -57,6 +59,8 @@ export interface OrchestrationResult {
   /** A short human-readable recap suitable for the session result text. */
   summary: string
 }
+
+const PROCESS_FILE_ROOTS = ['state']
 
 export class AutoOrchController {
   private readonly plan: ReturnType<typeof makeAutoOrchPlanner>
@@ -91,73 +95,107 @@ export class AutoOrchController {
    * to a result so the caller (router) can always report something coherent.
    */
   async run(signal: AbortSignal): Promise<OrchestrationResult> {
-    const planned = await this.plan(signal)
-    let storedPlanRef: AutoOrchStoredPlanRef | undefined
-    if (signal.aborted) {
-      const run: PlanRunResult = {
-        status: 'aborted',
-        visitedPath: [],
-        steps: [],
-        costUsd: 0,
-        note: 'parent run aborted before graph execution',
+    let planned: PlannerOutcome | undefined
+    let finalRun: PlanRunResult | undefined
+    const processSnapshot = await captureProcessFileSnapshot(this.projectDir).catch(() => undefined)
+    try {
+      planned = await this.plan(signal)
+      let storedPlanRef: AutoOrchStoredPlanRef | undefined
+      if (signal.aborted) {
+        const run: PlanRunResult = {
+          status: 'aborted',
+          visitedPath: [],
+          steps: [],
+          costUsd: 0,
+          note: 'parent run aborted before graph execution',
+        }
+        finalRun = run
+        return {
+          planSource: planned.source,
+          run,
+          planNote: planned.note,
+          summary: renderSummary(planned, run, 0),
+        }
+      }
+      if (planned.approvedByUser) {
+        const goal = this.safeGoal()
+        storedPlanRef = await saveApprovedAutoOrchPlan(this.projectDir, {
+          goal,
+          plan: planned.plan,
+          source: planned.source,
+          approvedByUser: true,
+          note: planned.note,
+        }).catch(() => undefined)
+      }
+      const materialized = await materializeCodeNodes(
+        planned.plan,
+        { dispatcher: this.dispatcher, projectDir: this.projectDir },
+        signal,
+      )
+      if (materialized.errors.length) {
+        const run: PlanRunResult = {
+          status: 'invalid',
+          visitedPath: [],
+          steps: [],
+          costUsd: 0,
+          note: materialized.errors.join('; '),
+        }
+        finalRun = run
+        return {
+          planSource: planned.source,
+          run,
+          planNote: planned.note,
+          summary: renderSummary(planned, run, 0),
+        }
+      }
+      const materializedPlanRef = storedPlanRef ?? (materialized.materialized > 0 ? planned.seedPlanRef : undefined)
+      if (materializedPlanRef) {
+        await saveMaterializedAutoOrchPlan(this.projectDir, materializedPlanRef, materialized.plan).catch(() => undefined)
+      }
+      const blackboard = new Blackboard()
+      const runner = new PlanRunner(materialized.plan, this.nodeRunner, { blackboard, observer: this.observer })
+      const run = await runner.run(signal)
+      finalRun = run
+      if (storedPlanRef) {
+        await appendAutoOrchPlanRun(this.projectDir, storedPlanRef, run).catch(() => undefined)
+      }
+      if (run.status === 'paused' && this.scheduler) {
+        await this.scheduler.schedulePausedRun(materialized.plan, run).catch(() => undefined)
+      } else if (this.scheduler) {
+        await this.scheduler.cancelAll(`auto_orch run ended: ${run.status}`).catch(() => undefined)
       }
       return {
         planSource: planned.source,
         run,
         planNote: planned.note,
-        summary: renderSummary(planned, run, 0),
+        summary: renderSummary(planned, run, blackboard.correctiveRounds()),
       }
-    }
-    if (planned.approvedByUser) {
-      const goal = this.safeGoal()
-      storedPlanRef = await saveApprovedAutoOrchPlan(this.projectDir, {
-        goal,
-        plan: planned.plan,
-        source: planned.source,
-        approvedByUser: true,
-        note: planned.note,
-      }).catch(() => undefined)
-    }
-    const materialized = await materializeCodeNodes(
-      planned.plan,
-      { dispatcher: this.dispatcher, projectDir: this.projectDir },
-      signal,
-    )
-    if (materialized.errors.length) {
+    } catch (err) {
       const run: PlanRunResult = {
-        status: 'invalid',
+        status: signal.aborted ? 'aborted' : 'failed',
         visitedPath: [],
         steps: [],
         costUsd: 0,
-        note: materialized.errors.join('; '),
+        note: err instanceof Error ? err.message : String(err),
       }
+      finalRun = run
+      const fallbackPlan = {
+        source: planned?.source ?? 'fallback',
+        note: planned?.note,
+      } satisfies Pick<PlannerOutcome, 'source' | 'note'>
       return {
-        planSource: planned.source,
+        planSource: fallbackPlan.source,
         run,
-        planNote: planned.note,
-        summary: renderSummary(planned, run, 0),
+        planNote: fallbackPlan.note,
+        summary: renderSummary(fallbackPlan, run, 0),
       }
-    }
-    if (storedPlanRef) {
-      await saveMaterializedAutoOrchPlan(this.projectDir, storedPlanRef, materialized.plan).catch(() => undefined)
-    }
-    const blackboard = new Blackboard()
-    const runner = new PlanRunner(materialized.plan, this.nodeRunner, { blackboard, observer: this.observer })
-    const run = await runner.run(signal)
-    if (storedPlanRef) {
-      await appendAutoOrchPlanRun(this.projectDir, storedPlanRef, run).catch(() => undefined)
-    }
-    if (run.status === 'paused' && this.scheduler) {
-      await this.scheduler.schedulePausedRun(materialized.plan, run).catch(() => undefined)
-    } else if (this.scheduler) {
-      await this.scheduler.cancelAll(`auto_orch run ended: ${run.status}`).catch(() => undefined)
-    }
-    if (run.status !== 'paused') await this.cleanupWorktrees()
-    return {
-      planSource: planned.source,
-      run,
-      planNote: planned.note,
-      summary: renderSummary(planned, run, blackboard.correctiveRounds()),
+    } finally {
+      if (finalRun?.status !== 'paused') {
+        if (finalRun && shouldRestoreProcessFiles(finalRun.status)) {
+          await processSnapshot?.restore().catch(() => undefined)
+        }
+        await this.cleanupWorktrees()
+      }
     }
   }
 
@@ -220,7 +258,11 @@ export function makeAutoOrchController(
   return new AutoOrchController({ dispatcher, projectDir, getGoal, nodeRunnerOptions })
 }
 
-function renderSummary(planned: PlannerOutcome, run: PlanRunResult, correctiveRounds: number): string {
+function renderSummary(
+  planned: Pick<PlannerOutcome, 'source' | 'note'>,
+  run: PlanRunResult,
+  correctiveRounds: number,
+): string {
   const lines: string[] = []
   const sourceZh = planned.source === 'planner'
     ? '计划'
@@ -256,5 +298,75 @@ function statusZh(status: PlanRunResult['status']): string {
       return '因内部错误中止'
     default:
       return ''
+  }
+}
+
+function shouldRestoreProcessFiles(status: PlanRunResult['status']): boolean {
+  return status !== 'completed' && status !== 'paused'
+}
+
+interface ProcessRootSnapshot {
+  relRoot: string
+  existed: boolean
+  dirs: string[]
+  files: Array<{ relPath: string; data: Buffer }>
+}
+
+async function captureProcessFileSnapshot(projectDir: string): Promise<{ restore: () => Promise<void> }> {
+  const root = resolve(projectDir)
+  const snapshots: ProcessRootSnapshot[] = []
+  for (const relRoot of PROCESS_FILE_ROOTS) {
+    const absRoot = resolve(root, relRoot)
+    const rel = relative(root, absRoot)
+    if (rel.startsWith('..') || rel === '' || rel.startsWith('/')) continue
+    snapshots.push(await snapshotRoot(absRoot, relRoot))
+  }
+  return {
+    async restore(): Promise<void> {
+      for (const snapshot of snapshots) {
+        await restoreRoot(root, snapshot)
+      }
+    },
+  }
+}
+
+async function snapshotRoot(absRoot: string, relRoot: string): Promise<ProcessRootSnapshot> {
+  const snapshot: ProcessRootSnapshot = { relRoot, existed: true, dirs: [], files: [] }
+  try {
+    await walkSnapshot(absRoot, absRoot, snapshot)
+  } catch {
+    snapshot.existed = false
+    snapshot.dirs = []
+    snapshot.files = []
+  }
+  return snapshot
+}
+
+async function walkSnapshot(absRoot: string, current: string, snapshot: ProcessRootSnapshot): Promise<void> {
+  const entries = await readdir(current, { withFileTypes: true })
+  for (const entry of entries) {
+    const abs = join(current, entry.name)
+    const relPath = relative(absRoot, abs)
+    if (entry.isDirectory()) {
+      snapshot.dirs.push(relPath)
+      await walkSnapshot(absRoot, abs, snapshot)
+    } else if (entry.isFile()) {
+      snapshot.files.push({ relPath, data: await readFile(abs) })
+    }
+  }
+}
+
+async function restoreRoot(projectDir: string, snapshot: ProcessRootSnapshot): Promise<void> {
+  const absRoot = join(projectDir, snapshot.relRoot)
+  await rm(absRoot, { recursive: true, force: true })
+  if (!snapshot.existed) return
+  await mkdir(absRoot, { recursive: true })
+  for (const relDir of snapshot.dirs) {
+    await mkdir(join(absRoot, relDir), { recursive: true })
+  }
+  for (const file of snapshot.files) {
+    const abs = join(absRoot, file.relPath)
+    await mkdir(dirname(abs), { recursive: true })
+    await writeFile(abs, file.data)
   }
 }

@@ -151,7 +151,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
         projectDir,
         getGoal,
         observer: baseConfig.autoOrchObserver,
-        nodeRunnerOptions: { roleCatalog, worktrees },
+        nodeRunnerOptions: { roleCatalog, worktrees, executorMaxTurns: baseConfig.autoOrchExecutorMaxTurns },
       })
     : null
 
@@ -172,7 +172,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
         // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
         // came from — verify/drift/reviewer are defined once. Parallel writers
         // merge via the shared worktree coordinator.
-        nodeRunnerOptions: { roleCatalog, worktrees },
+        nodeRunnerOptions: { roleCatalog, worktrees, executorMaxTurns: baseConfig.autoOrchExecutorMaxTurns },
       })
     : null
   const phaseHooks = orchController ? buildAutoOrchLaunchHooks(orchController) : undefined

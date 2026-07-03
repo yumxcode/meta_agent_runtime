@@ -153,7 +153,7 @@ export async function loadAutoOrchPlan(projectDir: string, refText: string): Pro
   if (!manifest) return null
   const approved = await readJsonFile<OrchPlan>(join(parsed.dir, 'approved.plan.json'))
   const materialized = await readJsonFile<OrchPlan>(join(parsed.dir, 'materialized.plan.json'))
-  const plan = approved ?? materialized
+  const plan = materialized ?? approved
   if (!plan) return null
   return { ref: parsed, manifest, plan }
 }

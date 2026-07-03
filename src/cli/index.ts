@@ -230,6 +230,7 @@ ${bold('OPTIONS')}
       --auto-orch-review-plan  Planner-only interactive review before auto_orch executes
       --auto-orch-plan <id[@vN]|latest>  Reuse a saved auto_orch plan
       --auto-orch-revise <text>  Revise the saved auto_orch plan before execution
+      --auto-orch-executor-max-turns <n>  Override auto_orch executor sub-agent max turns
       --auto-worktree-cleanup <preserve|safe|aggressive>  Auto worktree cleanup policy
   -j, --json            Output raw JSON events
   -v, --version         Print version
@@ -356,6 +357,7 @@ interface CliOptions {
   autoOrchReviewPlan: boolean     // --auto-orch-review-plan: review planner graph before execution
   autoOrchPlan: string | undefined
   autoOrchRevise: string | undefined
+  autoOrchExecutorMaxTurns: number | undefined
   autoWorktreeCleanup: AutoWorktreeCleanupStrategy | undefined
   prompt: string | null
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
@@ -386,6 +388,7 @@ function parseCliArgs(): CliOptions {
         'auto-orch-review-plan': { type: 'boolean', default: false },
         'auto-orch-plan': { type: 'string' },
         'auto-orch-revise': { type: 'string' },
+        'auto-orch-executor-max-turns': { type: 'string' },
         'auto-worktree-cleanup': { type: 'string' },
         json:         { type: 'boolean', short: 'j', default: false },
         version:      { type: 'boolean', short: 'v', default: false },
@@ -444,6 +447,7 @@ function parseCliArgs(): CliOptions {
     process.exit(1)
   }
   const rawCleanup = parsed.values['auto-worktree-cleanup'] as string | undefined
+  const rawAutoOrchExecutorMaxTurns = parsed.values['auto-orch-executor-max-turns'] as string | undefined
   if (rawCleanup && !['preserve', 'safe', 'aggressive'].includes(rawCleanup)) {
     console.error(red(`Error: --auto-worktree-cleanup must be preserve, safe, or aggressive (got "${rawCleanup}")`))
     process.exit(1)
@@ -458,6 +462,14 @@ function parseCliArgs(): CliOptions {
         console.error(red(`Error: --max-turns must be a positive integer or "infinity" (got "${rawMaxTurns}")`))
         process.exit(1)
       }
+    }
+  }
+  let autoOrchExecutorMaxTurns: number | undefined
+  if (rawAutoOrchExecutorMaxTurns) {
+    autoOrchExecutorMaxTurns = parseInt(rawAutoOrchExecutorMaxTurns, 10)
+    if (isNaN(autoOrchExecutorMaxTurns) || autoOrchExecutorMaxTurns < 1) {
+      console.error(red(`Error: --auto-orch-executor-max-turns must be a positive integer (got "${rawAutoOrchExecutorMaxTurns}")`))
+      process.exit(1)
     }
   }
 
@@ -477,6 +489,7 @@ function parseCliArgs(): CliOptions {
     autoOrchReviewPlan: parsed.values['auto-orch-review-plan'] as boolean,
     autoOrchPlan: parsed.values['auto-orch-plan'] as string | undefined,
     autoOrchRevise: parsed.values['auto-orch-revise'] as string | undefined,
+    autoOrchExecutorMaxTurns,
     autoWorktreeCleanup: rawCleanup as AutoWorktreeCleanupStrategy | undefined,
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
@@ -1120,6 +1133,7 @@ function makeRouter(
   const interactiveAutoOrch = explicitAutoOrch && !opts.json && isTTY
   if (opts.autoOrchPlan) cfg.autoOrchPlanRef = opts.autoOrchPlan
   if (opts.autoOrchRevise) cfg.autoOrchPlanRevision = opts.autoOrchRevise
+  if (opts.autoOrchExecutorMaxTurns) cfg.autoOrchExecutorMaxTurns = opts.autoOrchExecutorMaxTurns
   if (opts.autoWorktreeCleanup) cfg.autoWorktreeCleanup = opts.autoWorktreeCleanup
   if (opts.autoOrchReviewPlan || !!opts.autoOrchRevise || (interactiveAutoOrch && !opts.yes)) {
     cfg.autoOrchPlannerReview = { enabled: true, maxRounds: 3 }

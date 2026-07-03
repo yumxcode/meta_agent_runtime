@@ -52,7 +52,7 @@ const DEFAULT_DESTROY_WAIT_MS = 10_000
 const DEFAULT_AUTO_RETRY_LIMIT = 2
 /** Auto-mode conservative scheduler defaults (override-able by env vars). */
 const AUTO_MAX_CONCURRENT_SUB_AGENTS = 3
-const AUTO_DEFAULT_TOTAL_BUDGET_USD = 5
+const AUTO_DEFAULT_TOTAL_BUDGET_USD = 10
 
 const MERGED_NOTICE_RE = /^\[(\d+) 条更早的子代理通知已合并/
 const SHARED_READONLY_BLOCKED_WRITE_TOOLS = new Set([

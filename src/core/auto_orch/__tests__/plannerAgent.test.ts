@@ -366,8 +366,8 @@ describe('makeAutoOrchPlanner', () => {
     expect(out.seedPlanRef).toMatchObject({ planId: 'p1', version: 1 })
   })
 
-  it('loads the approved graph before a prior materialized graph', async () => {
-    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-approved-first-'))
+  it('loads the materialized graph before the approved graph', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-materialized-first-'))
     const approved = parseOrchPlan(VALID_PLAN_JSON)!
     const materialized: typeof approved = {
       ...approved,
@@ -392,7 +392,7 @@ describe('makeAutoOrchPlanner', () => {
     await saveMaterializedAutoOrchPlan(projectDir, ref, materialized)
 
     const loaded = await loadAutoOrchPlan(projectDir, 'p1')
-    expect(loaded?.plan.entry).toBe(approved.entry)
+    expect(loaded?.plan.entry).toBe(materialized.entry)
   })
 
   it('planner review can request a revision and feed the feedback into the next planner attempt', async () => {

@@ -263,6 +263,34 @@ export async function main(input, api) {
     expect(updated).toMatchObject({ stale_count: 2, status: 'pivot_required' })
     expect(updated.updated_at).toMatch(/^\d{4}-\d{2}-\d{2}T/)
   })
+
+  it('allows api.state reads inside the workspace but rejects writes outside state/', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-code-scope-'))
+    await writeFile(join(projectDir, 'README.md'), 'workspace context\n', 'utf-8')
+    const source = `
+export async function main(input, api) {
+  const readme = await api.state.readText("README.md")
+  if (!readme.includes("workspace context")) return { action: 'branch', label: 'error' }
+  await api.state.writeText("tmp/leak.txt", "leak")
+  return { action: 'branch', label: 'ok' }
+}`
+    const artifact = await writeCodeNodeArtifact(projectDir, 'scope', source)
+    const verdict = await new CodeNodeRunner({ projectDir }).run({
+      id: 'scope',
+      kind: 'code',
+      taskDescription: 'scope',
+      codeRef: artifact.codeRef,
+      sourceHash: artifact.sourceHash,
+      capabilities: ['state.read', 'state.write'],
+    }, new AbortController().signal)
+
+    expect(verdict).toMatchObject({
+      action: 'branch',
+      label: 'error',
+      note: expect.stringContaining('api.state write path must be under state/'),
+    })
+    await expect(readFile(join(projectDir, 'tmp', 'leak.txt'), 'utf-8')).rejects.toThrow()
+  })
 })
 
 // ── Graceful-termination (cycle escape) check ───────────────────────────────────

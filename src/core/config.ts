@@ -312,6 +312,9 @@ export interface MetaAgentConfig {
   /** Optional instruction for revising autoOrchPlanRef before execution. */
   autoOrchPlanRevision?: string
 
+  /** Optional override for auto_orch executor sub-agent turn limits. */
+  autoOrchExecutorMaxTurns?: number
+
   /**
    * Cleanup policy for auto-series isolated-write worktrees.
    * - preserve: keep tracked worktrees for manual recovery/resume.
@@ -444,6 +447,7 @@ export type ResolvedConfig = Required<
     | 'autoOrchPlannerReview'
     | 'autoOrchPlanRef'
     | 'autoOrchPlanRevision'
+    | 'autoOrchExecutorMaxTurns'
     | 'autoWorktreeCleanup'
     | 'autoOrchObserver'
     | 'permissionConfig'
@@ -480,6 +484,7 @@ export type ResolvedConfig = Required<
   autoOrchPlannerReview?: MetaAgentConfig['autoOrchPlannerReview']
   autoOrchPlanRef?: MetaAgentConfig['autoOrchPlanRef']
   autoOrchPlanRevision?: MetaAgentConfig['autoOrchPlanRevision']
+  autoOrchExecutorMaxTurns?: MetaAgentConfig['autoOrchExecutorMaxTurns']
   autoWorktreeCleanup?: MetaAgentConfig['autoWorktreeCleanup']
   autoOrchObserver?: MetaAgentConfig['autoOrchObserver']
   permissionConfig?: PermissionConfig
@@ -601,6 +606,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     autoOrchPlannerReview: config.autoOrchPlannerReview,
     autoOrchPlanRef: config.autoOrchPlanRef,
     autoOrchPlanRevision: config.autoOrchPlanRevision,
+    autoOrchExecutorMaxTurns: config.autoOrchExecutorMaxTurns,
     autoWorktreeCleanup: config.autoWorktreeCleanup,
     autoOrchObserver: config.autoOrchObserver,
     permissionConfig: config.permissionConfig,

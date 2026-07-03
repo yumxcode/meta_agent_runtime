@@ -5,20 +5,26 @@
  * records so the whole pipeline runs deterministically without a live LLM.
  */
 import { describe, it, expect } from 'vitest'
-import { mkdtemp, readFile } from 'fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { execFile } from 'child_process'
+import { promisify } from 'util'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentRecord, SubAgentStatus } from '../../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../../subagent/types.js'
 import { KernelNodeRunner, parseRoleVerdict } from '../KernelNodeRunner.js'
 import { AutoOrchController, buildAutoOrchLaunchHooks } from '../AutoOrchController.js'
 import { materializeCodeNodes } from '../CodeNodeAuthor.js'
+import { loadAutoOrchPlan, saveApprovedAutoOrchPlan, saveMaterializedAutoOrchPlan } from '../PlanStore.js'
 import { RoleCatalog } from '../RoleRegistry.js'
 import { runReviewer } from '../reviewer.js'
 import type { OrchNode } from '../LoopIR.js'
 import type { PlanRunContext } from '../PlanRunner.js'
 import type { PhaseHookEvent } from '../../../kernel/loop/PhaseHooks.js'
+import type { AutoWorktreeCoordinator } from '../../auto/AutoWorktreeCoordinator.js'
+
+const execFileAsync = promisify(execFile)
 
 /**
  * A catalogue where verify/drift resolve to the GENERIC reviewer (pass/fail
@@ -118,6 +124,137 @@ describe('KernelNodeRunner', () => {
     const v = await runner.run(exec, ctx())
     expect(v).toMatchObject({ action: 'branch', label: 'ok' })
     expect(v.data?.['costUsd']).toBe(0.2)
+  })
+
+  it('lets auto_orch override executor maxTurns for saved plans', async () => {
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([{ summary: 'built it', success: true }])
+    const seenMaxTurns: number[] = []
+    const wrapped: ISubAgentDispatcher = {
+      async spawnSubAgent(opts) {
+        seenMaxTurns.push(opts.config.maxTurns ?? -1)
+        return dispatcher.spawnSubAgent(opts)
+      },
+      getStatus: dispatcher.getStatus,
+      cancelTask: dispatcher.cancelTask,
+    }
+    const runner = new KernelNodeRunner(wrapped, { executorMaxTurns: 90 })
+
+    const v = await runner.run({ ...exec, maxTurns: 12 }, ctx())
+
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    expect(seenMaxTurns).toEqual([90])
+    expect(captured).toHaveLength(0)
+  })
+
+  it('merges a successful isolated_write executor before routing forward', async () => {
+    const merged: string[] = []
+    const worktrees = {
+      enabled: true,
+      recordFor(taskId: string) {
+        return { taskId, worktreePath: '/tmp/worktree' }
+      },
+      async finalize() {
+        return { status: 'committed', changedFiles: ['src/app.ts'], commitHash: 'def456' }
+      },
+      async merge(taskId: string) {
+        merged.push(taskId)
+        return { merged: true, commitHash: 'abc123' }
+      },
+    } as unknown as AutoWorktreeCoordinator
+    const runner = new KernelNodeRunner(
+      queueDispatcher([{ summary: 'bootstrapped state', success: true, output: { label: 'ok' } }]),
+      { worktrees },
+    )
+
+    const v = await runner.run(exec, ctx())
+
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    expect(merged).toHaveLength(1)
+    expect(merged[0]).toMatch(/^subtask-/)
+  })
+
+  it('syncs state-only isolated_write changes without git-merging the main tree', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-main-'))
+    const worktreePath = await mkdtemp(join(tmpdir(), 'auto-orch-wt-'))
+    await mkdir(join(worktreePath, 'state'), { recursive: true })
+    await writeFile(join(worktreePath, 'state', 'progress.json'), '{"iteration":1}\n', 'utf-8')
+    const calls: string[] = []
+    const worktrees = {
+      enabled: true,
+      recordFor(taskId: string) {
+        return { taskId, worktreePath }
+      },
+      async finalize(taskId: string) {
+        calls.push(`finalize:${taskId}`)
+        return { status: 'committed', changedFiles: ['state/progress.json'], commitHash: 'def456' }
+      },
+      async discard(taskId: string) {
+        calls.push(`discard:${taskId}`)
+      },
+      async merge(taskId: string) {
+        calls.push(`merge:${taskId}`)
+        return { merged: true, commitHash: 'abc123' }
+      },
+    } as unknown as AutoWorktreeCoordinator
+    const runner = new KernelNodeRunner(
+      queueDispatcher([{ summary: 'bootstrapped state', success: true, output: { label: 'ok' } }]),
+      { projectDir, worktrees },
+    )
+
+    const v = await runner.run(exec, ctx())
+
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    await expect(readFile(join(projectDir, 'state', 'progress.json'), 'utf-8')).resolves.toBe('{"iteration":1}\n')
+    expect(calls.some(c => c.startsWith('finalize:'))).toBe(true)
+    expect(calls.some(c => c.startsWith('discard:'))).toBe(true)
+    expect(calls.some(c => c.startsWith('merge:'))).toBe(false)
+  })
+
+  it('diffs committed worktree changes when finalize reports no changedFiles', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-main-'))
+    const worktreePath = await mkdtemp(join(tmpdir(), 'auto-orch-wt-committed-'))
+    await execFileAsync('git', ['init'], { cwd: worktreePath })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: worktreePath })
+    await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: worktreePath })
+    await writeFile(join(worktreePath, 'README.md'), 'base\n', 'utf-8')
+    await execFileAsync('git', ['add', 'README.md'], { cwd: worktreePath })
+    await execFileAsync('git', ['commit', '-m', 'base'], { cwd: worktreePath })
+    const forkPoint = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath })).stdout.trim()
+    await mkdir(join(worktreePath, 'state'), { recursive: true })
+    await writeFile(join(worktreePath, 'state', 'current_direction.json'), '{"id":"D1"}\n', 'utf-8')
+    await execFileAsync('git', ['add', 'state/current_direction.json'], { cwd: worktreePath })
+    await execFileAsync('git', ['commit', '-m', 'direction'], { cwd: worktreePath })
+
+    const calls: string[] = []
+    const worktrees = {
+      enabled: true,
+      recordFor(taskId: string) {
+        return { taskId, worktreePath, forkPoint }
+      },
+      async finalize(taskId: string) {
+        calls.push(`finalize:${taskId}`)
+        return { status: 'already_committed', changedFiles: [], commitHash: 'def456' }
+      },
+      async discard(taskId: string) {
+        calls.push(`discard:${taskId}`)
+      },
+      async merge(taskId: string) {
+        calls.push(`merge:${taskId}`)
+        return { merged: true, commitHash: 'abc123' }
+      },
+    } as unknown as AutoWorktreeCoordinator
+    const runner = new KernelNodeRunner(
+      queueDispatcher([{ summary: 'direction chosen', success: true, output: { label: 'ok' } }]),
+      { projectDir, worktrees },
+    )
+
+    const v = await runner.run(exec, ctx())
+
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    await expect(readFile(join(projectDir, 'state', 'current_direction.json'), 'utf-8')).resolves.toBe('{"id":"D1"}\n')
+    expect(calls.some(c => c.startsWith('discard:'))).toBe(true)
+    expect(calls.some(c => c.startsWith('merge:'))).toBe(false)
   })
 
   it('maps a failed executor to branch:error', async () => {
@@ -233,6 +370,135 @@ describe('materializeCodeNodes', () => {
     expect(captured[1]).toContain('source uses forbidden construct')
     expect(captured[1]).toContain('api.nowIso')
   })
+
+  it('retries code authoring after an unparsable author response', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-parse-retry-'))
+    const source = 'export async function main(input, api) { return { action: "branch", label: "healthy", data: { at: api.nowIso } } }'
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([
+      { summary: 'I can do that, but here is prose instead of JSON.' },
+      { summary: '```json\n' + JSON.stringify({ source, note: 'fixed format' }) + '\n```' },
+    ], captured)
+
+    const out = await materializeCodeNodes({
+      entry: 'reduce',
+      nodes: [{
+        id: 'reduce',
+        kind: 'code',
+        taskDescription: 'reduce',
+        codeSpec: { description: 'return healthy with a timestamp', labels: ['healthy'] },
+      }],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(1)
+    expect(captured).toHaveLength(2)
+    expect(captured[1]).toContain('no parseable source JSON')
+  })
+
+  it('batches multiple missing code nodes through one code_author spawn', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-batch-'))
+    const sourceA = 'export async function main(input, api) { await api.state.writeJson("state/a.json", { ok: true }); return { action: "branch", label: "ok" } }'
+    const sourceB = 'export async function main(input, api) { await api.state.writeJson("state/b.json", { ok: true }); return { action: "branch", label: "done" } }'
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([{
+      summary: '```json\n' + JSON.stringify({
+        nodes: [
+          { id: 'write_a', source: sourceA, note: 'writes a' },
+          { id: 'write_b', source: sourceB, note: 'writes b' },
+        ],
+      }) + '\n```',
+    }], captured)
+
+    const out = await materializeCodeNodes({
+      entry: 'write_a',
+      nodes: [
+        {
+          id: 'write_a',
+          kind: 'code',
+          taskDescription: 'write a',
+          codeSpec: { description: 'write state/a.json', outputs: ['state/a.json'], labels: ['ok'] },
+        },
+        {
+          id: 'write_b',
+          kind: 'code',
+          taskDescription: 'write b',
+          codeSpec: { description: 'write state/b.json', outputs: ['state/b.json'], labels: ['done'] },
+        },
+      ],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(2)
+    expect(captured).toHaveLength(1)
+    expect(captured[0]).toContain('write_a')
+    expect(captured[0]).toContain('write_b')
+    expect(out.plan.nodes[0].codeRef).toMatch(/^code_nodes\//)
+    expect(out.plan.nodes[1].codeRef).toMatch(/^code_nodes\//)
+  })
+
+  it('materializes report writer code nodes with a deterministic built-in source', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-report-'))
+    const dispatcher = queueDispatcher([])
+
+    const out = await materializeCodeNodes({
+      entry: 'attention_report_writer',
+      nodes: [{
+        id: 'attention_report_writer',
+        kind: 'code',
+        taskDescription: '生成需要人工干预的报告后停止',
+        codeSpec: {
+          description: 'Read progress and write an attention report.',
+          inputs: ['state/progress.json'],
+          outputs: ['state/attention_report.md'],
+          labels: ['ok'],
+        },
+        capabilities: ['state.read', 'state.write'],
+      }],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(1)
+    const codeRef = out.plan.nodes[0].codeRef
+    expect(codeRef).toMatch(/^code_nodes\//)
+    const source = await readFile(join(projectDir, '.meta-agent/auto_orch', codeRef!), 'utf-8')
+    expect(source).toContain('Attention Required Report')
+    expect(source).toContain('state/attention_report.md')
+  })
+
+  it('re-materializes saved code nodes when their local source artifact is missing', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-missing-artifact-'))
+    const dispatcher = queueDispatcher([])
+
+    const out = await materializeCodeNodes({
+      entry: 'completion_report',
+      nodes: [{
+        id: 'completion_report',
+        kind: 'code',
+        taskDescription: '生成完成报告后停止',
+        codeRef: 'code_node/missing.mjs',
+        sourceHash: '0'.repeat(64),
+        codeSpec: {
+          description: 'Read progress and write a completion report.',
+          inputs: ['state/progress.json'],
+          outputs: ['state/completion_report.md'],
+          labels: ['ok'],
+        },
+        capabilities: ['state.read', 'state.write'],
+      }],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(1)
+    const codeRef = out.plan.nodes[0].codeRef
+    expect(codeRef).toMatch(/^code_nodes\//)
+    expect(codeRef).not.toBe('code_node/missing.mjs')
+    await expect(readFile(join(projectDir, '.meta-agent/auto_orch', codeRef!), 'utf-8')).resolves.toContain('Completion Report')
+  })
 })
 
 // ── AutoOrchController (end-to-end) ────────────────────────────────────────────
@@ -250,6 +516,33 @@ const PLAN = '```json\n' + JSON.stringify({
   bounds: { maxNodeVisits: 4 },
 }) + '\n```'
 
+const CODE_PLAN = '```json\n' + JSON.stringify({
+  entry: 'compute_value',
+  nodes: [{
+    id: 'compute_value',
+    kind: 'code',
+    taskDescription: 'compute a deterministic value',
+    codeSpec: { description: 'return ok after computing a deterministic value', labels: ['ok'] },
+  }],
+  edges: [],
+}) + '\n```'
+
+const FAILING_STATE_CODE_PLAN = '```json\n' + JSON.stringify({
+  entry: 'write_then_fail',
+  nodes: [{
+    id: 'write_then_fail',
+    kind: 'code',
+    taskDescription: 'write process state, then fail',
+    codeSpec: {
+      description: 'write temporary process state and return an error verdict',
+      outputs: ['state/progress.json', 'state/transient.txt'],
+      labels: ['error'],
+    },
+    capabilities: ['state.write'],
+  }],
+  edges: [],
+}) + '\n```'
+
 describe('AutoOrchController', () => {
   it('plans then runs the graph to completion (gen → verify pass)', async () => {
     // queue: planner plan, then gen (executor ok), then verify (pass)
@@ -265,6 +558,60 @@ describe('AutoOrchController', () => {
     expect(result.run.visitedPath).toEqual(['gen', 'verify'])
     expect(result.run.costUsd).toBeCloseTo(0.4, 5)
     expect(result.summary).toContain('gen → verify')
+  })
+
+  it('cleans worktrees when graph setup exits early as invalid', async () => {
+    const cleanupStrategies: string[] = []
+    const controller = new AutoOrchController({
+      dispatcher: queueDispatcher([
+        { summary: CODE_PLAN },
+        { summary: '', status: 'failed', success: false },
+        { summary: '', status: 'failed', success: false },
+        { summary: '', status: 'failed', success: false },
+      ]),
+      projectDir: '/tmp',
+      getGoal: () => 'build X',
+      worktreeCleanup: {
+        strategy: 'safe',
+        coordinator: {
+          async cleanup(strategy: string) {
+            cleanupStrategies.push(strategy)
+          },
+        } as unknown as AutoWorktreeCoordinator,
+      },
+    })
+
+    const result = await controller.run(new AbortController().signal)
+
+    expect(result.run.status).toBe('invalid')
+    expect(cleanupStrategies).toEqual(['safe'])
+  })
+
+  it('restores process state files when graph execution fails', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-failed-state-'))
+    await mkdir(join(projectDir, 'state'), { recursive: true })
+    await writeFile(join(projectDir, 'state', 'progress.json'), '{"before":true}\n', 'utf-8')
+    const source = `
+export async function main(input, api) {
+  await api.state.writeJson("state/progress.json", { before: false })
+  await api.state.writeText("state/transient.txt", "temporary\\n")
+  return { action: "branch", label: "error", note: "fail after writing state" }
+}
+`
+    const controller = new AutoOrchController({
+      dispatcher: queueDispatcher([
+        { summary: FAILING_STATE_CODE_PLAN },
+        { summary: '```json\n' + JSON.stringify({ source }) + '\n```' },
+      ]),
+      projectDir,
+      getGoal: () => 'build X',
+    })
+
+    const result = await controller.run(new AbortController().signal)
+
+    expect(result.run.status).toBe('failed')
+    await expect(readFile(join(projectDir, 'state', 'progress.json'), 'utf-8')).resolves.toBe('{"before":true}\n')
+    await expect(readFile(join(projectDir, 'state', 'transient.txt'), 'utf-8')).rejects.toThrow()
   })
 
   it('persists an explicitly approved graph, materialized plan, and run record', async () => {
@@ -292,6 +639,54 @@ describe('AutoOrchController', () => {
     await expect(readFile(join(dir, 'materialized.plan.json'), 'utf-8')).resolves.toContain('"entry"')
     await expect(readFile(join(dir, 'runs.jsonl'), 'utf-8')).resolves.toContain('"status":"completed"')
     expect(manifest).toMatchObject({ approvedByUser: true, latestRunAt: expect.any(Number) })
+  })
+
+  it('repairs a saved materialized plan whose code artifact was deleted before execution', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-saved-missing-code-'))
+    const stalePlan = {
+      id: 'saved-missing-code',
+      entry: 'completion_report',
+      nodes: [{
+        id: 'completion_report',
+        kind: 'code' as const,
+        taskDescription: '生成完成报告后停止',
+        codeRef: 'code_node/missing.mjs',
+        sourceHash: '0'.repeat(64),
+        codeSpec: {
+          description: 'Read progress and write a completion report.',
+          inputs: ['state/progress.json'],
+          outputs: ['state/completion_report.md'],
+          labels: ['ok'],
+        },
+        capabilities: ['state.read', 'state.write'],
+      }],
+      edges: [],
+    }
+    const ref = await saveApprovedAutoOrchPlan(projectDir, {
+      goal: 'run saved graph',
+      plan: stalePlan,
+      source: 'planner',
+      approvedByUser: true,
+    })
+    await saveMaterializedAutoOrchPlan(projectDir, ref, stalePlan)
+
+    const controller = new AutoOrchController({
+      dispatcher: queueDispatcher([]),
+      projectDir,
+      getGoal: () => 'run saved graph',
+      planRef: 'latest',
+    })
+
+    const result = await controller.run(new AbortController().signal)
+
+    expect(result.planSource).toBe('saved')
+    expect(result.run.status).toBe('completed')
+    await expect(readFile(join(projectDir, 'state/completion_report.md'), 'utf-8')).resolves.toContain('Completion Report')
+    const loaded = await loadAutoOrchPlan(projectDir, 'latest')
+    const repairedRef = loaded?.plan.nodes[0].codeRef
+    expect(repairedRef).toMatch(/^code_nodes\//)
+    expect(repairedRef).not.toBe('code_node/missing.mjs')
+    await expect(readFile(join(projectDir, '.meta-agent/auto_orch', repairedRef!), 'utf-8')).resolves.toContain('Completion Report')
   })
 
   it('drives a generate→verify→fix cycle and flows correctives via the blackboard', async () => {

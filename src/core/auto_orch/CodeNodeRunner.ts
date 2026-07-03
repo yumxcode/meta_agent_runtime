@@ -29,11 +29,18 @@ function assertCap(cap) {
   if (!caps.has(cap)) throw new Error('missing capability: ' + cap)
 }
 
-function safePath(p) {
+function safeReadPath(p) {
   if (typeof p !== 'string' || !p) throw new Error('path must be a non-empty string')
   const abs = resolve(root, p)
-  const rel = relative(root, abs)
+  const rel = relative(root, abs).replace(/\\/g, '/')
   if (rel.startsWith('..') || rel === '' || rel.startsWith('/')) throw new Error('path escapes projectDir: ' + p)
+  return abs
+}
+
+function safeWritePath(p) {
+  const abs = safeReadPath(p)
+  const rel = relative(root, abs).replace(/\\/g, '/')
+  if (!rel.startsWith('state/')) throw new Error('api.state write path must be under state/: ' + p)
   return abs
 }
 
@@ -49,25 +56,25 @@ const api = {
   state: {
     async readJson(path) {
       assertCap('state.read')
-      return JSON.parse(await readFile(safePath(path), 'utf-8'))
+      return JSON.parse(await readFile(safeReadPath(path), 'utf-8'))
     },
     async writeJson(path, value) {
       assertCap('state.write')
-      await atomicWrite(safePath(path), JSON.stringify(value, null, 2))
+      await atomicWrite(safeWritePath(path), JSON.stringify(value, null, 2))
     },
     async appendJsonl(path, value) {
       assertCap('jsonl.append')
-      const abs = safePath(path)
+      const abs = safeWritePath(path)
       await mkdir(dirname(abs), { recursive: true })
       await appendFile(abs, JSON.stringify(value) + '\n', 'utf-8')
     },
     async readText(path) {
       assertCap('state.read')
-      return readFile(safePath(path), 'utf-8')
+      return readFile(safeReadPath(path), 'utf-8')
     },
     async writeText(path, value) {
       assertCap('state.write')
-      await atomicWrite(safePath(path), String(value))
+      await atomicWrite(safeWritePath(path), String(value))
     }
   },
   log(level, event, detail) {
