@@ -227,6 +227,95 @@ describe('validatePlan', () => {
     expect(validatePlan(plan, { allowUnmaterializedCode: true })).toHaveLength(0)
     expect(validatePlan(plan).some(e => e.includes('materialized'))).toBe(true)
   })
+
+  // ── Canonical-state path convention (.meta-agent/ is merge-excluded) ────────
+
+  it('rejects .meta-agent/ paths in taskDescription with an instructive message', () => {
+    const plan: OrchPlan = {
+      entry: 'init',
+      nodes: [node('init', {
+        workspaceMode: 'isolated_write',
+        taskDescription: '初始化 .meta-agent/research/task-001/state/progress.json',
+      })],
+      edges: [],
+    }
+    const errs = validatePlan(plan)
+    expect(errs.length).toBeGreaterThan(0)
+    expect(errs[0]).toContain('.meta-agent')
+    expect(errs[0]).toContain("state/") // remediation points to the canonical location
+  })
+
+  it('rejects .meta-agent/ in codeSpec inputs/outputs and input values', () => {
+    const plan: OrchPlan = {
+      entry: 'reduce',
+      nodes: [{
+        id: 'reduce',
+        kind: 'code',
+        taskDescription: 'reduce progress',
+        codeSpec: {
+          description: 'reduce',
+          inputs: ['.meta-agent/research/t1/state/progress.json'],
+          outputs: ['state/progress.json'],
+          labels: ['healthy'],
+        },
+        input: { taskDir: '.meta-agent/research/t1' },
+      }],
+      edges: [],
+    }
+    const errs = validatePlan(plan, { allowUnmaterializedCode: true })
+    expect(errs.some(e => e.includes('codeSpec.inputs'))).toBe(true)
+    expect(errs.some(e => e.includes('input'))).toBe(true)
+  })
+
+  it('rejects .meta-agent/ in declared outputs and parallel writeScope', () => {
+    const plan: OrchPlan = {
+      entry: 'par',
+      nodes: [
+        node('gen', { workspaceMode: 'isolated_write', outputs: ['.meta-agent/state/x.json'] }),
+        {
+          id: 'par',
+          kind: 'parallel',
+          taskDescription: 'fan out',
+          branches: [{
+            id: 'w',
+            taskDescription: 'write',
+            workspaceMode: 'isolated_write',
+            writeScope: ['.meta-agent/research/**'],
+          }],
+        },
+      ],
+      edges: [{ from: 'par', to: 'gen' }],
+    }
+    const errs = validatePlan(plan)
+    expect(errs.some(e => e.includes('outputs'))).toBe(true)
+    expect(errs.some(e => e.includes('writeScope'))).toBe(true)
+  })
+
+  it('rejects absolute or escaping declared outputs', () => {
+    const plan: OrchPlan = {
+      entry: 'gen',
+      nodes: [node('gen', {
+        workspaceMode: 'isolated_write',
+        outputs: ['/etc/passwd', '../outside.json'],
+      })],
+      edges: [],
+    }
+    const errs = validatePlan(plan)
+    expect(errs.filter(e => e.includes('workspace-relative'))).toHaveLength(2)
+  })
+
+  it('accepts state/-rooted paths everywhere', () => {
+    const plan: OrchPlan = {
+      entry: 'gen',
+      nodes: [node('gen', {
+        workspaceMode: 'isolated_write',
+        taskDescription: '写 state/progress.json 与 state/findings.jsonl',
+        outputs: ['state/progress.json'],
+      })],
+      edges: [],
+    }
+    expect(validatePlan(plan)).toHaveLength(0)
+  })
 })
 
 // ── Code nodes ───────────────────────────────────────────────────────────────
@@ -467,7 +556,18 @@ describe('PlanRunner', () => {
     expect(result.note).toBe('stop now')
   })
 
-  it('marks terminal error handler nodes as failed, not completed', async () => {
+  it('marks failed abort verdicts as failed', async () => {
+    const runner: NodeRunner = {
+      async run() {
+        return { action: 'abort', label: 'error', note: 'fatal stop', data: { failed: true } }
+      },
+    }
+    const result = await new PlanRunner(genVerifyFix, runner).run(new AbortController().signal)
+    expect(result.status).toBe('failed')
+    expect(result.note).toBe('fatal stop')
+  })
+
+  it('does not infer terminal failure from node id naming', async () => {
     const plan: OrchPlan = {
       entry: 'error_writer',
       nodes: [{ id: 'error_writer', kind: 'code', taskDescription: 'record error', codeRef: 'x', sourceHash: 'y' }],
@@ -475,8 +575,19 @@ describe('PlanRunner', () => {
     }
     const runner: NodeRunner = { async run() { return { action: 'branch', label: 'ok' } } }
     const result = await new PlanRunner(plan, runner).run(new AbortController().signal)
+    expect(result.status).toBe('completed')
+  })
+
+  it('marks terminal explicit error labels as failed', async () => {
+    const plan: OrchPlan = {
+      entry: 'record_status',
+      nodes: [{ id: 'record_status', kind: 'code', taskDescription: 'record error', codeRef: 'x', sourceHash: 'y' }],
+      edges: [],
+    }
+    const runner: NodeRunner = { async run() { return { action: 'branch', label: 'error', note: 'state write failed' } } }
+    const result = await new PlanRunner(plan, runner).run(new AbortController().signal)
     expect(result.status).toBe('failed')
-    expect(result.note).toContain('error_writer')
+    expect(result.note).toBe('state write failed')
   })
 
   it('treats a paused verdict as a legal run stop with a resume handle', async () => {
@@ -498,6 +609,32 @@ describe('PlanRunner', () => {
     expect(result.note).toBe('waiting for training')
     expect(result.costUsd).toBe(0.2)
     expect(result.visitedPath).toEqual(['gen'])
+    expect(result.resumeHandle).toMatchObject({
+      agentSessionId: 'auto-orch-subagent-1',
+      externalRunId: 'train-1',
+    })
+  })
+
+  it('lets a paused verdict win over cost bounds so the resume handle is schedulable', async () => {
+    const runner: NodeRunner = {
+      async run() {
+        return {
+          action: 'branch',
+          label: 'paused',
+          note: 'waiting for training',
+          data: {
+            costUsd: 0.2,
+            resumeHandle: { agentSessionId: 'auto-orch-subagent-1', externalRunId: 'train-1' },
+          },
+        }
+      },
+    }
+    const result = await new PlanRunner(
+      { ...genVerifyFix, bounds: { maxTotalCostUsd: 0.1 } },
+      runner,
+    ).run(new AbortController().signal)
+    expect(result.status).toBe('paused')
+    expect(result.costUsd).toBe(0.2)
     expect(result.resumeHandle).toMatchObject({
       agentSessionId: 'auto-orch-subagent-1',
       externalRunId: 'train-1',

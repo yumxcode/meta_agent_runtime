@@ -81,7 +81,8 @@ export class RoleCatalog {
   buildHandler(role: string, ctx: RoleContext): RoleHandler {
     const def = this.roles.get(role)
     if (def) return def.buildHandler(ctx)
-    return ({ criteria, signal }) => runReviewer(ctx.dispatcher, { role, criteria, signal })
+    return ({ criteria, signal }) =>
+      runReviewer(ctx.dispatcher, { role, criteria, signal, projectDir: ctx.projectDir })
   }
 
   /** The kernel completion gate from the registered 'verify' role, if any. */
@@ -97,15 +98,42 @@ export class RoleCatalog {
 
 // ── Built-in roles ──────────────────────────────────────────────────────────────
 
+/**
+ * Compose the frozen goal with the node's plan-authored review criteria (its
+ * taskDescription). The goal stays the anchor — criteria NARROW what the gate
+ * must check, they never replace the goal. Without this, verify/drift role
+ * nodes silently ignored the Planner's per-node review rubric and judged only
+ * the global goal (review report M1).
+ */
+export function goalWithCriteria(
+  getGoal: () => string | null,
+  criteria: string,
+): () => string | null {
+  return () => {
+    const goal = getGoal()
+    const extra = criteria.trim()
+    if (!extra) return goal
+    if (!goal || !goal.trim()) return extra
+    if (goal.includes(extra)) return goal // planner echoed the goal — don't duplicate
+    return [
+      goal,
+      '',
+      '【本节点的审查标准（由编排计划为此审查节点指定，判定时必须逐条核对）】',
+      extra,
+    ].join('\n')
+  }
+}
+
 /** verify: the completion judge. Kernel gate + node handler both delegate to it. */
 const VERIFY_ROLE: RoleDefinition = {
   name: 'verify',
   description: '完成度审查：对照原始目标核对是否真正达成。',
   buildVerifyGate: ctx => makeAutoVerifyGate(ctx),
-  buildHandler: ctx => {
-    const gate = makeAutoVerifyGate(ctx)
-    return async ({ signal }) =>
-      fromVerify(await gate({ workspaceRoot: ctx.projectDir, turnCount: 0, round: 1, signal }))
+  // Node handler: build the gate PER INVOCATION so the node's criteria can be
+  // folded into the goal the judge reads (lazily, via getGoal).
+  buildHandler: ctx => async ({ criteria, signal }) => {
+    const gate = makeAutoVerifyGate({ ...ctx, getGoal: goalWithCriteria(ctx.getGoal, criteria) })
+    return fromVerify(await gate({ workspaceRoot: ctx.projectDir, turnCount: 0, round: 1, signal }))
   },
 }
 
@@ -114,10 +142,9 @@ const DRIFT_ROLE: RoleDefinition = {
   name: 'drift',
   description: '航向审查：对照原始目标判断是否偏离。',
   buildDriftGate: ctx => makeAutoDriftGate(ctx),
-  buildHandler: ctx => {
-    const gate = makeAutoDriftGate(ctx)
-    return async ({ signal }) =>
-      fromDrift(await gate({ workspaceRoot: ctx.projectDir, turnCount: 0, reason: 'turn_interval', signal }))
+  buildHandler: ctx => async ({ criteria, signal }) => {
+    const gate = makeAutoDriftGate({ ...ctx, getGoal: goalWithCriteria(ctx.getGoal, criteria) })
+    return fromDrift(await gate({ workspaceRoot: ctx.projectDir, turnCount: 0, reason: 'turn_interval', signal }))
   },
 }
 
@@ -126,7 +153,7 @@ const REVIEWER_ROLE: RoleDefinition = {
   name: 'reviewer',
   description: '通用只读复核：对照标准给出 pass/fail。',
   buildHandler: ctx => ({ criteria, signal }) =>
-    runReviewer(ctx.dispatcher, { role: 'reviewer', criteria, signal }),
+    runReviewer(ctx.dispatcher, { role: 'reviewer', criteria, signal, projectDir: ctx.projectDir }),
 }
 
 /** A catalogue pre-loaded with the three built-in roles. */

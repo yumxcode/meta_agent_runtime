@@ -15,7 +15,7 @@
  *   • reject   — the executor's "done" is rejected; re-injects unfinished items;
  *   • branch   — node finished with a labelled outcome the graph routes on;
  *   • done     — this node/role is satisfied; the orchestrator may advance/stop;
- *   • abort    — terminate the run cleanly.
+ *   • abort    — terminate the run; clean by default, failed when data.failed=true or label='error'/'failed'.
  *
  * `label` is the routing key for `branch` (and may annotate any verdict); it is
  * how a node's outcome selects an outgoing edge (e.g. 'pass' vs 'fail').

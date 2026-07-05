@@ -81,6 +81,9 @@ export interface PlannerOutcome {
 
 /** Read-only investigation tools so the planner can size up the repo first. */
 const PLANNER_TOOLS = ['read_file', 'grep', 'glob', 'bash']
+const DEFAULT_PLANNER_MAX_TURNS = 30
+const DEFAULT_PLANNER_MAX_BUDGET_USD = 2
+const EMPTY_REVISION_FEEDBACK = '用户选择了 Revise plan，但未填写具体修改说明。请基于目标重新审视当前图，简化结构、补齐预算和退出条件后输出修订版。'
 
 const PLANNER_RUBRIC = `\
 你是一个独立的"任务编排规划 Agent"。你不执行任务，只为一个复杂目标设计一张**协作计划图**，交给固定引擎解释执行。
@@ -90,10 +93,10 @@ const PLANNER_RUBRIC = `\
 每个 node 必须有唯一 id 和**自包含**的 taskDescription（子 Agent 看不到你的上下文，所需信息都要写进去）。
 **taskDescription 长度硬性限制**：每个节点限 2-3 句话（合计 ≤200 字）。只写核心指令 + 必要约束（要读写哪些文件、产出什么、禁止什么）。
 **不要**在 taskDescription 里写完整的操作手册、代码分析步骤或论文摘要——子 Agent 执行时会自行探查工作区。
-- "executor"：干活（写代码/研究/改文件）。写文件的 executor **必须** "workspaceMode":"isolated_write"，否则被校验拒绝；只读用 "shared_readonly"。
+- "executor"：干活（写代码/研究/改文件）。写文件的 executor **必须** "workspaceMode":"isolated_write"，否则被校验拒绝；只读用 "shared_readonly"。跨节点状态一律写工作区根目录 state/（禁止 .meta-agent/，见下方"状态文件约定"）。
 - "role"：审查角色，role 取 "verify"（完成度审查）或 "reviewer"（通用只读复核）。审查节点只读，不产出代码；只用于语义性强、错误代价高、会污染长期结果/最终交付的关键产出。
 - "parallel"：**并发组**——需要**同时**跑的多个独立子任务放进**一个** parallel 节点的 branches 里（见下）。
-- "code"：确定性代码节点。你只声明 codeSpec/input/capabilities，不直接写源码；框架会在执行前用专门 code_author 生成源码、review、落盘成 codeRef+sourceHash，然后冻结执行。
+- "code"：规则确定性的机械代码节点。只用于路由标签计算、计数器更新、状态归约、简单 JSON/JSONL 原子落盘等；你只声明 codeSpec/input/capabilities，不直接写源码，框架会在执行前冻结成 codeRef+sourceHash。**摘要、报告、写作、解释、创造性生成、综合判断、需要自然语言质量的产出不要用 code，必须用 executor。**
 
 ## 节点执行预算（maxTurns / maxBudgetUsd）
 - executor 默认 turn 预算较小，只适合短任务。若节点需要长日志分析、实验状态排查、跨文件研究、生成较大 JSON/报告、或可能启动/接管训练任务，必须显式设置 "maxTurns"（建议 60-120）和合理的 "maxBudgetUsd"。
@@ -125,15 +128,21 @@ const PLANNER_RUBRIC = `\
 
 ## 确定性代码节点（code）
 当某一步是机械状态归约、计数器更新、JSON/JSONL 落盘、路由标签计算时，优先用 code 节点，而不是让 executor 用自然语言手写状态。
+code 只能表达可由固定规则决定的结果。若任务包含摘要、报告、写作、创造性生成、研究结论撰写、面向人类的解释文本，必须规划为 executor，即使它最终写入的是 state/*.md 或 state/*.txt。
 你只写规格，不写代码：
 \`\`\`json
 {"id":"reduce_progress","kind":"code","taskDescription":"更新 stale_count 并返回路由标签",
  "codeSpec":{"description":"读取 state/progress.json 与 state/iteration_eval.json；若 newFindingsCount<=0 或 metricDelta<0 则 stale_count+1，否则清零；返回 healthy/stale/pivot_required/attention_required。","inputs":["state/progress.json","state/iteration_eval.json"],"outputs":["state/progress.json"],"labels":["healthy","stale","pivot_required","attention_required"]},
- "input":{"taskDir":".meta-agent/research/task-001"},
+ "input":{"taskId":"task-001"},
  "capabilities":["state.read","state.write","jsonl.append"],
  "codeBounds":{"timeoutMs":3000,"maxOutputBytes":65536}}
 \`\`\`
 code 节点在规划输出里不要包含 codeRef/sourceHash；这些由框架冻结后补齐。
+
+## 状态文件约定（硬性，违反即计划被拒）
+- 所有跨节点共享的状态/产出（progress、findings、迭代日志、摘要、报告等）**必须放在工作区根目录的 \`state/\` 下**（如 state/progress.json、state/findings.jsonl、state/final_report.md）。executor 和 code 节点读写**同一套** state/ 路径。
+- **禁止**在任何 taskDescription、codeSpec、input、writeScope 中引用 \`.meta-agent/\` 下的路径：该目录是运行时内部元数据，任务 worktree 的合并会排除它，写进去的文件会被**静默丢弃**，后续节点根本读不到。
+- **写文件的 executor 建议声明 "outputs"**（工作区相对路径数组，如 \`"outputs":["state/progress.json","state/task_spec.md"]\`）：引擎会在节点合并后校验这些文件确实落地，缺失会把诊断反馈给该节点重试。这能及早暴露"节点自称成功但产出没落到共享状态"的问题。
 
 ## 边 edge
 {from,to,when?}，when 为 {"on":"always"} 或 {"on":"verdictLabel","label":"..."} 或 {"on":"verdictAction","action":"..."}。
@@ -185,7 +194,7 @@ function buildPlannerTask(goal: string): string {
     '【需要编排的目标】',
     goal,
     '',
-    '请先（必要时）用只读工具了解工作区，然后设计计划图，最后只输出一个 OrchPlan 的 JSON 代码块。',
+    '请先（必要时）用只读工具了解工作区，然后设计计划图，最后必须调用 return_result 提交完整 OrchPlan；data 参数为 OrchPlan JSON 对象，summary 用一句话概述。',
   ].join('\n')
 }
 
@@ -466,8 +475,8 @@ async function runPlannerAgent(
       taskDescription,
       systemPrompt: PLANNER_RUBRIC,
       allowedTools: PLANNER_TOOLS,
-      maxTurns: 12,
-      maxBudgetUsd: 0.4,
+      maxTurns: DEFAULT_PLANNER_MAX_TURNS,
+      maxBudgetUsd: DEFAULT_PLANNER_MAX_BUDGET_USD,
       requireHumanApproval: false,
       useEventDriven: false,
       pollIntervalMs: 500,
@@ -848,7 +857,7 @@ async function reviewPlanIfRequested(
     const feedback = await review.askUser('请描述希望 planner 如何修改这张 auto_orch 图。')
     return feedback.trim()
       ? { action: 'revise', feedback: feedback.trim() }
-      : { action: 'approve', approvedByUser: true }
+      : { action: 'revise', feedback: EMPTY_REVISION_FEEDBACK }
   }
   return { action: 'approve', approvedByUser: true }
 }

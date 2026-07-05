@@ -120,6 +120,20 @@ export function buildMacOSProfile(
     lines.push('')
   }
 
+  // Caller-specified write-deny paths — MUST come after the workspace/extra
+  // write allows: Seatbelt takes the LAST matching rule, so a later deny on a
+  // subpath carves a hole out of an earlier broader allow.
+  const denyWrite = config.writeDenyPaths ?? []
+  if (denyWrite.length > 0) {
+    lines.push(';; Caller-specified write-deny paths (override allows above).')
+    lines.push('(deny file-write*')
+    for (const p of denyWrite) {
+      lines.push(`  ${subpath(p)}`)
+    }
+    lines.push(')')
+    lines.push('')
+  }
+
   // ── File-read restrictions ────────────────────────────────────────────────
   const denyRead = config.readDenyPaths ?? []
   if (denyRead.length > 0) {

@@ -35,6 +35,7 @@ import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
 import { makeAutoOrchPauseExternalTool } from '../core/auto_orch/AutoOrchPauseTool.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
+import { isAbsolute, relative, resolve } from 'path'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -531,9 +532,18 @@ export class SubAgentRunner {
     const allowed = this.record.config.allowedTools
     if (!allowed || allowed.length === 0) return []
 
-    const tools = allowed
+    let tools = allowed
       .map(name => this.toolRegistry.get(name))
       .filter((t): t is MetaAgentTool => t !== undefined)
+
+    // Isolated-worktree writers: writes under .meta-agent/ are excluded from
+    // finalize/merge (:(exclude).meta-agent/**) and silently discarded, so fail
+    // the tool call NOW with an instructive error the sub-agent can act on in
+    // its own turn loop — instead of "succeeding" and losing the data.
+    if (this.record.config.isolateWorktree && this.record.config.projectDir) {
+      const root = this.record.config.projectDir
+      tools = tools.map(t => wrapWithDiscardedPathGuard(t, root))
+    }
 
     if (!sandboxHandle) return tools
 
@@ -694,4 +704,52 @@ export class SubAgentRunner {
       turnNumber,
     })
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Discarded-path guard (isolated worktrees)
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Why: isolated-write worktrees are finalized/merged with the pathspec
+ * `:(exclude).meta-agent/**` (AutoWorktreeCoordinator), so anything a sub-agent
+ * writes under `.meta-agent/` inside its worktree NEVER reaches the canonical
+ * workspace — the write "succeeds", then the data silently evaporates at merge.
+ *
+ * This wrapper turns that silent loss into an immediate, instructive tool error
+ * so the sub-agent can self-correct within its own turn loop (the cheapest
+ * feedback loop available — no node retry, no replan needed).
+ */
+export const DISCARDED_PATH_GUARD_MESSAGE =
+  'Error: writes under .meta-agent/ are DISCARDED at merge time — this directory is ' +
+  'runtime-internal metadata and task-worktree merges exclude it (:(exclude).meta-agent/**), ' +
+  'so nothing you write there will be visible to any later node or the main workspace. ' +
+  "Write canonical cross-node state under 'state/' at the workspace root instead " +
+  '(e.g. state/progress.json, state/findings.jsonl), then retry.'
+
+export function wrapWithDiscardedPathGuard(tool: MetaAgentTool, workspaceRoot: string): MetaAgentTool {
+  const pathFields = tool.permission?.pathFields
+  if (tool.permission?.category !== 'write' || !pathFields || pathFields.length === 0) return tool
+  return {
+    ...tool,
+    call: async (input, ctx) => {
+      for (const field of pathFields) {
+        const raw = input[field]
+        if (typeof raw !== 'string' || !raw) continue
+        if (pathIsUnderMetaAgent(raw, workspaceRoot)) {
+          return {
+            content: `${DISCARDED_PATH_GUARD_MESSAGE}\n(blocked ${tool.name}.${field} = ${raw})`,
+            isError: true,
+          }
+        }
+      }
+      return tool.call(input, ctx)
+    },
+  }
+}
+
+function pathIsUnderMetaAgent(raw: string, workspaceRoot: string): boolean {
+  const abs = isAbsolute(raw) ? raw : resolve(workspaceRoot, raw)
+  const rel = relative(resolve(workspaceRoot), abs).replace(/\\/g, '/')
+  return rel === '.meta-agent' || rel.startsWith('.meta-agent/')
 }

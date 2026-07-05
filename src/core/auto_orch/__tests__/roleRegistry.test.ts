@@ -9,7 +9,7 @@
  */
 import { describe, it, expect } from 'vitest'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
-import { RoleCatalog, defaultRoleCatalog, type RoleContext } from '../RoleRegistry.js'
+import { RoleCatalog, defaultRoleCatalog, goalWithCriteria, type RoleContext } from '../RoleRegistry.js'
 import type { OrchVerdict } from '../Verdict.js'
 
 const noopDispatcher: ISubAgentDispatcher = {
@@ -62,5 +62,51 @@ describe('RoleCatalog (custom)', () => {
 
   it('rejects a role without a name', () => {
     expect(() => new RoleCatalog().register({ name: '', buildHandler: () => async () => ({ action: 'continue' }) })).toThrow()
+  })
+})
+
+// ── M1 regression: role nodes must feed their taskDescription to the gates ─────
+describe('goalWithCriteria (M1)', () => {
+  it('composes goal + criteria, keeping the goal as the anchor', () => {
+    const get = goalWithCriteria(() => 'the goal', '必须包含单元测试')
+    const composed = get()!
+    expect(composed.startsWith('the goal')).toBe(true)
+    expect(composed).toContain('必须包含单元测试')
+    expect(composed).toContain('审查标准')
+  })
+
+  it('empty criteria → goal unchanged; missing goal → criteria alone', () => {
+    expect(goalWithCriteria(() => 'g', '   ')()).toBe('g')
+    expect(goalWithCriteria(() => null, 'c')()).toBe('c')
+  })
+
+  it('does not duplicate when the criteria echo the goal', () => {
+    expect(goalWithCriteria(() => 'do X carefully', 'X')()).toBe('do X carefully')
+  })
+
+  it('the verify node handler hands the node criteria to the spawned judge', async () => {
+    const seen: string[] = []
+    const captureDispatcher: ISubAgentDispatcher = {
+      async spawnSubAgent(opts) {
+        seen.push(String((opts.config as Record<string, unknown>)['taskDescription'] ?? ''))
+        return {
+          taskId: 't1',
+          status: 'completed',
+          config: opts.config,
+          result: { success: true, summary: 'not a verdict', costUsd: 0 },
+        } as never
+      },
+      async getStatus() { return null },
+      async cancelTask() { return true },
+    }
+    const handler = defaultRoleCatalog().buildHandler('verify', {
+      dispatcher: captureDispatcher,
+      projectDir: '/tmp/definitely-not-a-git-repo',
+      getGoal: () => 'GLOBAL-GOAL',
+    })
+    await handler({ criteria: 'NODE-CRITERIA-XYZ', signal: new AbortController().signal })
+    expect(seen.length).toBeGreaterThan(0)
+    expect(seen[0]).toContain('GLOBAL-GOAL')
+    expect(seen[0]).toContain('NODE-CRITERIA-XYZ')
   })
 })

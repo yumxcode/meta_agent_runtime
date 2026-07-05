@@ -89,6 +89,21 @@ export interface AutoWorktreeCleanupResult {
   errors: Array<{ taskId: string; error: string }>
 }
 
+export interface AutoWorktreeCoordinatorOptions {
+  /**
+   * Override where task worktrees are created. auto_orch run-scoped
+   * coordinators use a per-run base so their orphan sweep (reconcile) can never
+   * touch another coordinator's worktrees.
+   */
+  worktreeBase?: string
+  /**
+   * Override the registry file. Run-scoped coordinators MUST set this: the
+   * default path is shared per git-common-dir, and two live coordinator
+   * instances persisting the same file would stomp each other's records.
+   */
+  registryPath?: string
+}
+
 export class AutoWorktreeCoordinator {
   private readonly gwm: GitWorkspaceManager
   private readonly projectDir: string
@@ -97,9 +112,9 @@ export class AutoWorktreeCoordinator {
   private readonly records = new Map<string, AutoWorktreeRecord>()
   private operationChain: Promise<void> = Promise.resolve()
 
-  constructor(projectDir: string) {
+  constructor(projectDir: string, opts?: AutoWorktreeCoordinatorOptions) {
     this.projectDir = resolve(projectDir)
-    this.worktreeBase = join(this.projectDir, '.meta-agent', 'auto', 'worktrees')
+    this.worktreeBase = opts?.worktreeBase ?? join(this.projectDir, '.meta-agent', 'auto', 'worktrees')
     let gitCommonDir = join(this.projectDir, '.git')
     try {
       const raw = execFileSync('git', ['rev-parse', '--git-common-dir'], {
@@ -110,7 +125,7 @@ export class AutoWorktreeCoordinator {
       }).trim()
       gitCommonDir = resolve(this.projectDir, raw)
     } catch { /* non-git workspace; enabled remains false */ }
-    this.registryPath = join(gitCommonDir, 'meta-agent', 'auto-worktrees.json')
+    this.registryPath = opts?.registryPath ?? join(gitCommonDir, 'meta-agent', 'auto-worktrees.json')
     this.gwm = new GitWorkspaceManager(this.projectDir, this.worktreeBase)
     this._loadRegistry()
   }

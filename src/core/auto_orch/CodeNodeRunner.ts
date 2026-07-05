@@ -5,7 +5,16 @@ import { readCodeNodeSource } from './CodeNodeStore.js'
 import { reviewCodeNodeSource } from './CodeNodeAuthor.js'
 
 export interface CodeNodeRunnerOptions {
+  /** Root the code's api.state reads/writes against (integration tree when a
+   * run workspace is active, otherwise the main workspace). */
   projectDir: string
+  /**
+   * Root that holds the frozen code artifacts (.meta-agent/auto_orch/code_nodes).
+   * Artifacts always live in the MAIN workspace — the integration tree excludes
+   * .meta-agent — so this differs from projectDir when a run workspace is active.
+   * Defaults to projectDir.
+   */
+  codeRoot?: string
 }
 
 const DEFAULT_TIMEOUT_MS = 3_000
@@ -110,7 +119,11 @@ export class CodeNodeRunner {
       return { action: 'branch', label: 'error', note: `code node ${node.id} is not materialized` }
     }
     try {
-      const { source, path } = await readCodeNodeSource(this.opts.projectDir, node.codeRef, node.sourceHash)
+      const { source, path } = await readCodeNodeSource(
+        this.opts.codeRoot ?? this.opts.projectDir,
+        node.codeRef,
+        node.sourceHash,
+      )
       const reviewErrors = reviewCodeNodeSource(source)
       if (reviewErrors.length) {
         return { action: 'branch', label: 'error', note: `code node ${node.id} failed review: ${reviewErrors.join('; ')}` }

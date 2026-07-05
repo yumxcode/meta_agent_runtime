@@ -19,7 +19,7 @@ import {
 import { Blackboard } from '../Blackboard.js'
 import { parseOrchPlan } from '../PlannerAgent.js'
 import type { PlanRunContext } from '../PlanRunner.js'
-import { filesOutsideWriteScope } from '../KernelBranchOps.js'
+import { filesOutsideWriteScope, KernelBranchOps } from '../KernelBranchOps.js'
 
 function planWith(node: OrchNode): OrchPlan {
   return { entry: node.id, nodes: [node], edges: [] }
@@ -339,5 +339,61 @@ describe('PLANNER_RUBRIC examples', () => {
     expect(plan).not.toBeNull()
     expect(plan!.nodes[0]!.kind).toBe('parallel')
     expect(validatePlan(plan!)).toHaveLength(0)
+  })
+})
+
+// ── H3 regression: a branch without allowedTools must NOT spawn tool-less ──────
+describe('KernelBranchOps tool fallback (H3)', () => {
+  function captureDispatcher() {
+    const configs: Array<Record<string, unknown>> = []
+    const dispatcher = {
+      async spawnSubAgent(opts: { config: Record<string, unknown> }) {
+        configs.push(opts.config)
+        return {
+          taskId: `t-${configs.length}`,
+          status: 'completed',
+          config: opts.config,
+          result: { success: true, summary: 'done', costUsd: 0 },
+        }
+      },
+      async getStatus() { return null },
+      async cancelTask() { /* noop */ },
+    }
+    return { dispatcher, configs }
+  }
+
+  it('reader branch without allowedTools gets the read-only fallback toolset', async () => {
+    const { dispatcher, configs } = captureDispatcher()
+    const ops = new KernelBranchOps({ dispatcher: dispatcher as never })
+    const result = await ops.runBranch(
+      { id: 'probe', taskDescription: '调研' },
+      new AbortController().signal,
+    )
+    expect(result.success).toBe(true)
+    expect(configs[0]!['allowedTools']).toEqual(['read_file', 'grep', 'glob'])
+    expect(configs[0]!['maxBudgetUsd']).toBe(2)
+  })
+
+  it('writer branch without allowedTools gets the read+write+shell fallback', async () => {
+    const { dispatcher, configs } = captureDispatcher()
+    const ops = new KernelBranchOps({ dispatcher: dispatcher as never })
+    const result = await ops.runBranch(
+      { id: 'impl', taskDescription: '实现', workspaceMode: 'isolated_write', writeScope: ['src/**'] },
+      new AbortController().signal,
+    )
+    expect(result.success).toBe(true)
+    expect(configs[0]!['allowedTools']).toEqual(
+      ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash'],
+    )
+  })
+
+  it('explicit allowedTools are never overridden by the fallback', async () => {
+    const { dispatcher, configs } = captureDispatcher()
+    const ops = new KernelBranchOps({ dispatcher: dispatcher as never })
+    await ops.runBranch(
+      { id: 'custom', taskDescription: 'x', allowedTools: ['read_file'] },
+      new AbortController().signal,
+    )
+    expect(configs[0]!['allowedTools']).toEqual(['read_file'])
   })
 })

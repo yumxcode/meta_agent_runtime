@@ -147,6 +147,25 @@ describe('KernelNodeRunner', () => {
     expect(captured).toHaveLength(0)
   })
 
+  it('uses a non-trivial default executor budget when the plan omits one', async () => {
+    const dispatcher = queueDispatcher([{ summary: 'built it', success: true }])
+    const seenBudgets: number[] = []
+    const wrapped: ISubAgentDispatcher = {
+      async spawnSubAgent(opts) {
+        seenBudgets.push(opts.config.maxBudgetUsd ?? -1)
+        return dispatcher.spawnSubAgent(opts)
+      },
+      getStatus: dispatcher.getStatus,
+      cancelTask: dispatcher.cancelTask,
+    }
+    const runner = new KernelNodeRunner(wrapped)
+
+    const v = await runner.run(exec, ctx())
+
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    expect(seenBudgets).toEqual([2])
+  })
+
   it('merges a successful isolated_write executor before routing forward', async () => {
     const merged: string[] = []
     const worktrees = {
@@ -255,6 +274,96 @@ describe('KernelNodeRunner', () => {
     await expect(readFile(join(projectDir, 'state', 'current_direction.json'), 'utf-8')).resolves.toBe('{"id":"D1"}\n')
     expect(calls.some(c => c.startsWith('discard:'))).toBe(true)
     expect(calls.some(c => c.startsWith('merge:'))).toBe(false)
+  })
+
+  it('fails loudly (with one corrective retry) when a node only wrote merge-excluded .meta-agent/ paths', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-main-'))
+    const worktreePath = await mkdtemp(join(tmpdir(), 'auto-orch-wt-meta-'))
+    await execFileAsync('git', ['init'], { cwd: worktreePath })
+    await execFileAsync('git', ['config', 'user.email', 'test@example.com'], { cwd: worktreePath })
+    await execFileAsync('git', ['config', 'user.name', 'Test'], { cwd: worktreePath })
+    await writeFile(join(worktreePath, 'README.md'), 'base\n', 'utf-8')
+    await execFileAsync('git', ['add', 'README.md'], { cwd: worktreePath })
+    await execFileAsync('git', ['commit', '-m', 'base'], { cwd: worktreePath })
+    const forkPoint = (await execFileAsync('git', ['rev-parse', 'HEAD'], { cwd: worktreePath })).stdout.trim()
+    // The failure this suite exists for: everything landed under .meta-agent/.
+    await mkdir(join(worktreePath, '.meta-agent', 'research', 'task-001', 'state'), { recursive: true })
+    await writeFile(
+      join(worktreePath, '.meta-agent', 'research', 'task-001', 'state', 'progress.json'),
+      '{"iteration":0}\n', 'utf-8',
+    )
+
+    const worktrees = {
+      enabled: true,
+      recordFor(taskId: string) { return { taskId, worktreePath, forkPoint } },
+      // Mirrors AutoWorktreeCoordinator: .meta-agent/** is excluded → no changes.
+      async finalize() { return { status: 'no_changes', changedFiles: [] } },
+      async discard() {},
+      async merge() { return { merged: true, commitHash: 'abc123' } },
+    } as unknown as AutoWorktreeCoordinator
+    const captured: string[] = []
+    const runner = new KernelNodeRunner(
+      queueDispatcher([
+        { summary: 'state initialized', success: true, output: { label: 'ok' }, costUsd: 0.1 },
+        { summary: 'state initialized again', success: true, output: { label: 'ok' }, costUsd: 0.2 },
+      ], captured),
+      { projectDir, worktrees },
+    )
+
+    const v = await runner.run(exec, ctx())
+
+    // One corrective retry happened, carrying the diagnosis to the sub-agent…
+    expect(captured).toHaveLength(2)
+    expect(captured[1]).toContain('纠正性重试')
+    expect(captured[1]).toContain('.meta-agent')
+    // …and since the retry hit the same wall, the node surfaces a routable error.
+    expect(v).toMatchObject({ action: 'branch', label: 'error' })
+    expect(v.note).toContain('merge-excluded')
+    expect(v.data?.['costUsd']).toBeCloseTo(0.3)
+  })
+
+  it('verifies declared outputs after merge and retries once until they land', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-main-'))
+    const dispatcher = queueDispatcher([
+      { summary: 'claimed done, wrote nothing', success: true, output: { label: 'ok' }, costUsd: 0.1 },
+      { summary: 'actually wrote it', success: true, output: { label: 'ok' }, costUsd: 0.2 },
+    ])
+    let spawns = 0
+    const wrapped: ISubAgentDispatcher = {
+      async spawnSubAgent(opts) {
+        spawns++
+        if (spawns === 2) {
+          // The corrective retry "fixes" the node: the declared output lands.
+          await mkdir(join(projectDir, 'state'), { recursive: true })
+          await writeFile(join(projectDir, 'state', 'progress.json'), '{"iteration":0}\n', 'utf-8')
+        }
+        return dispatcher.spawnSubAgent(opts)
+      },
+      getStatus: dispatcher.getStatus,
+      cancelTask: dispatcher.cancelTask,
+    }
+    // No worktree coordinator → merge is a no-op; only the outputs contract bites.
+    const runner = new KernelNodeRunner(wrapped, { projectDir })
+
+    const v = await runner.run({ ...exec, outputs: ['state/progress.json'] }, ctx())
+
+    expect(spawns).toBe(2)
+    expect(v).toMatchObject({ action: 'branch', label: 'ok' })
+    expect(v.data?.['costUsd']).toBeCloseTo(0.3)
+  })
+
+  it('returns a routable error when declared outputs never land', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-main-'))
+    const runner = new KernelNodeRunner(
+      queueDispatcher([
+        { summary: 'done', success: true, output: { label: 'ok' } },
+        { summary: 'done again', success: true, output: { label: 'ok' } },
+      ]),
+      { projectDir },
+    )
+    const v = await runner.run({ ...exec, outputs: ['state/progress.json'] }, ctx())
+    expect(v).toMatchObject({ action: 'branch', label: 'error' })
+    expect(v.note).toContain('state/progress.json')
   })
 
   it('maps a failed executor to branch:error', async () => {
@@ -371,6 +480,37 @@ describe('materializeCodeNodes', () => {
     expect(captured[1]).toContain('api.nowIso')
   })
 
+  it('rejects authored source that references merge-excluded .meta-agent/ paths, then accepts the rewrite', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-metaagent-'))
+    const badSource =
+      "export async function main(input, api) { const p = await api.state.readJson('.meta-agent/research/t1/state/progress.json'); return { action: 'branch', label: 'healthy' } }"
+    const fixedSource =
+      "export async function main(input, api) { const p = await api.state.readJson('state/progress.json'); return { action: 'branch', label: 'healthy' } }"
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([
+      { summary: '```json\n' + JSON.stringify({ source: badSource, note: 'reads task dir' }) + '\n```' },
+      { summary: '```json\n' + JSON.stringify({ source: fixedSource, note: 'reads state/' }) + '\n```' },
+    ], captured)
+
+    const out = await materializeCodeNodes({
+      entry: 'reduce',
+      nodes: [{
+        id: 'reduce',
+        kind: 'code',
+        taskDescription: 'reduce',
+        codeSpec: { description: 'read progress and return healthy', labels: ['healthy'] },
+      }],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(1)
+    expect(captured).toHaveLength(2)
+    // The review error (with the state/ remediation) fed the author's retry.
+    expect(captured[1]).toContain('.meta-agent')
+    expect(captured[1]).toContain("state/")
+  })
+
   it('retries code authoring after an unparsable author response', async () => {
     const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-parse-retry-'))
     const source = 'export async function main(input, api) { return { action: "branch", label: "healthy", data: { at: api.nowIso } } }'
@@ -437,6 +577,50 @@ describe('materializeCodeNodes', () => {
     expect(captured[0]).toContain('write_b')
     expect(out.plan.nodes[0].codeRef).toMatch(/^code_nodes\//)
     expect(out.plan.nodes[1].codeRef).toMatch(/^code_nodes\//)
+  })
+
+  it('retries multiple code nodes as a batch instead of falling back to one agent per node', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'auto-orch-author-batch-retry-'))
+    const sourceA = 'export async function main(input, api) { await api.state.writeJson("state/a.json", { ok: true }); return { action: "branch", label: "ok" } }'
+    const sourceB = 'export async function main(input, api) { await api.state.writeJson("state/b.json", { ok: true }); return { action: "branch", label: "done" } }'
+    const captured: string[] = []
+    const dispatcher = queueDispatcher([
+      { summary: 'not json' },
+      {
+        summary: '```json\n' + JSON.stringify({
+          nodes: [
+            { id: 'write_a', source: sourceA, note: 'writes a' },
+            { id: 'write_b', source: sourceB, note: 'writes b' },
+          ],
+        }) + '\n```',
+      },
+    ], captured)
+
+    const out = await materializeCodeNodes({
+      entry: 'write_a',
+      nodes: [
+        {
+          id: 'write_a',
+          kind: 'code',
+          taskDescription: 'write a',
+          codeSpec: { description: 'write state/a.json', outputs: ['state/a.json'], labels: ['ok'] },
+        },
+        {
+          id: 'write_b',
+          kind: 'code',
+          taskDescription: 'write b',
+          codeSpec: { description: 'write state/b.json', outputs: ['state/b.json'], labels: ['done'] },
+        },
+      ],
+      edges: [],
+    }, { dispatcher, projectDir }, new AbortController().signal)
+
+    expect(out.errors).toHaveLength(0)
+    expect(out.materialized).toBe(2)
+    expect(captured).toHaveLength(2)
+    expect(captured[1]).toContain('write_a')
+    expect(captured[1]).toContain('write_b')
+    expect(captured[1]).toContain('previousErrors')
   })
 
   it('materializes report writer code nodes with a deterministic built-in source', async () => {

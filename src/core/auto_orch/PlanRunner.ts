@@ -201,9 +201,6 @@ export class PlanRunner {
           costUsd: stepCost,
         })
 
-        if (costUsd > bounds.maxTotalCostUsd) {
-          return finalize('bounds_exceeded', `cost ${costUsd.toFixed(4)} > ${bounds.maxTotalCostUsd}`)
-        }
         if (verdict.label === 'paused') {
           await this.emit({
             type: 'run_paused',
@@ -217,8 +214,14 @@ export class PlanRunner {
             objectRecord(verdict.data?.['resumeHandle']),
           )
         }
+        if (costUsd > bounds.maxTotalCostUsd) {
+          return finalize('bounds_exceeded', `cost ${costUsd.toFixed(4)} > ${bounds.maxTotalCostUsd}`)
+        }
         if (verdict.action === 'abort') {
-          return finalize('completed', verdict.note ?? 'node requested abort')
+          return finalize(
+            isFailedAbort(verdict) ? 'failed' : 'completed',
+            verdict.note ?? 'node requested abort',
+          )
         }
 
         // Fail-closed on a SKIPPED REVIEW gate (verify / generic reviewer): when
@@ -248,7 +251,7 @@ export class PlanRunner {
           label: verdict.label,
           action: verdict.action,
         })
-        if (!nextId && isTerminalError(node, verdict)) {
+        if (!nextId && isTerminalError(verdict)) {
           return finalize('failed', verdict.note ?? `terminal error node reached: ${fromId}`)
         }
         currentId = nextId
@@ -301,7 +304,10 @@ function objectRecord(v: unknown): Record<string, unknown> | undefined {
   return v && typeof v === 'object' ? v as Record<string, unknown> : undefined
 }
 
-function isTerminalError(node: OrchNode, verdict: OrchVerdict): boolean {
-  if (verdict.label === 'error') return true
-  return /(^|[_-])error([_-]|$)|error_writer|error_stop/.test(node.id)
+function isTerminalError(verdict: OrchVerdict): boolean {
+  return verdict.label === 'error'
+}
+
+function isFailedAbort(verdict: OrchVerdict): boolean {
+  return verdict.data?.['failed'] === true || verdict.label === 'error' || verdict.label === 'failed'
 }

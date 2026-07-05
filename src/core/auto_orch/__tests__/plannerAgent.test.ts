@@ -111,6 +111,34 @@ function queueStubWithCapturedTasks(summaries: (string | null)[], captured: stri
   }
 }
 
+function queueStubWithCapturedConfigs(summaries: (string | null)[], captured: Array<Record<string, unknown>>): ISubAgentDispatcher {
+  const recs = new Map<string, SubAgentRecord>()
+  return {
+    async spawnSubAgent({ config }) {
+      captured.push(config as unknown as Record<string, unknown>)
+      const summary = summaries.shift() ?? null
+      const taskId = makeSubAgentTaskId()
+      const rec: SubAgentRecord = {
+        schemaVersion: '1.0',
+        taskId,
+        parentSessionId: 'parent',
+        status: 'completed',
+        config: { taskDescription: 'plan' } as SubAgentRecord['config'],
+        createdAt: Date.now(),
+        completedAt: Date.now(),
+        pendingHumanApproval: false,
+        result: summary === null ? undefined : {
+          success: true, summary, turnsUsed: 1, inputTokens: 0, outputTokens: 0, costUsd: 0, durationMs: 1,
+        },
+      }
+      recs.set(taskId, rec)
+      return rec
+    },
+    async getStatus(id) { return recs.get(id) ?? null },
+    async cancelTask() { return true },
+  }
+}
+
 const TRAPPED_PLAN_JSON = '```json\n' + JSON.stringify({
   entry: 'A',
   nodes: [
@@ -177,7 +205,7 @@ describe('parseOrchPlan', () => {
           outputs: ['state/progress.json'],
           labels: ['healthy'],
         },
-        input: { taskDir: '.meta-agent/research/t1' },
+        input: { taskId: 't1' },
         capabilities: ['state.read', 'state.write'],
       }],
       edges: [],
@@ -315,6 +343,22 @@ describe('makeAutoOrchPlanner', () => {
     expect(validatePlan(out.plan)).toHaveLength(0)
   })
 
+  it('gives the planner enough budget and uses the return_result contract in the task', async () => {
+    const configs: Array<Record<string, unknown>> = []
+    const out = await makeAutoOrchPlanner({
+      dispatcher: queueStubWithCapturedConfigs([VALID_PLAN_JSON], configs),
+      projectDir: '/tmp',
+      getGoal: () => 'g',
+    })(signal())
+    expect(out.source).toBe('planner')
+    expect(configs[0]).toMatchObject({
+      maxTurns: 30,
+      maxBudgetUsd: 2,
+    })
+    expect(configs[0]!['taskDescription']).toContain('必须调用 return_result')
+    expect(configs[0]!['taskDescription']).not.toContain('只输出一个 OrchPlan 的 JSON 代码块')
+  })
+
   it('falls back after exhausting retries on a persistently trapped cycle', async () => {
     const dispatcher = queueStub([TRAPPED_PLAN_JSON, TRAPPED_PLAN_JSON])
     const out = await makeAutoOrchPlanner({ dispatcher, projectDir: '/tmp', getGoal: () => 'g', maxAttempts: 2 })(signal())
@@ -411,6 +455,25 @@ describe('makeAutoOrchPlanner', () => {
     expect(out.source).toBe('planner')
     expect(out.plan.id).toBe('p2')
     expect(captured[1]).toContain('Make it a single simple node')
+  })
+
+  it('planner review revise with empty feedback re-plans instead of approving', async () => {
+    const captured: string[] = []
+    const answers = ['Revise plan', '', 'Approve plan']
+    const out = await makeAutoOrchPlanner({
+      dispatcher: queueStubWithCapturedTasks([VALID_PLAN_JSON, VALID_PLAN_JSON_2], captured),
+      projectDir: '/tmp',
+      getGoal: () => 'g',
+      plannerReview: {
+        enabled: true,
+        maxRounds: 2,
+        askUser: async () => answers.shift() ?? 'Approve plan',
+      },
+    })(signal())
+    expect(out.source).toBe('planner')
+    expect(out.plan.id).toBe('p2')
+    expect(out.approvedByUser).toBe(true)
+    expect(captured[1]).toContain('未填写具体修改说明')
   })
 
   it('stops retrying when the parent signal is aborted during planning', async () => {

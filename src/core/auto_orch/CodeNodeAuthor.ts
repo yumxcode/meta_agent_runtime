@@ -14,6 +14,8 @@ export interface CodeNodeMaterializeResult {
   errors: string[]
 }
 
+type PendingAuthoredNode = { index: number; node: OrchNode }
+
 const CODE_AUTHOR_SYSTEM = `\
 你是 auto_orch 的 code_author。你的任务是为一个或多个确定性 code 节点生成 JavaScript ESM 源码。
 
@@ -22,9 +24,16 @@ const CODE_AUTHOR_SYSTEM = `\
 - source 必须导出 async function main(input, api) 或 function main(input, api)。
 - 不要 import/require 任何模块；不要访问 process、globalThis、eval、Function、网络、shell、计时器或随机数。
 - 所有状态读写只能通过 api.state.readJson/writeJson/appendJsonl/readText/writeText。
+- api.state 的路径是**工作区根目录相对路径**；所有**写**路径必须以 state/ 开头（运行时强制，写别处会直接报错）。
+- **禁止**读写 .meta-agent/ 下任何路径：该目录是运行时内部元数据，任务合并会排除它，写入会被静默丢弃；源码中出现 .meta-agent/ 会直接不通过审查。
 - 如需当前 ISO 时间戳，只能读取 api.nowIso 字符串；禁止使用 Date.now() 或 new Date()。
 - 返回值必须是 OrchVerdict JSON 对象，如 {"action":"branch","label":"healthy","data":{...}}。
 - 遇到输入缺失或状态不合法，返回 {"action":"branch","label":"error","note":"..."}，不要抛未处理异常。
+
+标准单节点输出示例：
+\`\`\`json
+{"source":"export async function main(input, api) {\\n  const progress = await api.state.readJson('state/progress.json')\\n  const label = progress && progress.status === 'stale' ? 'stale' : 'healthy'\\n  return { action: 'branch', label, data: { readAt: api.nowIso } }\\n}\\n","note":"Reads progress.json and routes by status."}
+\`\`\`
 `
 
 const FORBIDDEN_CODE_PATTERNS: RegExp[] = [
@@ -54,6 +63,15 @@ export function reviewCodeNodeSource(source: string): string[] {
   for (const pattern of FORBIDDEN_CODE_PATTERNS) {
     if (pattern.test(source)) errs.push(`source uses forbidden construct: ${pattern.source}`)
   }
+  // Canonical-state convention: .meta-agent/ is merge-excluded runtime metadata.
+  // This error feeds the author's retry loop (previousErrors) so the next
+  // attempt rewrites the path instead of shipping code that loses data.
+  if (/\.meta-agent[/\\]/.test(source)) {
+    errs.push(
+      "source references '.meta-agent/' — that directory is runtime-internal and merge-excluded; " +
+      "keep all state under workspace-root 'state/' paths (e.g. state/progress.json)",
+    )
+  }
   return errs
 }
 
@@ -65,7 +83,7 @@ export async function materializeCodeNodes(
   const errors: string[] = []
   let materialized = 0
   const nodes: OrchNode[] = [...plan.nodes]
-  const pendingAuthored: Array<{ index: number; node: OrchNode }> = []
+  const pendingAuthored: PendingAuthoredNode[] = []
 
   for (let index = 0; index < plan.nodes.length; index++) {
     const node = plan.nodes[index]
@@ -109,48 +127,83 @@ export async function materializeCodeNodes(
       materialized++
     }
   } else if (pendingAuthored.length > 1) {
-    const batch = await authorCodeNodesBatch(pendingAuthored.map(item => item.node), deps, signal).catch(() => null)
-    const remaining: Array<{ index: number; node: OrchNode; previousErrors: string[] }> = []
-
-    if (batch) {
-      for (const item of pendingAuthored) {
-        const authored = batch.get(item.node.id)
-        if (!authored) {
-          remaining.push({ ...item, previousErrors: ['batch code_author did not return this node'] })
-          continue
-        }
-        const reviewErrors = reviewCodeNodeSource(authored.source)
-        if (reviewErrors.length) {
-          remaining.push({ ...item, previousErrors: reviewErrors })
-          continue
-        }
-        const outcome = await freezeAuthoredNode(item.node, authored, deps).catch(err => ({
-          error: err instanceof Error ? err.message : String(err),
-        }))
-        if ('error' in outcome) {
-          remaining.push({ ...item, previousErrors: [outcome.error] })
-        } else {
-          nodes[item.index] = outcome.node
-          materialized++
-        }
-      }
-    } else {
-      for (const item of pendingAuthored) {
-        remaining.push({ ...item, previousErrors: ['batch code_author unavailable'] })
-      }
+    const outcome = await authorAndFreezeBatch(pendingAuthored, deps, signal)
+    for (const item of outcome.nodes) {
+      nodes[item.index] = item.node
+      materialized++
     }
-
-    for (const item of remaining) {
-      const outcome = await authorAndFreezeSingle(item.node, deps, signal, item.previousErrors)
-      if (!outcome.ok) errors.push(outcome.error)
-      else {
-        nodes[item.index] = outcome.node
-        materialized++
-      }
-    }
+    errors.push(...outcome.errors)
   }
 
   return { plan: { ...plan, nodes }, materialized, errors }
+}
+
+async function authorAndFreezeBatch(
+  items: PendingAuthoredNode[],
+  deps: CodeNodeMaterializeDeps,
+  signal: AbortSignal,
+): Promise<{ nodes: PendingAuthoredNode[]; errors: string[] }> {
+  const materialized: PendingAuthoredNode[] = []
+  const errors: string[] = []
+  let remaining = [...items]
+  const previousErrors = new Map<string, string[]>()
+
+  for (let attempt = 1; attempt <= 3 && remaining.length > 0; attempt++) {
+    let batch: Map<string, { source: string; note?: string }>
+    try {
+      batch = await authorCodeNodesBatch(
+        remaining.map(item => item.node),
+        deps,
+        signal,
+        previousErrors,
+      )
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      for (const item of remaining) previousErrors.set(item.node.id, [message])
+      if (attempt === 3) {
+        for (const item of remaining) {
+          errors.push(`code node[${item.node.id}] materialization failed: ${message}`)
+        }
+      }
+      continue
+    }
+
+    const failed: PendingAuthoredNode[] = []
+    for (const item of remaining) {
+      const authored = batch.get(item.node.id)
+      if (!authored) {
+        previousErrors.set(item.node.id, ['batch code_author did not return this node'])
+        failed.push(item)
+        continue
+      }
+      const reviewErrors = reviewCodeNodeSource(authored.source)
+      if (reviewErrors.length) {
+        previousErrors.set(item.node.id, reviewErrors)
+        failed.push(item)
+        continue
+      }
+      const outcome = await freezeAuthoredNode(item.node, authored, deps).catch(err => ({
+        error: err instanceof Error ? err.message : String(err),
+      }))
+      if ('error' in outcome) {
+        previousErrors.set(item.node.id, [outcome.error])
+        failed.push(item)
+      } else {
+        materialized.push({ index: item.index, node: outcome.node })
+        previousErrors.delete(item.node.id)
+      }
+    }
+
+    if (attempt === 3) {
+      for (const item of failed) {
+        const reason = previousErrors.get(item.node.id)?.join('; ') || 'unknown code_author failure'
+        errors.push(`code node[${item.node.id}] materialization failed: ${reason}`)
+      }
+    }
+    remaining = failed
+  }
+
+  return { nodes: materialized, errors }
 }
 
 async function authorAndFreezeSingle(
@@ -206,11 +259,12 @@ async function authorCodeNodesBatch(
   nodes: OrchNode[],
   deps: CodeNodeMaterializeDeps,
   signal: AbortSignal,
+  previousErrors: Map<string, string[]> = new Map(),
 ): Promise<Map<string, { source: string; note?: string }>> {
   const rec = await spawnAndWait(
     deps.dispatcher,
     {
-      taskDescription: buildBatchAuthorTask(nodes),
+      taskDescription: buildBatchAuthorTask(nodes, previousErrors),
       systemPrompt: CODE_AUTHOR_SYSTEM,
       allowedTools: [],
       maxTurns: Math.min(24, Math.max(10, nodes.length * 3)),
@@ -226,33 +280,44 @@ async function authorCodeNodesBatch(
     { pollMs: 500, maxWaitMs: 12 * 60 * 1000 },
   )
   const summary = rec?.result?.summary
-  if (rec?.status !== 'completed' || !summary) throw new Error('batch code_author unavailable')
-  const parsed = parseBatchAuthorOutput(summary)
+  if (rec?.status !== 'completed' || (!summary && rec?.result?.output === undefined)) throw new Error('batch code_author unavailable')
+  const parsed = parseBatchAuthorOutput(summary ?? '', rec?.result?.output, nodes.map(node => node.id))
   if (!parsed.size) throw new Error('batch code_author returned no parseable nodes JSON')
   return parsed
 }
 
-function buildBatchAuthorTask(nodes: OrchNode[]): string {
+function buildBatchAuthorTask(nodes: OrchNode[], previousErrors: Map<string, string[]> = new Map()): string {
+  const nodePayload = nodes.map(node => ({
+    id: node.id,
+    taskDescription: node.taskDescription,
+    codeSpec: node.codeSpec ?? {},
+    input: node.input ?? {},
+    capabilities: node.capabilities ?? [],
+    previousErrors: previousErrors.get(node.id) ?? undefined,
+  }))
   return [
     '为下面的多个 auto_orch code 节点批量生成确定性 JavaScript ESM 源码。',
     '',
-    '必须只输出一个 JSON 代码块，格式如下：',
-    '{"nodes":[{"id":"node_id","source":"export async function main(input, api) { ... }","note":"..."}]}',
+    '必须只输出一个 JSON 代码块，格式如下；不要输出解释文字，也不要只输出 node_id/labels/outputs 这类元数据：',
+    '```json',
+    '{"nodes":[{"id":"route_by_status","source":"export async function main(input, api) {\\n  const progress = await api.state.readJson(\'state/progress.json\')\\n  const allowed = [\'healthy\', \'stale\', \'pivot_required\', \'attention_required\', \'error\']\\n  const label = allowed.indexOf(progress.status) >= 0 ? progress.status : \'error\'\\n  return { action: \'branch\', label, data: { readAt: api.nowIso } }\\n}\\n","note":"Routes by progress.status."}]}',
+    '```',
     '',
-    '每个输入节点都必须返回一项，id 必须完全一致。source 的安全契约与 system prompt 相同。',
+    '每个输入节点都必须返回一项，id 必须完全一致。每个 source 第一行必须是 export async function main(input, api) { 或 export function main(input, api) {。source 的安全契约与 system prompt 相同。',
+    '如果某个节点带 previousErrors，请在同一个批量输出中修正该节点；不要漏掉其他节点。',
     '',
     '【节点列表】',
-    JSON.stringify(nodes.map(node => ({
-      id: node.id,
-      taskDescription: node.taskDescription,
-      codeSpec: node.codeSpec ?? {},
-      input: node.input ?? {},
-      capabilities: node.capabilities ?? [],
-    })), null, 2),
+    JSON.stringify(nodePayload, null, 2),
   ].join('\n')
 }
 
-function parseBatchAuthorOutput(text: string): Map<string, { source: string; note?: string }> {
+function parseBatchAuthorOutput(
+  text: string,
+  output?: unknown,
+  expectedIds: string[] = [],
+): Map<string, { source: string; note?: string }> {
+  const fromOutput = parseBatchAuthorValue(output, expectedIds)
+  if (fromOutput.size) return fromOutput
   const out = new Map<string, { source: string; note?: string }>()
   const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(m => m[1] ?? '')
   const candidates = fences.length ? fences : [text]
@@ -274,6 +339,29 @@ function parseBatchAuthorOutput(text: string): Map<string, { source: string; not
     } catch {
       // next candidate
     }
+  }
+  return out
+}
+
+function parseBatchAuthorValue(value: unknown, expectedIds: string[]): Map<string, { source: string; note?: string }> {
+  const out = new Map<string, { source: string; note?: string }>()
+  if (typeof value === 'string') return parseBatchAuthorOutput(value, undefined, expectedIds)
+  const entries = batchEntries(value)
+  if (entries.length) {
+    for (const entry of entries) {
+      if (typeof entry.id !== 'string' || typeof entry.source !== 'string') continue
+      out.set(entry.id, {
+        source: entry.source,
+        note: typeof entry.note === 'string' ? entry.note : undefined,
+      })
+    }
+    return out
+  }
+  if (expectedIds.length === 1 && isRecord(value) && typeof value['source'] === 'string') {
+    out.set(expectedIds[0]!, {
+      source: value['source'],
+      note: typeof value['note'] === 'string' ? value['note'] : undefined,
+    })
   }
   return out
 }
@@ -317,8 +405,8 @@ async function authorCodeNode(
     { pollMs: 500, maxWaitMs: 8 * 60 * 1000 },
   )
   const summary = rec?.result?.summary
-  if (rec?.status !== 'completed' || !summary) throw new Error('code_author unavailable')
-  const parsed = parseAuthorOutput(summary)
+  if (rec?.status !== 'completed' || (!summary && rec?.result?.output === undefined)) throw new Error('code_author unavailable')
+  const parsed = parseAuthorOutput(summary ?? '', rec?.result?.output)
   if (!parsed) throw new Error('code_author returned no parseable source JSON')
   return parsed
 }
@@ -341,6 +429,12 @@ function buildAuthorTask(node: OrchNode, previousErrors: string[] = []): string 
     '',
     '【capabilities】',
     JSON.stringify(node.capabilities ?? [], null, 2),
+    '',
+    '【标准输出示例】',
+    '必须只输出一个 JSON 代码块；source 必须包含 export：',
+    '```json',
+    '{"source":"export async function main(input, api) {\\n  const progress = await api.state.readJson(\'state/progress.json\')\\n  const label = progress && progress.status === \'stale\' ? \'stale\' : \'healthy\'\\n  return { action: \'branch\', label, data: { readAt: api.nowIso } }\\n}\\n","note":"Reads progress.json and routes by status."}',
+    '```',
   ]
   if (previousErrors.length) {
     lines.push(
@@ -355,7 +449,9 @@ function buildAuthorTask(node: OrchNode, previousErrors: string[] = []): string 
   return lines.join('\n')
 }
 
-function parseAuthorOutput(text: string): { source: string; note?: string } | null {
+function parseAuthorOutput(text: string, output?: unknown): { source: string; note?: string } | null {
+  const fromOutput = parseAuthorValue(output)
+  if (fromOutput) return fromOutput
   const fences = [...text.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)].map(m => m[1] ?? '')
   const candidates = fences.length ? fences : [text]
   for (let i = candidates.length - 1; i >= 0; i--) {
@@ -375,11 +471,24 @@ function parseAuthorOutput(text: string): { source: string; note?: string } | nu
   return null
 }
 
+function parseAuthorValue(value: unknown): { source: string; note?: string } | null {
+  if (typeof value === 'string') return parseAuthorOutput(value)
+  if (!isRecord(value) || typeof value['source'] !== 'string') return null
+  return {
+    source: value['source'],
+    note: typeof value['note'] === 'string' ? value['note'] : undefined,
+  }
+}
+
 function builtinCodeNodeSource(node: OrchNode): { source: string; note?: string } | null {
   if (!isReportWriterNode(node)) return null
   const inputs = (node.codeSpec?.inputs ?? []).filter(isStatePath)
   const outputs = (node.codeSpec?.outputs ?? []).filter(isStatePath)
-  const reportPath = outputs.find(p => p.endsWith('.md') || p.endsWith('.txt')) ?? `state/${node.id}.md`
+  // api.state.writeText only accepts state/-rooted paths — a declared output
+  // anywhere else (or under merge-excluded .meta-agent/) falls back to state/.
+  const reportPath =
+    outputs.find(p => p.startsWith('state/') && (p.endsWith('.md') || p.endsWith('.txt'))) ??
+    `state/${node.id}.md`
   const title = reportTitle(node)
   const source = `\
 export async function main(input, api) {

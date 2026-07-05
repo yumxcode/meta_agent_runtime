@@ -93,6 +93,12 @@ export interface ReviewerInput {
   allowedTools?: string[]
   maxTurns?: number
   maxBudgetUsd?: number
+  /**
+   * Workspace root the reviewer inspects. MUST be set when a run workspace is
+   * active (the integration tree): the autonomy jail otherwise fills the MAIN
+   * workspace root and the reviewer would judge a tree the run never wrote to.
+   */
+  projectDir?: string
   signal: AbortSignal
   spawnOptions?: SpawnWaitOptions
 }
@@ -119,6 +125,7 @@ export async function runReviewer(
       pollIntervalMs: input.spawnOptions?.pollMs ?? 500,
       checkpointEveryNTurns: 0,
       workspaceMode: 'shared_readonly',
+      ...(input.projectDir ? { projectDir: input.projectDir } : {}),
     },
     input.signal,
     input.spawnOptions,

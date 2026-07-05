@@ -32,6 +32,12 @@ import type {
   AutoWorktreeCleanupStrategy,
   AutoWorktreeCoordinator,
 } from '../auto/AutoWorktreeCoordinator.js'
+import {
+  createAutoOrchRunWorkspace,
+  sweepStaleAutoOrchRuns,
+  type AutoOrchRunWorkspace,
+} from './RunWorkspace.js'
+import { listAutoOrchSchedules } from './AutoOrchScheduleStore.js'
 import { mkdir, readdir, readFile, rm, writeFile } from 'fs/promises'
 import { dirname, join, relative, resolve } from 'path'
 
@@ -47,6 +53,13 @@ export interface AutoOrchControllerDeps extends AutoOrchPlannerDeps {
     coordinator: AutoWorktreeCoordinator
     strategy: AutoWorktreeCleanupStrategy
   }
+  /**
+   * Rebinds the sub-agent bridge's worktree coordinator for the duration of a
+   * run so isolated writers fork from / merge into the RUN branch instead of
+   * main. Called with the run coordinator at run start and null (restore the
+   * base coordinator) at run end.
+   */
+  worktreeBinding?: (coordinator: AutoWorktreeCoordinator | null) => void
 }
 
 export interface OrchestrationResult {
@@ -71,6 +84,8 @@ export class AutoOrchController {
   private readonly observer?: AutoOrchObserver
   private readonly getGoal: () => string | null
   private readonly worktreeCleanup?: AutoOrchControllerDeps['worktreeCleanup']
+  private readonly worktreeBinding?: AutoOrchControllerDeps['worktreeBinding']
+  private readonly nodeRunnerOptions?: KernelNodeRunnerOptions
 
   constructor(deps: AutoOrchControllerDeps) {
     this.plan = makeAutoOrchPlanner(deps)
@@ -80,8 +95,11 @@ export class AutoOrchController {
     this.observer = deps.observer
     this.getGoal = deps.getGoal
     this.worktreeCleanup = deps.worktreeCleanup
-    // Forward workspace + goal so role nodes ('verify'/'drift') resolved from the
-    // catalogue get the real jail root and frozen goal they judge against.
+    this.worktreeBinding = deps.worktreeBinding
+    this.nodeRunnerOptions = deps.nodeRunnerOptions
+    // Fallback (non-git workspace) runner: nodes operate on the main tree, as
+    // before. When a run workspace is created, run() builds a RUN-SCOPED runner
+    // pointed at the integration tree instead.
     this.nodeRunner = new KernelNodeRunner(deps.dispatcher, {
       projectDir: deps.projectDir,
       getGoal: deps.getGoal,
@@ -97,6 +115,7 @@ export class AutoOrchController {
   async run(signal: AbortSignal): Promise<OrchestrationResult> {
     let planned: PlannerOutcome | undefined
     let finalRun: PlanRunResult | undefined
+    let workspace: AutoOrchRunWorkspace | undefined
     const processSnapshot = await captureProcessFileSnapshot(this.projectDir).catch(() => undefined)
     try {
       planned = await this.plan(signal)
@@ -152,15 +171,53 @@ export class AutoOrchController {
       if (materializedPlanRef) {
         await saveMaterializedAutoOrchPlan(this.projectDir, materializedPlanRef, materialized.plan).catch(() => undefined)
       }
+      // Run workspace: fork an integration branch + private tree so MAIN is
+      // never written while the graph runs. null → non-git workspace, fall back
+      // to the legacy on-main path.
+      workspace = await this.setupRunWorkspace()
+      let nodeRunner = this.nodeRunner
+      if (workspace) {
+        // Isolated writers must fork from / merge into the RUN branch.
+        this.worktreeBinding?.(workspace.coordinator)
+        nodeRunner = new KernelNodeRunner(this.dispatcher, {
+          getGoal: this.getGoal,
+          ...this.nodeRunnerOptions,
+          projectDir: workspace.root,
+          codeArtifactRoot: this.projectDir,
+          worktrees: workspace.coordinator,
+          runTree: workspace,
+        })
+      }
       const blackboard = new Blackboard()
-      const runner = new PlanRunner(materialized.plan, this.nodeRunner, { blackboard, observer: this.observer })
-      const run = await runner.run(signal)
+      const runner = new PlanRunner(materialized.plan, nodeRunner, { blackboard, observer: this.observer })
+      let run = await runner.run(signal)
+      // Run-level transaction: completed → ONE squash merge of the run branch
+      // into main; any other terminal outcome → discard everything (main was
+      // never written, so the workspace stays clean by construction). A failed
+      // final merge downgrades the run to 'failed' — "success" always means
+      // "merged into main", never a stranded branch reported as done.
+      if (workspace) {
+        if (run.status === 'completed') {
+          const fin = await workspace.finishSuccess(
+            `auto_orch ${workspace.runId}: ${compactLine(this.safeGoal(), 72)}`,
+          )
+          if (!fin.merged) {
+            run = { ...run, status: 'failed', note: joinNotes(run.note, fin.note) }
+          } else if (fin.note) {
+            run = { ...run, note: joinNotes(run.note, fin.note) }
+          }
+        } else if (run.status !== 'paused') {
+          await workspace.finishDiscard().catch(() => undefined)
+        }
+      }
       finalRun = run
       if (storedPlanRef) {
         await appendAutoOrchPlanRun(this.projectDir, storedPlanRef, run).catch(() => undefined)
       }
       if (run.status === 'paused' && this.scheduler) {
-        await this.scheduler.schedulePausedRun(materialized.plan, run).catch(() => undefined)
+        await this.scheduler
+          .schedulePausedRun(materialized.plan, run, workspace?.descriptor(), materializedPlanRef)
+          .catch(() => undefined)
       } else if (this.scheduler) {
         await this.scheduler.cancelAll(`auto_orch run ended: ${run.status}`).catch(() => undefined)
       }
@@ -190,12 +247,41 @@ export class AutoOrchController {
         summary: renderSummary(fallbackPlan, run, 0),
       }
     } finally {
+      // Restore the base coordinator no matter how the run ended.
+      this.worktreeBinding?.(null)
       if (finalRun?.status !== 'paused') {
-        if (finalRun && shouldRestoreProcessFiles(finalRun.status)) {
+        // Defensive: on exception paths the workspace may not be finished yet.
+        // finishDiscard() is a no-op when it already was — including the
+        // deliberate branch-preserving failed-merge path.
+        await workspace?.finishDiscard().catch(() => undefined)
+        // Legacy on-main path only: with a run workspace, main's state/ is
+        // untouched during the run (success syncs it explicitly).
+        if (!workspace && finalRun && shouldRestoreProcessFiles(finalRun.status)) {
           await processSnapshot?.restore().catch(() => undefined)
         }
         await this.cleanupWorktrees()
       }
+    }
+  }
+
+  /**
+   * Sweep stale run workspaces from previous crashed/killed runs (protecting
+   * runs owned by live paused schedules), then fork this run's integration
+   * branch. undefined → non-git workspace, caller falls back to on-main.
+   */
+  private async setupRunWorkspace(): Promise<AutoOrchRunWorkspace | undefined> {
+    try {
+      const keep = new Set<string>()
+      const schedules = await listAutoOrchSchedules().catch(() => [])
+      for (const s of schedules) {
+        if ((s.status === 'scheduled' || s.status === 'running') && s.runWorkspace?.runId) {
+          keep.add(s.runWorkspace.runId)
+        }
+      }
+      await sweepStaleAutoOrchRuns(this.projectDir, keep).catch(() => [])
+      return (await createAutoOrchRunWorkspace(this.projectDir)) ?? undefined
+    } catch {
+      return undefined
     }
   }
 
@@ -303,6 +389,16 @@ function statusZh(status: PlanRunResult['status']): string {
 
 function shouldRestoreProcessFiles(status: PlanRunResult['status']): boolean {
   return status !== 'completed' && status !== 'paused'
+}
+
+function joinNotes(...notes: Array<string | undefined>): string | undefined {
+  const parts = notes.filter((n): n is string => !!n && n.trim().length > 0)
+  return parts.length ? parts.join('；') : undefined
+}
+
+function compactLine(text: string, maxChars: number): string {
+  const oneLine = text.replace(/\s+/g, ' ').trim()
+  return oneLine.length > maxChars ? `${oneLine.slice(0, maxChars)}…` : oneLine
 }
 
 interface ProcessRootSnapshot {

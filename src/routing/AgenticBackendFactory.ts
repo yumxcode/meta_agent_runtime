@@ -145,12 +145,23 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // writers can merge through it; the bridge wiring/reconcile happens below.
   const worktrees = new AutoWorktreeCoordinator(projectDir)
 
+  // Run-workspace binding: while an auto_orch run (or resumed continuation)
+  // executes, the bridge's worktree coordinator is swapped to the RUN-scoped
+  // one so isolated writers fork from / merge into the run's integration
+  // branch instead of main. null restores the base coordinator. Safe in
+  // auto_orch mode: the bridge's only worktree consumers are the run's nodes.
+  const bindRunCoordinator = (coord: AutoWorktreeCoordinator | null): void => {
+    bridgeRef?.setWorktreeCoordinator(coord ?? (worktrees.enabled ? worktrees : null))
+  }
+
   const orchScheduler = isAutoOrch
     ? new AutoOrchScheduler({
         dispatcher: lazyDispatcher,
         projectDir,
         getGoal,
         observer: baseConfig.autoOrchObserver,
+        worktreeBinding: bindRunCoordinator,
+        getSessionId: () => sessionIdForRoles,
         nodeRunnerOptions: { roleCatalog, worktrees, executorMaxTurns: baseConfig.autoOrchExecutorMaxTurns },
       })
     : null
@@ -169,6 +180,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
           coordinator: worktrees,
           strategy: worktreeCleanupStrategy,
         },
+        worktreeBinding: bindRunCoordinator,
         // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
         // came from — verify/drift/reviewer are defined once. Parallel writers
         // merge via the shared worktree coordinator.
@@ -303,7 +315,11 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
 
   const disposeSession = session.dispose.bind(session)
   session.dispose = async () => {
-    orchScheduler?.stop(true)
+    // Stop ticking but KEEP durable schedules: a paused run's schedule must
+    // survive session disposal so a daemon / later session can resume it
+    // (stop(true) used to cancel them here — that guaranteed orphaned pauses).
+    // Non-paused run endings already cancel their schedules in the controller.
+    orchScheduler?.stop(false)
     await disposeSession()
     if (worktrees.enabled && worktreeCleanupStrategy !== 'preserve') {
       await worktrees.cleanup(worktreeCleanupStrategy).catch(() => undefined)

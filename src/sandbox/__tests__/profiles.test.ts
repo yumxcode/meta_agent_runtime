@@ -31,4 +31,21 @@ describe('sandbox profiles', () => {
     }, workspaceRoot)
     expect(bwrapArgs).toEqual(expect.arrayContaining(['--bind', artifactRoot, artifactRoot]))
   })
+
+  it('carves writeDenyPaths out of a writable workspace', () => {
+    const workspaceRoot = '/repo'
+    const denied = '/repo/.meta-agent'
+
+    const macosProfile = buildMacOSProfile({ writeDenyPaths: [denied] }, workspaceRoot)
+    expect(macosProfile).toContain(`(allow file-write* (subpath "${workspaceRoot}"))`)
+    expect(macosProfile).toContain(`(subpath "${denied}")`)
+    // Seatbelt takes the LAST matching rule — the deny must appear AFTER the allow.
+    expect(macosProfile.indexOf(`(deny file-write*\n  (subpath "${denied}")`))
+      .toBeGreaterThan(macosProfile.indexOf(`(allow file-write* (subpath "${workspaceRoot}"))`))
+
+    const bwrapArgs = buildBwrapArgs({ writeDenyPaths: [denied] }, workspaceRoot)
+    expect(bwrapArgs).toEqual(expect.arrayContaining(['--ro-bind-try', denied, denied]))
+    // The ro-bind must come after the workspace bind so it shadows it.
+    expect(bwrapArgs.indexOf('--ro-bind-try')).toBeGreaterThan(bwrapArgs.indexOf('--bind'))
+  })
 })

@@ -107,6 +107,14 @@ export interface OrchNode {
   maxBudgetUsd?: number
   /** Where writes land (executors that write MUST be isolated_write). */
   workspaceMode?: NodeWorkspaceMode
+  /**
+   * Declared canonical artifacts (workspace-relative paths) this executor MUST
+   * have landed in the integration tree after its merge. The runner verifies
+   * existence post-merge and feeds a corrective retry when they're missing —
+   * this catches "node claimed ok but its writes never reached canonical state"
+   * (e.g. writes under merge-excluded paths). Optional; writers SHOULD declare it.
+   */
+  outputs?: string[]
   /** Phase hooks active only while this node runs. */
   hooks?: NodeHookSpec[]
   // ── Code-node fields (kind === 'code') ──────────────────────────────────────
@@ -223,6 +231,7 @@ export function validatePlan(plan: OrchPlan, opts: ValidatePlanOptions = {}): st
       if (h.when) errs.push(...validatePredicate(h.when, `node[${n.id}].hook[${h.id}].when`))
     }
     if (n.kind === 'parallel') errs.push(...validateParallelNode(n))
+    errs.push(...validateStatePathConvention(n))
   }
 
   if (!plan.entry) errs.push('plan.entry is required')
@@ -274,6 +283,72 @@ function validateCodeNode(n: OrchNode, opts: ValidatePlanOptions): string[] {
     }
   }
   return errs
+}
+
+// ── Canonical-state path convention ─────────────────────────────────────────────
+//
+// `.meta-agent/` is the runtime's OWN metadata root (worktrees, run registry,
+// code artifacts). Task worktrees and finalize/merge exclude it via the pathspec
+// `:(exclude).meta-agent/**`, so anything a node writes there is SILENTLY
+// DISCARDED at merge time and invisible to every later node — the exact failure
+// mode this rule prevents. All cross-node state must live under `state/` at the
+// workspace root (which is also what CodeNodeRunner's api.state enforces).
+
+const META_AGENT_PATH_RE = /\.meta-agent[/\\]/
+
+/** Instructive remediation appended to every violation, so the planner's retry
+ * loop (lastErrors → next attempt) can fix the plan without human help. */
+const STATE_PATH_REMEDIATION =
+  `paths under '.meta-agent/' are runtime-internal: task worktrees and merges exclude them ` +
+  `(':(exclude).meta-agent/**'), so writes there are silently discarded and unreadable by later ` +
+  `nodes. Keep ALL canonical cross-node state under 'state/' at the workspace root ` +
+  `(e.g. state/progress.json, state/findings.jsonl) and rewrite every reference accordingly.`
+
+/**
+ * Reject any node that anchors state (or declared outputs) under `.meta-agent/`.
+ * Structured fields (codeSpec.inputs/outputs, input values, outputs, writeScope)
+ * are checked exactly; taskDescription/systemPrompt heuristically — a mention of
+ * `.meta-agent/` in a task the sub-agent will follow verbatim is just as fatal.
+ */
+function validateStatePathConvention(n: OrchNode): string[] {
+  const errs: string[] = []
+  const flag = (field: string, value: string): void => {
+    errs.push(`node[${n.id}].${field} references '${truncatePath(value)}' — ${STATE_PATH_REMEDIATION}`)
+  }
+  if (META_AGENT_PATH_RE.test(n.taskDescription ?? '')) flag('taskDescription', n.taskDescription)
+  if (n.systemPrompt && META_AGENT_PATH_RE.test(n.systemPrompt)) flag('systemPrompt', n.systemPrompt)
+  for (const p of n.codeSpec?.inputs ?? []) if (META_AGENT_PATH_RE.test(p)) flag('codeSpec.inputs', p)
+  for (const p of n.codeSpec?.outputs ?? []) if (META_AGENT_PATH_RE.test(p)) flag('codeSpec.outputs', p)
+  for (const bad of scanStrings(n.input)) flag('input', bad)
+  for (const p of n.outputs ?? []) {
+    if (META_AGENT_PATH_RE.test(p)) flag('outputs', p)
+    else if (p.startsWith('/') || p.startsWith('..') || /^[A-Za-z]:[/\\]/.test(p)) {
+      errs.push(`node[${n.id}].outputs entry '${p}' must be a workspace-relative path (no absolute paths or '..')`)
+    }
+  }
+  for (const b of n.branches ?? []) {
+    if (META_AGENT_PATH_RE.test(b.taskDescription ?? '')) flag(`branch[${b.id}].taskDescription`, b.taskDescription)
+    for (const p of b.writeScope ?? []) if (META_AGENT_PATH_RE.test(p)) flag(`branch[${b.id}].writeScope`, p)
+  }
+  return errs
+}
+
+/** Depth-limited scan of a JSON-ish value for strings that hit the rule. */
+function scanStrings(v: unknown, depth = 0): string[] {
+  if (depth > 4 || v == null) return []
+  if (typeof v === 'string') return META_AGENT_PATH_RE.test(v) ? [v] : []
+  if (Array.isArray(v)) return v.flatMap(x => scanStrings(x, depth + 1))
+  if (typeof v === 'object') return Object.values(v).flatMap(x => scanStrings(x, depth + 1))
+  return []
+}
+
+function truncatePath(s: string, n = 120): string {
+  const m = META_AGENT_PATH_RE.exec(s)
+  if (!m) return s.length > n ? s.slice(0, n) + '…' : s
+  // Show the offending region, not a possibly huge taskDescription.
+  const start = Math.max(0, m.index - 30)
+  const excerpt = s.slice(start, m.index + 60)
+  return (start > 0 ? '…' : '') + excerpt + (m.index + 60 < s.length ? '…' : '')
 }
 
 /**

@@ -364,7 +364,11 @@ describe('SubAgentBridge isolated-write contract', () => {
       )
       expect(coordinator.recordFor(task.taskId)?.finalizedCommit).toBeTruthy()
       expect(git(record.config.projectDir!, ['status', '--porcelain'])).toBe('')
-      expect(bridge.drainNotifications().join('\n')).toContain('等待 auto_merge_subagent')
+      let notifications = ''
+      await waitFor(() => {
+        notifications += bridge.drainNotifications().join('\n')
+        return notifications.includes('等待 auto_merge_subagent')
+      })
     } finally {
       await bridge.dispose()
       rmSync(repo, { recursive: true, force: true })

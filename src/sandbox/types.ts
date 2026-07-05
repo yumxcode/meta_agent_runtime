@@ -31,6 +31,19 @@ export interface SandboxConfig {
   writeAllowPaths?: string[]
 
   /**
+   * Absolute paths the sub-agent may NOT write, even inside an otherwise
+   * writable workspace. Used e.g. to block isolated-worktree writers from
+   * `.meta-agent/` (merge-excluded → writes there are silently discarded).
+   *
+   * Note: on macOS (Seatbelt) this is exact ((deny file-write* (subpath …))
+   * appended after the workspace allow). On Linux (bwrap) it is approximated
+   * by ro-binding the path — the path must EXIST on the host for the bind to
+   * apply; callers should pre-create it.
+   * Default: [] (no extra write restrictions)
+   */
+  writeDenyPaths?: string[]
+
+  /**
    * Absolute paths the sub-agent may NOT read.
    * Useful for hiding secrets, credentials, or sibling project dirs.
    * Default: [] (no extra read restrictions)

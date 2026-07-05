@@ -68,6 +68,13 @@ export function buildBwrapArgs(
     args.push('--bind', p, p)
   }
 
+  // Write-deny approximation: ro-bind the denied path over the writable
+  // workspace bind (later mounts shadow earlier ones). The source path must
+  // exist on the host — callers pre-create it (see SandboxConfig docs).
+  for (const p of config.writeDenyPaths ?? []) {
+    args.push('--ro-bind-try', p, p)
+  }
+
   // ── Read-deny approximation ───────────────────────────────────────────────
   // Mount a fresh tmpfs over each denied path, making it appear empty.
   for (const p of config.readDenyPaths ?? []) {

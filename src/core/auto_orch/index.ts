@@ -138,6 +138,31 @@ export { Blackboard } from './Blackboard.js'
 export type { AutoOrchEvent, AutoOrchObserver } from './Observer.js'
 export { notifyAutoOrchObserver } from './Observer.js'
 
+// ── C: scheduler keep-alive ops (M5: foreground wait / daemon / self-heal) ────
+export type {
+  AutoOrchQuiescenceStatus,
+  WaitForQuiescenceOptions,
+  SpawnDetachedSchedulerResult,
+} from './SchedulerKeepAlive.js'
+export {
+  waitForAutoOrchQuiescence,
+  acquireAutoOrchDaemonLock,
+  spawnDetachedAutoOrchScheduler,
+} from './SchedulerKeepAlive.js'
+
+// ── C: run integration workspace (branch-isolated execution) ──────────────────
+export type {
+  AutoOrchRunWorkspaceDescriptor,
+  AutoOrchRunTreeOps,
+  AutoOrchRunFinishResult,
+} from './RunWorkspace.js'
+export {
+  AutoOrchRunWorkspace,
+  createAutoOrchRunWorkspace,
+  attachAutoOrchRunWorkspace,
+  sweepStaleAutoOrchRuns,
+} from './RunWorkspace.js'
+
 // ── C: end-to-end controller ───────────────────────────────────────────────────
 export type { AutoOrchControllerDeps, OrchestrationResult } from './AutoOrchController.js'
 export {
@@ -181,6 +206,8 @@ export {
   readAutoOrchSchedule,
   listAutoOrchSchedules,
   listDueAutoOrchSchedules,
+  listUnreportedAutoOrchTerminalNotices,
+  acknowledgeAutoOrchTerminalNotice,
   cancelAutoOrchSchedule,
   cancelAutoOrchSchedulesForAgentSession,
   cancelAutoOrchSchedulesForOrchestration,

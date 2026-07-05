@@ -19,6 +19,8 @@
  */
 
 import { randomUUID } from 'crypto'
+import { mkdir } from 'fs/promises'
+import { join } from 'path'
 import { readIntEnvOr, readFloatEnv } from '../infra/env/RuntimeEnv.js'
 import { readTask, writeTask, mutateTask, releaseWriteChain, listTasksForSession, cleanupTerminalTasks } from './SubAgentTaskStore.js'
 import { SubAgentRunner } from './SubAgentRunner.js'
@@ -582,10 +584,22 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       }
       const wt = await this._worktreeCoordinator.allocate(taskId, this.parentSessionId)
       if (!wt) throw new Error('isolated_write requires a git workspace')
+      // Deny writes to the worktree's .meta-agent/: finalize/merge exclude it
+      // (:(exclude).meta-agent/**), so anything written there is silently
+      // discarded. Denying at the sandbox level makes bash writes fail fast
+      // too (the tool-level guard in SubAgentRunner covers edit/write tools
+      // with an instructive message). Pre-create the dir so bwrap's ro-bind
+      // approximation has an existing bind source.
+      const metaAgentDir = join(wt.worktreePath, '.meta-agent')
+      await mkdir(metaAgentDir, { recursive: true }).catch(() => undefined)
       config = {
         ...config,
         projectDir: wt.worktreePath,
-        sandbox: { ...config.sandbox, writeAllowPaths: [wt.worktreePath] },
+        sandbox: {
+          ...config.sandbox,
+          writeAllowPaths: [wt.worktreePath],
+          writeDenyPaths: [...(config.sandbox?.writeDenyPaths ?? []), metaAgentDir],
+        },
       }
     }
 

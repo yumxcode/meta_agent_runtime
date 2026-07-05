@@ -16,6 +16,9 @@ import {
   listDueAutoOrchSchedules,
   cancelAutoOrchSchedule,
   cancelAutoOrchSchedulesForOrchestration,
+  claimAutoOrchSchedule,
+  releaseAutoOrchScheduleClaim,
+  autoOrchClaimOwner,
   type AutoOrchScheduledResume,
 } from './AutoOrchScheduleStore.js'
 import {
@@ -27,6 +30,13 @@ import {
   notifyAutoOrchObserver,
   type AutoOrchObserver,
 } from './Observer.js'
+import {
+  attachAutoOrchRunWorkspace,
+  type AutoOrchRunWorkspace,
+  type AutoOrchRunWorkspaceDescriptor,
+} from './RunWorkspace.js'
+import { appendAutoOrchPlanRun, type AutoOrchStoredPlanRef } from './PlanStore.js'
+import type { AutoWorktreeCoordinator } from '../auto/AutoWorktreeCoordinator.js'
 
 export interface AutoOrchObservation {
   prompt: string
@@ -47,12 +57,24 @@ export interface AutoOrchSchedulerOptions {
   resumePollMs?: number
   resumeMaxWaitMs?: number
   observer?: AutoOrchObserver
+  /**
+   * Rebinds the bridge's worktree coordinator to the resumed run's coordinator
+   * while a continuation executes (null restores the base). Mirrors
+   * AutoOrchControllerDeps.worktreeBinding.
+   */
+  worktreeBinding?: (coordinator: AutoWorktreeCoordinator | null) => void
+  /** Creating session id, stamped on schedules for observability. */
+  getSessionId?: () => string | undefined
 }
 
 const DEFAULT_POLL_MS = 5_000
 const DEFAULT_RESUME_POLL_MS = 1_000
 const DEFAULT_RESUME_MAX_WAIT_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS + 60_000
 const DEFAULT_NEXT_CHECK_MS = 30 * 60 * 1000
+const DEFAULT_MAX_ATTEMPTS = 5
+const MIN_REPAUSE_DELAY_MS = 60_000
+const BASE_RETRY_DELAY_MS = 60_000
+const MAX_RETRY_DELAY_MS = 60 * 60_000
 
 export class AutoOrchScheduler {
   private readonly collector: AutoOrchObservationCollector
@@ -63,6 +85,7 @@ export class AutoOrchScheduler {
   private timer: ReturnType<typeof setInterval> | null = null
   private stopped = false
   private ticking = false
+  private readonly claimOwner = autoOrchClaimOwner()
   private readonly active = new Set<string>()
   private readonly orchestrationTaskIds = new Set<string>()
   private readonly scheduleIds = new Set<string>()
@@ -115,7 +138,12 @@ export class AutoOrchScheduler {
     return n
   }
 
-  async schedulePausedRun(plan: OrchPlan, run: PlanRunResult): Promise<AutoOrchScheduledResume | null> {
+  async schedulePausedRun(
+    plan: OrchPlan,
+    run: PlanRunResult,
+    runWorkspace?: AutoOrchRunWorkspaceDescriptor,
+    planRef?: AutoOrchStoredPlanRef,
+  ): Promise<AutoOrchScheduledResume | null> {
     if (run.status !== 'paused' || !run.resumeHandle) return null
     const nodeId = stringOf(run.resumeHandle['nodeId']) ?? run.visitedPath.at(-1)
     const subTaskId = stringOf(run.resumeHandle['subTaskId'])
@@ -132,12 +160,20 @@ export class AutoOrchScheduler {
       nodeId,
       subTaskId,
       agentSessionId,
+      projectDir: this.opts.projectDir,
+      createdBySessionId: this.opts.getSessionId?.(),
+      // Persist the goal: a daemon / later session resuming this run has no
+      // in-memory goal anchor, but role nodes still need one to judge against.
+      goal: safeGoalOf(this.opts.getGoal),
       externalRunId: stringOf(run.resumeHandle['externalRunId']),
       resumeInstruction: stringOf(run.resumeHandle['resumeInstruction']),
       runAt: now + Math.max(0, nextCheckAfterMs),
       status: 'scheduled',
       attempts: 0,
+      maxAttempts: DEFAULT_MAX_ATTEMPTS,
       plan,
+      ...(planRef ? { planRef } : {}),
+      ...(runWorkspace ? { runWorkspace } : {}),
       createdAt: now,
       updatedAt: now,
     }
@@ -151,15 +187,22 @@ export class AutoOrchScheduler {
     if (this.stopped || this.ticking) return
     this.ticking = true
     try {
-      const due = await listDueAutoOrchSchedules()
+      // Workspace-scoped pickup: never touch another project's schedules.
+      const due = await listDueAutoOrchSchedules(Date.now(), { projectDir: this.opts.projectDir })
       for (const record of due) {
         if (this.stopped || signal.aborted) break
         if (this.active.has(record.scheduleId)) continue
+        // Cross-process atomic claim: exactly one scheduler executes a due
+        // schedule, even when several sessions share the workspace.
+        if (!(await claimAutoOrchSchedule(record.scheduleId, this.claimOwner))) continue
         this.active.add(record.scheduleId)
         try {
           await this.runDue(record, signal)
         } finally {
           this.active.delete(record.scheduleId)
+          // The claim guards the execution window only; a re-paused schedule's
+          // next fire re-claims.
+          await releaseAutoOrchScheduleClaim(record.scheduleId).catch(() => undefined)
         }
       }
     } finally {
@@ -175,9 +218,21 @@ export class AutoOrchScheduler {
     this.orchestrationTaskIds.add(record.orchestrationTaskId)
     const running = { ...record, status: 'running' as const, attempts: record.attempts + 1, updatedAt: Date.now() }
     await writeAutoOrchSchedule(running)
+    let workspace: AutoOrchRunWorkspace | null = null
     try {
       const stillRunning = await readAutoOrchSchedule(running.scheduleId)
       if (!stillRunning || stillRunning.status !== 'running') return
+      // Re-attach the run's integration workspace: the continuation must keep
+      // executing on the run branch, never on main.
+      if (running.runWorkspace) {
+        workspace = await attachAutoOrchRunWorkspace(this.opts.projectDir, running.runWorkspace)
+        if (!workspace) {
+          throw new Error(
+            `auto_orch run workspace is gone (branch ${running.runWorkspace.branchName}); cannot resume`,
+          )
+        }
+        this.opts.worktreeBinding?.(workspace.coordinator)
+      }
       const observation = await this.collector.collect(running, signal)
       await notifyAutoOrchObserver(this.opts.observer, {
         type: 'run_resumed',
@@ -197,17 +252,46 @@ export class AutoOrchScheduler {
       if (!finalTask) throw new Error(`resumed sub-agent did not finish: ${task.taskId}`)
 
       if (finalTask.result?.success && isAutoOrchPauseOutput(finalTask.result.output)) {
+        // Still waiting: keep the run workspace alive for the next check.
         await this.handleRepaused(running, finalTask, finalTask.result.output.auto_orch_pause)
         return
       }
 
       await this.markResumedSessionSettled(running, finalTask)
-      const continuation = await this.continuePlanFromResumedNode(running.plan, running.nodeId, finalTask, signal)
+      // A resumed isolated writer's worktree must merge into the run branch —
+      // synthesising 'ok' without merging would silently drop its file changes.
+      const resumeMerge = await this.mergeResumedTask(workspace, finalTask)
+      let continuation = await this.continuePlanFromResumedNode(
+        running.plan, running.nodeId, finalTask, signal, workspace, resumeMerge, running.goal,
+      )
       if (continuation.status === 'paused') {
-        await this.schedulePausedRun(running.plan, continuation)
+        await this.schedulePausedRun(running.plan, continuation, running.runWorkspace, running.planRef)
+      } else if (workspace) {
+        // Terminal: apply the run-level transaction (same semantics as the
+        // controller) — completed merges into main, everything else discards.
+        if (continuation.status === 'completed') {
+          const fin = await workspace.finishSuccess(`auto_orch ${workspace.runId}: resumed run completed`)
+          if (!fin.merged) {
+            continuation = {
+              ...continuation,
+              status: 'failed',
+              note: [continuation.note, fin.note].filter(Boolean).join('；'),
+            }
+          } else if (fin.note) {
+            continuation = {
+              ...continuation,
+              note: [continuation.note, fin.note].filter(Boolean).join('；'),
+            }
+          }
+        } else {
+          await workspace.finishDiscard().catch(() => undefined)
+        }
       }
       if (continuation.status !== 'paused') {
         await this.cancelOrchestration(running.orchestrationTaskId, 'auto_orch run reached a terminal non-paused state')
+      }
+      if (running.planRef) {
+        await appendAutoOrchPlanRun(this.opts.projectDir, running.planRef, continuation).catch(() => undefined)
       }
       await writeAutoOrchSchedule({
         ...running,
@@ -215,18 +299,63 @@ export class AutoOrchScheduler {
           ? 'failed'
           : 'completed',
         updatedAt: Date.now(),
+        terminalAt: Date.now(),
+        terminalNotice: terminalNoticeFor(continuation),
         lastError: continuation.status === 'completed' || continuation.status === 'paused'
           ? undefined
           : continuation.note,
       })
     } catch (err) {
+      const message = err instanceof Error ? err.message : String(err)
+      const maxAttempts = running.maxAttempts ?? DEFAULT_MAX_ATTEMPTS
+      if (running.attempts < maxAttempts && !signal.aborted) {
+        const delay = retryDelayMs(running.attempts)
+        await writeAutoOrchSchedule({
+          ...running,
+          status: 'scheduled',
+          runAt: Date.now() + delay,
+          updatedAt: Date.now(),
+          lastError: `${message}; retrying in ${Math.ceil(delay / 1000)}s`,
+        })
+        return
+      }
+      // The run is dead: discard its workspace so the main tree stays clean and
+      // a later re-run cannot trip over the residue.
+      await workspace?.finishDiscard().catch(() => undefined)
       await this.cancelOrchestration(running.orchestrationTaskId, 'auto_orch scheduled resume failed')
       await writeAutoOrchSchedule({
         ...running,
         status: 'failed',
         updatedAt: Date.now(),
-        lastError: err instanceof Error ? err.message : String(err),
+        terminalAt: Date.now(),
+        terminalNotice: `auto_orch scheduled resume failed after ${running.attempts} attempt(s): ${message}`,
+        lastError: message,
       })
+    } finally {
+      if (workspace) this.opts.worktreeBinding?.(null)
+    }
+  }
+
+  /** Merge a successfully-resumed isolated writer's worktree into the run branch. */
+  private async mergeResumedTask(
+    workspace: AutoOrchRunWorkspace | null,
+    task: SubAgentRecord,
+  ): Promise<{ ok: boolean; note?: string }> {
+    if (!workspace) return { ok: true }
+    if (task.status !== 'completed' || !task.result?.success) return { ok: true }
+    if (task.config.workspaceMode !== 'isolated_write') return { ok: true }
+    if (!workspace.coordinator.recordFor(task.taskId)) return { ok: true }
+    try {
+      const r = await workspace.coordinator.merge(task.taskId, {
+        message: `meta-agent: auto_orch resumed node merge (${task.taskId})`,
+      })
+      if (r?.merged === false) return { ok: false, note: 'resumed worktree merge failed' }
+      return { ok: true }
+    } catch (err) {
+      return {
+        ok: false,
+        note: `resumed worktree merge failed: ${err instanceof Error ? err.message : String(err)}`,
+      }
     }
   }
 
@@ -257,7 +386,7 @@ export class AutoOrchScheduler {
       subTaskId: task.taskId,
       externalRunId: pause.externalRunId ?? schedule.externalRunId,
       resumeInstruction: pause.resumeInstruction ?? schedule.resumeInstruction,
-      runAt: now + Math.max(0, pause.nextCheckAfterMs ?? DEFAULT_NEXT_CHECK_MS),
+      runAt: now + Math.max(MIN_REPAUSE_DELAY_MS, pause.nextCheckAfterMs ?? DEFAULT_NEXT_CHECK_MS),
       updatedAt: now,
     })
   }
@@ -281,8 +410,30 @@ export class AutoOrchScheduler {
     pausedNodeId: string,
     task: SubAgentRecord,
     signal: AbortSignal,
+    workspace: AutoOrchRunWorkspace | null,
+    resumeMerge: { ok: boolean; note?: string },
+    recordGoal?: string,
   ): Promise<PlanRunResult> {
-    const runner = new ResumeContinuationNodeRunner(pausedNodeId, task, this.nodeRunner)
+    // Goal: prefer the goal PERSISTED on the schedule — the session that
+    // created it may be long gone (daemon resume), and role nodes need it.
+    const getGoal = (): string | null => recordGoal ?? safeGoalOf(this.opts.getGoal) ?? null
+    // Run-scoped delegate: continuation nodes must execute against the
+    // integration tree, exactly like the original run's nodes did.
+    const delegate = workspace || recordGoal
+      ? new KernelNodeRunner(this.opts.dispatcher, {
+          getGoal,
+          ...this.opts.nodeRunnerOptions,
+          projectDir: workspace?.root ?? this.opts.projectDir,
+          ...(workspace
+            ? {
+                codeArtifactRoot: this.opts.projectDir,
+                worktrees: workspace.coordinator,
+                runTree: workspace,
+              }
+            : {}),
+        })
+      : this.nodeRunner
+    const runner = new ResumeContinuationNodeRunner(pausedNodeId, task, delegate, resumeMerge)
     return new PlanRunner(
       { ...plan, entry: pausedNodeId },
       runner,
@@ -308,12 +459,21 @@ class ResumeContinuationNodeRunner implements NodeRunner {
     private readonly pausedNodeId: string,
     private readonly resumedTask: SubAgentRecord,
     private readonly delegate: NodeRunner,
+    private readonly resumeMerge: { ok: boolean; note?: string } = { ok: true },
   ) {}
 
   async run(node: OrchNode, ctx: PlanRunContext): Promise<OrchVerdict> {
     if (!this.consumed && node.id === this.pausedNodeId) {
       this.consumed = true
       const costUsd = this.resumedTask.result?.costUsd ?? 0
+      if (!this.resumeMerge.ok) {
+        return {
+          action: 'branch',
+          label: 'error',
+          note: this.resumeMerge.note ?? 'resumed worktree merge failed',
+          data: { costUsd },
+        }
+      }
       if (this.resumedTask.status === 'completed' && this.resumedTask.result?.success) {
         return {
           action: 'branch',
@@ -357,6 +517,25 @@ function sleep(ms: number): Promise<void> {
     const timer = setTimeout(resolve, ms)
     if (timer.unref) timer.unref()
   })
+}
+
+function safeGoalOf(getGoal: () => string | null): string | undefined {
+  try {
+    const goal = getGoal()
+    return goal && goal.trim() ? goal : undefined
+  } catch {
+    return undefined
+  }
+}
+
+function retryDelayMs(attempts: number): number {
+  return Math.min(MAX_RETRY_DELAY_MS, BASE_RETRY_DELAY_MS * (2 ** Math.max(0, attempts - 1)))
+}
+
+function terminalNoticeFor(run: PlanRunResult): string {
+  const path = run.visitedPath.length ? ` path=${run.visitedPath.join(' → ')}` : ''
+  const note = run.note ? `; ${run.note}` : ''
+  return `auto_orch resumed run ${run.status}${path}; cost=$${run.costUsd.toFixed(3)}${note}`
 }
 
 function stringOf(v: unknown): string | undefined {

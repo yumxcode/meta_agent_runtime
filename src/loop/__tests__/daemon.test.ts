@@ -1,0 +1,107 @@
+/**
+ * loop-scheduler daemon (T2.4): drives a waiting loop to completion end-to-end
+ * with NO manual pumping — probes inline, harvest dispatched, idle exit when
+ * the workspace is quiescent, host lock exclusivity.
+ */
+import { describe, expect, it } from 'vitest'
+import { mkdtemp, mkdir, readFile, writeFile } from 'fs/promises'
+import { join } from 'path'
+import { tmpdir } from 'os'
+import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
+import type { SubAgentRecord } from '../../subagent/types.js'
+import { makeSubAgentTaskId } from '../../subagent/types.js'
+import { createInstance } from '../instance/InstanceStore.js'
+import { WakeStore } from '../wake/WakeStore.js'
+import { runLoopScheduler } from '../daemon.js'
+import { instancePaths } from '../types.js'
+import { walkResearchCharter } from './testCharter.js'
+
+function scriptedDispatcher(script: (task: string) => Promise<Record<string, unknown>>): ISubAgentDispatcher {
+  return {
+    async spawnSubAgent({ config }) {
+      const output = await script(config.taskDescription)
+      return {
+        schemaVersion: '1.0', taskId: makeSubAgentTaskId(), parentSessionId: 't',
+        status: 'completed', config: config as SubAgentRecord['config'],
+        createdAt: Date.now(), completedAt: Date.now(), pendingHumanApproval: false,
+        result: {
+          success: true, summary: 'scripted', output,
+          turnsUsed: 1, inputTokens: 0, outputTokens: 0, costUsd: 0.1, durationMs: 1,
+        },
+      } satisfies SubAgentRecord
+    },
+    async getStatus() { return null },
+    async cancelTask() { return true },
+  }
+}
+
+describe('runLoopScheduler', () => {
+  it('drives submit → probes → done → harvest → finalize, then idle-exits', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-daemon-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const statusFile = join(dir, 'sim_training.json')
+    let probeCount = 0
+
+    const dispatcher = scriptedDispatcher(async task => {
+      if (task.includes('收割段')) {
+        await mkdir(paths.draftsDir, { recursive: true })
+        await writeFile(join(paths.draftsDir, 'findings_draft.json'),
+          JSON.stringify([{ claim: 'done at 0.6', evidence: 'curve' }]), 'utf-8')
+        return { label: 'ok' }
+      }
+      if (task.includes('产出契约')) {
+        await writeFile(statusFile, JSON.stringify({ state: 'running', metricHistory: [0.1] }), 'utf-8')
+        // Flip the remote task to done shortly after submission; the daemon's
+        // probes must notice it without any help.
+        setTimeout(() => {
+          void writeFile(statusFile, JSON.stringify({ state: 'done', metricHistory: [0.1, 0.6] }), 'utf-8')
+            .catch(() => undefined)
+        }, 30)
+        return { label: 'wait', wait: 'training', effectKey: 'exp-d', payload: { statusFile: 'sim_training.json' } }
+      }
+      if (task.includes('隔离评审座位')) {
+        probeCount // (no-op ref)
+        return { verdict: 'pass', new_findings_count: 1, metric_delta: 0.5, metric: 0.6, messages: [] }
+      }
+      throw new Error('unexpected seat')
+    })
+
+    await createInstance({
+      projectDir: dir,
+      charter: walkResearchCharter({
+        tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+      }),
+      wakeStore: new WakeStore(dir),
+    })
+
+    const result = await runLoopScheduler({
+      dispatcher, projectDir: dir,
+      pollMs: 10, idleExitMs: 50,
+    })
+
+    expect(result.exitReason).toBe('idle')
+    expect(result.roundsRun).toBeGreaterThanOrEqual(2) // submit segment + harvest
+    expect(result.probesRun).toBeGreaterThanOrEqual(1)
+    const record = JSON.parse(await readFile(paths.instanceJson, 'utf-8'))
+    expect(record.status).toBe('done')
+    const report = await readFile(join(paths.reportsDir, 'final_report.md'), 'utf-8')
+    expect(report).toContain('total findings: 1')
+  }, 15_000)
+
+  it('host lock: a second daemon backs off while the first runs', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-daemon-lock-'))
+    const dispatcher = scriptedDispatcher(async () => ({ label: 'ok' }))
+    const abort = new AbortController()
+    const first = runLoopScheduler({
+      dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 5_000, signal: abort.signal,
+    })
+    await new Promise(r => setTimeout(r, 50)) // let it take the lock
+    const second = await runLoopScheduler({ dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 50 })
+    expect(second.exitReason).toBe('lock_held')
+    abort.abort()
+    expect((await first).exitReason).toBe('aborted')
+    // Lock released → a third daemon can now run to idle-exit.
+    const third = await runLoopScheduler({ dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 30 })
+    expect(third.exitReason).toBe('idle')
+  }, 15_000)
+})

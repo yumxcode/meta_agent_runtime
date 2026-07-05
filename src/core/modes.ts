@@ -164,11 +164,11 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
     compactProfile: 'robotics',
   },
 
-  // auto_orch is the simple_auto execution base PLUS an orchestration layer:
-  // an AI-authored plan graph (C) of executor/role nodes, and intra-turn phase
-  // hooks (B). Same weight/jail/autonomy as auto (it is a flavour, not heavier),
-  // but it deliberately does not add auto's implicit checkpoint/drift/verify
-  // gates; graph review roles must express those checks explicitly.
+  // ⚠️ RETIRED (spec D16): auto_orch v1 — the AI-authored plan-graph engine —
+  // is no longer selectable from the CLI. New long-horizon work runs on the
+  // charter-driven loop v2 runtime (src/loop, `meta-agent loop …`). This
+  // profile remains ONLY so orch-scheduler can drain pre-existing paused v1
+  // runs; it is removed together with the engine in the T4.3b deletion pass.
   'auto_orch': {
     weight: 1,
     identityLine:

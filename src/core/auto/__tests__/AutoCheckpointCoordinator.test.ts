@@ -85,14 +85,18 @@ describe('AutoCheckpointCoordinator', () => {
     const dir = mkdtempSync(join(tmpdir(), 'ma-cp-digest-'))
     try {
       const calls: string[][] = []
+      let digestReady: Promise<string> | undefined
       const coordinator = new AutoCheckpointCoordinator({
         projectDir: dir,
         fsOnlyDigestThreshold: 3,
         // Resolve on a later tick to mimic a real (async) LLM side-call.
-        summarizeEdits: paths => new Promise(resolve => {
+        summarizeEdits: paths => {
           calls.push(paths)
-          setTimeout(() => resolve('EDIT_DIGEST'), 5)
-        }),
+          digestReady = new Promise(resolve => {
+            setTimeout(() => resolve('EDIT_DIGEST'), 5)
+          })
+          return digestReady
+        },
         getSnapshot: () => ({ completedSteps: [], pendingTodos: [], artifacts: [], activeSubAgentIds: [] }),
       })
       const fsFlush = (n: number, path: string) => coordinator.flush({
@@ -110,7 +114,7 @@ describe('AutoCheckpointCoordinator', () => {
       // Digest not ready yet, so the threshold write carries no summary.
       expect(readAutoCheckpoint(dir, 's1')?.autoEditSummary).toBeUndefined()
 
-      await new Promise(r => setTimeout(r, 20))  // let the fire-and-forget digest resolve
+      await digestReady
       expect(calls).toHaveLength(1)
       expect(calls[0]).toEqual(['a.ts', 'b.ts', 'c.ts'])  // unioned paths of the streak
 

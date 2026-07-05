@@ -598,6 +598,23 @@ export class SessionRouter {
     return this._roboticsImpl()?.getTeamController() ?? null
   }
 
+  /**
+   * Create the backend NOW without submitting a prompt. Only valid for
+   * explicit-mode sessions (hint !== 'detect') — there is no prompt to detect
+   * a mode from. Used by the auto_orch scheduler daemon (`orch-scheduler`),
+   * which needs a live backend (dispatcher + orch scheduler ticking) to resume
+   * paused runs but never submits. Returns false in detect mode.
+   */
+  async prewarmBackend(): Promise<boolean> {
+    if (this._impl) return true
+    if (this._hint === 'detect') return false
+    this._raiseMode(this._hint)
+    this._impl = await this._createImpl(this._currentMode!)
+    for (const tool of this._pendingTools) this._impl.registerTool(tool)
+    this._pendingTools = []
+    return true
+  }
+
   // ── Internal ────────────────────────────────────────────────────────────────
 
   /**

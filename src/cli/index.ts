@@ -37,6 +37,17 @@ import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
+import {
+  acknowledgeAutoOrchTerminalNotice,
+  listPendingAutoOrchSchedules,
+  listUnreportedAutoOrchTerminalNotices,
+  writeAutoOrchSchedule,
+} from '../core/auto_orch/AutoOrchScheduleStore.js'
+import {
+  waitForAutoOrchQuiescence,
+  acquireAutoOrchDaemonLock,
+  spawnDetachedAutoOrchScheduler,
+} from '../core/auto_orch/SchedulerKeepAlive.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
@@ -232,9 +243,16 @@ ${bold('OPTIONS')}
       --auto-orch-revise <text>  Revise the saved auto_orch plan before execution
       --auto-orch-executor-max-turns <n>  Override auto_orch executor sub-agent max turns
       --auto-worktree-cleanup <preserve|safe|aggressive>  Auto worktree cleanup policy
+      --no-wait         Do not hold the process for paused auto_orch runs (hand off to daemon)
+      --project <dir>   Workspace for orch-* subcommands (default: cwd)
   -j, --json            Output raw JSON events
   -v, --version         Print version
   -h, --help            Show this help
+
+${bold('AUTO-ORCH OPS')}
+  meta-agent orch-status   [--project <dir>]  List pending paused-run schedules
+  meta-agent orch-resume [id] [--project <dir>]  Fire schedules now and resume in foreground
+  meta-agent orch-scheduler [--project <dir>]  Run the resume daemon until quiescent (idle-exit)
 
 ${bold('INTERACTIVE COMMANDS')}
   /mode                 Show current session mode
@@ -363,6 +381,9 @@ interface CliOptions {
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
   sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
+  noWait: boolean                 // --no-wait: don't hold the process for paused auto_orch runs
+  project: string | undefined     // --project <dir>: workspace for orch-* subcommands
+  orchCommand: { name: 'orch-scheduler' | 'orch-status' | 'orch-resume'; arg?: string } | null
 }
 
 function parseCliArgs(): CliOptions {
@@ -391,6 +412,8 @@ function parseCliArgs(): CliOptions {
         'auto-orch-executor-max-turns': { type: 'string' },
         'auto-worktree-cleanup': { type: 'string' },
         json:         { type: 'boolean', short: 'j', default: false },
+        'no-wait':    { type: 'boolean', default: false },
+        project:      { type: 'string' },
         version:      { type: 'boolean', short: 'v', default: false },
         help:         { type: 'boolean', short: 'h', default: false },
       },
@@ -416,13 +439,32 @@ function parseCliArgs(): CliOptions {
   const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
   // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
   // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
-  const validModes = ['detect', 'auto', 'simple_auto', 'auto_orch', 'agentic', 'campaign', 'robotics']
+  // 'auto_orch' (v1 graph engine) is RETIRED as a user-facing mode (spec D16):
+  // new long-horizon loops run on the loop v2 runtime (`meta-agent loop …`);
+  // orch-scheduler/orch-status remain available to drain pre-existing v1 runs.
+  const validModes = ['detect', 'auto', 'simple_auto', 'agentic', 'campaign', 'robotics']
+  if (rawMode === 'auto_orch') {
+    console.error(red(
+      'Error: mode "auto_orch" is retired (D16). Long-horizon loops now run on the charter-driven ' +
+      'loop runtime: `meta-agent loop distill/create/tick`. Existing paused v1 runs can still be ' +
+      'drained with `meta-agent orch-scheduler`.',
+    ))
+    process.exit(1)
+  }
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
   }
 
-  const promptParts = parsed.positionals
+  let promptParts = parsed.positionals
+  // auto_orch operational subcommands (M5): consume the positionals so they are
+  // never mistaken for a one-shot prompt.
+  let orchCommand: CliOptions['orchCommand'] = null
+  const sub = parsed.positionals[0]
+  if (sub === 'orch-scheduler' || sub === 'orch-status' || sub === 'orch-resume') {
+    orchCommand = { name: sub, arg: parsed.positionals[1] }
+    promptParts = []
+  }
   const rawWorkspace = parsed.values['workspace'] as string | undefined
   const rawSessionDir = parsed.values['session-dir'] as string | undefined
   let workspace: string | undefined
@@ -495,6 +537,9 @@ function parseCliArgs(): CliOptions {
     maxTurns,
     resume:     parsed.values['resume']   as string | undefined,
     sessionDir,
+    noWait:     parsed.values['no-wait']  as boolean,
+    project:    parsed.values['project']  as string | undefined,
+    orchCommand,
   }
 }
 
@@ -4349,6 +4394,12 @@ async function runRepl(opts: CliOptions): Promise<void> {
         }
       } catch { /* best-effort — close-path errors must not block process exit */ }
       try { await router.dispose() } catch { /* best-effort */ }
+      // M5 layer B: never strand paused auto_orch runs on session exit.
+      try {
+        const ws = resolve(opts.workspace ?? process.cwd())
+        const pendingOrch = await listPendingAutoOrchSchedules({ projectDir: ws })
+        if (pendingOrch.length > 0) handOffToDaemon(ws, opts.json)
+      } catch { /* best-effort */ }
       process.exit(0)
     })()
   })
@@ -4371,12 +4422,20 @@ async function runRepl(opts: CliOptions): Promise<void> {
     disableBracketedPaste()
     if (err) console.error(`\n${red('Fatal:')} ${terminalText(err instanceof Error ? err.message : String(err))}\n`)
     try { await router.dispose() } catch { /* best-effort */ }
+    try {
+      const ws = resolve(opts.workspace ?? process.cwd())
+      const pendingOrch = await listPendingAutoOrchSchedules({ projectDir: ws })
+      if (pendingOrch.length > 0) handOffToDaemon(ws, opts.json)
+    } catch { /* best-effort */ }
     try { rl.close() } catch { /* best-effort */ }
     process.exit(code)
   }
   process.once('SIGTERM',            () => { void disposeAndExit(0) })
   process.once('uncaughtException',  (e) => { void disposeAndExit(1, e) })
   process.once('unhandledRejection', (e) => { void disposeAndExit(1, e) })
+
+  // M5 layer D: surface pending auto_orch schedules for this workspace.
+  await printAutoOrchPendingHint(resolve(opts.workspace ?? process.cwd()), opts.json).catch(() => undefined)
 
   rl.prompt()
 
@@ -4800,6 +4859,10 @@ async function runRepl(opts: CliOptions): Promise<void> {
 // ── Single-turn mode ──────────────────────────────────────────────────────────
 
 async function runSingleTurn(opts: CliOptions): Promise<void> {
+  // M5 layer D: surface pending auto_orch schedules for this workspace.
+  if (!opts.json) {
+    await printAutoOrchPendingHint(resolve(opts.workspace ?? process.cwd()), opts.json).catch(() => undefined)
+  }
   const storeOptions = opts.sessionDir ? { rootDir: opts.sessionDir } : undefined
   let resumedMessages: ConversationMessage[] = []
   let resumedSessionId: string | undefined
@@ -4890,6 +4953,227 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
         sessionRoot: opts.sessionDir,
       })
     }
+    // M5 layer A: a paused auto_orch run leaves durable schedules behind — hold
+    // the process (its scheduler keeps ticking) until they are terminal, or
+    // hand off to the detached daemon (--no-wait / non-TTY / Ctrl-C).
+    if (opts.mode === 'auto_orch') {
+      await waitForPausedAutoOrch(opts, resolve(opts.workspace ?? process.cwd())).catch(() => undefined)
+    }
+    await router.dispose().catch(() => undefined)
+  }
+}
+
+// ── auto_orch scheduler ops (M5: A foreground wait / B daemon / D self-heal) ───
+
+/** Human-readable "in Xm" for a future epoch. */
+function inDuration(epochMs: number): string {
+  const ms = Math.max(0, epochMs - Date.now())
+  if (ms < 60_000) return `${Math.ceil(ms / 1000)}s`
+  if (ms < 60 * 60_000) return `${Math.ceil(ms / 60_000)}m`
+  return `${(ms / (60 * 60_000)).toFixed(1)}h`
+}
+
+function orchProjectDir(opts: CliOptions): string {
+  return resolve(opts.project ?? opts.workspace ?? process.cwd())
+}
+
+/**
+ * Layer A: hold the process after a paused auto_orch run so the live backend's
+ * scheduler keeps ticking. Ctrl-C hands off to the detached daemon (layer B).
+ */
+async function waitForPausedAutoOrch(opts: CliOptions, projectDir: string): Promise<void> {
+  const pendingNow = await listPendingAutoOrchSchedules({ projectDir }).catch(() => [])
+  if (pendingNow.length === 0) return
+  if (opts.noWait || opts.json || !process.stdout.isTTY) {
+    handOffToDaemon(projectDir, opts.json)
+    return
+  }
+  console.log(yellow(
+    `\n⏸  auto_orch 已暂停，等待外部事件（${pendingNow.length} 个待恢复调度）。` +
+    `进程保持存活以按时恢复；按 Ctrl+C 可交给后台守护继续。`,
+  ))
+  const abort = new AbortController()
+  const onSigint = (): void => abort.abort()
+  process.once('SIGINT', onSigint)
+  let lastLine = ''
+  try {
+    const { pendingAtExit } = await waitForAutoOrchQuiescence({
+      projectDir,
+      pollMs: 10_000,
+      signal: abort.signal,
+      onStatus: status => {
+        const next = status.nextRunAt !== undefined ? `，下次检查 ${inDuration(status.nextRunAt)} 后` : ''
+        const line = `[auto_orch] 待恢复调度 ${status.pending.length} 个${next}`
+        if (line !== lastLine) {
+          console.log(dim(line))
+          lastLine = line
+        }
+      },
+    })
+    if (pendingAtExit === 0) {
+      console.log(green('✓ auto_orch 所有暂停任务已终结。'))
+    } else {
+      handOffToDaemon(projectDir, false)
+    }
+  } finally {
+    process.removeListener('SIGINT', onSigint)
+  }
+}
+
+/** Layer B hand-off: spawn the detached daemon and tell the user where it went. */
+function handOffToDaemon(projectDir: string, json: boolean): void {
+  const spawned = spawnDetachedAutoOrchScheduler(projectDir)
+  if (json) return
+  if (spawned) {
+    console.log(yellow(
+      `⏸  待恢复的 auto_orch 调度已交给后台守护（pid ${spawned.pid ?? '?'}，日志 ${spawned.logPath}）。`,
+    ))
+  } else {
+    console.log(yellow(
+      `⏸  存在待恢复的 auto_orch 调度。请运行 meta-agent orch-scheduler --project ${projectDir} 以恢复。`,
+    ))
+  }
+}
+
+/** Layer D: startup self-heal hint — surface pending/overdue schedules. */
+async function printAutoOrchPendingHint(projectDir: string, json: boolean): Promise<void> {
+  if (json) return
+  const notices = await listUnreportedAutoOrchTerminalNotices({ projectDir }).catch(() => [])
+  for (const notice of notices) {
+    const status = notice.status === 'completed' ? green('completed') : notice.status === 'failed' ? red('failed') : yellow(notice.status)
+    console.log(
+      `${status} auto_orch schedule ${cyan(notice.scheduleId)}: ` +
+      `${terminalText(notice.terminalNotice ?? '')}`,
+    )
+    await acknowledgeAutoOrchTerminalNotice(notice.scheduleId).catch(() => false)
+  }
+  const pending = await listPendingAutoOrchSchedules({ projectDir }).catch(() => [])
+  if (pending.length === 0) return
+  const overdue = pending.filter(r => r.status === 'scheduled' && r.runAt <= Date.now()).length
+  console.log(yellow(
+    `⏸  本工作区有 ${pending.length} 个待恢复的 auto_orch 调度${overdue ? `（${overdue} 个已到期）` : ''} — ` +
+    `运行 meta-agent orch-status 查看、meta-agent orch-scheduler 恢复。`,
+  ))
+}
+
+async function runOrchCommand(opts: CliOptions): Promise<void> {
+  const projectDir = orchProjectDir(opts)
+  const cmd = opts.orchCommand!
+  switch (cmd.name) {
+    case 'orch-status': {
+      const pending = await listPendingAutoOrchSchedules({ projectDir })
+      const notices = await listUnreportedAutoOrchTerminalNotices({ projectDir }).catch(() => [])
+      if (pending.length === 0) {
+        if (notices.length > 0) {
+          console.log(`Recent completed auto_orch schedules for ${projectDir}:`)
+          for (const r of notices) {
+            const when = r.terminalAt ? new Date(r.terminalAt).toISOString() : 'terminal'
+            console.log(
+              `  ${cyan(r.scheduleId)}  ${r.status}  ${when}` +
+              `${r.terminalNotice ? `  ${sanitizeTerminalPreview(r.terminalNotice, 120)}` : ''}`,
+            )
+          }
+          return
+        }
+        console.log(green(`No pending auto_orch schedules for ${projectDir}`))
+        return
+      }
+      console.log(`Pending auto_orch schedules for ${projectDir}:`)
+      for (const r of pending) {
+        const when = r.status === 'scheduled'
+          ? (r.runAt <= Date.now() ? red('OVERDUE') : `in ${inDuration(r.runAt)}`)
+          : yellow('running')
+        console.log(
+          `  ${cyan(r.scheduleId)}  node=${r.nodeId}  ${when}  attempts=${r.attempts}` +
+          `${r.externalRunId ? `  external=${r.externalRunId}` : ''}` +
+          `${r.lastError ? `  lastError=${sanitizeTerminalPreview(r.lastError, 80)}` : ''}`,
+        )
+      }
+      if (notices.length > 0) {
+        console.log(`\nRecent completed auto_orch schedules:`)
+        for (const r of notices) {
+          const when = r.terminalAt ? new Date(r.terminalAt).toISOString() : 'terminal'
+          console.log(
+            `  ${cyan(r.scheduleId)}  ${r.status}  ${when}` +
+            `${r.terminalNotice ? `  ${sanitizeTerminalPreview(r.terminalNotice, 120)}` : ''}`,
+          )
+        }
+      }
+      console.log(dim(`\nResume now:  meta-agent orch-resume --project ${projectDir}`))
+      return
+    }
+    case 'orch-resume': {
+      // Pull matching schedules forward to fire immediately, then run the
+      // scheduler loop in the foreground until quiescent.
+      const pending = await listPendingAutoOrchSchedules({ projectDir })
+      const targets = pending.filter(r =>
+        r.status === 'scheduled' && (!cmd.arg || r.scheduleId === cmd.arg))
+      if (targets.length === 0) {
+        console.log(yellow(cmd.arg
+          ? `No scheduled record ${cmd.arg} for ${projectDir}`
+          : `No scheduled auto_orch records for ${projectDir}`))
+        return
+      }
+      const now = Date.now()
+      for (const r of targets) {
+        await writeAutoOrchSchedule({ ...r, runAt: now, updatedAt: now })
+      }
+      console.log(`Pulled ${targets.length} schedule(s) forward; resuming…`)
+      await runOrchSchedulerLoop(opts, projectDir)
+      return
+    }
+    case 'orch-scheduler':
+      await runOrchSchedulerLoop(opts, projectDir)
+      return
+  }
+}
+
+/**
+ * Layer B core: hold a live auto_orch backend and tick until the workspace has
+ * no pending schedules (idle-exit). Host-level lock keeps it single-instance.
+ */
+async function runOrchSchedulerLoop(opts: CliOptions, projectDir: string): Promise<void> {
+  const pending = await listPendingAutoOrchSchedules({ projectDir })
+  if (pending.length === 0) {
+    console.log(green(`[orch-scheduler] no pending schedules for ${projectDir}; exiting.`))
+    return
+  }
+  const release = await acquireAutoOrchDaemonLock(projectDir)
+  if (!release) {
+    console.log(yellow(`[orch-scheduler] another scheduler is already running for ${projectDir}; exiting.`))
+    return
+  }
+  const stamp = (): string => new Date().toISOString()
+  console.log(`[orch-scheduler] ${stamp()} start: ${pending.length} pending schedule(s) for ${projectDir}`)
+  // A minimal auto_orch session: the backend's own AutoOrchScheduler does the
+  // claiming/resuming; we only keep the process alive until quiescent.
+  const router = makeRouter(
+    { ...opts, mode: 'auto_orch', workspace: projectDir, prompt: null, json: false },
+    undefined, undefined, undefined, undefined, undefined, undefined,
+  )
+  const abort = new AbortController()
+  process.once('SIGINT', () => abort.abort())
+  process.once('SIGTERM', () => abort.abort())
+  try {
+    const warmed = await router.prewarmBackend()
+    if (!warmed) throw new Error('could not create the auto_orch backend')
+    let lastLine = ''
+    const { pendingAtExit } = await waitForAutoOrchQuiescence({
+      projectDir,
+      pollMs: 5_000,
+      signal: abort.signal,
+      onStatus: status => {
+        const next = status.nextRunAt !== undefined ? `, next check in ${inDuration(status.nextRunAt)}` : ''
+        const line = `[orch-scheduler] ${status.pending.length} pending${next}`
+        if (line !== lastLine) {
+          console.log(`${stamp()} ${line}`)
+          lastLine = line
+        }
+      },
+    })
+    console.log(`[orch-scheduler] ${stamp()} ${pendingAtExit === 0 ? 'quiescent — all schedules terminal' : `interrupted with ${pendingAtExit} pending`}; exiting.`)
+  } finally {
+    await release().catch(() => undefined)
     await router.dispose().catch(() => undefined)
   }
 }
@@ -4918,6 +5202,11 @@ async function main(): Promise<void> {
     process.stderr.write(`${yellow(bwrapWarning)}\n`)
   }
   assertApiKeyConfigured(opts)
+
+  if (opts.orchCommand) {
+    await runOrchCommand(opts)
+    return
+  }
 
   if (opts.prompt !== null) {
     if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })
