@@ -93,16 +93,10 @@ describe('resolveConfig — model config file', () => {
     expect(r.fallbackModel).toBe('cli-fallback') // from caller (file omitted it)
   })
 
-  it('preserves auto_orch saved-plan options', () => {
+  it('preserves auto-series worktree-cleanup option', () => {
     process.env['ZHIPU_API_KEY'] = 'zk'
     setModelConfigPathsForTest([path])
-    const r = resolveConfig({
-      autoOrchPlanRef: 'latest',
-      autoOrchPlanRevision: 'add review node',
-      autoWorktreeCleanup: 'safe',
-    })
-    expect(r.autoOrchPlanRef).toBe('latest')
-    expect(r.autoOrchPlanRevision).toBe('add review node')
+    const r = resolveConfig({ autoWorktreeCleanup: 'safe' })
     expect(r.autoWorktreeCleanup).toBe('safe')
   })
 })

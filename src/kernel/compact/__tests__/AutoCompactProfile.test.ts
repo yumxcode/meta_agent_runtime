@@ -16,11 +16,4 @@ describe('CompactPrompt auto profile', () => {
     const prompt = buildCompactPrompt(undefined, 'agentic')
     expect(prompt).not.toContain('自主执行账本')
   })
-
-  it('auto_orch uses the lightweight profile without the Autonomous Ledger', () => {
-    const prompt = buildCompactPrompt(undefined, 'auto_orch')
-    expect(prompt).toContain('## 1. 主要请求与意图')
-    expect(prompt).toContain('## 9. 可选的下一步')
-    expect(prompt).not.toContain('自主执行账本')
-  })
 })

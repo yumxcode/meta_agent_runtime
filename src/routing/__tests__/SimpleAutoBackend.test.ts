@@ -64,7 +64,7 @@ function tmpProjectDir(): string {
 }
 
 async function buildBackend(
-  promptModeKey: 'auto' | 'simple_auto' | 'auto_orch',
+  promptModeKey: 'auto' | 'simple_auto',
   opts: { projectDir?: string; explicitResume?: boolean; resumeSessionId?: string } = {},
 ) {
   const projectDir = opts.projectDir ?? tmpProjectDir()
@@ -103,9 +103,8 @@ describe('simple_auto backend wiring', () => {
   it('does NOT wire verify / drift / checkpoint / experience-recall', async () => {
     const { backend, config } = await buildBackend('simple_auto')
 
-    // Returned coordinators are null — no durable checkpoint, no orchestration.
+    // Returned coordinator is null — no durable checkpoint.
     expect(backend.checkpointCoordinator).toBeNull()
-    expect(backend.orchController).toBeNull()
 
     // The session is built with every self-supervision hook absent, which is
     // exactly what makes the kernel loop skip each mechanism.
@@ -126,35 +125,6 @@ describe('simple_auto backend wiring', () => {
     expect(config['driftGate']).toBeTypeOf('function')
     expect(config['onCheckpointBoundary']).toBeTypeOf('function')
     expect(config['getExperienceRecallBlock']).toBeTypeOf('function')
-    // auto (not auto_orch) carries the jail but no orchestration phase hooks.
-    expect(backend.orchController).toBeNull()
-  })
-
-  it('auto_orch uses the lightweight base plus orchestration hooks', async () => {
-    const { backend, config } = await buildBackend('auto_orch')
-
-    expect(config['promptMode']).toBe('auto_orch')
-    expect(config['autonomy']).toMatchObject({
-      autoApproveInWorkspace: true,
-      lockWorkspace: true,
-    })
-
-    // auto_orch is NOT plain auto with hidden gates. Its verify/drift semantics
-    // are explicit plan-graph role nodes, so the outer loop must not wire the
-    // implicit auto self-supervision hooks.
-    expect(backend.checkpointCoordinator).toBeNull()
-    expect(config['verifyGate']).toBeUndefined()
-    expect(config['driftGate']).toBeUndefined()
-    expect(config['onCheckpointBoundary']).toBeUndefined()
-    expect(config['getExperienceRecallBlock']).toBeUndefined()
-
-    // The orchestration layer remains enabled.
-    expect(backend.orchController).not.toBeNull()
-    expect(backend.orchScheduler).not.toBeNull()
-    expect(config['phaseHooks']).toBeTypeOf('function')
-    expect(mockState.autonomyJailCalls.at(-1)?.opts).toMatchObject({ retryLimit: 0 })
-
-    await backend.session.dispose()
   })
 
   it('only restores auto checkpoint counters for the matching resumed session', async () => {

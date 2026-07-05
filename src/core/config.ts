@@ -296,39 +296,12 @@ export interface MetaAgentConfig {
   askUser?: (question: string, choices?: string[]) => Promise<string>
 
   /**
-   * auto_orch planner-only interactive review. Default off. When enabled and an
-   * askUser callback is available, the Planner's validated draft graph is shown
-   * to the user before code materialisation/execution. Executor / role /
-   * code_author / code nodes remain unattended.
-   */
-  autoOrchPlannerReview?: boolean | {
-    enabled?: boolean
-    maxRounds?: number
-  }
-
-  /** Saved auto_orch plan id/version to load instead of planning from scratch. */
-  autoOrchPlanRef?: string
-
-  /** Optional instruction for revising autoOrchPlanRef before execution. */
-  autoOrchPlanRevision?: string
-
-  /** Optional override for auto_orch executor sub-agent turn limits. */
-  autoOrchExecutorMaxTurns?: number
-
-  /**
    * Cleanup policy for auto-series isolated-write worktrees.
    * - preserve: keep tracked worktrees for manual recovery/resume.
    * - safe: remove only no-change/empty failed worktrees and orphan runtime dirs.
    * - aggressive: discard every tracked auto worktree.
    */
   autoWorktreeCleanup?: AutoWorktreeCleanupStrategy
-
-  /**
-   * auto_orch graph execution observer. Intended for CLIs/UIs to render live
-   * plan/node/edge/pause/resume progress. Best-effort only: observer failures do
-   * not affect graph execution.
-   */
-  autoOrchObserver?: import('./auto_orch/Observer.js').AutoOrchObserver
 
   /** Runtime permission overrides merged after global/project permissions.json. */
   permissionConfig?: PermissionConfig
@@ -444,12 +417,7 @@ export type ResolvedConfig = Required<
     | 'beforeToolCall'
     | 'planModeRef'
     | 'askUser'
-    | 'autoOrchPlannerReview'
-    | 'autoOrchPlanRef'
-    | 'autoOrchPlanRevision'
-    | 'autoOrchExecutorMaxTurns'
     | 'autoWorktreeCleanup'
-    | 'autoOrchObserver'
     | 'permissionConfig'
     | 'promptMode'
     | 'autonomy'
@@ -481,12 +449,7 @@ export type ResolvedConfig = Required<
   beforeToolCall?: MetaAgentConfig['beforeToolCall']
   planModeRef?: MetaAgentConfig['planModeRef']
   askUser?: MetaAgentConfig['askUser']
-  autoOrchPlannerReview?: MetaAgentConfig['autoOrchPlannerReview']
-  autoOrchPlanRef?: MetaAgentConfig['autoOrchPlanRef']
-  autoOrchPlanRevision?: MetaAgentConfig['autoOrchPlanRevision']
-  autoOrchExecutorMaxTurns?: MetaAgentConfig['autoOrchExecutorMaxTurns']
   autoWorktreeCleanup?: MetaAgentConfig['autoWorktreeCleanup']
-  autoOrchObserver?: MetaAgentConfig['autoOrchObserver']
   permissionConfig?: PermissionConfig
   /** Default agent mode for prompt sections (absent → 'agentic'). */
   promptMode?: AgentMode
@@ -603,12 +566,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     beforeToolCall:  config.beforeToolCall,
     planModeRef:     config.planModeRef,
     askUser:         config.askUser,
-    autoOrchPlannerReview: config.autoOrchPlannerReview,
-    autoOrchPlanRef: config.autoOrchPlanRef,
-    autoOrchPlanRevision: config.autoOrchPlanRevision,
-    autoOrchExecutorMaxTurns: config.autoOrchExecutorMaxTurns,
     autoWorktreeCleanup: config.autoWorktreeCleanup,
-    autoOrchObserver: config.autoOrchObserver,
     permissionConfig: config.permissionConfig,
     promptMode:      config.promptMode,
     autonomy:        config.autonomy,

@@ -31,12 +31,7 @@ import type { AgentMode } from '../core/dynamicPrompt.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { FlashClient } from '../core/flash/FlashClient.js'
-import {
-  AutoOrchController,
-  AutoOrchScheduler,
-  buildAutoOrchLaunchHooks,
-  defaultRoleCatalog,
-} from '../core/auto_orch/index.js'
+import { defaultRoleCatalog } from '../core/roles/index.js'
 import {
   createAutoExperienceStore,
   renderRecentExperiences,
@@ -80,10 +75,6 @@ export interface AgenticBackend {
   bridge: SubAgentBridge
   /** Non-null only in AUTO mode. The Router holds it for durable checkpointing. */
   checkpointCoordinator: AutoCheckpointCoordinator | null
-  /** Non-null only in AUTO-ORCH mode. The end-to-end orchestration driver. */
-  orchController: AutoOrchController | null
-  /** Non-null only in AUTO-ORCH mode. In-process runner for durable paused resumes. */
-  orchScheduler: AutoOrchScheduler | null
 }
 
 /**
@@ -94,14 +85,10 @@ export interface AgenticBackend {
 export async function createAgenticBackend(input: AgenticBackendInput): Promise<AgenticBackend> {
   const { baseConfig, projectDir, resumeSessionId, explicitResume, overrides, getGoal } = input
   const hasAutonomyJail = overrides?.autonomy !== undefined
-  // auto_orch uses the simple_auto execution base: autonomy jail + lightweight
-  // kernel loop, then ADDS the orchestration layer. Its review semantics come
-  // from explicit graph nodes, not from auto's implicit outer-loop gates.
-  const isAutoOrch = overrides?.promptMode === 'auto_orch'
   // Only plain auto wires the heavyweight self-supervision machinery. simple_auto
-  // and auto_orch deliberately run on the lightweight execution base: no durable
-  // checkpoints, no drift gate, no completion-verify gate, and no auto experience
-  // store. The kernel loop no-ops those mechanisms whenever the hooks are absent.
+  // deliberately runs on the lightweight execution base: no durable checkpoints,
+  // no drift gate, no completion-verify gate, and no auto experience store. The
+  // kernel loop no-ops those mechanisms whenever the hooks are absent.
   const wantsGates = hasAutonomyJail && overrides?.promptMode === 'auto'
   const worktreeCleanupStrategy =
     baseConfig.autoWorktreeCleanup ?? defaultWorktreeCleanupStrategy(overrides?.promptMode)
@@ -136,58 +123,10 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     ? () => renderRecentExperiences(autoExperienceStore)
     : undefined
 
-  // AUTO-ORCH: the end-to-end orchestration driver (Planner → PlanRunner →
-  // KernelNodeRunner), plus the launch phase hook (B) that boots it on the first
-  // pre_query and surfaces its summary as the result. Both read the same lazy
-  // dispatcher facade. phaseHooks stays undefined for every other mode, so the
-  // kernel makes zero extra calls (zero regression).
-  // Git-worktree isolation coordinator — created early so auto_orch parallel
-  // writers can merge through it; the bridge wiring/reconcile happens below.
+  // Git-worktree isolation coordinator for isolated_write sub-agents (agentic +
+  // auto): concurrent WRITE tasks each run on their own branch; the bridge
+  // wiring/reconcile happens below.
   const worktrees = new AutoWorktreeCoordinator(projectDir)
-
-  // Run-workspace binding: while an auto_orch run (or resumed continuation)
-  // executes, the bridge's worktree coordinator is swapped to the RUN-scoped
-  // one so isolated writers fork from / merge into the run's integration
-  // branch instead of main. null restores the base coordinator. Safe in
-  // auto_orch mode: the bridge's only worktree consumers are the run's nodes.
-  const bindRunCoordinator = (coord: AutoWorktreeCoordinator | null): void => {
-    bridgeRef?.setWorktreeCoordinator(coord ?? (worktrees.enabled ? worktrees : null))
-  }
-
-  const orchScheduler = isAutoOrch
-    ? new AutoOrchScheduler({
-        dispatcher: lazyDispatcher,
-        projectDir,
-        getGoal,
-        observer: baseConfig.autoOrchObserver,
-        worktreeBinding: bindRunCoordinator,
-        getSessionId: () => sessionIdForRoles,
-        nodeRunnerOptions: { roleCatalog, worktrees, executorMaxTurns: baseConfig.autoOrchExecutorMaxTurns },
-      })
-    : null
-
-  const orchController = isAutoOrch
-    ? new AutoOrchController({
-        dispatcher: lazyDispatcher,
-        projectDir,
-        getGoal,
-        plannerReview: buildPlannerReviewConfig(baseConfig.autoOrchPlannerReview, baseConfig.askUser),
-        planRef: baseConfig.autoOrchPlanRef,
-        planRevision: baseConfig.autoOrchPlanRevision,
-        scheduler: orchScheduler ?? undefined,
-        observer: baseConfig.autoOrchObserver,
-        worktreeCleanup: {
-          coordinator: worktrees,
-          strategy: worktreeCleanupStrategy,
-        },
-        worktreeBinding: bindRunCoordinator,
-        // Graph 'role' nodes resolve through the SAME catalogue the kernel gates
-        // came from — verify/drift/reviewer are defined once. Parallel writers
-        // merge via the shared worktree coordinator.
-        nodeRunnerOptions: { roleCatalog, worktrees, executorMaxTurns: baseConfig.autoOrchExecutorMaxTurns },
-      })
-    : null
-  const phaseHooks = orchController ? buildAutoOrchLaunchHooks(orchController) : undefined
 
   // Edit-digest summarizer (auto only): one cheap flash side-call, fired by the
   // checkpoint coordinator at most once per N FS-only checkpoints, to recap a
@@ -252,7 +191,6 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     autonomy: overrides?.autonomy,
     verifyGate,
     driftGate,
-    phaseHooks,
     getExperienceRecallBlock,
     onCheckpointBoundary: checkpointCoordinator
       ? event => checkpointCoordinator.flush(event)
@@ -270,16 +208,12 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   )
   bridgeRef = bridge
   bridge.setToolRegistry(session.getToolRegistry())
-  orchScheduler?.start()
 
   // Auto mode only: extend the workspace jail to every spawned sub-agent
   // (sandbox fail-closed + autonomy passthrough + projectDir bound to the jail
   // root). The jail is auto-specific safety; worktree isolation below is shared.
   if (hasAutonomyJail) {
-    bridge.setAutonomyJail(
-      { workspaceRoot: projectDir, autonomy: overrides!.autonomy! },
-      { retryLimit: isAutoOrch ? 0 : undefined },
-    )
+    bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides!.autonomy! })
   }
 
   // Git-worktree isolation for isolated_write sub-agents — armed for BOTH
@@ -315,40 +249,21 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
 
   const disposeSession = session.dispose.bind(session)
   session.dispose = async () => {
-    // Stop ticking but KEEP durable schedules: a paused run's schedule must
-    // survive session disposal so a daemon / later session can resume it
-    // (stop(true) used to cancel them here — that guaranteed orphaned pauses).
-    // Non-paused run endings already cancel their schedules in the controller.
-    orchScheduler?.stop(false)
     await disposeSession()
     if (worktrees.enabled && worktreeCleanupStrategy !== 'preserve') {
       await worktrees.cleanup(worktreeCleanupStrategy).catch(() => undefined)
     }
   }
 
-  return { session, bridge, checkpointCoordinator, orchController, orchScheduler }
+  return { session, bridge, checkpointCoordinator }
 }
 
 function defaultWorktreeCleanupStrategy(mode: AgentMode | undefined): AutoWorktreeCleanupStrategy {
   switch (mode) {
     case 'simple_auto':
-    case 'auto_orch':
       return 'safe'
     case 'auto':
     default:
       return 'preserve'
-  }
-}
-
-function buildPlannerReviewConfig(
-  cfg: MetaAgentConfig['autoOrchPlannerReview'],
-  askUser: MetaAgentConfig['askUser'],
-): import('../core/auto_orch/index.js').AutoOrchPlannerReviewConfig | undefined {
-  const enabled = cfg === true || (typeof cfg === 'object' && cfg.enabled === true)
-  if (!enabled || !askUser) return undefined
-  return {
-    enabled: true,
-    askUser,
-    maxRounds: typeof cfg === 'object' ? cfg.maxRounds : undefined,
   }
 }

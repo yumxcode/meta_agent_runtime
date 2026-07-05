@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { runPostSessionMemoryWriter } from '../memoryWriter.js'
 import type { SessionMode } from '../../modes.js'
 
-const AUTONOMOUS_MODES: SessionMode[] = ['auto', 'simple_auto', 'auto_orch']
+const AUTONOMOUS_MODES: SessionMode[] = ['auto', 'simple_auto']
 
 describe('post-session memory writer — auto read-only boundary', () => {
   for (const mode of AUTONOMOUS_MODES) {

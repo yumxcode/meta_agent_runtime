@@ -3,7 +3,7 @@ import { AUTO_DENIED_TOOL_NAMES, type SessionMode } from '../../core/modes.js'
 import { createStandardTools } from '../index.js'
 import { createSystemTools } from '../system/index.js'
 
-const AUTONOMOUS_MODES: SessionMode[] = ['auto', 'simple_auto', 'auto_orch']
+const AUTONOMOUS_MODES: SessionMode[] = ['auto', 'simple_auto']
 
 describe('createStandardTools — auto capability boundary', () => {
   for (const mode of AUTONOMOUS_MODES) {

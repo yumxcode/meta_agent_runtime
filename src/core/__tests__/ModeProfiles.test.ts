@@ -4,7 +4,7 @@ import { buildStaticSystemPrompt } from '../staticPrompt.js'
 import { buildCurrentModeSection } from '../dynamicPrompt.js'
 import { SectionRegistry } from '../systemPromptSections.js'
 
-const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'simple_auto', 'campaign', 'robotics', 'auto_orch']
+const ALL_MODES: SessionMode[] = ['agentic', 'auto', 'simple_auto', 'campaign', 'robotics']
 
 async function render(section: ReturnType<typeof buildCurrentModeSection>): Promise<string> {
   const [t] = await new SectionRegistry().resolve([section])
@@ -31,7 +31,7 @@ describe('MODE_PROFILES single source of truth', () => {
 
   it('autonomous modes carry agenticOverrides (autonomy jail); agentic does not', () => {
     expect(MODE_PROFILES.agentic.agenticOverrides).toBeUndefined()
-    for (const mode of ['auto', 'simple_auto', 'auto_orch'] as const) {
+    for (const mode of ['auto', 'simple_auto'] as const) {
       expect(MODE_PROFILES[mode].agenticOverrides?.promptMode).toBe(mode)
       expect(MODE_PROFILES[mode].agenticOverrides?.autonomy).toMatchObject({
         autoApproveInWorkspace: true,

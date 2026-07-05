@@ -897,7 +897,7 @@ export async function* runKernelLoop(
     {
       const ph = await runPhaseHook('pre_query')
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort before query.'
+        resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort before query.'
         yield { type: 'text_delta', delta: resultText, sessionId }
         return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
@@ -1223,7 +1223,7 @@ export async function* runKernelLoop(
     {
       const ph = await runPhaseHook('post_query')
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort after query.'
+        resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort after query.'
         return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
@@ -1470,7 +1470,7 @@ export async function* runKernelLoop(
     {
       const ph = await runPhaseHook('pre_tool', { toolNames: batchToolNames })
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort before tool execution.'
+        resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort before tool execution.'
         return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }
@@ -1518,7 +1518,7 @@ export async function* runKernelLoop(
     {
       const ph = await runPhaseHook('post_tool', { toolNames: batchToolNames, erroredToolNames: [...erroredToolNameSet] })
       if (ph.abort) {
-        resultText = ph.note || resultText || 'Stopped (auto_orch): a phase hook requested abort after tool execution.'
+        resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort after tool execution.'
         return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
       }
     }

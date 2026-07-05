@@ -33,7 +33,6 @@ import { createSandboxExecutor } from '../sandbox/index.js'
 import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
-import { makeAutoOrchPauseExternalTool } from '../core/auto_orch/AutoOrchPauseTool.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
 import { isAbsolute, relative, resolve } from 'path'
 
@@ -322,17 +321,7 @@ export class SubAgentRunner {
     // chatty the run was. Injected on top of the resolved tools so it never masks
     // the "no tools resolved" guard above.
     const returnResultTool = makeReturnResultTool(r => { this._returnedResult = r })
-    const autoOrchPauseTool = cfg.autoOrch?.resumable
-      ? makeAutoOrchPauseExternalTool(payload => {
-          this._returnedResult = {
-            summary: `Paused auto_orch sub-agent: ${payload.reason}`,
-            data: { auto_orch_pause: payload },
-          }
-        })
-      : null
-    const sessionTools = autoOrchPauseTool
-      ? [...tools, returnResultTool, autoOrchPauseTool]
-      : [...tools, returnResultTool]
+    const sessionTools = [...tools, returnResultTool]
 
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
@@ -350,12 +339,6 @@ export class SubAgentRunner {
       // permission policy + bind its jail root. Absent for non-auto parents.
       ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
       ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
-      ...(cfg.autoOrch?.resumable && cfg.autoOrch.agentSessionId !== undefined
-        ? { sessionId: cfg.autoOrch.agentSessionId }
-        : {}),
-      ...(cfg.autoOrch?.resumable && cfg.initialMessages !== undefined
-        ? { initialMessages: cfg.initialMessages }
-        : {}),
     }
 
     this.session = new MetaAgentSession(sessionConfig)
@@ -508,7 +491,6 @@ export class SubAgentRunner {
       if (durationTimer) clearTimeout(durationTimer)
       this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
-      await this._persistAutoOrchSessionHistory().catch(() => undefined)
       await this.session?.dispose().catch(() => undefined)
       // Always release the sandbox handle, even if _writeTerminal or the loop
       // threw an unexpected error.  destroy() is a no-op for Noop/macOS handles
@@ -607,21 +589,6 @@ export class SubAgentRunner {
       case 'error_during_execution': return 'Error during execution'
       default: return `Stopped: ${subtype}`
     }
-  }
-
-  private async _persistAutoOrchSessionHistory(): Promise<void> {
-    const autoOrch = this.record.config.autoOrch
-    if (!autoOrch?.resumable || !this.session) return
-    const sessionId = autoOrch.agentSessionId ?? this.session.getSessionId()
-    const messages = this.session.getMessages()
-    await SessionStore.replace(sessionId, {
-      mode: 'auto_orch_subagent',
-      startTime: this.record.createdAt,
-      lastActivity: Date.now(),
-      messageCount: messages.length,
-      firstPrompt: this.record.config.taskDescription.slice(0, 80),
-      workspace: this.record.config.projectDir,
-    }, messages)
   }
 
   private _emitRuntime(event: SubAgentRuntimeEvent): void {

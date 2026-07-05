@@ -23,7 +23,7 @@ import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 
 // ── Canonical mode union ───────────────────────────────────────────────────────
 
-export type SessionMode = 'agentic' | 'auto' | 'simple_auto' | 'campaign' | 'robotics' | 'auto_orch'
+export type SessionMode = 'agentic' | 'auto' | 'simple_auto' | 'campaign' | 'robotics'
 
 // Compile-time guarantee that the kernel-layer CompactProfile (which cannot
 // import this core module without inverting layering) stays in lockstep with
@@ -163,43 +163,13 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
       '优先查阅经验库和硬件配置，所有代码须符合绑定平台的安全限制。',
     compactProfile: 'robotics',
   },
-
-  // ⚠️ RETIRED (spec D16): auto_orch v1 — the AI-authored plan-graph engine —
-  // is no longer selectable from the CLI. New long-horizon work runs on the
-  // charter-driven loop v2 runtime (src/loop, `meta-agent loop …`). This
-  // profile remains ONLY so orch-scheduler can drain pre-existing paused v1
-  // runs; it is removed together with the engine in the T4.3b deletion pass.
-  'auto_orch': {
-    weight: 1,
-    identityLine:
-      '你是 Meta-Agent，一个自主运行且具备自我编排能力的工程 Agent，专注于目标的达成与复杂任务的拆解执行。' +
-      '面对一个复杂目标，你会先规划出由多个子 Agent（执行者与审查角色，如校验、航向、复核）组成的协作流程，' +
-      '在工作区边界内持续自主推进，并在结束时清晰交代已完成与未完成的部分。',
-    currentModeText:
-      'AUTO-ORCH — 无人值守自主编排模式：在 SIMPLE-AUTO 的轻量执行基座之上，额外启用多 Agent 编排。\n' +
-      '- **授权与边界**：与 AUTO/SIMPLE-AUTO 一致 —— 工作区内文件的读/写/删/改、联网及 git 操作（`git pull` 拉取、`git push` 推送，HTTP 与 SSH 均支持）均已获授权，无需逐次确认；仅对**工作区之外文件**的读/写/删/编辑会被系统直接拒绝。\n' +
-      '- **训练与验证策略**：与 AUTO/SIMPLE-AUTO 一致 —— 深度学习 / 强化学习训练不在本地进行，尝试调用外部训练环境；本地仅核验语法与单元测试（test）。\n' +
-      '- **自主编排**：面对复杂任务，可将其拆分为子任务并编排多个子 Agent 并行/串行执行；可为关键节点挂载审查角色（校验完成度、检查航向、复核产出）。\n' +
-      '- **编排即数据**：编排方案是一张受校验与硬上限约束的计划图，由固定引擎解释执行，而非自由代码；非法或越界的编排会被拒绝并回退到默认自主循环。\n' +
-      '- **显式审查**：本模式不启用 AUTO 的隐式 checkpoint / drift / verify 关卡；校验、航向检查与复核必须由计划图中的显式 role 节点表达并保证，节点内部也不依赖隐藏的 auto gate 兜底。\n' +
-      '- **终止与总结**：完成或受阻时给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
-    compactProfile: 'auto_orch',
-    agenticOverrides: {
-      promptMode: 'auto_orch',
-      autonomy: {
-        autoApproveInWorkspace: true,
-        lockWorkspace: true,
-        deniedTools: AUTO_DENIED_TOOL_NAMES,
-      },
-    },
-  },
 }
 
 /** Modes that run unattended inside the auto workspace jail. */
 export function isAutonomousMode(
   mode: SessionMode | string | null | undefined,
-): mode is 'auto' | 'auto_orch' | 'simple_auto' {
-  return mode === 'auto' || mode === 'auto_orch' || mode === 'simple_auto'
+): mode is 'auto' | 'simple_auto' {
+  return mode === 'auto' || mode === 'simple_auto'
 }
 
 /** Numeric weight per mode, derived from the profile table. */

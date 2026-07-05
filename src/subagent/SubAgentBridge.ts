@@ -114,14 +114,13 @@ export function shouldRetrySubAgent(attempt: number, limit: number, armed: boole
   return armed && limit > 0 && attempt < limit
 }
 
-/** auto_orch graph edges own retry/error routing; bridge-level retries would leak background tasks. */
+/** Bridge-level auto-retry gate for a spawned sub-agent config. */
 export function shouldRetrySubAgentConfig(
-  config: Pick<SubAgentConfig, 'autoOrch'> | undefined,
+  _config: SubAgentConfig | undefined,
   attempt: number,
   limit: number,
   armed: boolean,
 ): boolean {
-  if (config?.autoOrch) return false
   return shouldRetrySubAgent(attempt, limit, armed)
 }
 
@@ -519,15 +518,6 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         ? 'isolated_write'
         : (config.workspaceMode ?? 'shared_write'),
       isolateWorktree: isolatedWrite,
-    }
-    if (config.autoOrch?.resumable && !config.autoOrch.agentSessionId) {
-      config = {
-        ...config,
-        autoOrch: {
-          ...config.autoOrch,
-          agentSessionId: `auto-orch-subagent-${randomUUID()}`,
-        },
-      }
     }
     if (config.workspaceMode === 'shared_readonly') {
       config = {

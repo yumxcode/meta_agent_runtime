@@ -1,4 +1,4 @@
-import { defineConfig } from 'vitest/config'
+import { defineConfig, configDefaults } from 'vitest/config'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 
@@ -13,6 +13,10 @@ export default defineConfig({
     globals: false,
     environment: 'node',
     include: ['src/**/__tests__/**/*.test.ts'],
+    // src/core/auto_orch is the retired v1 engine (T4.3b). Its files are emptied
+    // in place pending `git rm`; exclude the dir so its stub test files are not
+    // loaded as empty suites.
+    exclude: [...configDefaults.exclude, 'src/core/auto_orch/**'],
     setupFiles: ['src/__tests__/setup.ts'],
     env: {
       META_AGENT_HOME: TEST_META_AGENT_HOME,

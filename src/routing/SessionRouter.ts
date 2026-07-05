@@ -601,9 +601,8 @@ export class SessionRouter {
   /**
    * Create the backend NOW without submitting a prompt. Only valid for
    * explicit-mode sessions (hint !== 'detect') — there is no prompt to detect
-   * a mode from. Used by the auto_orch scheduler daemon (`orch-scheduler`),
-   * which needs a live backend (dispatcher + orch scheduler ticking) to resume
-   * paused runs but never submits. Returns false in detect mode.
+   * a mode from. For callers that need a live backend (dispatcher, tools) but
+   * never submit a prompt. Returns false in detect mode.
    */
   async prewarmBackend(): Promise<boolean> {
     if (this._impl) return true
@@ -705,14 +704,10 @@ export class SessionRouter {
       case 'agentic':
       case 'auto':
       case 'simple_auto':
-      case 'auto_orch':
-        // All four run on the shared agentic backend (same loop + research
+        // All three run on the shared agentic backend (same loop + research
         // wiring). AUTO adds the autonomous + config-locked workspace jail and
         // implicit checkpoint/drift/verify machinery; SIMPLE_AUTO adds the same
-        // jail but skips that machinery; AUTO-ORCH uses the same lightweight
-        // execution base as SIMPLE_AUTO plus the orchestration layer (phase hooks
-        // + plan graph). verify/drift in AUTO-ORCH are explicit graph role nodes,
-        // not hidden runtime gates. The per-mode posture is carried by
+        // jail but skips that machinery. The per-mode posture is carried by
         // MODE_PROFILES[mode].agenticOverrides (undefined for plain agentic).
         return this._createAgenticBackend(MODE_PROFILES[mode].agenticOverrides)
 

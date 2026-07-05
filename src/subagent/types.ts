@@ -61,21 +61,6 @@ export interface SubAgentConfig {
   /** Sub-agent system prompt.  Defaults to DEFAULT_SYSTEM_PROMPT when omitted. */
   systemPrompt?: string
   /**
-   * Auto-orch-only resumable session metadata. Ordinary sub-agent callers leave
-   * this unset and keep the existing one-shot isolated-session behaviour.
-   */
-  autoOrch?: {
-    resumable: true
-    orchestrationTaskId: string
-    nodeId: string
-    agentSessionId?: string
-  }
-  /**
-   * Auto-orch resume seed. Only used together with autoOrch.resumable; ordinary
-   * sub-agents still start with empty conversation history.
-   */
-  initialMessages?: import('../core/types.js').ConversationMessage[]
-  /**
    * Names of tools the sub-agent may call.  The SubAgentRunner looks these up
    * in the tool registry passed at spawn time.  When omitted the sub-agent
    * runs in pure-reasoning mode (no tools).
