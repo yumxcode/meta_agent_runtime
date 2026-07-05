@@ -23,6 +23,8 @@ export interface LoopCliDeps {
   /** Required only for `tick`. */
   dispatcher?: ISubAgentDispatcher
   signal?: AbortSignal
+  /** Live per-round/seat progress for `tick` (CLI renders it). */
+  observer?: (event: import('./kernel/LoopKernel.js').LoopEvent) => void
 }
 
 export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<string> {
@@ -173,7 +175,7 @@ async function cmdTick(rest: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.dispatcher) {
     throw new Error('loop tick needs a backend dispatcher (host CLI wires this; see orch-scheduler bootstrap)')
   }
-  const tickDeps = { dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: deps.signal }
+  const tickDeps = { dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: deps.signal, observer: deps.observer }
   if (rest.includes('--until-quiescent')) {
     const results = await runUntilQuiescent(tickDeps)
     const total = results.reduce((n, r) => n + r.claimed, 0)

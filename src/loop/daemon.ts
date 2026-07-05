@@ -60,7 +60,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       if (opts.signal?.aborted) return { ticks, roundsRun, probesRun, exitReason: 'aborted' }
 
       const result = await tickOnce(
-        { dispatcher: opts.dispatcher, projectDir: opts.projectDir, signal: opts.signal },
+        { dispatcher: opts.dispatcher, projectDir: opts.projectDir, signal: opts.signal, observer: opts.observer },
         now(),
       )
       ticks++

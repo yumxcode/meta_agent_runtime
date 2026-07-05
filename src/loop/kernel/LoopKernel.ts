@@ -33,7 +33,6 @@ import {
   ingestEvents,
   readPendingRound,
   reconcileWaiting,
-  scheduleNextProbe,
   writePendingRound,
 } from '../effects/WaitOps.js'
 
@@ -183,9 +182,14 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
 
 // ── seat loop: worker + per-cause corrective retries + gates ──────────────────
 
-/** What kind of wait the worker requested (M2 effect probe, or a self-timer park). */
+/**
+ * What kind of wait the worker requested. Only two exist: a self-timer park
+ * (the worker wakes itself), or an event wait (an external system concludes it
+ * by dropping an events/ file). There is NO code probe — status polling and any
+ * remedial action (account rotation, plateau judgement) live in the worker.
+ */
 type WaitRequest =
-  | { mode: 'effect'; waitName: string; effectKey: string; payload?: Record<string, unknown> }
+  | { mode: 'event'; effectKey: string; payload?: Record<string, unknown> }
   | { mode: 'self_timer'; afterMs: number; reason: string }
 
 interface SeatLoopOutcome {
@@ -226,24 +230,19 @@ async function runSeatLoop(
         waitRequest: { mode: 'self_timer', afterMs: worker.timer.afterMs, reason: worker.timer.reason },
       }
     }
-    // Wait request (M2): the worker submitted an external task.
-    if (worker.data['label'] === 'wait' && typeof worker.data['wait'] === 'string') {
-      const waitName = worker.data['wait']
-      if (instance.charter.waits?.[waitName]) {
-        return {
-          kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
-          waitRequest: {
-            mode: 'effect',
-            waitName,
-            effectKey: typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
-              ? worker.data['effectKey']
-              : `eff-${randomUUID().replace(/-/g, '').slice(0, 10)}`,
-            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
-          },
-        }
+    // Event wait: the worker submitted external work and waits for an event
+    // (an events/ file with this effectKey) to conclude it. No probe.
+    if (worker.data['label'] === 'wait') {
+      return {
+        kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
+        waitRequest: {
+          mode: 'event',
+          effectKey: typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
+            ? worker.data['effectKey']
+            : `eff-${randomUUID().replace(/-/g, '').slice(0, 10)}`,
+          payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
+        },
       }
-      seatSummaries['worker'] += ` [unknown wait '${waitName}' — treated as failure]`
-      worker = { ...worker, ok: false }
     }
     if (!worker.ok) break
 
@@ -301,7 +300,6 @@ async function submitSegment(
   deps: RunRoundDeps,
   input: SubmitInput,
 ): Promise<RoundOutcome> {
-  const waitDeps = { wakeStore: deps.wakeStore, projectDir: deps.projectDir }
   const base = {
     round: input.round,
     mode: input.mode,
@@ -332,28 +330,29 @@ async function submitSegment(
     }
   }
 
-  const wait = instance.charter.waits![input.waitRequest.waitName]!
+  // Event wait: register the effect (idempotent, harvest-once) and park. No
+  // probe is scheduled — an external system concludes it by dropping an
+  // events/<effectKey>.json file (ingested by RECONCILE → harvest wake).
   const effects = effectLedgerFor(instance)
   await effects.submit({
     effectKey: input.waitRequest.effectKey,
-    kind: wait.kind,
-    waitName: input.waitRequest.waitName,
+    kind: 'event',
+    waitName: 'event',
     payload: input.waitRequest.payload,
   })
   await writePendingRound(instance, {
     ...base, kind: 'effect',
     effectKey: input.waitRequest.effectKey,
-    waitName: input.waitRequest.waitName,
+    waitName: 'event',
   } satisfies PendingRound)
-  await scheduleNextProbe(instance, waitDeps, input.waitRequest.effectKey, wait)
-  await setInstanceStatus(instance, 'waiting', `waiting on ${input.waitRequest.effectKey}`)
+  await setInstanceStatus(instance, 'waiting', `waiting on event ${input.waitRequest.effectKey}`)
   deps.observer?.({
     type: 'waiting_entered', round: input.round,
-    effectKey: input.waitRequest.effectKey, waitName: input.waitRequest.waitName,
+    effectKey: input.waitRequest.effectKey, waitName: 'event',
   })
   return {
     round: input.round, mode: input.mode,
-    route: `waiting:${input.waitRequest.waitName}`, status: 'waiting', costUsd: input.costUsd,
+    route: 'waiting:event', status: 'waiting', costUsd: input.costUsd,
   }
 }
 

@@ -94,26 +94,6 @@ export function validateCharter(charter: Charter): string[] {
     errs.push('budgets.lifetime.rounds must be a positive integer')
   }
 
-  // Waits (M2): every wait needs a kind, a sane cadence, and a rule table in
-  // which at least one rule can conclude the wait (otherwise it sleeps forever).
-  const CONCLUDING: ReadonlySet<string> = new Set(['wake_harvest', 'terminate_and_harvest'])
-  for (const [name, wait] of Object.entries(charter.waits ?? {})) {
-    if (!wait.kind?.trim()) errs.push(`waits.${name} needs a kind (probe adapter)`)
-    if (!Number.isFinite(wait.probeEveryMs) || wait.probeEveryMs <= 0) {
-      errs.push(`waits.${name}.probeEveryMs must be a positive number`)
-    }
-    if (!wait.rules?.length) {
-      errs.push(`waits.${name} needs at least one probe rule`)
-    } else if (!wait.rules.some(r => CONCLUDING.has(r.do))) {
-      errs.push(`waits.${name} has no rule that can conclude the wait (wake_harvest/terminate_and_harvest)`)
-    }
-    for (const r of wait.rules ?? []) {
-      if (!r.when?.trim()) errs.push(`waits.${name} has a rule without 'when'`)
-      if (!['sleep', 'wake_harvest', 'terminate_and_harvest', 'rotate_and_resubmit'].includes(r.do)) {
-        errs.push(`waits.${name} rule '${r.when}' has unknown action '${r.do}'`)
-      }
-    }
-  }
   return errs
 }
 

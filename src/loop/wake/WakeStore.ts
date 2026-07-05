@@ -29,7 +29,7 @@ import {
 } from '../../infra/persist/index.js'
 import type { LoopInstanceId } from '../types.js'
 
-export type WakeKind = 'timer' | 'probe' | 'event' | 'manual'
+export type WakeKind = 'timer' | 'event' | 'manual'
 export type WakeStatus = 'pending' | 'claimed' | 'done' | 'cancelled'
 
 export interface WakeRecord {

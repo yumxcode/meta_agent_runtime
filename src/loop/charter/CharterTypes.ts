@@ -59,31 +59,6 @@ export interface BudgetSpec {
   lifetime?: { rounds?: number; usd?: number; deadlineMs?: number }
 }
 
-/** What a probe verdict makes the runtime do (all pure code; spec §3.1 waits). */
-export type ProbeActionKind =
-  | 'sleep'                  // reschedule the next probe, nobody wakes
-  | 'wake_harvest'           // effect concluded → run the harvest segment
-  | 'terminate_and_harvest'  // stop the remote task, then harvest
-  | 'rotate_and_resubmit'    // e.g. account exhausted → adapter resubmits, keep sleeping
-
-export interface ProbeRule {
-  /** Adapter verdict this rule matches (e.g. done/plateau/no_balance/error). */
-  when: string
-  do: ProbeActionKind
-}
-
-/** Declarative wait policy for one external-effect kind (RL training, …). */
-export interface WaitSpec {
-  /** Effect kind — selects the probe adapter from the registry. */
-  kind: string
-  /** Probe cadence while waiting. */
-  probeEveryMs: number
-  /** Verdict → action table, first match wins. Unmatched verdicts sleep. */
-  rules: ProbeRule[]
-  /** Adapter parameters (thresholds, status file/command, …). */
-  params?: Record<string, unknown>
-}
-
 export interface Charter {
   id: string
   version: number
@@ -102,8 +77,6 @@ export interface Charter {
   writeScope?: string[]
   /** Cadence of the next-round timer, ms after a round ends. Default 0 = immediate. */
   roundIntervalMs?: number
-  /** Wait policies by name; the worker requests one via {label:'wait', wait:'<name>', …}. */
-  waits?: Record<string, WaitSpec>
 }
 
 /** Charter after create-time freezing: every expression parsed to an AST. */

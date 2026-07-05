@@ -33,10 +33,8 @@ Charter 结构（全部字段；? 为可选）：
  "budgets": {"perRound":{"usd":N},"lifetime":{"rounds":N,"usd":N}},
  "writeScope": ["repo 内允许 worker 修改的 glob"]?,
  "roundIntervalMs": N?,
- "waits": {"<名>":{"kind":"file","probeEveryMs":N,"params":{...},
-   "rules":[{"when":"done","do":"wake_harvest"},{"when":"plateau","do":"terminate_and_harvest"},
-            {"when":"no_balance","do":"rotate_and_resubmit"},{"when":"error","do":"wake_harvest"}]}}?
 }
+（注：没有 charter.waits 字段。等待完全由 worker 驱动——见"座位底座"的等待机制。）
 
 座位底座（worker 座位运行在内核内置的 inner_orch_worker 底座上，你无法改动它，但必须据此写 seat.prompt）：
 - 底座**已自动提供**，seat.prompt 里**绝不要重复**：
@@ -47,9 +45,10 @@ Charter 结构（全部字段；? 为可选）：
   ⑤ 产出契约（先写 drafts/direction.json {"key","rationale"}，再写 drafts/findings_draft.json（数组，每条含 claim 与 evidence），最后调 return_result data={"label":"ok"|"error","note"}）；
   ⑥ 写入范围（由 charter.writeScope 下发，底座注入）；
   ⑦ 自计时等待工具 timer/timer_cancel（见下）。
-- 长时外部任务有两种等待方式，按"判定是否需要判断"二选一：
-  · **代码探针 wait（charter.waits + 规则表）**：探测判定是确定性阈值/换号（如平台期斜率、账号无余额换号）时用——探针纯代码、几乎免费，座位睡到规则结论才醒。写在 charter.waits 里。
-  · **自计时 wait（worker 用 timer 工具）**：判定"继续等 vs 终止"需要 worker 亲眼看结果（如"平台期但晚期有抬头趋势就再等一轮"）时用——worker 调 timer(minutes, reason) 把自己 park，到点内核 resume 它自查自决；timer_cancel 防死循环。**这条不写进 charter，worker 用工具即可**；只需在 seat.prompt 里点明"提交训练后用 timer 定期回看、按趋势决定终止或继续"。自计时必须搭 context:"lineage_loop"（要记得上次曲线）。
+- 长时外部任务（训练/远程评测）**只有两种等待方式，都由 worker 驱动，不写进 charter**（没有代码探针，状态检查/换号/平台期判断全部由 worker 用 skill 自己做）：
+  · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason) 把自己 park，到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"；timer_cancel 防死循环。适合需要 worker 亲眼判断的等待（如平台期"除非有明显抬头趋势否则终止"、账号无余额时自己换号）。**必须搭 context:"lineage_loop"**（要记得上次曲线）。
+  · **事件（外部系统推送）**：worker 返回 return_result data={"label":"wait","effectKey":"<id>"} 声明在等一个外部事件；外部系统往 events/<id>.json 丢 {effectKey, verdict, data} 即收割。适合真正 push 式的外部系统；无超时（要超时用自计时）。
+  你只需在 seat.prompt 里点明用哪种、以及提交后如何回看/判断——工具和事件机制底座已给。
 - 因此 seat.prompt 只写**领域/角色特有**的指令：本 worker 每轮具体做什么、如何选方向、领域判断标准、用哪个工具/skill 做什么、提交训练/评测的领域细节。**不要**复述身份、输出格式（drafts/return_result）、"你是自主 agent"、"记得读胶囊"、skill 列表——底座已给，重复只会污染提示词、增加成本。目标写进 charter.goal（底座作为 D0 目标锚注入），不要抄进 seat.prompt。
 - worker.context 二选一，决定底座的会话形态：
   · "lineage_loop"：跨轮 **resume 同一会话**、积累上下文——用于"在已有实现上持续迭代、调参、逐步推进"的 worker；
@@ -64,8 +63,8 @@ Charter 结构（全部字段；? 为可选）：
 硬性规则：
 - 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。
 - 保证可终止：至少有一条 stop/finalize tripwire 或一个 lifetime 预算（见"终止机制"）。tripwire 声明顺序即优先级（最严重的在前）。
-- judge/pivoter 的 context 必须是 "isolated"；确定性规则（计数、阈值、路由、盯外部任务、换号）必须落在 meters/tripwires/waits，**不得写进座位 prompt**。
-- 长时外部任务（训练/远程评测）必须建模为 waits，探测节奏和终止/换号规则写成 rules；不要指望座位记得去检查。
+- judge/pivoter 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
+- 长时外部任务的等待由 worker 用 timer 工具（自计时）或事件驱动，**不建模成 charter 字段**；在 seat.prompt 里说明即可（见"座位底座"的等待机制）。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。
 - 需求中"每轮至少包含的阶段"映射：load_state→内核胶囊(忽略)；choose/implement/extract→worker prompt（只写领域动作，身份/输出/纪律/胶囊/skill 由底座给，见"座位底座"）；semantic_eval/verify→judge rubric；reduce/route/state_writer→meters+tripwires(忽略其实现细节)。
 

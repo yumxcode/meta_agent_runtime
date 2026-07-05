@@ -15,16 +15,13 @@ import { readdir, readFile, rename, mkdir, rm } from 'fs/promises'
 import { join } from 'path'
 import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
-import type { WakeRecord } from '../wake/WakeStore.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import type { PendingRound } from '../types.js'
 import { EffectLedger } from './EffectLedger.js'
-import { getProbeAdapter } from './ProbeAdapters.js'
-import type { WaitSpec } from '../charter/CharterTypes.js'
 
 export interface WaitOpsDeps {
   wakeStore: WakeStore
-  /** Workspace root probes resolve relative paths against. */
+  /** Workspace root event ingestion resolves relative paths against. */
   projectDir: string
 }
 
@@ -42,97 +39,6 @@ export async function writePendingRound(instance: LoopInstance, pending: Pending
 
 export async function clearPendingRound(instance: LoopInstance): Promise<void> {
   await rm(instance.paths.pendingRoundJson, { force: true }).catch(() => undefined)
-}
-
-function waitSpecFor(instance: LoopInstance, waitName: string): WaitSpec | null {
-  return instance.charter.waits?.[waitName] ?? null
-}
-
-// ── probe path ────────────────────────────────────────────────────────────────
-
-export interface ProbeOutcome {
-  verdict: string
-  action: string
-}
-
-/** Execute one due probe wake. Never spawns an LLM. */
-export async function handleProbeWake(
-  instance: LoopInstance,
-  wake: WakeRecord,
-  deps: WaitOpsDeps,
-): Promise<ProbeOutcome> {
-  const effects = effectLedgerFor(instance)
-  try {
-    const effectKey = wake.effectKey
-    if (!effectKey) return { verdict: 'invalid', action: 'drop' }
-    const effect = await effects.get(effectKey)
-    if (!effect || effect.status === 'harvested' || effect.status === 'failed') {
-      return { verdict: 'stale', action: 'drop' }
-    }
-    if (effect.status === 'concluded') {
-      // Event beat this probe; make sure a harvest wake exists, then retire.
-      await scheduleHarvestWake(instance, deps, effectKey)
-      return { verdict: 'concluded', action: 'wake_harvest' }
-    }
-    const wait = waitSpecFor(instance, effect.waitName)
-    if (!wait) {
-      await effects.markFailed(effectKey, `wait '${effect.waitName}' missing from charter`)
-      return { verdict: 'invalid', action: 'fail' }
-    }
-    const adapter = getProbeAdapter(wait.kind)
-    if (!adapter) {
-      await effects.markFailed(effectKey, `no probe adapter for kind '${wait.kind}'`)
-      return { verdict: 'invalid', action: 'fail' }
-    }
-
-    const probeInput = { effect, params: wait.params ?? {}, projectDir: deps.projectDir }
-    const result = await adapter.probe(probeInput)
-    await effects.recordProbe(effectKey, result.verdict, result.data)
-
-    const rule = wait.rules.find(r => r.when === result.verdict)
-    const action = rule?.do ?? 'sleep'
-    switch (action) {
-      case 'wake_harvest': {
-        if (await effects.conclude(effectKey, result.verdict, 'probe', result.data)) {
-          await scheduleHarvestWake(instance, deps, effectKey)
-        }
-        return { verdict: result.verdict, action }
-      }
-      case 'terminate_and_harvest': {
-        await adapter.terminate?.(probeInput)
-        if (await effects.conclude(effectKey, result.verdict, 'probe', result.data)) {
-          await scheduleHarvestWake(instance, deps, effectKey)
-        }
-        return { verdict: result.verdict, action }
-      }
-      case 'rotate_and_resubmit': {
-        const resub = await adapter.resubmit?.(probeInput)
-        await effects.recordResubmit(effectKey, resub?.payload)
-        await scheduleNextProbe(instance, deps, effectKey, wait)
-        return { verdict: result.verdict, action }
-      }
-      case 'sleep':
-      default:
-        await scheduleNextProbe(instance, deps, effectKey, wait)
-        return { verdict: result.verdict, action: 'sleep' }
-    }
-  } finally {
-    await deps.wakeStore.release(wake.wakeId, 'done').catch(() => undefined)
-  }
-}
-
-export async function scheduleNextProbe(
-  instance: LoopInstance,
-  deps: WaitOpsDeps,
-  effectKey: string,
-  wait: WaitSpec,
-): Promise<void> {
-  await deps.wakeStore.schedule({
-    loopId: instance.record.instanceId,
-    kind: 'probe',
-    fireAt: Date.now() + wait.probeEveryMs,
-    effectKey,
-  })
 }
 
 async function scheduleHarvestWake(
@@ -188,9 +94,11 @@ export async function ingestEvents(instance: LoopInstance, deps: WaitOpsDeps): P
 
 /**
  * Repair the {pending_round, effect, wake} trio after any crash:
+ *   self_timer pending          → re-arm the timer wake if lost
  *   pending + effect concluded  → ensure a harvest wake exists
- *   pending + effect probing    → ensure a probe wake exists
- *   pending + effect missing    → submit segment crashed pre-register: drop the
+ *   pending + effect submitted   → event wait: nothing to schedule (waits for an
+ *                                 external events/ file; ingestEvents concludes it)
+ *   pending + effect missing     → submit segment crashed pre-register: drop the
  *                                 pending round and reschedule a fresh timer
  *   no pending + effect concluded → harvest finished its ledger writes but
  *                                 crashed before markHarvested: settle it
@@ -227,13 +135,8 @@ export async function reconcileWaiting(instance: LoopInstance, deps: WaitOpsDeps
         actions.push(`scheduled missing harvest wake for ${pending.effectKey}`)
       }
     } else if (effect.status === 'submitted' || effect.status === 'probing') {
-      if (!wakes.some(w => w.kind === 'probe' && w.effectKey === pending.effectKey)) {
-        const wait = waitSpecFor(instance, effect.waitName)
-        if (wait) {
-          await scheduleNextProbe(instance, deps, pending.effectKey!, wait)
-          actions.push(`scheduled missing probe wake for ${pending.effectKey}`)
-        }
-      }
+      // Event wait: nothing to re-arm — it concludes when an external events/
+      // file arrives (ingested at the top of every round). Just keep waiting.
     } else {
       // failed/harvested with a pending round left behind → drop and move on.
       await clearPendingRound(instance)

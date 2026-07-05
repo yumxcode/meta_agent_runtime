@@ -35,7 +35,7 @@ import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { runLoopCli, runLoopScheduler, type TickResult } from '../loop/index.js'
+import { runLoopCli, runLoopScheduler, type LoopEvent } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
@@ -4887,6 +4887,13 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   const abort = new AbortController()
   process.once('SIGINT', () => abort.abort())
   process.once('SIGTERM', () => abort.abort())
+  // Live progress: the kernel emits a LoopEvent per round/seat/wait transition;
+  // print each so the operator can watch the loop work (critical while testing).
+  const stamp = (): string => new Date().toISOString().slice(11, 19)
+  const observer = (e: LoopEvent): void => {
+    const line = formatLoopEvent(e)
+    if (line) console.log(`${dim(`[loop ${stamp()}]`)} ${line}`)
+  }
   try {
     const warmed = await router.prewarmBackend()
     if (!warmed) throw new Error('could not create the loop backend (auto mode)')
@@ -4894,32 +4901,30 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     if (!dispatcher) throw new Error('loop backend produced no sub-agent dispatcher')
 
     if (name === 'loop-scheduler') {
-      const stamp = (): string => new Date().toISOString()
-      console.log(`[loop-scheduler] ${stamp()} start (workspace ${projectDir})`)
-      const result = await runLoopScheduler({
-        dispatcher,
-        projectDir,
-        signal: abort.signal,
-        onTick: (t: TickResult) => {
-          for (const o of t.outcomes) {
-            if (o.outcome) {
-              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: round ${o.outcome.round} ` +
-                `[${o.outcome.mode}] route=${o.outcome.route} status=${o.outcome.status}`)
-            } else if (o.probe) {
-              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: probe ${o.probe}`)
-            } else if (o.error) {
-              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: ERROR ${o.error}`)
-            }
-          }
-        },
-      })
-      console.log(`[loop-scheduler] ${stamp()} exit (${result.exitReason}); ` +
-        `${result.roundsRun} round(s), ${result.probesRun} probe(s) over ${result.ticks} tick(s).`)
+      console.log(`${dim(`[loop ${stamp()}]`)} scheduler start (workspace ${projectDir})`)
+      const result = await runLoopScheduler({ dispatcher, projectDir, signal: abort.signal, observer })
+      console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
+        `${result.roundsRun} round(s) over ${result.ticks} tick(s).`)
     } else {
-      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal }))
+      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal, observer }))
     }
   } finally {
     await router.dispose().catch(() => undefined)
+  }
+}
+
+/** One-line render of a kernel LoopEvent for the CLI progress stream. */
+function formatLoopEvent(e: LoopEvent): string {
+  switch (e.type) {
+    case 'round_started':   return `round ${e.round} [${e.mode}] started`
+    case 'seat_completed':  return `  ${e.seat} ${e.ok ? green('✓') : red('✗')} (cost $${e.costUsd.toFixed(3)})`
+    case 'waiting_entered': return `  ⏸ waiting (${e.waitName}) — ${e.effectKey}`
+    case 'harvest_started': return `  ▶ resume/harvest — ${e.effectKey}`
+    case 'round_completed': return `round ${e.round} done: route=${e.route} status=${e.status} cost=$${e.costUsd.toFixed(3)}`
+    case 'terminated':      return e.escalated
+      ? yellow(`⚠ terminated (${e.reason}) — needs human ack`)
+      : green(`■ finalized (${e.reason})`)
+    default:                return ''
   }
 }
 

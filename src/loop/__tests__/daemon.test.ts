@@ -36,11 +36,9 @@ function scriptedDispatcher(script: (task: string) => Promise<Record<string, unk
 }
 
 describe('runLoopScheduler', () => {
-  it('drives submit → probes → done → harvest → finalize, then idle-exits', async () => {
+  it('drives submit(event wait) → external event → harvest → finalize, then idle-exits', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-daemon-'))
     const paths = instancePaths(dir, 'walk-research-v1')
-    const statusFile = join(dir, 'sim_training.json')
-    let probeCount = 0
 
     const dispatcher = scriptedDispatcher(async task => {
       if (task.includes('收割段')) {
@@ -49,18 +47,18 @@ describe('runLoopScheduler', () => {
           JSON.stringify([{ claim: 'done at 0.6', evidence: 'curve' }]), 'utf-8')
         return { label: 'ok' }
       }
-      if (task.includes('产出契约')) {
-        await writeFile(statusFile, JSON.stringify({ state: 'running', metricHistory: [0.1] }), 'utf-8')
-        // Flip the remote task to done shortly after submission; the daemon's
-        // probes must notice it without any help.
+      if (task.includes('草稿目录')) {
+        // Submit an event wait; an external system drops the completion event
+        // shortly after — the daemon ingests it on its next tick (no help).
         setTimeout(() => {
-          void writeFile(statusFile, JSON.stringify({ state: 'done', metricHistory: [0.1, 0.6] }), 'utf-8')
+          void mkdir(paths.eventsDir, { recursive: true })
+            .then(() => writeFile(join(paths.eventsDir, 'done.json'),
+              JSON.stringify({ effectKey: 'exp-d', verdict: 'done', data: { final: 0.6 } }), 'utf-8'))
             .catch(() => undefined)
         }, 30)
-        return { label: 'wait', wait: 'training', effectKey: 'exp-d', payload: { statusFile: 'sim_training.json' } }
+        return { label: 'wait', effectKey: 'exp-d' }
       }
       if (task.includes('隔离评审座位')) {
-        probeCount // (no-op ref)
         return { verdict: 'pass', new_findings_count: 1, metric_delta: 0.5, metric: 0.6, messages: [] }
       }
       throw new Error('unexpected seat')
@@ -81,7 +79,6 @@ describe('runLoopScheduler', () => {
 
     expect(result.exitReason).toBe('idle')
     expect(result.roundsRun).toBeGreaterThanOrEqual(2) // submit segment + harvest
-    expect(result.probesRun).toBeGreaterThanOrEqual(1)
     const record = JSON.parse(await readFile(paths.instanceJson, 'utf-8'))
     expect(record.status).toBe('done')
     const report = await readFile(join(paths.reportsDir, 'final_report.md'), 'utf-8')

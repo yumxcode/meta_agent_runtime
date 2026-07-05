@@ -16,11 +16,7 @@ export { runRound, type RoundOutcome } from './kernel/LoopKernel.js'
 export { tickOnce, runUntilQuiescent, type TickDeps, type TickResult } from './runner.js'
 export { runLoopCli, type LoopCliDeps } from './cli.js'
 export { EffectLedger, type EffectRecord, type EffectStatus } from './effects/EffectLedger.js'
-export {
-  registerProbeAdapter, getProbeAdapter, fileProbeAdapter, isPlateau,
-  type ProbeAdapter, type ProbeInput, type ProbeResult,
-} from './effects/ProbeAdapters.js'
-export { handleProbeWake, ingestEvents, reconcileWaiting, readPendingRound } from './effects/WaitOps.js'
+export { ingestEvents, reconcileWaiting, readPendingRound } from './effects/WaitOps.js'
 export { runLoopScheduler, type DaemonOptions, type DaemonResult } from './daemon.js'
 export { distillCharter, type DistillResult, type DistillDeps } from './distill/Distiller.js'
 export { migrateInstance, type MigrationEntry } from './instance/Migrate.js'

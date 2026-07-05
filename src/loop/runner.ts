@@ -7,13 +7,15 @@
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { loadInstance } from './instance/InstanceStore.js'
-import { runRound, type RoundOutcome } from './kernel/LoopKernel.js'
-import { handleProbeWake, ingestEvents } from './effects/WaitOps.js'
+import { runRound, type RoundOutcome, type LoopEvent } from './kernel/LoopKernel.js'
+import { ingestEvents } from './effects/WaitOps.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
   projectDir: string
   signal?: AbortSignal
+  /** Live per-round/seat progress (CLI renders it). */
+  observer?: (event: LoopEvent) => void
 }
 
 export interface TickResult {
@@ -58,16 +60,12 @@ export async function tickOnce(deps: TickDeps, now = Date.now()): Promise<TickRe
         outcomes.push({ loopId: wake.loopId, error: `instance is ${instance.record.status}` })
         continue
       }
-      if (wake.kind === 'probe') {
-        const probe = await handleProbeWake(instance, wake, { wakeStore, projectDir: deps.projectDir })
-        outcomes.push({ loopId: wake.loopId, probe: `${probe.verdict}→${probe.action}` })
-        continue
-      }
       const outcome = await runRound(instance, wake, {
         dispatcher: deps.dispatcher,
         projectDir: deps.projectDir,
         signal: deps.signal ?? new AbortController().signal,
         wakeStore,
+        observer: deps.observer,
       })
       outcomes.push({ loopId: wake.loopId, outcome })
     } catch (err) {

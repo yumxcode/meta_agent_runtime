@@ -58,19 +58,6 @@ export function walkResearchCharter(overrides?: Partial<Charter>): Charter {
       lifetime: { rounds: 12, usd: 60 },
     },
     roundIntervalMs: 0,
-    waits: {
-      training: {
-        kind: 'file',
-        probeEveryMs: 5,
-        params: { statusFile: 'sim_training.json', plateauWindow: 4, plateauMinSlope: 0.001 },
-        rules: [
-          { when: 'done', do: 'wake_harvest' },
-          { when: 'plateau', do: 'terminate_and_harvest' },
-          { when: 'no_balance', do: 'rotate_and_resubmit' },
-          { when: 'error', do: 'wake_harvest' },
-        ],
-      },
-    },
     ...overrides,
   }
 }
