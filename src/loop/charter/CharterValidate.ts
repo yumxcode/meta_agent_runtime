@@ -61,7 +61,7 @@ export function validateCharter(charter: Charter): string[] {
     }
   }
   if (charter.seats?.worker && charter.seats.worker.context === undefined) {
-    errs.push("seats.worker.context is required ('lineage_round' recommended)")
+    errs.push("seats.worker.context is required ('lineage_loop' to accumulate context across rounds, or 'isolated' for fresh-eyes rounds)")
   }
 
   // Gates.

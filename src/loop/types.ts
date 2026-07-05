@@ -105,8 +105,19 @@ export function instancePaths(taskDir: string, instanceId: LoopInstanceId): Inst
 export interface PendingRound {
   round: number
   mode: RoundMode
-  effectKey: string
-  waitName: string
+  /**
+   * 'effect'     — waiting on an external side-effect (probe/event; effectKey set).
+   * 'self_timer' — the worker parked itself via the timer tool; no effect ledger,
+   *                just a timer wake that resumes it at `fireAt`.
+   * Absent = 'effect' (back-compat with pre-self_timer instances).
+   */
+  kind?: 'effect' | 'self_timer'
+  /** Effect wait only. */
+  effectKey?: string
+  waitName?: string
+  /** self_timer only: why the worker parked, and when the timer resumes it. */
+  reason?: string
+  fireAt?: number
   startedAt: number
   costUsdSoFar: number
   seatSummaries: Record<string, string>

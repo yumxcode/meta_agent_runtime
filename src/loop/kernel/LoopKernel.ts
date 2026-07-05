@@ -88,7 +88,20 @@ export async function runRound(
 
     const pending = await readPendingRound(instance)
     if (pending) {
-      const effect = await effectLedgerFor(instance).get(pending.effectKey)
+      if (pending.kind === 'self_timer') {
+        // Self-timer park: the firing timer wake IS the resume signal. If it fired
+        // early (coalesced), keep waiting until fireAt.
+        if (Date.now() >= (pending.fireAt ?? 0)) {
+          await setInstanceStatus(instance, 'running')
+          return await harvestSegment(instance, deps, pending)
+        }
+        await setInstanceStatus(instance, 'waiting')
+        return {
+          round: pending.round, mode: pending.mode,
+          route: 'still-waiting', status: 'waiting', costUsd: 0,
+        }
+      }
+      const effect = await effectLedgerFor(instance).get(pending.effectKey!)
       if (effect?.status === 'concluded') {
         await setInstanceStatus(instance, 'running')
         return await harvestSegment(instance, deps, pending)
@@ -170,13 +183,18 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
 
 // ── seat loop: worker + per-cause corrective retries + gates ──────────────────
 
+/** What kind of wait the worker requested (M2 effect probe, or a self-timer park). */
+type WaitRequest =
+  | { mode: 'effect'; waitName: string; effectKey: string; payload?: Record<string, unknown> }
+  | { mode: 'self_timer'; afterMs: number; reason: string }
+
 interface SeatLoopOutcome {
   kind: 'complete' | 'wait'
   worker: SeatResult | null
   judge: SeatResult | null
   correctiveRetries: number
   costUsd: number
-  waitRequest?: { waitName: string; effectKey: string; payload?: Record<string, unknown> }
+  waitRequest?: WaitRequest
 }
 
 async function runSeatLoop(
@@ -200,6 +218,14 @@ async function runSeatLoop(
     seatSummaries['worker'] = truncate(worker.summary)
     deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'worker', ok: worker.ok, costUsd: worker.costUsd })
 
+    // Self-timer park (worker called the timer tool) — takes priority: the
+    // worker explicitly parked itself, no external effect involved.
+    if (worker.timer) {
+      return {
+        kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
+        waitRequest: { mode: 'self_timer', afterMs: worker.timer.afterMs, reason: worker.timer.reason },
+      }
+    }
     // Wait request (M2): the worker submitted an external task.
     if (worker.data['label'] === 'wait' && typeof worker.data['wait'] === 'string') {
       const waitName = worker.data['wait']
@@ -207,6 +233,7 @@ async function runSeatLoop(
         return {
           kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
           waitRequest: {
+            mode: 'effect',
             waitName,
             effectKey: typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
               ? worker.data['effectKey']
@@ -265,7 +292,7 @@ interface SubmitInput {
   costUsd: number
   seatSummaries: Record<string, string>
   correctiveRetries: number
-  waitRequest: { waitName: string; effectKey: string; payload?: Record<string, unknown> }
+  waitRequest: WaitRequest
   submitSummary: string
 }
 
@@ -275,6 +302,36 @@ async function submitSegment(
   input: SubmitInput,
 ): Promise<RoundOutcome> {
   const waitDeps = { wakeStore: deps.wakeStore, projectDir: deps.projectDir }
+  const base = {
+    round: input.round,
+    mode: input.mode,
+    startedAt: input.startedAt,
+    costUsdSoFar: input.costUsd,
+    seatSummaries: input.seatSummaries,
+    correctiveRetries: input.correctiveRetries,
+    submitSummary: truncate(input.submitSummary, 2_000),
+    createdAt: Date.now(),
+  }
+
+  // Self-timer park: no effect ledger — just persist the round and schedule a
+  // plain timer wake that resumes it at fireAt.
+  if (input.waitRequest.mode === 'self_timer') {
+    const fireAt = Date.now() + input.waitRequest.afterMs
+    await writePendingRound(instance, {
+      ...base, kind: 'self_timer', reason: input.waitRequest.reason, fireAt,
+    } satisfies PendingRound)
+    await deps.wakeStore.schedule({ loopId: instance.record.instanceId, kind: 'timer', fireAt })
+    await setInstanceStatus(instance, 'waiting', `self-timer: ${input.waitRequest.reason}`)
+    deps.observer?.({
+      type: 'waiting_entered', round: input.round,
+      effectKey: `self_timer:${input.waitRequest.reason}`, waitName: 'self_timer',
+    })
+    return {
+      round: input.round, mode: input.mode,
+      route: 'waiting:self_timer', status: 'waiting', costUsd: input.costUsd,
+    }
+  }
+
   const wait = instance.charter.waits![input.waitRequest.waitName]!
   const effects = effectLedgerFor(instance)
   await effects.submit({
@@ -284,16 +341,9 @@ async function submitSegment(
     payload: input.waitRequest.payload,
   })
   await writePendingRound(instance, {
-    round: input.round,
-    mode: input.mode,
+    ...base, kind: 'effect',
     effectKey: input.waitRequest.effectKey,
     waitName: input.waitRequest.waitName,
-    startedAt: input.startedAt,
-    costUsdSoFar: input.costUsd,
-    seatSummaries: input.seatSummaries,
-    correctiveRetries: input.correctiveRetries,
-    submitSummary: truncate(input.submitSummary, 2_000),
-    createdAt: Date.now(),
   } satisfies PendingRound)
   await scheduleNextProbe(instance, waitDeps, input.waitRequest.effectKey, wait)
   await setInstanceStatus(instance, 'waiting', `waiting on ${input.waitRequest.effectKey}`)
@@ -316,31 +366,45 @@ async function harvestSegment(
 ): Promise<RoundOutcome> {
   const { charter, ledger, paths } = instance
   const effects = effectLedgerFor(instance)
-  const effect = (await effects.get(pending.effectKey))!
+  const isSelfTimer = pending.kind === 'self_timer'
+  const effectKey = isSelfTimer ? null : pending.effectKey!
   const progress = await ledger.readProgress()
   const budgetExhausted = lifetimeExhausted(charter, progress)
-  deps.observer?.({ type: 'harvest_started', round: pending.round, effectKey: pending.effectKey })
+  deps.observer?.({
+    type: 'harvest_started', round: pending.round,
+    effectKey: effectKey ?? `self_timer:${pending.reason ?? ''}`,
+  })
 
   const capsule = await buildCapsule({
     paths, ledger, goal: charter.goal, round: pending.round, mode: pending.mode,
   })
-  // Lineage digest (D5): the harvest worker knows WHAT it submitted and WHY,
-  // via the submit summary — not via a shared transcript.
-  const harvestPreface = [
-    '【收割段】你（或你的前身）在本轮提交段启动了外部任务，现已结束。',
-    `【提交段摘要】${pending.submitSummary || '(无摘要)'}`,
-    `【外部任务结果】verdict=${effect.outcome?.verdict ?? 'unknown'} via=${effect.outcome?.via ?? '?'}`,
-    `【结果数据】${truncate(JSON.stringify(effect.outcome?.data ?? null), 3_000)}`,
-    '请基于结果完成本轮剩余工作（整理 findings 草稿等），遵守产出契约。',
-  ].join('\n')
+  // Lineage digest (D5): the harvest/continue worker knows WHAT it parked on and
+  // WHY, via the submit summary — not via a shared transcript.
+  let preface: string
+  if (isSelfTimer) {
+    preface = [
+      `【继续】已到你设定的时间（原因：${pending.reason ?? '?'}）。`,
+      `【提交段摘要】${pending.submitSummary || '(无摘要)'}`,
+      '请自行检查外部任务状态，决定：继续等待（再调 timer）还是收割（整理 findings/direction 草稿后 return_result data={"label":"ok"}）。',
+    ].join('\n')
+  } else {
+    const effect = (await effects.get(effectKey!))!
+    preface = [
+      '【收割段】你（或你的前身）在本轮提交段启动了外部任务，现已结束。',
+      `【提交段摘要】${pending.submitSummary || '(无摘要)'}`,
+      `【外部任务结果】verdict=${effect.outcome?.verdict ?? 'unknown'} via=${effect.outcome?.via ?? '?'}`,
+      `【结果数据】${truncate(JSON.stringify(effect.outcome?.data ?? null), 3_000)}`,
+      '请基于结果完成本轮剩余工作（整理 findings 草稿等），遵守产出契约。',
+    ].join('\n')
+  }
 
   const seatSummaries: Record<string, string> = { ...pending.seatSummaries }
-  const seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries, harvestPreface)
+  const seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries, preface)
   const costUsd = pending.costUsdSoFar + seatLoop.costUsd
 
   if (seatLoop.kind === 'wait') {
-    // Chained wait (multi-stage external work): same round submits again.
-    await effects.markHarvested(pending.effectKey)
+    // Chained wait / self-timer re-park: same round parks again.
+    if (effectKey) await effects.markHarvested(effectKey)
     return submitSegment(instance, deps, {
       round: pending.round, mode: pending.mode, startedAt: pending.startedAt,
       costUsd, seatSummaries,
@@ -361,7 +425,7 @@ async function harvestSegment(
   // completeRound → clear pending → settle the effect. reconcileWaiting heals
   // every interleaving of a crash between these three.
   await clearPendingRound(instance)
-  await effects.markHarvested(pending.effectKey)
+  if (effectKey) await effects.markHarvested(effectKey)
   return outcome
 }
 

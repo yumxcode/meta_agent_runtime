@@ -12,6 +12,7 @@
  *   3. Circuit breakers (maxTurns, maxBudgetUsd) are enforced in code, not prompt.
  *   4. Human-approval gate is implemented at the tool-handler layer.
  */
+import type { MetaAgentTool } from '../core/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task ID
@@ -67,11 +68,25 @@ export interface SubAgentConfig {
    */
   externalPromptAssembly?: boolean
   /**
+   * When set, the sub-agent session RESUMES from and PERSISTS to this stable
+   * session id across spawns (loop inner_orch_worker lineage variant): prior
+   * transcript is loaded as initial history, and the post-run transcript is
+   * written back. Absent = fresh one-shot session (the default / isolated).
+   */
+  lineageSessionId?: string
+  /**
    * Names of tools the sub-agent may call.  The SubAgentRunner looks these up
    * in the tool registry passed at spawn time.  When omitted the sub-agent
    * runs in pure-reasoning mode (no tools).
    */
   allowedTools?: string[]
+  /**
+   * Extra tool OBJECTS injected into this sub-agent's session (beyond the
+   * name-resolved allowedTools). Used by the loop to give a worker seat
+   * instance-scoped tools like timer/timer_cancel whose handlers close over
+   * loop state. In-process only (not serialized across a process boundary).
+   */
+  extraTools?: MetaAgentTool[]
 
   // ── Circuit breakers ──────────────────────────────────────────────────────
   /** Maximum conversation turns before the sub-agent is force-stopped.  Default: 10 */

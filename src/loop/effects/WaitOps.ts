@@ -204,22 +204,33 @@ export async function reconcileWaiting(instance: LoopInstance, deps: WaitOpsDeps
     w => w.loopId === instance.record.instanceId && (w.status === 'pending' || w.status === 'claimed'),
   )
 
-  if (pending) {
-    const effect = await effects.get(pending.effectKey)
+  if (pending && pending.kind === 'self_timer') {
+    // Self-timer park has no effect ledger — just a timer wake at fireAt. If that
+    // wake was lost to a crash, re-arm it (immediately if already overdue).
+    const hasTimer = wakes.some(w => w.kind === 'timer')
+    if (!hasTimer) {
+      await deps.wakeStore.schedule({
+        loopId: instance.record.instanceId, kind: 'timer',
+        fireAt: pending.fireAt ?? Date.now(),
+      })
+      actions.push(`re-armed missing self-timer wake (round ${pending.round}, reason ${pending.reason ?? '?'})`)
+    }
+  } else if (pending) {
+    const effect = await effects.get(pending.effectKey!)
     if (!effect) {
       await clearPendingRound(instance)
       await deps.wakeStore.schedule({ loopId: instance.record.instanceId, kind: 'timer', fireAt: Date.now() })
       actions.push(`dropped orphan pending_round (round ${pending.round}, no effect record)`)
     } else if (effect.status === 'concluded') {
       if (!wakes.some(w => w.kind === 'event' && w.effectKey === pending.effectKey)) {
-        await scheduleHarvestWake(instance, deps, pending.effectKey)
+        await scheduleHarvestWake(instance, deps, pending.effectKey!)
         actions.push(`scheduled missing harvest wake for ${pending.effectKey}`)
       }
     } else if (effect.status === 'submitted' || effect.status === 'probing') {
       if (!wakes.some(w => w.kind === 'probe' && w.effectKey === pending.effectKey)) {
         const wait = waitSpecFor(instance, effect.waitName)
         if (wait) {
-          await scheduleNextProbe(instance, deps, pending.effectKey, wait)
+          await scheduleNextProbe(instance, deps, pending.effectKey!, wait)
           actions.push(`scheduled missing probe wake for ${pending.effectKey}`)
         }
       }

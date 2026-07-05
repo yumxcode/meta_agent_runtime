@@ -321,7 +321,14 @@ export class SubAgentRunner {
     // chatty the run was. Injected on top of the resolved tools so it never masks
     // the "no tools resolved" guard above.
     const returnResultTool = makeReturnResultTool(r => { this._returnedResult = r })
-    const sessionTools = [...tools, returnResultTool]
+    const sessionTools = [...tools, returnResultTool, ...(cfg.extraTools ?? [])]
+
+    // Lineage seat (loop inner_orch_worker): resume the prior transcript under a
+    // stable session id so accumulated context carries across rounds. Isolated /
+    // ordinary sub-agents leave lineageSessionId unset and start fresh.
+    const priorMessages = cfg.lineageSessionId
+      ? await SessionStore.loadHistory(cfg.lineageSessionId)
+      : []
 
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
@@ -340,6 +347,8 @@ export class SubAgentRunner {
       ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
       ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
       ...(cfg.externalPromptAssembly ? { externalPromptAssembly: true } : {}),
+      ...(cfg.lineageSessionId ? { sessionId: cfg.lineageSessionId } : {}),
+      ...(priorMessages.length ? { initialMessages: priorMessages } : {}),
     }
 
     this.session = new MetaAgentSession(sessionConfig)
@@ -492,6 +501,7 @@ export class SubAgentRunner {
       if (durationTimer) clearTimeout(durationTimer)
       this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
+      await this._persistLineageHistory().catch(() => undefined)
       await this.session?.dispose().catch(() => undefined)
       // Always release the sandbox handle, even if _writeTerminal or the loop
       // threw an unexpected error.  destroy() is a no-op for Noop/macOS handles
@@ -590,6 +600,21 @@ export class SubAgentRunner {
       case 'error_during_execution': return 'Error during execution'
       default: return `Stopped: ${subtype}`
     }
+  }
+
+  /** Persist the lineage seat transcript so the next round resumes it (loop). */
+  private async _persistLineageHistory(): Promise<void> {
+    const lineageId = this.record.config.lineageSessionId
+    if (!lineageId || !this.session) return
+    const messages = this.session.getMessages()
+    await SessionStore.replace(lineageId, {
+      mode: 'inner_orch_worker',
+      startTime: this.record.createdAt,
+      lastActivity: Date.now(),
+      messageCount: messages.length,
+      firstPrompt: this.record.config.taskDescription.slice(0, 80),
+      workspace: this.record.config.projectDir,
+    }, messages)
   }
 
   private _emitRuntime(event: SubAgentRuntimeEvent): void {

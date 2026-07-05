@@ -13,8 +13,10 @@
  *           kernel injects into the same round's capsule.
  */
 import { readFile } from 'fs/promises'
-import { join } from 'path'
+import { basename, join } from 'path'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
+import type { MetaAgentTool } from '../../core/types.js'
+import { makeTimerTool, makeTimerCancelTool, type TimerIntent } from '../../subagent/tools/timer.js'
 import { spawnAndWait, type SpawnWaitOptions } from '../seatSpawn.js'
 import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
@@ -35,6 +37,8 @@ export interface SeatResult {
   /** Structured payload from return_result (authoritative). */
   data: Record<string, unknown>
   costUsd: number
+  /** Set when the worker parked itself via the timer tool (self_timer wait). */
+  timer?: TimerIntent
 }
 
 export interface SeatRunnerDeps {
@@ -72,6 +76,18 @@ export async function runWorkerSeat(
     draftsDir: join(paths.draftsDir),
     preface: correctivePreface,
   })
+  // lineage → resume a stable per-(instance,worker) session across rounds;
+  // isolated → fresh each round. instanceId is the .loop/<id> dir name.
+  const lineageSessionId = variant === 'lineage'
+    ? `loop-${basename(paths.root)}-worker`
+    : undefined
+  // Self-park channel: the worker may call timer(...) to be woken later this
+  // round; timer_cancel clears it. Captured here (in-process) into timerIntent.
+  let timerIntent: TimerIntent | null = null
+  const timerTools: MetaAgentTool[] = [
+    makeTimerTool(i => { timerIntent = i }),
+    makeTimerCancelTool(() => { timerIntent = null }),
+  ]
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
   // the sandbox level for the worker's bash — the prompt contract is the
   // instruction, this is the guarantee. Drafts/inbox stay writable.
@@ -84,7 +100,10 @@ export async function runWorkerSeat(
       paths.reportsDir,
     ],
   }
-  return runSeat(deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt)
+  const result = await runSeat(
+    deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, timerTools,
+  )
+  return timerIntent ? { ...result, timer: timerIntent } : result
 }
 
 const JUDGE_CONTRACT = `\
@@ -136,6 +155,10 @@ async function runSeat(
   sandbox?: { writeDenyPaths?: string[] },
   /** inner_orch_worker: a loop-composed system prompt used verbatim. */
   systemPromptOverride?: string,
+  /** inner_orch_worker lineage: stable session id to resume/persist across rounds. */
+  lineageSessionId?: string,
+  /** Instance-scoped tool objects (e.g. timer/timer_cancel for the worker). */
+  extraTools?: MetaAgentTool[],
 ): Promise<SeatResult> {
   const rec = await spawnAndWait(
     deps.dispatcher,
@@ -153,6 +176,8 @@ async function runSeat(
       ...(systemPromptOverride
         ? { systemPrompt: systemPromptOverride, externalPromptAssembly: true }
         : {}),
+      ...(lineageSessionId ? { lineageSessionId } : {}),
+      ...(extraTools?.length ? { extraTools } : {}),
     },
     deps.signal,
     deps.spawnOpts,

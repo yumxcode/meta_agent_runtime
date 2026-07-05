@@ -43,6 +43,13 @@ const DISCIPLINE = `\
 - **换策略前先诊断**：方法失败时先读错误、核对假设，再换方案；不盲目重试相同操作，也不因单次失败就放弃可行方案。
 - **如实报告**：某步失败就附上相关输出说明；未执行或未验证的步骤，明确说明，不得把未完成/已损坏的工作说成"已完成"。`
 
+const WAIT_TOOLS = `\
+## 等待远端任务（自计时）
+当你启动了慢任务（如远端训练），想过一会儿再回来亲自看结果、决定"继续等 vs 终止收割"时：
+- 调 timer({minutes, reason}) 把自己 park，然后 return_result data={"label":"wait"}。到点内核会 resume 你（同一会话），并提示你继续；你据此自行检查任务状态：想再等就再调一次 timer，想收割就整理 findings/direction 后 return_result data={"label":"ok"}。
+- 若想立刻收尾而不再等待，先调 timer_cancel，再正常 return_result——别让自己一直 timer 循环。
+（这是"要眼睛看着判断"的等待方式。若等待判定是纯确定性阈值/换号，内核另有代码探针机制，不需要你醒。）`
+
 function contextConventions(variant: InnerWorkerVariant): string {
   const base = `\
 ## 上下文约定
@@ -85,6 +92,7 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
     opts.seatPrompt.trim(),
     DISCIPLINE,
     contextConventions(opts.variant),
+    WAIT_TOOLS,
     scopeNote,
     skillManifest,
   ].filter(Boolean).join('\n\n')
