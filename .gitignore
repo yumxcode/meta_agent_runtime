@@ -28,3 +28,4 @@ dist/
 permissions.json
 _tmp_branchcycle.removed
 __trash_stale_auto_orch/
+src/core/auto_orch/
