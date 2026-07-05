@@ -61,6 +61,12 @@ export interface SubAgentConfig {
   /** Sub-agent system prompt.  Defaults to DEFAULT_SYSTEM_PROMPT when omitted. */
   systemPrompt?: string
   /**
+   * When true, `systemPrompt` is the COMPLETE prompt: MetaAgentSession appends no
+   * static/dynamic sections and no volatile `<context>` prefix. The loop
+   * runtime's inner_orch_worker sets this to own its lean seat prompt.
+   */
+  externalPromptAssembly?: boolean
+  /**
    * Names of tools the sub-agent may call.  The SubAgentRunner looks these up
    * in the tool registry passed at spawn time.  When omitted the sub-agent
    * runs in pure-reasoning mode (no tools).

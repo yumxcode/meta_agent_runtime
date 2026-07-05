@@ -20,6 +20,11 @@ import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
+import {
+  assembleInnerWorkerSystemPrompt,
+  renderInnerWorkerUserMessage,
+  type InnerWorkerVariant,
+} from './InnerOrchWorker.js'
 
 const EVIDENCE_CAP_CHARS = 6_000
 const DEFAULT_WORKER_TOOLS = ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash']
@@ -40,12 +45,10 @@ export interface SeatRunnerDeps {
   spawnOpts?: SpawnWaitOptions
 }
 
-const WORKER_CONTRACT = `\
-【产出契约（硬性）】
-1. 选定本轮方向后，先写 drafts/direction.json：{"key":"<方向短标识>","rationale":"一句话"}。
-2. 完成工作后，把结构化 findings 草稿写入 drafts/findings_draft.json（数组，每条含 claim 与 evidence 字段）。
-3. 最后必须调用 return_result，data 写 {"label":"ok"|"error","note":"一句话"}。
-【路径硬性约定】跨轮共享状态只写 drafts/ 下的草稿——入账由内核完成，你无权直接改 ledger/ 下任何文件；禁止写 .meta-agent/ 下任何路径。`
+/** seat.context → inner_orch_worker variant (spec D5). Only lineage_loop resumes. */
+function workerVariant(seat: SeatSpec): InnerWorkerVariant {
+  return seat.context === 'lineage_loop' ? 'lineage' : 'isolated'
+}
 
 export async function runWorkerSeat(
   deps: SeatRunnerDeps,
@@ -55,19 +58,22 @@ export async function runWorkerSeat(
   correctivePreface?: string,
 ): Promise<SeatResult> {
   const seat = charter.seats.worker
-  const scopeNote = charter.writeScope?.length
-    ? `【写入范围】除 drafts/ 外，仅允许修改：${charter.writeScope.join(', ')}`
-    : ''
-  const task = [
-    correctivePreface ?? '',
-    renderCapsule(capsule),
-    seat.prompt,
-    scopeNote,
-    `【草稿目录】${join(paths.draftsDir)}`,
-    WORKER_CONTRACT,
-  ].filter(Boolean).join('\n\n')
+  const variant = workerVariant(seat)
+  // System = the lean inner_orch_worker prompt (loop-owned, externalPromptAssembly);
+  // user = <context> capsule + round instruction + output contract.
+  const systemPrompt = await assembleInnerWorkerSystemPrompt({
+    seatPrompt: seat.prompt,
+    projectDir: deps.projectDir,
+    variant,
+    writeScope: charter.writeScope,
+  })
+  const userMessage = renderInnerWorkerUserMessage({
+    capsule,
+    draftsDir: join(paths.draftsDir),
+    preface: correctivePreface,
+  })
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
-  // the sandbox level for the worker's bash — the prompt contract above is the
+  // the sandbox level for the worker's bash — the prompt contract is the
   // instruction, this is the guarantee. Drafts/inbox stay writable.
   const sandbox = {
     writeDenyPaths: [
@@ -78,7 +84,7 @@ export async function runWorkerSeat(
       paths.reportsDir,
     ],
   }
-  return runSeat(deps, seat, task, DEFAULT_WORKER_TOOLS, sandbox)
+  return runSeat(deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt)
 }
 
 const JUDGE_CONTRACT = `\
@@ -128,6 +134,8 @@ async function runSeat(
   taskDescription: string,
   defaultTools: string[],
   sandbox?: { writeDenyPaths?: string[] },
+  /** inner_orch_worker: a loop-composed system prompt used verbatim. */
+  systemPromptOverride?: string,
 ): Promise<SeatResult> {
   const rec = await spawnAndWait(
     deps.dispatcher,
@@ -142,6 +150,9 @@ async function runSeat(
       checkpointEveryNTurns: 0,
       projectDir: deps.projectDir,
       ...(sandbox ? { sandbox } : {}),
+      ...(systemPromptOverride
+        ? { systemPrompt: systemPromptOverride, externalPromptAssembly: true }
+        : {}),
     },
     deps.signal,
     deps.spawnOpts,

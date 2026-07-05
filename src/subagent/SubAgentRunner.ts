@@ -339,6 +339,7 @@ export class SubAgentRunner {
       // permission policy + bind its jail root. Absent for non-auto parents.
       ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
       ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
+      ...(cfg.externalPromptAssembly ? { externalPromptAssembly: true } : {}),
     }
 
     this.session = new MetaAgentSession(sessionConfig)

@@ -100,6 +100,15 @@ export interface MetaAgentConfig {
    */
   sessionId?: string
 
+  /**
+   * When true, the caller has assembled the ENTIRE prompt itself: `systemPrompt`
+   * is used verbatim as the system message (no static/dynamic sections appended)
+   * and the per-turn user message is passed through with no volatile `<context>`
+   * prefix. Used by the loop runtime's inner_orch_worker base, which composes its
+   * own lean section set + `<context>` capsule (L2 owns the seat prompt).
+   */
+  externalPromptAssembly?: boolean
+
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
   apiKey?: string
 
@@ -439,8 +448,10 @@ export type ResolvedConfig = Required<
     | 'fallbackIncludeDefaultBetas'
     | 'thinkingConfig'
     | 'compact'
+    | 'externalPromptAssembly'
   >
 > & {
+  externalPromptAssembly?: boolean
   compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
   language?: string
@@ -581,6 +592,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     initialCheckpointRevision: config.initialCheckpointRevision,
     getExperienceRecallBlock: config.getExperienceRecallBlock,
     initialMessages: config.initialMessages,
+    externalPromptAssembly: config.externalPromptAssembly,
     debugMode:       config.debugMode,
     // projectDir: default to cwd so AGENT.md discovery works out-of-the-box
     projectDir: config.projectDir ?? process.cwd(),

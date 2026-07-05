@@ -34,6 +34,8 @@ import { isAbsolute, resolve, join } from 'node:path'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
+import { runLoopCli, runLoopScheduler, type TickResult } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
@@ -229,6 +231,17 @@ ${bold('OPTIONS')}
   -v, --version         Print version
   -h, --help            Show this help
 
+${bold('LOOP RUNTIME (charter-driven long-horizon loops)')}
+  meta-agent loop distill <需求.md>        Distill a requirement doc into a charter draft
+  meta-agent loop create <charter.json>    Validate+freeze a charter, init the instance, schedule first wake
+  meta-agent loop list                     List loop instances in this workspace
+  meta-agent loop inspect <instanceId>     Status + progress + recent rounds
+  meta-agent loop inbox <instanceId> <msg> Drop feedback for the next round
+  meta-agent loop tick [--until-quiescent] Claim due wakes and run rounds
+  meta-agent loop migrate <instanceId>     Migrate a live instance to a newer charter version
+  meta-agent loop-scheduler                Run the loop daemon until idle (unattended driver)
+  (put global flags like -w <dir> BEFORE the loop token: meta-agent -w <dir> loop tick)
+
 ${bold('INTERACTIVE COMMANDS')}
   /mode                 Show current session mode
   /workspace            Show current workspace directory
@@ -352,9 +365,25 @@ interface CliOptions {
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
   sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
+  /** `loop <cmd>` / `loop-scheduler` (v2 loop runtime, L2). Args pass through verbatim. */
+  loopCommand: { name: 'loop' | 'loop-scheduler'; args: string[] } | null
 }
 
 function parseCliArgs(): CliOptions {
+  // v2 loop runtime (L2): `meta-agent loop <cmd>` and `meta-agent loop-scheduler`
+  // carry their OWN sub-flags (--id / --until-quiescent / --version N / --out …)
+  // that the strict global parser would reject, so split them off up front.
+  // Global flags (-w/-k/-b/--model) go BEFORE the `loop` token.
+  const rawArgs = process.argv.slice(2)
+  const loopIdx = rawArgs.findIndex(a => a === 'loop' || a === 'loop-scheduler')
+  if (loopIdx !== -1) {
+    return buildLoopCliOptions(
+      rawArgs[loopIdx] as 'loop' | 'loop-scheduler',
+      rawArgs.slice(0, loopIdx),
+      rawArgs.slice(loopIdx + 1),
+    )
+  }
+
   let parsed: ReturnType<typeof parseArgs>
   try {
     parsed = parseArgs({
@@ -465,6 +494,66 @@ function parseCliArgs(): CliOptions {
     maxTurns,
     resume:     parsed.values['resume']   as string | undefined,
     sessionDir,
+    loopCommand: null,
+  }
+}
+
+/**
+ * Build CliOptions for a `loop` / `loop-scheduler` invocation. Only the backend
+ * essentials are parsed from the pre-`loop` global flags; everything after the
+ * `loop` token is handed verbatim to runLoopCli, which does its own flag parsing.
+ */
+function buildLoopCliOptions(
+  name: 'loop' | 'loop-scheduler',
+  globalArgs: string[],
+  loopArgs: string[],
+): CliOptions {
+  let g: ReturnType<typeof parseArgs>
+  try {
+    g = parseArgs({
+      args: globalArgs,
+      options: {
+        workspace:  { type: 'string', short: 'w' },
+        'api-key':  { type: 'string', short: 'k' },
+        'base-url': { type: 'string', short: 'b' },
+        model:      { type: 'string' },
+        json:       { type: 'boolean', short: 'j', default: false },
+      },
+      strict: false,
+      allowPositionals: true,
+    })
+  } catch (err) {
+    console.error(red(`Error: ${terminalText(err instanceof Error ? err.message : String(err))}`))
+    process.exit(1)
+  }
+  const rawWorkspace = g.values['workspace'] as string | undefined
+  let workspace: string | undefined
+  if (rawWorkspace) {
+    workspace = resolve(rawWorkspace)
+    if (!existsSync(workspace) || !statSync(workspace).isDirectory()) {
+      console.error(red(`Error: workspace "${workspace}" does not exist or is not a directory.`))
+      process.exit(1)
+    }
+  }
+  return {
+    mode: 'auto' as SessionModeHint,   // loop seats run unattended on the auto base
+    workspace,
+    hardwareId: undefined,
+    apiKey:  g.values['api-key']  as string | undefined,
+    baseUrl: g.values['base-url'] as string | undefined,
+    model:   g.values['model']    as string | undefined,
+    fallbackModel: undefined,
+    system: undefined,
+    json:   g.values['json'] as boolean,
+    debug: false,
+    showThinking: false,
+    yes: true,
+    autoWorktreeCleanup: undefined,
+    prompt: null,
+    maxTurns: undefined,
+    resume: undefined,
+    sessionDir: undefined,
+    loopCommand: { name, args: loopArgs },
   }
 }
 
@@ -4767,6 +4856,73 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
   }
 }
 
+// ── Loop runtime (v2, L2) ─────────────────────────────────────────────────────
+
+/**
+ * Dispatch `meta-agent loop <cmd>` and `meta-agent loop-scheduler`.
+ *
+ * Pure-code loop subcommands (create/list/inspect/inbox/migrate) need no LLM
+ * backend and run directly. `tick`, `distill`, and the `loop-scheduler` daemon
+ * spawn seats, so they need a live dispatcher: we prewarm an `auto` backend
+ * (unattended base = autonomy jail + workspace confinement for spawned seats)
+ * and hand its SubAgentBridge to the loop runtime.
+ */
+async function runLoopCommand(opts: CliOptions): Promise<void> {
+  const { name, args } = opts.loopCommand!
+  const projectDir = resolve(opts.workspace ?? process.cwd())
+  const sub = args[0]
+  const needsBackend = name === 'loop-scheduler' || sub === 'tick' || sub === 'distill'
+
+  if (!needsBackend) {
+    // create / list / inspect / inbox / migrate — deterministic, no LLM.
+    console.log(await runLoopCli(args, { projectDir }))
+    return
+  }
+
+  assertApiKeyConfigured(opts)
+  const router = makeRouter(
+    { ...opts, mode: 'auto', workspace: projectDir, prompt: null, loopCommand: null },
+    undefined, undefined, undefined, undefined, undefined, undefined,
+  )
+  const abort = new AbortController()
+  process.once('SIGINT', () => abort.abort())
+  process.once('SIGTERM', () => abort.abort())
+  try {
+    const warmed = await router.prewarmBackend()
+    if (!warmed) throw new Error('could not create the loop backend (auto mode)')
+    const dispatcher = SubAgentBridge.getBridge(router.getSessionId())
+    if (!dispatcher) throw new Error('loop backend produced no sub-agent dispatcher')
+
+    if (name === 'loop-scheduler') {
+      const stamp = (): string => new Date().toISOString()
+      console.log(`[loop-scheduler] ${stamp()} start (workspace ${projectDir})`)
+      const result = await runLoopScheduler({
+        dispatcher,
+        projectDir,
+        signal: abort.signal,
+        onTick: (t: TickResult) => {
+          for (const o of t.outcomes) {
+            if (o.outcome) {
+              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: round ${o.outcome.round} ` +
+                `[${o.outcome.mode}] route=${o.outcome.route} status=${o.outcome.status}`)
+            } else if (o.probe) {
+              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: probe ${o.probe}`)
+            } else if (o.error) {
+              console.log(`[loop-scheduler] ${stamp()} ${o.loopId}: ERROR ${o.error}`)
+            }
+          }
+        },
+      })
+      console.log(`[loop-scheduler] ${stamp()} exit (${result.exitReason}); ` +
+        `${result.roundsRun} round(s), ${result.probesRun} probe(s) over ${result.ticks} tick(s).`)
+    } else {
+      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal }))
+    }
+  } finally {
+    await router.dispose().catch(() => undefined)
+  }
+}
+
 // ── Entry point ───────────────────────────────────────────────────────────────
 
 /**
@@ -4790,6 +4946,14 @@ async function main(): Promise<void> {
   if (bwrapWarning) {
     process.stderr.write(`${yellow(bwrapWarning)}\n`)
   }
+  // Loop runtime dispatch first: its pure-code subcommands (list/inspect/…) must
+  // work without an API key; runLoopCommand asserts the key only when it needs a
+  // backend (tick/distill/loop-scheduler).
+  if (opts.loopCommand) {
+    await runLoopCommand(opts)
+    return
+  }
+
   assertApiKeyConfigured(opts)
 
   if (opts.prompt !== null) {

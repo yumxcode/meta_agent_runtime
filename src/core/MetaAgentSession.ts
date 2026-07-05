@@ -285,55 +285,63 @@ export class MetaAgentSession {
       this._provenanceDirty = false
     }
 
-    const stableSections = buildDynamicSections({
-      sessionId:      this.sessionId,
-      sessionStartMs: this.sessionStartMs,
-      mode,
-      domain:         this.config.domain,
-      rtx:            this.config.runtimeContext,
-      language:       this.config.language,
-      mcpServers:     this.config.mcpServers,
-      outputStyle:    this.config.outputStyle,
-      taskContract:   this._taskContract,
-      projectDir:     this.config.projectDir,
-      // NOTE: currentQuery / client / subAgentBridge are intentionally omitted —
-      // those drove D1b and D11 which are now in the volatile user prefix.
-    })
-
-    const stablePrompt = await this.sectionRegistry.resolveToString(stableSections)
-
-    // Assemble the full stable system prompt string
+    // externalPromptAssembly: the caller (loop inner_orch_worker) owns the whole
+    // prompt. Use its systemPrompt verbatim — no static/dynamic sections, no
+    // experience recall — so the seat carries exactly the lean section set L2
+    // composed, nothing more.
     let fullStablePrompt: string
-    if (!this._usingDefaultPrompt) {
+    if (this.config.externalPromptAssembly) {
       fullStablePrompt = this.config.systemPrompt ?? ''
-      if (this._appendSuffix)  fullStablePrompt += '\n\n' + this._appendSuffix
-      if (stablePrompt)        fullStablePrompt += '\n\n' + stablePrompt
     } else {
-      // Build mode-specific static prompt lazily and cache per mode.
-      // MetaAgentSession is only used for 'agentic' and 'robotics' modes;
-      // 'campaign' would be a safety fallback (CampaignSession handles that path).
-      // StaticPromptMode is now an alias of the canonical mode union, so the
-      // mode maps to its static template directly — no per-mode ternary needed.
-      const staticMode: StaticPromptMode = mode
-      let staticPrompt = this._staticPromptCache.get(staticMode)
-      if (!staticPrompt) {
-        staticPrompt = buildStaticSystemPrompt(staticMode)
-        this._staticPromptCache.set(staticMode, staticPrompt)
-      }
-      fullStablePrompt = staticPrompt + SYSTEM_PROMPT_DYNAMIC_BOUNDARY + stablePrompt
-      if (this._appendSuffix)  fullStablePrompt += '\n\n' + this._appendSuffix
-    }
+      const stableSections = buildDynamicSections({
+        sessionId:      this.sessionId,
+        sessionStartMs: this.sessionStartMs,
+        mode,
+        domain:         this.config.domain,
+        rtx:            this.config.runtimeContext,
+        language:       this.config.language,
+        mcpServers:     this.config.mcpServers,
+        outputStyle:    this.config.outputStyle,
+        taskContract:   this._taskContract,
+        projectDir:     this.config.projectDir,
+        // NOTE: currentQuery / client / subAgentBridge are intentionally omitted —
+        // those drove D1b and D11 which are now in the volatile user prefix.
+      })
 
-    // Auto mode (Learn · recall): append accumulated experience lessons so the
-    // main agent avoids repeating known pitfalls. Read fresh each submit (local
-    // JSON, cheap); the block only changes when a new experience is written, so
-    // the prompt stays byte-stable across turns in the common case (KV-cache
-    // friendly). Best-effort — a recall failure never blocks the turn.
-    if (this.config.getExperienceRecallBlock) {
-      try {
-        const recall = await this.config.getExperienceRecallBlock()
-        if (recall) fullStablePrompt += '\n\n' + recall
-      } catch { /* best-effort recall — never disrupt prompt assembly */ }
+      const stablePrompt = await this.sectionRegistry.resolveToString(stableSections)
+
+      // Assemble the full stable system prompt string
+      if (!this._usingDefaultPrompt) {
+        fullStablePrompt = this.config.systemPrompt ?? ''
+        if (this._appendSuffix)  fullStablePrompt += '\n\n' + this._appendSuffix
+        if (stablePrompt)        fullStablePrompt += '\n\n' + stablePrompt
+      } else {
+        // Build mode-specific static prompt lazily and cache per mode.
+        // MetaAgentSession is only used for 'agentic' and 'robotics' modes;
+        // 'campaign' would be a safety fallback (CampaignSession handles that path).
+        // StaticPromptMode is now an alias of the canonical mode union, so the
+        // mode maps to its static template directly — no per-mode ternary needed.
+        const staticMode: StaticPromptMode = mode
+        let staticPrompt = this._staticPromptCache.get(staticMode)
+        if (!staticPrompt) {
+          staticPrompt = buildStaticSystemPrompt(staticMode)
+          this._staticPromptCache.set(staticMode, staticPrompt)
+        }
+        fullStablePrompt = staticPrompt + SYSTEM_PROMPT_DYNAMIC_BOUNDARY + stablePrompt
+        if (this._appendSuffix)  fullStablePrompt += '\n\n' + this._appendSuffix
+      }
+
+      // Auto mode (Learn · recall): append accumulated experience lessons so the
+      // main agent avoids repeating known pitfalls. Read fresh each submit (local
+      // JSON, cheap); the block only changes when a new experience is written, so
+      // the prompt stays byte-stable across turns in the common case (KV-cache
+      // friendly). Best-effort — a recall failure never blocks the turn.
+      if (this.config.getExperienceRecallBlock) {
+        try {
+          const recall = await this.config.getExperienceRecallBlock()
+          if (recall) fullStablePrompt += '\n\n' + recall
+        } catch { /* best-effort recall — never disrupt prompt assembly */ }
+      }
     }
 
     // Only call setAppendSystemPrompt when the content actually changed.
@@ -350,28 +358,36 @@ export class MetaAgentSession {
     // resolved here and prepended to the user message as XML-tagged context.
     // This keeps messages[0] stable while still giving the model fresh
     // per-turn state on every submission.
-    const volatileSections = buildVolatileContextSections({
-      currentQuery:   prompt,
-      // Any Anthropic-format provider (native Anthropic, GLM/Zhipu, Qwen) can
-      // use the flash model for memory recall; OpenAI-protocol providers
-      // (DeepSeek) fall back to keyword matching since this client can't reach them.
-      client:         this.config.protocol === 'anthropic' ? this.client : undefined,
-      // Thread the resolved flash model so D1b's relevance side-call targets a
-      // model that actually exists on this provider (and so the P0-1 prefetch
-      // compatibility check matches — see prefetchRelevantMemories).
-      flashModel:     this.config.flashModel,
-      mode,
-      domain:         this.config.domain,
-      subAgentBridge: this._subAgentBridge,
-      rtx:            this.config.runtimeContext,
-      sessionStartMs: this.sessionStartMs,
-    })
+    // externalPromptAssembly: the caller already injected its own <context>
+    // (loop_capsule) into `prompt`, so skip the default volatile sections
+    // (memory recall / sub-agent notifications) entirely.
+    let effectivePrompt: string
+    if (this.config.externalPromptAssembly) {
+      effectivePrompt = prompt
+    } else {
+      const volatileSections = buildVolatileContextSections({
+        currentQuery:   prompt,
+        // Any Anthropic-format provider (native Anthropic, GLM/Zhipu, Qwen) can
+        // use the flash model for memory recall; OpenAI-protocol providers
+        // (DeepSeek) fall back to keyword matching since this client can't reach them.
+        client:         this.config.protocol === 'anthropic' ? this.client : undefined,
+        // Thread the resolved flash model so D1b's relevance side-call targets a
+        // model that actually exists on this provider (and so the P0-1 prefetch
+        // compatibility check matches — see prefetchRelevantMemories).
+        flashModel:     this.config.flashModel,
+        mode,
+        domain:         this.config.domain,
+        subAgentBridge: this._subAgentBridge,
+        rtx:            this.config.runtimeContext,
+        sessionStartMs: this.sessionStartMs,
+      })
 
-    const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
-    const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
-    const effectivePrompt  = volatilePrefix
-      ? `${volatilePrefix}\n\n---\n\n${prompt}`
-      : prompt
+      const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
+      const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
+      effectivePrompt = volatilePrefix
+        ? `${volatilePrefix}\n\n---\n\n${prompt}`
+        : prompt
+    }
 
     // ── Step 3: Delegate to AgenticSession ────────────────────────────────
     for await (const ev of this._inner.submit(effectivePrompt)) {
