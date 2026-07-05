@@ -22,11 +22,12 @@ describe('validateCharter', () => {
     expect(errs.some(e => e.includes('undeclared identifier') && e.includes('new_findingz'))).toBe(true)
   })
 
-  it('rejects a loop that cannot stop', () => {
+  it('rejects a loop with no guaranteed terminator (no stop tripwire and no lifetime budget)', () => {
     const errs = validateCharter(walkResearchCharter({
       tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }],
+      budgets: { perRound: { usd: 6 } },  // no lifetime cap
     }))
-    expect(errs.some(e => e.includes('cannot stop') || e.includes('no tripwire can stop'))).toBe(true)
+    expect(errs.some(e => e.includes('guaranteed terminator'))).toBe(true)
   })
 
   it('rejects non-isolated judge/pivoter (D6 is structural)', () => {

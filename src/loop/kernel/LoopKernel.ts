@@ -475,10 +475,14 @@ async function completeRound(
     : progress.bestMetric
 
   // ── 9. ROUTE (post-METER tripwire read) ───────────────────────────────────
+  // Built-in acceptance (symmetric with the built-in lifetime budget): if the
+  // judge reports the goal satisfied, the KERNEL ends the loop — no charter
+  // tripwire required. The judgment is the judge's; the decision is the kernel's.
+  const accepted = input.judge?.data['goal_satisfied'] === true
   const postCtx = buildCtx(meters, observables, input.budgetExhausted)
-  const postAction = firstTripwire(charter, postCtx)
-  const route = describeAction(postAction)
-  const status = statusFor(postAction, meters)
+  const postAction = accepted ? null : firstTripwire(charter, postCtx)
+  const route = accepted ? 'finalize:goal_satisfied' : describeAction(postAction)
+  const status = accepted ? 'completed' : statusFor(postAction, meters)
 
   await ledger.appendRound({
     round: input.round, mode: input.mode, observables, meters, route,
@@ -495,6 +499,16 @@ async function completeRound(
     totalCostUsd: progress.totalCostUsd + input.costUsd,
     updatedAt: Date.now(),
   })
+
+  if (accepted) {
+    return terminate(instance, deps, {
+      round: input.round, mode: input.mode,
+      reason: 'goal_satisfied', escalated: false,
+      startedAt: input.startedAt, costUsd: input.costUsd,
+      seatSummaries: input.seatSummaries, correctiveRetries: input.correctiveRetries,
+      observables, meters, alreadyAccounted: true,
+    })
+  }
 
   if (postAction?.escalate || postAction?.stop) {
     return terminate(instance, deps, {

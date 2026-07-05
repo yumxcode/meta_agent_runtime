@@ -56,9 +56,14 @@ Charter 结构（全部字段；? 为可选）：
   · "isolated"：每轮**全新会话、无历史**，只凭本轮 <context> 独立判断——用于"需要跳出既有框架、推翻假设、换新证据源、避免自我叙事绑架"的 worker。
   · 若需求同时要"迭代推进"与"周期性推翻重来"，可用两类思路：迭代 worker 用 lineage_loop，靠 tripwire 的 mode:"pivot" 触发 pivoter（isolated）给出结构性转向。judge/pivoter 永远 "isolated"（D6）。
 
+终止机制（两个内核内置，别当成 charter 特化去写）：
+- **内置验收**：judge 每轮在 data 里输出 goal_satisfied（bool），对照 charter.goal 判"目标是否达成"；一旦 true，**内核自动 finalize 结束整个 loop**——你**不需要**为此写任何 tripwire。你要做的：把 goal 写清楚、在 judge 的 rubric 里说清"什么算达成/成功标准"。对没有硬指标的任务，这就是"判不判得完"的判断出口。
+- **内置预算**：budgets.lifetime（rounds/usd/deadline）是硬兜底，一定结束。**每份 charter 都要设**——它是唯一保证不会无限跑的地板。
+- 因此"能停"的保证 = 一条 stop/finalize tripwire **或** 一个 lifetime 预算（二者至少其一，校验强制）。stale/pivot/attention 这些 tripwire 是**额外**的进展路由，不是唯一出口。对判不了的模糊目标，用 attention 定期升级给人，而不是硬造指标。
+
 硬性规则：
 - 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。
-- 至少一条 tripwire 能停止 loop（stop:true 或 mode:"finalize"）。声明顺序即优先级（最严重的在前）。
+- 保证可终止：至少有一条 stop/finalize tripwire 或一个 lifetime 预算（见"终止机制"）。tripwire 声明顺序即优先级（最严重的在前）。
 - judge/pivoter 的 context 必须是 "isolated"；确定性规则（计数、阈值、路由、盯外部任务、换号）必须落在 meters/tripwires/waits，**不得写进座位 prompt**。
 - 长时外部任务（训练/远程评测）必须建模为 waits，探测节奏和终止/换号规则写成 rules；不要指望座位记得去检查。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。

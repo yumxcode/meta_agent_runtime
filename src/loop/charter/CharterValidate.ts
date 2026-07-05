@@ -41,11 +41,19 @@ export function validateCharter(charter: Charter): string[] {
   if (tripwires.length === 0) errs.push('at least one tripwire is required (a loop must be able to stop)')
   for (const [i, tw] of tripwires.entries()) errs.push(...validateTripwire(tw, i, declared))
 
-  // Graceful-exit guarantee: SOME tripwire must be able to stop the loop.
-  if (!tripwires.some(tw => tw.then?.stop === true || tw.then?.mode === 'finalize')) {
+  // Guaranteed-termination guarantee. Loops end three ways: (a) built-in
+  // acceptance (judge sets goal_satisfied → kernel finalizes); (b) built-in
+  // lifetime budget (rounds/usd/deadline → kernel finalizes); (c) a charter
+  // stop/finalize tripwire. (a) is not guaranteed to fire, so we require at
+  // least one GUARANTEED terminator: a stopping tripwire OR a lifetime budget.
+  const hasStopTripwire = tripwires.some(tw => tw.then?.stop === true || tw.then?.mode === 'finalize')
+  const lifeCap = charter.budgets?.lifetime
+  const hasBudgetCap = !!(lifeCap && (lifeCap.rounds !== undefined || lifeCap.usd !== undefined || lifeCap.deadlineMs !== undefined))
+  if (!hasStopTripwire && !hasBudgetCap) {
     errs.push(
-      'no tripwire can stop the loop (need at least one with stop:true or mode:finalize) — ' +
-      'a loop that can only exit via budget exhaustion is rejected by design',
+      'loop has no guaranteed terminator — declare a stopping tripwire (stop:true or mode:finalize) ' +
+      'OR a lifetime budget (budgets.lifetime.rounds/usd/deadlineMs). Built-in acceptance ' +
+      '(judge goal_satisfied) ends the loop early, but is not guaranteed to fire.',
     )
   }
 

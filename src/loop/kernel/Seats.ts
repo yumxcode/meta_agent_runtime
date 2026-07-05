@@ -109,8 +109,9 @@ export async function runWorkerSeat(
 const JUDGE_CONTRACT = `\
 你是隔离评审座位：你看不到执行座位的任何推理过程，只能依据下方内嵌证据作出裁决。
 必须调用 return_result，data 写：
-{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"messages":["若fail给出具体纠偏项"]}
-每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。`
+{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["若fail给出具体纠偏项"]}
+每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
+【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。`
 
 export async function runJudgeSeat(
   deps: SeatRunnerDeps,
@@ -121,7 +122,12 @@ export async function runJudgeSeat(
   const seat = charter.seats.judge
   if (!seat) throw new Error('charter has no judge seat')
   const evidence = await inlineEvidence(paths, seat.inputs ?? evidencePaths)
-  const task = [seat.prompt, JUDGE_CONTRACT, '【证据（内嵌，只此为界）】', evidence].join('\n\n')
+  // The goal is injected by the kernel (not charter-specific) so the built-in
+  // acceptance mechanism works for every loop with a judge.
+  const task = [
+    `【验收目标】${charter.goal}`,
+    seat.prompt, JUDGE_CONTRACT, '【证据（内嵌，只此为界）】', evidence,
+  ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
   return runSeat(deps, seat, task, [])
 }

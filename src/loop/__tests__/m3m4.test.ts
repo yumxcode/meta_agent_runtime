@@ -64,7 +64,10 @@ const passingSeats = (paths: ReturnType<typeof instancePaths>) =>
 describe('distillCharter', () => {
   it('feeds validation errors back and succeeds on the corrected attempt', async () => {
     const good = walkResearchCharter()
-    const bad = walkResearchCharter({ tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }] })
+    const bad = walkResearchCharter({
+      tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }],
+      budgets: { perRound: { usd: 6 } },  // no lifetime cap → no guaranteed terminator
+    })
     const tasks: string[] = []
     let call = 0
     const dispatcher = scriptedDispatcher(async task => {
