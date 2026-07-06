@@ -13,7 +13,7 @@
  *   meta-agent --mode campaign "run a DOE sweep"
  *
  * Options:
- *   -m, --mode <mode>       Session mode: detect|auto|simple_auto|agentic|campaign|robotics (default: detect)
+ *   -m, --mode <mode>       Session mode: auto|simple_auto|agentic|campaign|robotics (default: agentic)
  *   -k, --api-key <key>     API key (or ANTHROPIC_API_KEY / DEEPSEEK_API_KEY env var)
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
@@ -78,9 +78,9 @@ import { detectSensitiveShellCommand } from '../kernel/permissions/SensitiveComm
 import { executePlan } from './teamPlannerExecutor.js'
 import { resolveTemplate } from './hardwareTemplate.js'
 import type { ProfileTemplate, ProfilePreset } from './hardwareTemplate.js'
-import type { SessionModeHint } from '../routing/types.js'
 import type { MetaAgentConfig, BeforeToolCallResult } from '../core/config.js'
 import type { RouterOptions } from '../routing/types.js'
+import type { SessionMode } from '../core/modes.js'
 import type { MetaAgentEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
@@ -202,7 +202,6 @@ ${bold('USAGE')}
   meta-agent env [--json]        Print env-var config (name, current value, default)
 
 ${bold('MODES')}
-  ${cyan('detect')}     Detect mode from prompt context (default)
   ${cyan('agentic')}    Full tool-use loop (default for all Q&A and engineering tasks)
   ${cyan('auto')}       Autonomous: in-workspace writes/deletes auto-approved (no prompts),
              all file changes hard-confined to the working directory
@@ -212,7 +211,7 @@ ${bold('MODES')}
   ${cyan('robotics')}   Robotics session — ExperienceStore + workflow + hardware profiles
 
 ${bold('OPTIONS')}
-  -m, --mode <mode>       Session mode: detect|agentic|auto|simple_auto|campaign|robotics
+  -m, --mode <mode>       Session mode: agentic|auto|simple_auto|campaign|robotics
       --yolo              Alias for --mode auto (autonomous + workspace jail)
   -w, --workspace <dir>   Working directory — agent ONLY operates within this folder
   -k, --api-key <key>     API key (or set DEEPSEEK_API_KEY / ANTHROPIC_API_KEY env var)
@@ -348,7 +347,8 @@ ${bold('EXAMPLES')}
 // ── Argument parsing ──────────────────────────────────────────────────────────
 
 interface CliOptions {
-  mode: SessionModeHint
+  mode: SessionMode
+  modeExplicit: boolean
   workspace: string | undefined   // resolved absolute path, set after confirmation
   hardwareId: string | undefined  // selected hardware profile name, robotics mode only
   apiKey: string | undefined
@@ -389,7 +389,7 @@ function parseCliArgs(): CliOptions {
     parsed = parseArgs({
       args: process.argv.slice(2),
       options: {
-        mode:         { type: 'string',  short: 'm', default: 'detect' },
+        mode:         { type: 'string',  short: 'm' },
         yolo:         { type: 'boolean', default: false },
         workspace:    { type: 'string',  short: 'w' },
         'api-key':    { type: 'string',  short: 'k' },
@@ -427,12 +427,13 @@ function parseCliArgs(): CliOptions {
   }
 
   // --yolo is an alias for --mode auto (autonomous + hard workspace jail).
-  const rawMode = (parsed.values['yolo'] ? 'auto' : (parsed.values['mode'] as string)).toLowerCase()
-  // 'detect' (the default) = let ModeDetector choose. 'auto' is a REAL mode now
-  // (autonomous execution + hard workspace jail), not the auto-detect sentinel.
+  const modeExplicit = parsed.values['yolo'] === true || parsed.values['mode'] !== undefined
+  const rawMode = (parsed.values['yolo'] ? 'auto' : ((parsed.values['mode'] as string | undefined) ?? 'agentic')).toLowerCase()
+  // Mode selection is explicit. Omitting --mode uses agentic; specialist modes
+  // must be entered intentionally.
   // 'auto_orch' (v1 graph engine) is fully retired (spec D16): long-horizon loops
   // run on the loop v2 runtime (`meta-agent loop …`).
-  const validModes = ['detect', 'auto', 'simple_auto', 'agentic', 'campaign', 'robotics']
+  const validModes = ['auto', 'simple_auto', 'agentic', 'campaign', 'robotics']
   if (!validModes.includes(rawMode)) {
     console.error(red(`Error: unknown mode "${rawMode}". Valid: ${validModes.join(', ')}`))
     process.exit(1)
@@ -477,7 +478,8 @@ function parseCliArgs(): CliOptions {
   }
 
   return {
-    mode:       rawMode as SessionModeHint,
+    mode:       rawMode as SessionMode,
+    modeExplicit,
     workspace,
     hardwareId: undefined,   // set later via interactive selection
     apiKey:     parsed.values['api-key']  as string | undefined,
@@ -536,7 +538,8 @@ function buildLoopCliOptions(
     }
   }
   return {
-    mode: 'auto' as SessionModeHint,   // loop seats run unattended on the auto base
+    mode: 'auto',   // loop seats run unattended on the auto base
+    modeExplicit: true,
     workspace,
     hardwareId: undefined,
     apiKey:  g.values['api-key']  as string | undefined,
@@ -1102,9 +1105,7 @@ function makeRouter(
   if (opts.baseUrl)    cfg.baseURL      = opts.baseUrl
   if (opts.model)      cfg.model        = opts.model
   if (opts.fallbackModel) cfg.fallbackModel = opts.fallbackModel
-  // 'detect' is the router's own default (run ModeDetector); only forward an
-  // explicit mode. 'auto' IS an explicit mode and must be forwarded.
-  if (opts.mode !== 'detect') cfg.mode  = opts.mode
+  cfg.mode = opts.mode
 
   // Apply maxTurns: explicit flag wins; otherwise cap each user turn so a
   // single prompt cannot run for hours without a checkpoint. Auto-series modes
@@ -1958,7 +1959,7 @@ async function streamPrompt(
           }
           const usage = event.usage
           const cost  = router.getEstimatedCost()
-          const mode  = router.mode ?? 'detect'
+          const mode  = router.mode ?? 'agentic'
           const modeTag = mode === 'campaign' ? cyan(mode)
                         : mode === 'agentic'  ? green(mode)
                         : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
@@ -2108,7 +2109,7 @@ async function persistSessionSnapshot({
     const firstUserMsg = findSessionPreviewMessage(messages)
     const firstPromptText = firstPromptFromMessage(firstUserMsg, currentInput)
     const meta = {
-      mode:          router.mode ?? (opts.mode === 'auto' ? 'agentic' : opts.mode),
+      mode:          router.mode ?? opts.mode,
       startTime:     Date.now(),
       lastActivity:  Date.now(),
       messageCount:  messages.length,
@@ -3501,8 +3502,12 @@ async function runRepl(opts: CliOptions): Promise<void> {
           // jail, auto-approval, and tool-set posture differ from what the saved
           // turns assumed. Use isAutonomousMode on BOTH sides so the rule covers
           // every autonomous flavour, not just 'auto'.
-          if (meta && isAutonomousMode(opts.mode) && meta.mode && !isAutonomousMode(meta.mode)) {
+          if (
+            meta?.mode &&
+            (!opts.modeExplicit || (isAutonomousMode(opts.mode) && !isAutonomousMode(meta.mode)))
+          ) {
             opts.mode = meta.mode as CliOptions['mode']
+            opts.modeExplicit = true
           }
         }
         if (resumedMessages.length > 0) {
@@ -3520,11 +3525,15 @@ async function runRepl(opts: CliOptions): Promise<void> {
           resumedMessages = resumed.messages
           resumedSessionId = resumed.sessionId
           // Restore the mode from the saved session so the router starts in the
-          // correct mode instead of re-detecting it from the first user message.
+          // correct mode instead of starting the resumed history in default agentic.
           // Same rule as above: never run an autonomous mode (auto / simple_auto /
           // auto_orch) over a non-autonomous history.
-          if (isAutonomousMode(opts.mode) && resumed.mode && !isAutonomousMode(resumed.mode)) {
+          if (
+            resumed.mode &&
+            (!opts.modeExplicit || (isAutonomousMode(opts.mode) && !isAutonomousMode(resumed.mode)))
+          ) {
             opts.mode = resumed.mode as CliOptions['mode']
+            opts.modeExplicit = true
           }
         }
       }
@@ -3544,7 +3553,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
       // policy reads — otherwise plan mode never gates writes.
       system: {
         cwd: opts.workspace,
-        mode: opts.mode === 'detect' ? 'agentic' : opts.mode,
+        mode: opts.mode,
         planModeRef: router.planModeRef,
       },
       // Main-session web_fetch is result-budgeted: full-text reading belongs in
@@ -3552,8 +3561,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
       // main context. Sub-agents get an unbudgeted override via the bridge.
       network: { webFetch: { maxResultSizeChars: 8_000 } },
       // Mode-specific tool selection (auto mode excludes ask_user/send_message).
-      // Only pass the mode when it's a concrete SessionMode (not 'detect').
-      mode: opts.mode === 'detect' ? undefined : opts.mode as import('../core/modes.js').SessionMode,
+      mode: opts.mode,
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -4642,33 +4650,6 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // ── Normal prompt ──
     interrupted = false
 
-    // ── Auto-mode hardware check (BEFORE streaming) ───────────────────────────
-    // Run mode detection ahead of the first LLM call so we can prompt for a
-    // hardware profile before the AI responds — ensuring the first turn already
-    // has hardware context in the system prompt.
-    // primeMode() is a no-op after the first submit(), so this only fires once.
-    if (opts.mode === 'auto' && !opts.hardwareId && !hardwareBindingPrompted && !opts.json && isTTY) {
-      const primed = await router.primeMode(input)
-      if (primed === 'robotics') {
-        hardwareBindingPrompted = true
-        console.log(
-          `\n${c.magenta}robotics${c.reset} 模式已激活。` +
-          `在继续之前，请绑定一个硬件配置。\n`,
-        )
-        const hp = new HardwareProfile()
-        const selected = await runWizard(() => selectHardwareProfile(hp, opts.workspace, rl))
-        opts.hardwareId     = selected.name || undefined
-        hardwareProfileText = selected.profileText
-        // Lock mode so the new router skips re-detection (no second flash model call)
-        opts.mode = 'robotics'
-        await router.dispose().catch(() => undefined)
-        router = makeRouter(opts, hardwareProfileText || undefined, rl, undefined, getCurrentRouter, _promptLineInline)
-        if (opts.hardwareId) {
-          console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定。\n`))
-        }
-      }
-    }
-
     // Snapshot pending counts before this turn so we can detect new additions
     const pendingCountBefore = router.getPendingExperiences()?.count ?? 0
     const anchorCountBefore = router.getPendingPhysicalAnchors()?.count ?? 0
@@ -4721,8 +4702,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
     }
 
     // ── Post-turn: hardware binding catch-up ─────────────────────────────────
-    // If primeMode() didn't detect robotics but the AI response upgraded the
-    // mode internally, prompt for hardware here so subsequent turns get context.
+    // If a robotics router exists without hardware binding, prompt so subsequent
+    // turns get hardware context.
     if (
       !interrupted && !opts.json && isTTY &&
       router.mode === 'robotics' && !opts.hardwareId && !hardwareBindingPrompted
@@ -4788,17 +4769,18 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
       if (resumedMessages.length > 0) {
         resumedSessionId = targetId
         savedMessageCount = resumedMessages.length
-        // Restore the saved mode when (a) the caller let mode auto-detect, or
-        // (b) the caller asked for an autonomous mode (auto / simple_auto /
+        // Restore the saved mode when (a) the caller did not explicitly pass
+        // --mode, or (b) the caller asked for an autonomous mode (auto / simple_auto /
         // auto_orch) but the saved history is non-autonomous — running a jailed,
         // auto-approving loop over agentic/campaign/robotics history is exactly
         // what this guard prevents. isAutonomousMode covers every flavour.
         if (
           meta?.mode &&
           !isAutonomousMode(meta.mode) &&
-          (opts.mode === 'detect' || isAutonomousMode(opts.mode))
+          (!opts.modeExplicit || isAutonomousMode(opts.mode))
         ) {
           opts.mode = meta.mode as CliOptions['mode']
+          opts.modeExplicit = true
         }
       } else if (!opts.json) {
         process.stderr.write(`${yellow(`Warning: session ${targetId} was not found; starting a new one-shot session.`)}\n`)
@@ -4829,7 +4811,7 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
       network: { webFetch: { maxResultSizeChars: 8_000 } },
       // Apply the same auto capability boundary in non-interactive/single-turn
       // runs as in the REPL.
-      mode: opts.mode === 'detect' ? undefined : opts.mode as import('../core/modes.js').SessionMode,
+      mode: opts.mode,
     })
     for (const tool of tools) {
       router.registerTool(tool)
@@ -4888,7 +4870,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
 
   assertApiKeyConfigured(opts)
   const router = makeRouter(
-    { ...opts, mode: 'auto', workspace: projectDir, prompt: null, loopCommand: null },
+    { ...opts, mode: 'auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
   )
   // Register the standard tool set into the backend so spawned seats / the
@@ -4958,7 +4940,7 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
 
   assertApiKeyConfigured(opts)
   const router = makeRouter(
-    { ...opts, mode: 'simple_auto', workspace: projectDir, prompt: null, loopCommand: null },
+    { ...opts, mode: 'simple_auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
   )
   const tools = await createStandardTools({

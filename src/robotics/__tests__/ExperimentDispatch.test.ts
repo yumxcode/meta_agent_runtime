@@ -55,6 +55,23 @@ function stubBridge(): { bridge: ISubAgentDispatcher; spawnSubAgent: ReturnType<
   }
 }
 
+function stubCompletedBridge(): { bridge: ISubAgentDispatcher; spawnSubAgent: ReturnType<typeof vi.fn> } {
+  const spawnSubAgent = vi.fn(async (opts: SpawnSubAgentOptions) => makeRecord(opts))
+  const getStatus = vi.fn(async (taskId: string) => ({
+    ...makeRecord({ taskId } as unknown as SpawnSubAgentOptions),
+    status: 'completed',
+    result: { success: true, summary: 'completed summary' },
+  }))
+  return {
+    spawnSubAgent,
+    bridge: {
+      spawnSubAgent,
+      getStatus,
+      cancelTask: vi.fn(),
+    } as unknown as ISubAgentDispatcher,
+  }
+}
+
 describe('experiment_dispatch', () => {
   it('binds the ExperimentAgent projectDir to the git worktree it created', async () => {
     const worktreePath = '/tmp/meta-agent-robotics/subtask-abc12345'
@@ -111,5 +128,32 @@ describe('experiment_dispatch', () => {
     expect(opts.config.projectDir).toBeUndefined()
     expect(opts.config.workspaceMode).toBeUndefined()
     expect(opts.config.isolateWorktree).toBeUndefined()
+  })
+
+  it('await_completion keeps branch-backed completed experiments active until merge/discard', async () => {
+    const worktreePath = '/tmp/meta-agent-robotics/subtask-complete'
+    const { bridge } = stubCompletedBridge()
+    const gitMgr = {
+      enabled: true,
+      createWorktreeForTask: vi.fn(async () => ({
+        taskId: 'subtask-complete',
+        role: 'experiment',
+        branchName: 'robotics/experiment/subtask-complete',
+        worktreePath,
+        forkPoint: 'abc123',
+        createdAt: Date.now(),
+      })),
+    } as unknown as GitWorkspaceManager
+    vi.spyOn(RoboticsProjectStore, 'updateGitState').mockResolvedValue(undefined)
+    vi.spyOn(RoboticsProjectStore, 'registerSubAgentTask').mockResolvedValue(undefined)
+    const completeSubAgentTask = vi.spyOn(RoboticsProjectStore, 'completeSubAgentTask').mockResolvedValue(undefined)
+
+    const tool = createExperimentDispatchTool(bridge, gitMgr, PROJECT_DIR, SESSION_ID)
+    const result = await tool.call({ ...input(), await_completion: true }, toolCtx())
+
+    expect(result.isError).toBe(false)
+    expect(result.content).toContain('git_diff_subagent')
+    expect(result.content).toContain('remains active')
+    expect(completeSubAgentTask).not.toHaveBeenCalled()
   })
 })

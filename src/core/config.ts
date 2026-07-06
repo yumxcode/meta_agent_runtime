@@ -123,8 +123,8 @@ export interface MetaAgentConfig {
   fallbackModel?: string
 
   /**
-   * Fast auxiliary (flash) model for side-calls: mode detection, memory
-   * relevance, experience summarisation, and other small enrichments. When
+   * Fast auxiliary (flash) model for side-calls: memory relevance, experience
+   * summarisation, and other small enrichments. When
    * omitted the provider's default flash model is used. Overridable via the
    * global config file (~/.meta-agent/config.json → flashModel).
    */
@@ -492,7 +492,7 @@ export type ResolvedConfig = Required<
   fallbackThinkingConfig?: ThinkingConfig
   fallbackBetas?: string[]
   fallbackIncludeDefaultBetas?: boolean
-  /** Fast auxiliary model for side-calls (mode detection, memory, small enrichments, etc.) */
+  /** Fast auxiliary model for side-calls (memory, small enrichments, etc.) */
   flashModel: string
   /** Model used specifically for compact summarisation. */
   compactModel: string

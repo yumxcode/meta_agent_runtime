@@ -410,7 +410,7 @@ src/
 ├── kernel/       # 流式模型调用、工具循环、compact、权限、成本统计
 ├── core/         # 高层 Session、配置、系统提示、记忆、任务契约、auto checkpoint/verify/drift
 ├── modes/        # agentic / campaign 后端适配与消息桥接
-├── routing/      # 模式检测 ModeDetector 与 SessionRouter
+├── routing/      # 显式模式选择与 SessionRouter
 ├── providers/    # 多提供商注册表(协议/计费/能力/探测)
 ├── tools/        # 内置工具(fs/shell/network/mcp/ui/system/agent/provenance/research)
 ├── subagent/     # 子代理调度、桥接、事件总线、委派工具
@@ -437,7 +437,7 @@ src/
 
 常用 API(完整列表见 `src/index.ts`):
 
-- 会话:`SessionRouter`、`MetaAgentSession`、`CampaignSession`、`RoboticsSession`、`ModeDetector`
+- 会话:`SessionRouter`、`MetaAgentSession`、`CampaignSession`、`RoboticsSession`
 - 工具:`createStandardTools`、`createFsTools`/`createShellTools`/`createNetworkTools`/`createMcpTools`/`createUiTools`/`createSystemTools`、`createRunAgentTool`/`createAgentTools`、`createRoboticsTools`、`EngineeringToolRegistry`
 - 运行时与验证:`createRuntimeContext`、`instrumentTool`、`VVHookChain`、`createDefaultVVChain`、`ProvenanceTracker`、`UnitRegistry`
 - Campaign:`campaignRegistry`、`CampaignStateStore`、`CampaignMonitor`、`WorkerCoordinator`、`ParetoAnalyzer`、`DOESampler`、`FidelityLadder`

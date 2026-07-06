@@ -1,17 +1,18 @@
 /**
- * SessionRouter — unified session entry point with automatic mode routing.
+ * SessionRouter — unified session entry point with explicit mode selection.
  *
  * Replaces direct use of MetaAgentSession / CampaignSession. Consumers create a
  * SessionRouter, optionally register tools, and call submit() — the router
- * selects the right execution path transparently.
+ * initialises the explicitly selected execution path lazily.
  *
- * Mode selection (in priority order):
- *   1. Caller explicitly sets mode: 'agentic' | 'campaign' | 'robotics'
- *   2. ModeDetector inspects the first prompt + environment (lazy, on submit)
- *   3. registerTool() auto-upgrades to minimum AGENTIC
+ * Mode selection:
+ *   1. Caller explicitly sets mode: 'agentic' | 'auto' | 'simple_auto' |
+ *      'campaign' | 'robotics'
+ *   2. Omitted mode defaults to 'agentic'
+ *   3. registerTool() keeps the session at minimum AGENTIC
  *
  * Mode selection is intentionally single-shot:
- *   - Mode is detected once on the FIRST submit() call.
+ *   - Mode is fixed once on the FIRST submit() call.
  *   - registerTool() before the first submit() can raise mode to minimum AGENTIC.
  *   - After the backend is initialised, mode is FIXED for the session lifetime.
  *   - There is no mid-session mode upgrade (agentic → campaign mid-conversation).
@@ -45,7 +46,6 @@ import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
 import { prefetchRelevantMemories, getMemoryRecallTimeoutMs } from '../core/memory/findRelevantMemories.js'
 import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
-import { ModeDetector } from './ModeDetector.js'
 import { readAutoCheckpoint, writeAutoCheckpoint, buildAutoResumePreamble, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
@@ -57,8 +57,7 @@ import { clearWebFetchCache } from '../tools/network/web_fetch/index.js'
 import { clearAnthropicClientCache } from '../kernel/api/AnthropicClient.js'
 import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
-import type { RouterOptions, SessionMode, SessionModeHint } from './types.js'
-import { MODE_WEIGHT } from './types.js'
+import type { RouterOptions, SessionMode } from './types.js'
 import { MODE_PROFILES, isAutonomousMode } from '../core/modes.js'
 export { isAutonomousMode } from '../core/modes.js'
 
@@ -107,7 +106,7 @@ export function isAutoContinuationPrompt(prompt: string): boolean {
 
 export class SessionRouter {
   private readonly _cfg: ResolvedConfig
-  private readonly _hint: SessionModeHint
+  private readonly _hint: SessionMode
   private readonly _debug: boolean
   /** P0-1: lazy side-call client used only by the memory-recall prefetch. */
   private readonly _recallClient: Anthropic | null = null
@@ -119,12 +118,12 @@ export class SessionRouter {
   /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
   private readonly _onEscalationRequest: ((reason: string) => Promise<boolean>) | undefined
   /**
-   * Lightweight Anthropic client used exclusively for one-shot mode detection.
+   * Lightweight Anthropic client used for side-calls.
    * Separate from the backend session client: 30 s timeout, 1 retry, always
    * uses the configured apiKey/baseURL. Null if no apiKey is available (or the
    * provider isn't Anthropic-protocol — see the construction site below).
    */
-  private readonly _detectionClient: Anthropic | null
+  private readonly _sideCallClient: Anthropic | null
 
   /**
    * Shared plan-mode flag. ONE object drives both (a) the enter_plan_mode /
@@ -155,8 +154,8 @@ export class SessionRouter {
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
     const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
-    // Default hint is 'detect' (run ModeDetector). 'auto' is now a real mode.
-    this._hint = mode ?? 'detect'
+    // Mode selection is explicit. Omitting mode means the normal agentic backend.
+    this._hint = mode ?? 'agentic'
     this._debug = debugMode ?? false
     this._robot = robot
     this._explicitResume = explicitResume ?? false
@@ -171,15 +170,13 @@ export class SessionRouter {
     // them up when it's created. registerTool() handles any added later.
     this._pendingTools = [...(config.tools ?? [])]
 
-    // Detection client: only create when (a) an API key is available AND (b)
+    // Side-call client: only create when (a) an API key is available AND (b)
     // the provider is Anthropic.  Third-party providers (DeepSeek, Qwen, custom
     // proxies) do not expose claude-haiku-4-5-20251001 (the Anthropic flash model),
     // so sending the flash model side-call there would fail with a 404/400.
-    // The detector falls back to regex heuristics automatically when this client
-    // is null (Task #22 fix).
     // Flash side-call timeout: 30 s, 1 retry. Slow providers such as GLM may
     // take 15-30 s to complete, but still fall back safely on timeout.
-    this._detectionClient = (this._cfg.apiKey && isAnthropicProvider(this._cfg.baseURL))
+    this._sideCallClient = (this._cfg.apiKey && isAnthropicProvider(this._cfg.baseURL))
       ? new Anthropic({
           apiKey:     this._cfg.apiKey,
           baseURL:    this._cfg.baseURL,
@@ -192,7 +189,7 @@ export class SessionRouter {
     // condition under which MetaAgentSession's D1b section gets a client
     // (protocol === 'anthropic'), so the prefetch compatibility check matches.
     // SDK timeout tracks the recall timeout (env-tunable for slow providers)
-    // instead of the detection client's hard 3 s.
+    // instead of the side-call client's fixed 30 s.
     this._recallClient = (this._cfg.apiKey && this._cfg.protocol === 'anthropic')
       ? new Anthropic({
           apiKey:     this._cfg.apiKey,
@@ -211,7 +208,7 @@ export class SessionRouter {
   }
 
   /**
-   * Return the lightweight Anthropic client used for side-calls (mode detection,
+   * Return the lightweight Anthropic client used for side-calls (memory,
    * experience summaries, etc.).  This client uses the shared flash side-call
    * timeout (30 s) and always
    * targets the configured provider's API — it is intentionally separate from the
@@ -224,7 +221,7 @@ export class SessionRouter {
    * (cheap + low-latency, provider-agnostic) — callers are responsible for choosing the model string.
    */
   getSideCallClient(): Anthropic | null {
-    return this._detectionClient
+    return this._sideCallClient
   }
 
   /**
@@ -252,17 +249,13 @@ export class SessionRouter {
   }
 
   /**
-   * Submit a prompt. On the first call, ModeDetector runs and the appropriate
-   * backend is created. Subsequent calls reuse the same backend.
-   *
-   * If the detected mode is higher than the current mode (e.g. prompt signals
-   * campaign intent but session started in agentic), the backend is rebuilt
-   * before forwarding the message.
+   * Submit a prompt. On the first call, the selected backend is created.
+   * Subsequent calls reuse the same backend.
    */
   async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
-    // P0-1: start the per-query memory recall NOW so it overlaps mode
-    // detection and backend initialisation instead of running serially after
-    // them. Single-flight + consume-once + compatibility-checked inside
+    // P0-1: start the per-query memory recall NOW so it overlaps backend
+    // initialisation instead of running serially after it. Single-flight +
+    // consume-once + compatibility-checked inside
     // findRelevantMemories — when anything mismatches, the prompt build simply
     // recomputes fresh, so correctness never depends on this call.
     prefetchRelevantMemories({
@@ -380,7 +373,7 @@ export class SessionRouter {
   }
 
   /**
-   * Register a tool. Auto-upgrades mode to minimum AGENTIC.
+   * Register a tool. Tool registration keeps the session at minimum AGENTIC.
    *
    * If the backend is already initialised, the tool is forwarded immediately.
    * If not, it is buffered and applied when the backend starts.
@@ -439,25 +432,12 @@ export class SessionRouter {
   }
 
   /**
-   * Run mode detection for `prompt` without initialising the backend.
-   * Returns the resolved SessionMode.
-   *
-   * Idempotent: once mode is fixed after the first submit(), subsequent calls
-   * return immediately.  Intended for CLI callers that need to know mode
-   * BEFORE streaming the first response — e.g. to prompt for a hardware
-   * profile in robotics mode so the first AI turn already has hardware context.
+   * Resolve the explicit/default mode without initialising the backend.
+   * Kept for CLI call sites that want the selected mode before streaming.
    */
-  async primeMode(prompt: string): Promise<SessionMode> {
+  async primeMode(_prompt: string): Promise<SessionMode> {
     if (this._currentMode !== null) return this._currentMode
-    const hasTools = this._pendingTools.length > 0
-    const result = await ModeDetector.detect(
-      prompt,
-      this._hint,
-      hasTools,
-      this._detectionClient ?? undefined,
-      this._cfg.flashModel,
-    )
-    this._raiseMode(result.mode)
+    this._raiseMode(this._hint)
     return this._currentMode!
   }
 
@@ -477,7 +457,7 @@ export class SessionRouter {
       this._memoryWriterDone = true
       try {
         await runPostSessionMemoryWriter({
-          client: this._detectionClient,
+          client: this._sideCallClient,
           mode: this._currentMode ?? 'agentic',
           domain: this._cfg.domain,
           messages: impl.getMessages(),
@@ -598,15 +578,9 @@ export class SessionRouter {
     return this._roboticsImpl()?.getTeamController() ?? null
   }
 
-  /**
-   * Create the backend NOW without submitting a prompt. Only valid for
-   * explicit-mode sessions (hint !== 'detect') — there is no prompt to detect
-   * a mode from. For callers that need a live backend (dispatcher, tools) but
-   * never submit a prompt. Returns false in detect mode.
-   */
+  /** Create the backend NOW without submitting a prompt. */
   async prewarmBackend(): Promise<boolean> {
     if (this._impl) return true
-    if (this._hint === 'detect') return false
     this._raiseMode(this._hint)
     this._impl = await this._createImpl(this._currentMode!)
     for (const tool of this._pendingTools) this._impl.registerTool(tool)
@@ -618,29 +592,19 @@ export class SessionRouter {
 
   /**
    * Lazily initialise the backend on the first submit().
-   * Mode is detected once here and fixed for the session lifetime.
+   * Mode is fixed once here for the session lifetime.
    * Subsequent submit() calls skip this entirely (_impl is already set).
    */
   private async _ensureImpl(prompt: string): Promise<void> {
     if (this._impl) return
 
-    // Detect mode — LLM path when client is available, heuristic fallback otherwise
-    const hasTools = this._pendingTools.length > 0
-    const result = await ModeDetector.detect(
-      prompt,
-      this._hint,
-      hasTools,
-      this._detectionClient ?? undefined,
-      this._cfg.flashModel,
-    )
-
-    // Apply the detected mode (respecting any prior raise from registerTool)
-    this._raiseMode(result.mode)
+    void prompt
+    // Apply the explicit/default mode (respecting any prior raise from registerTool)
+    this._raiseMode(this._hint)
 
     if (this._debug) {
       console.error(
-        `[SessionRouter] mode=${this._currentMode} confidence=${result.confidence} ` +
-        `signals=[${result.signals.map(s => s.label).join('; ')}]`,
+        `[SessionRouter] mode=${this._currentMode} confidence=explicit signals=[router explicit/default mode]`,
       )
     }
 
@@ -654,35 +618,10 @@ export class SessionRouter {
     this._pendingTools = []
   }
 
-  /**
-   * Raise the current mode to at least `newMode`.
-   * Never downgrades. If mode increases after impl creation, a rebuild would
-   * be needed — currently that's not triggered mid-session (registerTool raises
-   * before the first submit; we guard here anyway).
-   */
+  /** Lock the current mode to the explicit/default router mode. */
   private _raiseMode(newMode: SessionMode): void {
-    // Explicit-mode lock: when the caller declared a concrete mode
-    // (hint !== 'detect'), that mode always wins and is never changed by
-    // weight-based raises. This is essential for 'auto', whose weight (1) equals
-    // 'agentic': without the lock, a pre-submit registerTool('agentic') would
-    // pin the session to agentic and the later raise to 'auto' (1 > 1 === false)
-    // would be ignored — dropping the jail. A campaign/robotics detection signal
-    // must likewise never upgrade an explicit auto session.
-    if (this._hint !== 'detect') {
-      this._currentMode = this._hint
-      return
-    }
-    if (
-      this._currentMode === null ||
-      MODE_WEIGHT[newMode] > MODE_WEIGHT[this._currentMode]
-    ) {
-      if (this._debug && this._currentMode !== null) {
-        console.error(
-          `[SessionRouter] mode upgrade: ${this._currentMode} → ${newMode}`,
-        )
-      }
-      this._currentMode = newMode
-    }
+    void newMode
+    this._currentMode = this._hint
   }
 
   /**

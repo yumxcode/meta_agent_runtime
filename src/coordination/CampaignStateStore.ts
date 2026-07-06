@@ -307,11 +307,9 @@ export class CampaignStateStore {
    *   User checkpoint phases  (PARETO_READY_*)
    *     → 7-day threshold. The user may be reviewing Pareto results.
    *
-   * This is the *only* place zombie expiry fires — historically it was
-   * invoked from ModeDetector once per session; that hook has been removed
-   * but `listActive()` is still called by CampaignSession bootstrap and by
-   * CLI status commands, which is sufficient to keep the disk clean without
-   * a dedicated background sweeper.
+   * This is the *only* place zombie expiry fires. `listActive()` is called by
+   * CampaignSession bootstrap and by CLI status commands, which is sufficient
+   * to keep the disk clean without a dedicated background sweeper.
    */
   static async listActive(): Promise<CampaignStateStore[]> {
     const all = await CampaignStateStore._loadAll()

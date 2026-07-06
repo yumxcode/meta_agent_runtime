@@ -74,13 +74,11 @@ export {
 export type { UnitDef } from './units/index.js'
 
 // ── Session routing ───────────────────────────────────────────────────────────
-// SessionRouter is the recommended entry point — it auto-selects between
-// DIRECT (single-turn Q&A), AGENTIC (tool-use loop), and CAMPAIGN (full DOE
-// coordination) based on prompt signals and environment.
-export { SessionRouter, ModeDetector, MODE_WEIGHT } from './routing/index.js'
+// SessionRouter is the recommended entry point. Mode selection is explicit:
+// omitting a mode uses AGENTIC; specialist modes must be selected by the caller.
+export { SessionRouter, MODE_WEIGHT } from './routing/index.js'
 export type {
-  SessionMode, SessionModeHint, DetectionConfidence,
-  ModeSignal, ModeDetectionResult, RouterOptions,
+  SessionMode, RouterOptions,
 } from './routing/index.js'
 
 // ── Runtime integration (Phase 1 wiring) ──────────────────────────────────────

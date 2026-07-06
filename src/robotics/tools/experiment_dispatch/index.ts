@@ -216,9 +216,25 @@ Rules:
           }
           const final = await bridge.getStatus(record.taskId)
           if (final?.status === 'completed') {
-            await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
+            if (!branchName && !worktreePath) {
+              await RoboticsProjectStore.completeSubAgentTask(projectDir, sessionId, record.taskId)
+            }
             return {
-              content: `✅ Experiment completed.\n\nTask ID: ${record.taskId}\n\n${final.result?.summary ?? ''}`,
+              content: [
+                '✅ Experiment completed.',
+                '',
+                `Task ID: ${record.taskId}`,
+                ...(branchName
+                  ? [
+                      `Branch: \`${branchName}\``,
+                      '',
+                      'Next required action: run `git_diff_subagent`, then `git_merge_subagent` or `git_discard_subagent`.',
+                      'The task remains active until one of those finalization tools runs.',
+                    ]
+                  : []),
+                '',
+                final.result?.summary ?? '',
+              ].join('\n'),
               isError: false,
             }
           }

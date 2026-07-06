@@ -77,21 +77,6 @@ import {
 import { createRoboticsTools } from './tools/index.js'
 import { createFsTools } from '../tools/fs/index.js'
 import { createWebFetchTool } from '../tools/network/web_fetch/index.js'
-import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
-import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
-
-/**
- * Per-result budget for the MAIN agent's web_fetch. A single unbudgeted fetch
- * (≤100 KB) in the long-lived context is the noise amplifier behind the
- * compact-rework loop; full-text reading goes through research_dispatch.
- */
-const MAIN_AGENT_WEB_FETCH_MAX_CHARS = 8_000
-
-/** Join optional anchor/instruction blocks; null when none produced content. */
-function composeAnchorBlocks(...blocks: Array<string | null | undefined>): string | null {
-  const combined = blocks.filter(Boolean).join('\n\n')
-  return combined || null
-}
 import { createWebSearchTool } from '../tools/network/web_search/index.js'
 import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
@@ -111,8 +96,28 @@ import { createTeamTools } from './tools/team/index.js'
 import { RoboticsTeamCoordinator } from './team/RoboticsTeamCoordinator.js'
 import { ExperienceWorkingSetManager } from './ExperienceWorkingSet.js'
 import type { RoboticsCapabilities, RoboticsTeamController } from './contracts.js'
+import { createResearchDispatchTool } from '../tools/research/research_dispatch/index.js'
+import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
+
+/**
+ * Per-result budget for the MAIN agent's web_fetch. A single unbudgeted fetch
+ * (≤100 KB) in the long-lived context is the noise amplifier behind the
+ * compact-rework loop; full-text reading goes through research_dispatch.
+ */
+const MAIN_AGENT_WEB_FETCH_MAX_CHARS = 8_000
+
+/** Join optional anchor/instruction blocks; null when none produced content. */
+function composeAnchorBlocks(...blocks: Array<string | null | undefined>): string | null {
+  const combined = blocks.filter(Boolean).join('\n\n')
+  return combined || null
+}
 
 // ── Options ───────────────────────────────────────────────────────────────────
+
+const SINGLE_AGENT_DEFERRED_TOOLS = new Set([
+  'spawn_sub_agent',
+  'experiment_dispatch',
+])
 
 const EXPERIENCE_SLOT_REF_RE = /\bexperience:([A-Za-z0-9_-]+)\b/g
 const EXPERIENCE_ID_REF_RE = /\b(exp_[0-9a-z]+_[0-9a-f]{8})\b/g
@@ -157,8 +162,8 @@ export interface RoboticsSessionOptions extends MetaAgentConfig {
   /**
    * Agent orchestration mode override.
    *
-   * - 'single' — disable sub-agent dispatching; main agent handles everything.
-   * - 'multi'  — full multi-agent orchestration (experiment_dispatch, paper_search, git).
+   * - 'single' — one main coordinator; serial isolated helpers are allowed.
+   * - 'multi'  — full parallel orchestration (experiment_dispatch, fan-out, git).
    * - 'auto'   — (default) classify via flash model on first submit() using task context.
    *
    * When set explicitly, no flash model side-call is made.
@@ -253,6 +258,8 @@ export class RoboticsSession implements RoboticsCapabilities {
   private _anchorVersion = 0
   /** Resolved agent mode. Starts as 'single'; upgraded to 'multi' only on user confirmation. */
   private _agentMode: RoboticsAgentMode = 'single'
+  /** Parallel orchestration tools hidden until a session resolves to multi-agent mode. */
+  private readonly _deferredMultiAgentTools = new Map<string, MetaAgentTool>()
   /** True once mode has been classified or overridden; prevents re-classification. */
   private _modeClassified = false
   /** Heartbeat timer — touches lastActiveAt every HEARTBEAT_INTERVAL_MS */
@@ -577,7 +584,7 @@ export class RoboticsSession implements RoboticsCapabilities {
       flashClient: this._flashClient ?? undefined,
     })
     for (const tool of roboticsTools) {
-      this.inner.registerTool(tool)
+      this._registerRuntimeTool(tool)
     }
 
     // ── 3b. Register foundational tools (file I/O, shell, sub-agent status) ──
@@ -590,18 +597,18 @@ export class RoboticsSession implements RoboticsCapabilities {
     // dispatching sub-agents for every file operation — creating orphan tasks.
     const fsTools = await createFsTools()
     for (const tool of fsTools) {
-      this.inner.registerTool(tool)
+      this._registerRuntimeTool(tool)
     }
-    this.inner.registerTool(await createBashTool())
+    this._registerRuntimeTool(await createBashTool())
     // Generic delegation tools, parallel to robotics' domain dispatchers
     // (experiment_dispatch / paper_search). run_agent is SYNCHRONOUS (blocks
     // until done — use when the next step depends on the result); spawn_sub_agent
     // is ASYNCHRONOUS (fan out several in one turn to run in parallel). The
     // family also provides get_sub_agent_status / _intermediate / cancel / list,
     // which experiment_dispatch's poll-and-collect flow already relies on.
-    this.inner.registerTool(await createRunAgentTool(this.bridge))
+    this._registerRuntimeTool(await createRunAgentTool(this.bridge))
     for (const tool of makeSubAgentTools(this.bridge)) {
-      this.inner.registerTool(tool)
+      this._registerRuntimeTool(tool)
     }
     // Network tools — required by sub-agents (e.g. PaperSearchAgent) whose
     // allowedTools include 'web_fetch' / 'web_search'. Registering here also
@@ -612,14 +619,14 @@ export class RoboticsSession implements RoboticsCapabilities {
     // the documented noise amplifier behind compact-rework loops. Full-text
     // reading belongs in isolated research sub-agents — the bridge registry
     // below overrides web_fetch with an unbudgeted variant for sub-agents.
-    this.inner.registerTool(await createWebFetchTool({ maxResultSizeChars: MAIN_AGENT_WEB_FETCH_MAX_CHARS }))
+    this._registerRuntimeTool(await createWebFetchTool({ maxResultSizeChars: MAIN_AGENT_WEB_FETCH_MAX_CHARS }))
     // web_search gives the agent a real discovery path so it stops guessing
     // search-page URLs (e.g. github.com/search) that 404. It self-selects a
     // backend at call time — Anthropic web-search when ANTHROPIC_API_KEY is
     // set, else the GLM web-search-prime MCP (ZHIPU_API_KEY) — and returns a
     // clear "configure a backend" error if neither is available, which is
     // still strictly better than fabricating dead URLs.
-    this.inner.registerTool(await createWebSearchTool())
+    this._registerRuntimeTool(await createWebSearchTool())
 
     // MCP tools — mcp_call / list_mcp_resources / read_mcp_resource. These talk
     // to the process-global MCP client registry (populated by loadMcpConfig()
@@ -628,21 +635,21 @@ export class RoboticsSession implements RoboticsCapabilities {
     // search server used by paper_search in place of the removed web_search.
     const mcpTools = await createMcpTools()
     for (const tool of mcpTools) {
-      this.inner.registerTool(tool)
+      this._registerRuntimeTool(tool)
     }
     // Skill tool — gives the robotics agent access to user-defined skills under
     // ~/.meta-agent/skills/robotics/ and <projectDir>/.meta-agent/skills/
-    this.inner.registerTool(await createSkillTool(this.projectDir, 'robotics'))
+    this._registerRuntimeTool(await createSkillTool(this.projectDir, 'robotics'))
     // Memory write tool — allows the robotics agent to propose user/feedback memories.
     // Queued for human review; never auto-committed.
-    this.inner.registerTool(await createMemoryWriteTool({ mode: 'robotics', domain: this._domain }))
+    this._registerRuntimeTool(await createMemoryWriteTool({ mode: 'robotics', domain: this._domain }))
     // Team collaboration tools — the agent half of a "human + meta-agent" unit.
     // team_note writes directly (low-risk lab-notebook append on tasks this
     // unit owns); team_take / team_mark_done are flagged sensitive by the CLI
     // guard so a human confirms each. All three error cleanly when team mode
     // is not initialised, so unconditional registration is safe.
     for (const tool of createTeamTools(this.teamController)) {
-      this.inner.registerTool(tool)
+      this._registerRuntimeTool(tool)
     }
 
     // ── 4. Register workflow tools (if workflow found) ────────────────────
@@ -658,7 +665,7 @@ export class RoboticsSession implements RoboticsCapabilities {
         },
       )
       for (const tool of wfTools) {
-        this.inner.registerTool(tool)
+        this._registerRuntimeTool(tool)
       }
     }
 
@@ -668,7 +675,7 @@ export class RoboticsSession implements RoboticsCapabilities {
     // conclusion + report path to the main agent. Compact anchors (see
     // _buildDeterministicCompactAnchors) then steer post-compaction recovery
     // to re-READ the report file instead of re-RUNNING the research.
-    this.inner.registerTool(createResearchDispatchTool({
+    this._registerRuntimeTool(createResearchDispatchTool({
       dispatcher: this.bridge,
       projectDir: this.projectDir,
       sessionId: this._storeSessionId,
@@ -926,6 +933,10 @@ export class RoboticsSession implements RoboticsCapabilities {
     if (state && state.activeSubAgentTasks.length > 0) {
       await Promise.allSettled(
         state.activeSubAgentTasks.map(async task => {
+          const record = await this.bridge?.getStatus(task.taskId as import('../subagent/types.js').SubAgentTaskId).catch(() => null)
+          if (record?.status === 'completed' && task.branchName) {
+            return
+          }
           // Remove worktree (keep branch for post-mortem)
           if (task.worktreePath) {
             await this.gitMgr.removeWorktree(
@@ -1088,7 +1099,34 @@ export class RoboticsSession implements RoboticsCapabilities {
   }
 
   registerTool(tool: MetaAgentTool): void {
+    this._registerRuntimeTool(tool)
+  }
+
+  private _registerRuntimeTool(tool: MetaAgentTool): void {
+    if (this._agentMode === 'single' && SINGLE_AGENT_DEFERRED_TOOLS.has(tool.name)) {
+      this._deferredMultiAgentTools.set(tool.name, tool)
+      this._syncBridgeToolRegistry()
+      return
+    }
+
     this.inner.registerTool(tool)
+    this._syncBridgeToolRegistry()
+  }
+
+  private _flushDeferredMultiAgentTools(): void {
+    if (this._agentMode === 'single' || this._deferredMultiAgentTools.size === 0) return
+
+    const tools = [...this._deferredMultiAgentTools.values()]
+    this._deferredMultiAgentTools.clear()
+    for (const tool of tools) {
+      this.inner.registerTool(tool)
+    }
+    this._syncBridgeToolRegistry()
+  }
+
+  private _syncBridgeToolRegistry(): void {
+    if (!this.bridge) return
+    this.bridge.setToolRegistry(this.inner.getToolRegistry())
   }
 
   interrupt(): void {
@@ -1331,14 +1369,16 @@ ${input.content.slice(0, 12000)}`,
 You are deciding whether a robotics development task requires multi-agent orchestration.
 
 single — Direct implementation, quick script, simple fix, single focused experiment,
-         or tasks completable in under ~10 minutes. No need for parallel work or git
-         branch isolation. Sub-agent overhead would outweigh any benefit.
+         serial literature survey, or tasks completable in under ~10 minutes.
+         Serial context-isolated helpers such as paper_search/run_agent are allowed.
+         No need for parallel fan-out or multiple isolated experiment branches.
 
 multi  — Complex algorithm development, multiple parallel experiments, hypothesis
          comparison, long-running simulations (>10 min), paper search + implementation
          + validation pipeline, or tasks that genuinely benefit from isolated git branches.
 
-Default to single unless the task clearly requires parallel sub-agents.
+Default to single unless the task clearly requires parallel sub-agents or branch-isolated
+experiment fan-out.
 
 Reply with a JSON object: {"mode":"single"|"multi","reason":"<one sentence why>"}`
 
@@ -1381,6 +1421,7 @@ Reply with a JSON object: {"mode":"single"|"multi","reason":"<one sentence why>"
       }
 
       this._agentMode = classifiedMode
+      this._flushDeferredMultiAgentTools()
 
       // Invalidate R1 so next resolveToString() renders the correct variant
       this.sectionRegistry.invalidate('robotics_domain')

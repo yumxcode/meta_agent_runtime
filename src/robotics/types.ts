@@ -206,10 +206,11 @@ export interface ActiveSubAgentRecord {
 
 // ── Agent orchestration mode ──────────────────────────────────────────────────
 /**
- * single — main agent handles everything directly; no sub-agent dispatch.
- *          R1 omits multi-agent roles and Git coordination protocol.
- * multi  — full multi-agent orchestration; experiment_dispatch, paper_search,
- *          Git worktree isolation, and noise-isolation protocol all active.
+ * single — one main coordinator; direct work first, with serial context-isolated
+ *          helpers such as paper_search/run_agent allowed when useful.
+ *          R1 omits parallel fan-out and experiment worktree orchestration.
+ * multi  — full multi-agent orchestration; experiment_dispatch, parallel
+ *          fan-out, Git worktree isolation, and merge/discard protocol active.
  *
  * Classified by flash model on first submit() using task context + AGENT.md signals.
  * Persisted in project state so resumed sessions keep the same mode.

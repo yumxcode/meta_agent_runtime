@@ -22,6 +22,7 @@ import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 import { RoboticsSession } from '../RoboticsSession.js'
 import { RoboticsProjectStore } from '../persistence/RoboticsProjectStore.js'
 import type { ActiveSubAgentRecord } from '../types.js'
+import type { MetaAgentTool } from '../../core/types.js'
 
 const cleanup: string[] = []
 const sessions: RoboticsSession[] = []
@@ -122,5 +123,81 @@ describe('RoboticsSession _state re-hydration', () => {
     await session.dispose()
 
     expect(removeWorktree).toHaveBeenCalledWith('TASK_WITH_WORKTREE', { deleteBranch: false })
+  })
+
+  it('registerTool keeps the robotics sub-agent bridge registry in sync', async () => {
+    const { session } = await freshSession()
+    const tool: MetaAgentTool = {
+      name: 'custom_robotics_tool',
+      description: 'test tool',
+      inputSchema: { type: 'object', properties: {} },
+      call: async () => ({ content: 'ok' }),
+    }
+
+    session.registerTool(tool)
+
+    const bridge = (session as unknown as { bridge: { toolRegistry: Map<string, MetaAgentTool> } }).bridge
+    expect(bridge.toolRegistry.has('custom_robotics_tool')).toBe(true)
+  })
+
+  it('single-agent mode exposes only serial sub-agent tools', async () => {
+    const { session } = await freshSession()
+    const sessionInternals = session as unknown as {
+      inner: { getToolRegistry: () => Map<string, MetaAgentTool> }
+      bridge: { toolRegistry: Map<string, MetaAgentTool> }
+    }
+    const registry = sessionInternals.inner.getToolRegistry()
+
+    for (const name of ['paper_search', 'run_agent']) {
+      expect(registry.has(name)).toBe(true)
+      expect(sessionInternals.bridge.toolRegistry.has(name)).toBe(true)
+    }
+
+    for (const name of ['spawn_sub_agent', 'experiment_dispatch']) {
+      expect(registry.has(name)).toBe(false)
+      expect(sessionInternals.bridge.toolRegistry.has(name)).toBe(false)
+    }
+  })
+
+  it('multi-agent mode exposes deferred sub-agent dispatch tools', async () => {
+    const { session } = await freshSession()
+    const sessionInternals = session as unknown as {
+      _agentMode: string
+      _flushDeferredMultiAgentTools: () => void
+      inner: { getToolRegistry: () => Map<string, MetaAgentTool> }
+      bridge: { toolRegistry: Map<string, MetaAgentTool> }
+    }
+
+    expect(sessionInternals.inner.getToolRegistry().has('spawn_sub_agent')).toBe(false)
+
+    sessionInternals._agentMode = 'multi'
+    sessionInternals._flushDeferredMultiAgentTools()
+
+    for (const name of ['spawn_sub_agent', 'experiment_dispatch']) {
+      expect(sessionInternals.inner.getToolRegistry().has(name)).toBe(true)
+      expect(sessionInternals.bridge.toolRegistry.has(name)).toBe(true)
+    }
+  })
+
+  it('dispose preserves completed branch-backed tasks for later merge/discard', async () => {
+    const { session, projectDir, storeSessionId } = await freshSession()
+
+    await RoboticsProjectStore.registerSubAgentTask(projectDir, storeSessionId, makeRecord({
+      taskId: 'TASK_COMPLETED_BRANCH',
+      branchName: 'exp/completed',
+      worktreePath: '/tmp/robotics-completed-worktree',
+    }))
+
+    const removeWorktree = vi.fn().mockResolvedValue(undefined)
+    ;(session as unknown as { gitMgr: { removeWorktree: typeof removeWorktree } }).gitMgr.removeWorktree =
+      removeWorktree
+    ;(session as unknown as { bridge: { getStatus: typeof vi.fn } }).bridge.getStatus =
+      vi.fn().mockResolvedValue({ status: 'completed' })
+
+    await session.dispose()
+
+    expect(removeWorktree).not.toHaveBeenCalled()
+    const state = await RoboticsProjectStore.findBySession(projectDir, storeSessionId)
+    expect(state?.activeSubAgentTasks.some(t => t.taskId === 'TASK_COMPLETED_BRANCH')).toBe(true)
   })
 })
