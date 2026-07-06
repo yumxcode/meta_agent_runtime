@@ -13,7 +13,7 @@ import { spawnAndWait } from '../seatSpawn.js'
 import type { Charter } from '../charter/CharterTypes.js'
 import { validateCharter } from '../charter/CharterValidate.js'
 
-const DISTILLER_SYSTEM = `\
+export const DISTILLER_SYSTEM = `\
 你是 loop 章程蒸馏器。把用户的 loop 需求描述蒸馏成一份 Charter JSON——它是被内核逐条机械执行的契约，不是给人看的散文。
 
 Charter 结构（全部字段；? 为可选）：
@@ -41,19 +41,30 @@ Charter 结构（全部字段；? 为可选）：
   ① 座位身份（"你是本 loop 的 worker，只推进本轮、把结构化产出写入 drafts/、最后 return_result，不面向终端用户、不寒暄、不写用户报告"）；
   ② 基本纪律（读前改 / 换策略前先诊断 / 如实报告）；
   ③ 上下文约定（每轮 user 消息开头有 <context> 胶囊：目标/轮次/计数器/近期发现/已试方向/人工反馈/转向指令——底座已叮嘱先读它，遇到 --- 之后才是本轮指令）；
-  ④ 可用 skill 清单（worker 自动看到，用 skill(action="load", name=…) 加载；例如训练用的 gm 由 skill 提供）；
+  ④ 可用 skill 清单（worker 自动看到，用 skill(action="load", name=…) 加载；例如某个外部工具/平台的能力由 skill 提供）；
   ⑤ 产出契约（先写 drafts/direction.json {"key","rationale"}，再写 drafts/findings_draft.json（数组，每条含 claim 与 evidence），最后调 return_result data={"label":"ok"|"error","note"}）；
   ⑥ 写入范围（由 charter.writeScope 下发，底座注入）；
   ⑦ 自计时等待工具 timer/timer_cancel（见下）。
-- 长时外部任务（训练/远程评测）**只有两种等待方式，都由 worker 驱动，不写进 charter**（没有代码探针，状态检查/换号/平台期判断全部由 worker 用 skill 自己做）：
-  · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason) 把自己 park，到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"；timer_cancel 防死循环。适合需要 worker 亲眼判断的等待（如平台期"除非有明显抬头趋势否则终止"、账号无余额时自己换号）。**必须搭 context:"lineage_loop"**（要记得上次曲线）。
+- 长时外部任务（任何需要"发起后等一会儿再看结果"的动作）**只有两种等待方式，都由 worker 驱动，不写进 charter**（没有代码探针；等待期间的状态检查、异常处理/重试、以及"继续等还是收尾"的判断，全部由 worker 自己用工具/skill 做）：
+  · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason) 把自己 park，到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"；timer_cancel 防死循环。适合需要 worker 亲眼看中间结果再决定"继续等 vs 收尾"、或等待中要 worker 自己处理异常的场景。**必须搭 context:"lineage_loop"**（要记得上一段的中间态）。（举例，不限于此：盯一个慢任务的进展按趋势决定是否提前终止；等待中遇到可恢复错误自己重试。）
   · **事件（外部系统推送）**：worker 返回 return_result data={"label":"wait","effectKey":"<id>"} 声明在等一个外部事件；外部系统往 events/<id>.json 丢 {effectKey, verdict, data} 即收割。适合真正 push 式的外部系统；无超时（要超时用自计时）。
   你只需在 seat.prompt 里点明用哪种、以及提交后如何回看/判断——工具和事件机制底座已给。
-- 因此 seat.prompt 只写**领域/角色特有**的指令：本 worker 每轮具体做什么、如何选方向、领域判断标准、用哪个工具/skill 做什么、提交训练/评测的领域细节。**不要**复述身份、输出格式（drafts/return_result）、"你是自主 agent"、"记得读胶囊"、skill 列表——底座已给，重复只会污染提示词、增加成本。目标写进 charter.goal（底座作为 D0 目标锚注入），不要抄进 seat.prompt。
+- 因此 seat.prompt 只写**领域/角色特有**的指令：本 worker 每轮具体做什么、如何选方向、领域判断标准、用哪个工具/skill 做什么、调用外部工具或提交长任务的领域细节。**不要**复述身份、输出格式（drafts/return_result）、"你是自主 agent"、"记得读胶囊"、skill 列表——底座已给，重复只会污染提示词、增加成本。目标写进 charter.goal（底座作为 D0 目标锚注入），不要抄进 seat.prompt。
 - worker.context 二选一，决定底座的会话形态：
   · "lineage_loop"：跨轮 **resume 同一会话**、积累上下文——用于"在已有实现上持续迭代、调参、逐步推进"的 worker；
   · "isolated"：每轮**全新会话、无历史**，只凭本轮 <context> 独立判断——用于"需要跳出既有框架、推翻假设、换新证据源、避免自我叙事绑架"的 worker。
   · 若需求同时要"迭代推进"与"周期性推翻重来"，可用两类思路：迭代 worker 用 lineage_loop，靠 tripwire 的 mode:"pivot" 触发 pivoter（isolated）给出结构性转向。judge/pivoter 永远 "isolated"（D6）。
+
+账本归内核（最容易映射错的地方，务必钉死）：
+- 内核在实例目录 .loop/<id>/ledger/ 下**独占写入**这些"状态/日志"文件，**不要**让任何座位去写：
+  · ledger/progress.json —— iteration/stale_count/status/best_metric/total_findings/updated_at，**全部内核从 meters 算**（worker 一个字都不写）；
+  · ledger/findings.jsonl —— 内核在 judge 门通过后，把 worker 写的 drafts/findings_draft.json **入账**；
+  · ledger/directions.json —— 内核把 worker 写的 drafts/direction.json 去重后记录；
+  · ledger/rounds.jsonl —— 每轮审计（内核写，含座位摘要/路由），对应需求里的 iteration_log。
+- 所以 worker 对"状态"的**全部写入只有两个 draft**：drafts/direction.json + drafts/findings_draft.json。worker prompt **绝不能**出现"更新 progress.json / append findings.jsonl / 写 directions_tried / 算 stale_count / 写 status / 落盘 state 脚本"这类动作——那是内核的活，写了就和内核账本打架（D7 单写者）。需求里的 state_writer/reduce_progress 阶段直接**丢弃**。
+- judge/pivoter 的 inputs、findings_gate 的 evidence 都**相对实例目录**解析，要用内核账本路径：ledger/findings.jsonl、ledger/directions.json、ledger/progress.json —— **不要**用工作区的 state/xxx（内核不写那里、也读不到）。
+- state_gate（schema 门）如需要，检查 ledger/progress.json 即可（内核写的、恒为合法）；通常可省。
+- writeScope 是**"worker 允许改的仓库文件/产物" glob**——按任务而定（代码、配置、文档皆可；纯分析/写作类 loop 可为空/不设），**不是**状态目录。别把 state/ledger/drafts 放进去（drafts 本就可写、账本 worker 碰不到）。若 worker 每轮确实要改某些产物，writeScope 必须覆盖那些路径，否则会被 prompt 挡住。
 
 终止机制（两个内核内置，别当成 charter 特化去写）：
 - **内置验收**：judge 每轮在 data 里输出 goal_satisfied（bool），对照 charter.goal 判"目标是否达成"；一旦 true，**内核自动 finalize 结束整个 loop**——你**不需要**为此写任何 tripwire。你要做的：把 goal 写清楚、在 judge 的 rubric 里说清"什么算达成/成功标准"。对没有硬指标的任务，这就是"判不判得完"的判断出口。
@@ -66,7 +77,9 @@ Charter 结构（全部字段；? 为可选）：
 - judge/pivoter 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
 - 长时外部任务的等待由 worker 用 timer 工具（自计时）或事件驱动，**不建模成 charter 字段**；在 seat.prompt 里说明即可（见"座位底座"的等待机制）。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。
-- 需求中"每轮至少包含的阶段"映射：load_state→内核胶囊(忽略)；choose/implement/extract→worker prompt（只写领域动作，身份/输出/纪律/胶囊/skill 由底座给，见"座位底座"）；semantic_eval/verify→judge rubric；reduce/route/state_writer→meters+tripwires(忽略其实现细节)。
+- 账本归内核：worker 只写 drafts/direction.json + drafts/findings_draft.json；progress/findings/directions/log 由内核写入 ledger/，worker 绝不碰（见"账本归内核"）。
+- writeScope = worker 要改的仓库文件 glob（按任务而定，可为空），不是 state/ledger/drafts。
+- 需求"每轮阶段"映射：load_state→内核胶囊(忽略)；choose/implement/extract→worker prompt(领域动作)；semantic_eval/verify→judge rubric；**reduce_progress/state_writer/route_by_status→内核 METER/LEDGER/ROUTE，全部丢弃，绝不写进 worker**。
 
 输出：必须调用 return_result，data 为 {"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。`
 
@@ -112,7 +125,20 @@ export async function distillCharter(doc: string, deps: DistillDeps): Promise<Di
     )
     const parsed = parseDistillOutput(rec?.result?.output, rec?.result?.summary)
     if (!parsed) {
-      lastErrors = ['no parseable {charter, taskSpec} payload in return_result']
+      // Surface WHY the distiller sub-agent produced nothing usable: its terminal
+      // status, whether it succeeded, and what it actually said. This turns the
+      // opaque "no parseable payload" into an actionable diagnosis.
+      const status = rec?.status ?? 'no-record'
+      const success = rec?.result?.success
+      const err = String(rec?.result?.error ?? '').replace(/\s+/g, ' ').trim().slice(0, 600)
+      const said = String(rec?.result?.summary ?? '').replace(/\s+/g, ' ').trim().slice(0, 400)
+      const outKind = rec?.result?.output === undefined
+        ? 'output=undefined'
+        : `output=${typeof rec?.result?.output}`
+      lastErrors = [
+        `no parseable {charter, taskSpec} (sub-agent status=${status}, success=${success}, ${outKind}). ` +
+        `sub-agent error: ${err || '(none)'}. sub-agent said: ${said || '(empty)'}`,
+      ]
       continue
     }
     const errs = validateCharter(parsed.charter)
@@ -124,7 +150,7 @@ export async function distillCharter(doc: string, deps: DistillDeps): Promise<Di
   throw new Error(`distiller failed after ${maxAttempts} attempts:\n- ${lastErrors.join('\n- ')}`)
 }
 
-function parseDistillOutput(
+export function parseDistillOutput(
   output: unknown,
   summary?: string,
 ): { charter: Charter; taskSpec: string } | null {

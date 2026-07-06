@@ -47,7 +47,7 @@ describe('runLoopScheduler', () => {
           JSON.stringify([{ claim: 'done at 0.6', evidence: 'curve' }]), 'utf-8')
         return { label: 'ok' }
       }
-      if (task.includes('草稿目录')) {
+      if (task.includes('产出契约')) {
         // Submit an event wait; an external system drops the completion event
         // shortly after — the daemon ingests it on its next tick (no help).
         setTimeout(() => {

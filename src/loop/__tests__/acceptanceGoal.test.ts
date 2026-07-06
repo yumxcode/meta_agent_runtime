@@ -33,7 +33,7 @@ function scriptedDispatcher(script: (task: string) => Promise<Record<string, unk
 }
 
 const isJudge = (t: string) => t.includes('隔离评审座位')
-const isWorker = (t: string) => t.includes('草稿目录')
+const isWorker = (t: string) => t.includes('产出契约')
 
 describe('built-in acceptance (judge goal_satisfied)', () => {
   it('ends the loop from the kernel even when no tripwire would stop this round', async () => {

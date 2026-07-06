@@ -10,7 +10,6 @@ import { join } from 'node:path'
 import {
   assembleInnerWorkerSystemPrompt,
   renderInnerWorkerUserMessage,
-  INNER_WORKER_OUTPUT_CONTRACT,
 } from '../InnerOrchWorker.js'
 import type { Capsule } from '../../capsule/CapsuleBuilder.js'
 
@@ -59,7 +58,9 @@ describe('inner_orch_worker user message', () => {
     expect(msg).toContain('improve gait stability')  // capsule goal
     expect(msg).toContain('\n---\n')                 // context / instruction boundary
     expect(msg).toContain('【收割段】结果已就绪')      // harvest preface
-    expect(msg).toContain('/tmp/x/drafts')           // drafts dir
-    expect(msg).toContain(INNER_WORKER_OUTPUT_CONTRACT)
+    // Output contract carries ABSOLUTE draft paths (not relative "drafts/…").
+    expect(msg).toContain('/tmp/x/drafts/direction.json')
+    expect(msg).toContain('/tmp/x/drafts/findings_draft.json')
+    expect(msg).toContain('产出契约')
   })
 })

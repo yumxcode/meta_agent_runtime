@@ -31,11 +31,11 @@ import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { Writable } from 'node:stream'
 import { isAbsolute, resolve, join } from 'node:path'
-import { existsSync, mkdirSync, statSync } from 'node:fs'
+import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { runLoopCli, runLoopScheduler, type LoopEvent } from '../loop/index.js'
+import { runLoopCli, runLoopScheduler, DISTILLER_SYSTEM, parseDistillOutput, validateCharter, type LoopEvent } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
@@ -4879,11 +4879,27 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     return
   }
 
+  // Distill runs as a DIRECT streaming session (simple_auto), not a hidden
+  // sub-agent — so its work is visible in the CLI and easy to debug.
+  if (sub === 'distill') {
+    await runDistillDirect(opts, projectDir, args)
+    return
+  }
+
   assertApiKeyConfigured(opts)
   const router = makeRouter(
     { ...opts, mode: 'auto', workspace: projectDir, prompt: null, loopCommand: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
   )
+  // Register the standard tool set into the backend so spawned seats / the
+  // distiller sub-agent can resolve read_file/grep/glob/bash/etc. — without this
+  // the bridge's tool registry is empty and every seat fails "No tools resolved".
+  const loopTools = await createStandardTools({
+    system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
+    network: { webFetch: { maxResultSizeChars: 8_000 } },
+    mode: 'auto',
+  })
+  for (const tool of loopTools) router.registerTool(tool)
   const abort = new AbortController()
   process.once('SIGINT', () => abort.abort())
   process.once('SIGTERM', () => abort.abort())
@@ -4926,6 +4942,74 @@ function formatLoopEvent(e: LoopEvent): string {
       : green(`■ finalized (${e.reason})`)
     default:                return ''
   }
+}
+
+/**
+ * Distill a requirement doc into a charter draft as a DIRECT simple_auto session
+ * (visible/streamed in the CLI), rather than a hidden sub-agent. Retries up to 3×,
+ * feeding validation errors back, then writes the draft for human review.
+ */
+async function runDistillDirect(opts: CliOptions, projectDir: string, args: string[]): Promise<void> {
+  const docFile = args.slice(1).find(a => !a.startsWith('--'))
+  if (!docFile) throw new Error('loop distill: requirement doc path required')
+  const outIdx = args.indexOf('--out')
+  const out = outIdx >= 0 ? args[outIdx + 1]! : 'charter.draft.json'
+  const doc = readFileSync(resolve(projectDir, docFile), 'utf-8')
+
+  assertApiKeyConfigured(opts)
+  const router = makeRouter(
+    { ...opts, mode: 'simple_auto', workspace: projectDir, prompt: null, loopCommand: null },
+    undefined, undefined, undefined, undefined, undefined, undefined,
+  )
+  const tools = await createStandardTools({
+    system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
+    network: { webFetch: { maxResultSizeChars: 8_000 } },
+    mode: 'simple_auto',
+  })
+  for (const tool of tools) router.registerTool(tool)
+
+  try {
+    let lastErrors: string[] = []
+    for (let attempt = 1; attempt <= 3; attempt++) {
+      const prompt = attempt === 1
+        ? `${DISTILLER_SYSTEM}\n\n【loop 需求描述】\n${doc}\n\n` +
+          '你可以用 read_file/grep/glob 读工作区来理解项目。最后在一个 ```json 代码块里输出最终结果：' +
+          '{"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。'
+        : `上一版章程未通过校验，必须修复：\n- ${lastErrors.join('\n- ')}\n` +
+          '请重新在一个 ```json 代码块里输出修正后的完整 {"charter":..., "taskSpec":...}。'
+      console.log(dim(`\n[distill] 第 ${attempt}/3 次尝试…\n`))
+      await streamPrompt(router, prompt, false, opts.showThinking)
+      const parsed = parseDistillOutput(undefined, lastAssistantText(router.getMessages()))
+      if (!parsed) { lastErrors = ['没有找到可解析的 ```json {charter, taskSpec} 代码块']; continue }
+      const errs = validateCharter(parsed.charter)
+      if (errs.length === 0) {
+        writeFileSync(resolve(projectDir, out), JSON.stringify(parsed.charter, null, 2), 'utf-8')
+        if (parsed.taskSpec) writeFileSync(resolve(projectDir, 'task_spec.draft.md'), parsed.taskSpec, 'utf-8')
+        console.log(green(`\n✓ charter 草案已写入 ${out}（第 ${attempt} 次尝试，已通过校验）`))
+        console.log(dim(`  审阅后运行: meta-agent -w ${projectDir} loop create ${out}`))
+        return
+      }
+      lastErrors = errs
+      console.log(yellow(`\n[distill] 校验未过：\n- ${errs.join('\n- ')}`))
+    }
+    throw new Error(`distill 失败（3 次尝试后仍未产出合格 charter）:\n- ${lastErrors.join('\n- ')}`)
+  } finally {
+    await router.dispose().catch(() => undefined)
+  }
+}
+
+/** Concatenate the text blocks of the last assistant message. */
+function lastAssistantText(msgs: readonly ConversationMessage[]): string {
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    const m = msgs[i]!
+    if (m.role === 'assistant' && Array.isArray(m.content)) {
+      return m.content
+        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
+        .map(b => b.text)
+        .join('\n')
+    }
+  }
+  return ''
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

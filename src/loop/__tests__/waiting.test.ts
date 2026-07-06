@@ -44,7 +44,7 @@ function scriptedDispatcher(script: SeatScript): ISubAgentDispatcher & { spawns:
   }
 }
 
-const isWorker = (t: string) => t.includes('草稿目录')
+const isWorker = (t: string) => t.includes('产出契约')
 const isJudge = (t: string) => t.includes('隔离评审座位')
 const isHarvest = (t: string) => t.includes('收割段')
 

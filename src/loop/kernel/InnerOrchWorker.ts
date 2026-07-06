@@ -17,6 +17,7 @@
  *   • 'isolated' — fresh session every round; no history, decides from the
  *                  capsule + evidence alone (the "overturn assumptions" worker).
  */
+import { join } from 'path'
 import { SectionRegistry } from '../../core/systemPromptSections.js'
 import { buildSkillManifestSection } from '../../core/dynamicPrompt.js'
 import type { AgentMode } from '../../core/dynamicPrompt.js'
@@ -25,13 +26,22 @@ import { renderCapsule } from '../capsule/CapsuleBuilder.js'
 
 export type InnerWorkerVariant = 'lineage' | 'isolated'
 
-/** Hard output contract — stays in the user message (per-round, task-facing). */
-export const INNER_WORKER_OUTPUT_CONTRACT = `\
+/**
+ * Hard output contract (per-round, task-facing). The draft paths are ABSOLUTE —
+ * the worker's cwd is the workspace, so a relative "drafts/…" would land in
+ * <workspace>/drafts, not the kernel's <instance>/drafts. Only the kernel reads
+ * the latter, so the contract must point the worker at the exact absolute files.
+ */
+export function buildOutputContract(draftsDir: string): string {
+  const direction = join(draftsDir, 'direction.json')
+  const findings = join(draftsDir, 'findings_draft.json')
+  return `\
 【产出契约（硬性）】
-1. 选定本轮方向后，先写 drafts/direction.json：{"key":"<方向短标识>","rationale":"一句话"}。
-2. 完成工作后，把结构化 findings 草稿写入 drafts/findings_draft.json（数组，每条含 claim 与 evidence 字段）。
+1. 选定本轮方向后，先写 ${direction}：{"key":"<方向短标识>","rationale":"一句话"}。
+2. 完成工作后，把结构化 findings 草稿写入 ${findings}（数组，每条含 claim 与 evidence 字段）。
 3. 最后必须调用 return_result，data 写 {"label":"ok"|"error","note":"一句话"}。
-【路径硬性约定】跨轮共享状态只写 drafts/ 下的草稿——入账由内核完成，你无权直接改 ledger/ 下任何文件；禁止写 .meta-agent/ 下任何路径。`
+【路径硬性约定】跨轮共享状态只写上面这两个**绝对路径**草稿——入账由内核完成，你无权直接改 ledger/ 下任何文件；禁止写 .meta-agent/ 下任何路径。`
+}
 
 const ROLE_HEADER = `\
 ## 角色
@@ -109,11 +119,9 @@ export function renderInnerWorkerUserMessage(opts: {
   preface?: string
   outputContract?: string
 }): string {
-  const contract = opts.outputContract ?? INNER_WORKER_OUTPUT_CONTRACT
-  const instruction = [
-    opts.preface?.trim(),
-    `【草稿目录】${opts.draftsDir}`,
-    contract,
-  ].filter(Boolean).join('\n\n')
+  // The output contract already carries the ABSOLUTE draft file paths, so no
+  // separate (ambiguous, relative) 草稿目录 note is needed.
+  const contract = opts.outputContract ?? buildOutputContract(opts.draftsDir)
+  const instruction = [opts.preface?.trim(), contract].filter(Boolean).join('\n\n')
   return `<context>\n${renderCapsule(opts.capsule)}\n</context>\n\n---\n\n${instruction}`
 }

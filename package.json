@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.5.2",
+  "version": "0.5.3",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -17,7 +17,8 @@
   "files": [
     "dist",
     "!dist/**/__tests__/**",
-    "!dist/**/__tests__"
+    "!dist/**/__tests__",
+    "!dist/core/auto_orch/**"
   ],
   "scripts": {
     "build": "tsc --project tsconfig.json && node scripts/build-cli.js",
@@ -43,7 +44,6 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
-    "@meta-agent/runtime": "file:meta-agent-runtime-0.5.2.tgz",
     "openai": "^6.39.0",
     "zod": "^4.4.3"
   },
