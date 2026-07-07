@@ -4,6 +4,17 @@
 
 **验证**：`src/subagent` + `src/sandbox` 7 文件 38 用例通过（此前 core/auto、kernel、robotics 套件亦全绿）。
 
+## 0.1 2026-07-07 修复落地状态
+
+本轮已落地前四项高收益优化：
+
+1. **子 Agent 默认跳过 D1b 记忆召回**：`MetaAgentConfig.skipMemoryRecall` 接入 `MetaAgentSession` / `buildVolatileContextSections`；`SubAgentRunner` 默认传 `skipMemoryRecall: true`，可显式设为 `false` 恢复旧行为。
+2. **isolated_write finalize 幂等早退**：`AutoWorktreeCoordinator.finalize()` 对已 `awaiting_merge` / `merged` 的记录直接返回缓存状态，避免 `getStatus()` 重复串行跑 git 子进程。
+3. **同步 run_agent 改为事件/runner 等待**：`SubAgentBridge.waitForTerminal()` 暴露事件驱动等待；`run_agent` 不再启用 500ms poll timer，仅保留超时/abort 取消。
+4. **确定性失败不自动重试**：`shouldRetrySubAgentConfig()` 识别 max turns、budget、缺工具、sandbox/worktree 不可用、cancelled 等确定性错误，避免同配置重复烧钱。
+
+新增/更新测试覆盖：`MemoryDedup.test.ts`（跳过 memory）、`AutoRetryAndBackpressure.test.ts`（确定性失败不重试）、`AutoWorktreeCoordinator.test.ts`（finalize 幂等）。
+
 ---
 
 ## 1. 隔离机制审核结论

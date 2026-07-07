@@ -68,6 +68,12 @@ export interface SubAgentConfig {
    */
   externalPromptAssembly?: boolean
   /**
+   * Skip the parent session's per-query memory recall in the isolated
+   * sub-agent. Defaults to true for ordinary one-shot sub-agents; lineage /
+   * externally-assembled seats may opt back in explicitly.
+   */
+  skipMemoryRecall?: boolean
+  /**
    * When set, the sub-agent session RESUMES from and PERSISTS to this stable
    * session id across spawns (loop inner_orch_worker lineage variant): prior
    * transcript is loaded as initial history, and the post-run transcript is

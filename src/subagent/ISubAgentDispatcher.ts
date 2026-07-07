@@ -35,4 +35,14 @@ export interface ISubAgentDispatcher {
    * Returns true if the task was cancelled, false if it was already terminal or not found.
    */
   cancelTask(taskId: SubAgentTaskId, reason?: string): Promise<boolean>
+
+  /**
+   * Wait until a task reaches a terminal state. Implementations should prefer
+   * in-process completion events / runner promises and use polling only as a
+   * cross-process fallback.
+   */
+  waitForTerminal?(
+    taskId: SubAgentTaskId,
+    opts?: { timeoutMs?: number; abortSignal?: AbortSignal },
+  ): Promise<SubAgentRecord | null>
 }

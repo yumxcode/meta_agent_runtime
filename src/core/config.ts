@@ -109,6 +109,14 @@ export interface MetaAgentConfig {
    */
   externalPromptAssembly?: boolean
 
+  /**
+   * When true, skip the per-query memory recall volatile section.  This is used
+   * by one-shot sub-agents whose taskDescription is expected to carry all needed
+   * context; it avoids a flash-model side-call and prevents global memories from
+   * leaking into isolated reviewer/judge roles.
+   */
+  skipMemoryRecall?: boolean
+
   /** Anthropic API key. Falls back to ANTHROPIC_API_KEY env var. */
   apiKey?: string
 
@@ -449,9 +457,11 @@ export type ResolvedConfig = Required<
     | 'thinkingConfig'
     | 'compact'
     | 'externalPromptAssembly'
+    | 'skipMemoryRecall'
   >
 > & {
   externalPromptAssembly?: boolean
+  skipMemoryRecall?: boolean
   compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
   language?: string
@@ -593,6 +603,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     getExperienceRecallBlock: config.getExperienceRecallBlock,
     initialMessages: config.initialMessages,
     externalPromptAssembly: config.externalPromptAssembly,
+    skipMemoryRecall: config.skipMemoryRecall,
     debugMode:       config.debugMode,
     // projectDir: default to cwd so AGENT.md discovery works out-of-the-box
     projectDir: config.projectDir ?? process.cwd(),

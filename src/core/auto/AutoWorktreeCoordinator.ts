@@ -219,6 +219,12 @@ export class AutoWorktreeCoordinator {
     if (!existsSync(record.worktreePath)) {
       throw new Error(`Worktree path is missing for task "${taskId}"`)
     }
+    if (record.phase === 'awaiting_merge' || record.phase === 'merged') {
+      if (record.finalizedCommit) {
+        return { status: 'already_committed', commitHash: record.finalizedCommit, changedFiles: [] }
+      }
+      return { status: 'no_changes', changedFiles: [] }
+    }
 
     await this._updateRecord(record, { phase: 'finalizing', error: undefined })
     try {

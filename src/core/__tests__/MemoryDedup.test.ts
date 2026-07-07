@@ -4,7 +4,11 @@
  * frontmatter must be stripped (header line already carries name/date).
  */
 import { describe, it, expect } from 'vitest'
-import { stripMemoryFrontmatter, filterRecalledIndexBullets } from '../dynamicPrompt.js'
+import {
+  buildVolatileContextSections,
+  stripMemoryFrontmatter,
+  filterRecalledIndexBullets,
+} from '../dynamicPrompt.js'
 
 describe('stripMemoryFrontmatter', () => {
   it('removes the YAML frontmatter block, keeps the body', () => {
@@ -73,5 +77,15 @@ describe('filterRecalledIndexBullets（召回差集）', () => {
       new Set(['mem_f2609a72.md', 'mem_e83b8ddd.md', 'gradmotion_task_create_skill.md']),
     )
     expect(out).toBe('')
+  })
+})
+
+describe('buildVolatileContextSections', () => {
+  it('can skip memory recall for isolated sub-agents', () => {
+    const sections = buildVolatileContextSections({
+      currentQuery: 'sub-agent task',
+      skipMemoryRecall: true,
+    })
+    expect(sections.map(s => s.name)).not.toContain('memory_content')
   })
 })

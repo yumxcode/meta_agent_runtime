@@ -114,13 +114,20 @@ export function shouldRetrySubAgent(attempt: number, limit: number, armed: boole
   return armed && limit > 0 && attempt < limit
 }
 
+export function isDeterministicSubAgentFailure(error: string): boolean {
+  return /Turn limit exceeded|Budget exceeded|No tools resolved|cancelled|isolated_write requires|Sandbox requested|nested bwrap|not found on PATH/i
+    .test(error)
+}
+
 /** Bridge-level auto-retry gate for a spawned sub-agent config. */
 export function shouldRetrySubAgentConfig(
   _config: SubAgentConfig | undefined,
   attempt: number,
   limit: number,
   armed: boolean,
+  error = '',
 ): boolean {
+  if (isDeterministicSubAgentFailure(error)) return false
   return shouldRetrySubAgent(attempt, limit, armed)
 }
 
@@ -674,6 +681,62 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     return record
   }
 
+  async waitForTerminal(
+    taskId: SubAgentTaskId,
+    opts: { timeoutMs?: number; abortSignal?: AbortSignal } = {},
+  ): Promise<SubAgentRecord | null> {
+    const initialRunner = this.runners.get(taskId)
+    return new Promise<SubAgentRecord | null>((resolve) => {
+      let settled = false
+      let timer: ReturnType<typeof setTimeout> | undefined
+
+      const cleanup = () => {
+        CampaignEventBus.off('subagent:completed', onCompleted)
+        CampaignEventBus.off('subagent:failed', onFailed)
+        opts.abortSignal?.removeEventListener('abort', onAbort)
+        if (timer) clearTimeout(timer)
+      }
+
+      const settle = (record: SubAgentRecord | null) => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolve(record)
+      }
+
+      const readAndSettle = () => {
+        void readTask(taskId).then(settle, () => settle(null))
+      }
+
+      const onCompleted = (e: SubAgentCompletedEvent) => {
+        if (e.parentSessionId === this.parentSessionId && e.taskId === taskId) readAndSettle()
+      }
+      const onFailed = (e: SubAgentFailedEvent) => {
+        if (e.parentSessionId === this.parentSessionId && e.taskId === taskId) readAndSettle()
+      }
+      const onAbort = () => readAndSettle()
+
+      CampaignEventBus.on('subagent:completed', onCompleted)
+      CampaignEventBus.on('subagent:failed', onFailed)
+      if (opts.abortSignal) {
+        if (opts.abortSignal.aborted) {
+          onAbort()
+          return
+        }
+        opts.abortSignal.addEventListener('abort', onAbort, { once: true })
+      }
+      if (opts.timeoutMs !== undefined && opts.timeoutMs >= 0) {
+        timer = setTimeout(readAndSettle, opts.timeoutMs)
+        if (timer.unref) timer.unref()
+      }
+
+      void readTask(taskId).then(record => {
+        if (record && TERMINAL_STATUSES.has(record.status)) settle(record)
+      }, () => undefined)
+      void initialRunner?.wait().then(readAndSettle, readAndSettle)
+    })
+  }
+
   /**
    * Read the latest checkpoint of a running sub-agent.
    * This is the "explicit intermediate fetch" path — only called when the
@@ -849,7 +912,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     if (this.destroyed) return
     const rec = await readTask(taskId).catch(() => null)
     const attempt = rec?.config.retryCount ?? 0
-    if (!rec || !shouldRetrySubAgentConfig(rec.config, attempt, this._autoRetryLimit, this._autonomyJail !== null)) {
+    if (!rec || !shouldRetrySubAgentConfig(rec.config, attempt, this._autoRetryLimit, this._autonomyJail !== null, error)) {
       surfaceFailure()
       return
     }

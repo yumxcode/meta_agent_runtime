@@ -98,6 +98,23 @@ describe('AutoWorktreeCoordinator', () => {
     expect(readFileSync(join(repo, 'dirty.txt'), 'utf-8')).toBe('uncommitted output\n')
   })
 
+  it('finalize is idempotent after a worktree is awaiting merge', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const handle = await coord.allocate('task-idempotent', 'session-1')
+    writeFileSync(join(handle!.worktreePath, 'once.txt'), 'one commit\n')
+
+    const first = await coord.finalize('task-idempotent')
+    const second = await coord.finalize('task-idempotent')
+
+    expect(first.status).toBe('committed')
+    expect(second).toEqual({
+      status: 'already_committed',
+      commitHash: first.commitHash,
+      changedFiles: [],
+    })
+  })
+
   it('persists task-to-branch mapping and restores a missing worktree on reconcile', async () => {
     initRepo(repo)
     const first = new AutoWorktreeCoordinator(repo)

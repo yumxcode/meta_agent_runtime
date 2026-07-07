@@ -1,5 +1,6 @@
 import { describe, it, expect } from 'vitest'
 import {
+  isDeterministicSubAgentFailure,
   mergeOverflowNotifications,
   retryBackoffMs,
   shouldRetrySubAgent,
@@ -39,6 +40,13 @@ describe('retry policy helpers', () => {
     expect(shouldRetrySubAgentConfig({}, 0, 2, true)).toBe(true)
     expect(shouldRetrySubAgentConfig({}, 0, 2, false)).toBe(false)
     expect(shouldRetrySubAgentConfig({}, 0, 0, true)).toBe(false)
+  })
+
+  it('does not retry deterministic failures with the same config', () => {
+    expect(isDeterministicSubAgentFailure('Turn limit exceeded (10 turns)')).toBe(true)
+    expect(isDeterministicSubAgentFailure('Budget exceeded ($0.50 limit)')).toBe(true)
+    expect(shouldRetrySubAgentConfig({}, 0, 2, true, 'Turn limit exceeded (10 turns)')).toBe(false)
+    expect(shouldRetrySubAgentConfig({}, 0, 2, true, 'transient provider overload')).toBe(true)
   })
 
   it('retryBackoffMs grows exponentially and caps at 30s', () => {

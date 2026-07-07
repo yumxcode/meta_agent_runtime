@@ -40,6 +40,25 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
             ? 'shared_readonly'
             : 'shared_write'
       const MAX_WAIT_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS + 60_000
+      const abortableSleep = (ms: number): Promise<void> =>
+        new Promise(resolve => {
+          let settled = false
+          let timer: ReturnType<typeof setTimeout>
+          const onAbort = () => {
+            if (settled) return
+            settled = true
+            clearTimeout(timer)
+            resolve()
+          }
+          timer = setTimeout(() => {
+            if (settled) return
+            settled = true
+            ctx.abortSignal.removeEventListener('abort', onAbort)
+            resolve()
+          }, ms)
+          if (ctx.abortSignal.aborted) onAbort()
+          else ctx.abortSignal.addEventListener('abort', onAbort, { once: true })
+        })
 
       try {
         const record = await bridge.spawnSubAgent({
@@ -50,8 +69,8 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
             maxTurns,
             maxBudgetUsd,
             requireHumanApproval: false,
-            useEventDriven: false,
-            pollIntervalMs: 500,
+            useEventDriven: true,
+            pollIntervalMs: 1_800_000,
             checkpointEveryNTurns: 0,
             workspaceMode,
             isolateWorktree: workspaceMode === 'isolated_write',
@@ -59,69 +78,53 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
           abortSignal: ctx.abortSignal,
         })
 
-        /**
-         * Abort-aware sleep: resolves after `ms` OR immediately when the
-         * AbortSignal fires — whichever comes first.  Clears the timer in
-         * both branches so no timer leaks under Bun or Node.
-         */
-        const abortableSleep = (ms: number): Promise<void> =>
-          new Promise<void>((resolve) => {
-            let settled = false
-            let timer: ReturnType<typeof setTimeout>
-            const onAbort = () => {
-              if (settled) return
-              settled = true
-              clearTimeout(timer)
-              resolve()
-            }
-            timer = setTimeout(() => {
-              if (settled) return
-              settled = true
-              ctx.abortSignal.removeEventListener('abort', onAbort)
-              resolve()
-            }, ms)
-            // Resolve immediately on abort — the timer is cleared to prevent
-            // the orphaned callback from firing 500ms later (memory + CPU leak
-            // when many agents are running concurrently under Bun).
-            if (ctx.abortSignal.aborted) {
-              onAbort()
-              return
-            }
-            ctx.abortSignal.addEventListener('abort', onAbort, { once: true })
-          })
-
-        const startMs = Date.now()
-        while (Date.now() - startMs < MAX_WAIT_MS) {
-          if (ctx.abortSignal.aborted) {
-            await bridge.cancelTask(record.taskId, 'run_agent aborted').catch(() => {})
-            return { content: 'Sub-agent cancelled (aborted by caller)', isError: true }
-          }
-          await abortableSleep(500)
-          // Re-check abort immediately after waking (may have been abort-triggered)
-          if (ctx.abortSignal.aborted) {
-            await bridge.cancelTask(record.taskId, 'run_agent aborted').catch(() => {})
-            return { content: 'Sub-agent cancelled (aborted by caller)', isError: true }
-          }
-          const status = await bridge.getStatus(record.taskId)
-          if (!status) return { content: `Internal error: task ${record.taskId} not found`, isError: true }
-
-          if (status.status === 'completed') {
-            return {
-              content: JSON.stringify({
-                task_id: record.taskId,
-                success: status.result?.success ?? true,
-                summary: status.result?.summary ?? '',
-                turns_used: status.result?.turnsUsed,
-                cost_usd: status.result?.costUsd,
-                duration_ms: status.result?.durationMs,
-                workspace_mode: status.config.workspaceMode,
-              }, null, 2),
-              isError: false,
-            }
-          }
-          if (status.status === 'failed') return { content: `Sub-agent failed: ${status.result?.error ?? 'unknown error'}`, isError: true }
-          if (status.status === 'cancelled') return { content: 'Sub-agent was cancelled', isError: true }
+        const onAbort = () => {
+          void bridge.cancelTask(record.taskId, 'run_agent aborted').catch(() => {})
         }
+        if (ctx.abortSignal.aborted) onAbort()
+        else ctx.abortSignal.addEventListener('abort', onAbort, { once: true })
+
+        let status: Awaited<ReturnType<typeof bridge.getStatus>>
+        try {
+          if (bridge.waitForTerminal) {
+            status = await bridge.waitForTerminal(record.taskId, {
+              timeoutMs: MAX_WAIT_MS,
+              abortSignal: ctx.abortSignal,
+            })
+          } else {
+            const startMs = Date.now()
+            do {
+              status = await bridge.getStatus(record.taskId)
+              if (status && ['completed', 'failed', 'cancelled'].includes(status.status)) break
+              await abortableSleep(500)
+            } while (!ctx.abortSignal.aborted && Date.now() - startMs < MAX_WAIT_MS)
+          }
+        } finally {
+          ctx.abortSignal.removeEventListener('abort', onAbort)
+        }
+
+        if (ctx.abortSignal.aborted) {
+          await bridge.cancelTask(record.taskId, 'run_agent aborted').catch(() => {})
+          return { content: 'Sub-agent cancelled (aborted by caller)', isError: true }
+        }
+        if (!status) return { content: `Internal error: task ${record.taskId} not found`, isError: true }
+
+        if (status.status === 'completed') {
+          return {
+            content: JSON.stringify({
+              task_id: record.taskId,
+              success: status.result?.success ?? true,
+              summary: status.result?.summary ?? '',
+              turns_used: status.result?.turnsUsed,
+              cost_usd: status.result?.costUsd,
+              duration_ms: status.result?.durationMs,
+              workspace_mode: status.config.workspaceMode,
+            }, null, 2),
+            isError: false,
+          }
+        }
+        if (status.status === 'failed') return { content: `Sub-agent failed: ${status.result?.error ?? 'unknown error'}`, isError: true }
+        if (status.status === 'cancelled') return { content: 'Sub-agent was cancelled', isError: true }
 
         await bridge.cancelTask(record.taskId, 'run_agent timeout').catch(() => {})
         return { content: `Sub-agent timed out after ${Math.round(MAX_WAIT_MS / 1000)}s`, isError: true }

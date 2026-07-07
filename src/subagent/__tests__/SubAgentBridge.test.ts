@@ -193,6 +193,26 @@ describe('SubAgentBridge scheduler', () => {
     expect(mockState.runners.map(r => r.taskId)).toEqual([first.taskId])
   })
 
+  it('waitForTerminal resolves when a running task finishes', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 1,
+      maxQueuedSubAgents: 4,
+      startDelayMs: 0,
+    })
+
+    const task = await bridge.spawnSubAgent({ config: { taskDescription: 'wait' } })
+    await waitFor(() => mockState.runners.length === 1)
+
+    const done = bridge.waitForTerminal(task.taskId, { timeoutMs: 1000 })
+    completeTask(task.taskId, 0.03)
+
+    await expect(done).resolves.toMatchObject({
+      taskId: task.taskId,
+      status: 'completed',
+      result: { costUsd: 0.03 },
+    })
+  })
+
   it('rejects spawns when running plus queued capacity is exhausted', async () => {
     const bridge = new SubAgentBridge(crypto.randomUUID(), {
       maxConcurrentSubAgents: 1,

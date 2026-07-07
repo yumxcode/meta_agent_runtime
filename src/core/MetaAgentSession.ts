@@ -375,6 +375,7 @@ export class MetaAgentSession {
         // model that actually exists on this provider (and so the P0-1 prefetch
         // compatibility check matches — see prefetchRelevantMemories).
         flashModel:     this.config.flashModel,
+        skipMemoryRecall: this.config.skipMemoryRecall,
         mode,
         domain:         this.config.domain,
         subAgentBridge: this._subAgentBridge,

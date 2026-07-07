@@ -874,6 +874,8 @@ export interface VolatileContextOptions {
   currentQuery?: string
   /** Client for flash model memory side-call; falls back to keyword match. */
   client?: Anthropic
+  /** Skip D1b memory recall entirely for isolated one-shot sessions. */
+  skipMemoryRecall?: boolean
   /**
    * Flash model id for the D1b relevance side-call. When omitted the recall
    * falls back to a hard-coded default that may not exist on the configured
@@ -914,17 +916,21 @@ export interface VolatileContextOptions {
  *   const effectivePrompt = prefix ? `${prefix}\n\n---\n\n${prompt}` : prompt
  */
 export function buildVolatileContextSections(opts: VolatileContextOptions): SystemPromptSection[] {
-  const sections: SystemPromptSection[] = [
-    // D1b — per-query memory recall (always first so the model has memory context
-    // before reading mode-specific state)
-    buildMemoryContentSection(
+  const sections: SystemPromptSection[] = []
+
+  // D1b — per-query memory recall (first when enabled so the model has memory
+  // context before reading mode-specific state).  Isolated sub-agents skip this
+  // by default: their taskDescription is the contract, and memory recall is a
+  // slow side-call plus an isolation leak for judge/reviewer roles.
+  if (!opts.skipMemoryRecall) {
+    sections.push(buildMemoryContentSection(
       opts.currentQuery ?? '',
       opts.client,
       opts.mode,
       opts.domain,
       opts.flashModel,
-    ),
-  ]
+    ))
+  }
 
   // Rx — caller-provided mode-specific volatile sections (R2, R3, R5, team, etc.)
   if (opts.volatileExtensions) {

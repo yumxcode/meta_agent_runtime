@@ -334,6 +334,7 @@ export class SubAgentRunner {
 
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
+      skipMemoryRecall: cfg.skipMemoryRecall ?? true,
       maxTurns:     cfg.maxTurns,
       maxBudgetUsd: cfg.maxBudgetUsd,
       tools:        sessionTools,
