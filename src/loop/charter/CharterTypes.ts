@@ -8,11 +8,19 @@
  */
 import type { Ast } from '../expr/Expr.js'
 
-/** Where an observable's value is collected from each round (spec §3.1). */
+/**
+ * Where an observable's value is collected from each round (spec §3.1).
+ *
+ * ONLY `judge` is wired: `collectObservables` reads the value from the judge's
+ * return_result `data[key]`. Other sources (ledger/meter) were declared but never
+ * implemented, so they are NOT part of the contract — a charter that uses them
+ * would silently produce an unpopulated observable (dead tripwires/meters). If a
+ * new source is ever added, wire it in `collectObservables`, extend this union,
+ * AND allow it in `validateCharter` together — the validator is the source of
+ * truth for what the kernel can actually honor.
+ */
 export type ObservableSource =
   | { from: 'judge'; key: string }              // judge return_result data field
-  | { from: 'ledger'; file: string; path: string } // JSON pointer-ish dotted path
-  | { from: 'meter'; name: string }
 
 export interface ObservableSpec {
   name: string

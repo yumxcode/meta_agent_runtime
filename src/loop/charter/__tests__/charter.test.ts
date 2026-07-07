@@ -22,6 +22,28 @@ describe('validateCharter', () => {
     expect(errs.some(e => e.includes('undeclared identifier') && e.includes('new_findingz'))).toBe(true)
   })
 
+  it("rejects an observable whose source.from is not 'judge' (only wired source)", () => {
+    const errs = validateCharter(walkResearchCharter({
+      observables: [
+        { name: 'new_findings', source: { from: 'judge', key: 'new_findings_count' } },
+        { name: 'metric_delta', source: { from: 'judge', key: 'metric_delta' } },
+        // Unsupported source — the kernel never populates it (dead tripwire risk).
+        { name: 'worker_status', source: { from: 'worker', key: 'label' } as unknown as { from: 'judge'; key: string } },
+      ],
+    }))
+    expect(errs.some(e => e.includes('worker_status') && e.includes("must be 'judge'"))).toBe(true)
+  })
+
+  it("rejects a judge observable missing its 'key'", () => {
+    const errs = validateCharter(walkResearchCharter({
+      observables: [
+        { name: 'new_findings', source: { from: 'judge', key: 'new_findings_count' } },
+        { name: 'metric_delta', source: { from: 'judge' } as unknown as { from: 'judge'; key: string } },
+      ],
+    }))
+    expect(errs.some(e => e.includes('metric_delta') && e.includes("needs a non-empty 'key'"))).toBe(true)
+  })
+
   it('rejects a loop with no guaranteed terminator (no stop tripwire and no lifetime budget)', () => {
     const errs = validateCharter(walkResearchCharter({
       tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }],

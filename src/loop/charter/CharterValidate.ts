@@ -25,7 +25,22 @@ export function validateCharter(charter: Charter): string[] {
     if (obsNames.has(o.name)) errs.push(`duplicate observable: ${o.name}`)
     obsNames.add(o.name)
     declared.add(o.name)
-    if (!o.source || !('from' in o.source)) errs.push(`observable[${o.name}] needs a source`)
+    // The validator is the source of truth for what the kernel can resolve.
+    // Only `from:'judge'` is wired (collectObservables reads judge.data[key]);
+    // anything else silently yields an unpopulated observable → dead
+    // tripwires/meters. Reject it loudly at create time.
+    const src = o.source as { from?: unknown; key?: unknown } | undefined
+    if (!src || typeof src.from !== 'string') {
+      errs.push(`observable[${o.name}] needs a source with a 'from'`)
+    } else if (src.from !== 'judge') {
+      errs.push(
+        `observable[${o.name}].source.from must be 'judge' — the only source the kernel resolves ` +
+        `(got '${src.from}'). Do NOT observe the worker: a failed worker round already increments ` +
+        `stale_count, so route worker errors via a stale_count tripwire (pivot/attention).`,
+      )
+    } else if (typeof src.key !== 'string' || !src.key.trim()) {
+      errs.push(`observable[${o.name}].source needs a non-empty 'key' (the judge return_result data field)`)
+    }
   }
   const meterNames = new Set<string>()
   for (const m of charter.meters ?? []) {

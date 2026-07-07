@@ -75,6 +75,7 @@ Charter 结构（全部字段；? 为可选）：
 - 因此"能停"的保证 = 一条 stop/finalize tripwire **或** 一个 lifetime 预算（二者至少其一，校验强制）。stale/pivot/attention 这些 tripwire 是**额外**的进展路由，不是唯一出口。对判不了的模糊目标，用 attention 定期升级给人，而不是硬造指标。
 
 硬性规则：
+- **observable 只能是 {"from":"judge","key":"<judge return_result 的字段名>"}**——内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，用了会静默失效成死规则，且校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/attention）兜底即可。
 - 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。
 - 保证可终止：至少有一条 stop/finalize tripwire 或一个 lifetime 预算（见"终止机制"）。tripwire 声明顺序即优先级（最严重的在前）。
 - judge/pivoter 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
