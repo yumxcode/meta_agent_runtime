@@ -30,7 +30,7 @@ import * as readline from 'node:readline'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { Writable } from 'node:stream'
-import { isAbsolute, resolve, join } from 'node:path'
+import { isAbsolute, resolve, join, basename } from 'node:path'
 import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
@@ -231,7 +231,8 @@ ${bold('OPTIONS')}
   -h, --help            Show this help
 
 ${bold('LOOP RUNTIME (charter-driven long-horizon loops)')}
-  meta-agent loop distill <需求.md>        Distill a requirement doc into a charter draft
+  meta-agent loop distill <需求.md>        Distill a requirement doc into a charter draft (visible agentic session)
+  meta-agent loop distill <需求.md> --resume --note "<意见>"  Co-create: resume the distill session and refine the draft
   meta-agent loop create <charter.json>    Validate+freeze a charter, init the instance, schedule first wake
   meta-agent loop list                     List loop instances in this workspace
   meta-agent loop inspect <instanceId>     Status + progress + recent rounds
@@ -4931,34 +4932,89 @@ function formatLoopEvent(e: LoopEvent): string {
  * (visible/streamed in the CLI), rather than a hidden sub-agent. Retries up to 3×,
  * feeding validation errors back, then writes the draft for human review.
  */
+/** value of a `--flag <value>` option, if present. */
+function flagValue(args: string[], name: string): string | undefined {
+  const i = args.indexOf(name)
+  return i >= 0 ? args[i + 1] : undefined
+}
+
+/** Prompt the human for a single line (co-creation feedback) on a TTY. */
+async function askLine(question: string): Promise<string> {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
+  try { return (await new Promise<string>(res => rl.question(question, res))).trim() }
+  finally { rl.close() }
+}
+
+/** Stable distill session id derived from the requirement doc (or an explicit --session). */
+function distillSessionId(docFile: string, override?: string): string {
+  if (override) return override
+  const slug = basename(docFile).replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase()
+  return `loop-distill-${slug || 'charter'}`
+}
+
+/**
+ * Distill a requirement doc into a charter draft as a DIRECT, VISIBLE agentic
+ * session that PERSISTS — so the human can `--resume` it and co-create the draft
+ * over several turns (each `--note` is one turn of feedback; the agent keeps its
+ * full reasoning + workspace exploration across turns). Retries up to 3× per turn
+ * feeding validation errors back, then writes the draft for review.
+ */
 async function runDistillDirect(opts: CliOptions, projectDir: string, args: string[]): Promise<void> {
-  const docFile = args.slice(1).find(a => !a.startsWith('--'))
+  const isResume = args.includes('--resume')
+  const out = flagValue(args, '--out') ?? 'charter.draft.json'
+  const sessionOverride = flagValue(args, '--session')
+  let note = flagValue(args, '--note')
+  // Positional doc path: skip flags and the values that follow value-flags.
+  const skip = new Set<string>()
+  for (const f of ['--out', '--note', '--session']) {
+    const i = args.indexOf(f)
+    if (i >= 0) { skip.add(args[i]!); if (args[i + 1]) skip.add(args[i + 1]!) }
+  }
+  const docFile = args.slice(1).find(a => !a.startsWith('--') && !skip.has(a))
   if (!docFile) throw new Error('loop distill: requirement doc path required')
-  const outIdx = args.indexOf('--out')
-  const out = outIdx >= 0 ? args[outIdx + 1]! : 'charter.draft.json'
   const doc = readFileSync(resolve(projectDir, docFile), 'utf-8')
+  const sessionId = distillSessionId(docFile, sessionOverride)
 
   assertApiKeyConfigured(opts)
+
+  // Resume: preload the prior distill transcript so the agent keeps context.
+  const priorMessages = isResume ? await SessionStore.loadHistory(sessionId) : []
+  if (isResume && priorMessages.length === 0) {
+    throw new Error(`没有可恢复的 distill 会话（${sessionId}）。请先不带 --resume 跑一次。`)
+  }
+  if (isResume) {
+    console.log(green(`✓ 已恢复 distill 会话 ${sessionId}（${priorMessages.length} 条历史）\n`))
+    if (!note) note = await askLine('修订意见 > ')
+    if (!note) throw new Error('loop distill --resume 需要修订意见（--note "…" 或交互输入）。')
+  }
+
   const router = makeRouter(
-    { ...opts, mode: 'simple_auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
-    undefined, undefined, undefined, undefined, undefined, undefined,
+    { ...opts, mode: 'agentic', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
+    undefined, undefined, priorMessages.length > 0 ? priorMessages : undefined, undefined, undefined, undefined,
   )
   const tools = await createStandardTools({
     system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
     network: { webFetch: { maxResultSizeChars: 8_000 } },
-    mode: 'simple_auto',
+    mode: 'agentic',
   })
   for (const tool of tools) router.registerTool(tool)
 
+  const freshPrompt =
+    `${DISTILLER_SYSTEM}\n\n【loop 需求描述】\n${doc}\n\n` +
+    '你可以用 read_file/grep/glob 读工作区来理解项目。最后在一个 ```json 代码块里输出最终结果：' +
+    '{"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。'
+  const resumePrompt =
+    `【修订意见】\n${note}\n\n在现有草案基础上**最小改动**修订：保留已正确的部分，只改我指出的地方。` +
+    '最后在一个 ```json 代码块里重新输出完整 {"charter":..., "taskSpec":...}。'
+
   try {
     let lastErrors: string[] = []
+    let wrote = false
     for (let attempt = 1; attempt <= 3; attempt++) {
-      const prompt = attempt === 1
-        ? `${DISTILLER_SYSTEM}\n\n【loop 需求描述】\n${doc}\n\n` +
-          '你可以用 read_file/grep/glob 读工作区来理解项目。最后在一个 ```json 代码块里输出最终结果：' +
-          '{"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。'
-        : `上一版章程未通过校验，必须修复：\n- ${lastErrors.join('\n- ')}\n` +
+      const prompt = attempt > 1
+        ? `上一版章程未通过校验，必须修复：\n- ${lastErrors.join('\n- ')}\n` +
           '请重新在一个 ```json 代码块里输出修正后的完整 {"charter":..., "taskSpec":...}。'
+        : (isResume ? resumePrompt : freshPrompt)
       console.log(dim(`\n[distill] 第 ${attempt}/3 次尝试…\n`))
       await streamPrompt(router, prompt, false, opts.showThinking)
       const parsed = parseDistillOutput(undefined, lastAssistantText(router.getMessages()))
@@ -4967,14 +5023,28 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
       if (errs.length === 0) {
         writeFileSync(resolve(projectDir, out), JSON.stringify(parsed.charter, null, 2), 'utf-8')
         if (parsed.taskSpec) writeFileSync(resolve(projectDir, 'task_spec.draft.md'), parsed.taskSpec, 'utf-8')
+        wrote = true
         console.log(green(`\n✓ charter 草案已写入 ${out}（第 ${attempt} 次尝试，已通过校验）`))
-        console.log(dim(`  审阅后运行: meta-agent -w ${projectDir} loop create ${out}`))
-        return
+        console.log(dim(`  审阅后运行:   meta-agent -w ${projectDir} loop create ${out}`))
+        console.log(dim(`  继续共创修订: meta-agent -w ${projectDir} loop distill ${docFile} --resume --note "你的意见"`))
+        break
       }
       lastErrors = errs
       console.log(yellow(`\n[distill] 校验未过：\n- ${errs.join('\n- ')}`))
     }
-    throw new Error(`distill 失败（3 次尝试后仍未产出合格 charter）:\n- ${lastErrors.join('\n- ')}`)
+    // Persist the transcript (success OR not) so the session is always resumable.
+    await SessionStore.replace(
+      sessionId,
+      { mode: 'agentic', startTime: Date.now(), lastActivity: Date.now(),
+        messageCount: router.getMessages().length, firstPrompt: `loop distill ${docFile}`, workspace: projectDir },
+      router.getMessages(),
+    ).catch(() => undefined)
+    if (!wrote) {
+      throw new Error(
+        `distill 未产出合格 charter（3 次尝试）:\n- ${lastErrors.join('\n- ')}\n` +
+        `会话已保存，可修订后继续: loop distill ${docFile} --resume --note "…"`,
+      )
+    }
   } finally {
     await router.dispose().catch(() => undefined)
   }
