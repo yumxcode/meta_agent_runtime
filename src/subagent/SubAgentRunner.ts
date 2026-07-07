@@ -150,6 +150,8 @@ export class SubAgentRunner {
   private _timedOut = false
   /** Authoritative result the sub-agent submitted via the return_result tool, if any. */
   private _returnedResult?: ReturnedResult
+  /** Set when a self-park tool (via cfg.parkSignal) ended the segment — terminal 'completed' with {label:'wait'}. */
+  private _parked = false
 
   constructor(
     record: SubAgentRecord,
@@ -406,12 +408,42 @@ export class SubAgentRunner {
           ) {
             await this._saveCheckpoint(lastText, toolResultCount)
           }
+          // Self-park (loop worker `timer`): the tool flipped parkSignal. End the
+          // segment MECHANICALLY — interrupt the session so no further model turn
+          // runs, and let the resulting 'result' event settle as a clean
+          // 'completed' with {label:'wait'} (the _parked branch below). This makes
+          // "call timer" == "park now", independent of the model returning wait.
+          if (cfg.parkSignal?.requested && !this._parked) {
+            this._parked = true
+            this._returnedResult = { summary: 'Parked (timer); resuming later to continue.', data: { label: 'wait' } }
+            this.session?.interrupt()
+          }
         }
 
         // Terminal: final result event from the agentic loop
         if (event.type === 'result') {
           turnsUsed    = event.numTurns
           inputTokens  = event.usage.inputTokens
+          // Self-park: the worker called timer → we interrupted. This is a clean
+          // parked handoff, NOT a timeout/cancel — write 'completed' with the
+          // {label:'wait'} payload the kernel uses to schedule the resume.
+          if (this._parked) {
+            outputTokens = event.usage.outputTokens
+            await this._writeTerminal('completed', {
+              success:      true,
+              summary:      this._summaryFor(lastText),
+              output:       this._returnedData(),
+              turnsUsed,
+              inputTokens,
+              outputTokens,
+              costUsd:      event.totalCostUsd,
+              durationMs:   Date.now() - startMs,
+              progressState: extractProgressState(
+                lastText, toolResultCount, this.record.latestCheckpoint,
+              ),
+            })
+            return
+          }
           outputTokens = event.usage.outputTokens
 
           // Abort may have fired mid-stream — timeout → failed, user cancel → cancelled
@@ -462,6 +494,26 @@ export class SubAgentRunner {
           await this._writeTerminal(isError ? 'failed' : 'completed', result)
           return
         }
+      }
+
+      // Generator exhausted without a 'result' event. If we self-parked, the
+      // interrupt ended the loop cleanly — settle as a parked 'completed' rather
+      // than a failure.
+      if (this._parked) {
+        await this._writeTerminal('completed', {
+          success:      true,
+          summary:      this._summaryFor(lastText),
+          output:       this._returnedData(),
+          turnsUsed,
+          inputTokens,
+          outputTokens,
+          costUsd:      this.session.getEstimatedCost(),
+          durationMs:   Date.now() - startMs,
+          progressState: extractProgressState(
+            lastText, toolResultCount, this.record.latestCheckpoint,
+          ),
+        })
+        return
       }
 
       // Generator exhausted without a 'result' event — either the wall-clock

@@ -49,7 +49,13 @@ export interface SeatSpec {
   context: SeatContext
   prompt: string
   tools?: string[]
-  budgetPerRound?: { usd?: number; turns?: number }
+  /**
+   * Per-SEGMENT circuit breakers for a seat call. `wallclockMin` sets the seat's
+   * wall-clock cap in minutes (default 30). A research submit segment (read +
+   * design + implement + submit) can need more; the long wait BETWEEN segments
+   * is free because the process is dead while parked.
+   */
+  budgetPerRound?: { usd?: number; turns?: number; wallclockMin?: number }
   /** Evidence whitelist for isolated seats (paths relative to stateRoot). */
   inputs?: string[]
 }

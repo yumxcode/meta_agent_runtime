@@ -67,6 +67,10 @@ export function validateCharter(charter: Charter): string[] {
     if (META_AGENT_RE.test(seat.prompt ?? '')) {
       errs.push(`seats.${name}.prompt references .meta-agent/ — runtime-internal, writes there are discarded`)
     }
+    const wc = seat.budgetPerRound?.wallclockMin
+    if (wc !== undefined && (!Number.isFinite(wc) || wc < 1)) {
+      errs.push(`seats.${name}.budgetPerRound.wallclockMin must be a positive number of minutes`)
+    }
   }
   if (charter.seats?.worker && charter.seats.worker.context === undefined) {
     errs.push("seats.worker.context is required ('lineage_loop' to accumulate context across rounds, or 'isolated' for fresh-eyes rounds)")

@@ -54,11 +54,11 @@ const DISCIPLINE = `\
 - **如实报告**：某步失败就附上相关输出说明；未执行或未验证的步骤，明确说明，不得把未完成/已损坏的工作说成"已完成"。`
 
 const WAIT_TOOLS = `\
-## 等待远端任务（自计时）
-当你启动了慢任务（如远端训练），想过一会儿再回来亲自看结果、决定"继续等 vs 终止收割"时：
-- 调 timer({minutes, reason}) 把自己 park，然后 return_result data={"label":"wait"}。到点内核会 resume 你（同一会话），并提示你继续；你据此自行检查任务状态：想再等就再调一次 timer，想收割就整理 findings/direction 后 return_result data={"label":"ok"}。
-- 若想立刻收尾而不再等待，先调 timer_cancel，再正常 return_result——别让自己一直 timer 循环。
-（这是"要眼睛看着判断"的等待方式。若等待判定是纯确定性阈值/换号，内核另有代码探针机制，不需要你醒。）`
+## 段协议（长任务如何等待）
+你的一轮可能被"等待"切成多段，段与段之间进程是关闭的——由内核负责在合适时机把你原样唤醒。
+- **发起了必须等结果的慢任务（如远端训练）后，立刻调 timer({minutes, reason})。调用 timer 即刻结束本段**——不需要再 return_result，也不要在本段继续做别的事（不要轮询、不要 sleep、不要再扇活）。minutes 取 5..180，按慢任务真正需要多久才有可见进展来定（如训练约 30 分钟看一次曲线）。
+- 到点后内核会 **resume 你（同一会话）**，user 消息会带"继续/收割"提示并附上提交段摘要。此时你亲自查状态：还需要等就**再调一次 timer**（再次 park），可以收割了就整理 findings/direction 后 return_result data={"label":"ok"}。
+- 因此"盯训练直到平台期再终止"这类判断发生在**被唤醒后的收割段**，而不是提交段里内联死等。`
 
 function contextConventions(variant: InnerWorkerVariant): string {
   const base = `\

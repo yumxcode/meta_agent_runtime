@@ -27,7 +27,7 @@ Charter 结构（全部字段；? 为可选）：
  "tripwires": [{"when":"<表达式>","then":{"mode":"pivot"|"finalize"|"attention"?, "escalate":"<名>"?, "stop":true?}}, …],
  "gates": {"state_gate":{"kind":"schema","files":["ledger/progress.json"]},
            "findings_gate":{"kind":"judge","evidence":["drafts/findings_draft.json","ledger/findings.jsonl"],"rubric":"…"}},
- "seats": {"worker":{"context":"lineage_loop"|"isolated","prompt":"<仅领域指令，见"座位底座">","tools":["read_file","edit_file","bash"],"budgetPerRound":{"usd":4,"turns":80}},
+ "seats": {"worker":{"context":"lineage_loop"|"isolated","prompt":"<仅领域指令，见"座位底座">","tools":["read_file","edit_file","bash"],"budgetPerRound":{"usd":4,"turns":80,"wallclockMin":45?}},
            "judge":{"context":"isolated","prompt":"…","inputs":["drafts/findings_draft.json","ledger/findings.jsonl"],"budgetPerRound":{"usd":0.5,"turns":10}},
            "pivoter":{"context":"isolated","prompt":"…","inputs":["ledger/directions.json","ledger/findings.jsonl"]}?},
  "budgets": {"perRound":{"usd":N},"lifetime":{"rounds":N,"usd":N}},
@@ -44,12 +44,15 @@ Charter 结构（全部字段；? 为可选）：
   ④ 可用 skill 清单（worker 自动看到，用 skill(action="load", name=…) 加载；例如某个外部工具/平台的能力由 skill 提供）；
   ⑤ 产出契约（先写 drafts/direction.json {"key","rationale"}，再写 drafts/findings_draft.json（数组，每条含 claim 与 evidence），最后调 return_result data={"label":"ok"|"error","note"}）；
   ⑥ 写入范围（由 charter.writeScope 下发，底座注入）；
-  ⑦ 自计时等待工具 timer/timer_cancel（见下）。
+  ⑦ 自计时等待工具 timer（见下）；以及"段协议"（提交长任务后调 timer 即结束本段、被唤醒后进收割段）——底座已讲，seat.prompt 不要复述机制。
 - 长时外部任务（任何需要"发起后等一会儿再看结果"的动作）**只有两种等待方式，都由 worker 驱动，不写进 charter**（没有代码探针；等待期间的状态检查、异常处理/重试、以及"继续等还是收尾"的判断，全部由 worker 自己用工具/skill 做）：
-  · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason) 把自己 park，到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"；timer_cancel 防死循环。适合需要 worker 亲眼看中间结果再决定"继续等 vs 收尾"、或等待中要 worker 自己处理异常的场景。**必须搭 context:"lineage_loop"**（要记得上一段的中间态）。（举例，不限于此：盯一个慢任务的进展按趋势决定是否提前终止；等待中遇到可恢复错误自己重试。）
+  · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason)——**调用即刻结束本段并 park**（底座硬保证；worker 不需要、也不应在调 timer 后继续做别的）。到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"。minutes 取 5..180（按慢任务真正需要多久才有可见进展来定）。适合需要 worker 亲眼看中间结果再决定"继续等 vs 收尾"、或等待中要 worker 自己处理异常的场景。**必须搭 context:"lineage_loop"**（要记得上一段的中间态）。（举例，不限于此：盯一个慢任务的进展按趋势决定是否提前终止。）
   · **事件（外部系统推送）**：worker 返回 return_result data={"label":"wait","effectKey":"<id>"} 声明在等一个外部事件；外部系统往 events/<id>.json 丢 {effectKey, verdict, data} 即收割。适合真正 push 式的外部系统；无超时（要超时用自计时）。
   你只需在 seat.prompt 里点明用哪种、以及提交后如何回看/判断——工具和事件机制底座已给。
-- 因此 seat.prompt 只写**领域/角色特有**的指令：本 worker 每轮具体做什么、如何选方向、领域判断标准、用哪个工具/skill 做什么、调用外部工具或提交长任务的领域细节。**不要**复述身份、输出格式（drafts/return_result）、"你是自主 agent"、"记得读胶囊"、skill 列表——底座已给，重复只会污染提示词、增加成本。目标写进 charter.goal（底座作为 D0 目标锚注入），不要抄进 seat.prompt。
+- **worker 每段任务必须是串行流程**（一步接一步：选方向 →〔需要就检索资料〕→ 设计 → 实现 → 提交长任务 → 调 timer 结束本段）。**绝不要**让 worker 在一段里并行扇出多个子代理再阻塞等待——那会挂死并拖满座位墙钟。若 worker 需要检索资料（如查论文），可 spawn **单个**子代理串行地搜、拿到结果再继续；tools 里给 spawn_sub_agent 即可，但 seat.prompt **不要**写"并行扇出 investigation/refutation/analogy"这类多路并发探索段。
+- **提交长任务后立刻调 timer 结束本段**是铁律；"盯进度直到平台期再终止"这类监控判断放到**被唤醒后的收割段**，不要在提交段里内联死盯或轮询。
+- 因此 seat.prompt 只写**领域/角色特有**的指令：本 worker 每轮具体做什么、如何选方向、领域判断标准、用哪个工具/skill 做什么、调用外部工具或提交长任务的领域细节。**不要**复述身份、输出格式（drafts/return_result）、段协议/timer 机制、"你是自主 agent"、"记得读胶囊"、skill 列表——底座已给，重复只会污染提示词、增加成本。目标写进 charter.goal（底座作为 D0 目标锚注入），不要抄进 seat.prompt。
+- seat.budgetPerRound 可含 **wallclockMin**（该座位**单段**墙钟上限，分钟；默认 30）。若某座位的提交段本来就要"读码+设计+实现+提交"这类较重工作，设大些（如 45–60），避免正常工作被 30 分钟墙钟误杀；段与段之间的等待不计墙钟（进程已关闭）。
 - worker.context 二选一，决定底座的会话形态：
   · "lineage_loop"：跨轮 **resume 同一会话**、积累上下文——用于"在已有实现上持续迭代、调参、逐步推进"的 worker；
   · "isolated"：每轮**全新会话、无历史**，只凭本轮 <context> 独立判断——用于"需要跳出既有框架、推翻假设、换新证据源、避免自我叙事绑架"的 worker。

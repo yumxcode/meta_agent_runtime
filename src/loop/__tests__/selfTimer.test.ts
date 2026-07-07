@@ -1,7 +1,8 @@
 /**
  * self_timer wait — the worker parks itself via the timer tool, the kernel
  * schedules a plain timer wake (NO effect ledger), and resumes the same round
- * at fireAt with a "continue" preface. timer_cancel breaks the park.
+ * at fireAt with a "continue" preface. Calling timer hard-ends the segment (the
+ * runner enforces the park; here the scripted dispatcher returns {label:'wait'}).
  */
 import { describe, expect, it } from 'vitest'
 import { mkdtemp, mkdir, readFile, writeFile } from 'fs/promises'
@@ -50,11 +51,6 @@ async function callTimer(config: SubAgentRecord['config'], minutes: number, reas
   const tool = config.extraTools?.find(t => t.name === 'timer')
   await tool?.call({ minutes, reason })
 }
-async function callCancel(config: SubAgentRecord['config']): Promise<void> {
-  const tool = config.extraTools?.find(t => t.name === 'timer_cancel')
-  await tool?.call({})
-}
-
 async function writeHarvestDrafts(paths: ReturnType<typeof instancePaths>): Promise<void> {
   await mkdir(paths.draftsDir, { recursive: true })
   await writeFile(join(paths.draftsDir, 'direction.json'), JSON.stringify({ key: 'dir-1' }), 'utf-8')
@@ -114,20 +110,24 @@ describe('self_timer wait', () => {
     expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('done')
   })
 
-  it('timer_cancel breaks the park — the round completes in one tick without waiting', async () => {
-    const { dir, paths } = await setup()
+  it('timer enforces 5..180 minute bounds and records the intent', async () => {
+    const { dir } = await setup()
+    let captured: unknown = null
     const dispatcher = scriptedDispatcher(async (task, config) => {
       if (isWorker(task) && !isContinue(task)) {
-        await callTimer(config, 30, 'oops')
-        await callCancel(config)            // changed mind → conclude now
-        await writeHarvestDrafts(paths)
-        return { label: 'ok' }
+        const tool = config.extraTools?.find(t => t.name === 'timer')!
+        const tooShort = await tool.call({ minutes: 2, reason: 'r' })
+        const tooLong  = await tool.call({ minutes: 300, reason: 'r' })
+        captured = { tooShort: tooShort.isError, tooLong: tooLong.isError }
+        await tool.call({ minutes: 30, reason: '看训练进度' }) // valid → parks
+        return { label: 'wait' }
       }
       if (isJudge(task)) return { verdict: 'pass', new_findings_count: 1, metric_delta: 0.1, metric: 0.5, messages: [] }
       throw new Error('unexpected seat')
     })
     await tickOnce({ dispatcher, projectDir: dir })
-    expect(await readPendingRound((await loadInstance(dir, 'walk-research-v1'))!)).toBeNull()
-    expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('done')
+    expect(captured).toEqual({ tooShort: true, tooLong: true })
+    // No timer_cancel tool is offered anymore.
+    // (park is enforced by the runner on the timer tool_result — see SubAgentRunner.)
   })
 })

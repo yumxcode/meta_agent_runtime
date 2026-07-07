@@ -16,7 +16,7 @@ import { readFile } from 'fs/promises'
 import { basename, join } from 'path'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { MetaAgentTool } from '../../core/types.js'
-import { makeTimerTool, makeTimerCancelTool, type TimerIntent } from '../../subagent/tools/timer.js'
+import { makeTimerTool, type TimerIntent } from '../../subagent/tools/timer.js'
 import { spawnAndWait, type SpawnWaitOptions } from '../seatSpawn.js'
 import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
@@ -82,11 +82,14 @@ export async function runWorkerSeat(
     ? `loop-${basename(paths.root)}-worker`
     : undefined
   // Self-park channel: the worker may call timer(...) to be woken later this
-  // round; timer_cancel clears it. Captured here (in-process) into timerIntent.
+  // round. Calling timer HARD-PARKS the segment — the sink records the intent
+  // AND flips parkSignal, which the runner detects on the timer tool_result to
+  // interrupt the session and terminate with {label:'wait'}. So the worker
+  // cannot keep working after parking (no reliance on a follow-up return_result).
   let timerIntent: TimerIntent | null = null
+  const parkSignal = { requested: false }
   const timerTools: MetaAgentTool[] = [
-    makeTimerTool(i => { timerIntent = i }),
-    makeTimerCancelTool(() => { timerIntent = null }),
+    makeTimerTool(i => { timerIntent = i; parkSignal.requested = true }),
   ]
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
   // the sandbox level for the worker's bash — the prompt contract is the
@@ -101,7 +104,7 @@ export async function runWorkerSeat(
     ],
   }
   const result = await runSeat(
-    deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, timerTools,
+    deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, timerTools, parkSignal,
   )
   return timerIntent ? { ...result, timer: timerIntent } : result
 }
@@ -163,8 +166,10 @@ async function runSeat(
   systemPromptOverride?: string,
   /** inner_orch_worker lineage: stable session id to resume/persist across rounds. */
   lineageSessionId?: string,
-  /** Instance-scoped tool objects (e.g. timer/timer_cancel for the worker). */
+  /** Instance-scoped tool objects (e.g. timer for the worker). */
   extraTools?: MetaAgentTool[],
+  /** Shared park signal — a self-park tool flips it to end the segment (worker). */
+  parkSignal?: { requested: boolean },
 ): Promise<SeatResult> {
   const rec = await spawnAndWait(
     deps.dispatcher,
@@ -173,6 +178,12 @@ async function runSeat(
       allowedTools: seat.tools ?? defaultTools,
       maxTurns: seat.budgetPerRound?.turns ?? 30,
       maxBudgetUsd: seat.budgetPerRound?.usd ?? 2,
+      // Per-segment wall-clock: a research submit segment can legitimately need
+      // >30 min (read + design + implement + submit). Configurable per charter;
+      // the long wait BETWEEN segments costs nothing (the process is dead).
+      ...(seat.budgetPerRound?.wallclockMin
+        ? { maxDurationMs: seat.budgetPerRound.wallclockMin * 60_000 }
+        : {}),
       requireHumanApproval: false,
       useEventDriven: false,
       pollIntervalMs: 500,
@@ -184,6 +195,7 @@ async function runSeat(
         : {}),
       ...(lineageSessionId ? { lineageSessionId } : {}),
       ...(extraTools?.length ? { extraTools } : {}),
+      ...(parkSignal ? { parkSignal } : {}),
     },
     deps.signal,
     deps.spawnOpts,

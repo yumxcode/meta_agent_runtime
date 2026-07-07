@@ -83,10 +83,18 @@ export interface SubAgentConfig {
   /**
    * Extra tool OBJECTS injected into this sub-agent's session (beyond the
    * name-resolved allowedTools). Used by the loop to give a worker seat
-   * instance-scoped tools like timer/timer_cancel whose handlers close over
+   * instance-scoped tools like timer whose handlers close over
    * loop state. In-process only (not serialized across a process boundary).
    */
   extraTools?: MetaAgentTool[]
+  /**
+   * Shared park signal for loop worker seats. A self-park tool (timer) flips
+   * `requested` when called; the runner detects it on that tool's tool_result,
+   * interrupts the session, and writes a terminal 'completed' with output
+   * {label:'wait'} — so calling the tool ENDS the segment mechanically, without
+   * relying on the model to also return_result. In-process only (by reference).
+   */
+  parkSignal?: { requested: boolean }
 
   // ── Circuit breakers ──────────────────────────────────────────────────────
   /** Maximum conversation turns before the sub-agent is force-stopped.  Default: 10 */
