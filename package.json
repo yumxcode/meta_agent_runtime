@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.5.6",
+  "version": "0.5.8",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -44,6 +44,7 @@
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",
+    "@meta-agent/runtime": "file:meta-agent-runtime-0.5.8.tgz",
     "openai": "^6.39.0",
     "zod": "^4.4.3"
   },

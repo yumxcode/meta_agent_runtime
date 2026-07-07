@@ -18,6 +18,7 @@ import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { MetaAgentTool } from '../../core/types.js'
 import { makeTimerTool, type TimerIntent } from '../../subagent/tools/timer.js'
 import { spawnAndWait, type SpawnWaitOptions } from '../seatSpawn.js'
+import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../subagent/types.js'
 import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
@@ -171,6 +172,20 @@ async function runSeat(
   /** Shared park signal — a self-park tool flips it to end the segment (worker). */
   parkSignal?: { requested: boolean },
 ): Promise<SeatResult> {
+  // Per-segment wall-clock: a research submit segment can legitimately need
+  // >30 min (read + design + implement + submit). Configurable per charter;
+  // the long wait BETWEEN segments costs nothing (the process is dead).
+  const seatMaxDurationMs = seat.budgetPerRound?.wallclockMin
+    ? seat.budgetPerRound.wallclockMin * 60_000
+    : DEFAULT_SUB_AGENT_MAX_DURATION_MS
+  // The OUTER poll must outlast the seat's own wall-clock, else spawnAndWait
+  // abandons a still-running seat at the default 31 min and records "no record"
+  // (worker ✗, cost 0) — which silently defeats wallclockMin. Track the cap + slack,
+  // while respecting a larger daemon-provided override.
+  const spawnOpts: SpawnWaitOptions = {
+    ...deps.spawnOpts,
+    maxWaitMs: Math.max(deps.spawnOpts?.maxWaitMs ?? 0, seatMaxDurationMs + 60_000),
+  }
   const rec = await spawnAndWait(
     deps.dispatcher,
     {
@@ -178,12 +193,7 @@ async function runSeat(
       allowedTools: seat.tools ?? defaultTools,
       maxTurns: seat.budgetPerRound?.turns ?? 30,
       maxBudgetUsd: seat.budgetPerRound?.usd ?? 2,
-      // Per-segment wall-clock: a research submit segment can legitimately need
-      // >30 min (read + design + implement + submit). Configurable per charter;
-      // the long wait BETWEEN segments costs nothing (the process is dead).
-      ...(seat.budgetPerRound?.wallclockMin
-        ? { maxDurationMs: seat.budgetPerRound.wallclockMin * 60_000 }
-        : {}),
+      ...(seat.budgetPerRound?.wallclockMin ? { maxDurationMs: seatMaxDurationMs } : {}),
       requireHumanApproval: false,
       useEventDriven: false,
       pollIntervalMs: 500,
@@ -198,7 +208,7 @@ async function runSeat(
       ...(parkSignal ? { parkSignal } : {}),
     },
     deps.signal,
-    deps.spawnOpts,
+    spawnOpts,
   )
   const result = rec?.result
   const data = extractData(result?.output, result?.summary)

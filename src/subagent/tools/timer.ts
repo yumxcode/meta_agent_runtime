@@ -31,6 +31,12 @@ export function makeTimerTool(sink: (intent: TimerIntent) => void): MetaAgentToo
   return {
     name: 'timer',
     isConcurrencySafe: false,
+    // Auto mode gates out tools with no abortSupport contract (ToolExecution.ts).
+    // The loop worker seat runs in auto mode; without this, `timer` is DISABLED
+    // and the whole self-park mechanism silently never fires — the worker is
+    // forced to inline-poll instead. timer returns instantly (records intent, the
+    // runner then parks), so it is trivially abort-safe.
+    abortSupport: 'cooperative',
     description: `Park yourself and be woken later to continue THIS round.
 
 Use when you've started something slow (e.g. a remote training run) and want to

@@ -116,6 +116,10 @@ describe('self_timer wait', () => {
     const dispatcher = scriptedDispatcher(async (task, config) => {
       if (isWorker(task) && !isContinue(task)) {
         const tool = config.extraTools?.find(t => t.name === 'timer')!
+        // Auto mode gates out tools without an abort-safe contract; the loop
+        // worker seat is auto, so timer MUST declare abortSupport or it's disabled.
+        expect(tool.abortSupport).toBeDefined()
+        expect(tool.abortSupport).not.toBe('non_cooperative')
         const tooShort = await tool.call({ minutes: 2, reason: 'r' })
         const tooLong  = await tool.call({ minutes: 300, reason: 'r' })
         captured = { tooShort: tooShort.isError, tooLong: tooLong.isError }
