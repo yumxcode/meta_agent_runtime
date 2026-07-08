@@ -212,9 +212,18 @@ async function runSeat(
   )
   const result = rec?.result
   const data = extractData(result?.output, result?.summary)
+  // Surface the FAILURE REASON, not just the summary: failed spawns (API error,
+  // "No tools resolved", timeout, …) write summary:'' and put the cause in
+  // result.error — dropping it leaves an empty worker summary in the ledger and
+  // makes daemon failures undiagnosable.
+  const summary = result?.summary?.trim()
+    ? result.summary
+    : result?.error
+      ? `seat failed: ${result.error}`
+      : `seat did not complete (${rec?.status ?? 'no record'})`
   return {
     ok: rec?.status === 'completed' && result?.success === true && data['label'] !== 'error',
-    summary: result?.summary ?? `seat did not complete (${rec?.status ?? 'no record'})`,
+    summary,
     data,
     costUsd: result?.costUsd ?? 0,
   }

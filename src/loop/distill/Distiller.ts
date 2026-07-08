@@ -74,10 +74,24 @@ Charter 结构（全部字段；? 为可选）：
 - **内置预算**：budgets.lifetime（rounds/usd/deadline）是硬兜底，一定结束。**每份 charter 都要设**——它是唯一保证不会无限跑的地板。
 - 因此"能停"的保证 = 一条 stop/finalize tripwire **或** 一个 lifetime 预算（二者至少其一，校验强制）。stale/pivot/attention 这些 tripwire 是**额外**的进展路由，不是唯一出口。对判不了的模糊目标，用 attention 定期升级给人，而不是硬造指标。
 
+tripwire 动作语义（mode / escalate / stop —— 最易配错，务必钉死）：
+- 一条 tripwire 的 then 里三个字段语义完全不同，内核处理方式也不同：
+  · mode：这一轮的"开场姿态"标签。唯一有行为的是 mode:"pivot" —— 轮首内核先跑 pivoter 座位、把结构性 directive 注入胶囊喂给 worker（前提：声明了 pivoter 座位，且本轮没被 escalate/stop 终止）。mode:"finalize"/"attention" 基本只是状态标签，不改流程。
+  · escalate:"<名>"：立即终止整个 loop，并标记 needs-human-ack（status=attention_required、实例 paused）。这个字符串只是"终止原因标签"，**不会让同名座位运行**——escalate:"pivoter" 不等于"跑 pivoter 座位"。
+  · stop:true：立即终止、干净收尾（finalize），不需人工。
+- 优先级（死代码高发点）：escalate/stop 是**终止动作**，在轮首(MODE)与轮尾(ROUTE)两处都**先于 mode 的 pivot 效果**判定。所以把 escalate/stop 与 mode:"pivot" 写进**同一条 then 会互斥**——escalate/stop 赢，mode:"pivot" 永远到不了，pivoter 座位就成了永不执行的死代码。
+- 由此两条铁律：
+  1. 绝不把 escalate 或 stop 与 mode:"pivot" 放进同一条动作。要**自动结构性转向**就只写 {"mode":"pivot"}（不加 escalate/stop）；要**停下交人工**就只写 {"escalate":"<原因>"}（不加 mode:"pivot"）。
+  2. 声明 pivoter 座位 ⟺ 必须存在一条**可达的、只带 mode:"pivot"** 的 tripwire，否则 pivoter 永不触发=死座位；反过来，若不打算自动转向，就**别声明 pivoter 座位**，也别在 worker prompt 里写"按 pivoter directive 推进"（那句同样成死指令）。
+- 典型正确写法（stale 渐进升级；声明顺序=优先级，高阈值在前，故 4 在 2 前）：
+  · {"when":"stale_count >= 4","then":{"escalate":"attention"}} —— 长期无进展，停下交人工
+  · {"when":"stale_count >= 2","then":{"mode":"pivot"}} —— 先让 pivoter 自动结构性转向、把方向喂给 worker
+
 硬性规则：
 - **observable 只能是 {"from":"judge","key":"<judge return_result 的字段名>"}**——内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，用了会静默失效成死规则，且校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/attention）兜底即可。
 - 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。
 - 保证可终止：至少有一条 stop/finalize tripwire 或一个 lifetime 预算（见"终止机制"）。tripwire 声明顺序即优先级（最严重的在前）。
+- **mode/escalate/stop 三者互斥**（见"tripwire 动作语义"）：同一条 then 里 escalate/stop 绝不与 mode:"pivot" 并存；声明了 pivoter 座位就必须配一条只带 mode:"pivot" 的可达 tripwire，否则 pivoter=死座位。
 - judge/pivoter 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
 - 长时外部任务的等待由 worker 用 timer 工具（自计时）或事件驱动，**不建模成 charter 字段**；在 seat.prompt 里说明即可（见"座位底座"的等待机制）。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。

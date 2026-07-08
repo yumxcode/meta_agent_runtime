@@ -4901,7 +4901,17 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
 
     if (name === 'loop-scheduler') {
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler start (workspace ${projectDir})`)
-      const result = await runLoopScheduler({ dispatcher, projectDir, signal: abort.signal, observer })
+      const result = await runLoopScheduler({
+        dispatcher, projectDir, signal: abort.signal, observer,
+        // Without onTick, per-wake errors from tickOnce (outcomes[].error) are
+        // silently dropped in scheduler mode — `loop tick` prints them, so the
+        // daemon must too, or spawn failures become invisible.
+        onTick: tick => {
+          for (const o of tick.outcomes) {
+            if (o.error) console.log(`${dim(`[loop ${stamp()}]`)} ${red('✗')} ${o.loopId}: ${o.error}`)
+          }
+        },
+      })
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
         `${result.roundsRun} round(s) over ${result.ticks} tick(s).`)
     } else {
