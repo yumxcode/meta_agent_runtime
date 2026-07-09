@@ -10,7 +10,7 @@ import { createHash } from 'crypto'
 import { mkdir } from 'fs/promises'
 import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
 import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
-import { freezeCharter } from '../charter/CharterValidate.js'
+import { freezeCharter, normalizeCharter } from '../charter/CharterValidate.js'
 import { Ledger, withBuiltinSchemas } from '../ledger/LedgerApi.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import {
@@ -102,7 +102,9 @@ async function loadInstanceFrom(paths: InstancePaths, record: LoopInstanceRecord
   if (!charter) throw new Error(`instance ${record.instanceId} is missing its frozen charter`)
   return {
     record,
-    charter,
+    // Pre-v3 frozen snapshots carry legacy tripwire actions; normalize on every
+    // load (deterministic, in-memory only — the on-disk snapshot/hash is untouched).
+    charter: normalizeCharter(charter),
     paths,
     ledger: withBuiltinSchemas(new Ledger(paths), paths),
   }

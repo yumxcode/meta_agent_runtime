@@ -3791,6 +3791,19 @@ async function runRepl(opts: CliOptions): Promise<void> {
   let _pendingPasteText = ''
   let _activePasteSegment: PasteDisplaySegment | null = null
   const _pasteSegments: PasteDisplaySegment[] = []
+  /**
+   * Snapshot of readline's line/cursor taken the instant a paste collection
+   * starts (from the PREPENDED stdin listener, i.e. before readline ingests the
+   * chunk). A MULTI-LINE paste makes readline consume that pre-paste line —
+   * typed prefix and any earlier segment placeholders — into an intermediate
+   * 'line' event, leaving only the paste tail in rl.line. Without this snapshot
+   * the placeholder renderer overwrites the line with a bare [已粘贴N字] (typed
+   * chars vanish from display) AND the Enter-time ordered submit — which
+   * expands placeholders from the restored line and DISCARDS the accumulator
+   * copy — silently drops the typed prefix from the submitted message.
+   */
+  let _prePasteLine = ''
+  let _prePasteCursor = 0
 
   function beginPasteOutputMute(): void {
     if (_pasteOutputMuted) return
@@ -3820,6 +3833,11 @@ async function runRepl(opts: CliOptions): Promise<void> {
       _pendingPasteTail = ''
       _pendingPasteText = ''
       _activePasteSegment = null
+      // This runs from the prepended stdin listener, BEFORE readline ingests
+      // the paste chunk — rl.line still holds exactly what preceded the paste.
+      const rlm = mutableReadline()
+      _prePasteLine = rlm.line ?? ''
+      _prePasteCursor = Math.min(rlm.cursor ?? _prePasteLine.length, _prePasteLine.length)
     }
     _pasteNoticeChars += charCount(text)
     _pendingPasteText += text
@@ -3900,6 +3918,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     }
     const current = mutableRl.line ?? ''
     const nextPlaceholder = `[已粘贴${segment.chars}字]`
+    let cursorAt = -1
     if (segment.placeholder && current.includes(segment.placeholder)) {
       mutableRl.line = current.replace(segment.placeholder, nextPlaceholder)
     } else {
@@ -3911,13 +3930,27 @@ async function runRepl(opts: CliOptions): Promise<void> {
           break
         }
       }
-      const prefix = visiblePasteChars > 0
+      let prefix = visiblePasteChars > 0
         ? current.slice(0, current.length - visiblePasteChars)
         : current
-      mutableRl.line = `${prefix}${nextPlaceholder}`
+      let suffix = ''
+      // Multi-line paste: readline consumed the pre-paste line (typed prefix +
+      // earlier placeholders) into an intermediate 'line' event, so `current`
+      // holds only the paste tail. Re-anchor the placeholder inside the
+      // snapshotted pre-paste line — otherwise the typed prefix vanishes from
+      // the display AND from the ordered submit (the accumulator copy that
+      // still contains it is discarded in favour of the restored line).
+      if (lineBreakCount(segment.text) > 0 && _prePasteLine && !prefix.includes(_prePasteLine)) {
+        suffix = _prePasteLine.slice(_prePasteCursor)
+        prefix = `${_prePasteLine.slice(0, _prePasteCursor)}${prefix}`
+      }
+      mutableRl.line = `${prefix}${nextPlaceholder}${suffix}`
+      // Keep the insertion point right after the pasted block (before any text
+      // that sat after the cursor when the paste began).
+      cursorAt = `${prefix}${nextPlaceholder}`.length
     }
     segment.placeholder = nextPlaceholder
-    mutableRl.cursor = mutableRl.line.length
+    mutableRl.cursor = cursorAt >= 0 ? cursorAt : mutableRl.line.length
     rlOutput.withPassthrough(() => { mutableRl._refreshLine?.() })
   }
 
@@ -3991,6 +4024,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
     _pasteNoticeChars = 0
     _pendingPasteTail = ''
     _pendingPasteText = ''
+    _prePasteLine = ''
+    _prePasteCursor = 0
     _pasteCollecting = false
     _activePasteSegment = null
     _pasteSegments.length = 0
@@ -4005,6 +4040,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
     _pasteNoticeChars = 0
     _pendingPasteTail = ''
     _pendingPasteText = ''
+    _prePasteLine = ''
+    _prePasteCursor = 0
     _pasteCollecting = false
     _activePasteSegment = null
     _pasteSegments.length = 0
@@ -4019,6 +4056,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
     _pasteNoticeChars = 0
     _pendingPasteTail = ''
     _pendingPasteText = ''
+    _prePasteLine = ''
+    _prePasteCursor = 0
     _pasteCollecting = false
     _activePasteSegment = null
     _pasteApplySerial++
@@ -4031,6 +4070,8 @@ async function runRepl(opts: CliOptions): Promise<void> {
     _pasteNoticeChars = 0
     _pendingPasteTail = ''
     _pendingPasteText = ''
+    _prePasteLine = ''
+    _prePasteCursor = 0
     _pasteCollecting = false
     _activePasteSegment = null
     _pasteApplySerial++

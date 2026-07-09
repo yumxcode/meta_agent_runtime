@@ -300,7 +300,7 @@ function buildBatchAuthorTask(nodes: OrchNode[], previousErrors: Map<string, str
     '',
     '必须只输出一个 JSON 代码块，格式如下；不要输出解释文字，也不要只输出 node_id/labels/outputs 这类元数据：',
     '```json',
-    '{"nodes":[{"id":"route_by_status","source":"export async function main(input, api) {\\n  const progress = await api.state.readJson(\'state/progress.json\')\\n  const allowed = [\'healthy\', \'stale\', \'pivot_required\', \'attention_required\', \'error\']\\n  const label = allowed.indexOf(progress.status) >= 0 ? progress.status : \'error\'\\n  return { action: \'branch\', label, data: { readAt: api.nowIso } }\\n}\\n","note":"Routes by progress.status."}]}',
+    '{"nodes":[{"id":"route_by_status","source":"export async function main(input, api) {\\n  const progress = await api.state.readJson(\'state/progress.json\')\\n  const allowed = [\'healthy\', \'stale\', \'pivot_scheduled\', \'paused_attention\', \'completed\', \'error\']\\n  const label = allowed.indexOf(progress.status) >= 0 ? progress.status : \'error\'\\n  return { action: \'branch\', label, data: { readAt: api.nowIso } }\\n}\\n","note":"Routes by progress.status."}]}',
     '```',
     '',
     '每个输入节点都必须返回一项，id 必须完全一致。每个 source 第一行必须是 export async function main(input, api) { 或 export function main(input, api) {。source 的安全契约与 system prompt 相同。',

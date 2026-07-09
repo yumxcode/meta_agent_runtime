@@ -35,7 +35,36 @@ export interface MeterSpec {
   resetWhen?: string
 }
 
-export type TripwireAction = {
+/**
+ * Tripwire action — a discriminated union so that meaningless combinations are
+ * UNREPRESENTABLE (v3 redesign). Exactly three actions exist, each mapping to
+ * exactly one kernel behavior at ROUTE:
+ *
+ *   pivot    — schedule the NEXT round as a pivot round (one-shot directive;
+ *              the pivoter seat runs and its directive is injected into the
+ *              worker capsule). Requires seats.pivoter (validated).
+ *   finalize — end the loop gracefully: optional finalizer seat writes the
+ *              narrative, final_report.md is rendered, instance → done.
+ *   escalate — pause for a human: attention_report.md is rendered, wakes are
+ *              cancelled, instance → paused_attention. `onResume.resetMeters`
+ *              names the meters reset when a human re-arms (defaults to the
+ *              meters referenced by the fired tripwire's expression, so the
+ *              same tripwire cannot re-fire instantly after resume).
+ *
+ * Termination is owned by the kernel two ways regardless of tripwires:
+ * lifetime-budget exhaustion and judge acceptance (goal_satisfied) both
+ * finalize. Tripwires own everything situational.
+ */
+export type TripwireAction =
+  | { act: 'pivot' }
+  | { act: 'finalize'; reason?: string }
+  | { act: 'escalate'; reason: string; onResume?: { resetMeters: string[] } }
+
+/**
+ * Pre-v3 action shape ({mode?, escalate?, stop?}). Accepted ONLY through
+ * `normalizeCharter` (create/load-time migration); the kernel never sees it.
+ */
+export interface LegacyTripwireAction {
   mode?: 'pivot' | 'finalize' | 'attention'
   escalate?: string
   stop?: boolean
@@ -85,7 +114,15 @@ export interface Charter {
     worker: SeatSpec
     judge?: SeatSpec
     pivoter?: SeatSpec
+    /** Runs ONCE on graceful finalize to write the report's narrative section. */
+    finalizer?: SeatSpec
   }
+  /**
+   * Health rule for progress.status on continue rounds: staleWhen true → 'stale',
+   * else 'healthy'. Absent: falls back to the `stale_count > 0` convention when a
+   * meter named stale_count exists, else always 'healthy'.
+   */
+  health?: { staleWhen: string }
   budgets?: BudgetSpec
   /** repo write scope for the worker seat (D8); empty = state-only loop. */
   writeScope?: string[]
@@ -98,6 +135,8 @@ export interface FrozenCharter extends Charter {
   frozen: {
     meterAsts: Record<string, { incWhen?: Ast; resetWhen?: Ast }>
     tripwireAsts: Ast[]
+    /** Parsed charter.health.staleWhen, when declared. */
+    healthAst?: Ast
     /** All identifiers the expressions may reference (audit). */
     declaredIdentifiers: string[]
     frozenAt: number

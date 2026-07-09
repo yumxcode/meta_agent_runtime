@@ -12,13 +12,18 @@
  *   • meters carry over by NAME (new meters start at 0; dropped meters are
  *     archived in the audit entry, their history stays in rounds.jsonl);
  *   • migration of a paused_attention instance also re-arms it (that IS the
- *     human ack: the charter was amended in response to the report).
+ *     human ack: the charter was amended in response to the report);
+ *   • re-arm RESETS the meters behind the fired escalation (onResume.resetMeters,
+ *     defaulting to the meters the tripwire's expression references) — otherwise
+ *     the same tripwire would re-fire on the next round's ROUTE and the loop
+ *     would pause again without doing any work.
  */
 import { createHash } from 'crypto'
 import { join } from 'path'
 import { atomicWriteJson } from '../../infra/persist/index.js'
-import type { Charter } from '../charter/CharterTypes.js'
+import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
 import { freezeCharter } from '../charter/CharterValidate.js'
+import { collectRefs } from '../expr/Expr.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import type { LoopInstance } from './InstanceStore.js'
 import { setInstanceStatus } from './InstanceStore.js'
@@ -33,6 +38,33 @@ export interface MigrationEntry {
   newMeters: string[]
   droppedMeters: Record<string, number>
   reArmed: boolean
+  /** Meters zeroed by the re-arm (empty when not re-arming). */
+  resetMeters: string[]
+}
+
+/**
+ * Which meters must be zeroed so the fired escalation cannot instantly re-fire.
+ * Explicit onResume.resetMeters wins; default = identifiers referenced by the
+ * fired tripwire's expression, intersected with the meters. When the fired
+ * index is unknown (pre-v3 instance records), every escalate tripwire counts.
+ */
+function reArmResetTargets(
+  charter: FrozenCharter,
+  meterNames: ReadonlySet<string>,
+  firedIndex: number | undefined,
+): string[] {
+  const targets = new Set<string>()
+  const indices = firedIndex !== undefined
+    ? [firedIndex]
+    : charter.tripwires.flatMap((tw, i) => (tw.then.act === 'escalate' ? [i] : []))
+  for (const i of indices) {
+    const action = charter.tripwires[i]?.then
+    if (!action || action.act !== 'escalate') continue
+    const names = action.onResume?.resetMeters
+      ?? (charter.frozen.tripwireAsts[i] ? collectRefs(charter.frozen.tripwireAsts[i]!) : [])
+    for (const name of names) if (meterNames.has(name)) targets.add(name)
+  }
+  return [...targets]
 }
 
 export async function migrateInstance(
@@ -69,6 +101,14 @@ export async function migrateInstance(
   }
   for (const name of newMeterNames) carried[name] ??= 0
 
+  // Re-arm reset: computed against the OLD charter (the one whose tripwire
+  // fired), applied to whatever carried over into the new meter set.
+  const reArming = record.status === 'paused_attention'
+  const resetMeters = reArming
+    ? reArmResetTargets(instance.charter, newMeterNames, record.lastEscalation?.tripwireIndex)
+    : []
+  for (const name of resetMeters) carried[name] = 0
+
   const entry: MigrationEntry = {
     at: Date.now(),
     fromVersion: record.charterVersion,
@@ -78,7 +118,8 @@ export async function migrateInstance(
     carriedMeters: Object.keys(carried).filter(n => n in progress.meters),
     newMeters: [...newMeterNames].filter(n => !(n in progress.meters)),
     droppedMeters: dropped,
-    reArmed: record.status === 'paused_attention',
+    reArmed: reArming,
+    resetMeters,
   }
 
   // Order: audit first (append-only), then the swap, then progress/status.
@@ -91,8 +132,17 @@ export async function migrateInstance(
     charterHash: toHash,
     updatedAt: Date.now(),
   }
+  // The escalation is acknowledged by this migration — clear its marker.
+  if (reArming) delete instance.record.lastEscalation
   await atomicWriteJson(paths.instanceJson, instance.record)
-  await ledger.writeProgress({ ...progress, meters: carried, updatedAt: Date.now() })
+  // Re-arm also clears the terminal-ish progress status: the offending meters
+  // were just reset, and the next round's ROUTE recomputes the truth anyway.
+  await ledger.writeProgress({
+    ...progress,
+    meters: carried,
+    ...(reArming ? { status: 'healthy' as const } : {}),
+    updatedAt: Date.now(),
+  })
 
   if (entry.reArmed) {
     await setInstanceStatus(instance, 'idle', `migrated to v${frozen.version} (human ack)`)

@@ -8,7 +8,55 @@
 import { join, resolve } from 'path'
 
 export type LoopInstanceId = string
-export type RoundMode = 'normal' | 'pivot' | 'finalize' | 'attention'
+
+/**
+ * How a round runs. Exactly two modes exist (v3): 'pivot' rounds run the
+ * pivoter seat first and inject its directive into the worker capsule;
+ * 'normal' rounds don't. Termination is NOT a mode — it is a route action
+ * (see RouteDecision). Pre-v3 ledgers may contain 'finalize'/'attention';
+ * `normalizeRoundMode` maps them to 'normal' on read.
+ */
+export type RoundMode = 'normal' | 'pivot'
+
+/** Read-tolerance for pre-v3 persisted modes. */
+export function normalizeRoundMode(mode: unknown): RoundMode {
+  return mode === 'pivot' ? 'pivot' : 'normal'
+}
+
+/**
+ * The ROUTE decision of a round — structured, no string grammar.
+ *   continue — schedule the next round
+ *   pivot    — schedule the next round as a pivot round (nextRoundMode)
+ *   finalize — end the loop (cause: accepted | budget | tripwire)
+ *   escalate — pause for a human (always from a tripwire)
+ */
+export interface RouteDecision {
+  kind: 'continue' | 'pivot' | 'finalize' | 'escalate'
+  /** What triggered a non-continue kind. */
+  cause?: 'accepted' | 'budget' | 'tripwire'
+  /** Set when cause is 'tripwire' (index into charter.tripwires). */
+  tripwireIndex?: number
+  /** Human-readable reason (tripwire action reason, 'goal_satisfied', 'budget'…). */
+  reason?: string
+}
+
+/** Render a route for reports/CLI/capsule digests. Tolerates pre-v3 strings. */
+export function renderRoute(route: RouteDecision | string): string {
+  if (typeof route === 'string') return route
+  const label = route.reason ?? (route.cause === 'accepted' || route.cause === 'budget' ? route.cause : undefined)
+  const tw = route.tripwireIndex !== undefined ? `#tw${route.tripwireIndex}` : ''
+  return `${route.kind}${label ? `:${label}` : ''}${tw}`
+}
+
+/**
+ * progress.json status — a TOTAL function of the round's RouteDecision (plus
+ * the health rule on continue). Every value has exactly one producer:
+ *   healthy | stale    — route=continue (health rule)
+ *   pivot_scheduled    — route=pivot (next round will run the pivoter)
+ *   paused_attention   — route=escalate (mirrors the instance status: same fact)
+ *   completed          — route=finalize (the ONLY status a terminated-ok loop shows)
+ */
+export type ProgressStatus = 'healthy' | 'stale' | 'pivot_scheduled' | 'paused_attention' | 'completed'
 
 export type LoopInstanceStatus =
   | 'idle'              // between rounds, wake scheduled
@@ -32,6 +80,12 @@ export interface LoopInstanceRecord {
   updatedAt: number
   /** Set when status is terminal or paused — surfaced by `loop list`. */
   statusReason?: string
+  /**
+   * Set when status is paused_attention: which tripwire escalated. Consumed by
+   * re-arm (migrate) to reset the offending meters so the same tripwire cannot
+   * re-fire instantly after a human ack. Cleared on re-arm.
+   */
+  lastEscalation?: { tripwireIndex: number; reason: string; at: number }
 }
 
 /** One audited round — the append-only spine of the loop (ledger/rounds.jsonl). */
@@ -42,8 +96,8 @@ export interface RoundEntry {
   observables: Record<string, number | boolean | string>
   /** Meter values AFTER this round's METER step. */
   meters: Record<string, number>
-  /** Route decision taken (tripwire action or 'continue'). */
-  route: string
+  /** Route decision taken at ROUTE (pre-v3 ledgers hold strings; render via renderRoute). */
+  route: RouteDecision
   /** Corrective retries consumed this round (0 or 1 in M1). */
   correctiveRetries: number
   costUsd: number

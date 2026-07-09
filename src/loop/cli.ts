@@ -16,7 +16,7 @@ import { migrateInstance } from './instance/Migrate.js'
 import { distillCharter } from './distill/Distiller.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { tickOnce, runUntilQuiescent } from './runner.js'
-import { instancePaths, type LoopInstanceRecord } from './types.js'
+import { instancePaths, renderRoute, type LoopInstanceRecord } from './types.js'
 
 export interface LoopCliDeps {
   projectDir: string
@@ -154,7 +154,7 @@ async function cmdInspect(rest: string[], deps: LoopCliDeps): Promise<string> {
     '',
     'recent rounds:',
     ...view.lastRounds.map(r =>
-      `  #${r.round} [${r.mode}] route=${r.route} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
+      `  #${r.round} [${r.mode}] route=${renderRoute(r.route)} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
   ].join('\n')
 }
 

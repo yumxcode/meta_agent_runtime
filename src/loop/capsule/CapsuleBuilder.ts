@@ -9,7 +9,7 @@
 import { readFile, readdir, rename, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { atomicWriteJson } from '../../infra/persist/index.js'
-import type { InstancePaths, RoundMode } from '../types.js'
+import { renderRoute, type InstancePaths, type RoundMode } from '../types.js'
 import type { Ledger } from '../ledger/LedgerApi.js'
 
 export interface Capsule {
@@ -71,7 +71,7 @@ export async function buildCapsule(input: BuildCapsuleInput): Promise<Capsule> {
       .slice(-MAX_LIST_ITEMS * 4),
     recentFindings: view.lastFindings.map(digestLine),
     recentRounds: view.lastRounds.map(r =>
-      digestLine(`#${r.round} [${r.mode}] route=${r.route} ${Object.values(r.seatSummaries)[0] ?? ''}`),
+      digestLine(`#${r.round} [${r.mode}] route=${renderRoute(r.route)} ${Object.values(r.seatSummaries)[0] ?? ''}`),
     ),
     inboxMessages,
     ...(input.pivotDirective ? { pivotDirective: digestLine(input.pivotDirective) } : {}),

@@ -17,14 +17,17 @@
 import { appendFile, mkdir, readFile } from 'fs/promises'
 import { dirname } from 'path'
 import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
-import type { InstancePaths, RoundEntry } from '../types.js'
+import type { InstancePaths, ProgressStatus, RoundEntry } from '../types.js'
 
 export type SchemaValidator = (value: unknown) => string[]
 
 export interface ProgressView {
   iteration: number
   meters: Record<string, number>
-  status: string
+  /** Total function of the last round's RouteDecision — see ProgressStatus. */
+  status: ProgressStatus
+  /** One-shot directive: the next round runs as a pivot round (set by ROUTE, consumed by MODE). */
+  nextRoundMode?: 'pivot'
   bestMetric: number | null
   totalFindings: number
   totalCostUsd: number
@@ -157,8 +160,11 @@ export function roundSchema(value: unknown): string[] {
   if (typeof value !== 'object' || value === null) return ['round entry must be an object']
   const r = value as Record<string, unknown>
   if (typeof r['round'] !== 'number') errs.push('round must be a number')
-  if (typeof r['mode'] !== 'string') errs.push('mode must be a string')
-  if (typeof r['route'] !== 'string') errs.push('route must be a string')
+  if (r['mode'] !== 'normal' && r['mode'] !== 'pivot') errs.push("mode must be 'normal' | 'pivot'")
+  const route = r['route'] as Record<string, unknown> | undefined
+  if (typeof route !== 'object' || route === null || typeof route['kind'] !== 'string') {
+    errs.push('route must be a RouteDecision object with a kind')
+  }
   if (typeof r['costUsd'] !== 'number') errs.push('costUsd must be a number')
   return errs
 }

@@ -46,10 +46,68 @@ describe('validateCharter', () => {
 
   it('rejects a loop with no guaranteed terminator (no stop tripwire and no lifetime budget)', () => {
     const errs = validateCharter(walkResearchCharter({
-      tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }],
+      tripwires: [{ when: 'stale_count >= 2', then: { act: 'pivot' } }],
       budgets: { perRound: { usd: 6 } },  // no lifetime cap
     }))
     expect(errs.some(e => e.includes('guaranteed terminator'))).toBe(true)
+  })
+
+  it('rejects an escalate action without a reason', () => {
+    const errs = validateCharter(walkResearchCharter({
+      tripwires: [
+        { when: 'stale_count >= 4', then: { act: 'escalate' } as never },
+        { when: 'stale_count >= 2', then: { act: 'pivot' } },
+        { when: 'iteration >= 3', then: { act: 'finalize' } },
+      ],
+    }))
+    expect(errs.some(e => e.includes("escalate needs a non-empty 'reason'"))).toBe(true)
+  })
+
+  it('rejects onResume.resetMeters that names a non-meter', () => {
+    const errs = validateCharter(walkResearchCharter({
+      tripwires: [
+        { when: 'stale_count >= 4', then: { act: 'escalate', reason: 'x', onResume: { resetMeters: ['new_findings'] } } },
+        { when: 'stale_count >= 2', then: { act: 'pivot' } },
+        { when: 'iteration >= 3', then: { act: 'finalize' } },
+      ],
+    }))
+    expect(errs.some(e => e.includes('not a declared meter'))).toBe(true)
+  })
+
+  it('enforces pivot ⇔ pivoter in both directions', () => {
+    // pivot tripwire without a pivoter seat
+    const noSeat = walkResearchCharter()
+    delete noSeat.seats.pivoter
+    expect(validateCharter(noSeat).some(e => e.includes('seats.pivoter is not declared'))).toBe(true)
+    // pivoter seat without a pivot tripwire (explicit seats override keeps the pivoter)
+    const noTripwire = walkResearchCharter()
+    noTripwire.tripwires = [{ when: 'iteration >= 3', then: { act: 'finalize' } }]
+    expect(validateCharter(noTripwire).some(e => e.includes('dead seat'))).toBe(true)
+  })
+
+  it('validates health.staleWhen statically', () => {
+    const errs = validateCharter(walkResearchCharter({ health: { staleWhen: 'nope_meter > 1' } }))
+    expect(errs.some(e => e.includes('health.staleWhen') && e.includes('undeclared'))).toBe(true)
+    expect(validateCharter(walkResearchCharter({ health: { staleWhen: 'stale_count >= 2' } }))).toEqual([])
+  })
+
+  it('migrates pre-v3 tripwire actions on validate/freeze (attention→escalate, stop→finalize)', () => {
+    const legacy = walkResearchCharter({
+      tripwires: [
+        { when: 'stale_count >= 4', then: { escalate: 'attention', stop: true } as never },
+        { when: 'stale_count >= 2', then: { mode: 'pivot' } as never },
+        { when: 'iteration >= 5', then: { mode: 'attention' } as never },
+        { when: 'iteration >= 3', then: { mode: 'finalize', stop: true } as never },
+      ],
+    })
+    expect(validateCharter(legacy)).toEqual([])
+    const frozen = freezeCharter(legacy)
+    expect(frozen.tripwires.map(tw => tw.then)).toEqual([
+      { act: 'escalate', reason: 'attention' },
+      { act: 'pivot' },
+      { act: 'escalate', reason: 'attention' },
+      { act: 'finalize' },
+    ])
   })
 
   it('rejects non-isolated judge/pivoter (D6 is structural)', () => {

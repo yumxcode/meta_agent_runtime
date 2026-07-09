@@ -5,7 +5,7 @@
 import type { Charter } from '../charter/CharterTypes.js'
 
 export function walkResearchCharter(overrides?: Partial<Charter>): Charter {
-  return {
+  const charter: Charter = {
     id: 'walk-research',
     version: 1,
     goal: '人形机器人行走控制长周期自主研究：每轮推进研究并产出可验证 findings。',
@@ -22,9 +22,9 @@ export function walkResearchCharter(overrides?: Partial<Charter>): Charter {
       },
     ],
     tripwires: [
-      { when: 'stale_count >= 4', then: { escalate: 'attention', stop: true } },
-      { when: 'stale_count >= 2', then: { mode: 'pivot' } },
-      { when: 'iteration >= 3', then: { mode: 'finalize', stop: true } },
+      { when: 'stale_count >= 4', then: { act: 'escalate', reason: 'attention' } },
+      { when: 'stale_count >= 2', then: { act: 'pivot' } },
+      { when: 'iteration >= 3', then: { act: 'finalize' } },
     ],
     gates: {
       state_gate: { kind: 'schema', files: ['ledger/progress.json'] },
@@ -60,4 +60,23 @@ export function walkResearchCharter(overrides?: Partial<Charter>): Charter {
     roundIntervalMs: 0,
     ...overrides,
   }
+  // Keep the pivot ⇔ pivoter invariant (validator enforces BOTH directions)
+  // when a test overrides only ONE side: drop the dead pivoter seat, or drop
+  // the unhonorable pivot tripwire. (Tests overriding both sides are on their
+  // own — presumably exercising the validator.)
+  const hasPivotTripwire = charter.tripwires.some(tw => {
+    const t = tw.then as { act?: string; mode?: string }
+    return t.act === 'pivot' || t.mode === 'pivot' // v3 + legacy-migration fixtures
+  })
+  if (overrides?.tripwires && !overrides.seats && !hasPivotTripwire && charter.seats.pivoter) {
+    charter.seats = { ...charter.seats }
+    delete charter.seats.pivoter
+  }
+  if (overrides?.seats && !overrides.tripwires && hasPivotTripwire && !charter.seats.pivoter) {
+    charter.tripwires = charter.tripwires.filter(tw => {
+      const t = tw.then as { act?: string; mode?: string }
+      return t.act !== 'pivot' && t.mode !== 'pivot'
+    })
+  }
+  return charter
 }

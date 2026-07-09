@@ -5,14 +5,51 @@
  * the planner-error feedback pattern that proved out in v1).
  */
 import { parse, type Ast } from '../expr/Expr.js'
-import type { Charter, FrozenCharter, MeterSpec, TripwireSpec } from './CharterTypes.js'
+import type { Charter, FrozenCharter, LegacyTripwireAction, MeterSpec, TripwireAction, TripwireSpec } from './CharterTypes.js'
 
 const ID_RE = /^[a-z][a-z0-9_-]*$/i
 const META_AGENT_RE = /\.meta-agent[/\\]/
 
-export function validateCharter(charter: Charter): string[] {
+// ── v3 migration: legacy {mode?, escalate?, stop?} → discriminated union ──────
+
+function isLegacyAction(then: unknown): then is LegacyTripwireAction {
+  return typeof then === 'object' && then !== null && !('act' in then)
+}
+
+/**
+ * Map a pre-v3 action to its v3 equivalent, preserving the LEGACY KERNEL's
+ * actual priority (escalate > stop/finalize > pivot; bare mode:'attention'
+ * was intended as "hand to a human" → escalate).
+ */
+export function normalizeTripwireAction(then: TripwireAction | LegacyTripwireAction): TripwireAction {
+  if (!isLegacyAction(then)) return then
+  if (then.escalate) return { act: 'escalate', reason: then.escalate }
+  if (then.stop === true || then.mode === 'finalize') return { act: 'finalize' }
+  if (then.mode === 'pivot') return { act: 'pivot' }
+  if (then.mode === 'attention') return { act: 'escalate', reason: 'attention' }
+  // Empty legacy action — surfaces as a validation error downstream.
+  return then as unknown as TripwireAction
+}
+
+/**
+ * Upgrade a charter (or frozen charter) in place-shape: only tripwire actions
+ * differ between v2 and v3. Deterministic and idempotent — safe to apply on
+ * every load. Expressions/ASTs are untouched (`when` never changed shape).
+ */
+export function normalizeCharter<T extends Charter>(charter: T): T {
+  if (!charter || typeof charter !== 'object' || !Array.isArray(charter.tripwires)) return charter
+  const tripwires = charter.tripwires.map(tw =>
+    tw && typeof tw === 'object'
+      ? { ...tw, then: normalizeTripwireAction(tw.then as TripwireAction | LegacyTripwireAction) }
+      : tw,
+  )
+  return { ...charter, tripwires }
+}
+
+export function validateCharter(rawCharter: Charter): string[] {
   const errs: string[] = []
-  if (!charter || typeof charter !== 'object') return ['charter must be an object']
+  if (!rawCharter || typeof rawCharter !== 'object') return ['charter must be an object']
+  const charter = normalizeCharter(rawCharter)
   if (!charter.id || !ID_RE.test(charter.id)) errs.push('charter.id must match [a-z][a-z0-9_-]*')
   if (!Number.isInteger(charter.version) || charter.version < 1) errs.push('charter.version must be a positive integer')
   if (!charter.goal?.trim()) errs.push('charter.goal is required')
@@ -54,22 +91,45 @@ export function validateCharter(charter: Charter): string[] {
   for (const m of charter.meters ?? []) errs.push(...validateMeterExprs(m, declared))
   const tripwires = charter.tripwires ?? []
   if (tripwires.length === 0) errs.push('at least one tripwire is required (a loop must be able to stop)')
-  for (const [i, tw] of tripwires.entries()) errs.push(...validateTripwire(tw, i, declared))
+  for (const [i, tw] of tripwires.entries()) errs.push(...validateTripwire(tw, i, declared, meterNames))
 
   // Guaranteed-termination guarantee. Loops end three ways: (a) built-in
   // acceptance (judge sets goal_satisfied → kernel finalizes); (b) built-in
   // lifetime budget (rounds/usd/deadline → kernel finalizes); (c) a charter
-  // stop/finalize tripwire. (a) is not guaranteed to fire, so we require at
-  // least one GUARANTEED terminator: a stopping tripwire OR a lifetime budget.
-  const hasStopTripwire = tripwires.some(tw => tw.then?.stop === true || tw.then?.mode === 'finalize')
+  // finalize tripwire. (a) is not guaranteed to fire, so we require at least
+  // one GUARANTEED terminator: a finalize tripwire OR a lifetime budget.
+  // (escalate does not count — it pauses for a human, it does not terminate.)
+  const hasFinalizeTripwire = tripwires.some(tw => tw.then?.act === 'finalize')
   const lifeCap = charter.budgets?.lifetime
   const hasBudgetCap = !!(lifeCap && (lifeCap.rounds !== undefined || lifeCap.usd !== undefined || lifeCap.deadlineMs !== undefined))
-  if (!hasStopTripwire && !hasBudgetCap) {
+  if (!hasFinalizeTripwire && !hasBudgetCap) {
     errs.push(
-      'loop has no guaranteed terminator — declare a stopping tripwire (stop:true or mode:finalize) ' +
+      "loop has no guaranteed terminator — declare a tripwire with {act:'finalize'} " +
       'OR a lifetime budget (budgets.lifetime.rounds/usd/deadlineMs). Built-in acceptance ' +
       '(judge goal_satisfied) ends the loop early, but is not guaranteed to fire.',
     )
+  }
+
+  // pivot ⇔ pivoter binding (both directions, so neither side can go dead).
+  const hasPivotTripwire = tripwires.some(tw => tw.then?.act === 'pivot')
+  if (hasPivotTripwire && !charter.seats?.pivoter) {
+    errs.push("a tripwire uses {act:'pivot'} but seats.pivoter is not declared — the pivot round would degrade to a plain round")
+  }
+  if (charter.seats?.pivoter && !hasPivotTripwire) {
+    errs.push("seats.pivoter is declared but no tripwire uses {act:'pivot'} — the pivoter seat would never run (dead seat)")
+  }
+
+  // Meter names for onResume validation + health expression check.
+  if (charter.health) {
+    if (typeof charter.health.staleWhen !== 'string' || !charter.health.staleWhen.trim()) {
+      errs.push('health.staleWhen must be a non-empty expression')
+    } else {
+      try {
+        parse(charter.health.staleWhen, declared)
+      } catch (err) {
+        errs.push(`health.staleWhen: ${(err as Error).message}`)
+      }
+    }
   }
 
   // Seats.
@@ -133,7 +193,12 @@ function validateMeterExprs(m: MeterSpec, declared: ReadonlySet<string>): string
   return errs
 }
 
-function validateTripwire(tw: TripwireSpec, index: number, declared: ReadonlySet<string>): string[] {
+function validateTripwire(
+  tw: TripwireSpec,
+  index: number,
+  declared: ReadonlySet<string>,
+  meters: ReadonlySet<string>,
+): string[] {
   const errs: string[] = []
   if (!tw.when?.trim()) { errs.push(`tripwire[${index}] needs a 'when' expression`); return errs }
   try {
@@ -141,19 +206,41 @@ function validateTripwire(tw: TripwireSpec, index: number, declared: ReadonlySet
   } catch (err) {
     errs.push(`tripwire[${index}].when: ${(err as Error).message}`)
   }
-  const t = tw.then ?? {}
-  if (!t.mode && !t.escalate && t.stop !== true) {
-    errs.push(`tripwire[${index}].then must set mode, escalate, or stop`)
+  const t = tw.then as TripwireAction | undefined
+  switch (t?.act) {
+    case 'pivot':
+      break
+    case 'finalize':
+      break
+    case 'escalate': {
+      if (typeof t.reason !== 'string' || !t.reason.trim()) {
+        errs.push(`tripwire[${index}].then escalate needs a non-empty 'reason'`)
+      }
+      for (const name of t.onResume?.resetMeters ?? []) {
+        if (!meters.has(name)) {
+          errs.push(`tripwire[${index}].then.onResume.resetMeters references '${name}', which is not a declared meter`)
+        }
+      }
+      break
+    }
+    default:
+      errs.push(
+        `tripwire[${index}].then must be {act:'pivot'} | {act:'finalize'} | {act:'escalate',reason} — ` +
+        `got ${JSON.stringify(tw.then)}. (Pre-v3 {mode/escalate/stop} shapes are auto-migrated on create/load.)`,
+      )
   }
   return errs
 }
 
-/** Parse every expression and attach ASTs — the instantiation-time freeze (D9). */
-export function freezeCharter(charter: Charter): FrozenCharter {
-  const errs = validateCharter(charter)
+/** Parse every expression and attach ASTs — the instantiation-time freeze (D9).
+ * Pre-v3 tripwire actions are migrated here, so a frozen charter always carries
+ * the v3 discriminated union (the kernel never sees the legacy shape). */
+export function freezeCharter(rawCharter: Charter): FrozenCharter {
+  const errs = validateCharter(rawCharter)
   if (errs.length > 0) {
     throw new Error(`charter failed validation:\n- ${errs.join('\n- ')}`)
   }
+  const charter = normalizeCharter(rawCharter)
   const declared = new Set<string>(['budget.lifetime.exhausted'])
   for (const o of charter.observables) declared.add(o.name)
   for (const m of charter.meters) declared.add(m.name)
@@ -170,6 +257,7 @@ export function freezeCharter(charter: Charter): FrozenCharter {
     frozen: {
       meterAsts,
       tripwireAsts: charter.tripwires.map(tw => parse(tw.when, declared)),
+      ...(charter.health ? { healthAst: parse(charter.health.staleWhen, declared) } : {}),
       declaredIdentifiers: [...declared].sort(),
       frozenAt: Date.now(),
     },

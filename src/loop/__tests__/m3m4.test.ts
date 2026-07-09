@@ -65,7 +65,7 @@ describe('distillCharter', () => {
   it('feeds validation errors back and succeeds on the corrected attempt', async () => {
     const good = walkResearchCharter()
     const bad = walkResearchCharter({
-      tripwires: [{ when: 'stale_count >= 2', then: { mode: 'pivot' } }],
+      tripwires: [{ when: 'stale_count >= 2', then: { act: 'pivot' } }],
       budgets: { perRound: { usd: 6 } },  // no lifetime cap → no guaranteed terminator
     })
     const tasks: string[] = []
@@ -115,7 +115,7 @@ describe('migrateInstance', () => {
         { name: 'iteration', inc: 'every_round' },
         { name: 'plateau_streak', incWhen: 'metric_delta < 0' }, // stale_count dropped
       ],
-      tripwires: [{ when: 'iteration >= 10', then: { mode: 'finalize', stop: true } }],
+      tripwires: [{ when: 'iteration >= 10', then: { act: 'finalize' } }],
     })
     const oldHash = inst.record.charterHash
     const entry = await migrateInstance(inst, v2, { projectDir: dir })
@@ -145,7 +145,7 @@ describe('migrateInstance', () => {
       .rejects.toThrow(/cannot migrate while 'waiting'/)
   })
 
-  it('re-arms a paused_attention instance (migration = human ack)', async () => {
+  it('re-arms a paused_attention instance (migration = human ack) and resets the escalating meters', async () => {
     const { dir, inst } = await idleInstanceWithMeters()
     await setInstanceStatus(inst, 'paused_attention', 'attention at round 3')
     const wakeStore = new WakeStore(dir)
@@ -153,6 +153,12 @@ describe('migrateInstance', () => {
     expect(entry.reArmed).toBe(true)
     expect(inst.record.status).toBe('idle')
     expect((await wakeStore.list()).some(w => w.kind === 'timer' && w.status === 'pending')).toBe(true)
+    // v3: re-arm resets the meters behind the escalation (stale_count>=4 tripwire
+    // references stale_count) so the same tripwire can't re-fire instantly.
+    expect(entry.resetMeters).toEqual(['stale_count'])
+    const progress = await inst.ledger.readProgress()
+    expect(progress.meters['stale_count']).toBe(0)
+    expect(progress.meters['iteration']).toBe(3) // untouched
   })
 
   it('is reachable end-to-end via the CLI (save v2 → loop migrate)', async () => {
@@ -171,8 +177,8 @@ describe('lifetime budgets (T4.1)', () => {
   const budgetCharter = (lifetime: Record<string, number>) => walkResearchCharter({
     budgets: { perRound: { usd: 4 }, lifetime },
     tripwires: [
-      { when: 'budget.lifetime.exhausted', then: { escalate: 'budget', stop: true } },
-      { when: 'iteration >= 100', then: { mode: 'finalize', stop: true } },
+      { when: 'budget.lifetime.exhausted', then: { act: 'escalate', reason: 'budget' } },
+      { when: 'iteration >= 100', then: { act: 'finalize' } },
     ],
   })
 
@@ -190,7 +196,9 @@ describe('lifetime budgets (T4.1)', () => {
     expect(record.status).toBe('paused_attention')
     expect(record.statusReason).toContain('budget')
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')
-    expect(rounds.length).toBe(3) // 2 productive + 1 escalation entry
+    // v3: exhaustion is recomputed at ROUTE with the round accounted, so the
+    // escalation happens ON round 2 — no wasted empty third round.
+    expect(rounds.length).toBe(2)
     await expect(readFile(join(paths.reportsDir, 'attention_report.md'), 'utf-8'))
       .resolves.toContain('budget')
   })
@@ -217,7 +225,7 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
     await createInstance({
       projectDir: dir,
       charter: walkResearchCharter({
-        tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
       }),
       wakeStore: new WakeStore(dir),
     })
@@ -239,7 +247,7 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
     await createInstance({
       projectDir: dir,
       charter: walkResearchCharter({
-        tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
       }),
       wakeStore: new WakeStore(dir),
     })

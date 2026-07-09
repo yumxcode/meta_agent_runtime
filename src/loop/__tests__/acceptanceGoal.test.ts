@@ -41,7 +41,7 @@ describe('built-in acceptance (judge goal_satisfied)', () => {
     const paths = instancePaths(dir, 'walk-research-v1')
     const charter = walkResearchCharter({
       // Tripwires that will NOT fire at round 1 — so only acceptance can end it.
-      tripwires: [{ when: 'iteration >= 100', then: { mode: 'finalize', stop: true } }],
+      tripwires: [{ when: 'iteration >= 100', then: { act: 'finalize' } }],
       budgets: { perRound: { usd: 6 }, lifetime: { rounds: 100 } },
       seats: {
         worker: { context: 'isolated', prompt: 'W' },
@@ -71,7 +71,7 @@ describe('built-in acceptance (judge goal_satisfied)', () => {
     expect(rec.statusReason).toContain('goal_satisfied')
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n').map(l => JSON.parse(l) as RoundEntry)
     expect(rounds).toHaveLength(1)
-    expect(rounds[0]!.route).toBe('finalize:goal_satisfied')
+    expect(rounds[0]!.route).toMatchObject({ kind: 'finalize', cause: 'accepted', reason: 'goal_satisfied' })
     // Final report written (clean finalize, not attention).
     await expect(readFile(join(paths.reportsDir, 'final_report.md'), 'utf-8')).resolves.toContain('goal_satisfied')
     expect((await loadInstance(dir, 'walk-research-v1'))!.record.status).toBe('done')

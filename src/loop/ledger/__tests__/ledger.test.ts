@@ -13,7 +13,7 @@ async function freshLedger() {
 
 const round = (n: number): RoundEntry => ({
   round: n, mode: 'normal', observables: {}, meters: { stale_count: 0 },
-  route: 'continue', correctiveRetries: 0, costUsd: 0.5,
+  route: { kind: 'continue' }, correctiveRetries: 0, costUsd: 0.5,
   seatSummaries: {}, startedAt: 1, finishedAt: 2,
 })
 
@@ -46,7 +46,7 @@ describe('Ledger', () => {
   it('rejects malformed round entries before touching disk', async () => {
     const { ledger, paths } = await freshLedger()
     await expect(
-      ledger.appendJsonl(paths.roundsJsonl, { round: 'one', mode: 'normal', route: 'x', costUsd: 0 }),
+      ledger.appendJsonl(paths.roundsJsonl, { round: 'one', mode: 'normal', route: { kind: 'continue' }, costUsd: 0 }),
     ).rejects.toThrow(/round must be a number/)
     expect(await ledger.readJsonl(paths.roundsJsonl)).toEqual([])
   })

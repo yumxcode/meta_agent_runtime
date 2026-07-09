@@ -1,12 +1,23 @@
 /**
  * LoopKernel — the fixed nine-step round pipeline (spec §2, C7).
  *
- *   WAKE ▶ RECONCILE ▶ CAPSULE ▶ MODE ▶ SEAT ▶ GATE ▶ METER ▶ LEDGER ▶ ROUTE
+ *   WAKE ▶ RECONCILE ▶ MODE ▶ CAPSULE ▶ SEAT ▶ GATE ▶ METER ▶ LEDGER ▶ ROUTE
  *
  * Control flow is HOST CODE — no LLM ever decides what step comes next. The
- * only intelligent moments are SEAT (worker/pivoter) and the judge half of
- * GATE; every kernel decision is an expression evaluation over the frozen
- * charter, and every round leaves one audited RoundEntry behind.
+ * only intelligent moments are SEAT (worker/pivoter/finalizer) and the judge
+ * half of GATE; every kernel decision is an expression evaluation over the
+ * frozen charter, and every round leaves one audited RoundEntry behind.
+ *
+ * v3 invariants (mode/route/status redesign):
+ *   • Tripwires are evaluated EXACTLY ONCE per round, at ROUTE, on the freshest
+ *     meters. The result either executes now (finalize/escalate) or persists as
+ *     the next round's explicit directive (pivot → progress.nextRoundMode).
+ *   • MODE never reads tripwires: it consumes the one-shot pivot directive and
+ *     runs the built-in budget guard. The kernel owns WHETHER the loop may
+ *     continue (budget, acceptance); the charter owns WHEN to pivot/finalize/
+ *     escalate.
+ *   • Every status value is a total function of the RouteDecision — there is no
+ *     label the kernel ignores, and 'completed' is written ONLY on termination.
  *
  * M2: a round may SPLIT into a submit segment and a harvest segment. The
  * worker requests a wait ({label:'wait', wait:'<name>', …}); the kernel
@@ -23,10 +34,18 @@ import type { FrozenCharter, TripwireAction } from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
 import { setInstanceStatus } from '../instance/InstanceStore.js'
 import { buildCapsule, type Capsule } from '../capsule/CapsuleBuilder.js'
-import { runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
+import { runFinalizerSeat, runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
 import { WakeStore, type WakeRecord } from '../wake/WakeStore.js'
 import { atomicWriteFile } from '../../infra/persist/index.js'
-import type { PendingRound, RoundEntry, RoundMode } from '../types.js'
+import {
+  normalizeRoundMode,
+  renderRoute,
+  type PendingRound,
+  type ProgressStatus,
+  type RoundEntry,
+  type RoundMode,
+  type RouteDecision,
+} from '../types.js'
 import {
   clearPendingRound,
   effectLedgerFor,
@@ -108,7 +127,7 @@ export async function runRound(
       // A coalesced timer fired while we wait — the probe/event owns progress.
       await setInstanceStatus(instance, 'waiting')
       return {
-        round: pending.round, mode: pending.mode,
+        round: pending.round, mode: normalizeRoundMode(pending.mode),
         route: 'still-waiting', status: 'waiting', costUsd: 0,
       }
     }
@@ -130,25 +149,26 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
 
   const progress = await ledger.readProgress()
   const round = progress.iteration + 1
-  const budgetExhausted = lifetimeExhausted(charter, progress)
-  deps.observer?.({ type: 'round_started', round, mode: 'normal' })
 
-  // ── 4. MODE (pre-round tripwire read; D10: seats cannot veto) ───────────────
-  const preCtx = buildCtx(progress.meters, {}, budgetExhausted)
-  const preAction = firstTripwire(charter, preCtx)
-  const mode: RoundMode = preAction?.mode ?? 'normal'
+  // ── 3. MODE — no tripwire read here (v3: single evaluation point is ROUTE).
+  // Consume the one-shot pivot directive persisted by the previous ROUTE.
+  const mode: RoundMode = progress.nextRoundMode === 'pivot' && charter.seats.pivoter ? 'pivot' : 'normal'
+  deps.observer?.({ type: 'round_started', round, mode })
 
-  if (preAction?.escalate || preAction?.stop || budgetExhausted) {
-    const reason = preAction?.escalate ?? (budgetExhausted ? 'budget' : 'finalize')
+  // Built-in budget guard: when the lifetime budget is exhausted BEFORE any
+  // seat runs (e.g. a deadline passed while idle), the loop must not spend.
+  // The charter may still claim this boundary via an escalate/finalize tripwire
+  // on budget.lifetime.exhausted; otherwise the kernel finalizes.
+  if (lifetimeExhausted(charter, progress)) {
+    const route = terminalRouteForExhaustion(charter, buildCtx(progress.meters, {}, true))
     return terminate(instance, deps, {
-      round, mode, reason,
-      escalated: Boolean(preAction?.escalate) || budgetExhausted,
+      round, mode, route,
       startedAt, costUsd, seatSummaries, correctiveRetries: 0,
       observables: {}, meters: progress.meters,
     })
   }
 
-  // ── 3+5a. CAPSULE (+ pivoter when this is a pivot round) ────────────────────
+  // ── 4+5a. CAPSULE (+ pivoter when this is a pivot round) ────────────────────
   let pivotDirective: string | undefined
   if (mode === 'pivot' && charter.seats.pivoter) {
     const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode })
@@ -176,8 +196,25 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
     round, mode, startedAt, costUsd, seatSummaries,
     correctiveRetries: seatLoop.correctiveRetries,
     worker: seatLoop.worker, judge: seatLoop.judge,
-    budgetExhausted, baseProgress: progress,
+    baseProgress: progress,
   })
+}
+
+/**
+ * Terminal route when the lifetime budget is exhausted: the first matching
+ * tripwire may claim the boundary (escalate → hand to a human; finalize →
+ * graceful stop with its reason); a pivot match cannot be honored (no rounds
+ * remain), so the kernel's built-in finalize(budget) applies.
+ */
+function terminalRouteForExhaustion(charter: FrozenCharter, ctx: EvalContext): RouteDecision {
+  const hit = firstTripwire(charter, ctx)
+  if (hit?.action.act === 'escalate') {
+    return { kind: 'escalate', cause: 'tripwire', tripwireIndex: hit.index, reason: hit.action.reason }
+  }
+  if (hit?.action.act === 'finalize') {
+    return { kind: 'finalize', cause: 'tripwire', tripwireIndex: hit.index, reason: hit.action.reason ?? 'finalize' }
+  }
+  return { kind: 'finalize', cause: 'budget', reason: 'budget' }
 }
 
 // ── seat loop: worker + per-cause corrective retries + gates ──────────────────
@@ -368,14 +405,14 @@ async function harvestSegment(
   const isSelfTimer = pending.kind === 'self_timer'
   const effectKey = isSelfTimer ? null : pending.effectKey!
   const progress = await ledger.readProgress()
-  const budgetExhausted = lifetimeExhausted(charter, progress)
+  const mode = normalizeRoundMode(pending.mode)
   deps.observer?.({
     type: 'harvest_started', round: pending.round,
     effectKey: effectKey ?? `self_timer:${pending.reason ?? ''}`,
   })
 
   const capsule = await buildCapsule({
-    paths, ledger, goal: charter.goal, round: pending.round, mode: pending.mode,
+    paths, ledger, goal: charter.goal, round: pending.round, mode,
   })
   // Lineage digest (D5): the harvest/continue worker knows WHAT it parked on and
   // WHY, via the submit summary — not via a shared transcript.
@@ -405,7 +442,7 @@ async function harvestSegment(
     // Chained wait / self-timer re-park: same round parks again.
     if (effectKey) await effects.markHarvested(effectKey)
     return submitSegment(instance, deps, {
-      round: pending.round, mode: pending.mode, startedAt: pending.startedAt,
+      round: pending.round, mode, startedAt: pending.startedAt,
       costUsd, seatSummaries,
       correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
       waitRequest: seatLoop.waitRequest!,
@@ -414,11 +451,11 @@ async function harvestSegment(
   }
 
   const outcome = await completeRound(instance, deps, {
-    round: pending.round, mode: pending.mode, startedAt: pending.startedAt,
+    round: pending.round, mode, startedAt: pending.startedAt,
     costUsd, seatSummaries,
     correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
     worker: seatLoop.worker, judge: seatLoop.judge,
-    budgetExhausted, baseProgress: progress,
+    baseProgress: progress,
   })
   // Order matters for crash recovery: round ledger writes happened inside
   // completeRound → clear pending → settle the effect. reconcileWaiting heals
@@ -439,7 +476,6 @@ interface CompleteInput {
   correctiveRetries: number
   worker: SeatResult | null
   judge: SeatResult | null
-  budgetExhausted: boolean
   baseProgress: Awaited<ReturnType<LoopInstance['ledger']['readProgress']>>
 }
 
@@ -454,7 +490,11 @@ async function completeRound(
   // ── 7. METER ──────────────────────────────────────────────────────────────
   const observables = collectObservables(charter, input.judge)
   const meters = { ...progress.meters }
-  const meterCtx = buildCtx(meters, observables, input.budgetExhausted)
+  // Budget exhaustion is recomputed WITH this round accounted (iteration+cost),
+  // so ROUTE terminates now instead of wasting a wake on an empty next round.
+  const totalCostUsd = progress.totalCostUsd + input.costUsd
+  const budgetExhausted = lifetimeExhausted(charter, { iteration: input.round, totalCostUsd })
+  const meterCtx = buildCtx(meters, observables, budgetExhausted)
   for (const meter of charter.meters) {
     const asts = charter.frozen.meterAsts[meter.name] ?? {}
     if (meter.inc === 'every_round') {
@@ -473,15 +513,13 @@ async function completeRound(
     ? metric
     : progress.bestMetric
 
-  // ── 9. ROUTE (post-METER tripwire read) ───────────────────────────────────
-  // Built-in acceptance (symmetric with the built-in lifetime budget): if the
-  // judge reports the goal satisfied, the KERNEL ends the loop — no charter
-  // tripwire required. The judgment is the judge's; the decision is the kernel's.
-  const accepted = input.judge?.data['goal_satisfied'] === true
-  const postCtx = buildCtx(meters, observables, input.budgetExhausted)
-  const postAction = accepted ? null : firstTripwire(charter, postCtx)
-  const route = accepted ? 'finalize:goal_satisfied' : describeAction(postAction)
-  const status = accepted ? 'completed' : statusFor(postAction, meters)
+  // ── 9. ROUTE — the SINGLE tripwire evaluation point of the round ──────────
+  // Priority: built-in acceptance (judge goal_satisfied → the judgment is the
+  // judge's, the decision is the kernel's) ▸ first matching charter tripwire ▸
+  // built-in budget backstop ▸ continue.
+  const postCtx = buildCtx(meters, observables, budgetExhausted)
+  const route = decideRoute(charter, postCtx, input.judge, budgetExhausted)
+  const status = statusFor(route, charter, postCtx, meters)
 
   await ledger.appendRound({
     round: input.round, mode: input.mode, observables, meters, route,
@@ -493,27 +531,18 @@ async function completeRound(
     iteration: input.round,
     meters,
     status,
+    // One-shot pivot directive: set exactly when ROUTE chose pivot; the next
+    // round's MODE consumes it, and every other write clears it.
+    ...(route.kind === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
     bestMetric,
     totalFindings: progress.totalFindings + admitted,
-    totalCostUsd: progress.totalCostUsd + input.costUsd,
+    totalCostUsd,
     updatedAt: Date.now(),
   })
 
-  if (accepted) {
+  if (route.kind === 'finalize' || route.kind === 'escalate') {
     return terminate(instance, deps, {
-      round: input.round, mode: input.mode,
-      reason: 'goal_satisfied', escalated: false,
-      startedAt: input.startedAt, costUsd: input.costUsd,
-      seatSummaries: input.seatSummaries, correctiveRetries: input.correctiveRetries,
-      observables, meters, alreadyAccounted: true,
-    })
-  }
-
-  if (postAction?.escalate || postAction?.stop) {
-    return terminate(instance, deps, {
-      round: input.round, mode: input.mode,
-      reason: postAction.escalate ?? 'finalize',
-      escalated: Boolean(postAction.escalate),
+      round: input.round, mode: input.mode, route,
       startedAt: input.startedAt, costUsd: input.costUsd,
       seatSummaries: input.seatSummaries, correctiveRetries: input.correctiveRetries,
       observables, meters, alreadyAccounted: true,
@@ -526,8 +555,39 @@ async function completeRound(
     fireAt: Date.now() + (charter.roundIntervalMs ?? 0),
   })
   await setInstanceStatus(instance, 'idle')
-  deps.observer?.({ type: 'round_completed', round: input.round, route, status, costUsd: input.costUsd })
-  return { round: input.round, mode: input.mode, route, status, costUsd: input.costUsd }
+  const routeText = renderRoute(route)
+  deps.observer?.({ type: 'round_completed', round: input.round, route: routeText, status, costUsd: input.costUsd })
+  return { round: input.round, mode: input.mode, route: routeText, status, costUsd: input.costUsd }
+}
+
+/** ROUTE decision — total over the three tripwire actions + two built-ins. */
+function decideRoute(
+  charter: FrozenCharter,
+  ctx: EvalContext,
+  judge: SeatResult | null,
+  budgetExhausted: boolean,
+): RouteDecision {
+  if (judge?.data['goal_satisfied'] === true) {
+    return { kind: 'finalize', cause: 'accepted', reason: 'goal_satisfied' }
+  }
+  const hit = firstTripwire(charter, ctx)
+  if (hit) {
+    const { action, index } = hit
+    switch (action.act) {
+      case 'pivot':
+        // Validator guarantees seats.pivoter for v3 charters; a normalized
+        // legacy charter without one degrades to continue (cannot pivot).
+        return charter.seats.pivoter
+          ? { kind: 'pivot', cause: 'tripwire', tripwireIndex: index }
+          : { kind: 'continue' }
+      case 'finalize':
+        return { kind: 'finalize', cause: 'tripwire', tripwireIndex: index, reason: action.reason ?? 'finalize' }
+      case 'escalate':
+        return { kind: 'escalate', cause: 'tripwire', tripwireIndex: index, reason: action.reason }
+    }
+  }
+  if (budgetExhausted) return { kind: 'finalize', cause: 'budget', reason: 'budget' }
+  return { kind: 'continue' }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────
@@ -541,9 +601,12 @@ function buildCtx(
 }
 
 /** First matching tripwire in declaration order (charter authors rank them). */
-function firstTripwire(charter: FrozenCharter, ctx: EvalContext): TripwireAction | null {
+function firstTripwire(
+  charter: FrozenCharter,
+  ctx: EvalContext,
+): { action: TripwireAction; index: number } | null {
   for (const [i, ast] of charter.frozen.tripwireAsts.entries()) {
-    if (safeEval(ast, ctx, false)) return charter.tripwires[i]!.then
+    if (safeEval(ast, ctx, false)) return { action: charter.tripwires[i]!.then, index: i }
   }
   return null
 }
@@ -651,25 +714,34 @@ function judgeEvidence(charter: FrozenCharter): string[] {
   return []
 }
 
-function describeAction(action: TripwireAction | null): string {
-  if (!action) return 'continue'
-  if (action.escalate) return `escalate:${action.escalate}`
-  if (action.mode) return action.stop ? `${action.mode}+stop` : `mode:${action.mode}`
-  return action.stop ? 'stop' : 'continue'
-}
-
-function statusFor(action: TripwireAction | null, meters: Record<string, number>): string {
-  if (action?.escalate) return 'attention_required'
-  if (action?.mode === 'finalize') return 'completed'
-  if (action?.mode === 'pivot') return 'pivot_required'
-  return (meters['stale_count'] ?? 0) > 0 ? 'stale' : 'healthy'
+/**
+ * progress.status — a TOTAL function of the RouteDecision. No dead branches:
+ * every value has exactly one producer, and 'completed' is written only when
+ * the loop actually terminates.
+ */
+function statusFor(
+  route: RouteDecision,
+  charter: FrozenCharter,
+  ctx: EvalContext,
+  meters: Record<string, number>,
+): ProgressStatus {
+  switch (route.kind) {
+    case 'finalize': return 'completed'
+    case 'escalate': return 'paused_attention'
+    case 'pivot': return 'pivot_scheduled'
+    case 'continue': {
+      const healthAst = charter.frozen.healthAst
+      if (healthAst) return safeEval(healthAst, ctx, false) ? 'stale' : 'healthy'
+      return (meters['stale_count'] ?? 0) > 0 ? 'stale' : 'healthy'
+    }
+  }
 }
 
 interface TerminateInput {
   round: number
   mode: RoundMode
-  reason: string
-  escalated: boolean
+  /** The route that terminated the loop (kind finalize | escalate). */
+  route: RouteDecision
   startedAt: number
   costUsd: number
   seatSummaries: Record<string, string>
@@ -679,43 +751,84 @@ interface TerminateInput {
   alreadyAccounted?: boolean
 }
 
-/** Stop path: render the report from the LEDGER (code template), park the
- * instance, cancel pending wakes. Fail-stop, never fail-silent (D10). */
+/** Stop path: render the report from the LEDGER (code template, with an
+ * optional finalizer-seat narrative on graceful finalize), park the instance,
+ * cancel pending wakes. Fail-stop, never fail-silent (D10). */
 async function terminate(
   instance: LoopInstance,
   deps: RunRoundDeps,
   input: TerminateInput,
 ): Promise<RoundOutcome> {
-  const { ledger, paths } = instance
-  const terminalStatus = input.escalated ? 'attention_required' : 'completed'
+  const { charter, ledger, paths } = instance
+  const escalated = input.route.kind === 'escalate'
+  const reason = input.route.reason ?? input.route.kind
+  const terminalStatus: ProgressStatus = escalated ? 'paused_attention' : 'completed'
+
   if (!input.alreadyAccounted) {
     await ledger.appendRound({
       round: input.round, mode: input.mode,
       observables: input.observables, meters: input.meters,
-      route: input.escalated ? `escalate:${input.reason}` : 'finalize+stop',
+      route: input.route,
       correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
       seatSummaries: input.seatSummaries,
       startedAt: input.startedAt, finishedAt: Date.now(),
     })
   }
-  const report = await renderReport(instance, input.reason)
-  const reportName = input.escalated ? 'attention_report.md' : 'final_report.md'
+
+  // Finalizer seat (graceful finalize only): one isolated, tool-less pass that
+  // writes the report narrative from inlined ledger evidence. Fail-open — the
+  // code-template report renders regardless.
+  let narrative: string | undefined
+  let finalizerCost = 0
+  if (!escalated && charter.seats.finalizer) {
+    try {
+      const fin = await runFinalizerSeat(deps, charter, paths, reason)
+      finalizerCost = fin.costUsd
+      deps.observer?.({
+        type: 'seat_completed', round: input.round, seat: 'finalizer', ok: fin.ok, costUsd: fin.costUsd,
+      })
+      const text = fin.data['narrative']
+      if (fin.ok && typeof text === 'string' && text.trim()) narrative = text.trim()
+    } catch { /* narrative stays absent */ }
+  }
+
+  // Terminal progress write — covers the not-yet-accounted path (pre-round
+  // budget guard) and folds in the finalizer cost, so progress.status can
+  // never contradict the instance status again.
+  const progress = await ledger.readProgress()
+  await ledger.writeProgress({
+    ...progress,
+    status: terminalStatus,
+    nextRoundMode: undefined,
+    totalCostUsd: progress.totalCostUsd + (input.alreadyAccounted ? 0 : input.costUsd) + finalizerCost,
+    updatedAt: Date.now(),
+  })
+
+  // Escalation marker: re-arm (migrate) uses it to reset the offending meters.
+  if (escalated && input.route.tripwireIndex !== undefined) {
+    instance.record.lastEscalation = {
+      tripwireIndex: input.route.tripwireIndex, reason, at: Date.now(),
+    }
+  }
+
+  const report = await renderReport(instance, reason, narrative)
+  const reportName = escalated ? 'attention_report.md' : 'final_report.md'
   await atomicWriteFile(join(paths.reportsDir, reportName), report)
   await deps.wakeStore.cancelForLoop(instance.record.instanceId)
   await setInstanceStatus(
     instance,
-    input.escalated ? 'paused_attention' : 'done',
-    `${input.reason} at round ${input.round}`,
+    escalated ? 'paused_attention' : 'done',
+    `${reason} at round ${input.round}`,
   )
-  deps.observer?.({ type: 'terminated', round: input.round, reason: input.reason, escalated: input.escalated })
+  deps.observer?.({ type: 'terminated', round: input.round, reason, escalated })
   return {
     round: input.round, mode: input.mode,
-    route: input.escalated ? `escalate:${input.reason}` : 'finalize+stop',
-    status: terminalStatus, costUsd: input.costUsd,
+    route: renderRoute(input.route),
+    status: terminalStatus, costUsd: input.costUsd + finalizerCost,
   }
 }
 
-async function renderReport(instance: LoopInstance, reason: string): Promise<string> {
+async function renderReport(instance: LoopInstance, reason: string, narrative?: string): Promise<string> {
   const view = await instance.ledger.readView(50)
   const lines = [
     `# Loop Report — ${instance.record.instanceId}`,
@@ -726,10 +839,11 @@ async function renderReport(instance: LoopInstance, reason: string): Promise<str
     `- best_metric: ${view.progress.bestMetric ?? 'null'}`,
     `- total findings: ${view.findingsCount}`,
     `- total cost: $${view.progress.totalCostUsd.toFixed(2)}`,
+    ...(narrative ? ['', '## Narrative (finalizer seat)', '', narrative] : []),
     '',
     '## Rounds',
     ...view.lastRounds.map(r =>
-      `- #${r.round} [${r.mode}] route=${r.route} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
+      `- #${r.round} [${r.mode}] route=${renderRoute(r.route)} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
     '',
     '## Directions tried',
     ...view.directions.map(d => `- ${JSON.stringify(d)}`),

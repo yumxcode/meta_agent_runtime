@@ -11,6 +11,8 @@
  *           the worker's transcript because there is no channel to it.
  * pivoter — isolated, low-frequency; produces a structural directive the
  *           kernel injects into the same round's capsule.
+ * finalizer — isolated, runs ONCE at graceful finalize; writes the narrative
+ *           section of the final report from inlined ledger evidence.
  */
 import { readFile } from 'fs/promises'
 import { basename, join } from 'path'
@@ -152,6 +154,31 @@ export async function runPivoterSeat(
   const evidence = await inlineEvidence(paths, seat.inputs ?? [])
   const task = [renderCapsule(capsule), seat.prompt, PIVOTER_CONTRACT, '【证据（内嵌）】', evidence]
     .filter(Boolean).join('\n\n')
+  return runSeat(deps, seat, task, [])
+}
+
+const FINALIZER_CONTRACT = `\
+你是收尾叙事座位：loop 已终止，你为最终报告撰写叙事段。只依据下方内嵌证据，
+概述：达成了什么、证据何在、未竟之处、值得后续跟进的方向。不要编造证据之外的结论。
+必须调用 return_result，data 写 {"narrative":"<一段 markdown 叙事>"}。`
+
+const FINALIZER_DEFAULT_INPUTS = ['ledger/progress.json', 'ledger/findings.jsonl', 'ledger/directions.json']
+
+export async function runFinalizerSeat(
+  deps: SeatRunnerDeps,
+  charter: FrozenCharter,
+  paths: InstancePaths,
+  reason: string,
+): Promise<SeatResult> {
+  const seat = charter.seats.finalizer
+  if (!seat) throw new Error('charter has no finalizer seat')
+  const evidence = await inlineEvidence(paths, seat.inputs ?? FINALIZER_DEFAULT_INPUTS)
+  const task = [
+    `【终止原因】${reason}`,
+    `【验收目标】${charter.goal}`,
+    seat.prompt, FINALIZER_CONTRACT, '【证据（内嵌，只此为界）】', evidence,
+  ].filter(Boolean).join('\n\n')
+  // No tools: like the judge, the finalizer's world is exactly the evidence block.
   return runSeat(deps, seat, task, [])
 }
 

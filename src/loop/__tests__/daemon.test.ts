@@ -67,7 +67,7 @@ describe('runLoopScheduler', () => {
     await createInstance({
       projectDir: dir,
       charter: walkResearchCharter({
-        tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
       }),
       wakeStore: new WakeStore(dir),
     })

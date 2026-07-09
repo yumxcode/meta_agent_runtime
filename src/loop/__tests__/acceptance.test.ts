@@ -98,7 +98,8 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     // Ledger audit: 3 rounds + a terminal entry, findings admitted, meters exact.
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')
       .map(l => JSON.parse(l) as RoundEntry)
-    expect(rounds.map(r => r.route)).toEqual(['continue', 'continue', 'finalize+stop'])
+    expect(rounds.map(r => r.route.kind)).toEqual(['continue', 'continue', 'finalize'])
+    expect(rounds[2]!.route).toMatchObject({ cause: 'tripwire', tripwireIndex: 2 })
     expect(rounds[0]!.meters).toEqual({ iteration: 1, stale_count: 0 })
     expect(rounds[1]!.meters).toEqual({ iteration: 2, stale_count: 1 }) // 0 findings → stale
     expect(rounds[2]!.meters).toEqual({ iteration: 3, stale_count: 0 }) // recovered
@@ -139,9 +140,9 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     // Allow more iterations so stale_count can reach 4 before finalize.
     const charter = walkResearchCharter({
       tripwires: [
-        { when: 'stale_count >= 4', then: { escalate: 'attention', stop: true } },
-        { when: 'stale_count >= 2', then: { mode: 'pivot' } },
-        { when: 'iteration >= 10', then: { mode: 'finalize', stop: true } },
+        { when: 'stale_count >= 4', then: { act: 'escalate', reason: 'attention' } },
+        { when: 'stale_count >= 2', then: { act: 'pivot' } },
+        { when: 'iteration >= 10', then: { act: 'finalize' } },
       ],
     })
     await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
@@ -184,7 +185,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     })
 
     const charter = walkResearchCharter({
-      tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
     })
     const inst = await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
     // Seed a tried direction so attempt 1 collides.
@@ -227,7 +228,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
       await runUntilQuiescent({ dispatcher, projectDir: dir })
       const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')
         .map(l => JSON.parse(l) as RoundEntry)
-      return rounds.map(r => `${r.round}:${r.mode}:${r.route}:${JSON.stringify(r.meters)}`)
+      return rounds.map(r => `${r.round}:${r.mode}:${JSON.stringify(r.route)}:${JSON.stringify(r.meters)}`)
     }
     const [a, b] = await Promise.all([run(), run()])
     expect(a).toEqual(b)

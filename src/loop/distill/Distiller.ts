@@ -24,13 +24,15 @@ Charter 结构（全部字段；? 为可选）：
  "observables": [{"name":"new_findings","source":{"from":"judge","key":"new_findings_count"}}, …],
  "meters": [{"name":"iteration","inc":"every_round"},
             {"name":"stale_count","incWhen":"<表达式>","resetWhen":"<表达式>"}],
- "tripwires": [{"when":"<表达式>","then":{"mode":"pivot"|"finalize"|"attention"?, "escalate":"<名>"?, "stop":true?}}, …],
+ "tripwires": [{"when":"<表达式>","then":{"act":"pivot"} | {"act":"finalize","reason":"<原因>"?} | {"act":"escalate","reason":"<原因>","onResume":{"resetMeters":["<meter名>"]}?}}, …],
  "gates": {"state_gate":{"kind":"schema","files":["ledger/progress.json"]},
            "findings_gate":{"kind":"judge","evidence":["drafts/findings_draft.json","ledger/findings.jsonl"],"rubric":"…"}},
  "seats": {"worker":{"context":"lineage_loop"|"isolated","prompt":"<仅领域指令，见"座位底座">","tools":["read_file","edit_file","bash"],"budgetPerRound":{"usd":4,"turns":80,"wallclockMin":45?}},
            "judge":{"context":"isolated","prompt":"…","inputs":["drafts/findings_draft.json","ledger/findings.jsonl"],"budgetPerRound":{"usd":0.5,"turns":10}},
-           "pivoter":{"context":"isolated","prompt":"…","inputs":["ledger/directions.json","ledger/findings.jsonl"]}?},
+           "pivoter":{"context":"isolated","prompt":"…","inputs":["ledger/directions.json","ledger/findings.jsonl"]}?,
+           "finalizer":{"context":"isolated","prompt":"…","inputs":["ledger/progress.json","ledger/findings.jsonl"]}?},
  "budgets": {"perRound":{"usd":N},"lifetime":{"rounds":N,"usd":N}},
+ "health": {"staleWhen":"<表达式>"}?,
  "writeScope": ["repo 内允许 worker 修改的 glob"]?,
  "roundIntervalMs": N?,
 }
@@ -56,7 +58,7 @@ Charter 结构（全部字段；? 为可选）：
 - worker.context 二选一，决定底座的会话形态：
   · "lineage_loop"：跨轮 **resume 同一会话**、积累上下文——用于"在已有实现上持续迭代、调参、逐步推进"的 worker；
   · "isolated"：每轮**全新会话、无历史**，只凭本轮 <context> 独立判断——用于"需要跳出既有框架、推翻假设、换新证据源、避免自我叙事绑架"的 worker。
-  · 若需求同时要"迭代推进"与"周期性推翻重来"，可用两类思路：迭代 worker 用 lineage_loop，靠 tripwire 的 mode:"pivot" 触发 pivoter（isolated）给出结构性转向。judge/pivoter 永远 "isolated"（D6）。
+  · 若需求同时要"迭代推进"与"周期性推翻重来"，可用两类思路：迭代 worker 用 lineage_loop，靠 tripwire 的 {"act":"pivot"} 触发 pivoter（isolated）给出结构性转向。judge/pivoter/finalizer 永远 "isolated"（D6）。
 
 账本归内核（最容易映射错的地方，务必钉死）：
 - 内核在实例目录 .loop/<id>/ledger/ 下**独占写入**这些"状态/日志"文件，**不要**让任何座位去写：
@@ -69,30 +71,37 @@ Charter 结构（全部字段；? 为可选）：
 - state_gate（schema 门）如需要，检查 ledger/progress.json 即可（内核写的、恒为合法）；通常可省。
 - writeScope 是**"worker 允许改的仓库文件/产物" glob**——按任务而定（代码、配置、文档皆可；纯分析/写作类 loop 可为空/不设），**不是**状态目录。别把 state/ledger/drafts 放进去（drafts 本就可写、账本 worker 碰不到）。若 worker 每轮确实要改某些产物，writeScope 必须覆盖那些路径，否则会被 prompt 挡住。
 
+内核轮管线（理解 tripwire 何时生效的前提）：
+- 每轮固定九步：WAKE ▸ RECONCILE ▸ MODE ▸ CAPSULE ▸ SEAT ▸ GATE ▸ METER ▸ LEDGER ▸ ROUTE，全部是宿主代码。
+- **tripwires 每轮只在轮末 ROUTE 求值一次**（用刚更新完的 meters/observables）。命中后要么当场执行（finalize/escalate），要么持久化为下一轮的显式指令（pivot → 下一轮开场跑 pivoter）。轮首 MODE 不读 tripwire——它只消费上一轮留下的 pivot 指令 + 内核预算守卫。
+- 分工不变式：**内核独占"loop 是否还允许跑"**（预算耗尽、验收达成），**charter 独占"何时转向/收尾/叫人"**（tripwires）。
+
 终止机制（两个内核内置，别当成 charter 特化去写）：
 - **内置验收**：judge 每轮在 data 里输出 goal_satisfied（bool），对照 charter.goal 判"目标是否达成"；一旦 true，**内核自动 finalize 结束整个 loop**——你**不需要**为此写任何 tripwire。你要做的：把 goal 写清楚、在 judge 的 rubric 里说清"什么算达成/成功标准"。对没有硬指标的任务，这就是"判不判得完"的判断出口。
-- **内置预算**：budgets.lifetime（rounds/usd/deadline）是硬兜底，一定结束。**每份 charter 都要设**——它是唯一保证不会无限跑的地板。
-- 因此"能停"的保证 = 一条 stop/finalize tripwire **或** 一个 lifetime 预算（二者至少其一，校验强制）。stale/pivot/attention 这些 tripwire 是**额外**的进展路由，不是唯一出口。对判不了的模糊目标，用 attention 定期升级给人，而不是硬造指标。
+- **内置预算**：budgets.lifetime（rounds/usd/deadline）是硬兜底，一定结束（finalize，原因=budget）。**每份 charter 都要设**——它是唯一保证不会无限跑的地板。若你想让"预算耗尽"交人工而非静默收尾，写一条 {"when":"budget.lifetime.exhausted","then":{"act":"escalate","reason":"budget"}}——charter 绊线优先于内核兜底。
+- 因此"能停"的保证 = 一条 {"act":"finalize"} tripwire **或** 一个 lifetime 预算（二者至少其一，校验强制）。**escalate 不算终止**——它只是暂停等人。对判不了的模糊目标，用 escalate 定期升级给人，而不是硬造指标。
 
-tripwire 动作语义（mode / escalate / stop —— 最易配错，务必钉死）：
-- 一条 tripwire 的 then 里三个字段语义完全不同，内核处理方式也不同：
-  · mode：这一轮的"开场姿态"标签。唯一有行为的是 mode:"pivot" —— 轮首内核先跑 pivoter 座位、把结构性 directive 注入胶囊喂给 worker（前提：声明了 pivoter 座位，且本轮没被 escalate/stop 终止）。mode:"finalize"/"attention" 基本只是状态标签，不改流程。
-  · escalate:"<名>"：立即终止整个 loop，并标记 needs-human-ack（status=attention_required、实例 paused）。这个字符串只是"终止原因标签"，**不会让同名座位运行**——escalate:"pivoter" 不等于"跑 pivoter 座位"。
-  · stop:true：立即终止、干净收尾（finalize），不需人工。
-- 优先级（死代码高发点）：escalate/stop 是**终止动作**，在轮首(MODE)与轮尾(ROUTE)两处都**先于 mode 的 pivot 效果**判定。所以把 escalate/stop 与 mode:"pivot" 写进**同一条 then 会互斥**——escalate/stop 赢，mode:"pivot" 永远到不了，pivoter 座位就成了永不执行的死代码。
-- 由此两条铁律：
-  1. 绝不把 escalate 或 stop 与 mode:"pivot" 放进同一条动作。要**自动结构性转向**就只写 {"mode":"pivot"}（不加 escalate/stop）；要**停下交人工**就只写 {"escalate":"<原因>"}（不加 mode:"pivot"）。
-  2. 声明 pivoter 座位 ⟺ 必须存在一条**可达的、只带 mode:"pivot"** 的 tripwire，否则 pivoter 永不触发=死座位；反过来，若不打算自动转向，就**别声明 pivoter 座位**，也别在 worker prompt 里写"按 pivoter directive 推进"（那句同样成死指令）。
+tripwire 动作语义（then 是三选一的判别联合，"act" 字段决定一切；无效组合在类型上不存在）：
+- {"act":"pivot"}：**调度下一轮为转向轮**（一次性指令）。下一轮开场内核先跑 pivoter 座位、把结构性 directive 注入胶囊喂给 worker，然后指令自动清除；若之后还要再转向，需 tripwire 再次命中。本轮照常收尾，loop 不终止。校验强制：用了 act:"pivot" 就必须声明 seats.pivoter。
+- {"act":"finalize","reason"?}：**优雅终止整个 loop**。若声明了 seats.finalizer，内核会让它跑一次、为最终报告补一段叙事；然后渲染 final_report.md、取消全部 wake、实例 status=done、progress.status=completed。
+- {"act":"escalate","reason","onResume"?}：**暂停交人工**（不是终止）。渲染 attention_report.md、取消 wake、实例 status=paused_attention、progress.status=paused_attention。人工通过 loop migrate（修订 charter = human ack）恢复；恢复时内核会**重置触发该绊线的 meters**（默认=绊线表达式引用的 meters；可用 onResume.resetMeters 显式指定），保证不会一恢复就原地再暂停。reason 必填，只是原因标签，**不会让同名座位运行**。
+- 三个动作互斥且穷尽——不存在 mode/stop 字段，不存在"标签式"动作；每个 act 都对应内核一条确定的代码路径。
 - 典型正确写法（stale 渐进升级；声明顺序=优先级，高阈值在前，故 4 在 2 前）：
-  · {"when":"stale_count >= 4","then":{"escalate":"attention"}} —— 长期无进展，停下交人工
-  · {"when":"stale_count >= 2","then":{"mode":"pivot"}} —— 先让 pivoter 自动结构性转向、把方向喂给 worker
+  · {"when":"stale_count >= 4","then":{"act":"escalate","reason":"长期无进展","onResume":{"resetMeters":["stale_count"]}}} —— 停下交人工
+  · {"when":"stale_count >= 2","then":{"act":"pivot"}} —— 先让 pivoter 自动结构性转向、把方向喂给 worker
+- pivoter 座位 ⟺ act:"pivot" 绊线**双向强制**（校验器两个方向都查）：声明了 pivoter 就必须有一条可达的 pivot 绊线，否则死座位报错；反之用了 pivot 绊线就必须声明 pivoter。不打算自动转向就两者都别写，也别在 worker prompt 里写"按 pivoter directive 推进"（死指令）。
+- finalizer 座位（可选）：isolated、无工具，只在优雅 finalize 时跑一次，依据内嵌账本证据写收尾叙事（成果/未竟/后续建议）。需要"最终报告有人话总结"的需求就声明它；不声明则报告为纯代码模板。它**不能**替代 judge，也不参与轮内流程。
+
+health（progress.status 的健康规则，可选）：
+- 内核每轮轮末把 progress.status 写成 route 的确定函数：continue→healthy|stale、pivot→pivot_scheduled、escalate→paused_attention、finalize→completed。
+- 其中 healthy|stale 由 health.staleWhen 表达式判定（true→stale）；不声明时回退约定：存在名为 stale_count 的 meter 且 >0 → stale。若你的"停滞"语义不是 stale_count（比如 plateau_streak >= 2），就显式声明 health.staleWhen。
 
 硬性规则：
-- **observable 只能是 {"from":"judge","key":"<judge return_result 的字段名>"}**——内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，用了会静默失效成死规则，且校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/attention）兜底即可。
-- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。
-- 保证可终止：至少有一条 stop/finalize tripwire 或一个 lifetime 预算（见"终止机制"）。tripwire 声明顺序即优先级（最严重的在前）。
-- **mode/escalate/stop 三者互斥**（见"tripwire 动作语义"）：同一条 then 里 escalate/stop 绝不与 mode:"pivot" 并存；声明了 pivoter 座位就必须配一条只带 mode:"pivot" 的可达 tripwire，否则 pivoter=死座位。
-- judge/pivoter 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
+- **observable 只能是 {"from":"judge","key":"<judge return_result 的字段名>"}**——内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，用了会静默失效成死规则，且校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/escalate）兜底即可。
+- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。health.staleWhen、onResume.resetMeters 同受静态校验（resetMeters 必须是已声明 meter）。
+- 保证可终止：至少有一条 {"act":"finalize"} tripwire 或一个 lifetime 预算（见"终止机制"；escalate 不算）。tripwire 声明顺序即优先级（最严重的在前）。
+- **then 只有三种合法形态**：{"act":"pivot"} / {"act":"finalize","reason"?} / {"act":"escalate","reason",…}——没有 mode、stop、attention 字段（那是旧版形态，校验器会给迁移提示但你不要输出它们）。pivoter ⟺ pivot 绊线双向强制。
+- judge/pivoter/finalizer 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。
 - 长时外部任务的等待由 worker 用 timer 工具（自计时）或事件驱动，**不建模成 charter 字段**；在 seat.prompt 里说明即可（见"座位底座"的等待机制）。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。
 - 账本归内核：worker 只写 drafts/direction.json + drafts/findings_draft.json；progress/findings/directions/log 由内核写入 ledger/，worker 绝不碰（见"账本归内核"）。
@@ -173,10 +182,11 @@ export function parseDistillOutput(
   summary?: string,
 ): { charter: Charter; taskSpec: string } | null {
   const candidates: unknown[] = [output]
-  if (typeof output === 'string') candidates.push(tryJson(output))
-  if (summary) {
-    for (const m of summary.matchAll(/```(?:json)?\s*([\s\S]*?)```/gi)) candidates.push(tryJson(m[1] ?? ''))
+  if (typeof output === 'string') {
+    candidates.push(tryJson(output))
+    candidates.push(...extractJsonObjects(output))
   }
+  if (summary) candidates.push(...extractJsonObjects(summary))
   for (const c of candidates) {
     if (c && typeof c === 'object' && !Array.isArray(c)) {
       const obj = c as Record<string, unknown>
@@ -190,6 +200,42 @@ export function parseDistillOutput(
     }
   }
   return null
+}
+
+/**
+ * Extract every top-level balanced {...} object from free text and JSON-parse each.
+ * Robust against prose that mentions a json code fence in narration — the old
+ * fence-pairing regex mis-paired a fence written in prose with the real block's
+ * opening fence and captured prose instead of the JSON. Brace-scanning ignores
+ * fences entirely, tracks string literals so braces inside strings never
+ * miscount, and returns outermost objects in document order (charter wins).
+ */
+function extractJsonObjects(s: string): unknown[] {
+  const out: unknown[] = []
+  for (let i = 0; i < s.length; i++) {
+    if (s[i] !== '{') continue
+    let depth = 0, inStr = false, esc = false
+    for (let j = i; j < s.length; j++) {
+      const ch = s[j]!
+      if (inStr) {
+        if (esc) esc = false
+        else if (ch === '\\') esc = true
+        else if (ch === '"') inStr = false
+        continue
+      }
+      if (ch === '"') inStr = true
+      else if (ch === '{') depth++
+      else if (ch === '}') {
+        if (--depth === 0) {
+          const v = tryJson(s.slice(i, j + 1))
+          if (v !== null) out.push(v)
+          i = j
+          break
+        }
+      }
+    }
+  }
+  return out
 }
 
 function tryJson(s: string): unknown {

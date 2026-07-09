@@ -10,7 +10,7 @@
     { "name": "stale_count", "incWhen": "new_findings == 0", "resetWhen": "new_findings > 0" }
   ],
   "tripwires": [
-    { "when": "stale_count >= 3", "then": { "mode": "finalize", "stop": true } }
+    { "when": "stale_count >= 3", "then": { "act": "finalize", "reason": "stale" } }
   ],
   "gates": {
     "findings_gate": {

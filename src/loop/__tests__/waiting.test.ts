@@ -67,7 +67,7 @@ function setup(charterOverrides?: Parameters<typeof walkResearchCharter>[0]) {
     const dir = await mkdtemp(join(tmpdir(), 'loop-wait-'))
     const paths = instancePaths(dir, 'walk-research-v1')
     const charter = walkResearchCharter({
-      tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
       ...charterOverrides,
     })
     await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
@@ -120,7 +120,7 @@ describe('waiting rounds — event driven', () => {
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n').map(l => JSON.parse(l) as RoundEntry)
     expect(rounds).toHaveLength(1)
     expect(rounds[0]!.round).toBe(1)
-    expect(rounds[0]!.route).toBe('finalize+stop')
+    expect(rounds[0]!.route).toMatchObject({ kind: 'finalize', cause: 'tripwire' })
     expect((await effects.get('exp-42'))!.status).toBe('harvested')
     expect(await readPendingRound((await loadInstance(dir, 'walk-research-v1'))!)).toBeNull()
     const harvestTask = dispatcher.spawns.find(isHarvest)!

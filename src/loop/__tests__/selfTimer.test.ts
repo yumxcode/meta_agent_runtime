@@ -66,7 +66,7 @@ async function setup() {
       worker: { context: 'lineage_loop', prompt: 'W' },
       judge: { context: 'isolated', prompt: 'J', inputs: ['drafts/findings_draft.json'] },
     },
-    tripwires: [{ when: 'iteration >= 1', then: { mode: 'finalize', stop: true } }],
+    tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
   })
   await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
   return { dir, paths }
@@ -105,7 +105,7 @@ describe('self_timer wait', () => {
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n').map(l => JSON.parse(l) as RoundEntry)
     expect(rounds).toHaveLength(1)
     expect(rounds[0]!.round).toBe(1)
-    expect(rounds[0]!.route).toBe('finalize+stop')
+    expect(rounds[0]!.route).toMatchObject({ kind: 'finalize', cause: 'tripwire' })
     expect(await readPendingRound((await loadInstance(dir, 'walk-research-v1'))!)).toBeNull()
     expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('done')
   })
