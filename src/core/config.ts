@@ -23,6 +23,7 @@ import type { AutoWorktreeCleanupStrategy } from './auto/AutoWorktreeCoordinator
 import { loadModelConfig } from './config/ConfigService.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
 import type { Capabilities, Protocol } from '../providers/registry.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Provider detection
@@ -215,6 +216,19 @@ export interface MetaAgentConfig {
 
   /** Maximum USD cost before stopping. */
   maxBudgetUsd?: number
+
+  /**
+   * Internal auto-mode hook: reports the main kernel's cumulative cost to a
+   * shared session ledger. Absent for ordinary agentic/campaign/robotics runs.
+   */
+  onMainCostUsd?: (costUsd: number) => void
+
+  /**
+   * Internal auto-mode hook: child-task settled cost plus reservations. The
+   * kernel includes it in maxBudgetUsd checks so concurrent work shares one
+   * session budget.
+   */
+  getAdditionalBudgetUsd?: () => number
 
   /** Maximum output tokens per API call. Default: 8192 */
   maxTokens?: number
@@ -458,10 +472,14 @@ export type ResolvedConfig = Required<
     | 'compact'
     | 'externalPromptAssembly'
     | 'skipMemoryRecall'
+    | 'onMainCostUsd'
+    | 'getAdditionalBudgetUsd'
   >
 > & {
   externalPromptAssembly?: boolean
   skipMemoryRecall?: boolean
+  onMainCostUsd?: MetaAgentConfig['onMainCostUsd']
+  getAdditionalBudgetUsd?: MetaAgentConfig['getAdditionalBudgetUsd']
   compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
   language?: string
@@ -573,7 +591,13 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     systemPrompt: config.systemPrompt ?? DEFAULT_SYSTEM_PROMPT,
     appendSystemPrompt: config.appendSystemPrompt ?? '',
     maxTurns: config.maxTurns ?? Infinity,
-    maxBudgetUsd: config.maxBudgetUsd ?? Infinity,
+    maxBudgetUsd: config.maxBudgetUsd ?? (
+      config.autonomy !== undefined || config.promptMode === 'auto' || config.promptMode === 'simple_auto'
+        ? RuntimeEnv.autoSessionBudgetUsd()
+        : Infinity
+    ),
+    onMainCostUsd: config.onMainCostUsd,
+    getAdditionalBudgetUsd: config.getAdditionalBudgetUsd,
     maxTokens: config.maxTokens ?? 131_072,
     tools: config.tools ?? [],
     includeStreamEvents: config.includeStreamEvents ?? false,

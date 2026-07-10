@@ -497,26 +497,25 @@ export class RoboticsSession implements RoboticsCapabilities {
       const sessionAge = Date.now() - existing.lastActiveAt
       const hasActiveTasks = existing.activeSubAgentTasks.length > 0
       if (sessionAge > RoboticsSession.STALE_SESSION_TTL_MS && hasActiveTasks) {
-        for (const task of existing.activeSubAgentTasks) {
-          if (task.branchName) {
-            await this.gitMgr.removeWorktree(
-              task.taskId,
-              { deleteBranch: false },  // keep branch for forensics; only remove worktree
-            ).catch(() => undefined)
-          }
-          await RoboticsProjectStore.purgeStaleSubAgentTask(
-            this.projectDir, this._storeSessionId, task.taskId,
-          )
-        }
+        await this._recoverStaleSubAgentTasks(existing.activeSubAgentTasks)
       }
 
       // ── Reconcile worktrees still on disk ────────────────────────────────
+      // Re-read after crash recovery: using `existing.git` here would restore
+      // a worktree we just purged from durable state.
+      const stateForReconcile = await RoboticsProjectStore.findBySession(
+        this.projectDir,
+        this._storeSessionId,
+      ) ?? existing
+      this._state = stateForReconcile
       // staleIds = tasks whose worktree/branch no longer exists — purge them.
-      const staleIds = await this.gitMgr.reconcileWorktrees(existing.git)
+      const staleIds = await this.gitMgr.reconcileWorktrees(stateForReconcile.git)
       if (staleIds.length > 0) {
         for (const id of staleIds) {
           await RoboticsProjectStore.purgeStaleSubAgentTask(this.projectDir, this._storeSessionId, id)
         }
+        this._state = await RoboticsProjectStore.findBySession(this.projectDir, this._storeSessionId)
+          ?? stateForReconcile
       }
       // Restore persisted agent mode (explicit override wins)
       if (this._modeOverride) {
@@ -740,6 +739,32 @@ export class RoboticsSession implements RoboticsCapabilities {
       // map entry and event listener don't leak, then rethrow for the caller.
       try { await this.bridge?.dispose() } catch { /* best-effort */ }
       throw err
+    }
+  }
+
+  /**
+   * Reconcile tasks left active by an abnormal session exit. A completed
+   * branch-backed experiment deliberately remains active until the user merges
+   * or discards it, so it must survive the stale-session TTL on the next open.
+   */
+  private async _recoverStaleSubAgentTasks(
+    tasks: readonly import('./types.js').ActiveSubAgentRecord[],
+  ): Promise<void> {
+    for (const task of tasks) {
+      const record = task.branchName
+        ? await this.bridge?.getStatus(task.taskId as import('../subagent/types.js').SubAgentTaskId).catch(() => null)
+        : null
+      if (task.branchName && record?.status === 'completed') continue
+
+      if (task.branchName) {
+        await this.gitMgr.removeWorktree(
+          task.taskId,
+          { deleteBranch: false },  // keep branch for forensics; only remove worktree
+        ).catch(() => undefined)
+      }
+      await RoboticsProjectStore.purgeStaleSubAgentTask(
+        this.projectDir, this._storeSessionId, task.taskId,
+      )
     }
   }
 

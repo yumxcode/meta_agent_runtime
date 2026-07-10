@@ -46,7 +46,7 @@ export interface MetaAgentToolResultEvent {
 /** Terminal success result for the full turn */
 export interface MetaAgentResultEvent {
   type: 'result'
-  subtype: 'success' | 'error_max_turns' | 'error_max_budget' | 'error_during_execution'
+  subtype: 'success' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
   sessionId: string
   result: string
   isError: boolean

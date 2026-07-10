@@ -91,6 +91,7 @@ export type ResultSubtype =
   | 'success'
   | 'error_max_turns'
   | 'error_max_budget_usd'
+  | 'error_max_output_tokens'
   | 'error_during_execution'
   | 'error_blocking_limit'
 

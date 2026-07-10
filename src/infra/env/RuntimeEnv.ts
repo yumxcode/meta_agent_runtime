@@ -193,6 +193,11 @@ export const RuntimeEnv = {
     return isEnvSet('META_AGENT_MAX_OUTPUT_TOKENS')
   },
 
+  /** Finite whole-session USD ceiling for unattended auto/simple_auto runs. */
+  autoSessionBudgetUsd(): number {
+    return readFloatEnv('META_AGENT_AUTO_MAX_BUDGET_USD', { gt: 0, max: 1_000_000 }) ?? 20
+  },
+
   // ── CLI ───────────────────────────────────────────────────────────────────
   /** Max visible chars before the CLI truncates a rendered block. [10k, 2M]. */
   cliMaxVisibleChars(fallback: number): number {
@@ -246,7 +251,12 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_MAX_CONCURRENT_SUB_AGENTS', type: 'int', default: '4 (auto: 3)', description: 'Max concurrently running sub-agents.' },
   { name: 'META_AGENT_MAX_QUEUED_SUB_AGENTS', type: 'int', default: '64', description: 'Max queued sub-agents beyond the running cap. Range [0,10000].' },
   { name: 'META_AGENT_SUB_AGENT_START_DELAY_MS', type: 'int', default: '50', description: 'Stagger delay before starting each queued sub-agent (ms).' },
-  { name: 'META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD', type: 'float', default: 'unlimited (auto: 5)', description: 'Total spend cap across all sub-agents (USD).' },
+  { name: 'META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD', type: 'float', default: 'unlimited (auto: 10)', description: 'Total spend cap across ordinary sub-agents (USD).' },
+  { name: 'META_AGENT_AUTO_MAX_BUDGET_USD', type: 'float', default: '20', description: 'Whole-session USD ceiling for auto/simple_auto, including sub-agents and gates.' },
+  { name: 'META_AGENT_VERIFY_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto verify judge.' },
+  { name: 'META_AGENT_VERIFY_MAX_BUDGET_USD', type: 'float', default: '1', description: 'Maximum USD spend for one auto verify judge.' },
+  { name: 'META_AGENT_VERIFY_MAX_DURATION_MS', type: 'int', default: '1800000', description: 'Wall-clock limit for one auto verify judge.' },
+  { name: 'META_AGENT_DRIFT_MAX_BUDGET_USD', type: 'float', default: '0.5', description: 'Maximum USD spend for one auto drift judge.' },
   { name: 'META_AGENT_HOME', type: 'string', default: '~/.meta-agent', description: 'Root directory for all persisted meta-agent state.' },
   { name: 'META_AGENT_TOOL_TIMEOUT_MS', type: 'int', default: '180000', description: 'Global per-tool timeout (ms). 0 disables.' },
   { name: 'META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS', type: 'int', default: '3', description: 'Auto-mode circuit cap on timed-out-but-running tools.' },

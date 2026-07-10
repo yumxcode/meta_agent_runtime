@@ -122,12 +122,13 @@ export function translateKernelEvent(
   }
 }
 
-type MetaResultSubtype = 'success' | 'error_max_turns' | 'error_max_budget' | 'error_during_execution'
+type MetaResultSubtype = 'success' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
 
 function mapResultSubtype(subtype: string): MetaResultSubtype {
   if (subtype === 'success')           return 'success'
   if (subtype === 'error_max_turns')   return 'error_max_turns'
   if (subtype === 'error_max_budget_usd') return 'error_max_budget'
+  if (subtype === 'error_max_output_tokens') return 'error_max_output_tokens'
   return 'error_during_execution'
 }
 

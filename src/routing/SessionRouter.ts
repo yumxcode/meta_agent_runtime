@@ -48,6 +48,7 @@ import { getMemoryPendingStore } from '../core/memory/MemoryPendingStore.js'
 import { deleteJobsForSession } from '../tools/system/cronStore.js'
 import { readAutoCheckpoint, writeAutoCheckpoint, buildAutoResumePreamble, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
+import { AutoCostLedger, type AutoCostBreakdown } from '../core/auto/AutoCostLedger.js'
 import { deleteTodosForSession } from '../tools/ui/todo_write/index.js'
 import { deleteProgressNoteForSession } from '../tools/ui/progress_note/index.js'
 import { deleteArtifactsForSession } from '../tools/ui/artifacts_register/index.js'
@@ -59,6 +60,7 @@ import { clearDeepSeekClientCache } from '../kernel/api/DeepSeekClient.js'
 import { pruneStaleDebug } from '../kernel/api/DebugWriter.js'
 import type { RouterOptions, SessionMode } from './types.js'
 import { MODE_PROFILES, isAutonomousMode } from '../core/modes.js'
+import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 export { isAutonomousMode } from '../core/modes.js'
 
 // The robotics capability contracts live in the robotics package (so
@@ -151,6 +153,8 @@ export class SessionRouter {
   private _autoBridge: SubAgentBridge | null = null
   /** Auto mode: single-writer durable checkpoint coordinator. */
   private _autoCheckpointCoordinator: AutoCheckpointCoordinator | null = null
+  /** Auto/simple_auto shared main + child cost ledger. */
+  private _autoCostLedger: AutoCostLedger | null = null
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
     const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
@@ -164,7 +168,13 @@ export class SessionRouter {
     // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
     // Without this, destructuring above strips debugMode from sessionConfig,
     // making this.config.debugMode always undefined inside MetaAgentSession.
-    this._cfg = resolveConfig({ ...sessionConfig, debugMode })
+    this._cfg = resolveConfig({
+      ...sessionConfig,
+      debugMode,
+      maxBudgetUsd: sessionConfig.maxBudgetUsd ?? (
+        isAutonomousMode(this._hint) ? RuntimeEnv.autoSessionBudgetUsd() : undefined
+      ),
+    })
 
     // If tools are supplied in config, note them as pending so the impl picks
     // them up when it's created. registerTool() handles any added later.
@@ -424,7 +434,12 @@ export class SessionRouter {
   }
 
   getEstimatedCost(): number {
-    return this._impl?.getEstimatedCost() ?? 0
+    return this._autoCostLedger?.getTotalCostUsd() ?? this._impl?.getEstimatedCost() ?? 0
+  }
+
+  /** Auto/simple_auto cost split for CLI and embedding observability. */
+  getAutoCostBreakdown(): AutoCostBreakdown | null {
+    return this._autoCostLedger?.getBreakdown() ?? null
   }
 
   getSessionId(): string {
@@ -686,7 +701,7 @@ export class SessionRouter {
     overrides?: { autonomy?: AutonomyProfile; promptMode?: import('../core/dynamicPrompt.js').AgentMode },
   ): Promise<SessionImpl> {
     const projectDir = this._cfg.projectDir ?? process.cwd()
-    const { session, bridge, checkpointCoordinator } = await createAgenticBackend({
+    const { session, bridge, checkpointCoordinator, costLedger } = await createAgenticBackend({
       baseConfig: this._cfgAsConfig(),
       projectDir,
       resumeSessionId: this._resumeSessionId,
@@ -695,7 +710,10 @@ export class SessionRouter {
       getGoal: () => this._autoGoal,
     })
     this._autoCheckpointCoordinator = checkpointCoordinator
-    if (overrides?.autonomy) this._autoBridge = bridge
+    if (overrides?.autonomy) {
+      this._autoBridge = bridge
+      this._autoCostLedger = costLedger
+    }
     return session
   }
 

@@ -79,6 +79,7 @@ vi.mock('../SubAgentRunner.js', () => ({
 import { SubAgentBridge } from '../SubAgentBridge.js'
 import { CampaignEventBus } from '../CampaignEventBus.js'
 import { AutoWorktreeCoordinator } from '../../core/auto/AutoWorktreeCoordinator.js'
+import { AutoCostLedger } from '../../core/auto/AutoCostLedger.js'
 
 function git(cwd: string, args: string[]): string {
   return execFileSync('git', args, {
@@ -281,6 +282,27 @@ describe('SubAgentBridge scheduler', () => {
       config: { taskDescription: 'verify', maxBudgetUsd: 0.5, internal: true },
     })
     expect(gate.taskId).toBeTruthy()
+  })
+
+  it('keeps internal safety-gate tasks inside the whole auto-session budget', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 1,
+      maxQueuedSubAgents: 4,
+      startDelayMs: 0,
+      maxTotalSubAgentBudgetUsd: 1,
+      costLedger: new AutoCostLedger(1),
+    })
+
+    // The local bridge cap reserves capacity for a gate, but the outer ledger
+    // includes every child role so an auto run cannot overspend its session cap.
+    await bridge.spawnSubAgent({
+      config: { taskDescription: 'research', maxBudgetUsd: 0.9 },
+    })
+    await expect(
+      bridge.spawnSubAgent({
+        config: { taskDescription: 'verify', maxBudgetUsd: 0.5, internal: true },
+      }),
+    ).rejects.toThrow(/Auto session budget exceeded/)
   })
 
   it('internal safety-gate tasks bypass the queue-full cap', async () => {

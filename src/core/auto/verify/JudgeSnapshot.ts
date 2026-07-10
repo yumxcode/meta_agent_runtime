@@ -99,6 +99,7 @@ export async function withReadonlySnapshot<T>(
   if (!isGitRepo(root)) return fn(null, null)
 
   let worktreePath: string | null = null
+  let snapshotDir: string | null = null
   let tmpIndexDir: string | null = null
   try {
     // 1. Snapshot commit via an isolated index — never touches the live index.
@@ -114,10 +115,10 @@ export async function withReadonlySnapshot<T>(
       ['commit-tree', tree, '-p', head, '-m', 'meta-agent: verify snapshot'],
     )
 
-    // 2. Detached worktree at that commit, under the project's .meta-agent dir.
-    worktreePath = join(root, '.meta-agent', 'auto', 'verify-snapshot')
-    // Clear any leftover from a previous crashed run before re-adding.
-    await git(root, ['worktree', 'remove', '--force', worktreePath]).catch(() => undefined)
+    // 2. Detached worktree at a per-invocation path. A fixed workspace-local
+    // path lets concurrent auto sessions remove each other's judge snapshot.
+    snapshotDir = mkdtempSync(join(tmpdir(), 'ma-judge-snapshot-'))
+    worktreePath = join(snapshotDir, 'worktree')
     await git(root, ['worktree', 'add', '--detach', worktreePath, commit])
 
     // 3. Pre-compute THIS round's delta (baseline HEAD → snapshot commit) while
@@ -142,6 +143,9 @@ export async function withReadonlySnapshot<T>(
     await git(root, ['worktree', 'prune']).catch(() => undefined)
     if (tmpIndexDir) {
       try { rmSync(tmpIndexDir, { recursive: true, force: true }) } catch { /* best-effort */ }
+    }
+    if (snapshotDir) {
+      try { rmSync(snapshotDir, { recursive: true, force: true }) } catch { /* best-effort */ }
     }
   }
 }

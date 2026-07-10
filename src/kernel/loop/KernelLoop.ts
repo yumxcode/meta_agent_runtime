@@ -76,6 +76,7 @@ export type LoopTerminationReason =
   | 'aborted_streaming'
   | 'aborted_tools'
   | 'max_budget_usd'
+  | 'max_output_tokens'
   | 'verify_exhausted'
   | 'auto_verify_unavailable'
   | 'auto_drift_unavailable'
@@ -600,6 +601,24 @@ export async function* runKernelLoop(
   let allPermissionDenials: PermissionDenial[] = []
   let resultText = ''
   let lastToolRequestSignature = ''
+
+  const additionalBudgetUsd = (): number => {
+    try {
+      const value = config.getAdditionalBudgetUsd?.() ?? 0
+      return Number.isFinite(value) && value > 0 ? value : 0
+    } catch {
+      // Accounting must never take down the execution loop. A later callback
+      // can still report the main-agent cost for operator diagnostics.
+      return 0
+    }
+  }
+  const reportMainCost = (): void => {
+    try { config.onMainCostUsd?.(totalCost) } catch { /* accounting is best-effort */ }
+  }
+  const budgetExceeded = (): boolean =>
+    config.maxBudgetUsd !== undefined &&
+    totalCost + additionalBudgetUsd() >= config.maxBudgetUsd
+  reportMainCost()
   let repeatedToolRequestCount = 0
   // Auto-mode stall circuit.
   let consecutiveAllErrorTurns = 0   // every tool result errored, N turns running
@@ -639,7 +658,10 @@ export async function* runKernelLoop(
         ...event,
         sessionId,
         toolBatchCount,
-        estimatedCostUsd: totalCost,
+        // Snapshot the session-wide committed spend, not just the main model.
+        // Outstanding child reservations are intentional: checkpoints must not
+        // under-report work already admitted by the scheduler.
+        estimatedCostUsd: totalCost + additionalBudgetUsd(),
       })
       checkpointRevision = Math.max(checkpointRevision, result.revision)
       return result
@@ -667,7 +689,7 @@ export async function* runKernelLoop(
         workspaceRoot: config.cwd ?? process.cwd(),
         state: {
           turnCount: toolBatchCount,
-          estimatedCostUsd: totalCost,
+          estimatedCostUsd: totalCost + additionalBudgetUsd(),
           toolNames: extra?.toolNames,
           erroredToolNames: extra?.erroredToolNames,
         },
@@ -1048,6 +1070,7 @@ export async function* runKernelLoop(
             assistantMessages.push(assistantMsg)
             totalUsage = addUsage(totalUsage, usage)
             totalCost += calcCostUsd(usage, state.currentModel)
+            reportMainCost()
             // Reset accumulator for potential next message in same stream
             Object.assign(acc, newAccumulator())
             break
@@ -1272,8 +1295,11 @@ export async function* runKernelLoop(
           continue
         }
 
-        // Phase 3: exhausted → surface to user and exit
-        return done('success')
+        // Phase 3: exhausted. The visible text is partial, so never report a
+        // normal completion to callers or an auto-mode supervisor.
+        resultText =
+          `${assistantText}\n\n[Stopped: the model repeatedly hit its output-token limit before completing a response.]`
+        return done('max_output_tokens')
       }
 
       // 14c: empty successful response recovery. A provider can occasionally
@@ -1321,6 +1347,11 @@ export async function* runKernelLoop(
       if (state.emptyResponseRecoveryCount !== 0) {
         state = { ...state, emptyResponseRecoveryCount: 0 }
       }
+
+      // A natural no-tools completion used to return success before the common
+      // budget check below. Include the final model response and concurrent
+      // child reservations in the same hard ceiling.
+      if (budgetExceeded()) return done('max_budget_usd')
 
       // ── Step 14d: auto-mode completion gate (Verify) ───────────────────────
       // The model thinks it's done (no tool calls). In an unattended run we do
@@ -1745,7 +1776,7 @@ export async function* runKernelLoop(
     }
 
     // ── Budget check ─────────────────────────────────────────────────────────
-    if (config.maxBudgetUsd !== undefined && totalCost >= config.maxBudgetUsd) {
+    if (budgetExceeded()) {
       return done('max_budget_usd')
     }
 

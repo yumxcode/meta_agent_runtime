@@ -38,6 +38,7 @@ import {
 } from './types.js'
 import type { ISubAgentDispatcher } from './ISubAgentDispatcher.js'
 import type { MetaAgentEvent, MetaAgentTool } from '../core/types.js'
+import type { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
 
 const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
@@ -177,6 +178,8 @@ export interface SubAgentBridgeOptions {
   maxTotalSubAgentBudgetUsd?: number
   /** Minimum delay between starting queued sub-agents. */
   startDelayMs?: number
+  /** Shared auto-session budget ledger; absent keeps legacy per-bridge limits. */
+  costLedger?: AutoCostLedger
   /**
    * Auto mode: lower the DEFAULT concurrency (→ AUTO_MAX_CONCURRENT_SUB_AGENTS)
    * and apply a non-null default total budget (→ AUTO_DEFAULT_TOTAL_BUDGET_USD)
@@ -292,17 +295,13 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private readonly maxConcurrentSubAgents: number
   private readonly maxQueuedSubAgents: number
   private readonly maxTotalSubAgentBudgetUsd: number | undefined
+  private readonly costLedger: AutoCostLedger | undefined
   private readonly startDelayMs: number
   private readonly constructedAtMs = Date.now()
   private reservedBudgetUsd = 0
   private settledCostUsd = 0
   private readonly reservedBudgetByTask = new Map<SubAgentTaskId, number>()
-  /**
-   * Internal safety-gate task IDs (config.internal). Tracked so the budget
-   * accounting can exclude them entirely — they neither reserve nor settle
-   * against the shared cap, keeping the cap a measure of research/worker spend
-   * only and guaranteeing the gates can always spawn.
-   */
+  /** Internal safety-gate task IDs bypass local queue/worker limits only. */
   private readonly internalTaskIds = new Set<SubAgentTaskId>()
   private drainingStarts = false
   private destroyed = false
@@ -326,6 +325,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     SubAgentBridge._bridgesBySessionId.set(parentSessionId, this)
 
     this.parentSessionId = parentSessionId
+    this.costLedger = options.costLedger
     // Auto mode: lower the DEFAULTS (concurrency + a non-null total budget) but
     // keep precedence explicit-option > env > default, so an operator can still
     // raise them via env without code changes.
@@ -555,6 +555,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       )
     }
 
+    const taskId = opts.taskId ?? makeSubAgentTaskId()
     const requestedBudget = Math.max(0, config.maxBudgetUsd)
     if (
       !isInternal &&
@@ -570,55 +571,67 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       )
     }
 
-    const taskId = opts.taskId ?? makeSubAgentTaskId()
+    let ledgerReserved = false
+    if (this.costLedger) {
+      if (!this.costLedger.tryReserveTask(taskId, requestedBudget)) {
+        const stats = this.costLedger.getBreakdown()
+        throw new Error(
+          `[SubAgentBridge] Auto session budget exceeded. Requested $${requestedBudget.toFixed(4)}, ` +
+          `committed $${stats.committedCostUsd.toFixed(4)}, limit $${stats.budgetUsd.toFixed(4)}.`,
+        )
+      }
+      ledgerReserved = true
+    }
 
     // Explicit isolated-write requests fail closed. Silently falling back to
     // the shared tree would reintroduce concurrent-write races while reporting
     // a false isolation guarantee to the caller.
-    if (isolatedWrite) {
-      if (!this._worktreeCoordinator?.enabled) {
-        throw new Error('isolated_write requires an auto-mode git worktree coordinator')
-      }
-      const wt = await this._worktreeCoordinator.allocate(taskId, this.parentSessionId)
-      if (!wt) throw new Error('isolated_write requires a git workspace')
-      // Deny writes to the worktree's .meta-agent/: finalize/merge exclude it
-      // (:(exclude).meta-agent/**), so anything written there is silently
-      // discarded. Denying at the sandbox level makes bash writes fail fast
-      // too (the tool-level guard in SubAgentRunner covers edit/write tools
-      // with an instructive message). Pre-create the dir so bwrap's ro-bind
-      // approximation has an existing bind source.
-      const metaAgentDir = join(wt.worktreePath, '.meta-agent')
-      await mkdir(metaAgentDir, { recursive: true }).catch(() => undefined)
-      config = {
-        ...config,
-        projectDir: wt.worktreePath,
-        sandbox: {
-          ...config.sandbox,
-          writeAllowPaths: [wt.worktreePath],
-          writeDenyPaths: [...(config.sandbox?.writeDenyPaths ?? []), metaAgentDir],
-        },
-      }
-    }
-
-    const record: SubAgentRecord = {
-      schemaVersion:        '1.0',
-      taskId,
-      parentSessionId:      this.parentSessionId,
-      status:               'queued',
-      config,
-      createdAt:            Date.now(),
-      pendingHumanApproval: false,
-    }
-
+    let record: SubAgentRecord
     try {
+      if (isolatedWrite) {
+        if (!this._worktreeCoordinator?.enabled) {
+          throw new Error('isolated_write requires an auto-mode git worktree coordinator')
+        }
+        const wt = await this._worktreeCoordinator.allocate(taskId, this.parentSessionId)
+        if (!wt) throw new Error('isolated_write requires a git workspace')
+        // Deny writes to the worktree's .meta-agent/: finalize/merge exclude it
+        // (:(exclude).meta-agent/**), so anything written there is silently
+        // discarded. Denying at the sandbox level makes bash writes fail fast
+        // too (the tool-level guard in SubAgentRunner covers edit/write tools
+        // with an instructive message). Pre-create the dir so bwrap's ro-bind
+        // approximation has an existing bind source.
+        const metaAgentDir = join(wt.worktreePath, '.meta-agent')
+        await mkdir(metaAgentDir, { recursive: true }).catch(() => undefined)
+        config = {
+          ...config,
+          projectDir: wt.worktreePath,
+          sandbox: {
+            ...config.sandbox,
+            writeAllowPaths: [wt.worktreePath],
+            writeDenyPaths: [...(config.sandbox?.writeDenyPaths ?? []), metaAgentDir],
+          },
+        }
+      }
+
+      record = {
+        schemaVersion:        '1.0',
+        taskId,
+        parentSessionId:      this.parentSessionId,
+        status:               'queued',
+        config,
+        createdAt:            Date.now(),
+        pendingHumanApproval: false,
+      }
       await writeTask(record)
     } catch (err) {
       if (isolatedWrite) {
         await this._worktreeCoordinator?.discard(taskId).catch(() => undefined)
       }
+      if (ledgerReserved) this.costLedger?.releaseTaskReservation(taskId)
       throw err
     }
-    // Internal tasks neither reserve nor (later) settle against the shared cap.
+    // Internal tasks bypass only the local normal-worker cap. They still use
+    // the shared auto-session ledger so verify/drift cannot spend unboundedly.
     if (isInternal) this.internalTaskIds.add(taskId)
     else this._reserveBudget(taskId, requestedBudget)
 
@@ -1106,17 +1119,18 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   }
 
   private _settleBudget(taskId: SubAgentTaskId, actualCostUsd: number | undefined): void {
-    // Internal safety-gate tasks were never reserved and are excluded from the
-    // shared cap entirely — drop the marker and return without touching totals.
-    if (this.internalTaskIds.delete(taskId)) return
-    const reserved = this.reservedBudgetByTask.get(taskId) ?? 0
-    if (reserved > 0) {
-      this.reservedBudgetUsd = Math.max(0, this.reservedBudgetUsd - reserved)
-      this.reservedBudgetByTask.delete(taskId)
+    const internal = this.internalTaskIds.delete(taskId)
+    if (!internal) {
+      const reserved = this.reservedBudgetByTask.get(taskId) ?? 0
+      if (reserved > 0) {
+        this.reservedBudgetUsd = Math.max(0, this.reservedBudgetUsd - reserved)
+        this.reservedBudgetByTask.delete(taskId)
+      }
+      if (actualCostUsd !== undefined && Number.isFinite(actualCostUsd) && actualCostUsd > 0) {
+        this.settledCostUsd += actualCostUsd
+      }
     }
-    if (actualCostUsd !== undefined && Number.isFinite(actualCostUsd) && actualCostUsd > 0) {
-      this.settledCostUsd += actualCostUsd
-    }
+    this.costLedger?.settleTask(taskId, actualCostUsd)
   }
 
   private _clearParentAbortForwarder(taskId: SubAgentTaskId): void {

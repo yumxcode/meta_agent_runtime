@@ -39,6 +39,15 @@ async function* emptyEndTurnStream(): AsyncGenerator<import('../api/AnthropicCli
   yield { type: 'message_stop' }
 }
 
+async function* maxOutputTokensStream(text = 'partial response'): AsyncGenerator<import('../api/AnthropicClient.js').StreamEvent> {
+  yield { type: 'message_start', usage: { input_tokens: 50 } }
+  yield { type: 'content_block_start', index: 0, content_block: { type: 'text', text: '' } as any }
+  yield { type: 'content_block_delta', index: 0, delta: { type: 'text_delta', text } }
+  yield { type: 'content_block_stop', index: 0 }
+  yield { type: 'message_delta', delta: { stop_reason: 'max_tokens', stop_sequence: null }, usage: { output_tokens: 20 } }
+  yield { type: 'message_stop' }
+}
+
 async function collectEvents(session: KernelSession, prompt: string) {
   const events = []
   for await (const e of session.submitMessage(prompt)) events.push(e)
@@ -163,5 +172,45 @@ describe('KernelLoop — stream error recovery', () => {
     const result = events.find(e => e.type === 'result')
     expect(result?.subtype).toBe('error_during_execution')
     expect(result?.resultText).toContain('empty response')
+  })
+
+  it('reports max-output-token exhaustion as a non-success result', async () => {
+    const previous = process.env['META_AGENT_MAX_OUTPUT_TOKENS']
+    process.env['META_AGENT_MAX_OUTPUT_TOKENS'] = '1'
+    try {
+      let call = 0
+      mockStream.mockImplementation(async function* () {
+        call++
+        yield* maxOutputTokensStream()
+      })
+
+      const session = new KernelSession(makeConfig())
+      const events = await collectEvents(session, 'Hello')
+
+      expect(call).toBe(4) // initial attempt + bounded recovery attempts
+      const result = events.find(e => e.type === 'result')
+      expect(result?.subtype).toBe('error_max_output_tokens')
+      expect(result?.stopReason).toBe('max_output_tokens')
+      expect(result?.resultText).toContain('partial response')
+    } finally {
+      if (previous === undefined) delete process.env['META_AGENT_MAX_OUTPUT_TOKENS']
+      else process.env['META_AGENT_MAX_OUTPUT_TOKENS'] = previous
+    }
+  })
+
+  it('enforces the shared budget against concurrent child reservations on a natural completion', async () => {
+    mockStream.mockImplementation(async function* () {
+      yield* textStream('would otherwise complete')
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxBudgetUsd: 1,
+      getAdditionalBudgetUsd: () => 1,
+    }))
+    const events = await collectEvents(session, 'Hello')
+
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('error_max_budget_usd')
+    expect(result?.stopReason).toBe('max_budget_usd')
   })
 })

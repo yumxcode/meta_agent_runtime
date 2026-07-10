@@ -94,7 +94,7 @@ import { CLI_VERSION } from './version.js'
 
 const VERSION = CLI_VERSION
 const DEFAULT_CLI_MAX_TURNS = 100
-// Auto-series (auto / simple_auto / auto_orch) run unattended and carry their
+// Auto-series (auto / simple_auto) run unattended and carry their
 // own bounds (stall guards, budgets, and for plain auto only checkpoint +
 // drift/verify gates), so they get a much higher per-message turn cap than
 // attended modes.
@@ -220,6 +220,7 @@ ${bold('OPTIONS')}
       --fallback-model <model>  Model to retry with when primary lacks a feature
   -s, --system <text>   Custom system prompt
   -t, --max-turns <n>   Max agentic turns per message (default: 100; use "infinity" for no cap)
+      --max-budget-usd <n>  Whole-session USD budget (auto/simple_auto default: 20)
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
       --session-dir <dir>  Persist one-shot session history under this folder
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
@@ -364,6 +365,7 @@ interface CliOptions {
   autoWorktreeCleanup: AutoWorktreeCleanupStrategy | undefined
   prompt: string | null
   maxTurns: number | undefined    // --max-turns override; undefined → CLI default
+  maxBudgetUsd: number | undefined // --max-budget-usd override; undefined → mode default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
   sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
   /** `loop <cmd>` / `loop-scheduler` (v2 loop runtime, L2). Args pass through verbatim. */
@@ -399,6 +401,7 @@ function parseCliArgs(): CliOptions {
         'fallback-model': { type: 'string' },
         system:       { type: 'string',  short: 's' },
         'max-turns':  { type: 'string',  short: 't' },
+        'max-budget-usd': { type: 'string' },
         resume:       { type: 'string',  short: 'r' },
         'session-dir': { type: 'string' },
         yes:          { type: 'boolean', short: 'y', default: false },
@@ -460,6 +463,7 @@ function parseCliArgs(): CliOptions {
     }
   }
   const rawMaxTurns = parsed.values['max-turns'] as string | undefined
+  const rawMaxBudgetUsd = parsed.values['max-budget-usd'] as string | undefined
   const rawCleanup = parsed.values['auto-worktree-cleanup'] as string | undefined
   if (rawCleanup && !['preserve', 'safe', 'aggressive'].includes(rawCleanup)) {
     console.error(red(`Error: --auto-worktree-cleanup must be preserve, safe, or aggressive (got "${rawCleanup}")`))
@@ -475,6 +479,14 @@ function parseCliArgs(): CliOptions {
         console.error(red(`Error: --max-turns must be a positive integer or "infinity" (got "${rawMaxTurns}")`))
         process.exit(1)
       }
+    }
+  }
+  let maxBudgetUsd: number | undefined
+  if (rawMaxBudgetUsd) {
+    maxBudgetUsd = Number.parseFloat(rawMaxBudgetUsd)
+    if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) {
+      console.error(red(`Error: --max-budget-usd must be a positive number (got "${rawMaxBudgetUsd}")`))
+      process.exit(1)
     }
   }
 
@@ -495,6 +507,7 @@ function parseCliArgs(): CliOptions {
     autoWorktreeCleanup: rawCleanup as AutoWorktreeCleanupStrategy | undefined,
     prompt:     promptParts.length > 0 ? promptParts.join(' ') : null,
     maxTurns,
+    maxBudgetUsd,
     resume:     parsed.values['resume']   as string | undefined,
     sessionDir,
     loopCommand: null,
@@ -555,6 +568,7 @@ function buildLoopCliOptions(
     autoWorktreeCleanup: undefined,
     prompt: null,
     maxTurns: undefined,
+    maxBudgetUsd: undefined,
     resume: undefined,
     sessionDir: undefined,
     loopCommand: { name, args: loopArgs },
@@ -1116,6 +1130,7 @@ function makeRouter(
   // stay at 100.
   cfg.maxTurns =
     opts.maxTurns ?? (isAutonomousMode(cfg.mode) ? AUTO_CLI_MAX_TURNS : DEFAULT_CLI_MAX_TURNS)
+  if (opts.maxBudgetUsd !== undefined) cfg.maxBudgetUsd = opts.maxBudgetUsd
 
   // Debug mode
   if (opts.debug) cfg.debugMode = true
@@ -1390,6 +1405,7 @@ function terminationReasonLabel(subtype: string): string {
   switch (subtype) {
     case 'error_max_turns':      return '达到最大步数上限（max_turns）'
     case 'error_max_budget_usd': return '超出预算/费用上限（max_budget）'
+    case 'error_max_output_tokens': return '模型输出达到上限（max_output_tokens）'
     case 'error_blocking_limit': return '达到阻塞操作上限（blocking_limit）'
     case 'error_during_execution':
       return '执行中止（可能是无进展死循环、verify 未通过、被外部依赖阻塞，或运行时错误）'
@@ -1934,6 +1950,11 @@ async function streamPrompt(
             await safeStdoutWrite(
               `\n${yellow('⚠')}  ${yellow('已超出 token 预算上限。')} ` +
               `${dim('任务已提前终止。可继续输入或拆分为更小的子任务。')}\n`,
+            )
+          } else if (event.subtype === 'error_max_output_tokens') {
+            await safeStdoutWrite(
+              `\n${yellow('⚠')}  ${yellow('模型输出连续达到上限，结果可能不完整。')} ` +
+              `${dim('请缩小任务范围、提高输出上限或继续该任务。')}\n`,
             )
           } else if (event.subtype === 'error_during_execution') {
             const errDetails = sanitizeTerminalText((event as { errors?: string[] }).errors?.join('\n  ') ?? '')
@@ -3498,7 +3519,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           resumedMessages = await SessionStore.loadHistory(targetId)
           resumedSessionId = targetId
           // Restore the mode from the saved session. An autonomous mode (auto /
-          // simple_auto / auto_orch) must never run over a history produced in a
+          // simple_auto) must never run over a history produced in a
           // NON-autonomous mode (agentic / campaign / robotics): the workspace
           // jail, auto-approval, and tool-set posture differ from what the saved
           // turns assumed. Use isAutonomousMode on BOTH sides so the rule covers
@@ -3528,7 +3549,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
           // Restore the mode from the saved session so the router starts in the
           // correct mode instead of starting the resumed history in default agentic.
           // Same rule as above: never run an autonomous mode (auto / simple_auto /
-          // auto_orch) over a non-autonomous history.
+          // simple_auto) over a non-autonomous history.
           if (
             resumed.mode &&
             (!opts.modeExplicit || (isAutonomousMode(opts.mode) && !isAutonomousMode(resumed.mode)))
@@ -4447,10 +4468,17 @@ async function runRepl(opts: CliOptions): Promise<void> {
         case '/usage': {
           const u = router.getUsage()
           const cost = router.getEstimatedCost()
+          const autoCost = router.getAutoCostBreakdown()
+          const costDetail = autoCost
+            ? `Estimated cost: $${cost.toFixed(5)}  ` +
+              `(main: $${autoCost.mainCostUsd.toFixed(5)}, sub-agents: $${autoCost.subAgentCostUsd.toFixed(5)}, ` +
+              `reserved: $${autoCost.reservedSubAgentBudgetUsd.toFixed(5)}, ` +
+              `budget: $${autoCost.budgetUsd.toFixed(5)})\n`
+            : `Estimated cost: $${cost.toFixed(5)}\n`
           console.log(
             `\nTokens — in: ${u.inputTokens}  out: ${u.outputTokens}  ` +
             `cache_read: ${u.cacheReadInputTokens ?? 0}\n` +
-            `Estimated cost: $${cost.toFixed(5)}\n`,
+            costDetail,
           )
           break
         }
@@ -4812,8 +4840,8 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
         resumedSessionId = targetId
         savedMessageCount = resumedMessages.length
         // Restore the saved mode when (a) the caller did not explicitly pass
-        // --mode, or (b) the caller asked for an autonomous mode (auto / simple_auto /
-        // auto_orch) but the saved history is non-autonomous — running a jailed,
+        // --mode, or (b) the caller asked for an autonomous mode (auto / simple_auto)
+        // but the saved history is non-autonomous — running a jailed,
         // auto-approving loop over agentic/campaign/robotics history is exactly
         // what this guard prevents. isAutonomousMode covers every flavour.
         if (
@@ -4906,11 +4934,14 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   // Distill runs as a DIRECT streaming session (simple_auto), not a hidden
   // sub-agent — so its work is visible in the CLI and easy to debug.
   if (sub === 'distill') {
+    assertApiKeyConfigured(opts)
+    await ensureMcpServerInstructions()
     await runDistillDirect(opts, projectDir, args)
     return
   }
 
   assertApiKeyConfigured(opts)
+  await ensureMcpServerInstructions()
   const router = makeRouter(
     { ...opts, mode: 'auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
@@ -5123,16 +5154,23 @@ function lastAssistantText(msgs: readonly ConversationMessage[]): string {
  * makeRouter() reads this to inject into cfg.mcpServers.
  */
 let _mcpServerInstructions: McpServerInstruction[] = []
+let _mcpInstructionsReady = false
+
+/**
+ * Register MCP clients only when a command will actually start an LLM session.
+ * Help, version, validation failures, and pure `loop` commands must stay local
+ * and usable while an optional MCP endpoint is down.
+ */
+async function ensureMcpServerInstructions(): Promise<void> {
+  if (_mcpInstructionsReady) return
+  _mcpInstructionsReady = true
+  loadMcpConfig()
+  _mcpServerInstructions = await buildMcpServerInstructions()
+}
 
 async function main(): Promise<void> {
   // Sanitize env-var API keys once so detectProvider() receives clean values
   sanitizeEnvKeys()
-  // Load ~/.meta-agent/mcp.json and register all configured MCP servers.
-  loadMcpConfig()
-  // Pre-compute D5 tool-name + description summary for all registered MCP servers.
-  // Stored in module variable so makeRouter() can inject into cfg.mcpServers.
-  _mcpServerInstructions = await buildMcpServerInstructions()
-
   const opts = parseCliArgs()
   const bwrapWarning = getMissingBwrapWarning()
   if (bwrapWarning) {
@@ -5147,6 +5185,7 @@ async function main(): Promise<void> {
   }
 
   assertApiKeyConfigured(opts)
+  await ensureMcpServerInstructions()
 
   if (opts.prompt !== null) {
     if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })

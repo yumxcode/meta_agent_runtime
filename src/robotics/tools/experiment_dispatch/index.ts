@@ -146,10 +146,15 @@ Rules:
 - Commit your changes with descriptive messages (git add + git commit)
 - Do NOT run git push, git checkout, git merge, or create new branches
 - The main agent decides whether to merge your branch`
-          } catch {
-            // Git not available or worktree creation failed — continue without git
-            gitContext = ''
+          } catch (err) {
+            const reason = err instanceof Error ? err.message : String(err)
+            return {
+              content: `Unable to create an isolated git worktree for this experiment: ${reason}. No sub-agent was started.`,
+              isError: true,
+            }
           }
+        } else {
+          gitContext = `\n\n## Workspace Context\nGit worktree isolation is unavailable for this project. You are working directly in: \`${projectDir}\`\nDo not assume changes are isolated from other work.`
         }
 
         const agentInstructions = String(input['agent_instructions'] ?? '').trim()
@@ -176,7 +181,9 @@ Rules:
           taskId,
           config: {
             taskDescription: withReturnResultHint(taskDescription),
-            ...(worktreePath ? { projectDir: worktreePath } : {}),
+            // Always bind the runner to the requested robotics project. The
+            // old fallback used process.cwd(), which is wrong for SDK callers.
+            projectDir: worktreePath ?? projectDir,
             allowedTools: (input['allowed_tools'] as string[] | undefined) ?? [
               'bash', 'read_file', 'write_file', 'edit_file', 'glob', 'grep', 'experience_write',
             ],

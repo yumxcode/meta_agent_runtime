@@ -581,6 +581,7 @@ export class KernelSession {
         aborted_streaming: 'error_during_execution',
         aborted_tools:     'error_during_execution',
         max_budget_usd:    'error_max_budget_usd',
+        max_output_tokens: 'error_max_output_tokens',
         verify_exhausted:  'error_during_execution',
         auto_verify_unavailable: 'error_during_execution',
         auto_drift_unavailable: 'error_during_execution',

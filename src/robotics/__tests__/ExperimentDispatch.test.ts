@@ -110,7 +110,7 @@ describe('experiment_dispatch', () => {
     }))
   })
 
-  it('does not set projectDir when git worktree isolation is unavailable', async () => {
+  it('binds a non-git experiment to the requested robotics project', async () => {
     const { bridge, spawnSubAgent } = stubBridge()
     const gitMgr = {
       enabled: false,
@@ -125,9 +125,25 @@ describe('experiment_dispatch', () => {
     expect(result.isError).toBe(false)
     expect(gitMgr.createWorktreeForTask).not.toHaveBeenCalled()
     const opts = spawnSubAgent.mock.calls[0]?.[0] as SpawnSubAgentOptions
-    expect(opts.config.projectDir).toBeUndefined()
+    expect(opts.config.projectDir).toBe(PROJECT_DIR)
     expect(opts.config.workspaceMode).toBeUndefined()
     expect(opts.config.isolateWorktree).toBeUndefined()
+    expect(String(opts.config.taskDescription)).toContain('Git worktree isolation is unavailable')
+  })
+
+  it('fails closed when a git project cannot allocate its isolated worktree', async () => {
+    const { bridge, spawnSubAgent } = stubBridge()
+    const gitMgr = {
+      enabled: true,
+      createWorktreeForTask: vi.fn(async () => { throw new Error('worktree locked') }),
+    } as unknown as GitWorkspaceManager
+
+    const tool = createExperimentDispatchTool(bridge, gitMgr, PROJECT_DIR, SESSION_ID)
+    const result = await tool.call(input(), toolCtx())
+
+    expect(result.isError).toBe(true)
+    expect(result.content).toContain('Unable to create an isolated git worktree')
+    expect(spawnSubAgent).not.toHaveBeenCalled()
   })
 
   it('await_completion keeps branch-backed completed experiments active until merge/discard', async () => {

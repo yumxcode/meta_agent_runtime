@@ -40,6 +40,16 @@ export interface AutoDriftGateDeps {
 
 /** Read-only investigation tools + the direct experience writer. */
 const DRIFT_TOOLS = ['read_file', 'grep', 'glob', 'bash', 'experience_write']
+export const DRIFT_AGENT_DEFAULT_MAX_BUDGET_USD = 0.5
+
+/** Per-invocation override so long-running hosts can change the cap live. */
+export function resolveDriftMaxBudgetUsd(): number {
+  const raw = process.env['META_AGENT_DRIFT_MAX_BUDGET_USD']
+  if (raw === undefined) return DRIFT_AGENT_DEFAULT_MAX_BUDGET_USD
+  const value = Number.parseFloat(raw)
+  if (!Number.isFinite(value) || value < 0.01) return DRIFT_AGENT_DEFAULT_MAX_BUDGET_USD
+  return Math.min(value, 1_000_000)
+}
 
 const DRIFT_RUBRIC = `\
 你是一个独立的"航向审查 + 经验沉淀 Agent"，在一次长时间无人值守任务的中途被触发。你看不到执行 Agent 的推理过程，只拿到【原始目标】、【进度快照(checkpoint)】和【既有经验】。
@@ -123,8 +133,7 @@ async function runDriftAgent(
       systemPrompt: DRIFT_RUBRIC,
       allowedTools: DRIFT_TOOLS,
       maxTurns: 30,
-      // Budget left unbounded for now; pin to a concrete cap before real deploy.
-      maxBudgetUsd: Number.POSITIVE_INFINITY,
+      maxBudgetUsd: resolveDriftMaxBudgetUsd(),
       requireHumanApproval: false,
       useEventDriven: false,
       pollIntervalMs: 500,

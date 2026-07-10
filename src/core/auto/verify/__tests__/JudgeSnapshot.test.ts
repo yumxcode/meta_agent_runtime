@@ -123,4 +123,37 @@ describe('withReadonlySnapshot', () => {
     // Live working tree edit is preserved (snapshot used an isolated index).
     expect(readFileSync(join(dir, 'a.txt'), 'utf-8')).toBe('live-edit\n')
   })
+
+  it('uses independent worktrees for concurrent verification rounds', async () => {
+    git(dir, ['init'])
+    git(dir, ['config', 'user.email', 't@t.dev'])
+    git(dir, ['config', 'user.name', 'tester'])
+    writeFileSync(join(dir, 'a.txt'), 'a\n')
+    git(dir, ['add', '-A'])
+    git(dir, ['commit', '-m', 'init'])
+
+    let releaseFirst: (() => void) | undefined
+    let firstPath: string | null = null
+    let markFirstReady: (() => void) | undefined
+    const firstReady = new Promise<void>(resolve => { markFirstReady = resolve })
+    const first = withReadonlySnapshot(dir, async snapshot => {
+      firstPath = snapshot
+      markFirstReady?.()
+      await new Promise<void>(resolve => { releaseFirst = resolve })
+      return snapshot
+    })
+
+    await firstReady
+    const secondPath = await withReadonlySnapshot(dir, async snapshot => snapshot)
+
+    expect(firstPath).not.toBeNull()
+    expect(secondPath).not.toBeNull()
+    expect(secondPath).not.toBe(firstPath)
+    expect(existsSync(firstPath!)).toBe(true)
+    expect(existsSync(secondPath!)).toBe(false)
+
+    releaseFirst?.()
+    const completedFirstPath = await first
+    expect(existsSync(completedFirstPath!)).toBe(false)
+  })
 })

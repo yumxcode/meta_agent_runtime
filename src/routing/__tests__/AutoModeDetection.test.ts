@@ -19,6 +19,12 @@ describe('SessionRouter — explicit mode selection', () => {
       await expect(router.primeMode('prompt text should not change the selected mode')).resolves.toBe(mode)
     },
   )
+
+  it('applies a finite default whole-session budget to autonomous modes', () => {
+    const router = new SessionRouter({ mode: 'auto' })
+    const config = router as unknown as { _cfg: { maxBudgetUsd: number } }
+    expect(config._cfg.maxBudgetUsd).toBe(20)
+  })
 })
 
 describe('MODE_WEIGHT', () => {

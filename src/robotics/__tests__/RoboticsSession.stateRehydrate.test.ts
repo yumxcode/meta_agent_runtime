@@ -200,4 +200,34 @@ describe('RoboticsSession _state re-hydration', () => {
     const state = await RoboticsProjectStore.findBySession(projectDir, storeSessionId)
     expect(state?.activeSubAgentTasks.some(t => t.taskId === 'TASK_COMPLETED_BRANCH')).toBe(true)
   })
+
+  it('stale recovery preserves a completed branch-backed task awaiting merge', async () => {
+    const { session, projectDir, storeSessionId } = await freshSession()
+    const task = makeRecord({
+      taskId: 'TASK_AWAITING_MERGE',
+      branchName: 'exp/awaiting-merge',
+      worktreePath: '/tmp/robotics-awaiting-merge-worktree',
+    })
+    await RoboticsProjectStore.registerSubAgentTask(projectDir, storeSessionId, task)
+    await RoboticsProjectStore.updateGitState(projectDir, storeSessionId, {
+      subAgentBranches: { [task.taskId]: task.branchName! },
+      forkPoints: { [task.taskId]: 'abc123' },
+    })
+
+    const removeWorktree = vi.fn().mockResolvedValue(undefined)
+    const sessionInternals = session as unknown as {
+      gitMgr: { removeWorktree: typeof removeWorktree }
+      bridge: { getStatus: typeof vi.fn }
+      _recoverStaleSubAgentTasks: (tasks: ActiveSubAgentRecord[]) => Promise<void>
+    }
+    sessionInternals.gitMgr.removeWorktree = removeWorktree
+    sessionInternals.bridge.getStatus = vi.fn().mockResolvedValue({ status: 'completed' })
+
+    await sessionInternals._recoverStaleSubAgentTasks([task])
+
+    expect(removeWorktree).not.toHaveBeenCalled()
+    const state = await RoboticsProjectStore.findBySession(projectDir, storeSessionId)
+    expect(state?.activeSubAgentTasks.some(t => t.taskId === task.taskId)).toBe(true)
+    expect(state?.git.subAgentBranches[task.taskId]).toBe(task.branchName)
+  })
 })

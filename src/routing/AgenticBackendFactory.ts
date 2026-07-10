@@ -30,6 +30,7 @@ import type { AutonomyProfile } from '../core/types.js'
 import type { AgentMode } from '../core/dynamicPrompt.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
+import { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
 import { FlashClient } from '../core/flash/FlashClient.js'
 import { defaultRoleCatalog } from '../core/roles/index.js'
 import {
@@ -75,6 +76,8 @@ export interface AgenticBackend {
   bridge: SubAgentBridge
   /** Non-null only in AUTO mode. The Router holds it for durable checkpointing. */
   checkpointCoordinator: AutoCheckpointCoordinator | null
+  /** Shared main/sub-agent cost ledger for unattended modes with a finite cap. */
+  costLedger: AutoCostLedger | null
 }
 
 /**
@@ -96,6 +99,10 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   const resumeCheckpoint = wantsGates && explicitResume && resumeSessionId
     ? readAutoCheckpoint(projectDir, resumeSessionId)
     : null
+  const autoBudgetUsd = baseConfig.maxBudgetUsd
+  const costLedger = hasAutonomyJail && typeof autoBudgetUsd === 'number' && Number.isFinite(autoBudgetUsd)
+    ? new AutoCostLedger(autoBudgetUsd)
+    : null
 
   // Lazy dispatcher facade — the bridge is created after the session below, so
   // the gates read this local ref at invocation time (deep in a later turn).
@@ -107,8 +114,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   }
 
   // Role catalogue: the single source of truth for review roles. drift/verify
-  // are now obtained THROUGH it (it delegates to the same makers), so the kernel
-  // gates and the auto_orch graph nodes share one role definition surface.
+  // are obtained through it so every auto caller uses one role definition.
   const roleCatalog = defaultRoleCatalog()
   let sessionIdForRoles = resumeSessionId
   const roleCtx = { dispatcher: lazyDispatcher, projectDir, getGoal, getSessionId: () => sessionIdForRoles }
@@ -186,6 +192,10 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
 
   const session = new MetaAgentSession({
     ...baseConfig,
+    ...(costLedger ? {
+      onMainCostUsd: (costUsd: number) => costLedger.recordMainCost(costUsd),
+      getAdditionalBudgetUsd: () => costLedger.getAdditionalBudgetUsd(),
+    } : {}),
     sessionId: resumeSessionId,
     promptMode: overrides?.promptMode,
     autonomy: overrides?.autonomy,
@@ -204,7 +214,9 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // total budget) as unattended safety/cost guards (env still overrides).
   const bridge = new SubAgentBridge(
     session.getSessionId(),
-    hasAutonomyJail ? { conservativeAutoDefaults: true } : undefined,
+    hasAutonomyJail
+      ? { conservativeAutoDefaults: true, ...(costLedger ? { costLedger } : {}) }
+      : undefined,
   )
   bridgeRef = bridge
   bridge.setToolRegistry(session.getToolRegistry())
@@ -255,7 +267,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     }
   }
 
-  return { session, bridge, checkpointCoordinator }
+  return { session, bridge, checkpointCoordinator, costLedger }
 }
 
 function defaultWorktreeCleanupStrategy(mode: AgentMode | undefined): AutoWorktreeCleanupStrategy {

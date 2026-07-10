@@ -8,7 +8,8 @@
 
 ## 特性概览
 
-- **六种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`auto_orch`(simple_auto 执行基座 + 多 Agent 编排图,verify/drift 由显式图节点表达)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。外加 `detect` 哨兵按提示词与环境自动选择。
+- **五种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。模式只会显式选择，未指定时为 `agentic`。
+- **长周期 Loop 运行时**:`meta-agent loop ...` 提供章程、账本、round 调度与 daemon；它是会话之上的运行时，不是 `SessionMode`。
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
@@ -103,7 +104,7 @@ npm install @meta-agent/runtime
 import { SessionRouter, createStandardTools } from '@meta-agent/runtime'
 
 const router = new SessionRouter({
-  mode: 'agentic',          // 'detect' | 'agentic' | 'auto' | 'simple_auto' | 'auto_orch' | 'campaign' | 'robotics'
+  mode: 'agentic',          // 'agentic' | 'auto' | 'simple_auto' | 'campaign' | 'robotics'
   projectDir: process.cwd(),
   maxTurns: 30,
 })
@@ -137,8 +138,8 @@ meta-agent --mode auto "把构建跑绿,修掉所有失败用例"      # 或 --y
 # 轻量无人值守(同款工作区监狱,但不启用 checkpoint/drift/verify,适合简单短任务)
 meta-agent --mode simple_auto "把 README 里的死链接都修掉"
 
-# 自治编排(simple_auto 执行基座 + 编排图,审查由显式节点保证)
-meta-agent --mode auto_orch "把整个数据管线重写为流式架构,并补齐单测与文档"
+# 长周期多 Agent Loop（从需求文档生成 charter 草案）
+meta-agent loop distill requirements.md
 
 # 其它模式
 meta-agent --mode campaign "做一次 x=[0,10], y=[0,5] 的 DOE 参数扫描"
@@ -149,7 +150,7 @@ meta-agent --resume last "继续"
 meta-agent --json "检查项目结构"
 ```
 
-CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-b/--base-url`、`--model`、`--fallback-model`、`-t/--max-turns`、`-r/--resume`、`--session-dir <dir>`(单次 prompt 运行时把会话历史持久化到该目录,便于后续 `--resume`)、`-y/--yes`、`-d/--debug`、`--show-thinking`、`-j/--json`。交互期内 `Ctrl+G` 注入修正(在下一步边界引导模型,不打断生成),`Ctrl+C` 中断当前轮。运行 `meta-agent --help` 查看全部交互命令(`/team`、`/experience`、`/principle`、`/anchor`、`/memory`、`/sessions`、`/compact` 等)。
+CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-b/--base-url`、`--model`、`--fallback-model`、`-t/--max-turns`、`--max-budget-usd`、`-r/--resume`、`--session-dir <dir>`(单次 prompt 运行时把会话历史持久化到该目录,便于后续 `--resume`)、`-y/--yes`、`-d/--debug`、`--show-thinking`、`-j/--json`。交互期内 `Ctrl+G` 注入修正(在下一步边界引导模型,不打断生成),`Ctrl+C` 中断当前轮。运行 `meta-agent --help` 查看全部交互命令(`/team`、`/experience`、`/principle`、`/anchor`、`/memory`、`/sessions`、`/compact` 等)。
 
 ---
 
@@ -157,11 +158,9 @@ CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-
 
 | 模式 | 适用场景 | 关键能力 |
 | --- | --- | --- |
-| `detect` | 默认哨兵 | 按提示词与环境推断到 agentic(auto 仅显式进入) |
 | `agentic` | 通用工程任务与问答 | 多轮工具调用、文件修改、命令执行、上下文压缩、同步/异步子代理 |
-| `auto` | 无人值守自治 | 工作区硬监狱、verify/drift 关卡、断路器、checkpoint/恢复、失败重试、收紧的并发与预算 |
+| `auto` | 无人值守自治 | 工作区硬监狱、verify/drift 关卡、断路器、checkpoint/恢复、失败重试、会话级预算 |
 | `simple_auto` | 轻量无人值守 | 同款工作区硬监狱与自动批准,但**去掉 checkpoint / drift / verify**;面向简单、短链路任务 |
-| `auto_orch` | 轻量自治 + 多 Agent 编排 | `simple_auto` 执行基座 + AI 自编排计划图(执行节点 + 校验/航向/复核审查角色)与阶段钩子;verify/drift 由显式图节点保证 |
 | `campaign` | 长周期实验/优化 | DOE、多保真度、并行评估、Pareto、论文复现、人工检查点、溯源 |
 | `robotics` | 机器人开发 | 硬件档案、三层知识库、工作流阶段、并行实验、Git 工作树、Team 协作 |
 
@@ -172,7 +171,7 @@ CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-
 - **工作区硬监狱**:fail-closed OS 沙箱,所有文件写/删被强制约束在工作目录内,配置层无法解锁;同样下发给每个被派生的子代理。
 - **verify 关卡**:执行体声明完成时,起一个独立的只读判定子代理,在一次性 git 快照里核验"原始目标是否真的达成",每个"完成"主张都需证据,失败开放(verifier 故障不会卡死已完成的运行)。
 - **drift 关卡**:在结构性边界起一个独立子代理,对照原始目标与 durable checkpoint 判断是否跑偏,并可沉淀有据可循的经验教训。
-- **断路器与收紧默认**:并发子代理上限收到 3、共享预算上限默认 \$5;失败子代理指数退避自动重试。
+- **断路器与收紧默认**:并发子代理上限收紧到 3、普通子代理共享预算上限默认 \$10；`auto` / `simple_auto` 的主代理、子代理和 gate 共用默认 \$20 会话预算，可用 `--max-budget-usd` 或 `META_AGENT_AUTO_MAX_BUDGET_USD` 覆盖。
 - **可中断 / 可恢复**:进度(目标、已完成、待办、产出、在途子代理)写入 durable checkpoint;`--resume` 可继续中断的运行。在已恢复的会话里**输入新需求时,新需求会成为新目标**;只有空输入或"继续/continue"这类续跑信号才保留原目标。
 
 verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多文件交付物放宽):
@@ -180,8 +179,9 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 | 环境变量 | 默认 | 含义 |
 | --- | --- | --- |
 | `META_AGENT_VERIFY_MAX_TURNS` | 30 | 判定子代理最大轮次 |
-| `META_AGENT_VERIFY_MAX_BUDGET_USD` | 无上限 | 判定子代理最大花费(美元);默认不设上限,真实部署时建议显式设定 |
-| `META_AGENT_VERIFY_MAX_DURATION_MS` | 600000 | 判定子代理墙钟上限(ms) |
+| `META_AGENT_VERIFY_MAX_BUDGET_USD` | 1 | 判定子代理最大花费(美元) |
+| `META_AGENT_DRIFT_MAX_BUDGET_USD` | 0.5 | 航向判定子代理最大花费(美元) |
+| `META_AGENT_VERIFY_MAX_DURATION_MS` | 1800000 | 判定子代理墙钟上限(ms) |
 
 ### simple_auto 轻量自治模式
 
@@ -194,19 +194,9 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 实现上,内核循环对 checkpoint/drift/verify 三者都是"配置钩子缺失即跳过",`simple_auto` 只是让后端工厂不挂载这些钩子(见 `AgenticBackendFactory` 的 `wantsGates` 开关),因此得到的是"`auto` 的自治与监狱、但没有自监督开销"。和 `auto` 一样,`simple_auto` 仅能**显式进入**(`--mode simple_auto`),绝不会被提示词措辞推断出来。任务一旦变复杂或高风险,建议改用 `auto`。
 
-### auto_orch 自治编排模式
+### 长周期 Loop 运行时
 
-`auto_orch` 是 `simple_auto` 执行基座之上的**多 Agent 自我编排**:保留工作区硬监狱、自动批准、断路器与子代理调度,但不启用 `auto` 的隐式 checkpoint / drift / verify 关卡。复杂目标的校验、航向检查与复核由计划图中的显式角色节点表达和保证。
-
-- **自主编排**:面对复杂目标,主代理先规划出一张由多个子代理节点组成的协作流程——执行节点负责干活,审查角色节点(校验完成度 / 检查航向 / 复核产出)负责把关,节点间可并行或串行。
-- **计划审核**:交互式 CLI 中显式进入 `--mode auto_orch` 时,planner 生成的候选图会先在终端展示节点、边与 bounds,用户可批准、要求修改或取消;`--yes` / `--json` 下不打断执行。也可用 `--auto-orch-review-plan` 显式开启。
-- **编排即数据**:编排方案是一张**受校验与硬上限约束的计划图(plan graph)**,由固定引擎解释执行,而非模型自由生成并直接运行的代码;非法或越界的编排会被拒绝并回退到单执行器 + 显式 verify 的安全计划,因此编排层永远绕不过权限牢笼。
-- **阶段钩子**:启动编排图并在阶段边界承载编排层控制;默认不再额外注入外层 drift/verify。
-- **终端可观测**:执行图时终端会打印 `plan_started`、`node_started`、`node_finished`、`edge_selected`、`run_paused`、`run_resumed`、`run_completed` 对应的进度行,包括节点 id、label、选边、暂停恢复信息与执行路径。
-- **显式审查**:计划图需要审查时必须放置 role 节点(如 `verify` / `drift` / `reviewer`)并通过边表达返工路径;节点内部不依赖隐藏的 auto gate 兜底。
-- **轻量执行基座**:工作区监狱、自动批准、断路器、`maxTurns`、子代理 jail 透传等与 `simple_auto` 一致;不写/读 auto durable checkpoint,不装配 auto 经验召回/写入。
-
-实现上,`auto_orch` 与 `simple_auto` 使用同一套轻量自治执行基座(`isAuto` 为真、复用工作区 jail,但不挂载 `wantsGates` 对应的 checkpoint/drift/verify/experience hooks),并额外接上规划器(`PlannerAgent` 生成计划图)、角色注册表与阶段钩子(见 `AgenticBackendFactory` / `core/auto_orch`)。和 `auto` / `simple_auto` 一样,`auto_orch` 仅能**显式进入**(`--mode auto_orch`),绝不会被提示词措辞推断出来。
+跨阶段、多 Agent 的长周期任务使用 `meta-agent loop create|tick|list|inspect|pause|resume|inbox|distill`，而不是会话模式。Loop 把 charter、round ledger、预算和 daemon 调度放在会话之上；座位仍使用 `auto` / `simple_auto` / `agentic` 等会话档位执行。设计与命令详情见 [`docs/auto-orch-v2-spec.md`](docs/auto-orch-v2-spec.md)。
 
 ---
 

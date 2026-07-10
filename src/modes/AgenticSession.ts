@@ -134,6 +134,8 @@ export class AgenticSession {
       initialCheckpointRevision: config.initialCheckpointRevision,
       maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
+      onMainCostUsd: resolved.onMainCostUsd,
+      getAdditionalBudgetUsd: resolved.getAdditionalBudgetUsd,
       maxOutputTokens: resolved.maxTokens,
       maxRetries: resolved.maxRetries,
       compact: {

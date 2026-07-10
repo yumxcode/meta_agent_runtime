@@ -182,6 +182,15 @@ export interface KernelConfig {
   /** Maximum cumulative USD budget across this session's lifetime */
   maxBudgetUsd?: number
 
+  /** Report this kernel's cumulative main-agent spend to an outer ledger. */
+  onMainCostUsd?: (costUsd: number) => void
+
+  /**
+   * Additional settled/reserved spend owned by concurrent child tasks. Included
+   * in maxBudgetUsd checks to enforce one budget for an autonomous session.
+   */
+  getAdditionalBudgetUsd?: () => number
+
   /** Override max_tokens sent to the API */
   maxOutputTokens?: number
 
