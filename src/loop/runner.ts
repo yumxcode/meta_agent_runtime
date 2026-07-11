@@ -7,9 +7,17 @@
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { listInstanceRecords, loadInstance } from './instance/InstanceStore.js'
-import { runRound, type RoundOutcome, type LoopEvent } from './kernel/LoopKernel.js'
+import {
+  RoundAbortedError,
+  RoundExecutionUncertainError,
+  runRound,
+  type RoundOutcome,
+  type LoopEvent,
+} from './kernel/LoopKernel.js'
+import { setInstanceStatus } from './instance/InstanceStore.js'
 import { ingestEvents, reconcileWaiting } from './effects/WaitOps.js'
 import { HALTED_STATUSES } from './types.js'
+import { LedgerCorruptionError } from './ledger/LedgerApi.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
@@ -88,8 +96,40 @@ export async function tickOnce(deps: TickDeps, now = Date.now()): Promise<TickRe
         wakeStore,
         observer: deps.observer,
       })
+      await wakeStore.release(wake.wakeId, outcome.route === 'stale-wake' ? 'cancelled' : 'done')
       outcomes.push({ loopId: wake.loopId, outcome })
     } catch (err) {
+      if (err instanceof LedgerCorruptionError) {
+        const instance = await loadInstance(deps.projectDir, wake.loopId)
+        if (instance) {
+          await setInstanceStatus(instance, 'failed', `ledger recovery failed: ${err.message}`).catch(() => undefined)
+          await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
+        } else {
+          await wakeStore.release(wake.wakeId, 'cancelled').catch(() => undefined)
+        }
+        outcomes.push({ loopId: wake.loopId, error: err.message })
+        continue
+      }
+      if (err instanceof RoundExecutionUncertainError) {
+        const instance = await loadInstance(deps.projectDir, wake.loopId)
+        if (instance) {
+          await setInstanceStatus(
+            instance,
+            'failed',
+            `seat ${err.taskId} cancellation was not confirmed; operator reconciliation required`,
+          ).catch(() => undefined)
+          await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
+        } else {
+          await wakeStore.release(wake.wakeId, 'cancelled').catch(() => undefined)
+        }
+        outcomes.push({ loopId: wake.loopId, error: err.message })
+        continue
+      }
+      if (err instanceof RoundAbortedError) {
+        await wakeStore.addAbortedCost(wake.wakeId, err.costUsd).catch(() => undefined)
+        const instance = await loadInstance(deps.projectDir, wake.loopId)
+        if (instance) await setInstanceStatus(instance, 'idle', 'round safely cancelled; pending replay').catch(() => undefined)
+      }
       // A crashed round re-queues its wake (claim TTL would also recover it,
       // but an in-process failure can requeue immediately and cheaply).
       await wakeStore.release(wake.wakeId, 'pending').catch(() => undefined)

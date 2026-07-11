@@ -104,7 +104,7 @@ export interface SeatSpec {
 }
 
 export interface BudgetSpec {
-  perRound?: { usd?: number; turns?: number }
+  perRound?: { usd?: number }
   lifetime?: { rounds?: number; usd?: number; deadlineMs?: number }
 }
 

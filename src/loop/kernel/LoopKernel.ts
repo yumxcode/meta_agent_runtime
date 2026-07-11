@@ -28,6 +28,7 @@
  */
 import { readFile, rm } from 'fs/promises'
 import { join } from 'path'
+import { resolveExistingInside } from '../security/PathSafety.js'
 import { evaluateBool, type EvalContext } from '../expr/Expr.js'
 import type { FrozenCharter, TripwireAction } from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
@@ -68,6 +69,53 @@ export interface RunRoundDeps extends SeatRunnerDeps {
   observer?: (event: LoopEvent) => void
 }
 
+export class RoundAbortedError extends Error {
+  constructor(public readonly costUsd: number) {
+    super('loop round aborted after its active seat reached a terminal state')
+    this.name = 'RoundAbortedError'
+  }
+}
+
+export class RoundExecutionUncertainError extends Error {
+  constructor(public readonly taskId: string, public readonly costUsd: number) {
+    super(`loop seat ${taskId} did not confirm terminal cancellation; refusing replay`)
+    this.name = 'RoundExecutionUncertainError'
+  }
+}
+
+function assertReplaySafeSeat(seat: SeatResult, attemptCostUsd: number): void {
+  if (seat.termination === 'cancellation_unconfirmed') {
+    throw new RoundExecutionUncertainError(seat.taskId, attemptCostUsd)
+  }
+  if (seat.termination === 'aborted') throw new RoundAbortedError(attemptCostUsd)
+}
+
+function remainingSeatUsd(
+  charter: FrozenCharter,
+  lifetimeCostUsd: number,
+  spentThisRoundUsd: number,
+): number | undefined {
+  const limits: number[] = []
+  const roundCap = charter.budgets?.perRound?.usd
+  if (roundCap !== undefined) limits.push(roundCap - spentThisRoundUsd)
+  const lifeCap = charter.budgets?.lifetime?.usd
+  if (lifeCap !== undefined) limits.push(lifeCap - lifetimeCostUsd - spentThisRoundUsd)
+  return limits.length > 0 ? Math.max(0, Math.min(...limits)) : undefined
+}
+
+function budgetBlockedSeat(summary: string): SeatResult {
+  return {
+    ok: false,
+    summary,
+    data: {},
+    structured: true,
+    costUsd: 0,
+    turnsUsed: 0,
+    termination: 'terminal',
+    taskId: 'budget-blocked',
+  }
+}
+
 export interface RoundOutcome {
   round: number
   mode: RoundMode
@@ -106,19 +154,33 @@ export async function runRound(
   }, 60_000)
   heartbeat.unref?.()
   try {
+    if (deps.signal.aborted) throw new RoundAbortedError(0)
     // ── 2. RECONCILE ──────────────────────────────────────────────────────────
     await deps.wakeStore.reconcileOrphans()
     await ingestEvents(instance, waitDeps)
     await reconcileWaiting(instance, waitDeps)
 
     const pending = await readPendingRound(instance)
+    if (
+      wake.kind === 'event' &&
+      (!pending || pending.kind !== 'effect' || pending.effectKey !== wake.effectKey)
+    ) {
+      const progress = await instance.ledger.readProgress()
+      return {
+        round: pending?.round ?? progress.iteration,
+        mode: pending ? normalizeRoundMode(pending.mode) : 'normal',
+        route: 'stale-wake',
+        status: instance.record.status,
+        costUsd: 0,
+      }
+    }
     if (pending) {
       if (pending.kind === 'self_timer') {
         // Self-timer park: the firing timer wake IS the resume signal. If it fired
         // early (coalesced), keep waiting until fireAt.
         if (Date.now() >= (pending.fireAt ?? 0)) {
           await setInstanceStatus(instance, 'running')
-          return await harvestSegment(instance, deps, pending)
+          return await harvestSegment(instance, deps, pending, wake.abortedCostUsd ?? 0)
         }
         // Fired early (a coalesced/foreign timer): this wake is consumed on
         // release, so re-arm the REAL resume wake at fireAt — otherwise the
@@ -136,7 +198,7 @@ export async function runRound(
       const effect = await effectLedgerFor(instance).get(pending.effectKey!)
       if (effect?.status === 'concluded') {
         await setInstanceStatus(instance, 'running')
-        return await harvestSegment(instance, deps, pending)
+        return await harvestSegment(instance, deps, pending, wake.abortedCostUsd ?? 0)
       }
       // A coalesced timer fired while we wait — the probe/event owns progress.
       await setInstanceStatus(instance, 'waiting')
@@ -147,20 +209,20 @@ export async function runRound(
     }
 
     await setInstanceStatus(instance, 'running')
-    return await freshRound(instance, deps)
+    return await freshRound(instance, deps, wake.abortedCostUsd ?? 0)
   } finally {
     clearInterval(heartbeat)
-    await deps.wakeStore.release(wake.wakeId, 'done').catch(() => undefined)
   }
 }
 
 // ── fresh round (submit segment when the worker requests a wait) ──────────────
 
-async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<RoundOutcome> {
+async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCostUsd = 0): Promise<RoundOutcome> {
   const { charter, ledger, paths } = instance
   const startedAt = Date.now()
   const seatSummaries: Record<string, string> = {}
-  let costUsd = 0
+  let costUsd = carriedCostUsd
+  let attemptCostUsd = 0
 
   const progress = await ledger.readProgress()
   const round = progress.iteration + 1
@@ -174,7 +236,7 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
   // seat runs (e.g. a deadline passed while idle), the loop must not spend.
   // The charter may still claim this boundary via an escalate/finalize tripwire
   // on budget.lifetime.exhausted; otherwise the kernel finalizes.
-  if (lifetimeExhausted(charter, progress)) {
+  if (lifetimeExhausted(charter, { ...progress, totalCostUsd: progress.totalCostUsd + carriedCostUsd })) {
     const route = terminalRouteForExhaustion(charter, buildCtx(progress.meters, {}, true))
     return terminate(instance, deps, {
       round, mode, route,
@@ -192,15 +254,29 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
     // drop the human feedback from the worker's capsule (the second build).
     inboxMessages = await consumeInbox(paths)
     const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, inboxMessages })
-    const pivot = await runPivoterSeat(deps, charter, paths, capsuleForPivot)
+    const pivotLimit = remainingSeatUsd(charter, progress.totalCostUsd, costUsd)
+    const pivot = pivotLimit !== undefined && pivotLimit <= 0
+      ? budgetBlockedSeat('pivoter skipped: round/lifetime USD budget exhausted')
+      : await runPivoterSeat(deps, charter, paths, capsuleForPivot, { usd: pivotLimit })
     costUsd += pivot.costUsd
+    attemptCostUsd += pivot.costUsd
+    assertReplaySafeSeat(pivot, attemptCostUsd)
     seatSummaries['pivoter'] = truncate(pivot.summary)
     pivotDirective = typeof pivot.data['directive'] === 'string' ? pivot.data['directive'] : undefined
   }
   const capsule = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, pivotDirective, inboxMessages })
 
   // ── 5b+6. SEAT + GATE ───────────────────────────────────────────────────────
-  const seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries)
+  let seatLoop: SeatLoopOutcome
+  try {
+    seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries, undefined, costUsd)
+  } catch (err) {
+    if (err instanceof RoundAbortedError) throw new RoundAbortedError(attemptCostUsd + err.costUsd)
+    if (err instanceof RoundExecutionUncertainError) {
+      throw new RoundExecutionUncertainError(err.taskId, attemptCostUsd + err.costUsd)
+    }
+    throw err
+  }
   costUsd += seatLoop.costUsd
 
   if (seatLoop.kind === 'wait') {
@@ -264,6 +340,7 @@ async function runSeatLoop(
   capsule: Capsule,
   seatSummaries: Record<string, string>,
   initialPreface?: string,
+  spentBeforeUsd = 0,
 ): Promise<SeatLoopOutcome> {
   const { charter, paths } = instance
   let judge: SeatResult | null = null
@@ -274,10 +351,18 @@ async function runSeatLoop(
   const retried = { diversity: false, schema: false, judge: false, judgeCrash: false, wait: false }
 
   for (;;) {
-    worker = await runWorkerSeat(deps, charter, paths, capsule, corrective)
+    const progress = await instance.ledger.readProgress()
+    const workerLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
+    if (workerLimit !== undefined && workerLimit <= 0) {
+      worker = budgetBlockedSeat('worker skipped: round/lifetime USD budget exhausted')
+      seatSummaries['worker'] = worker.summary
+      break
+    }
+    worker = await runWorkerSeat(deps, charter, paths, capsule, corrective, { usd: workerLimit })
     costUsd += worker.costUsd
     seatSummaries['worker'] = truncate(worker.summary)
     deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'worker', ok: worker.ok, costUsd: worker.costUsd })
+    assertReplaySafeSeat(worker, costUsd)
 
     // Self-timer park (worker called the timer tool) — takes priority: the
     // worker explicitly parked itself, no external effect involved.
@@ -335,26 +420,45 @@ async function runSeatLoop(
       continue
     }
     if (charter.seats.judge) {
-      judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter))
+      const judgeLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
+      if (judgeLimit !== undefined && judgeLimit <= 0) {
+        judge = budgetBlockedSeat('judge skipped: round/lifetime USD budget exhausted; drafts rejected')
+        seatSummaries['judge'] = judge.summary
+        worker = { ...worker, ok: false, summary: `${worker.summary}; ${judge.summary}` }
+        break
+      }
+      judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter), { usd: judgeLimit })
       costUsd += judge.costUsd
       seatSummaries['judge'] = truncate(judge.summary)
       deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
+      assertReplaySafeSeat(judge, costUsd)
       if (!judge.ok && !retried.judgeCrash) {
         // A crashed judge (API error / timeout, no verdict) must not silently
         // pass its gate: one in-round rerun; if it crashes again, admitDrafts
         // fails closed (drafts discarded) instead of admitting unreviewed.
         retried.judgeCrash = true
-        judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter))
+        const retryLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
+        if (retryLimit !== undefined && retryLimit <= 0) {
+          judge = budgetBlockedSeat('judge retry skipped: round/lifetime USD budget exhausted; drafts rejected')
+          seatSummaries['judge'] = judge.summary
+          worker = { ...worker, ok: false, summary: `${worker.summary}; ${judge.summary}` }
+          break
+        }
+        judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter), { usd: retryLimit })
         costUsd += judge.costUsd
         seatSummaries['judge'] = truncate(judge.summary)
         deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
+        assertReplaySafeSeat(judge, costUsd)
       }
-      const failMessages = judge.data['verdict'] === 'fail'
+      const judgeFailed = judge.data['verdict'] === 'fail'
+      const failMessages = judgeFailed
         ? (Array.isArray(judge.data['messages']) ? (judge.data['messages'] as unknown[]).map(String) : [])
         : []
-      if (failMessages.length > 0 && !retried.judge) {
+      if (judgeFailed && !retried.judge) {
         retried.judge = true
-        corrective = `【纠偏重试】评审未通过：\n- ${failMessages.join('\n- ')}`
+        corrective = failMessages.length > 0
+          ? `【纠偏重试】评审未通过：\n- ${failMessages.join('\n- ')}`
+          : '【纠偏重试】评审未通过（judge 未给出具体纠偏项）。请自查证据链、产出格式和目标达成条件后重做。'
         correctiveRetries++
         continue
       }
@@ -444,6 +548,7 @@ async function harvestSegment(
   instance: LoopInstance,
   deps: RunRoundDeps,
   pending: PendingRound,
+  carriedCostUsd = 0,
 ): Promise<RoundOutcome> {
   const { charter, ledger, paths } = instance
   const effects = effectLedgerFor(instance)
@@ -508,8 +613,10 @@ async function harvestSegment(
   }
 
   const seatSummaries: Record<string, string> = { ...pending.seatSummaries }
-  const seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries, preface)
-  const costUsd = pending.costUsdSoFar + seatLoop.costUsd
+  const seatLoop = await runSeatLoop(
+    instance, deps, capsule, seatSummaries, preface, pending.costUsdSoFar + carriedCostUsd,
+  )
+  const costUsd = pending.costUsdSoFar + carriedCostUsd + seatLoop.costUsd
 
   if (seatLoop.kind === 'wait') {
     // Chained wait / self-timer re-park: same round parks again.
@@ -593,24 +700,26 @@ async function completeRound(
   const postCtx = buildCtx(meters, observables, budgetExhausted)
   const route = decideRoute(charter, postCtx, input.judge, budgetExhausted)
   const status = statusFor(route, charter, postCtx, meters)
+  const postState = {
+    iteration: input.round,
+    meters,
+    status,
+    ...(route.kind === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
+    bestMetric,
+    totalFindings: progress.totalFindings + admitted,
+    totalCostUsd,
+  }
 
   await ledger.appendRound({
     round: input.round, mode: input.mode, observables, meters, route,
     correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
     seatSummaries: input.seatSummaries,
     startedAt: input.startedAt, finishedAt: Date.now(),
+    postState,
     ...(warnings.length > 0 ? { warnings } : {}),
   } satisfies RoundEntry)
   await ledger.writeProgress({
-    iteration: input.round,
-    meters,
-    status,
-    // One-shot pivot directive: set exactly when ROUTE chose pivot; the next
-    // round's MODE consumes it, and every other write clears it.
-    ...(route.kind === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
-    bestMetric,
-    totalFindings: progress.totalFindings + admitted,
-    totalCostUsd,
+    ...postState,
     updatedAt: Date.now(),
   })
 
@@ -795,7 +904,8 @@ async function admitDrafts(instance: LoopInstance, judge: SeatResult | null): Pr
     const entries = Array.isArray(parsed) ? parsed : [parsed]
     // Fail-closed: a declared judge that crashed (ok=false, no verdict) must
     // not admit unreviewed findings into the permanent ledger.
-    const pass = !judge || (judge.ok && judge.data['verdict'] !== 'fail')
+    const judgeRequired = !!instance.charter.seats.judge
+    const pass = !judgeRequired || (!!judge && judge.ok && judge.data['verdict'] !== 'fail')
     if (pass) {
       for (const entry of entries) {
         await ledger.appendJsonl(paths.findingsJsonl, entry)
@@ -842,8 +952,8 @@ async function runSchemaGates(instance: LoopInstance): Promise<string[]> {
   for (const gate of Object.values(instance.charter.gates ?? {})) {
     if (gate.kind !== 'schema') continue
     for (const rel of gate.files) {
-      const abs = join(instance.paths.root, rel)
       try {
+        const abs = await resolveExistingInside(instance.paths.root, rel)
         JSON.parse(await readFile(abs, 'utf-8'))
       } catch (err) {
         errs.push(`${rel}: ${(err as Error).message}`)
@@ -911,8 +1021,17 @@ async function terminate(
   const escalated = input.route.kind === 'escalate'
   const reason = input.route.reason ?? input.route.kind
   const terminalStatus: ProgressStatus = escalated ? 'paused_attention' : 'completed'
+  const progressBeforeTerminal = await ledger.readProgress()
 
   if (!input.alreadyAccounted) {
+    const terminalPostState = {
+      ...progressBeforeTerminal,
+      iteration: Math.max(progressBeforeTerminal.iteration, input.round),
+      meters: input.meters,
+      status: terminalStatus,
+      nextRoundMode: undefined,
+      totalCostUsd: progressBeforeTerminal.totalCostUsd + input.costUsd,
+    }
     await ledger.appendRound({
       round: input.round, mode: input.mode,
       observables: input.observables, meters: input.meters,
@@ -920,6 +1039,7 @@ async function terminate(
       correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
       seatSummaries: input.seatSummaries,
       startedAt: input.startedAt, finishedAt: Date.now(),
+      postState: terminalPostState,
     })
   }
 
@@ -943,7 +1063,7 @@ async function terminate(
   // Terminal progress write — covers the not-yet-accounted path (pre-round
   // budget guard) and folds in the finalizer cost, so progress.status can
   // never contradict the instance status again.
-  const progress = await ledger.readProgress()
+  const progress = input.alreadyAccounted ? await ledger.readProgress() : progressBeforeTerminal
   await ledger.writeProgress({
     ...progress,
     // The not-yet-accounted path appended a terminal RoundEntry above — keep

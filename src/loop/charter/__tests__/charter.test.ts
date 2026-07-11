@@ -123,6 +123,23 @@ describe('validateCharter', () => {
     expect(errs.some(e => e.includes('.meta-agent'))).toBe(true)
   })
 
+  it('rejects paths and write scopes that cannot be enforced safely', () => {
+    const charter = walkResearchCharter({ writeScope: ['*.md'] })
+    charter.seats.judge!.inputs = ['../../etc/passwd']
+    const errs = validateCharter(charter)
+    expect(errs.some(e => e.includes('cannot be enforced safely'))).toBe(true)
+    expect(errs.some(e => e.includes("must not contain '..'"))).toBe(true)
+  })
+
+  it('requires a judge for judge-sourced observables', () => {
+    const charter = walkResearchCharter()
+    delete charter.seats.judge
+    delete charter.gates.findings_gate
+    expect(validateCharter(charter)).toContain(
+      'judge-sourced observables require seats.judge — otherwise they can never be populated',
+    )
+  })
+
   it('rejects a judge gate without a judge seat', () => {
     const charter = walkResearchCharter()
     delete charter.seats.judge

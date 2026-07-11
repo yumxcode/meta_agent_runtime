@@ -118,6 +118,17 @@ export interface RoundEntry {
   /** Kernel-detected anomalies this round (e.g. a declared observable the judge
    * never emitted). Purely diagnostic — never routed on. */
   warnings?: string[]
+  /** Authoritative state after this round committed. progress.json is a
+   * rebuildable cache of this append-only payload. */
+  postState?: {
+    iteration: number
+    meters: Record<string, number>
+    status: ProgressStatus
+    nextRoundMode?: 'pivot'
+    bestMetric: number | null
+    totalFindings: number
+    totalCostUsd: number
+  }
 }
 
 // ── Instance directory layout ─────────────────────────────────────────────────

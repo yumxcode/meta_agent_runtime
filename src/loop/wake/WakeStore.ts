@@ -45,6 +45,10 @@ export interface WakeRecord {
   status: WakeStatus
   claim?: { owner: string; claimedAt: number; expiresAt: number }
   attempts: number
+  /** Cost observed on safely-cancelled attempts before this wake completed.
+   * It is carried into the eventual RoundEntry so abort/restart cannot reset
+   * the lifetime USD ledger. */
+  abortedCostUsd?: number
   createdAt: number
   updatedAt: number
 }
@@ -183,6 +187,19 @@ export class WakeStore {
         ...record,
         claim: { ...record.claim, expiresAt: now + this.claimTtlMs },
         updatedAt: now,
+      })
+    })
+  }
+
+  async addAbortedCost(wakeId: string, costUsd: number): Promise<void> {
+    if (!Number.isFinite(costUsd) || costUsd <= 0) return
+    await withFileLock(this.lockPath(), async () => {
+      const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
+      if (!record) return
+      await atomicWriteJson(this.pathFor(wakeId), {
+        ...record,
+        abortedCostUsd: (record.abortedCostUsd ?? 0) + costUsd,
+        updatedAt: Date.now(),
       })
     })
   }

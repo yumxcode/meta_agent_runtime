@@ -5,6 +5,7 @@
  * the planner-error feedback pattern that proved out in v1).
  */
 import { parse, type Ast } from '../expr/Expr.js'
+import { relativePathError, writeScopeRoot } from '../security/PathSafety.js'
 import type { Charter, FrozenCharter, LegacyTripwireAction, MeterSpec, TripwireAction, TripwireSpec } from './CharterTypes.js'
 
 const ID_RE = /^[a-z][a-z0-9_-]*$/i
@@ -79,6 +80,9 @@ export function validateCharter(rawCharter: Charter): string[] {
       errs.push(`observable[${o.name}].source needs a non-empty 'key' (the judge return_result data field)`)
     }
   }
+  if ((charter.observables?.length ?? 0) > 0 && !charter.seats?.judge) {
+    errs.push("judge-sourced observables require seats.judge — otherwise they can never be populated")
+  }
   const meterNames = new Set<string>()
   for (const m of charter.meters ?? []) {
     if (!m.name) { errs.push('meter needs a name'); continue }
@@ -142,6 +146,10 @@ export function validateCharter(rawCharter: Charter): string[] {
     if (META_AGENT_RE.test(seat.prompt ?? '')) {
       errs.push(`seats.${name}.prompt references .meta-agent/ — runtime-internal, writes there are discarded`)
     }
+    for (const input of seat.inputs ?? []) {
+      const pathErr = relativePathError(input)
+      if (pathErr) errs.push(`seats.${name}.inputs '${input}' ${pathErr}`)
+    }
     const wc = seat.budgetPerRound?.wallclockMin
     if (wc !== undefined && (!Number.isFinite(wc) || wc < 1)) {
       errs.push(`seats.${name}.budgetPerRound.wallclockMin must be a positive number of minutes`)
@@ -159,9 +167,19 @@ export function validateCharter(rawCharter: Charter): string[] {
       if (!charter.seats?.judge) {
         errs.push(`gate[${name}] is a judge gate but no judge seat is declared`)
       }
+      for (const evidence of gate.evidence) {
+        const pathErr = relativePathError(evidence)
+        if (pathErr) errs.push(`gate[${name}].evidence '${evidence}' ${pathErr}`)
+      }
     }
     if (gate.kind === 'schema' && gate.files.length === 0) {
       errs.push(`gate[${name}] declares no files`)
+    }
+    if (gate.kind === 'schema') {
+      for (const file of gate.files) {
+        const pathErr = relativePathError(file)
+        if (pathErr) errs.push(`gate[${name}].files '${file}' ${pathErr}`)
+      }
     }
   }
   if (judgeGateNames.length > 1) {
@@ -174,10 +192,18 @@ export function validateCharter(rawCharter: Charter): string[] {
   // Write scope hygiene (D8 + v1 postmortem).
   for (const scope of charter.writeScope ?? []) {
     if (META_AGENT_RE.test(scope)) errs.push(`writeScope '${scope}' is under .meta-agent/ (merge-excluded)`)
-    if (scope.startsWith('/') || scope.startsWith('..')) errs.push(`writeScope '${scope}' must be workspace-relative`)
+    try {
+      writeScopeRoot(scope)
+    } catch (err) {
+      errs.push(`writeScope '${scope}' cannot be enforced safely: ${(err as Error).message}`)
+    }
   }
 
   // Budgets sanity.
+  const perRound = charter.budgets?.perRound
+  if (perRound?.usd !== undefined && (!Number.isFinite(perRound.usd) || perRound.usd <= 0)) {
+    errs.push('budgets.perRound.usd must be a positive number')
+  }
   const life = charter.budgets?.lifetime
   if (life) {
     if (life.rounds !== undefined && (!Number.isInteger(life.rounds) || life.rounds < 1)) {

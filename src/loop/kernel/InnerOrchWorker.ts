@@ -95,7 +95,7 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
 
   const scopeNote = opts.writeScope?.length
     ? `## 写入范围\n除 drafts/ 外，仅允许修改：${opts.writeScope.join(', ')}`
-    : ''
+    : '## 写入范围\n本 loop 不允许修改仓库文件；只允许写入本轮 drafts/。'
 
   return [
     ROLE_HEADER,

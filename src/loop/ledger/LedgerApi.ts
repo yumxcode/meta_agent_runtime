@@ -16,7 +16,7 @@
  *     so CapsuleBuilder and budget checks share one truth (D13: ledger is the
  *     authority for lifetime accounting).
  */
-import { appendFile, mkdir, readFile } from 'fs/promises'
+import { appendFile, mkdir, readFile, rename } from 'fs/promises'
 import { dirname } from 'path'
 import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
 import type { InstancePaths, ProgressStatus, RoundEntry } from '../types.js'
@@ -42,6 +42,13 @@ export interface LedgerView {
   lastFindings: unknown[]
   directions: unknown[]
   findingsCount: number
+}
+
+export class LedgerCorruptionError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'LedgerCorruptionError'
+  }
 }
 
 const DEFAULT_PROGRESS: ProgressView = {
@@ -122,7 +129,57 @@ export class Ledger {
   }
 
   async readProgress(): Promise<ProgressView> {
-    return (await readJsonFile<ProgressView>(this.paths.progressJson)) ?? { ...DEFAULT_PROGRESS }
+    let progress: ProgressView | null = null
+    let corrupt = false
+    try {
+      const candidate = JSON.parse(await readFile(this.paths.progressJson, 'utf-8')) as ProgressView
+      const schemaErrors = progressSchema(candidate)
+      if (schemaErrors.length > 0) throw new Error(schemaErrors.join('; '))
+      progress = candidate
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') {
+        corrupt = true
+        await rename(this.paths.progressJson, `${this.paths.progressJson}.corrupt`).catch(() => undefined)
+      }
+    }
+
+    const rounds = await this.readJsonl<RoundEntry>(this.paths.roundsJsonl)
+    for (let i = 1; i < rounds.length; i++) {
+      if (rounds[i]!.round <= rounds[i - 1]!.round) {
+        throw new LedgerCorruptionError(
+          `round ledger is not strictly increasing at ${rounds[i - 1]!.round} → ${rounds[i]!.round}`,
+        )
+      }
+    }
+    const last = rounds.at(-1)
+    if (!progress) {
+      if (!last && !corrupt) return { ...DEFAULT_PROGRESS }
+      if (!last?.postState) {
+        throw new LedgerCorruptionError(
+          `progress is ${corrupt ? 'corrupt' : 'missing'} and rounds do not contain a recoverable postState`,
+        )
+      }
+      const rebuilt = { ...last.postState, updatedAt: Date.now() }
+      await this.writeProgress(rebuilt)
+      return rebuilt
+    }
+
+    if (last && last.round > progress.iteration) {
+      if (!last.postState) {
+        throw new LedgerCorruptionError(
+          `progress is behind round ${last.round}, but that round has no recoverable postState`,
+        )
+      }
+      const rebuilt = { ...last.postState, updatedAt: Date.now() }
+      await this.writeProgress(rebuilt)
+      return rebuilt
+    }
+    if (last && last.round < progress.iteration) {
+      throw new LedgerCorruptionError(
+        `progress iteration ${progress.iteration} is ahead of the last audited round ${last.round}`,
+      )
+    }
+    return progress
   }
 
   /** One derived truth for capsule/budget/meter steps. */
@@ -168,6 +225,15 @@ export function roundSchema(value: unknown): string[] {
     errs.push('route must be a RouteDecision object with a kind')
   }
   if (typeof r['costUsd'] !== 'number') errs.push('costUsd must be a number')
+  if (r['postState'] !== undefined) {
+    const p = r['postState'] as Record<string, unknown>
+    if (typeof p !== 'object' || p === null) errs.push('postState must be an object')
+    else {
+      if (p['iteration'] !== r['round']) errs.push('postState.iteration must equal round')
+      if (typeof p['totalCostUsd'] !== 'number') errs.push('postState.totalCostUsd must be a number')
+      if (typeof p['totalFindings'] !== 'number') errs.push('postState.totalFindings must be a number')
+    }
+  }
   return errs
 }
 

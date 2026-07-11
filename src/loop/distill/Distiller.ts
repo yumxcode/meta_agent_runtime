@@ -77,7 +77,7 @@ Charter 结构（全部字段；? 为可选）：
 - 所以 worker 对"状态"的**全部写入只有两个 draft**：drafts/direction.json + drafts/findings_draft.json。worker prompt **绝不能**出现"更新 progress.json / append findings.jsonl / 写 directions_tried / 算 stale_count / 写 status / 落盘 state 脚本"这类动作——那是内核的活，写了就和内核账本打架（D7 单写者）。需求里的 state_writer/reduce_progress 阶段直接**丢弃**。
 - judge/pivoter 的 inputs、findings_gate 的 evidence 都**相对实例目录**解析，要用内核账本路径：ledger/findings.jsonl、ledger/directions.json、ledger/progress.json —— **不要**用工作区的 state/xxx（内核不写那里、也读不到）。
 - state_gate（schema 门）如需要，检查 ledger/progress.json 即可（内核写的、恒为合法）；通常可省。
-- writeScope 是**"worker 允许改的仓库文件/产物" glob**——按任务而定（代码、配置、文档皆可；纯分析/写作类 loop 可为空/不设），**不是**状态目录。别把 state/ledger/drafts 放进去（drafts 本就可写、账本 worker 碰不到）。若 worker 每轮确实要改某些产物，writeScope 必须覆盖那些路径，否则会被 prompt 挡住。
+- writeScope 是由 OS 沙箱强制的仓库写白名单：只允许现有文件/目录，或目录树形式 path/**；不支持 src/**/*.ts、*.md 这类无法被沙箱精确执行的复杂 glob。纯分析/写作类 loop 可为空，此时只能写 drafts/。它**不是**状态目录；别把 state/ledger/drafts 放进去（drafts 本就可写、账本 worker 碰不到）。
 
 内核轮管线（理解 tripwire 何时生效的前提）：
 - 每轮固定九步：WAKE ▸ RECONCILE ▸ MODE ▸ CAPSULE ▸ SEAT ▸ GATE ▸ METER ▸ LEDGER ▸ ROUTE，全部是宿主代码。
@@ -119,7 +119,7 @@ health（progress.status 的健康规则，可选）：
 - 长时外部任务的等待由 worker 用 timer 工具（自计时）或事件驱动，**不建模成 charter 字段**；在 seat.prompt 里说明即可（见"座位底座"的等待机制）。
 - 禁止在任何 prompt/路径中出现 .meta-agent/。
 - 账本归内核：worker 只写 drafts/direction.json + drafts/findings_draft.json；progress/findings/directions/log 由内核写入 ledger/，worker 绝不碰（见"账本归内核"）。
-- writeScope = worker 要改的仓库文件 glob（按任务而定，可为空），不是 state/ledger/drafts。
+- writeScope = worker 可写的现有文件/目录树（path/**，可为空），不是任意 glob，也不是 state/ledger/drafts。
 - 需求"每轮阶段"映射：load_state→内核胶囊(忽略)；choose/implement/extract→worker prompt(领域动作)；semantic_eval/verify→judge rubric；**reduce_progress/state_writer/route_by_status→内核 METER/LEDGER/ROUTE，全部丢弃，绝不写进 worker**。
 
 输出：必须调用 return_result，data 为 {"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。`

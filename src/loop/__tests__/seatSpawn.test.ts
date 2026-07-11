@@ -8,7 +8,7 @@ import { describe, expect, it } from 'vitest'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentRecord, SubAgentStatus } from '../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../subagent/types.js'
-import { spawnAndWait } from '../seatSpawn.js'
+import { spawnAndWait, spawnAndWaitDetailed } from '../seatSpawn.js'
 
 function rec(status: SubAgentStatus): SubAgentRecord {
   return {
@@ -41,11 +41,19 @@ describe('spawnAndWait maxWaitMs', () => {
     expect(out?.status).toBe('completed')
   })
 
-  it('returns null (abandons) when the deadline elapses before terminal', async () => {
+  it('returns null after cancelling when the deadline elapses before terminal', async () => {
     const out = await spawnAndWait(
       slowDispatcher(1_000), { taskDescription: 't' }, new AbortController().signal,
-      { pollMs: 2, maxWaitMs: 12 },
+      { pollMs: 2, maxWaitMs: 12, cancelGraceMs: 5 },
     )
     expect(out).toBeNull()
+  })
+
+  it('reports cancellation_unconfirmed so callers cannot replay a live task', async () => {
+    const out = await spawnAndWaitDetailed(
+      slowDispatcher(1_000), { taskDescription: 't' }, new AbortController().signal,
+      { pollMs: 2, maxWaitMs: 5, cancelGraceMs: 5 },
+    )
+    expect(out.kind).toBe('cancellation_unconfirmed')
   })
 })

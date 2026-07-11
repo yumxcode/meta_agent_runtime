@@ -19,12 +19,13 @@ import { basename, join } from 'path'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { MetaAgentTool } from '../../core/types.js'
 import { makeTimerTool, type TimerIntent } from '../../subagent/tools/timer.js'
-import { spawnAndWait, type SpawnWaitOptions } from '../seatSpawn.js'
+import { spawnAndWaitDetailed, type SpawnWaitOptions, type SpawnWaitKind } from '../seatSpawn.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../subagent/types.js'
 import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
+import { resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import {
   assembleInnerWorkerSystemPrompt,
   renderInnerWorkerUserMessage,
@@ -46,6 +47,9 @@ export interface SeatResult {
    */
   structured: boolean
   costUsd: number
+  turnsUsed: number
+  termination: SpawnWaitKind
+  taskId: string
   /** Set when the worker parked itself via the timer tool (self_timer wait). */
   timer?: TimerIntent
 }
@@ -69,6 +73,7 @@ export async function runWorkerSeat(
   paths: InstancePaths,
   capsule: Capsule,
   correctivePreface?: string,
+  budgetOverride?: { usd?: number },
 ): Promise<SeatResult> {
   const seat = charter.seats.worker
   const variant = workerVariant(seat)
@@ -103,7 +108,13 @@ export async function runWorkerSeat(
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
   // the sandbox level for the worker's bash — the prompt contract is the
   // instruction, this is the guarantee. Drafts/inbox stay writable.
+  const writeAllowPaths = [
+    paths.draftsDir,
+    ...await Promise.all((charter.writeScope ?? []).map(scope => resolveWriteScopeRoot(deps.projectDir, scope))),
+  ]
   const sandbox = {
+    readonlyWorkspace: true,
+    writeAllowPaths,
     writeDenyPaths: [
       paths.ledgerDir,
       paths.frozenCharter,
@@ -121,6 +132,7 @@ export async function runWorkerSeat(
   }
   const result = await runSeat(
     deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, timerTools, parkSignal,
+    budgetOverride,
   )
   return timerIntent ? { ...result, timer: timerIntent } : result
 }
@@ -159,7 +171,7 @@ export function buildJudgeContract(extraKeys: string[]): string {
   return `\
 你是隔离评审座位：你看不到执行座位的任何推理过程，只能依据下方内嵌证据作出裁决。
 必须调用 return_result，data 写：
-{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["若fail给出具体纠偏项"]}${extraClause}
+{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]}${extraClause}
 每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
 【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。`
 }
@@ -169,6 +181,7 @@ export async function runJudgeSeat(
   charter: FrozenCharter,
   paths: InstancePaths,
   evidencePaths: string[],
+  budgetOverride?: { usd?: number },
 ): Promise<SeatResult> {
   const seat = charter.seats.judge
   if (!seat) throw new Error('charter has no judge seat')
@@ -180,7 +193,7 @@ export async function runJudgeSeat(
     seat.prompt, buildJudgeContract(extraJudgeKeys(charter)), '【证据（内嵌，只此为界）】', evidence,
   ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
-  return runSeat(deps, seat, task, [])
+  return runSeat(deps, seat, task, [], undefined, undefined, undefined, undefined, undefined, budgetOverride)
 }
 
 const PIVOTER_CONTRACT = `\
@@ -193,13 +206,14 @@ export async function runPivoterSeat(
   charter: FrozenCharter,
   paths: InstancePaths,
   capsule: Capsule,
+  budgetOverride?: { usd?: number },
 ): Promise<SeatResult> {
   const seat = charter.seats.pivoter
   if (!seat) throw new Error('charter has no pivoter seat')
   const evidence = await inlineEvidence(paths, seat.inputs ?? [])
   const task = [renderCapsule(capsule), seat.prompt, PIVOTER_CONTRACT, '【证据（内嵌）】', evidence]
     .filter(Boolean).join('\n\n')
-  return runSeat(deps, seat, task, [])
+  return runSeat(deps, seat, task, [], undefined, undefined, undefined, undefined, undefined, budgetOverride)
 }
 
 const FINALIZER_CONTRACT = `\
@@ -243,6 +257,7 @@ async function runSeat(
   extraTools?: MetaAgentTool[],
   /** Shared park signal — a self-park tool flips it to end the segment (worker). */
   parkSignal?: { requested: boolean },
+  budgetOverride?: { usd?: number },
 ): Promise<SeatResult> {
   // Per-segment wall-clock: a research submit segment can legitimately need
   // >30 min (read + design + implement + submit). Configurable per charter;
@@ -258,13 +273,13 @@ async function runSeat(
     ...deps.spawnOpts,
     maxWaitMs: Math.max(deps.spawnOpts?.maxWaitMs ?? 0, seatMaxDurationMs + 60_000),
   }
-  const rec = await spawnAndWait(
+  const spawn = await spawnAndWaitDetailed(
     deps.dispatcher,
     {
       taskDescription,
       allowedTools: seat.tools ?? defaultTools,
       maxTurns: seat.budgetPerRound?.turns ?? 30,
-      maxBudgetUsd: seat.budgetPerRound?.usd ?? 2,
+      maxBudgetUsd: Math.min(seat.budgetPerRound?.usd ?? 2, budgetOverride?.usd ?? Number.POSITIVE_INFINITY),
       ...(seat.budgetPerRound?.wallclockMin ? { maxDurationMs: seatMaxDurationMs } : {}),
       requireHumanApproval: false,
       useEventDriven: false,
@@ -282,6 +297,7 @@ async function runSeat(
     deps.signal,
     spawnOpts,
   )
+  const rec = spawn.record
   const result = rec?.result
   const { data, structured } = extractData(result?.output, result?.summary)
   // Surface the FAILURE REASON, not just the summary: failed spawns (API error,
@@ -299,6 +315,9 @@ async function runSeat(
     data,
     structured,
     costUsd: result?.costUsd ?? 0,
+    turnsUsed: result?.turnsUsed ?? 0,
+    termination: spawn.kind,
+    taskId: spawn.taskId,
   }
 }
 
@@ -338,7 +357,16 @@ function lastJsonBlock(text: string): Record<string, unknown> | null {
 async function inlineEvidence(paths: InstancePaths, relPaths: string[]): Promise<string> {
   const sections: string[] = []
   for (const rel of relPaths) {
-    const abs = join(paths.root, rel)
+    let abs: string
+    try {
+      abs = await resolveExistingInside(paths.root, rel)
+    } catch (err) {
+      // Unsafe paths and symlink escapes are configuration/security failures,
+      // not optional missing evidence. Preserve fail-closed behavior.
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') throw err
+      sections.push(`--- ${rel} ---\n(不存在)`)
+      continue
+    }
     try {
       const raw = await readFile(abs, 'utf-8')
       const capped = raw.length > EVIDENCE_CAP_CHARS ? raw.slice(-EVIDENCE_CAP_CHARS) : raw

@@ -215,10 +215,33 @@ describe('lifetime budgets (T4.1)', () => {
   })
 })
 
+describe('per-round USD budget', () => {
+  it('caps the worker and fails closed when no budget remains for the judge', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-round-budget-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async t => passingSeats(paths)(t))
+    await createInstance({
+      projectDir: dir,
+      charter: walkResearchCharter({
+        budgets: { perRound: { usd: 0.1 }, lifetime: { rounds: 1 } },
+        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+      }),
+      wakeStore: new WakeStore(dir),
+    })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+    expect(dispatcher.configs).toHaveLength(1)
+    expect(dispatcher.configs[0]!.maxBudgetUsd).toBe(0.1)
+    const instance = (await loadInstance(dir, 'walk-research-v1'))!
+    expect(await instance.ledger.readView()).toMatchObject({
+      findingsCount: 0,
+    })
+  })
+})
+
 // ── T4.2 sandbox denial + T4.4 observer ───────────────────────────────────────
 
 describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
-  it('worker spawns carry writeDenyPaths over the ledger; judge carries none', async () => {
+  it('worker spawns use a readonly workspace with drafts allowlisted; judge carries none', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-sbx-'))
     const paths = instancePaths(dir, 'walk-research-v1')
     const dispatcher = scriptedDispatcher(async t => passingSeats(paths)(t))
@@ -233,6 +256,12 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
 
     const worker = dispatcher.configs.find(c => c.taskDescription!.includes('产出契约'))!
     const denied = (worker.sandbox as { writeDenyPaths?: string[] } | undefined)?.writeDenyPaths ?? []
+    const workerSandbox = worker.sandbox as {
+      readonlyWorkspace?: boolean
+      writeAllowPaths?: string[]
+    }
+    expect(workerSandbox.readonlyWorkspace).toBe(true)
+    expect(workerSandbox.writeAllowPaths).toEqual([paths.draftsDir])
     expect(denied).toContain(paths.ledgerDir)
     expect(denied).toContain(paths.instanceJson)
     const judge = dispatcher.configs.find(c => c.taskDescription!.includes('隔离评审座位'))!

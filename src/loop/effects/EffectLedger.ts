@@ -15,6 +15,7 @@
  */
 import type { Ledger } from '../ledger/LedgerApi.js'
 import type { InstancePaths } from '../types.js'
+import { withFileLock } from '../../infra/persist/index.js'
 
 export type EffectStatus = 'submitted' | 'probing' | 'concluded' | 'harvested' | 'failed'
 
@@ -50,39 +51,47 @@ export class EffectLedger {
     await this.ledger.appendJsonl(this.paths.effectsJsonl, event)
   }
 
+  private locked<T>(fn: () => Promise<T>): Promise<T> {
+    return withFileLock(this.paths.effectsJsonl, fn)
+  }
+
   async submit(input: {
     effectKey: string; kind: string; waitName: string; payload?: Record<string, unknown>
   }): Promise<void> {
-    const existing = await this.get(input.effectKey)
-    if (existing) return // idempotent: re-registering an effect is a no-op
-    await this.append({ t: 'submit', ...input, at: Date.now() })
+    await this.locked(async () => {
+      const existing = await this.get(input.effectKey)
+      if (existing) return // idempotent: re-registering an effect is a no-op
+      await this.append({ t: 'submit', ...input, at: Date.now() })
+    })
   }
 
   async recordProbe(effectKey: string, verdict: string, data?: unknown): Promise<void> {
-    await this.append({ t: 'probe', effectKey, verdict, data, at: Date.now() })
+    await this.locked(() => this.append({ t: 'probe', effectKey, verdict, data, at: Date.now() }))
   }
 
   async recordResubmit(effectKey: string, payload?: Record<string, unknown>): Promise<void> {
-    await this.append({ t: 'resubmit', effectKey, payload, at: Date.now() })
+    await this.locked(() => this.append({ t: 'resubmit', effectKey, payload, at: Date.now() }))
   }
 
   /** Conclude exactly once: the first conclude wins, later ones are no-ops.
    * This is the probe/event idempotency point (both paths call it). */
   async conclude(effectKey: string, verdict: string, via: 'probe' | 'event', data?: unknown): Promise<boolean> {
-    const current = await this.get(effectKey)
-    if (!current || current.status === 'concluded' || current.status === 'harvested' || current.status === 'failed') {
-      return false
-    }
-    await this.append({ t: 'conclude', effectKey, verdict, data, via, at: Date.now() })
-    return true
+    return this.locked(async () => {
+      const current = await this.get(effectKey)
+      if (!current || current.status === 'concluded' || current.status === 'harvested' || current.status === 'failed') {
+        return false
+      }
+      await this.append({ t: 'conclude', effectKey, verdict, data, via, at: Date.now() })
+      return true
+    })
   }
 
   async markHarvested(effectKey: string): Promise<void> {
-    await this.append({ t: 'harvested', effectKey, at: Date.now() })
+    await this.locked(() => this.append({ t: 'harvested', effectKey, at: Date.now() }))
   }
 
   async markFailed(effectKey: string, reason: string): Promise<void> {
-    await this.append({ t: 'failed', effectKey, reason, at: Date.now() })
+    await this.locked(() => this.append({ t: 'failed', effectKey, reason, at: Date.now() }))
   }
 
   async get(effectKey: string): Promise<EffectRecord | null> {

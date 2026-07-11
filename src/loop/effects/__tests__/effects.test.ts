@@ -32,6 +32,16 @@ describe('EffectLedger (event-sourced fold)', () => {
     expect((await effects.get('e1'))!.outcome!.verdict).toBe('done')
   })
 
+  it('concurrent conclude calls have exactly one winner', async () => {
+    const { effects } = await freshEffects()
+    await effects.submit({ effectKey: 'e1', kind: 'event', waitName: 'event' })
+    const results = await Promise.all([
+      effects.conclude('e1', 'done-a', 'event'),
+      effects.conclude('e1', 'done-b', 'event'),
+    ])
+    expect(results.filter(Boolean)).toHaveLength(1)
+  })
+
   it('submit is idempotent (first payload wins)', async () => {
     const { effects } = await freshEffects()
     await effects.submit({ effectKey: 'e1', kind: 'event', waitName: 'event', payload: { a: 1 } })

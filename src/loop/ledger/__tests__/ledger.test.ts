@@ -15,6 +15,10 @@ const round = (n: number): RoundEntry => ({
   round: n, mode: 'normal', observables: {}, meters: { stale_count: 0 },
   route: { kind: 'continue' }, correctiveRetries: 0, costUsd: 0.5,
   seatSummaries: {}, startedAt: 1, finishedAt: 2,
+  postState: {
+    iteration: n, meters: { stale_count: 0 }, status: 'healthy',
+    bestMetric: null, totalFindings: 0, totalCostUsd: n * 0.5,
+  },
 })
 
 describe('Ledger', () => {
@@ -71,7 +75,15 @@ describe('Ledger', () => {
     expect(view.lastRounds).toHaveLength(1)
     expect(view.findingsCount).toBe(1)
     expect(view.directions).toEqual([{ key: 'd1' }])
-    expect(view.progress.iteration).toBe(0) // default until kernel writes it
+    expect(view.progress.iteration).toBe(1) // rebuilt from the committed round
+  })
+
+  it('rebuilds progress from a committed round after the progress write is lost', async () => {
+    const { ledger } = await freshLedger()
+    await ledger.appendRound(round(3))
+    const progress = await ledger.readProgress()
+    expect(progress.iteration).toBe(3)
+    expect(progress.totalCostUsd).toBe(1.5)
   })
 
   it('appendJsonl entries are one line each (audit greppability)', async () => {
