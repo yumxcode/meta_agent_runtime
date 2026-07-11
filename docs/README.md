@@ -12,6 +12,7 @@
 - [Robotics mode design v2](robotics-mode-design-v2.md)
 - [Prompt optimization plan](prompt-optimization-plan.md)
 - [Sandbox architecture plan](architecture/sandbox_architecture_plan.svg)
+- [P0 workspace jail and resume integrity remediation](architecture/p0-workspace-jail-and-resume-integrity-plan-2026-07-10.md)
 
 ## Reviews
 

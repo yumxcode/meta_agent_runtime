@@ -19,7 +19,7 @@
  *     would pause again without doing any work.
  */
 import { createHash } from 'crypto'
-import { join } from 'path'
+import { dirname, join } from 'path'
 import { atomicWriteJson } from '../../infra/persist/index.js'
 import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
 import { freezeCharter } from '../charter/CharterValidate.js'
@@ -48,7 +48,7 @@ export interface MigrationEntry {
  * fired tripwire's expression, intersected with the meters. When the fired
  * index is unknown (pre-v3 instance records), every escalate tripwire counts.
  */
-function reArmResetTargets(
+export function reArmResetTargets(
   charter: FrozenCharter,
   meterNames: ReadonlySet<string>,
   firedIndex: number | undefined,
@@ -82,6 +82,11 @@ export async function migrateInstance(
     throw new Error(
       `migrate needs a NEWER version (instance at v${record.charterVersion}, got v${newCharter.version})`,
     )
+  }
+  if (record.status === 'paused_manual') {
+    // Migrating a manually-paused instance would end with status 'idle' but its
+    // wakes cancelled — a frozen loop nothing re-arms. Resume first.
+    throw new Error("cannot migrate while 'paused_manual' — run `loop resume` first")
   }
   if (record.status !== 'idle' && record.status !== 'paused_attention') {
     throw new Error(`cannot migrate while '${record.status}' — wait for idle or a paused escalation`)
@@ -146,7 +151,11 @@ export async function migrateInstance(
 
   if (entry.reArmed) {
     await setInstanceStatus(instance, 'idle', `migrated to v${frozen.version} (human ack)`)
-    const wakeStore = opts?.wakeStore ?? new WakeStore(opts?.projectDir ?? paths.root)
+    // Fallback workspace = two levels above the instance root
+    // (<workspace>/.loop/<id>): a WakeStore rooted at paths.root would write
+    // wakes into <instance>/.loop/wakes, which no scheduler ever scans — the
+    // re-armed loop would never wake.
+    const wakeStore = opts?.wakeStore ?? new WakeStore(opts?.projectDir ?? dirname(dirname(paths.root)))
     await wakeStore.schedule({ loopId: record.instanceId, kind: 'timer', fireAt: Date.now() })
   } else {
     await setInstanceStatus(instance, 'idle', `migrated to v${frozen.version}`)

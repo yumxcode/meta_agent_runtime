@@ -71,10 +71,27 @@ export async function ingestEvents(instance: LoopInstance, deps: WaitOpsDeps): P
   let concluded = 0
   for (const file of files) {
     const from = join(instance.paths.eventsDir, file)
+    let raw: string
     try {
-      const parsed = JSON.parse(await readFile(from, 'utf-8')) as {
-        effectKey?: unknown; verdict?: unknown; data?: unknown
-      }
+      raw = await readFile(from, 'utf-8')
+    } catch {
+      continue // vanished (a concurrent ingester won the race) — nothing to do
+    }
+    let parsed: { effectKey?: unknown; verdict?: unknown; data?: unknown }
+    try {
+      parsed = JSON.parse(raw) as { effectKey?: unknown; verdict?: unknown; data?: unknown }
+    } catch (err) {
+      // Quarantine LOUDLY: silently retrying an unparseable event every round
+      // forever hides the producer's bug. `.bad` files fall out of the .json
+      // filter above, so this is a one-time action.
+      console.error(
+        `[loop] unparseable event file ${from} — quarantined as .bad:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      await rename(from, `${from}.bad`).catch(() => undefined)
+      continue
+    }
+    try {
       if (typeof parsed.effectKey === 'string' && parsed.effectKey) {
         const verdict = typeof parsed.verdict === 'string' ? parsed.verdict : 'done'
         if (await effects.conclude(parsed.effectKey, verdict, 'event', parsed.data)) {
@@ -84,7 +101,7 @@ export async function ingestEvents(instance: LoopInstance, deps: WaitOpsDeps): P
       }
       await rename(from, join(instance.paths.eventsProcessedDir, file))
     } catch {
-      // Unreadable event: leave in place; a human or the sender can fix it.
+      // Concluded/renamed by a concurrent ingester — leave as is.
     }
   }
   return concluded

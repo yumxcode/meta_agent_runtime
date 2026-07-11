@@ -39,6 +39,7 @@ import { loadModelConfig } from '../../core/config/ConfigService.js'
 import { HttpMcpClient } from './HttpMcpClient.js'
 import { registerMcpClient, mcpClients } from './registry.js'
 import type { McpClient } from './registry.js'
+import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 
 // ── Config path ───────────────────────────────────────────────────────────────
 
@@ -58,12 +59,16 @@ interface SseServerConfig {
   headers?: Record<string, string>
 }
 
-interface StdioServerConfig {
+export interface StdioServerConfig {
   type: 'stdio'
   command: string
   args?: string[]
   env?: Record<string, string>
   cwd?: string
+  /** Per-RPC wall-clock limit. Default META_AGENT_MCP_STDIO_TIMEOUT_MS or 60s. */
+  timeoutMs?: number
+  /** Maximum stdout bytes retained per RPC. Default 10 MiB. */
+  maxResponseBytes?: number
 }
 
 type McpServerConfig = HttpServerConfig | SseServerConfig | StdioServerConfig
@@ -128,7 +133,10 @@ function interpolateRecord(
  * Minimal stdio MCP client.  Spawns the command and communicates over
  * stdin/stdout using newline-delimited JSON-RPC 2.0.
  */
-class StdioMcpClient implements McpClient {
+const DEFAULT_STDIO_TIMEOUT_MS = 60_000
+const DEFAULT_STDIO_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+
+export class StdioMcpClient implements McpClient {
   private readonly _config: StdioServerConfig
   private _idCounter = 1
 
@@ -147,18 +155,59 @@ class StdioMcpClient implements McpClient {
     })
 
     return new Promise((resolve, reject) => {
+      const useProcessGroup = process.platform !== 'win32'
       const child = spawn(cfg.command, cfg.args ?? [], {
         cwd: cfg.cwd,
         env: mergedEnv,
         stdio: ['pipe', 'pipe', 'inherit'],
+        detached: useProcessGroup,
       })
 
       let stdout = ''
-      child.stdout.on('data', (chunk: Buffer) => { stdout += chunk.toString() })
-      child.on('error', reject)
+      let stdoutBytes = 0
+      let settled = false
+      const timeoutMs = Number.isFinite(cfg.timeoutMs) && (cfg.timeoutMs ?? 0) > 0
+        ? cfg.timeoutMs!
+        : RuntimeEnv.mcpStdioTimeoutMs(DEFAULT_STDIO_TIMEOUT_MS)
+      const maxBytes = Number.isFinite(cfg.maxResponseBytes) && (cfg.maxResponseBytes ?? 0) > 0
+        ? cfg.maxResponseBytes!
+        : RuntimeEnv.mcpStdioMaxResponseBytes(DEFAULT_STDIO_MAX_RESPONSE_BYTES)
+
+      const killProcessGroup = (): void => {
+        if (child.pid === undefined) return
+        try {
+          if (useProcessGroup) process.kill(-child.pid, 'SIGKILL')
+          else child.kill('SIGKILL')
+        } catch { /* process already exited */ }
+      }
+      const finish = (fn: () => void): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
+        fn()
+      }
+      const fail = (err: Error): void => finish(() => {
+        killProcessGroup()
+        reject(err)
+      })
+      const timer = setTimeout(() => {
+        fail(new Error(`MCP stdio RPC "${method}" timed out after ${timeoutMs}ms`))
+      }, timeoutMs)
+
+      child.stdout.on('data', (chunk: Buffer) => {
+        if (settled) return
+        stdoutBytes += chunk.byteLength
+        if (stdoutBytes > maxBytes) {
+          fail(new Error(`MCP stdio response exceeded ${maxBytes} bytes`))
+          return
+        }
+        stdout += chunk.toString()
+      })
+      child.on('error', err => fail(err))
       child.on('close', (code) => {
+        if (settled) return
         if (code !== 0 && !stdout.trim()) {
-          reject(new Error(`MCP stdio process exited with code ${code}`))
+          finish(() => reject(new Error(`MCP stdio process exited with code ${code}`)))
           return
         }
         try {
@@ -167,17 +216,18 @@ class StdioMcpClient implements McpClient {
           for (let i = lines.length - 1; i >= 0; i--) {
             try {
               const parsed = JSON.parse(lines[i]!) as { result?: T; error?: { code: number; message: string } }
-              if (parsed.error) reject(new Error(`MCP error: ${parsed.error.message}`))
-              else resolve(parsed.result as T)
+              if (parsed.error) finish(() => reject(new Error(`MCP error: ${parsed.error!.message}`)))
+              else finish(() => resolve(parsed.result as T))
               return
             } catch { /* try previous line */ }
           }
-          reject(new Error('No valid JSON-RPC response from stdio MCP server'))
+          finish(() => reject(new Error('No valid JSON-RPC response from stdio MCP server')))
         } catch (err) {
-          reject(err)
+          finish(() => reject(err))
         }
       })
 
+      child.stdin.on('error', err => fail(err))
       child.stdin.write(body + '\n')
       child.stdin.end()
     })

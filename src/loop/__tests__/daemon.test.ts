@@ -4,7 +4,7 @@
  * the workspace is quiescent, host lock exclusivity.
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, mkdir, readFile, writeFile } from 'fs/promises'
+import { mkdtemp, mkdir, readFile, stat, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
@@ -100,5 +100,34 @@ describe('runLoopScheduler', () => {
     // Lock released → a third daemon can now run to idle-exit.
     const third = await runLoopScheduler({ dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 30 })
     expect(third.exitReason).toBe('idle')
+  }, 15_000)
+
+  it('refreshes the host lease while a long tick is still running', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-daemon-heartbeat-'))
+    const dispatcher = scriptedDispatcher(async task => {
+      if (task.includes('隔离评审座位')) return { verdict: 'pass', messages: [] }
+      await new Promise(r => setTimeout(r, 250))
+      return { label: 'ok' }
+    })
+    await createInstance({
+      projectDir: dir,
+      charter: walkResearchCharter({
+        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+      }),
+      wakeStore: new WakeStore(dir),
+    })
+    const abort = new AbortController()
+    const run = runLoopScheduler({
+      dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 5_000,
+      signal: abort.signal, lockFreshMs: 120, lockHeartbeatMs: 20,
+    })
+    const lockPath = join(dir, '.loop', 'daemon.lock')
+    await new Promise(r => setTimeout(r, 40))
+    const firstMtime = (await stat(lockPath)).mtimeMs
+    await new Promise(r => setTimeout(r, 80))
+    const refreshedMtime = (await stat(lockPath)).mtimeMs
+    expect(refreshedMtime).toBeGreaterThan(firstMtime)
+    abort.abort()
+    await run
   }, 15_000)
 })

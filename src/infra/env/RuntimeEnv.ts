@@ -137,6 +137,18 @@ export const RuntimeEnv = {
     return n ?? fallback
   },
 
+  // ── MCP ─────────────────────────────────────────────────────────────────
+  /** Stdio MCP per-RPC wall-clock limit (ms). */
+  mcpStdioTimeoutMs(fallback: number): number {
+    return readIntEnvOr('META_AGENT_MCP_STDIO_TIMEOUT_MS', fallback, 100, 600_000)
+  },
+  /** Stdio MCP maximum stdout bytes retained per RPC. */
+  mcpStdioMaxResponseBytes(fallback: number): number {
+    return readIntEnvOr(
+      'META_AGENT_MCP_STDIO_MAX_RESPONSE_BYTES', fallback, 1_024, 256 * 1024 * 1024,
+    )
+  },
+
   // ── Permissions ───────────────────────────────────────────────────────────
   /** Skip on-disk permission configs (hermetic mode) when set. */
   ignoreUserPermissions(): boolean {
@@ -218,6 +230,15 @@ export const RuntimeEnv = {
   resumeMaxBytes(fallback: number): number {
     return readIntEnvOr('META_AGENT_MAX_RESUME_BYTES', fallback, 1)
   },
+  /**
+   * Idle time (ms) before an index-evicted or unindexed-orphan session
+   * directory is physically deleted. Guards sessions still live in another
+   * process from having their history removed mid-conversation. `0` deletes
+   * immediately.
+   */
+  sessionEvictGraceMs(fallback: number): number {
+    return readIntEnvOr('META_AGENT_SESSION_EVICT_GRACE_MS', fallback, 0)
+  },
 } as const
 
 // ── Documentation registry (for `--help` / docs / auditing) ──────────────────
@@ -242,6 +263,8 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'DISABLE_AUTO_COMPACT', type: 'flag', default: 'off', description: 'Alias of DISABLE_COMPACT.' },
   { name: 'META_AGENT_JOB_TIMEOUT_MS', type: 'int', default: '1800000', description: 'LocalExecutor watchdog budget per job (ms). 0 disables.' },
   { name: 'META_AGENT_KEEP_TERMINAL_JOBS', type: 'int', default: '200', description: 'Max terminal jobs retained in memory (LRU).' },
+  { name: 'META_AGENT_MCP_STDIO_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one stdio MCP RPC. Range [100,600000].' },
+  { name: 'META_AGENT_MCP_STDIO_MAX_RESPONSE_BYTES', type: 'int', default: '10485760', description: 'Maximum stdout bytes retained from one stdio MCP RPC.' },
   { name: 'META_AGENT_IGNORE_USER_PERMISSIONS', type: 'flag', default: 'off', description: 'Ignore on-disk permission configs (hermetic mode).' },
   { name: 'META_AGENT_WEB_FETCH_UA', type: 'string', default: 'built-in UA', description: 'User-Agent header for web_fetch.' },
   { name: 'META_AGENT_TRUST_FAKE_IP', type: 'flag', default: 'off', description: 'Allow spoofed client IP headers in web_fetch (testing).' },
@@ -267,4 +290,5 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_CLI_MAX_VISIBLE_CHARS', type: 'int', default: '50000', description: 'Max visible chars before the CLI truncates a block. Range [10k,2M].' },
   { name: 'META_AGENT_MAX_RESUME_MESSAGES', type: 'int', default: 'unlimited', description: 'Max messages loaded verbatim on resume; older history is folded into one summary. Unset = full history.' },
   { name: 'META_AGENT_MAX_RESUME_BYTES', type: 'int', default: '67108864', description: 'Max bytes read from a session history file on resume (safety guard).' },
+  { name: 'META_AGENT_SESSION_EVICT_GRACE_MS', type: 'int', default: '86400000', description: 'Idle time before an evicted/orphaned session directory is deleted (ms). 0 = immediate.' },
 ] as const

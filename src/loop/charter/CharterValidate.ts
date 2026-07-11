@@ -152,13 +152,23 @@ export function validateCharter(rawCharter: Charter): string[] {
   }
 
   // Gates.
+  const judgeGateNames: string[] = []
   for (const [name, gate] of Object.entries(charter.gates ?? {})) {
-    if (gate.kind === 'judge' && !charter.seats?.judge) {
-      errs.push(`gate[${name}] is a judge gate but no judge seat is declared`)
+    if (gate.kind === 'judge') {
+      judgeGateNames.push(name)
+      if (!charter.seats?.judge) {
+        errs.push(`gate[${name}] is a judge gate but no judge seat is declared`)
+      }
     }
     if (gate.kind === 'schema' && gate.files.length === 0) {
       errs.push(`gate[${name}] declares no files`)
     }
+  }
+  if (judgeGateNames.length > 1) {
+    errs.push(
+      `only ONE judge gate is supported (the kernel reads the first it finds) — ` +
+      `declared: ${judgeGateNames.join(', ')}. Merge the evidence lists into a single gate.`,
+    )
   }
 
   // Write scope hygiene (D8 + v1 postmortem).
@@ -169,8 +179,16 @@ export function validateCharter(rawCharter: Charter): string[] {
 
   // Budgets sanity.
   const life = charter.budgets?.lifetime
-  if (life && life.rounds !== undefined && (!Number.isInteger(life.rounds) || life.rounds < 1)) {
-    errs.push('budgets.lifetime.rounds must be a positive integer')
+  if (life) {
+    if (life.rounds !== undefined && (!Number.isInteger(life.rounds) || life.rounds < 1)) {
+      errs.push('budgets.lifetime.rounds must be a positive integer')
+    }
+    if (life.usd !== undefined && (!Number.isFinite(life.usd) || life.usd <= 0)) {
+      errs.push('budgets.lifetime.usd must be a positive number')
+    }
+    if (life.deadlineMs !== undefined && (!Number.isFinite(life.deadlineMs) || life.deadlineMs <= 0)) {
+      errs.push('budgets.lifetime.deadlineMs must be a positive epoch-ms timestamp')
+    }
   }
 
   return errs

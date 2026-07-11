@@ -1,9 +1,9 @@
 import { existsSync, readFileSync } from 'fs'
 import { createHash } from 'crypto'
-import { homedir } from 'os'
 import { join } from 'path'
 import type { WorkflowDefinition, WorkflowRepairer } from './types.js'
 import { WorkflowParser } from './WorkflowParser.js'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 
 type WorkflowSourceKind = 'workflow_file' | 'agent_tag'
 
@@ -119,11 +119,11 @@ export class WorkflowLoader {
     }
 
     const globalWorkflow = WorkflowLoader.readWorkflowFile(
-      join(homedir(), '.meta-agent', 'workflows', `${mode}.md`),
+      join(META_AGENT_HOME, 'workflows', `${mode}.md`),
     )
     if (globalWorkflow) return globalWorkflow
 
-    return WorkflowLoader.readAgentWorkflowBlock(join(homedir(), '.meta-agent', 'AGENT.md'), mode)
+    return WorkflowLoader.readAgentWorkflowBlock(join(META_AGENT_HOME, 'AGENT.md'), mode)
   }
 
   /**
@@ -141,7 +141,7 @@ export class WorkflowLoader {
     const candidates = [
       join(projectDir, '.meta-agent', 'AGENT.md'),
       join(projectDir, 'AGENT.md'),
-      join(homedir(), '.meta-agent', 'AGENT.md'),
+      join(META_AGENT_HOME, 'AGENT.md'),
     ]
     const found = candidates.find(p => existsSync(p))
     if (!found) return null

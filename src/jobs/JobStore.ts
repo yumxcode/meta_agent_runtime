@@ -9,15 +9,15 @@
  */
 
 import { join } from 'path'
-import { homedir } from 'os'
 import { atomicWriteJson, readJsonFile, listJsonIds, deleteJsonFile } from '../core/persist/index.js'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { EngineeringJobSchema, parseOrNull } from '../core/persist/schemas.js'
 import type { EngineeringJob, JobId } from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 
 function jobsRoot(): string {
-  return join(homedir(), '.meta-agent', 'jobs')
+  return join(META_AGENT_HOME, 'jobs')
 }
 
 function sessionDir(sessionId: string): string {

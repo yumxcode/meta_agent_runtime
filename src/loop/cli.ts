@@ -13,6 +13,7 @@ import type { Charter } from './charter/CharterTypes.js'
 import { CharterStore } from './charter/CharterStore.js'
 import { createInstance, loadInstance } from './instance/InstanceStore.js'
 import { migrateInstance } from './instance/Migrate.js'
+import { pauseInstance, resumeInstance, stopInstance } from './instance/Lifecycle.js'
 import { distillCharter } from './distill/Distiller.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { tickOnce, runUntilQuiescent } from './runner.js'
@@ -37,12 +38,18 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'tick': return cmdTick(rest, deps)
     case 'distill': return cmdDistill(rest, deps)
     case 'migrate': return cmdMigrate(rest, deps)
+    case 'pause': return cmdLifecycle('pause', rest, deps)
+    case 'resume': return cmdLifecycle('resume', rest, deps)
+    case 'stop': return cmdLifecycle('stop', rest, deps)
     default:
       return [
         'Usage: meta-agent loop <command>',
         '  distill <需求.md> [--out charter.draft.json]  Distill a requirement doc into a charter draft (needs backend)',
         '  create <charter.json> [--id <instanceId>]   Validate+freeze charter, init ledger, schedule first wake',
         '  migrate <instanceId> [--version N]          Migrate a live instance to a newer charter version',
+        '  pause <instanceId> [--reason …]             Freeze an idle|waiting instance (wakes cancelled, events untouched)',
+        '  resume <instanceId> [--reason …]            Un-pause (rebuilds wakes) / light-ack a paused escalation (resets its meters)',
+        '  stop <instanceId> [--reason …]              Graceful terminate → final_report.md (finalizer seat runs when a backend is wired)',
         '  list                                        List loop instances in this workspace',
         '  inspect <instanceId>                        Status + progress + recent rounds',
         '  inbox <instanceId> <message…>               Drop feedback for the next round',
@@ -88,6 +95,39 @@ async function cmdMigrate(rest: string[], deps: LoopCliDeps): Promise<string> {
       `dropped: ${Object.keys(entry.droppedMeters).join(', ') || '(none)'}`,
     entry.reArmed ? 're-armed from paused_attention (human ack recorded); next round scheduled' : 'instance idle',
   ].join('\n')
+}
+
+async function cmdLifecycle(
+  action: 'pause' | 'resume' | 'stop',
+  rest: string[],
+  deps: LoopCliDeps,
+): Promise<string> {
+  const id = rest.find(a => !a.startsWith('--'))
+  if (!id) throw new Error(`loop ${action}: instanceId required`)
+  const instance = await loadInstance(deps.projectDir, id)
+  if (!instance) return `instance ${id} not found`
+  const reason = flagValue(rest, '--reason')
+  const lifecycleDeps = { wakeStore: new WakeStore(deps.projectDir), projectDir: deps.projectDir }
+  const result = action === 'pause'
+    ? await pauseInstance(instance, lifecycleDeps, reason)
+    : action === 'resume'
+      ? await resumeInstance(instance, lifecycleDeps, reason)
+      : await stopInstance(instance, {
+          ...lifecycleDeps,
+          ...(deps.observer ? { observer: deps.observer } : {}),
+          // With a backend wired (host CLI passes it), the finalizer seat can
+          // write the report narrative; without one, code-template report only.
+          ...(deps.dispatcher
+            ? {
+                seatDeps: {
+                  dispatcher: deps.dispatcher,
+                  projectDir: deps.projectDir,
+                  signal: deps.signal ?? new AbortController().signal,
+                },
+              }
+            : {}),
+        }, reason)
+  return `${id}: ${result.message}  (status: ${result.status})`
 }
 
 async function cmdCreate(rest: string[], deps: LoopCliDeps): Promise<string> {

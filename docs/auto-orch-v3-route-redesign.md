@@ -98,9 +98,23 @@ escalate 绊线取并集）。保证恢复后不会原地再暂停。审计入 `
 - Distiller system prompt 已注入 v3 全套语义（管线、三动作、内置终止、health、finalizer、onResume），
   蒸馏出的 charter.draft.json 直接是 v3 形态。
 
-## 7. 回归测试锚点
+## 7. 手动生命周期（pause / resume / stop，v3.1）
+
+实例状态新增 `paused_manual`；`loop` CLI 新增三命令（均纯代码，无需 backend）：
+
+| 命令 | 准入 | 行为 |
+|---|---|---|
+| `loop pause <id>` | idle \| waiting（running 拒绝：不抢占活座位；paused_manual 幂等） | 先置状态再取消 wakes（顺序即崩溃安全：残留 wake 由 runner 的 HALTED 守卫代扫）。**真冻结**：runner 对 halted 实例跳过 ingestEvents，外部结果留在 events/ 不消费 |
+| `loop resume <id>` | paused_manual → 还原 idle\|waiting；paused_attention → idle（**轻量 ack**） | 无快照文件——wake 全部从持久态重建：有 pending_round 先 ingestEvents 再 reconcileWaiting（即 kill -9 自愈路径），无则调度立即 timer。attention 分派执行 v3 re-arm（resetMeters + 清 lastEscalation + progress→healthy），**不必像 migrate 那样 bump charter 版本** |
+| `loop stop <id>` | 除 running/failed 外任意态（done 幂等） | 走内核 terminate：终审计条目 `route={kind:'finalize', cause:'manual'}`、final_report.md、progress→completed、实例→done。停在 waiting 时废弃挂起轮，但其 round 号/已花成本/座位摘要**折入终审计条目**（账目不丢）。带 backend 时可跑 finalizer 座位补叙事，否则纯代码模板报告 |
+
+配套：`RouteDecision.cause` 增 `'manual'`；`HALTED_STATUSES` 是 runner/daemon 守卫的单一事实源；migrate **拒绝** paused_manual（否则迁移后 idle 且无 wake = 永久冻结），提示先 resume；所有人工干预审计入 `ledger/lifecycle.jsonl` `{at, action: pause|resume|ack|stop, reason, fromStatus, toStatus, resetMeters?, healed?}`。
+
+## 8. 回归测试锚点
 
 `src/loop/__tests__/routeV3.test.ts`：pivot 一次性（调度→消费→清除，pivoter 恰跑一次）、
 status 词表逐轮断言、escalate→migrate→重置→真跑一轮不复暂停、finalizer 叙事+成本入账。
 `charter.test.ts`：判别联合校验、onResume/health 静态检查、pivot⇔pivoter 双向、旧形态迁移映射。
 `m3m4.test.ts`：预算三路径（rounds/usd/deadline）在新单点求值下的轮数与终态。
+`lifecycle.test.ts`：pause 冻结（事件不被消费）、resume 从持久态重建 wake 且同轮收割、
+attention 轻量 ack 后真跑一轮、stop 折账终止与幂等、migrate 拒绝 paused_manual。

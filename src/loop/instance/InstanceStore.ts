@@ -7,8 +7,9 @@
  * returning the existing record (re-running a provisioning script is safe).
  */
 import { createHash } from 'crypto'
-import { mkdir } from 'fs/promises'
-import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
+import { mkdir, readdir } from 'fs/promises'
+import { join, resolve } from 'path'
+import { atomicWriteJson, readJsonFile, withFileLock } from '../../infra/persist/index.js'
 import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
 import { freezeCharter, normalizeCharter } from '../charter/CharterValidate.js'
 import { Ledger, withBuiltinSchemas } from '../ledger/LedgerApi.js'
@@ -71,7 +72,9 @@ export async function createInstance(input: CreateInstanceInput): Promise<LoopIn
     charterId: frozen.id,
     charterVersion: frozen.version,
     charterHash,
-    projectDir: paths.root,
+    // The WORKSPACE the loop operates on (the field's documented meaning) —
+    // NOT the instance dir (paths.root), which is derivable from it.
+    projectDir: resolve(input.projectDir),
     status: 'idle',
     createdAt: Date.now(),
     updatedAt: Date.now(),
@@ -110,16 +113,70 @@ async function loadInstanceFrom(paths: InstancePaths, record: LoopInstanceRecord
   }
 }
 
+export interface SetStatusOpts {
+  /**
+   * Validate — under the file lock, against DISK state — that the transition
+   * starts from one of these statuses. This closes the CLI-vs-daemon race
+   * where e.g. `loop pause` reads 'idle', the daemon flips to 'running', and
+   * the pause blindly overwrites it (and is then silently undone at the round
+   * boundary). Throws when the on-disk status disagrees.
+   */
+  expectFrom?: readonly LoopInstanceStatus[]
+  /** Atomically set (object) or clear (null) the escalation marker with this write. */
+  lastEscalation?: LoopInstanceRecord['lastEscalation'] | null
+}
+
 export async function setInstanceStatus(
   instance: LoopInstance,
   status: LoopInstanceStatus,
   reason?: string,
+  opts?: SetStatusOpts,
 ): Promise<void> {
-  instance.record = {
-    ...instance.record,
-    status,
-    statusReason: reason,
-    updatedAt: Date.now(),
+  await withFileLock(instance.paths.instanceJson, async () => {
+    if (opts?.expectFrom) {
+      const disk = await readJsonFile<LoopInstanceRecord>(instance.paths.instanceJson)
+      if (disk) instance.record = disk // adopt the freshest truth before validating
+      if (!opts.expectFrom.includes(instance.record.status)) {
+        throw new Error(
+          `refusing status transition to '${status}': instance is '${instance.record.status}' ` +
+          `on disk (expected ${opts.expectFrom.join('|')})`,
+        )
+      }
+    }
+    const next: LoopInstanceRecord = {
+      ...instance.record,
+      status,
+      statusReason: reason,
+      updatedAt: Date.now(),
+    }
+    if (opts && 'lastEscalation' in opts) {
+      if (opts.lastEscalation === null) delete next.lastEscalation
+      else if (opts.lastEscalation) next.lastEscalation = opts.lastEscalation
+    }
+    instance.record = next
+    await atomicWriteJson(instance.paths.instanceJson, next)
+  })
+}
+
+/**
+ * Enumerate every loop instance record in a workspace by scanning
+ * `<projectDir>/.loop/<id>/instance.json`. Instances must be discoverable from
+ * DISK, never from the wake store: an event-waiting loop legitimately has no
+ * wake records at all.
+ */
+export async function listInstanceRecords(projectDir: string): Promise<LoopInstanceRecord[]> {
+  const root = join(resolve(projectDir), '.loop')
+  let entries: string[]
+  try {
+    entries = await readdir(root)
+  } catch {
+    return []
   }
-  await atomicWriteJson(instance.paths.instanceJson, instance.record)
+  const out: LoopInstanceRecord[] = []
+  for (const id of entries.sort()) {
+    if (id === 'charters' || id === 'wakes' || id.startsWith('daemon.lock')) continue
+    const record = await readJsonFile<LoopInstanceRecord>(instancePaths(projectDir, id).instanceJson)
+    if (record) out.push(record)
+  }
+  return out
 }

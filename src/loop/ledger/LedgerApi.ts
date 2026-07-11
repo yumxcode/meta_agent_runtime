@@ -5,9 +5,11 @@
  *   • single writer — only the kernel process holds a Ledger instance; seats
  *     produce DRAFTS which the kernel admits after gates. An agent can never
  *     corrupt progress.json with hand-written JSON.
- *   • atomicity — appendJsonl appends a single fsync'd line; replaceJson goes
- *     through temp+rename. A kill -9 leaves either the old or the new state,
- *     never a torn file.
+ *   • atomicity — appendJsonl appends one line in a single write() call;
+ *     replaceJson goes through temp+rename. A process crash (kill -9) leaves
+ *     either the old or the new state, never a torn file. NOTE: neither path
+ *     fsyncs — durability is process-crash level, not power-loss level; a
+ *     torn tail line from power loss is tolerated by readJsonl (skipped).
  *   • schema-checked writes — every file can register a validator; a write
  *     that violates its schema throws BEFORE touching disk (invariant gate).
  *   • derived views — readView() computes meters/last-K digests in one place,

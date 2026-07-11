@@ -32,7 +32,6 @@ import { once } from 'node:events'
 import { Writable } from 'node:stream'
 import { isAbsolute, resolve, join, basename } from 'node:path'
 import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
-import { homedir } from 'node:os'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { runLoopCli, runLoopScheduler, DISTILLER_SYSTEM, parseDistillOutput, validateCharter, type LoopEvent } from '../loop/index.js'
@@ -40,6 +39,7 @@ import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
@@ -2138,7 +2138,10 @@ async function persistSessionSnapshot({
       firstPrompt:   firstPromptText,
       workspace:     opts.workspace,
     }
-    const storeOptions = sessionRoot ? { rootDir: sessionRoot } : undefined
+    const storeOptions = {
+      ...(sessionRoot ? { rootDir: sessionRoot } : {}),
+      expectedMessageCount: savedMessageCount,
+    }
     if (messages.length < savedMessageCount) {
       await SessionStore.replace(sessionId, meta, messages, storeOptions)
     } else if (messages.length > savedMessageCount) {
@@ -3461,7 +3464,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
 
   if (!opts.json) {
     const debugDir = opts.debug
-      ? join(homedir(), '.meta-agent', 'debug', '<sessionId>')
+      ? join(META_AGENT_HOME, 'debug', '<sessionId>')
       : ''
     console.log(
       `${bold('meta-agent')}  ${dim(`v${VERSION}`)}\n` +
@@ -3984,6 +3987,98 @@ async function runRepl(opts: CliOptions): Promise<void> {
     return restored
   }
 
+  // ── Placeholder-aware editing ─────────────────────────────────────────────
+  //
+  // The [已粘贴N字] placeholder is literal text in readline's buffer, but it
+  // STANDS FOR the hidden pasted content — so it must edit like a single
+  // token. Without this, backspace eats the placeholder one CHARACTER at a
+  // time: the user "deletes" for a while, the hidden paste text is never
+  // dropped, and once the placeholder string is damaged the Enter-time
+  // restore no longer matches — the submit silently carries the mangled
+  // literal "[已粘贴50" instead of either the paste or its deletion.
+  //
+  //   • Backspace / forward-delete touching a placeholder deletes the WHOLE
+  //     block (placeholder + hidden text + its accumulator lines).
+  //   • Any other edit that leaves a placeholder partially damaged is undone
+  //     (line restored) — corruption is never representable.
+  //   • An edit that removes a placeholder cleanly (e.g. kill-line) drops the
+  //     segment with it.
+
+  const BACKSPACE_CHUNKS = new Set(['\x7f', '\b'])
+  const FORWARD_DELETE_CHUNK = '\x1b[3~'
+
+  /** The placeholder span a BS/DEL keypress at `cursor` should atomically remove. */
+  function placeholderSpanFor(
+    line: string,
+    cursor: number,
+    kind: 'bs' | 'del',
+  ): { segment: PasteDisplaySegment; start: number; end: number } | null {
+    for (const segment of _pasteSegments) {
+      if (!segment.placeholder) continue
+      let start = line.indexOf(segment.placeholder)
+      while (start !== -1) {
+        const end = start + segment.placeholder.length
+        // BS deletes the char BEFORE the cursor → fires when that char is any
+        // part of the placeholder; DEL deletes AT the cursor → same, shifted.
+        if (kind === 'bs' ? cursor > start && cursor <= end : cursor >= start && cursor < end) {
+          return { segment, start, end }
+        }
+        start = line.indexOf(segment.placeholder, start + 1)
+      }
+    }
+    return null
+  }
+
+  function dropPasteSegment(segment: PasteDisplaySegment): void {
+    const i = _pasteSegments.indexOf(segment)
+    if (i >= 0) _pasteSegments.splice(i, 1)
+    // The paste's intermediate lines live in the accumulator (multi-line paste);
+    // deleting the block must delete them too, or Enter would resurrect them.
+    _paste.clear()
+  }
+
+  /**
+   * Runs in the prepended stdin listener (BEFORE readline edits the line), so
+   * the pre-edit line/cursor can be captured; the correction is applied on
+   * setImmediate, after readline has processed the same chunk.
+   */
+  function handlePasteAwareEditChunk(chunk: string): void {
+    if (_pasteSegments.length === 0) return
+    const before = mutableReadline()
+    const beforeLine = before.line ?? ''
+    const beforeCursor = Math.min(before.cursor ?? beforeLine.length, beforeLine.length)
+    if (!_pasteSegments.some(s => s.placeholder && beforeLine.includes(s.placeholder))) return
+    const kind = BACKSPACE_CHUNKS.has(chunk) ? 'bs' : chunk === FORWARD_DELETE_CHUNK ? 'del' : null
+    const hit = kind ? placeholderSpanFor(beforeLine, beforeCursor, kind) : null
+    setImmediate(() => {
+      const rlm = mutableReadline()
+      if (hit) {
+        // Atomic delete: one keypress removes the whole pasted block.
+        rlm.line = beforeLine.slice(0, hit.start) + beforeLine.slice(hit.end)
+        rlm.cursor = hit.start
+        dropPasteSegment(hit.segment)
+        rlOutput.withPassthrough(() => { rlm._refreshLine?.() })
+        return
+      }
+      // Integrity guard for every other editing key.
+      const line = rlm.line ?? ''
+      for (const segment of [..._pasteSegments]) {
+        if (!segment.placeholder || !beforeLine.includes(segment.placeholder)) continue
+        if (line.includes(segment.placeholder)) continue
+        if (beforeLine.replace(segment.placeholder, '') === line) {
+          dropPasteSegment(segment)   // clean removal (e.g. kill-line on a lone block)
+          continue
+        }
+        // Partial damage — undo the edit rather than let a mangled placeholder
+        // corrupt the submit.
+        rlm.line = beforeLine
+        rlm.cursor = beforeCursor
+        rlOutput.withPassthrough(() => { rlm._refreshLine?.() })
+        return
+      }
+    })
+  }
+
   function mutableReadline(): readline.Interface & {
     line?: string
     cursor?: number
@@ -4266,8 +4361,14 @@ async function runRepl(opts: CliOptions): Promise<void> {
     } else if (pasteNoticeActive()) {
       renderPasteNotice()
       endCurrentPasteDisplaySegment()
+      handlePasteAwareEditChunk(buf.toString())
     } else if (!_paste.buffering && _pasteCollecting) {
       discardCurrentPasteCandidate()
+      handlePasteAwareEditChunk(buf.toString())
+    } else {
+      // Ordinary keystroke while placeholders are on the line: keep the pasted
+      // blocks atomic under backspace/delete and immune to partial damage.
+      handlePasteAwareEditChunk(buf.toString())
     }
     // While a multi-line paste is still being collected, blank readline's prompt
     // so the trailing partial line isn't redrawn with a second `you ›` prefix on
@@ -4765,7 +4866,7 @@ async function runRepl(opts: CliOptions): Promise<void> {
     if (opts.debug && !debugDirShown) {
       const sid = router.getSessionId()
       if (sid) {
-        const realDir = join(homedir(), '.meta-agent', 'debug', sid)
+        const realDir = join(META_AGENT_HOME, 'debug', sid)
         console.log(`\n${dim('调试日志目录:')} ${cyan(realDir)}\n`)
         debugDirShown = true
       }

@@ -27,13 +27,12 @@
  *   queue never drains (a permanent deadlock).
  *
  *   To bound this, every running job gets a wall-clock watchdog. On expiry the
- *   executor (a) aborts the job's signal for well-behaved handlers and (b)
- *   force-fails the job NOW — releasing the slot and draining the queue —
- *   regardless of whether the handler ever settles. A per-job `settled` guard
- *   ensures the watchdog and the handler's eventual resolution can never both
- *   fire callbacks or double-decrement the slot counter. (The background
- *   promise may still run to completion; in-process JS cannot be force-killed,
- *   but it no longer blocks scheduling.)
+ *   executor aborts the job's signal and reports a terminal failure immediately.
+ *   Crucially, the physical concurrency slot remains occupied until the handler
+ *   really settles. In-process JavaScript cannot force-kill an arbitrary Promise;
+ *   releasing the slot early would make `maxConcurrent` a bookkeeping fiction
+ *   and allow timed-out handlers to accumulate without bound behind newly-started
+ *   work. Callers that require hard termination must use a subprocess executor.
  *
  *   The budget is `context.timeoutMs` (per job) ?? the executor default
  *   (`META_AGENT_JOB_TIMEOUT_MS` env or 30 min). A value of 0 disables the
@@ -93,6 +92,7 @@ const DEFAULT_JOB_TIMEOUT_MS = 30 * 60_000   // 30 minutes
 
 export class LocalExecutor implements Executor {
   private readonly maxConcurrent: number
+  private readonly maxQueued: number
   private readonly defaultTimeoutMs: number
   private running = 0
   private queue: PendingJob[] = []
@@ -105,8 +105,9 @@ export class LocalExecutor implements Executor {
    *   `0` disables the watchdog by default (a per-job `timeoutMs` can still
    *   re-enable it). Negative / non-finite inputs are ignored.
    */
-  constructor(maxConcurrent = 4, defaultTimeoutMs?: number) {
-    this.maxConcurrent = maxConcurrent
+  constructor(maxConcurrent = 4, defaultTimeoutMs?: number, maxQueued = Math.max(1, maxConcurrent) * 16) {
+    this.maxConcurrent = Math.max(1, Math.floor(maxConcurrent))
+    this.maxQueued = Math.max(0, Math.floor(maxQueued))
     this.defaultTimeoutMs =
       defaultTimeoutMs !== undefined && Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs >= 0
         ? defaultTimeoutMs
@@ -125,6 +126,16 @@ export class LocalExecutor implements Executor {
     if (this.running < this.maxConcurrent) {
       this._run(job)
     } else {
+      if (this.queue.length >= this.maxQueued) {
+        callbacks.onFailed(
+          jobId,
+          new Error(
+            `LocalExecutor queue is full (${this.queue.length}/${this.maxQueued}); ` +
+            'refusing work while all physical slots are occupied.',
+          ),
+        )
+        return
+      }
       callbacks.onQueued(jobId)
       this.queue.push(job)
     }
@@ -170,37 +181,38 @@ export class LocalExecutor implements Executor {
       callbacks.onProgress({ jobId, ...progress })
     }
 
-    // ── Single-fire guard + slot cleanup ────────────────────────────────────
-    // The watchdog and the handler's eventual settlement race for the same job.
-    // `settled` ensures exactly one of them releases the slot and fires a
-    // terminal callback; the loser becomes a no-op (no double-decrement, no
-    // duplicate callback). cleanup() is therefore run at most once.
-    let settled = false
+    // Reporting and resource settlement are deliberately separate. The
+    // watchdog may report failure before an uncooperative handler settles, but
+    // only REAL settlement releases the physical concurrency slot.
+    let terminalReported = false
+    let resourcesReleased = false
     let watchdog: ReturnType<typeof setTimeout> | undefined
 
-    const cleanup = (): void => {
+    const releaseResources = (): void => {
+      if (resourcesReleased) return
+      resourcesReleased = true
       if (watchdog) { clearTimeout(watchdog); watchdog = undefined }
       this.abortControllers.delete(jobId)
       this.running--
       this._drainQueue()
     }
 
-    const settle = (fireTerminal: () => void): void => {
-      if (settled) return
-      settled = true
-      cleanup()
+    const reportTerminal = (fireTerminal: () => void): void => {
+      if (terminalReported) return
+      terminalReported = true
       fireTerminal()
     }
 
     // ── Wall-clock watchdog ─────────────────────────────────────────────────
-    // Bounds a handler that never settles (ignores abort / wedged in a native
-    // call) so it can't hold a concurrency slot for the executor's lifetime.
+    // Bounds the caller-visible job lifetime. A handler that ignores abort may
+    // still hold its physical slot indefinitely, intentionally applying
+    // backpressure instead of starting unbounded replacement work.
     const timeoutMs = context.timeoutMs ?? this.defaultTimeoutMs
     if (timeoutMs > 0 && Number.isFinite(timeoutMs)) {
       watchdog = setTimeout(() => {
-        settle(() => {
-          // Best-effort cooperative cancel for well-behaved handlers; the slot
-          // is already freed by cleanup() regardless of whether they observe it.
+        reportTerminal(() => {
+          // Best-effort cooperative cancel. The slot intentionally remains held
+          // until the handler really settles; see the class-level safety note.
           ctrl.abort()
           callbacks.onFailed(
             jobId,
@@ -212,9 +224,13 @@ export class LocalExecutor implements Executor {
       watchdog.unref?.()
     }
 
-    handler(input, fullContext, reporter)
+    // Start on a microtask so a synchronously-throwing handler follows the same
+    // terminal path as a rejected Promise instead of escaping submit().
+    Promise.resolve()
+      .then(() => handler(input, fullContext, reporter))
       .then((result) => {
-        settle(() => {
+        releaseResources()
+        reportTerminal(() => {
           if (ctrl.signal.aborted) {
             callbacks.onCancelled(jobId)
           } else {
@@ -223,7 +239,8 @@ export class LocalExecutor implements Executor {
         })
       })
       .catch((err: unknown) => {
-        settle(() => {
+        releaseResources()
+        reportTerminal(() => {
           if (
             ctrl.signal.aborted ||
             (err instanceof Error && err.name === 'AbortError')

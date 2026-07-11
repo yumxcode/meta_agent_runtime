@@ -23,12 +23,14 @@ function makeCallbacks(): ExecutorCallbacks & {
 }
 
 describe('LocalExecutor watchdog', () => {
-  it('force-fails and frees the slot for a handler that ignores abort', async () => {
-    // maxConcurrent = 1 so a wedged job would otherwise block the queue forever.
+  it('reports timeout but keeps the slot until an abort-ignoring handler really settles', async () => {
+    // maxConcurrent = 1 makes the physical-concurrency invariant observable.
     const exec = new LocalExecutor(1)
 
-    // A handler that never settles and never checks the abort signal.
-    const wedged: JobHandler = () => new Promise(() => { /* never resolves */ })
+    let release: (() => void) | undefined
+    const wedged: JobHandler = () => new Promise(resolve => {
+      release = () => resolve({ output: {}, summary: 'late', artifacts: [] })
+    })
     const quick: JobHandler = async () => ({ output: { ok: true }, summary: 'ok', artifacts: [] })
 
     const cb1 = makeCallbacks()
@@ -46,7 +48,14 @@ describe('LocalExecutor watchdog', () => {
     // The wedged job was force-failed by the watchdog...
     expect(cb1.failed.map(f => f.id)).toContain('wedged')
     expect(cb1.failed[0]!.err.message).toMatch(/watchdog/)
-    // ...and the slot was released so the queued job ran to completion.
+    // The still-running handler retains the physical slot, so real concurrency
+    // never exceeds maxConcurrent and queued work cannot amplify zombies.
+    expect(cb2.completed).toHaveLength(0)
+    expect(exec.freeSlots).toBe(0)
+
+    // Once the handler actually settles, the slot is released and the queue drains.
+    release?.()
+    await new Promise(r => setTimeout(r, 30))
     expect(cb2.completed).toContain('quick')
   })
 
@@ -78,6 +87,20 @@ describe('LocalExecutor watchdog', () => {
     await new Promise(r => setTimeout(r, 30))
     expect(cb.completed).toEqual(['q'])
     expect(cb.failed).toHaveLength(0)
+  })
+
+  it('bounds the pending queue while physical slots are wedged', async () => {
+    const exec = new LocalExecutor(1, 10_000, 2)
+    const wedged: JobHandler = () => new Promise(() => {})
+    exec.submit('running', wedged, {}, ctx('running'), makeCallbacks())
+    exec.submit('queued-1', wedged, {}, ctx('queued-1'), makeCallbacks())
+    exec.submit('queued-2', wedged, {}, ctx('queued-2'), makeCallbacks())
+    const overflow = makeCallbacks()
+    exec.submit('overflow', wedged, {}, ctx('overflow'), overflow)
+
+    await new Promise(r => setTimeout(r, 10))
+    expect(exec.totalPending).toBe(3)
+    expect(overflow.failed[0]?.err.message).toMatch(/queue is full/)
   })
 })
 

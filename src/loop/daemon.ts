@@ -15,10 +15,12 @@
  *     longer than `idleExitMs`, the daemon exits 0 (layer C self-heal or the
  *     next CLI invocation restarts it when needed).
  */
-import { mkdir, readFile, rm, writeFile } from 'fs/promises'
+import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { hostname } from 'os'
+import { randomUUID } from 'crypto'
 import { tickOnce, type TickDeps, type TickResult } from './runner.js'
+import { listInstanceRecords } from './instance/InstanceStore.js'
 import { WakeStore } from './wake/WakeStore.js'
 
 export interface DaemonOptions extends TickDeps {
@@ -29,6 +31,10 @@ export interface DaemonOptions extends TickDeps {
   onTick?: (result: TickResult) => void
   /** Test hook: clock source. */
   now?: () => number
+  /** Cross-host lease freshness window. Default 5 min. Primarily a test hook. */
+  lockFreshMs?: number
+  /** Independent lease heartbeat interval. Default 60 s. Primarily a test hook. */
+  lockHeartbeatMs?: number
 }
 
 export interface DaemonResult {
@@ -47,9 +53,22 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
   const lockDir = join(resolve(opts.projectDir), '.loop')
   const lockPath = join(lockDir, LOCK_FILE)
 
-  if (!(await acquireLock(lockPath))) {
+  const lockFreshMs = Math.max(100, opts.lockFreshMs ?? LOCK_FRESH_MS)
+  const lockHeartbeatMs = Math.max(10, Math.min(
+    opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS,
+    Math.max(10, Math.floor(lockFreshMs / 3)),
+  ))
+  const lockToken = await acquireLock(lockPath, lockFreshMs)
+  if (!lockToken) {
     return { ticks: 0, roundsRun: 0, probesRun: 0, exitReason: 'lock_held' }
   }
+  // This timer is independent of tickOnce(): a model seat can legally run for
+  // hours, so refreshing only between ticks lets a cross-host observer reap a
+  // live daemon's 5-minute lease mid-round.
+  const lockHeartbeat = setInterval(() => {
+    void refreshLock(lockPath, lockToken).catch(() => undefined)
+  }, lockHeartbeatMs)
+  lockHeartbeat.unref?.()
   const wakeStore = new WakeStore(opts.projectDir)
   let ticks = 0
   let roundsRun = 0
@@ -59,6 +78,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     for (;;) {
       if (opts.signal?.aborted) return { ticks, roundsRun, probesRun, exitReason: 'aborted' }
 
+      await refreshLock(lockPath, lockToken)
       const result = await tickOnce(
         { dispatcher: opts.dispatcher, projectDir: opts.projectDir, signal: opts.signal, observer: opts.observer },
         now(),
@@ -72,11 +92,16 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
         continue // drain immediately while there is work
       }
 
-      // Idle detection: pending OR claimed wakes (even future ones) keep us alive.
+      // Idle detection: pending OR claimed wakes (even future ones) keep us
+      // alive — and so does any WAITING instance: an event wait has no wake by
+      // design (its resume signal is an external events/ file), and only a
+      // live process can ingest that file when it arrives.
       const live = (await wakeStore.list()).filter(
         w => w.status === 'pending' || w.status === 'claimed',
       )
-      if (live.length === 0) {
+      const hasWaiting = live.length === 0 &&
+        (await listInstanceRecords(opts.projectDir)).some(r => r.status === 'waiting')
+      if (live.length === 0 && !hasWaiting) {
         idleSince ??= now()
         if (now() - idleSince >= idleExitMs) {
           return { ticks, roundsRun, probesRun, exitReason: 'idle' }
@@ -87,35 +112,81 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       await sleep(pollMs, opts.signal)
     }
   } finally {
-    await releaseLock(lockPath)
+    clearInterval(lockHeartbeat)
+    await releaseLock(lockPath, lockToken)
   }
 }
 
-async function acquireLock(lockPath: string): Promise<boolean> {
+/** A lock older than this (mtime) is presumed orphaned. The holder refreshes
+ * its lock every poll iteration, so a live daemon's lock stays far fresher. */
+const LOCK_FRESH_MS = 5 * 60_000
+const LOCK_HEARTBEAT_MS = 60_000
+
+interface DaemonLockRecord {
+  pid: number
+  host: string
+  token: string
+  at: number
+}
+
+async function acquireLock(lockPath: string, freshMs: number): Promise<string | null> {
   await mkdir(join(lockPath, '..'), { recursive: true }).catch(() => undefined)
   try {
     const raw = await readFile(lockPath, 'utf-8')
-    const held = JSON.parse(raw) as { pid: number; host: string }
-    if (held.host === hostname() && isAlive(held.pid)) return false
-    // Stale lock (dead pid or other host's leftover on a shared dir): reap it.
-    await rm(lockPath, { force: true })
+    const held = JSON.parse(raw) as DaemonLockRecord
+    if (held.host === hostname()) {
+      if (isAlive(held.pid)) return null
+    } else {
+      // Cross-host (shared dir): pid liveness is unknowable here — judge by
+      // lock freshness instead of reaping unconditionally, which would let two
+      // hosts run duelling daemons over the same workspace.
+      const st = await stat(lockPath).catch(() => null)
+      if (st && Date.now() - st.mtimeMs < freshMs) return null
+    }
+    // Claim the stale inode with an atomic rename. Direct rm() has a race where
+    // two contenders can delete each other's freshly-created lock.
+    const stalePath = `${lockPath}.${process.pid}.${randomUUID()}.stale`
+    try {
+      await rename(lockPath, stalePath)
+      await rm(stalePath, { force: true })
+    } catch {
+      return null
+    }
   } catch {
     // no lock file — free to take it
   }
+  const token = randomUUID()
   try {
-    await writeFile(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), at: Date.now() }), {
+    await writeFile(lockPath, JSON.stringify({
+      pid: process.pid, host: hostname(), token, at: Date.now(),
+    } satisfies DaemonLockRecord), {
       flag: 'wx', // exclusive create — loser of a race backs off
     })
-    return true
+    return token
   } catch {
-    return false
+    return null
   }
 }
 
-async function releaseLock(lockPath: string): Promise<void> {
+/** Touch the lock's mtime so cross-host observers see the holder is alive. */
+async function refreshLock(lockPath: string, token: string): Promise<void> {
   try {
-    const held = JSON.parse(await readFile(lockPath, 'utf-8')) as { pid: number }
-    if (held.pid === process.pid) await rm(lockPath, { force: true })
+    const held = JSON.parse(await readFile(lockPath, 'utf-8')) as DaemonLockRecord
+    if (held.pid === process.pid && held.host === hostname() && held.token === token) {
+      const t = new Date()
+      await utimes(lockPath, t, t)
+    }
+  } catch {
+    // Lock vanished or is not ours — the next acquire/tick decides.
+  }
+}
+
+async function releaseLock(lockPath: string, token: string): Promise<void> {
+  try {
+    const held = JSON.parse(await readFile(lockPath, 'utf-8')) as DaemonLockRecord
+    if (held.pid === process.pid && held.host === hostname() && held.token === token) {
+      await rm(lockPath, { force: true })
+    }
   } catch { /* already gone */ }
 }
 

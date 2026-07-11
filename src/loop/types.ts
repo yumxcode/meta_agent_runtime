@@ -32,8 +32,8 @@ export function normalizeRoundMode(mode: unknown): RoundMode {
  */
 export interface RouteDecision {
   kind: 'continue' | 'pivot' | 'finalize' | 'escalate'
-  /** What triggered a non-continue kind. */
-  cause?: 'accepted' | 'budget' | 'tripwire'
+  /** What triggered a non-continue kind ('manual' = `loop stop`). */
+  cause?: 'accepted' | 'budget' | 'tripwire' | 'manual'
   /** Set when cause is 'tripwire' (index into charter.tripwires). */
   tripwireIndex?: number
   /** Human-readable reason (tripwire action reason, 'goal_satisfied', 'budget'…). */
@@ -43,7 +43,7 @@ export interface RouteDecision {
 /** Render a route for reports/CLI/capsule digests. Tolerates pre-v3 strings. */
 export function renderRoute(route: RouteDecision | string): string {
   if (typeof route === 'string') return route
-  const label = route.reason ?? (route.cause === 'accepted' || route.cause === 'budget' ? route.cause : undefined)
+  const label = route.reason ?? (route.cause && route.cause !== 'tripwire' ? route.cause : undefined)
   const tw = route.tripwireIndex !== undefined ? `#tw${route.tripwireIndex}` : ''
   return `${route.kind}${label ? `:${label}` : ''}${tw}`
 }
@@ -58,11 +58,22 @@ export function renderRoute(route: RouteDecision | string): string {
  */
 export type ProgressStatus = 'healthy' | 'stale' | 'pivot_scheduled' | 'paused_attention' | 'completed'
 
+/**
+ * Statuses in which the scheduler must NOT advance the loop: terminal states
+ * plus both pause flavours. The runner refuses (and culls) wakes for these,
+ * and skips event ingestion so external results stay unconsumed in events/
+ * until a resume. Single source of truth for runner/daemon guards.
+ */
+export const HALTED_STATUSES: ReadonlySet<string> = new Set([
+  'done', 'failed', 'paused_attention', 'paused_manual',
+])
+
 export type LoopInstanceStatus =
   | 'idle'              // between rounds, wake scheduled
   | 'running'           // a tick process holds the claim
   | 'waiting'           // external effect pending (M2)
-  | 'paused_attention'  // escalated, needs human ack
+  | 'paused_attention'  // escalated, needs human ack (resume = light ack, or migrate)
+  | 'paused_manual'     // human ran `loop pause`; resume restores idle|waiting
   | 'done'
   | 'failed'
 
@@ -118,6 +129,8 @@ export interface InstancePaths {
   directionsJson: string
   progressJson: string
   effectsJsonl: string
+  /** Append-only audit of manual lifecycle interventions (pause/resume/ack/stop). */
+  lifecycleJsonl: string
   /** Persisted mid-round state while an external effect is pending (M2). */
   pendingRoundJson: string
   draftsDir: string
@@ -144,6 +157,7 @@ export function instancePaths(taskDir: string, instanceId: LoopInstanceId): Inst
     directionsJson: join(ledgerDir, 'directions.json'),
     progressJson: join(ledgerDir, 'progress.json'),
     effectsJsonl: join(ledgerDir, 'effects.jsonl'),
+    lifecycleJsonl: join(ledgerDir, 'lifecycle.jsonl'),
     pendingRoundJson: join(ledgerDir, 'pending_round.json'),
     draftsDir: join(root, 'drafts'),
     inboxDir: join(root, 'inbox'),

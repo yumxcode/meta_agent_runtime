@@ -7,7 +7,7 @@
  * snapshot anyway, but the library itself also never rewrites history).
  */
 import { join, resolve } from 'path'
-import { atomicWriteJson, ensureDir, readJsonFile } from '../../infra/persist/index.js'
+import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../../infra/persist/index.js'
 import type { Charter } from './CharterTypes.js'
 import { validateCharter } from './CharterValidate.js'
 
@@ -51,18 +51,23 @@ export class CharterStore {
   async save(charter: Charter): Promise<CharterRef> {
     const errs = validateCharter({ ...charter, version: 1 })
     if (errs.length > 0) throw new Error(`refusing to save invalid charter:\n- ${errs.join('\n- ')}`)
-    const latest = await readJsonFile<LatestPointer>(this.latestPath(charter.id))
-    const version = (latest?.version ?? 0) + 1
-    const stamped: Charter = { ...charter, version }
-    const path = this.versionPath(charter.id, version)
-    await ensureDir(join(this.charterDir(charter.id), `v${String(version).padStart(4, '0')}`))
-    await atomicWriteJson(path, stamped)
-    await atomicWriteJson(this.latestPath(charter.id), {
-      charterId: charter.id,
-      version,
-      updatedAt: Date.now(),
-    } satisfies LatestPointer)
-    return { charterId: charter.id, version, path }
+    // Version allocation is read-modify-write on latest.json — lock it so two
+    // concurrent saves cannot both allocate the same version and clobber each
+    // other (append-only history must stay append-only).
+    return withFileLock(this.latestPath(charter.id), async () => {
+      const latest = await readJsonFile<LatestPointer>(this.latestPath(charter.id))
+      const version = (latest?.version ?? 0) + 1
+      const stamped: Charter = { ...charter, version }
+      const path = this.versionPath(charter.id, version)
+      await ensureDir(join(this.charterDir(charter.id), `v${String(version).padStart(4, '0')}`))
+      await atomicWriteJson(path, stamped)
+      await atomicWriteJson(this.latestPath(charter.id), {
+        charterId: charter.id,
+        version,
+        updatedAt: Date.now(),
+      } satisfies LatestPointer)
+      return { charterId: charter.id, version, path }
+    })
   }
 
   async load(id: string, version?: number): Promise<Charter | null> {

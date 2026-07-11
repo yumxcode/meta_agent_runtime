@@ -28,12 +28,11 @@
  */
 import { readFile, rm } from 'fs/promises'
 import { join } from 'path'
-import { randomUUID } from 'crypto'
 import { evaluateBool, type EvalContext } from '../expr/Expr.js'
 import type { FrozenCharter, TripwireAction } from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
 import { setInstanceStatus } from '../instance/InstanceStore.js'
-import { buildCapsule, type Capsule } from '../capsule/CapsuleBuilder.js'
+import { buildCapsule, consumeInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
 import { runFinalizerSeat, runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
 import { WakeStore, type WakeRecord } from '../wake/WakeStore.js'
 import { atomicWriteFile } from '../../infra/persist/index.js'
@@ -98,6 +97,14 @@ export async function runRound(
   deps: RunRoundDeps,
 ): Promise<RoundOutcome> {
   const waitDeps = { wakeStore: deps.wakeStore, projectDir: deps.projectDir }
+  // Keep the wake claim fresh for the WHOLE round: seats legally run far longer
+  // than the claim TTL (wallclockMin can be hours vs a 10-min TTL), and an
+  // expired claim would let a concurrent `loop tick` re-pend + re-claim this
+  // wake and run a duplicate round (double spend, interleaved ledger writes).
+  const heartbeat = setInterval(() => {
+    void deps.wakeStore.heartbeat(wake.wakeId).catch(() => undefined)
+  }, 60_000)
+  heartbeat.unref?.()
   try {
     // ── 2. RECONCILE ──────────────────────────────────────────────────────────
     await deps.wakeStore.reconcileOrphans()
@@ -113,6 +120,13 @@ export async function runRound(
           await setInstanceStatus(instance, 'running')
           return await harvestSegment(instance, deps, pending)
         }
+        // Fired early (a coalesced/foreign timer): this wake is consumed on
+        // release, so re-arm the REAL resume wake at fireAt — otherwise the
+        // park would strand until a manual resume (schedule() coalesces, so
+        // this is idempotent).
+        await deps.wakeStore.schedule({
+          loopId: instance.record.instanceId, kind: 'timer', fireAt: pending.fireAt ?? Date.now(),
+        })
         await setInstanceStatus(instance, 'waiting')
         return {
           round: pending.round, mode: pending.mode,
@@ -135,6 +149,7 @@ export async function runRound(
     await setInstanceStatus(instance, 'running')
     return await freshRound(instance, deps)
   } finally {
+    clearInterval(heartbeat)
     await deps.wakeStore.release(wake.wakeId, 'done').catch(() => undefined)
   }
 }
@@ -170,14 +185,19 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps): Promise<R
 
   // ── 4+5a. CAPSULE (+ pivoter when this is a pivot round) ────────────────────
   let pivotDirective: string | undefined
+  let inboxMessages: string[] | undefined
   if (mode === 'pivot' && charter.seats.pivoter) {
-    const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode })
+    // Consume the inbox ONCE per round: buildCapsule moves messages to
+    // processed/, so letting the pivoter's build consume them would silently
+    // drop the human feedback from the worker's capsule (the second build).
+    inboxMessages = await consumeInbox(paths)
+    const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, inboxMessages })
     const pivot = await runPivoterSeat(deps, charter, paths, capsuleForPivot)
     costUsd += pivot.costUsd
     seatSummaries['pivoter'] = truncate(pivot.summary)
     pivotDirective = typeof pivot.data['directive'] === 'string' ? pivot.data['directive'] : undefined
   }
-  const capsule = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, pivotDirective })
+  const capsule = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, pivotDirective, inboxMessages })
 
   // ── 5b+6. SEAT + GATE ───────────────────────────────────────────────────────
   const seatLoop = await runSeatLoop(instance, deps, capsule, seatSummaries)
@@ -251,7 +271,7 @@ async function runSeatLoop(
   let corrective: string | undefined = initialPreface
   let correctiveRetries = 0
   let costUsd = 0
-  const retried = { diversity: false, schema: false, judge: false }
+  const retried = { diversity: false, schema: false, judge: false, judgeCrash: false, wait: false }
 
   for (;;) {
     worker = await runWorkerSeat(deps, charter, paths, capsule, corrective)
@@ -268,18 +288,33 @@ async function runSeatLoop(
       }
     }
     // Event wait: the worker submitted external work and waits for an event
-    // (an events/ file with this effectKey) to conclude it. No probe.
-    if (worker.data['label'] === 'wait') {
-      return {
-        kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
-        waitRequest: {
-          mode: 'event',
-          effectKey: typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
-            ? worker.data['effectKey']
-            : `eff-${randomUUID().replace(/-/g, '').slice(0, 10)}`,
-          payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
-        },
+    // (an events/ file with this effectKey) to conclude it. No probe. Honored
+    // ONLY from the structured return_result payload — the free-text JSON
+    // fallback could turn a quoted example in prose into an accidental park.
+    if (worker.structured && worker.data['label'] === 'wait') {
+      const effectKey = typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
+        ? (worker.data['effectKey'] as string)
+        : null
+      if (effectKey) {
+        return {
+          kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
+          waitRequest: {
+            mode: 'event',
+            effectKey,
+            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
+          },
+        }
       }
+      // A wait without an effectKey is unconcludable — the external system
+      // cannot guess a kernel-generated key, so the loop would park forever.
+      // One corrective retry, then the round hard-fails.
+      if (!retried.wait) {
+        retried.wait = true
+        corrective = '【纠偏重试】你声明了 label:"wait" 但没有提供 effectKey。外部系统只能通过 events/<effectKey>.json 了结这次等待，缺少 key 的等待永远不会结束。请重新 return_result：要么带上 {"label":"wait","effectKey":"<外部系统已知的任务标识>"}，要么改用 timer 工具自计时。'
+        correctiveRetries++
+        continue
+      }
+      worker = { ...worker, ok: false, summary: `seat requested an event wait without effectKey (rejected): ${worker.summary}` }
     }
     if (!worker.ok) break
 
@@ -304,6 +339,16 @@ async function runSeatLoop(
       costUsd += judge.costUsd
       seatSummaries['judge'] = truncate(judge.summary)
       deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
+      if (!judge.ok && !retried.judgeCrash) {
+        // A crashed judge (API error / timeout, no verdict) must not silently
+        // pass its gate: one in-round rerun; if it crashes again, admitDrafts
+        // fails closed (drafts discarded) instead of admitting unreviewed.
+        retried.judgeCrash = true
+        judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter))
+        costUsd += judge.costUsd
+        seatSummaries['judge'] = truncate(judge.summary)
+        deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
+      }
       const failMessages = judge.data['verdict'] === 'fail'
         ? (Array.isArray(judge.data['messages']) ? (judge.data['messages'] as unknown[]).map(String) : [])
         : []
@@ -406,6 +451,34 @@ async function harvestSegment(
   const effectKey = isSelfTimer ? null : pending.effectKey!
   const progress = await ledger.readProgress()
   const mode = normalizeRoundMode(pending.mode)
+
+  // Replay guard: if this round is ALREADY accounted (a crash landed between
+  // completeRound's ledger writes and clearPendingRound), re-running the
+  // harvest would duplicate the round entry, double the cost, and re-spend on
+  // LLM seats. Settle the leftovers instead and resume normal scheduling.
+  if (progress.iteration >= pending.round) {
+    await clearPendingRound(instance)
+    if (effectKey) await effects.markHarvested(effectKey)
+    if (progress.status === 'completed' || progress.status === 'paused_attention') {
+      await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+      await setInstanceStatus(
+        instance,
+        progress.status === 'completed' ? 'done' : 'paused_attention',
+        'settled by harvest replay guard',
+      )
+    } else {
+      await deps.wakeStore.schedule({
+        loopId: instance.record.instanceId, kind: 'timer',
+        fireAt: Date.now() + (charter.roundIntervalMs ?? 0),
+      })
+      await setInstanceStatus(instance, 'idle')
+    }
+    return {
+      round: pending.round, mode,
+      route: 'already-accounted', status: progress.status, costUsd: 0,
+    }
+  }
+
   deps.observer?.({
     type: 'harvest_started', round: pending.round,
     effectKey: effectKey ?? `self_timer:${pending.reason ?? ''}`,
@@ -590,6 +663,61 @@ function decideRoute(
   return { kind: 'continue' }
 }
 
+// ── manual stop (loop stop <id>) ──────────────────────────────────────────────
+
+export interface ManualStopDeps {
+  wakeStore: WakeStore
+  observer?: (event: LoopEvent) => void
+  /** Provide a live backend to run the finalizer seat; omitted → code-template report only. */
+  seatDeps?: SeatRunnerDeps
+}
+
+/**
+ * Graceful HUMAN termination — the `loop stop` path. Reuses terminate() so a
+ * manual stop is indistinguishable in shape from a tripwire finalize: terminal
+ * RoundEntry (route {kind:'finalize', cause:'manual'}), final_report.md,
+ * progress 'completed', wakes cancelled, instance 'done'.
+ *
+ * A parked (waiting) round is abandoned, but NOT silently: its round number,
+ * cost-so-far, and seat summaries are folded into the terminal entry, so the
+ * ledger accounts for every dollar the abandoned segment spent. The caller is
+ * responsible for clearing pending_round (Lifecycle does, before this runs).
+ */
+export async function stopLoopManually(
+  instance: LoopInstance,
+  deps: ManualStopDeps,
+  reason: string,
+  abandoned?: Pick<PendingRound, 'round' | 'mode' | 'costUsdSoFar' | 'seatSummaries' | 'correctiveRetries' | 'startedAt'>,
+): Promise<RoundOutcome> {
+  const progress = await instance.ledger.readProgress()
+  const runDeps: RunRoundDeps = {
+    wakeStore: deps.wakeStore,
+    ...(deps.observer ? { observer: deps.observer } : {}),
+    ...(deps.seatDeps ?? {
+      // Stub backend — never invoked because skipFinalizer is set below.
+      dispatcher: {
+        spawnSubAgent: async () => { throw new Error('manual stop has no backend') },
+        getStatus: async () => null,
+        cancelTask: async () => true,
+      },
+      projectDir: instance.record.projectDir,
+      signal: new AbortController().signal,
+    }),
+  }
+  return terminate(instance, runDeps, {
+    round: abandoned?.round ?? progress.iteration + 1,
+    mode: normalizeRoundMode(abandoned?.mode),
+    route: { kind: 'finalize', cause: 'manual', reason },
+    startedAt: abandoned?.startedAt ?? Date.now(),
+    costUsd: abandoned?.costUsdSoFar ?? 0,
+    seatSummaries: abandoned?.seatSummaries ?? {},
+    correctiveRetries: abandoned?.correctiveRetries ?? 0,
+    observables: {},
+    meters: progress.meters,
+    skipFinalizer: !deps.seatDeps,
+  })
+}
+
 // ── helpers ───────────────────────────────────────────────────────────────────
 
 function buildCtx(
@@ -649,7 +777,9 @@ async function admitDrafts(instance: LoopInstance, judge: SeatResult | null): Pr
     const raw = await readFile(draftPath, 'utf-8')
     const parsed = JSON.parse(raw) as unknown
     const entries = Array.isArray(parsed) ? parsed : [parsed]
-    const pass = !judge || judge.data['verdict'] !== 'fail'
+    // Fail-closed: a declared judge that crashed (ok=false, no verdict) must
+    // not admit unreviewed findings into the permanent ledger.
+    const pass = !judge || (judge.ok && judge.data['verdict'] !== 'fail')
     if (pass) {
       for (const entry of entries) {
         await ledger.appendJsonl(paths.findingsJsonl, entry)
@@ -749,6 +879,8 @@ interface TerminateInput {
   observables: Record<string, number | boolean | string>
   meters: Record<string, number>
   alreadyAccounted?: boolean
+  /** Manual stop without a backend: render the code-template report only. */
+  skipFinalizer?: boolean
 }
 
 /** Stop path: render the report from the LEDGER (code template, with an
@@ -780,7 +912,7 @@ async function terminate(
   // code-template report renders regardless.
   let narrative: string | undefined
   let finalizerCost = 0
-  if (!escalated && charter.seats.finalizer) {
+  if (!escalated && !input.skipFinalizer && charter.seats.finalizer) {
     try {
       const fin = await runFinalizerSeat(deps, charter, paths, reason)
       finalizerCost = fin.costUsd
@@ -798,6 +930,9 @@ async function terminate(
   const progress = await ledger.readProgress()
   await ledger.writeProgress({
     ...progress,
+    // The not-yet-accounted path appended a terminal RoundEntry above — keep
+    // iteration consistent with rounds.jsonl (the ledger is the authority).
+    ...(input.alreadyAccounted ? {} : { iteration: Math.max(progress.iteration, input.round) }),
     status: terminalStatus,
     nextRoundMode: undefined,
     totalCostUsd: progress.totalCostUsd + (input.alreadyAccounted ? 0 : input.costUsd) + finalizerCost,

@@ -39,6 +39,12 @@ export interface SeatResult {
   summary: string
   /** Structured payload from return_result (authoritative). */
   data: Record<string, unknown>
+  /**
+   * True when `data` came from the structured return_result output; false when
+   * it was scraped from free text (last-JSON-block fallback). Control-flow
+   * labels (e.g. label:'wait') must only be honored from structured payloads.
+   */
+  structured: boolean
   costUsd: number
   /** Set when the worker parked itself via the timer tool (self_timer wait). */
   timer?: TimerIntent
@@ -104,6 +110,13 @@ export async function runWorkerSeat(
       paths.instanceJson,
       paths.capsuleJson,
       paths.reportsDir,
+      // Kernel INPUT channels, not just outputs: events/ would let the worker
+      // conclude its own external wait, inbox/ would let it forge "human
+      // feedback" into the next capsule, and the wake store is scheduler state
+      // no seat may touch. Drafts stay writable (that IS the output channel).
+      paths.eventsDir,
+      paths.inboxDir,
+      join(deps.projectDir, '.loop', 'wakes'),
     ],
   }
   const result = await runSeat(
@@ -238,7 +251,7 @@ async function runSeat(
     spawnOpts,
   )
   const result = rec?.result
-  const data = extractData(result?.output, result?.summary)
+  const { data, structured } = extractData(result?.output, result?.summary)
   // Surface the FAILURE REASON, not just the summary: failed spawns (API error,
   // "No tools resolved", timeout, …) write summary:'' and put the cause in
   // result.error — dropping it leaves an empty worker summary in the ledger and
@@ -252,24 +265,30 @@ async function runSeat(
     ok: rec?.status === 'completed' && result?.success === true && data['label'] !== 'error',
     summary,
     data,
+    structured,
     costUsd: result?.costUsd ?? 0,
   }
 }
 
-/** Prefer structured return_result output; fall back to the last JSON block. */
-function extractData(output: unknown, summary?: string): Record<string, unknown> {
+/** Prefer structured return_result output; fall back to the last JSON block.
+ * `structured` records which path produced the data — free-text scrapes must
+ * never drive control flow (e.g. label:'wait'). */
+function extractData(
+  output: unknown,
+  summary?: string,
+): { data: Record<string, unknown>; structured: boolean } {
   if (output && typeof output === 'object' && !Array.isArray(output)) {
-    return output as Record<string, unknown>
+    return { data: output as Record<string, unknown>, structured: true }
   }
   if (typeof output === 'string') {
     const parsed = lastJsonBlock(output)
-    if (parsed) return parsed
+    if (parsed) return { data: parsed, structured: false }
   }
   if (summary) {
     const parsed = lastJsonBlock(summary)
-    if (parsed) return parsed
+    if (parsed) return { data: parsed, structured: false }
   }
-  return {}
+  return { data: {}, structured: false }
 }
 
 function lastJsonBlock(text: string): Record<string, unknown> | null {

@@ -29,8 +29,8 @@ import Anthropic from '@anthropic-ai/sdk'
 import { randomUUID } from 'crypto'
 import { writeFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
-import { homedir } from 'node:os'
 import { buildAnthropicAuth } from '../kernel/api/AnthropicClient.js'
+import { META_AGENT_HOME } from './metaAgentHome.js'
 import {
   resolveConfig,
   DEFAULT_SYSTEM_PROMPT,
@@ -564,7 +564,7 @@ export class MetaAgentSession {
 
   /** Return the debug log directory for this session (may not exist yet). */
   getDebugDir(): string {
-    return join(homedir(), '.meta-agent', 'debug', this.sessionId)
+    return join(META_AGENT_HOME, 'debug', this.sessionId)
   }
 
   // ─────────────────────────────────────────────────────────────────────────
@@ -583,7 +583,7 @@ export class MetaAgentSession {
     payload: unknown,
   ): Promise<void> {
     try {
-      const dir = join(homedir(), '.meta-agent', 'debug', sessionId)
+      const dir = join(META_AGENT_HOME, 'debug', sessionId)
       await mkdir(dir, { recursive: true })
       const filename = `turn-${String(turn).padStart(3, '0')}-${kind}.json`
       await writeFile(join(dir, filename), JSON.stringify(payload, null, 2), 'utf8')

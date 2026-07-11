@@ -1,9 +1,9 @@
 import { readdir, readFile, stat } from 'fs/promises'
-import { homedir } from 'os'
 import { join, resolve } from 'path'
 import type { AgentMode } from '../../../core/dynamicPrompt.js'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
+import { META_AGENT_HOME } from '../../../core/metaAgentHome.js'
 
 // ── Skill directory resolution ────────────────────────────────────────────────
 //
@@ -14,8 +14,8 @@ import { loadToolPrompt } from '../../util.js'
 
 function skillDirs(cwd: string, mode: AgentMode): string[] {
   const projectLocal = join(resolve(cwd), '.meta-agent', 'skills')
-  const userMode     = join(homedir(), '.meta-agent', 'skills', mode)
-  const userGlobal   = join(homedir(), '.meta-agent', 'skills')
+  const userMode     = join(META_AGENT_HOME, 'skills', mode)
+  const userGlobal   = join(META_AGENT_HOME, 'skills')
   return [projectLocal, userMode, userGlobal]
 }
 

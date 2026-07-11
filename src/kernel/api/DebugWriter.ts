@@ -23,12 +23,12 @@
  *   await writer.close()
  */
 
-import { homedir } from 'os'
 import { join } from 'path'
 import { mkdir, open, readdir, rm, stat } from 'fs/promises'
 import type { FileHandle } from 'fs/promises'
+import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 
-const DEBUG_ROOT = join(homedir(), '.meta-agent', 'debug')
+const DEBUG_ROOT = join(META_AGENT_HOME, 'debug')
 const DEFAULT_DEBUG_TTL_MS = 14 * 24 * 60 * 60 * 1000   // 14 days
 const DEFAULT_SESSION_DIR_SIZE_CAP = 200 * 1024 * 1024   // 200 MB per session
 
@@ -312,7 +312,7 @@ export class DebugWriter {
   ): Promise<DebugWriter | null> {
     if (!debug || !sessionId) return null
 
-    const dir = join(rootDir ?? join(homedir(), '.meta-agent', 'debug'), sessionId)
+    const dir = join(rootDir ?? DEBUG_ROOT, sessionId)
     await mkdir(dir, { recursive: true })
 
     const ts = isoNow().replace(/[:.]/g, '-')

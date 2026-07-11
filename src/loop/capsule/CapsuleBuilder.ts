@@ -47,6 +47,13 @@ export interface BuildCapsuleInput {
   round: number
   mode: RoundMode
   pivotDirective?: string
+  /**
+   * Pre-consumed inbox messages. When the kernel builds MULTIPLE capsules in
+   * one round (pivot rounds: pivoter + worker) it must consume the inbox once
+   * and pass the messages here — otherwise the first build would move them to
+   * processed/ and the later capsules would silently lose the human feedback.
+   */
+  inboxMessages?: string[]
 }
 
 /**
@@ -56,7 +63,7 @@ export interface BuildCapsuleInput {
  */
 export async function buildCapsule(input: BuildCapsuleInput): Promise<Capsule> {
   const view = await input.ledger.readView(MAX_LIST_ITEMS)
-  const inboxMessages = await consumeInbox(input.paths)
+  const inboxMessages = input.inboxMessages ?? await consumeInbox(input.paths)
 
   const capsule: Capsule = {
     builtAt: Date.now(),
@@ -104,7 +111,9 @@ export function renderCapsule(capsule: Capsule): string {
   return lines.join('\n')
 }
 
-async function consumeInbox(paths: InstancePaths): Promise<string[]> {
+/** Consume the inbox (messages move to processed/). Exported for the kernel's
+ * once-per-round consumption on multi-capsule (pivot) rounds. */
+export async function consumeInbox(paths: InstancePaths): Promise<string[]> {
   let files: string[]
   try {
     files = (await readdir(paths.inboxDir)).filter(f => f.endsWith('.json') || f.endsWith('.txt')).sort()
