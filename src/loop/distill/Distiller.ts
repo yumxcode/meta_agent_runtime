@@ -59,6 +59,14 @@ Charter 结构（全部字段；? 为可选）：
   · "lineage_loop"：跨轮 **resume 同一会话**、积累上下文——用于"在已有实现上持续迭代、调参、逐步推进"的 worker；
   · "isolated"：每轮**全新会话、无历史**，只凭本轮 <context> 独立判断——用于"需要跳出既有框架、推翻假设、换新证据源、避免自我叙事绑架"的 worker。
   · 若需求同时要"迭代推进"与"周期性推翻重来"，可用两类思路：迭代 worker 用 lineage_loop，靠 tripwire 的 {"act":"pivot"} 触发 pivoter（isolated）给出结构性转向。judge/pivoter/finalizer 永远 "isolated"（D6）。
+- seat.budgetPerRound 缺省值：usd 2、turns 30、wallclockMin 30——对重座位（如要读码+实现的 worker）**要显式设大**，否则默认额度可能中途掐死正常工作。
+
+隔离座位底座（judge/pivoter/finalizer 的运行事实，prompt 据此写）：
+- **三个隔离座位的输出格式全部由内核追加的固定 contract 定义**，seat.prompt 一律**只写角色/判断标准，绝不要规定输出 JSON 结构**：judge → JUDGE_CONTRACT（见"硬性规则"）；pivoter → 内核强制 return_result data={"directive":"<结构性转向指令>","key":"<新方向短标识>"}；finalizer → 内核强制 data={"narrative":"<markdown 叙事>"}。
+- 隔离座位**无工具**，世界=内嵌证据：seat.inputs 列出的文件被内核读出并内嵌进 prompt，**每个文件只取尾部 6000 字符**、不存在则标注"(不存在)"——inputs 要选小而信息密的账本文件，别指望它读大文件全文。
+- judge 的 prompt 前内核会注入【验收目标】= charter.goal（内置验收据此判 goal_satisfied），goal 本身写清楚成功标准比 rubric 里重复目标更重要。
+- judge 的裁决有硬后果：**verdict:"fail" → 本轮 findings 草稿不入账**，且 messages 会被内核原文作为 worker 的**同轮纠偏重试指令**（每轮最多一次）——rubric 要求 messages 写"可执行的具体纠偏项"而不是泛泛评语。judge 崩溃时内核重跑一次，仍失败则 fail-closed（草稿弃置）。
+- 内核在 SEAT+GATE 内的自动纠偏重试**每轮每种原因至多一次**：方向与 directions_tried 完全重复 / state schema 门失败 / judge fail / wait 缺 effectKey。别在任何 prompt 里再造重试循环。
 
 账本归内核（最容易映射错的地方，务必钉死）：
 - 内核在实例目录 .loop/<id>/ledger/ 下**独占写入**这些"状态/日志"文件，**不要**让任何座位去写：
@@ -97,8 +105,14 @@ health（progress.status 的健康规则，可选）：
 - 其中 healthy|stale 由 health.staleWhen 表达式判定（true→stale）；不声明时回退约定：存在名为 stale_count 的 meter 且 >0 → stale。若你的"停滞"语义不是 stale_count（比如 plateau_streak >= 2），就显式声明 health.staleWhen。
 
 硬性规则：
-- **observable 只能是 {"from":"judge","key":"<judge return_result 的字段名>"}**——内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，用了会静默失效成死规则，且校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/escalate）兜底即可。
-- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；不得出现函数调用。health.staleWhen、onResume.resetMeters 同受静态校验（resetMeters 必须是已声明 meter）。
+- **observable 只能是 {"from":"judge","key":"…"}，judge 输出 schema 由内核所有**：内核会在你的 judge prompt **之后追加一段 JUDGE_CONTRACT**，强制 judge 的 return_result data 恒含核心六键 {"verdict","new_findings_count","metric_delta","metric","goal_satisfied","messages"}，**并把 charter 里声明的所有额外 observable key 一并注入该 contract 强制输出**。因此：
+  · **优先用核心键**：new_findings_count（int）/ metric_delta（number）/ metric（number|null）/ goal_satisfied（bool）。"结果变好没有"= metric_delta > 0，"有新发现"= new_findings_count > 0，多数需求核心键够用。
+  · **确需自定义键**（如 coverage_ratio）可以直接声明——内核会替你强制 judge 输出它；但你**必须在 judge 的 rubric 里定义该键的语义与取值标准**（值限 number/boolean/string），否则 judge 只能瞎填。
+  · judge 的 seat.prompt **只写 rubric**（怎么判、什么算 finding、成功标准、自定义键的语义），**绝不要规定输出格式/JSON 结构**——输出格式由内核追加的 JUDGE_CONTRACT 全权定义，你写的格式指令只会与之冲突。
+  · 内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/escalate）兜底即可。
+- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；字面量可用数字/布尔/'字符串'（如 verdict_obs == 'pass'，前提是已声明对应 observable）；不得出现函数调用。类型严格：逻辑要布尔、比较要数字，混用在运行时按"缺值"回退处理。health.staleWhen、onResume.resetMeters 同受静态校验（resetMeters 必须是已声明 meter）。
+- meter 语义：incWhen 与 resetWhen 同轮同真时**只 inc 不 reset**（incWhen 优先）；meter 表达式看到的是**本轮更新前**的 meters + 本轮新 observables。observables 与 meters 名字共用一个命名空间，不得重名。
+- gates 里**至多一个 judge 门**（内核只读第一个）；judge seat.inputs 声明时**覆盖** findings_gate.evidence（二者取其一维护，别写成两套不同清单）。
 - 保证可终止：至少有一条 {"act":"finalize"} tripwire 或一个 lifetime 预算（见"终止机制"；escalate 不算）。tripwire 声明顺序即优先级（最严重的在前）。
 - **then 只有三种合法形态**：{"act":"pivot"} / {"act":"finalize","reason"?} / {"act":"escalate","reason",…}——没有 mode、stop、attention 字段（那是旧版形态，校验器会给迁移提示但你不要输出它们）。pivoter ⟺ pivot 绊线双向强制。
 - judge/pivoter/finalizer 的 context 必须是 "isolated"；计数/阈值/路由这类确定性规则落在 meters/tripwires，**不得写进座位 prompt**。

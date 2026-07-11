@@ -18,6 +18,12 @@ import type { Ast } from '../expr/Expr.js'
  * new source is ever added, wire it in `collectObservables`, extend this union,
  * AND allow it in `validateCharter` together — the validator is the source of
  * truth for what the kernel can actually honor.
+ *
+ * `key` may be one of the kernel's core judge keys (JUDGE_CORE_KEYS in Seats.ts)
+ * or a charter-invented extra key: every declared key is INJECTED into the
+ * JUDGE_CONTRACT the kernel appends to the judge prompt, so the judge is always
+ * required to emit it. The kernel — not the charter prompt — owns the judge's
+ * output schema; the charter's judge rubric defines the SEMANTICS of extra keys.
  */
 export type ObservableSource =
   | { from: 'judge'; key: string }              // judge return_result data field

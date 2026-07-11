@@ -561,7 +561,7 @@ async function completeRound(
   const { baseProgress: progress } = input
 
   // ── 7. METER ──────────────────────────────────────────────────────────────
-  const observables = collectObservables(charter, input.judge)
+  const { observables, warnings } = collectObservables(charter, input.judge)
   const meters = { ...progress.meters }
   // Budget exhaustion is recomputed WITH this round accounted (iteration+cost),
   // so ROUTE terminates now instead of wasting a wake on an empty next round.
@@ -599,6 +599,7 @@ async function completeRound(
     correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
     seatSummaries: input.seatSummaries,
     startedAt: input.startedAt, finishedAt: Date.now(),
+    ...(warnings.length > 0 ? { warnings } : {}),
   } satisfies RoundEntry)
   await ledger.writeProgress({
     iteration: input.round,
@@ -756,15 +757,30 @@ function safeEval(ast: Parameters<typeof evaluateBool>[0], ctx: EvalContext, fal
 function collectObservables(
   charter: FrozenCharter,
   judge: SeatResult | null,
-): Record<string, number | boolean | string> {
+): { observables: Record<string, number | boolean | string>; warnings: string[] } {
   const out: Record<string, number | boolean | string> = {}
+  const warnings: string[] = []
   for (const spec of charter.observables) {
-    if (spec.source.from === 'judge') {
-      const v = judge?.data[spec.source.key]
-      if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') out[spec.name] = v
+    if (spec.source.from !== 'judge') continue
+    const v = judge?.data[spec.source.key]
+    if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') {
+      out[spec.name] = v
+    } else if (judge) {
+      // The judge DID run but never emitted this key. Every declared key is
+      // injected into JUDGE_CONTRACT (core or charter-declared extra), so this
+      // means the judge disobeyed its contract or crashed mid-output. Silent
+      // absence turns every dependent meter/tripwire into a dead rule, so make
+      // it loud in the round audit. (judge === null means the worker failed —
+      // that case is expected and covered by the stale fallback, not warned.)
+      const emitted = Object.keys(judge.data).join(', ') || '<none>'
+      warnings.push(
+        `observable '${spec.name}': judge never emitted key '${spec.source.key}' ` +
+        `despite it being demanded by JUDGE_CONTRACT (judge output keys: ${emitted}); ` +
+        `dependent meters/tripwires fell back to defaults this round`,
+      )
     }
   }
-  return out
+  return { observables: out, warnings }
 }
 
 /** Admit findings drafts into the ledger; returns number admitted. Drafts are

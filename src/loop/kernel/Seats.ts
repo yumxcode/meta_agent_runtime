@@ -125,12 +125,44 @@ export async function runWorkerSeat(
   return timerIntent ? { ...result, timer: timerIntent } : result
 }
 
-const JUDGE_CONTRACT = `\
+/**
+ * Judge output vocabulary — kernel-owned. The contract is appended AFTER the
+ * charter's judge prompt, so at runtime it is the final word on output shape.
+ * Charter observables may declare EXTRA keys beyond the core set; the kernel
+ * injects them into the contract (buildJudgeContract), so "the charter names
+ * an observable key" and "the judge is required to emit it" can never drift
+ * apart — the kernel is the single authority over the judge's output schema.
+ */
+export const JUDGE_CORE_KEYS = [
+  'verdict', 'new_findings_count', 'metric_delta', 'metric', 'goal_satisfied', 'messages',
+] as const
+
+/** Charter-declared judge observable keys OUTSIDE the core set (deduped, in
+ * declaration order) — the keys the contract must additionally demand. */
+export function extraJudgeKeys(charter: FrozenCharter): string[] {
+  const core = new Set<string>(JUDGE_CORE_KEYS)
+  const extras: string[] = []
+  for (const o of charter.observables) {
+    if (o.source.from === 'judge' && !core.has(o.source.key) && !extras.includes(o.source.key)) {
+      extras.push(o.source.key)
+    }
+  }
+  return extras
+}
+
+export function buildJudgeContract(extraKeys: string[]): string {
+  const extraClause = extraKeys.length
+    ? `\n【charter 观测字段（同样必须输出）】除上述固定字段外，data 还必须包含：${extraKeys.map(k => `"${k}"`).join('、')}。` +
+      '其语义与取值标准以上方评审指令的定义为准；值只能是 number/boolean/string。' +
+      '任何一个缺失都会让内核依赖它的规则失效，因此每轮都要输出全部字段。'
+    : ''
+  return `\
 你是隔离评审座位：你看不到执行座位的任何推理过程，只能依据下方内嵌证据作出裁决。
 必须调用 return_result，data 写：
-{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["若fail给出具体纠偏项"]}
+{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["若fail给出具体纠偏项"]}${extraClause}
 每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
 【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。`
+}
 
 export async function runJudgeSeat(
   deps: SeatRunnerDeps,
@@ -145,7 +177,7 @@ export async function runJudgeSeat(
   // acceptance mechanism works for every loop with a judge.
   const task = [
     `【验收目标】${charter.goal}`,
-    seat.prompt, JUDGE_CONTRACT, '【证据（内嵌，只此为界）】', evidence,
+    seat.prompt, buildJudgeContract(extraJudgeKeys(charter)), '【证据（内嵌，只此为界）】', evidence,
   ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
   return runSeat(deps, seat, task, [])

@@ -115,6 +115,9 @@ export interface RoundEntry {
   seatSummaries: Record<string, string>
   startedAt: number
   finishedAt: number
+  /** Kernel-detected anomalies this round (e.g. a declared observable the judge
+   * never emitted). Purely diagnostic — never routed on. */
+  warnings?: string[]
 }
 
 // ── Instance directory layout ─────────────────────────────────────────────────
