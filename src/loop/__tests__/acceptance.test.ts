@@ -130,6 +130,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')
       .map(l => JSON.parse(l) as RoundEntry)
     expect(rounds.map(r => r.route.kind)).toEqual(['continue', 'continue', 'finalize'])
+    expect(rounds.map(r => r.observables['producer_ok'])).toEqual([true, true, true])
     expect(rounds[2]!.route).toMatchObject({ cause: 'tripwire', tripwireIndex: 2 })
     expect(rounds[0]!.meters).toEqual({ iteration: 1, stale_count: 0 })
     expect(rounds[1]!.meters).toEqual({ iteration: 2, stale_count: 1 }) // 0 findings → stale
@@ -145,6 +146,192 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
       expect(task).not.toContain('产出契约')
       expect(task).toContain('证据（内嵌，只此为界）')
     }
+  })
+
+  it('records producer_ok and preserves judge-dependent versus meter-only failure semantics', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-producer-ok-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) return { label: 'error' }
+      throw new Error('judge must not run after a failed producer')
+    })
+    const charter = walkResearchCharter({
+      meters: [
+        { name: 'iteration', inc: 'every_round' },
+        { name: 'stale_count', incWhen: 'new_findings == 0' },
+        { name: 'meter_only', incWhen: 'iteration > 99' },
+      ],
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const rounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')
+      .map(l => JSON.parse(l) as RoundEntry)
+    expect(rounds).toHaveLength(1)
+    expect(rounds[0]!.observables['producer_ok']).toBe(false)
+    expect(rounds[0]!.observationResults?.['producer_ok']).toMatchObject({
+      status: 'present', value: false,
+    })
+    expect(rounds[0]!.observationResults?.['new_findings']).toMatchObject({
+      status: 'absent', reason: 'not_produced',
+    })
+    expect(rounds[0]!.meters).toEqual({ iteration: 1, stale_count: 1, meter_only: 0 })
+    expect(rounds[0]!.warnings).toContain("objective 'metric' absent; applied skip_update")
+  })
+
+  it('applies tripwire onError=fail_stop to an invalid judge observable', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-observable-error-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) {
+        await writeWorkerDrafts(paths.draftsDir, 'observable-error', [])
+        return { label: 'ok' }
+      }
+      if (isJudge(task)) {
+        return { verdict: 'pass', metric_delta: 0, metric: null, messages: [] }
+      }
+      throw new Error('unexpected seat')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [
+        {
+          when: 'new_findings == 0',
+          then: { act: 'finalize' },
+          onAbsent: 'skip',
+          onError: 'fail_stop',
+        },
+        { when: 'iteration >= 10', then: { act: 'finalize' } },
+      ],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(round.observationResults?.['new_findings']).toMatchObject({
+      status: 'error', errorCode: 'judge_output_invalid',
+    })
+    expect(round.route).toMatchObject({ kind: 'escalate', cause: 'rule_error' })
+    expect(round.warnings?.some(w => w.includes('tripwire[0] error') && w.includes('fail_stop'))).toBe(true)
+  })
+
+  it('applies tripwire onAbsent=fail_stop when the producer fails before judge', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-observable-absent-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) return { label: 'error' }
+      throw new Error('judge must not run after a failed producer')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [
+        {
+          when: 'new_findings == 0',
+          then: { act: 'finalize' },
+          onAbsent: 'fail_stop',
+          onError: 'fail_stop',
+        },
+        { when: 'iteration >= 10', then: { act: 'finalize' } },
+      ],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(round.observationResults?.['new_findings']).toMatchObject({ status: 'absent' })
+    expect(round.route).toMatchObject({ kind: 'escalate', cause: 'rule_error' })
+    expect(round.warnings?.some(w => w.includes('tripwire[0] absent') && w.includes('fail_stop'))).toBe(true)
+  })
+
+  it('does not apply an absent policy to a short-circuited expression branch', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-observable-short-circuit-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) return { label: 'error' }
+      throw new Error('judge must not run after a failed producer')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [{
+        when: 'iteration >= 1 || new_findings == 0',
+        then: { act: 'finalize' },
+        onAbsent: 'fail_stop',
+        onError: 'fail_stop',
+      }],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(round.observationResults?.['new_findings']).toMatchObject({ status: 'absent' })
+    expect(round.route).toMatchObject({ kind: 'finalize', cause: 'tripwire' })
+    expect(round.warnings?.some(w => w.includes('tripwire[0] absent'))).toBe(false)
+  })
+
+  it('treats present-null as rule error and applies Health fail_stop', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-observable-null-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) {
+        await writeWorkerDrafts(paths.draftsDir, 'observable-null', [])
+        return { label: 'ok' }
+      }
+      if (isJudge(task)) {
+        return {
+          verdict: 'pass', new_findings_count: 1, metric_delta: 0,
+          metric: null, messages: [],
+        }
+      }
+      throw new Error('unexpected seat')
+    })
+    const charter = walkResearchCharter({
+      observables: [
+        { name: 'new_findings', source: { from: 'judge', key: 'new_findings_count' } },
+        { name: 'metric_delta', source: { from: 'judge', key: 'metric_delta' } },
+        { name: 'nullable_metric', source: { from: 'judge', key: 'metric' } },
+      ],
+      health: {
+        staleWhen: 'nullable_metric == 0',
+        onAbsent: 'skip',
+        onError: 'fail_stop',
+      },
+      tripwires: [{ when: 'iteration >= 10', then: { act: 'finalize' } }],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(round.observationResults?.['nullable_metric']).toMatchObject({ status: 'present', value: null })
+    expect(round.observables).not.toHaveProperty('nullable_metric')
+    expect(round.route).toMatchObject({ kind: 'escalate', cause: 'rule_error' })
+    expect(round.warnings?.some(w => w.includes('health error') && w.includes('present-null'))).toBe(true)
+  })
+
+  it('applies Objective onNull=fail_stop without coercing null into a metric', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-objective-null-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) {
+        await writeWorkerDrafts(paths.draftsDir, 'objective-null', [])
+        return { label: 'ok' }
+      }
+      if (isJudge(task)) {
+        return {
+          verdict: 'pass', new_findings_count: 1, metric_delta: 0,
+          metric: null, messages: [],
+        }
+      }
+      throw new Error('unexpected seat')
+    })
+    const charter = walkResearchCharter({
+      metric: { direction: 'max', onNull: 'fail_stop' },
+      tripwires: [{ when: 'iteration >= 10', then: { act: 'finalize' } }],
+    })
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(round.route).toMatchObject({ kind: 'escalate', cause: 'rule_error' })
+    expect(round.postState?.bestMetric).toBeNull()
+    expect(round.warnings).toContain("objective 'metric' null; applied fail_stop")
   })
 
   it('escalates stale → pivot → attention with pivoter participation', async () => {
@@ -234,6 +421,40 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     // Corrective prefaces reached the worker verbatim.
     expect(dispatcher.spawns.some(t => t.includes('完全重复'))).toBe(true)
     expect(dispatcher.spawns.some(t => t.includes('评审未通过'))).toBe(true)
+  })
+
+  it('fails closed when the diversity GateBinding exhausts its producer retry', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-diversity-exhausted-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    let workerCalls = 0
+    let judgeCalls = 0
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) {
+        workerCalls++
+        await writeWorkerDrafts(paths.draftsDir, 'already-tried', [{ claim: 'c', evidence: 'e' }])
+        return { label: 'ok' }
+      }
+      if (isJudge(task)) {
+        judgeCalls++
+        return { verdict: 'pass', new_findings_count: 1, metric_delta: 1, metric: 1, messages: [] }
+      }
+      throw new Error('unexpected seat')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+    })
+    const instance = await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await instance.ledger.replaceJson(paths.directionsJson, {
+      directions: [{ key: 'already-tried' }],
+    })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
+    expect(workerCalls).toBe(2)
+    expect(judgeCalls).toBe(0)
+    expect(round.correctiveRetries).toBe(1)
+    expect(round.observables['producer_ok']).toBe(false)
+    expect(round.seatSummaries['worker']).toContain("Artifact Gate 'direction_diversity' failed")
   })
 
   it('replay determinism: identical script ⇒ identical routes and meters', async () => {

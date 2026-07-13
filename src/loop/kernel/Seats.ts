@@ -25,6 +25,7 @@ import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
+import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import {
   assembleInnerWorkerSystemPrompt,
@@ -85,11 +86,13 @@ export async function runWorkerSeat(
     projectDir: deps.projectDir,
     variant,
     writeScope: charter.writeScope,
+    effectBindings: charter.effects,
   })
   const userMessage = renderInnerWorkerUserMessage({
     capsule,
     draftsDir: join(paths.draftsDir),
     preface: correctivePreface,
+    outputContract: scenarioRuntimeFor(charter).producerOutputContract(paths.draftsDir, charter.artifacts),
   })
   // lineage → resume a stable per-(instance,worker) session across rounds;
   // isolated → fresh each round. instanceId is the .loop/<id> dir name.
@@ -166,9 +169,17 @@ export const JUDGE_CORE_KEYS = [
 export function extraJudgeKeys(charter: FrozenCharter): string[] {
   const core = new Set<string>(JUDGE_CORE_KEYS)
   const extras: string[] = []
-  for (const o of charter.observables) {
-    if (o.source.from === 'judge' && !core.has(o.source.key) && !extras.includes(o.source.key)) {
-      extras.push(o.source.key)
+  const obligations = charter.frozen?.observableObligations
+  const judgeKeys = obligations
+    ? Object.values(obligations)
+        .filter(obligation => obligation.source === 'judge')
+        .map(obligation => obligation.outputKey)
+    : charter.observables
+        .filter(observable => observable.source.from === 'judge')
+        .map(observable => observable.source.key)
+  for (const key of judgeKeys) {
+    if (!core.has(key) && !extras.includes(key)) {
+      extras.push(key)
     }
   }
   return extras

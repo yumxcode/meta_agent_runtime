@@ -261,6 +261,36 @@ export function roundSchema(value: unknown): string[] {
     errs.push('route must be a RouteDecision object with a kind')
   }
   if (typeof r['costUsd'] !== 'number') errs.push('costUsd must be a number')
+  if (r['observationResults'] !== undefined) {
+    if (typeof r['observationResults'] !== 'object' || r['observationResults'] === null || Array.isArray(r['observationResults'])) {
+      errs.push('observationResults must be an object')
+    } else {
+      for (const [name, raw] of Object.entries(r['observationResults'] as Record<string, unknown>)) {
+        if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) {
+          errs.push(`observationResults.${name} must be an object`)
+          continue
+        }
+        const result = raw as Record<string, unknown>
+        if (!['present', 'absent', 'error'].includes(String(result['status']))) {
+          errs.push(`observationResults.${name}.status must be present | absent | error`)
+        }
+        if (typeof result['source'] !== 'string') errs.push(`observationResults.${name}.source must be a string`)
+        if (typeof result['observedAt'] !== 'number') errs.push(`observationResults.${name}.observedAt must be a number`)
+        if (!Array.isArray(result['provenance'])) errs.push(`observationResults.${name}.provenance must be an array`)
+        if (result['status'] === 'present' && !('value' in result)) {
+          errs.push(`observationResults.${name}.value is required when present`)
+        }
+        if (result['status'] === 'absent' && typeof result['reason'] !== 'string') {
+          errs.push(`observationResults.${name}.reason is required when absent`)
+        }
+        if (result['status'] === 'error' && (
+          typeof result['errorCode'] !== 'string' || typeof result['message'] !== 'string'
+        )) {
+          errs.push(`observationResults.${name}.errorCode/message are required when error`)
+        }
+      }
+    }
+  }
   if (r['postState'] !== undefined) {
     const p = r['postState'] as Record<string, unknown>
     if (typeof p !== 'object' || p === null) errs.push('postState must be an object')

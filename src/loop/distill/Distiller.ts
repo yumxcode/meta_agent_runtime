@@ -21,11 +21,13 @@ Charter 结构（全部字段；? 为可选）：
  "id": "kebab-case 标识",
  "version": 1,
  "goal": "一段话目标",
- "metric": {"direction":"max"|"min"}?,
+ "scenario": "builtin/research@1",
+ "effects": {"training":{"adapter":"vendor/task@2","observations":{"status":{"pointer":"/state","type":"string"}},"rules":[{"when":"status == 'succeeded'","then":{"act":"harvest","verdict":"completed"},"onAbsent":"fail_stop","onError":"fail_stop"}],"admission":{"maxConcurrentCalls":2,"minIntervalMs":1000}}}?,
+ "metric": {"direction":"max"|"min","onAbsent":"skip_update"|"fail_stop","onError":"skip_update"|"fail_stop","onNull":"skip_update"|"fail_stop"}?,
  "observables": [{"name":"new_findings","source":{"from":"judge","key":"new_findings_count"}}, …],
  "meters": [{"name":"iteration","inc":"every_round"},
             {"name":"stale_count","incWhen":"<表达式>","resetWhen":"<表达式>"}],
- "tripwires": [{"when":"<表达式>","then":{"act":"pivot"} | {"act":"finalize","reason":"<原因>"?} | {"act":"escalate","reason":"<原因>","onResume":{"resetMeters":["<meter名>"]}?}}, …],
+ "tripwires": [{"when":"<表达式>","then":{"act":"pivot"} | {"act":"finalize","reason":"<原因>"?} | {"act":"escalate","reason":"<原因>","onResume":{"resetMeters":["<meter名>"]}?},"onAbsent":"skip"|"false"|"fail_stop","onError":"skip"|"false"|"fail_stop"}, …],
  "gates": {"state_gate":{"kind":"schema","files":["ledger/progress.json"],"spec":{"type":"object","required":["iteration","status"],"properties":{"iteration":{"type":"integer","minimum":0},"status":{"type":"string","minLength":1}}}},
            "findings_gate":{"kind":"judge","evidence":["drafts/findings_draft.json","ledger/findings.jsonl"],"rubric":"…"}},
  "seats": {"worker":{"context":"lineage_round"|"lineage_loop"|"isolated","prompt":"<仅领域指令，见"座位底座">","tools":["read_file","edit_file","bash"],"budgetPerRound":{"usd":4,"turns":80,"wallclockMin":45?}},
@@ -33,11 +35,14 @@ Charter 结构（全部字段；? 为可选）：
            "pivoter":{"context":"isolated","prompt":"…","inputs":["ledger/directions.json","ledger/findings.jsonl"]}?,
            "finalizer":{"context":"isolated","prompt":"…","inputs":["ledger/progress.json","ledger/findings.jsonl"]}?},
  "budgets": {"perRound":{"usd":N},"lifetime":{"rounds":N,"usd":N}},
- "health": {"staleWhen":"<表达式>"}?,
+ "health": {"staleWhen":"<表达式>","onAbsent":"skip"|"false"|"fail_stop","onError":"skip"|"false"|"fail_stop"}?,
  "writeScope": ["repo 内允许 worker 修改的现有文件或 path/** 目录树"]?,
  "roundIntervalMs": N?,
 }
-（注：没有 charter.waits 字段。等待完全由 worker 驱动——见"座位底座"的等待机制。）
+（注：没有 charter.waits 字段。语义性等待由 worker 的 timer 驱动；确定性外部系统可声明
+effects EffectBinding，冻结 adapter、typed observations、Effect Rule 与 admission 上限。）
+（注：内置 Scenario 的 ArtifactSpec 与 GateBinding 由注册表模板解析，并在实例化时完整冻结；
+蒸馏器不得自行发明这两组执行绑定。当前研究型蒸馏固定选择 builtin/research@1。）
 
 座位底座（worker 座位运行在内核内置的 inner_orch_worker 底座上，你无法改动它，但必须据此写 seat.prompt）：
 - 底座**已自动提供**，seat.prompt 里**绝不要重复**：
@@ -50,7 +55,8 @@ Charter 结构（全部字段；? 为可选）：
   ⑦ 自计时等待工具 timer（见下）；以及"段协议"（提交长任务后调 timer 即结束本段、被唤醒后进收割段）——底座已讲，seat.prompt 不要复述机制。
 - 长时外部任务（任何需要"发起后等一会儿再看结果"的动作）**只有两种等待方式，都由 worker 驱动，不写进 charter**（没有代码探针；等待期间的状态检查、异常处理/重试、以及"继续等还是收尾"的判断，全部由 worker 自己用工具/skill 做）：
   · **自计时（worker 用 timer 工具）**：worker 调 timer(minutes, reason)——**调用即刻结束本段并 park**（底座硬保证；worker 不需要、也不应在调 timer 后继续做别的）。到点内核 resume 它，worker 自查状态、自决"继续等（再 timer）还是收割"。minutes 取 5..180（按慢任务真正需要多久才有可见进展来定）。适合需要 worker 亲眼看中间结果再决定"继续等 vs 收尾"、或等待中要 worker 自己处理异常的场景。**必须搭 context:"lineage_loop"**（要记得上一段的中间态）。（举例，不限于此：盯一个慢任务的进展按趋势决定是否提前终止。）
-  · **事件（外部系统推送）**：worker 返回 return_result data={"label":"wait","effectKey":"<id>"} 声明在等一个外部事件；外部系统往 events/<id>.json 丢 {effectKey, verdict, data} 即收割。适合真正 push 式的外部系统；无超时（要超时用自计时）。
+  · **事件（外部系统推送）**：worker 返回 return_result data={"label":"wait","effectKey":"<id>"}；外部系统往 events/<id>.json 投递结果。maxWaitMs 缺省 7 天且有确定性超时升级。
+  · **确定性 EffectAdapter**：Charter 声明版本化 effects binding 后，worker 用 data={"label":"wait","effectKey":"<稳定幂等ID>","effectBinding":"<冻结绑定ID>"}。worker 不得自行填写 adapterId 或规则；inspect/event first-wins、deadline/retry/cancel 和硬状态规则均由内核执行。
   你只需在 seat.prompt 里点明用哪种、以及提交后如何回看/判断——工具和事件机制底座已给。
 - **worker 每段任务必须是串行流程**（一步接一步：选方向 →〔需要就检索资料〕→ 设计 → 实现 → 提交长任务 → 调 timer 结束本段）。**绝不要**让 worker 在一段里并行扇出多个子代理再阻塞等待——那会挂死并拖满座位墙钟。若 worker 需要检索资料（如查论文），可 spawn **单个**子代理串行地搜、拿到结果再继续；tools 里给 spawn_sub_agent 即可，但 seat.prompt **不要**写"并行扇出 investigation/refutation/analogy"这类多路并发探索段。
 - **提交长任务后立刻调 timer 结束本段**是铁律；"盯进度直到平台期再终止"这类监控判断放到**被唤醒后的收割段**，不要在提交段里内联死盯或轮询。
@@ -104,6 +110,8 @@ tripwire 动作语义（then 是三选一的判别联合，"act" 字段决定一
 health（progress.status 的健康规则，可选）：
 - 内核每轮轮末把 progress.status 写成 route 的确定函数：continue→healthy|stale、pivot→pivot_scheduled、escalate→paused_attention、finalize→completed。
 - 其中 healthy|stale 由 health.staleWhen 表达式判定（true→stale）；不声明时回退约定：存在名为 stale_count 的 meter 且 >0 → stale。若你的"停滞"语义不是 stale_count（比如 plateau_streak >= 2），就显式声明 health.staleWhen。
+- tripwire/health 只要引用 observable，就必须显式声明 onAbsent/onError：skip=本规则本轮不参与，false=本轮判 false，fail_stop=暂停交人工并记录 rule_error。不得依赖上一轮值或静默默认。
+- metric 是 Objective 兼容入口；声明时同时给出 onAbsent/onError/onNull。通常三者用 skip_update；只有缺失、错误或 null 本身代表契约破坏时才用 fail_stop。null 不得当作 0、无穷或布尔值。
 
 硬性规则：
 - **observable 只能是 {"from":"judge","key":"…"}，judge 输出 schema 由内核所有**：内核会在你的 judge prompt **之后追加一段 JUDGE_CONTRACT**，强制 judge 的 return_result data 恒含核心六键 {"verdict","new_findings_count","metric_delta","metric","goal_satisfied","messages"}，**并把 charter 里声明的所有额外 observable key 一并注入该 contract 强制输出**。因此：
@@ -111,7 +119,7 @@ health（progress.status 的健康规则，可选）：
   · **确需自定义键**（如 coverage_ratio）可以直接声明——内核会替你强制 judge 输出它；但你**必须在 judge 的 rubric 里定义该键的语义与取值标准**（值限 number/boolean/string），否则 judge 只能瞎填。
   · judge 的 seat.prompt **只写 rubric**（怎么判、什么算 finding、成功标准、自定义键的语义），**绝不要规定输出格式/JSON 结构**——输出格式由内核追加的 JUDGE_CONTRACT 全权定义，你写的格式指令只会与之冲突。
   · 内核只解析 judge 来源（没有 from:"worker"/"ledger"/"meter"，校验器会直接报错）。**不要为"worker 报错"建 observable/tripwire**：worker 失败的那一轮内核会自动让 stale_count 自增，交给你的 stale_count tripwire（pivot/escalate）兜底即可。
-- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；字面量可用数字/布尔/'字符串'（如 verdict_obs == 'pass'，前提是已声明对应 observable）；不得出现函数调用。类型严格：逻辑要布尔、比较要数字，混用在运行时按"缺值"回退处理。health.staleWhen、onResume.resetMeters 同受静态校验（resetMeters 必须是已声明 meter）。
+- 表达式只能用已声明的 observables/meters 名与 budget.lifetime.exhausted；运算符仅 == != < <= > >= && || ! + - * / 与括号；字面量可用数字/布尔/'字符串'（如 verdict_obs == 'pass'，前提是已声明对应 observable）；不得出现函数调用。类型严格：逻辑要布尔、比较要数字；缺失、错误或 present-null 按消费方声明的策略处理，禁止隐式回退。health.staleWhen、onResume.resetMeters 同受静态校验（resetMeters 必须是已声明 meter）。
 - meter 语义：incWhen 与 resetWhen 同轮同真时**只 inc 不 reset**（incWhen 优先）；meter 表达式看到的是**本轮更新前**的 meters + 本轮新 observables。observables 与 meters 名字共用一个命名空间，不得重名。
 - gates 里**至多一个 judge 门**（内核只读第一个）；judge seat.inputs 声明时**覆盖** findings_gate.evidence（二者取其一维护，别写成两套不同清单）。
 - 保证可终止：至少有一条 {"act":"finalize"} tripwire 或一个 lifetime 预算（见"终止机制"；escalate 不算）。tripwire 声明顺序即优先级（最严重的在前）。

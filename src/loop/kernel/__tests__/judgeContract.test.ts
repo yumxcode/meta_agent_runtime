@@ -9,6 +9,8 @@
 import { describe, expect, it } from 'vitest'
 import { JUDGE_CORE_KEYS, buildJudgeContract, extraJudgeKeys } from '../Seats.js'
 import type { FrozenCharter } from '../../charter/CharterTypes.js'
+import { freezeCharter } from '../../charter/CharterValidate.js'
+import { walkResearchCharter } from '../../__tests__/testCharter.js'
 
 function charterWithKeys(keys: string[]): FrozenCharter {
   return {
@@ -26,6 +28,21 @@ describe('extraJudgeKeys', () => {
       'new_findings_count', 'results_improved', 'coverage_ratio', 'results_improved', 'goal_satisfied',
     ])
     expect(extraJudgeKeys(charter)).toEqual(['results_improved', 'coverage_ratio'])
+  })
+
+  it('uses the frozen obligation graph as the output-contract authority', () => {
+    const charter = walkResearchCharter()
+    charter.observables.push({
+      name: 'coverage', source: { from: 'judge', key: 'coverage_ratio' },
+    })
+    charter.health = {
+      staleWhen: 'coverage < 0.5', onAbsent: 'false', onError: 'fail_stop',
+    }
+    const frozen = freezeCharter(charter)
+    // A post-freeze mutable view cannot silently change the required output;
+    // the obligation snapshot remains authoritative.
+    frozen.observables = []
+    expect(extraJudgeKeys(frozen)).toEqual(['coverage_ratio'])
   })
 })
 

@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentConfig, SubAgentRecord } from '../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../subagent/types.js'
-import { distillCharter } from '../distill/Distiller.js'
+import { DISTILLER_SYSTEM, distillCharter } from '../distill/Distiller.js'
 import { migrateInstance } from '../instance/Migrate.js'
 import { createInstance, loadInstance, setInstanceStatus } from '../instance/InstanceStore.js'
 import { CharterStore } from '../charter/CharterStore.js'
@@ -62,6 +62,13 @@ const passingSeats = (paths: ReturnType<typeof instancePaths>) =>
 // ── T3.1 distiller ────────────────────────────────────────────────────────────
 
 describe('distillCharter', () => {
+  it('teaches explicit tri-state policies and forbids implicit fallback', () => {
+    expect(DISTILLER_SYSTEM).toContain('"onAbsent":"skip"|"false"|"fail_stop"')
+    expect(DISTILLER_SYSTEM).toContain('"onNull":"skip_update"|"fail_stop"')
+    expect(DISTILLER_SYSTEM).toContain('禁止隐式回退')
+    expect(DISTILLER_SYSTEM).not.toContain('混用在运行时按"缺值"回退处理')
+  })
+
   it('feeds validation errors back and succeeds on the corrected attempt', async () => {
     const good = walkResearchCharter()
     const bad = walkResearchCharter({

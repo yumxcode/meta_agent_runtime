@@ -25,6 +25,7 @@ import { WakeStore } from '../wake/WakeStore.js'
 import { tickOnce, runUntilQuiescent } from '../runner.js'
 import { instancePaths, type RoundEntry } from '../types.js'
 import { readPendingRound } from '../effects/WaitOps.js'
+import { EffectAdapterRegistry } from '../effects/EffectAdapter.js'
 import { walkResearchCharter } from './testCharter.js'
 
 function scriptedDispatcher(
@@ -291,6 +292,43 @@ describe('stop — graceful manual terminate', () => {
     expect(rounds[0]!).toMatchObject({ round: 1, costUsd: 0.1 })
     expect(rounds[0]!.route).toMatchObject({ kind: 'finalize', cause: 'manual' })
     expect((await reloaded.ledger.readProgress()).totalCostUsd).toBeCloseTo(0.1)
+  })
+
+  it('stop(waiting) fail-stops when the host can no longer resolve the frozen adapter', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-lc-stop-missing-adapter-'))
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) return {
+        label: 'wait', effectKey: 'remote-1', effectBinding: 'remote',
+      }
+      throw new Error('unexpected seat')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+      effects: {
+        remote: {
+          adapter: 'test/stop-remote@1', observations: {}, rules: [],
+          admission: { maxConcurrentCalls: 1 },
+        },
+      },
+    })
+    const wakeStore = new WakeStore(dir)
+    await createInstance({ projectDir: dir, charter, wakeStore })
+    const registry = new EffectAdapterRegistry([{
+      id: 'test/stop-remote@1',
+      async submit() { return {} },
+      async inspect() { return { state: 'pending' } },
+      async cancel() { return { state: 'cancelled' } },
+    }])
+    await tickOnce({ dispatcher, projectDir: dir, effectAdapters: registry })
+    const waiting = (await loadInstance(dir, ID))!
+    await expect(stopInstance(waiting, { wakeStore, projectDir: dir }))
+      .rejects.toThrow(/cancellation could not start/)
+    const failed = (await loadInstance(dir, ID))!
+    expect(failed.record.status).toBe('failed')
+    expect(await readPendingRound(failed)).not.toBeNull()
+    expect((await wakeStore.list()).filter(wake =>
+      wake.status === 'pending' || wake.status === 'claimed',
+    )).toHaveLength(0)
   })
 })
 

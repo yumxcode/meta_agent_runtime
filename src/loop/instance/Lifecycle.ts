@@ -32,11 +32,14 @@ import type { LoopInstance } from './InstanceStore.js'
 import { setInstanceStatus } from './InstanceStore.js'
 import { reArmResetTargets } from './Migrate.js'
 import { clearPendingRound, ingestEvents, readPendingRound, reconcileWaiting } from '../effects/WaitOps.js'
+import { cancelEffect } from '../effects/EffectRuntime.js'
+import type { EffectAdapterRegistry } from '../effects/EffectAdapter.js'
 import type { LoopInstanceStatus } from '../types.js'
 
 export interface LifecycleDeps {
   wakeStore: WakeStore
   projectDir: string
+  effectAdapters?: EffectAdapterRegistry
 }
 
 /** One audited manual intervention (ledger/lifecycle.jsonl). */
@@ -193,6 +196,23 @@ export async function stopInstance(
   // Abandon a parked round explicitly, folding its cost/summaries into the
   // terminal entry so the ledger accounts for what the segment spent.
   const pending = await readPendingRound(instance)
+  if (pending?.kind === 'effect' && pending.effectKey) {
+    let cancelled: Awaited<ReturnType<typeof cancelEffect>>
+    try {
+      cancelled = await cancelEffect(instance, pending.effectKey, deps.effectAdapters, deps.wakeStore)
+    } catch (error) {
+      const failure = `effect ${pending.effectKey} cancellation could not start: ${error instanceof Error ? error.message : String(error)}`
+      await setInstanceStatus(instance, 'failed', failure)
+      await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+      throw new Error(failure)
+    }
+    if (cancelled && !['cancelled', 'concluded', 'harvested'].includes(cancelled.status)) {
+      const failure = `effect ${pending.effectKey} cancellation was not confirmed; operator reconciliation required`
+      await setInstanceStatus(instance, 'failed', failure)
+      await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+      throw new Error(failure)
+    }
+  }
   if (pending) await clearPendingRound(instance)
   const outcome = await stopLoopManually(
     instance,

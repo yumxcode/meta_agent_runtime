@@ -9,6 +9,30 @@ import { join, resolve } from 'path'
 
 export type LoopInstanceId = string
 
+export type ObservationResult =
+  | {
+      status: 'present'
+      value: number | boolean | string | null
+      source: string
+      observedAt: number
+      provenance: string[]
+    }
+  | {
+      status: 'absent'
+      source: string
+      observedAt: number
+      reason: 'not_produced' | 'not_concluded' | 'pointer_missing' | 'not_applicable'
+      provenance: string[]
+    }
+  | {
+      status: 'error'
+      source: string
+      observedAt: number
+      errorCode: string
+      message: string
+      provenance: string[]
+    }
+
 /**
  * How a round runs. Exactly two modes exist (v3): 'pivot' rounds run the
  * pivoter seat first and inject its directive into the worker capsule;
@@ -33,7 +57,7 @@ export function normalizeRoundMode(mode: unknown): RoundMode {
 export interface RouteDecision {
   kind: 'continue' | 'pivot' | 'finalize' | 'escalate'
   /** What triggered a non-continue kind ('manual' = `loop stop`). */
-  cause?: 'accepted' | 'budget' | 'tripwire' | 'manual' | 'effect_timeout'
+  cause?: 'accepted' | 'budget' | 'tripwire' | 'manual' | 'effect_timeout' | 'effect_rule' | 'rule_error'
   /** Set when cause is 'tripwire' (index into charter.tripwires). */
   tripwireIndex?: number
   /** Human-readable reason (tripwire action reason, 'goal_satisfied', 'budget'…). */
@@ -105,11 +129,13 @@ export interface RoundEntry {
   mode: RoundMode
   /** Observables collected for METER/ROUTE this round. */
   observables: Record<string, number | boolean | string>
+  /** Authoritative tri-state observations; absent on legacy ledger entries. */
+  observationResults?: Record<string, ObservationResult>
   /** Meter values AFTER this round's METER step. */
   meters: Record<string, number>
   /** Route decision taken at ROUTE (pre-v3 ledgers hold strings; render via renderRoute). */
   route: RouteDecision
-  /** Corrective retries consumed this round (0 or 1 in M1). */
+  /** Corrective producer retries consumed this round (bounded per gate). */
   correctiveRetries: number
   costUsd: number
   seatSummaries: Record<string, string>
@@ -143,6 +169,18 @@ export interface InstancePaths {
   directionsJson: string
   progressJson: string
   effectsJsonl: string
+  /** Append-only authority for Artifact proposal/gate/commit transactions. */
+  artifactsJsonl: string
+  /** Immutable, hash-chained Artifact journal segments. */
+  artifactsSegmentsDir: string
+  artifactsSegmentPagesDir: string
+  artifactsSegmentsManifestJson: string
+  artifactsCheckpointJson: string
+  /** Rebuildable exact indexes; sharded so checkpoint memory stays bounded. */
+  artifactsTransactionIndexDir: string
+  artifactsStreamIndexDir: string
+  /** Research legacy-projection watermark; the Artifact journal remains authority. */
+  researchProjectionIndexJson: string
   /** Append-only audit of manual lifecycle interventions (pause/resume/ack/stop). */
   lifecycleJsonl: string
   /** Persisted mid-round state while an external effect is pending (M2). */
@@ -171,6 +209,14 @@ export function instancePaths(taskDir: string, instanceId: LoopInstanceId): Inst
     directionsJson: join(ledgerDir, 'directions.json'),
     progressJson: join(ledgerDir, 'progress.json'),
     effectsJsonl: join(ledgerDir, 'effects.jsonl'),
+    artifactsJsonl: join(ledgerDir, 'artifacts.jsonl'),
+    artifactsSegmentsDir: join(ledgerDir, 'artifacts.segments'),
+    artifactsSegmentPagesDir: join(ledgerDir, 'artifacts.segment-pages'),
+    artifactsSegmentsManifestJson: join(ledgerDir, 'artifacts.segments.json'),
+    artifactsCheckpointJson: join(ledgerDir, 'artifacts.checkpoint.json'),
+    artifactsTransactionIndexDir: join(ledgerDir, 'artifacts.index', 'transactions'),
+    artifactsStreamIndexDir: join(ledgerDir, 'artifacts.index', 'streams'),
+    researchProjectionIndexJson: join(ledgerDir, 'research.projection.json'),
     lifecycleJsonl: join(ledgerDir, 'lifecycle.jsonl'),
     pendingRoundJson: join(ledgerDir, 'pending_round.json'),
     draftsDir: join(root, 'drafts'),

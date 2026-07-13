@@ -90,6 +90,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     dispatcher: opts.dispatcher,
     projectDir: opts.projectDir,
     signal: opts.signal,
+    effectAdapters: opts.effectAdapters,
     observer: opts.observer,
   }
   try {

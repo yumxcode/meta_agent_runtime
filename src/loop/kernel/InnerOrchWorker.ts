@@ -17,12 +17,12 @@
  *   • 'isolated' — fresh session every round; no history, decides from the
  *                  capsule + evidence alone (the "overturn assumptions" worker).
  */
-import { join } from 'path'
 import { SectionRegistry } from '../../core/systemPromptSections.js'
 import { buildSkillManifestSection } from '../../core/dynamicPrompt.js'
 import type { AgentMode } from '../../core/dynamicPrompt.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
+import { DEFAULT_SCENARIO_ID, scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 
 export type InnerWorkerVariant = 'lineage' | 'isolated'
 
@@ -33,14 +33,7 @@ export type InnerWorkerVariant = 'lineage' | 'isolated'
  * the latter, so the contract must point the worker at the exact absolute files.
  */
 export function buildOutputContract(draftsDir: string): string {
-  const direction = join(draftsDir, 'direction.json')
-  const findings = join(draftsDir, 'findings_draft.json')
-  return `\
-【产出契约（硬性）】
-1. 选定本轮方向后，先写 ${direction}：{"key":"<方向短标识>","rationale":"一句话"}。
-2. 完成工作后，把结构化 findings 草稿写入 ${findings}（数组，每条含 claim 与 evidence 字段）。
-3. 最后必须调用 return_result，data 写 {"label":"ok"|"error","note":"一句话"}。
-【路径硬性约定】跨轮共享状态只写上面这两个**绝对路径**草稿——入账由内核完成，你无权直接改 ledger/ 下任何文件；禁止写 .meta-agent/ 下任何路径。`
+  return scenarioRuntimeFor(DEFAULT_SCENARIO_ID).producerOutputContract(draftsDir, {})
 }
 
 const ROLE_HEADER = `\
@@ -57,7 +50,7 @@ const WAIT_TOOLS = `\
 ## 段协议（长任务如何等待）
 你的一轮可能被"等待"切成多段，段与段之间进程是关闭的——由内核负责在合适时机把你原样唤醒。
 - **发起了必须等结果的慢任务（如远端训练）后，立刻调 timer({minutes, reason})。调用 timer 即刻结束本段**——不需要再 return_result，也不要在本段继续做别的事（不要轮询、不要 sleep、不要再扇活）。minutes 取 5..180，按慢任务真正需要多久才有可见进展来定（如训练约 30 分钟看一次曲线）。
-- 到点后内核会 **resume 你（同一会话）**，user 消息会带"继续/收割"提示并附上提交段摘要。此时你亲自查状态：还需要等就**再调一次 timer**（再次 park），可以收割了就整理 findings/direction 后 return_result data={"label":"ok"}。
+- 到点后内核会 **resume 你（同一会话）**，user 消息会带"继续/收割"提示并附上提交段摘要。此时你亲自查状态：还需要等就**再调一次 timer**（再次 park），可以收割了就按产出契约整理草稿后 return_result data={"label":"ok"}。
 - 因此"盯训练直到平台期再终止"这类判断发生在**被唤醒后的收割段**，而不是提交段里内联死等。
 - 若外部系统会主动投递完成事件，也可 return_result data={"label":"wait","effectKey":"<外部任务稳定ID>","maxWaitMs":<60000..2592000000>}。事件由 events/ 通道唤醒；maxWaitMs 可省略（默认 7 天），超时后内核确定性升级给人工，禁止永久挂起。`
 
@@ -85,6 +78,8 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
   skillMode?: AgentMode
   /** Optional repo write-scope note (stable per charter). */
   writeScope?: string[]
+  /** Frozen deterministic external-effect bindings exposed by ID, never raw adapter selection. */
+  effectBindings?: Record<string, { adapter: string }>
 }): Promise<string> {
   const skillMode: AgentMode = opts.skillMode ?? 'simple_auto'
   let skillManifest = ''
@@ -97,6 +92,9 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
   const scopeNote = opts.writeScope?.length
     ? `## 写入范围\n除 drafts/ 外，仅允许修改：${opts.writeScope.join(', ')}`
     : '## 写入范围\n本 loop 不允许修改仓库文件；只允许写入本轮 drafts/。'
+  const effectNote = Object.keys(opts.effectBindings ?? {}).length > 0
+    ? `## 确定性外部 Effect\n若已提交由内核 adapter 跟踪的外部任务，使用 return_result data={"label":"wait","effectKey":"<稳定幂等ID>","effectBinding":"<绑定ID>"}。只能选择以下 Charter 冻结绑定：${Object.entries(opts.effectBindings ?? {}).map(([id, binding]) => `${id}→${binding.adapter}`).join(', ')}。不要自行填写 adapterId。`
+    : ''
 
   return [
     ROLE_HEADER,
@@ -104,6 +102,7 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
     DISCIPLINE,
     contextConventions(opts.variant),
     WAIT_TOOLS,
+    effectNote,
     scopeNote,
     skillManifest,
   ].filter(Boolean).join('\n\n')

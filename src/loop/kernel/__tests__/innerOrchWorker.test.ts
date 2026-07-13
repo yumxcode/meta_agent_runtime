@@ -27,12 +27,14 @@ describe('inner_orch_worker system prompt', () => {
     const sys = await assembleInnerWorkerSystemPrompt({
       seatPrompt: 'CHARTER_SEAT_ROLE_XYZ', projectDir, variant: 'isolated',
       writeScope: ['humanoid/envs/x1/**'],
+      effectBindings: { training: { adapter: 'vendor/task@2' } },
     })
     expect(sys).toContain('inner_orch_worker')      // loop-seat identity
     expect(sys).toContain('CHARTER_SEAT_ROLE_XYZ')  // charter seat prompt (D-role)
     expect(sys).toContain('基本纪律')                // S3 discipline kept
     expect(sys).toContain('<context>')              // context-block convention kept
     expect(sys).toContain('humanoid/envs/x1/**')    // write scope
+    expect(sys).toContain('training→vendor/task@2') // frozen effect binding, no raw adapter selection
     // Dropped generic-agent scaffolding must NOT be composed here.
     expect(sys).not.toContain('自主执行账本')        // no autonomous ledger
     expect(sys).not.toContain('委派')                // no delegation guidance

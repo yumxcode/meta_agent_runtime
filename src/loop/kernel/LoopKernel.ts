@@ -26,21 +26,32 @@
  * and a harvest wake resumes the SAME round — worker lineage carried by the
  * submit-segment digest, meters/gates untouched in between.
  */
-import { readFile, rm } from 'fs/promises'
+import { readFile } from 'fs/promises'
 import { join } from 'path'
 import { resolveExistingInside } from '../security/PathSafety.js'
-import { evaluateBool, type EvalContext } from '../expr/Expr.js'
-import type { FrozenCharter, ShapeSpec, TripwireAction } from '../charter/CharterTypes.js'
+import { collectRefs, evaluateBool, type EvalContext } from '../expr/Expr.js'
+import { PRODUCER_OK_OBSERVABLE } from '../charter/CharterTypes.js'
+import type {
+  FrozenCharter,
+  ObjectiveFailurePolicy,
+  ObservationFailurePolicy,
+  ShapeSpec,
+  TripwireAction,
+} from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
 import { setInstanceStatus } from '../instance/InstanceStore.js'
 import { buildCapsule, consumeInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
 import { runFinalizerSeat, runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
 import { WakeStore, type WakeRecord } from '../wake/WakeStore.js'
 import { atomicWriteFile } from '../../infra/persist/index.js'
+import { runConditionalCounterProjection } from '../projection/ConditionalCounterReducer.js'
+import { gateBinding } from '../charter/ExecutionPlan.js'
+import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 import {
   normalizeRoundMode,
   renderRoute,
   type PendingRound,
+  type ObservationResult,
   type ProgressStatus,
   type RoundEntry,
   type RoundMode,
@@ -54,6 +65,13 @@ import {
   reconcileWaiting,
   writePendingRound,
 } from '../effects/WaitOps.js'
+import {
+  defaultEffectAdapterRegistry,
+  EVENT_EFFECT_ADAPTER_ID,
+  type EffectAdapterRegistry,
+} from '../effects/EffectAdapter.js'
+import { advanceEffect, submitEffect } from '../effects/EffectRuntime.js'
+import type { EffectRetryPolicy } from '../effects/EffectLedger.js'
 
 /** Observability events (T4.4) — consumed by CLI/daemon renderers. */
 export type LoopEvent =
@@ -66,6 +84,7 @@ export type LoopEvent =
 
 export interface RunRoundDeps extends SeatRunnerDeps {
   wakeStore: WakeStore
+  effectAdapters?: EffectAdapterRegistry
   observer?: (event: LoopEvent) => void
 }
 
@@ -144,7 +163,8 @@ export async function runRound(
   wake: WakeRecord,
   deps: RunRoundDeps,
 ): Promise<RoundOutcome> {
-  const waitDeps = { wakeStore: deps.wakeStore, projectDir: deps.projectDir }
+  const effectAdapters = deps.effectAdapters ?? defaultEffectAdapterRegistry()
+  const waitDeps = { wakeStore: deps.wakeStore, projectDir: deps.projectDir, effectAdapters }
   // Keep the wake claim fresh for the WHOLE round: seats legally run far longer
   // than the claim TTL (wallclockMin can be hours vs a 10-min TTL), and an
   // expired claim would let a concurrent `loop tick` re-pend + re-claim this
@@ -159,10 +179,11 @@ export async function runRound(
     await deps.wakeStore.reconcileOrphans()
     await ingestEvents(instance, waitDeps)
     await reconcileWaiting(instance, waitDeps)
+    await scenarioRuntimeFor(instance.charter).reconcileArtifacts(instance)
 
     const pending = await readPendingRound(instance)
     if (
-      wake.kind === 'event' &&
+      (wake.kind === 'event' || wake.kind === 'effect_poll') &&
       (!pending || pending.kind !== 'effect' || pending.effectKey !== wake.effectKey)
     ) {
       const progress = await instance.ledger.readProgress()
@@ -175,6 +196,29 @@ export async function runRound(
       }
     }
     if (pending) {
+      if (wake.kind === 'effect_poll' && pending.kind === 'effect') {
+        const advanced = await advanceEffect(
+          instance, deps.wakeStore, pending.effectKey!, effectAdapters, 'inspect',
+        )
+        if (advanced?.status === 'failed') {
+          await setInstanceStatus(
+            instance, 'failed',
+            `effect ${pending.effectKey} failed: ${advanced.lastError ?? 'operator reconciliation required'}`,
+          )
+          await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+          return {
+            round: pending.round, mode: normalizeRoundMode(pending.mode),
+            route: 'effect-failed', status: 'failed', costUsd: 0,
+          }
+        }
+        if (advanced?.status !== 'concluded') {
+          await setInstanceStatus(instance, 'waiting')
+          return {
+            round: pending.round, mode: normalizeRoundMode(pending.mode),
+            route: 'still-waiting', status: 'waiting', costUsd: 0,
+          }
+        }
+      }
       if (pending.kind !== 'self_timer' && pending.timedOutAt) {
         const progress = await instance.ledger.readProgress()
         if (progress.iteration >= pending.round) {
@@ -226,6 +270,28 @@ export async function runRound(
       }
       const effect = await effectLedgerFor(instance).get(pending.effectKey!)
       if (effect?.status === 'concluded') {
+        if (effect.outcome?.verdict === 'effect_rule_escalate') {
+          const progress = await instance.ledger.readProgress()
+          const data = isRecord(effect.outcome.data) ? effect.outcome.data : {}
+          const reason = typeof data['reason'] === 'string'
+            ? data['reason']
+            : `Effect Rule escalated '${pending.effectKey}'`
+          await setInstanceStatus(instance, 'running')
+          const outcome = await terminate(instance, deps, {
+            round: pending.round,
+            mode: normalizeRoundMode(pending.mode),
+            route: { kind: 'escalate', cause: 'effect_rule', reason },
+            startedAt: pending.startedAt,
+            costUsd: pending.costUsdSoFar + (wake.abortedCostUsd ?? 0),
+            seatSummaries: pending.seatSummaries,
+            correctiveRetries: pending.correctiveRetries,
+            observables: {},
+            meters: progress.meters,
+          })
+          await clearPendingRound(instance)
+          await effectLedgerFor(instance).markHarvested(pending.effectKey!)
+          return outcome
+        }
         await setInstanceStatus(instance, 'running')
         return await harvestSegment(instance, deps, pending, wake.abortedCostUsd ?? 0)
       }
@@ -333,10 +399,13 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
  */
 function terminalRouteForExhaustion(charter: FrozenCharter, ctx: EvalContext): RouteDecision {
   const hit = firstTripwire(charter, ctx)
-  if (hit?.action.act === 'escalate') {
+  if (hit?.kind === 'fail_stop') {
+    return { kind: 'escalate', cause: 'rule_error', reason: hit.reason }
+  }
+  if (hit?.kind === 'hit' && hit.action.act === 'escalate') {
     return { kind: 'escalate', cause: 'tripwire', tripwireIndex: hit.index, reason: hit.action.reason }
   }
-  if (hit?.action.act === 'finalize') {
+  if (hit?.kind === 'hit' && hit.action.act === 'finalize') {
     return { kind: 'finalize', cause: 'tripwire', tripwireIndex: hit.index, reason: hit.action.reason ?? 'finalize' }
   }
   return { kind: 'finalize', cause: 'budget', reason: 'budget' }
@@ -351,18 +420,39 @@ function terminalRouteForExhaustion(charter: FrozenCharter, ctx: EvalContext): R
  * remedial action (account rotation, plateau judgement) live in the worker.
  */
 type WaitRequest =
-  | { mode: 'event'; effectKey: string; payload?: Record<string, unknown>; maxWaitMs: number }
+  | {
+      mode: 'event'; effectKey: string; payload?: Record<string, unknown>; maxWaitMs: number;
+      adapterId: string; effectBindingId?: string; authRequired: boolean; retryPolicy: EffectRetryPolicy
+    }
   | { mode: 'self_timer'; afterMs: number; reason: string }
 
 const DEFAULT_EVENT_MAX_WAIT_MS = 7 * 24 * 60 * 60_000
 const MIN_EVENT_MAX_WAIT_MS = 60_000
 const MAX_EVENT_MAX_WAIT_MS = 30 * 24 * 60 * 60_000
+const DEFAULT_EFFECT_RETRY: EffectRetryPolicy = {
+  maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 60_000, callTimeoutMs: 30_000,
+}
 
 function eventMaxWaitMs(value: unknown): number {
   return typeof value === 'number' && Number.isFinite(value) &&
     value >= MIN_EVENT_MAX_WAIT_MS && value <= MAX_EVENT_MAX_WAIT_MS
     ? Math.floor(value)
     : DEFAULT_EVENT_MAX_WAIT_MS
+}
+
+function effectRetryPolicy(value: unknown): EffectRetryPolicy {
+  if (!isRecord(value)) return DEFAULT_EFFECT_RETRY
+  const integer = (field: string, fallback: number, min: number, max: number): number => {
+    const candidate = value[field]
+    return typeof candidate === 'number' && Number.isInteger(candidate) && candidate >= min && candidate <= max
+      ? candidate : fallback
+  }
+  return {
+    maxAttempts: integer('maxAttempts', 3, 1, 5),
+    baseDelayMs: integer('baseDelayMs', 1_000, 10, 60_000),
+    maxDelayMs: integer('maxDelayMs', 60_000, 10, 24 * 60 * 60_000),
+    callTimeoutMs: integer('callTimeoutMs', 30_000, 10, 10 * 60_000),
+  }
 }
 
 interface SeatLoopOutcome {
@@ -388,7 +478,13 @@ async function runSeatLoop(
   let corrective: string | undefined = initialPreface
   let correctiveRetries = 0
   let costUsd = 0
-  const retried = { diversity: false, schema: false, judge: false, judgeCrash: false, wait: false }
+  const retried = { schema: false, judge: false, judgeCrash: false, wait: false }
+  const retriedProducerGates = new Set<string>()
+  const executionPlan = charter.frozen.executionPlan
+  const producerRetryEnabled = (id: string): boolean =>
+    gateBinding(executionPlan, id)?.retryProducer === 1
+  const executionRetryEnabled = (id: 'judge'): boolean =>
+    gateBinding(executionPlan, id)?.executionRetry === 1
 
   for (;;) {
     const progress = await instance.ledger.readProgress()
@@ -420,41 +516,154 @@ async function runSeatLoop(
       const effectKey = typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
         ? (worker.data['effectKey'] as string)
         : null
-      if (effectKey) {
+      const prepareEventWait = scenarioRuntimeFor(instance.charter).prepareEventWait
+      if (effectKey || prepareEventWait) {
+        let wait: {
+          effectKey: string; payload?: Record<string, unknown>; maxWaitMs: number;
+          adapterId?: string; effectBindingId?: string;
+          authRequired?: boolean; retryPolicy?: EffectRetryPolicy
+        }
+        try {
+          wait = await prepareEventWait?.(instance, {
+            round: capsule.round,
+            ...(effectKey ? { effectKey } : {}),
+            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
+            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
+          }) ?? {
+            effectKey: effectKey!,
+            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
+            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
+            adapterId: typeof worker.data['adapterId'] === 'string'
+              ? worker.data['adapterId'] as string : EVENT_EFFECT_ADAPTER_ID,
+            effectBindingId: typeof worker.data['effectBinding'] === 'string'
+              ? worker.data['effectBinding'] as string : undefined,
+            authRequired: worker.data['authRequired'] === true,
+            retryPolicy: effectRetryPolicy(worker.data['retryPolicy']),
+          }
+        } catch (error) {
+          const message = error instanceof Error ? error.message : String(error)
+          if (!retried.wait && producerRetryEnabled('wait_contract')) {
+            retried.wait = true
+            corrective = `【纠偏重试】Scenario 拒绝了本次等待：${message}。请修正草稿或等待请求后重新提交。`
+            correctiveRetries++
+            continue
+          }
+          worker = { ...worker, ok: false, summary: `Scenario wait preparation failed: ${message}; ${worker.summary}` }
+          seatSummaries['worker'] = truncate(worker.summary)
+          break
+        }
+        const requestedBindingId = wait.effectBindingId ?? (
+          typeof worker.data['effectBinding'] === 'string' ? worker.data['effectBinding'] as string : undefined
+        )
+        if (requestedBindingId) {
+          const binding = charter.effects[requestedBindingId]
+          if (!binding) {
+            const message = `EffectBinding '${requestedBindingId}' is not frozen in this Charter`
+            if (!retried.wait && producerRetryEnabled('wait_contract')) {
+              retried.wait = true
+              corrective = `【纠偏重试】${message}。请使用已声明的 effectBinding。`
+              correctiveRetries++
+              continue
+            }
+            worker = { ...worker, ok: false, summary: `${message}; ${worker.summary}` }
+            seatSummaries['worker'] = truncate(worker.summary)
+            break
+          }
+          wait = { ...wait, adapterId: binding.adapter, effectBindingId: requestedBindingId }
+        } else if ((wait.adapterId ?? EVENT_EFFECT_ADAPTER_ID) !== EVENT_EFFECT_ADAPTER_ID) {
+          const matching = Object.entries(charter.effects)
+            .filter(([, binding]) => binding.adapter === wait.adapterId)
+          if (matching.length === 1) wait = { ...wait, effectBindingId: matching[0]![0] }
+          else {
+            const message = matching.length === 0
+              ? `adapter '${wait.adapterId}' is not authorized by a frozen EffectBinding`
+              : `adapter '${wait.adapterId}' has multiple bindings; effectBinding is required`
+            if (!retried.wait && producerRetryEnabled('wait_contract')) {
+              retried.wait = true
+              corrective = `【纠偏重试】${message}。`
+              correctiveRetries++
+              continue
+            }
+            worker = { ...worker, ok: false, summary: `${message}; ${worker.summary}` }
+            seatSummaries['worker'] = truncate(worker.summary)
+            break
+          }
+        }
+        try {
+          (deps.effectAdapters ?? defaultEffectAdapterRegistry()).resolve(
+            wait.adapterId ?? EVENT_EFFECT_ADAPTER_ID,
+          )
+        } catch (error) {
+          // A frozen binding naming an unavailable host adapter is deployment
+          // misconfiguration, not worker output the model can repair.
+          if (wait.effectBindingId) throw error
+          const message = error instanceof Error ? error.message : String(error)
+          if (!retried.wait && producerRetryEnabled('wait_contract')) {
+            retried.wait = true
+            corrective = `【纠偏重试】等待请求引用了不可用的 EffectAdapter：${message}。请改用已注册的 adapterId。`
+            correctiveRetries++
+            continue
+          }
+          worker = { ...worker, ok: false, summary: `EffectAdapter validation failed: ${message}; ${worker.summary}` }
+          seatSummaries['worker'] = truncate(worker.summary)
+          break
+        }
         return {
           kind: 'wait', worker, judge: null, correctiveRetries, costUsd,
           waitRequest: {
             mode: 'event',
-            effectKey,
-            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
-            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
+            ...wait,
+            adapterId: wait.adapterId ?? EVENT_EFFECT_ADAPTER_ID,
+            effectBindingId: wait.effectBindingId,
+            authRequired: wait.authRequired ?? false,
+            retryPolicy: wait.retryPolicy ?? effectRetryPolicy(worker.data['retryPolicy']),
           },
         }
       }
       // A wait without an effectKey is unconcludable — the external system
       // cannot guess a kernel-generated key, so the loop would park forever.
       // One corrective retry, then the round hard-fails.
-      if (!retried.wait) {
+      if (!retried.wait && producerRetryEnabled('wait_contract')) {
         retried.wait = true
         corrective = '【纠偏重试】你声明了 label:"wait" 但没有提供 effectKey。外部系统只能通过 events/<effectKey>.json 了结这次等待，缺少 key 的等待永远不会结束。请重新 return_result：要么带上 {"label":"wait","effectKey":"<外部系统已知的任务标识>"}，要么改用 timer 工具自计时。'
         correctiveRetries++
         continue
       }
       worker = { ...worker, ok: false, summary: `seat requested an event wait without effectKey (rejected): ${worker.summary}` }
+      seatSummaries['worker'] = truncate(worker.summary)
     }
     if (!worker.ok) break
 
-    // Deterministic point: direction diversity (exact-match, code).
-    const dup = await duplicatedDirection(instance)
-    if (dup && !retried.diversity) {
-      retried.diversity = true
-      corrective = `【纠偏重试】你选择的方向 '${dup}' 与 directions_tried 完全重复。请换一个未出现在已试清单中的方向。`
-      correctiveRetries++
-      continue
+    let producerGateFailed = false
+    for (const binding of executionPlan.gates.filter(gate => gate.handler === 'scenario')) {
+      const gateId = binding.id
+      const gate = await scenarioRuntimeFor(instance.charter).runProducerGate(instance, gateId)
+      if (gate.verdict !== 'pass' && !retriedProducerGates.has(gateId) && producerRetryEnabled(gateId)) {
+        retriedProducerGates.add(gateId)
+        corrective = `【纠偏重试】Artifact Gate '${gateId}' 未通过：${gate.messages.join('; ') || '请修正 proposal'}`
+        correctiveRetries++
+        producerGateFailed = true
+        break
+      }
+      if (gate.verdict !== 'pass') {
+        worker = {
+          ...worker,
+          ok: false,
+          summary: `Artifact Gate '${gateId}' failed after corrective retry: ` +
+            `${gate.messages.join('; ') || gate.verdict}; ${worker.summary}`,
+        }
+        seatSummaries['worker'] = truncate(worker.summary)
+        break
+      }
     }
+    if (producerGateFailed) continue
+    if (!worker.ok) break
 
-    const schemaErrs = await runSchemaGates(instance)
-    if (schemaErrs.length > 0 && !retried.schema) {
+    const schemaErrs = await runSchemaGates(
+      instance,
+      gateBinding(executionPlan, 'schema')?.gateIds ?? [],
+    )
+    if (schemaErrs.length > 0 && !retried.schema && producerRetryEnabled('schema')) {
       retried.schema = true
       corrective = `【纠偏重试】state 校验失败：${schemaErrs.join('; ')}`
       correctiveRetries++
@@ -466,6 +675,7 @@ async function runSeatLoop(
         ok: false,
         summary: `schema gate failed after corrective retry: ${schemaErrs.join('; ')}; ${worker.summary}`,
       }
+      seatSummaries['worker'] = truncate(worker.summary)
       break
     }
     if (charter.seats.judge) {
@@ -476,15 +686,19 @@ async function runSeatLoop(
         worker = { ...worker, ok: false, summary: `${worker.summary}; ${judge.summary}` }
         break
       }
-      judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter), { usd: judgeLimit })
+      const evidence = judgeEvidence(
+        charter,
+        gateBinding(executionPlan, 'judge')?.gateIds ?? [],
+      )
+      judge = await runJudgeSeat(deps, charter, paths, evidence, { usd: judgeLimit })
       costUsd += judge.costUsd
       seatSummaries['judge'] = truncate(judge.summary)
       deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
       assertReplaySafeSeat(judge, costUsd)
-      if (!judge.ok && !retried.judgeCrash) {
+      if (!judge.ok && !retried.judgeCrash && executionRetryEnabled('judge')) {
         // A crashed judge (API error / timeout, no verdict) must not silently
-        // pass its gate: one in-round rerun; if it crashes again, admitDrafts
-        // fails closed (drafts discarded) instead of admitting unreviewed.
+        // pass its gate: one in-round rerun; if it crashes again, Artifact
+        // commit fails closed instead of admitting unreviewed proposals.
         retried.judgeCrash = true
         const retryLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
         if (retryLimit !== undefined && retryLimit <= 0) {
@@ -493,7 +707,7 @@ async function runSeatLoop(
           worker = { ...worker, ok: false, summary: `${worker.summary}; ${judge.summary}` }
           break
         }
-        judge = await runJudgeSeat(deps, charter, paths, judgeEvidence(charter), { usd: retryLimit })
+        judge = await runJudgeSeat(deps, charter, paths, evidence, { usd: retryLimit })
         costUsd += judge.costUsd
         seatSummaries['judge'] = truncate(judge.summary)
         deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
@@ -503,7 +717,7 @@ async function runSeatLoop(
       const failMessages = judgeFailed
         ? (Array.isArray(judge.data['messages']) ? (judge.data['messages'] as unknown[]).map(String) : [])
         : []
-      if (judgeFailed && !retried.judge) {
+      if (judgeFailed && !retried.judge && producerRetryEnabled('judge')) {
         retried.judge = true
         corrective = failMessages.length > 0
           ? `【纠偏重试】评审未通过：\n- ${failMessages.join('\n- ')}`
@@ -565,22 +779,27 @@ async function submitSegment(
     }
   }
 
-  // Event wait: register the effect (idempotent, harvest-once) and park. No
-  // probe is scheduled — an external system concludes it by dropping an
-  // events/<effectKey>.json file (ingested by RECONCILE → harvest wake).
-  const effects = effectLedgerFor(instance)
-  await effects.submit({
-    effectKey: input.waitRequest.effectKey,
-    kind: 'event',
-    waitName: 'event',
-    payload: input.waitRequest.payload,
-  })
-  await writePendingRound(instance, {
-    ...base, kind: 'effect',
+  const pending = {
+    ...base, kind: 'effect' as const,
     effectKey: input.waitRequest.effectKey,
     waitName: 'event',
     expiresAt: Date.now() + input.waitRequest.maxWaitMs,
-  } satisfies PendingRound)
+  } satisfies PendingRound
+  // Persist the resumable round before crossing the adapter boundary. A crash
+  // after the remote side effect but before ack can then reconcile by effectKey.
+  await writePendingRound(instance, pending)
+  await submitEffect(instance, deps.wakeStore, {
+    effectKey: input.waitRequest.effectKey,
+    adapterId: input.waitRequest.adapterId,
+    effectBindingId: input.waitRequest.effectBindingId,
+    payload: input.waitRequest.payload,
+    deadlineAt: Date.now() + input.waitRequest.maxWaitMs,
+    retryPolicy: input.waitRequest.retryPolicy,
+    authRequired: input.waitRequest.authRequired,
+    admission: input.waitRequest.effectBindingId
+      ? instance.charter.effects[input.waitRequest.effectBindingId]?.admission
+      : undefined,
+  }, deps.effectAdapters ?? defaultEffectAdapterRegistry())
   await setInstanceStatus(instance, 'waiting', `waiting on event ${input.waitRequest.effectKey}`)
   deps.observer?.({
     type: 'waiting_entered', round: input.round,
@@ -646,20 +865,18 @@ async function harvestSegment(
   // WHY, via the submit summary — not via a shared transcript.
   let preface: string
   if (isSelfTimer) {
-    preface = [
-      `【继续】已到你设定的时间（原因：${pending.reason ?? '?'}）。`,
-      `【提交段摘要】${pending.submitSummary || '(无摘要)'}`,
-      '请自行检查外部任务状态，决定：继续等待（再调 timer）还是收割（整理 findings/direction 草稿后 return_result data={"label":"ok"}）。',
-    ].join('\n')
+    preface = scenarioRuntimeFor(instance.charter).harvestPreface({
+      selfTimer: true,
+      reason: pending.reason,
+      submitSummary: pending.submitSummary,
+    })
   } else {
     const effect = (await effects.get(effectKey!))!
-    preface = [
-      '【收割段】你（或你的前身）在本轮提交段启动了外部任务，现已结束。',
-      `【提交段摘要】${pending.submitSummary || '(无摘要)'}`,
-      `【外部任务结果】verdict=${effect.outcome?.verdict ?? 'unknown'} via=${effect.outcome?.via ?? '?'}`,
-      `【结果数据】${truncate(JSON.stringify(effect.outcome?.data ?? null), 3_000)}`,
-      '请基于结果完成本轮剩余工作（整理 findings 草稿等），遵守产出契约。',
-    ].join('\n')
+    preface = scenarioRuntimeFor(instance.charter).harvestPreface({
+      selfTimer: false,
+      submitSummary: pending.submitSummary,
+      effect: effect.outcome,
+    })
   }
 
   const seatSummaries: Record<string, string> = { ...pending.seatSummaries }
@@ -718,27 +935,35 @@ async function completeRound(
   const { baseProgress: progress } = input
 
   // ── 7. METER ──────────────────────────────────────────────────────────────
-  const { observables, warnings } = collectObservables(charter, input.judge)
-  const meters = { ...progress.meters }
+  const producerOk = input.worker?.ok === true
+  const { observables, observationResults, warnings } = collectObservables(
+    charter,
+    input.judge,
+    producerOk,
+  )
   // Budget exhaustion is recomputed WITH this round accounted (iteration+cost),
   // so ROUTE terminates now instead of wasting a wake on an empty next round.
   const totalCostUsd = progress.totalCostUsd + input.costUsd
   const budgetExhausted = lifetimeExhausted(charter, { iteration: input.round, totalCostUsd })
-  const meterCtx = buildCtx(meters, observables, budgetExhausted)
-  for (const meter of charter.meters) {
-    const asts = charter.frozen.meterAsts[meter.name] ?? {}
-    if (meter.inc === 'every_round') {
-      meters[meter.name] = (meters[meter.name] ?? 0) + 1
-    } else if (asts.incWhen && safeEval(asts.incWhen, meterCtx, !input.worker?.ok)) {
-      meters[meter.name] = (meters[meter.name] ?? 0) + 1
-    } else if (asts.resetWhen && safeEval(asts.resetWhen, meterCtx, false)) {
-      meters[meter.name] = 0
-    }
-  }
+  const counterProjection = runConditionalCounterProjection(
+    charter,
+    progress.meters,
+    observationResults,
+    budgetExhausted,
+  )
+  const meters = counterProjection.meters
+  warnings.push(...counterProjection.diagnostics)
 
-  // ── 8. LEDGER: admit drafts, then account the round ───────────────────────
-  const admitted = await admitDrafts(instance, input.judge)
-  const metric = typeof input.judge?.data['metric'] === 'number' ? (input.judge.data['metric'] as number) : null
+  // ── 8. LEDGER: commit gated Artifact proposals, then account the round ────
+  const artifactCommit = await scenarioRuntimeFor(instance.charter).commitArtifacts(instance, {
+    round: input.round,
+    producerOk,
+    judgeRequired: !!charter.seats.judge,
+    judge: input.judge,
+  })
+  const legacyFindingDelta = artifactCommit.legacyFindingDelta
+  const objective = evaluateMetricObjective(charter, input.judge, warnings)
+  const metric = objective.value
   const metricImproved = metric !== null && (
     progress.bestMetric === null ||
     (charter.metric?.direction === 'min' ? metric < progress.bestMetric : metric > progress.bestMetric)
@@ -752,20 +977,36 @@ async function completeRound(
   // judge's, the decision is the kernel's) ▸ first matching charter tripwire ▸
   // built-in budget backstop ▸ continue.
   const postCtx = buildCtx(meters, observables, budgetExhausted)
-  const route = decideRoute(charter, postCtx, input.judge, budgetExhausted)
-  const status = statusFor(route, charter, postCtx, meters)
+  const initialRoute: RouteDecision = objective.failStopReason
+    ? { kind: 'escalate', cause: 'rule_error', reason: objective.failStopReason }
+    : decideRoute(
+        charter,
+        postCtx,
+        observationResults,
+        warnings,
+        input.judge,
+        budgetExhausted,
+      )
+  const { route, status } = applyHealthPolicy(
+    initialRoute,
+    charter,
+    postCtx,
+    observationResults,
+    warnings,
+    meters,
+  )
   const postState = {
     iteration: input.round,
     meters,
     status,
     ...(route.kind === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
     bestMetric,
-    totalFindings: progress.totalFindings + admitted,
+    totalFindings: progress.totalFindings + legacyFindingDelta,
     totalCostUsd,
   }
 
   await ledger.appendRound({
-    round: input.round, mode: input.mode, observables, meters, route,
+    round: input.round, mode: input.mode, observables, observationResults, meters, route,
     correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
     seatSummaries: input.seatSummaries,
     startedAt: input.startedAt, finishedAt: Date.now(),
@@ -801,14 +1042,19 @@ async function completeRound(
 function decideRoute(
   charter: FrozenCharter,
   ctx: EvalContext,
+  observationResults: Readonly<Record<string, ObservationResult>>,
+  warnings: string[],
   judge: SeatResult | null,
   budgetExhausted: boolean,
 ): RouteDecision {
   if (judge?.data['goal_satisfied'] === true) {
     return { kind: 'finalize', cause: 'accepted', reason: 'goal_satisfied' }
   }
-  const hit = firstTripwire(charter, ctx)
+  const hit = firstTripwire(charter, ctx, observationResults, warnings)
   if (hit) {
+    if (hit.kind === 'fail_stop') {
+      return { kind: 'escalate', cause: 'rule_error', reason: hit.reason }
+    }
     const { action, index } = hit
     switch (action.act) {
       case 'pivot':
@@ -896,114 +1142,219 @@ function buildCtx(
 function firstTripwire(
   charter: FrozenCharter,
   ctx: EvalContext,
-): { action: TripwireAction; index: number } | null {
+  observationResults: Readonly<Record<string, ObservationResult>> = {},
+  warnings: string[] = [],
+):
+  | { kind: 'hit'; action: TripwireAction; index: number }
+  | { kind: 'fail_stop'; reason: string }
+  | null {
   for (const [i, ast] of charter.frozen.tripwireAsts.entries()) {
-    if (safeEval(ast, ctx, false)) return { action: charter.tripwires[i]!.then, index: i }
+    const rule = charter.tripwires[i]!
+    const result = evaluateObservationRule(
+      ast,
+      ctx,
+      observationResults,
+      rule.onAbsent ?? 'false',
+      rule.onError ?? 'false',
+      `tripwire[${i}]`,
+      warnings,
+    )
+    if (result.kind === 'fail_stop') return result
+    if (result.kind === 'match') return { kind: 'hit', action: rule.then, index: i }
   }
   return null
-}
-
-/**
- * Tripwires/meters may reference judge observables that are missing when the
- * worker failed outright. `fallback` decides how a missing-context evaluation
- * counts: meter incWhen falls back to TRUE on a failed round (a failed round
- * IS stale), everything else to false.
- */
-function safeEval(ast: Parameters<typeof evaluateBool>[0], ctx: EvalContext, fallback: boolean): boolean {
-  try {
-    return evaluateBool(ast, ctx)
-  } catch {
-    return fallback
-  }
 }
 
 function collectObservables(
   charter: FrozenCharter,
   judge: SeatResult | null,
-): { observables: Record<string, number | boolean | string>; warnings: string[] } {
-  const out: Record<string, number | boolean | string> = {}
+  producerOk: boolean,
+): {
+  observables: Record<string, number | boolean | string>
+  observationResults: Record<string, ObservationResult>
+  warnings: string[]
+} {
+  const observedAt = Date.now()
+  const out: Record<string, number | boolean | string> = {
+    [PRODUCER_OK_OBSERVABLE]: producerOk,
+  }
+  const observationResults: Record<string, ObservationResult> = {
+    [PRODUCER_OK_OBSERVABLE]: {
+      status: 'present',
+      value: producerOk,
+      source: `kernel:${PRODUCER_OK_OBSERVABLE}`,
+      observedAt,
+      provenance: [producerOk ? 'seat.completed:worker' : 'seat.blocked_or_failed:worker'],
+    },
+  }
   const warnings: string[] = []
   for (const spec of charter.observables) {
     if (spec.source.from !== 'judge') continue
     const v = judge?.data[spec.source.key]
-    if (typeof v === 'number' || typeof v === 'boolean' || typeof v === 'string') {
-      out[spec.name] = v
-    } else if (judge) {
+    const source = `judge:${spec.source.key}`
+    if (judge === null) {
+      observationResults[spec.name] = {
+        status: 'absent',
+        source,
+        observedAt,
+        reason: 'not_produced',
+        provenance: ['seat.completed:worker'],
+      }
+    } else if (!judge.ok) {
+      observationResults[spec.name] = {
+        status: 'error',
+        source,
+        observedAt,
+        errorCode: 'judge_failed',
+        message: 'judge did not complete successfully',
+        provenance: ['seat.completed:judge'],
+      }
+      warnings.push(
+        `observable '${spec.name}': judge failed; dependent rules use their onError policy`,
+      )
+    } else if (
+      v === null ||
+      (typeof v === 'number' && Number.isFinite(v)) ||
+      typeof v === 'boolean' ||
+      typeof v === 'string'
+    ) {
+      observationResults[spec.name] = {
+        status: 'present',
+        value: v,
+        source,
+        observedAt,
+        provenance: ['seat.completed:judge'],
+      }
+      if (v !== null) out[spec.name] = v
+    } else {
+      observationResults[spec.name] = {
+        status: 'error',
+        source,
+        observedAt,
+        errorCode: 'judge_output_invalid',
+        message: `judge omitted or emitted an unsupported value for '${spec.source.key}'`,
+        provenance: ['seat.completed:judge'],
+      }
       // The judge DID run but never emitted this key. Every declared key is
       // injected into JUDGE_CONTRACT (core or charter-declared extra), so this
       // means the judge disobeyed its contract or crashed mid-output. Silent
       // absence turns every dependent meter/tripwire into a dead rule, so make
       // it loud in the round audit. (judge === null means the worker failed —
-      // that case is expected and covered by the stale fallback, not warned.)
+      // that case is expected and represented by producer_ok, not warned.)
       const emitted = Object.keys(judge.data).join(', ') || '<none>'
       warnings.push(
         `observable '${spec.name}': judge never emitted key '${spec.source.key}' ` +
         `despite it being demanded by JUDGE_CONTRACT (judge output keys: ${emitted}); ` +
-        `dependent meters/tripwires fell back to defaults this round`,
+        `dependent meters retained and route/health rules evaluated false this round`,
       )
     }
   }
-  return { observables: out, warnings }
+  return { observables: out, observationResults, warnings }
 }
 
-/** Admit findings drafts into the ledger; returns number admitted. Drafts are
- * consumed either way (a rejected draft must not haunt the next round). */
-async function admitDrafts(instance: LoopInstance, judge: SeatResult | null): Promise<number> {
-  const { paths, ledger } = instance
-  const draftPath = join(paths.draftsDir, 'findings_draft.json')
-  let admitted = 0
-  try {
-    const raw = await readFile(draftPath, 'utf-8')
-    const parsed = JSON.parse(raw) as unknown
-    const entries = Array.isArray(parsed) ? parsed : [parsed]
-    // Fail-closed: a declared judge that crashed (ok=false, no verdict) must
-    // not admit unreviewed findings into the permanent ledger.
-    const judgeRequired = !!instance.charter.seats.judge
-    const pass = !judgeRequired || (!!judge && judge.ok && judge.data['verdict'] !== 'fail')
-    if (pass) {
-      for (const entry of entries) {
-        await ledger.appendJsonl(paths.findingsJsonl, entry)
-        admitted++
-      }
-    }
-  } catch {
-    // no draft — a legitimate zero-findings round
-  }
-  await rm(draftPath, { force: true }).catch(() => undefined)
+type ObservationRuleResult =
+  | { kind: 'match' }
+  | { kind: 'no_match' }
+  | { kind: 'fail_stop'; reason: string }
 
-  const dirPath = join(paths.draftsDir, 'direction.json')
+function evaluateObservationRule(
+  ast: Parameters<typeof evaluateBool>[0],
+  ctx: EvalContext,
+  observationResults: Readonly<Record<string, ObservationResult>>,
+  onAbsent: ObservationFailurePolicy,
+  onError: ObservationFailurePolicy,
+  label: string,
+  warnings: string[],
+): ObservationRuleResult {
   try {
-    const raw = JSON.parse(await readFile(dirPath, 'utf-8')) as { key?: unknown }
-    if (typeof raw.key === 'string' && raw.key) {
-      const file = await ledger.readJson<{ directions: unknown[] }>(paths.directionsJson)
-      const directions = file?.directions ?? []
-      if (!directions.some(d => typeof d === 'object' && d !== null && (d as { key?: unknown }).key === raw.key)) {
-        await ledger.replaceJson(paths.directionsJson, { directions: [...directions, raw] })
-      }
+    return evaluateBool(ast, ctx) ? { kind: 'match' } : { kind: 'no_match' }
+  } catch (err) {
+    // Classify only after real evaluation fails. Pre-scanning all refs would
+    // incorrectly apply a policy to the unevaluated side of a short-circuit.
+    const refs = collectRuleObservationFailures(ast, observationResults)
+    const failed = refs.find(item => item.result.status === 'error' || (
+      item.result.status === 'present' && item.result.value === null
+    ))
+    if (failed) {
+      const detail = failed.result.status === 'error'
+        ? `${failed.name}:${failed.result.errorCode}`
+        : `${failed.name}:present-null`
+      return applyObservationFailurePolicy(onError, label, 'error', detail, warnings)
     }
-  } catch { /* no direction draft */ }
-  await rm(dirPath, { force: true }).catch(() => undefined)
-  return admitted
-}
-
-async function duplicatedDirection(instance: LoopInstance): Promise<string | null> {
-  const { paths, ledger } = instance
-  try {
-    const draft = JSON.parse(await readFile(join(paths.draftsDir, 'direction.json'), 'utf-8')) as { key?: unknown }
-    if (typeof draft.key !== 'string' || !draft.key) return null
-    const file = await ledger.readJson<{ directions: unknown[] }>(paths.directionsJson)
-    const dup = (file?.directions ?? []).some(
-      d => typeof d === 'object' && d !== null && (d as { key?: unknown }).key === draft.key,
+    const absent = refs.find(item => item.result.status === 'absent')
+    if (absent) {
+      return applyObservationFailurePolicy(
+        onAbsent,
+        label,
+        'absent',
+        `${absent.name}:${absent.result.status === 'absent' ? absent.result.reason : 'absent'}`,
+        warnings,
+      )
+    }
+    return applyObservationFailurePolicy(
+      onError,
+      label,
+      'error',
+      (err as Error).message,
+      warnings,
     )
-    return dup ? draft.key : null
-  } catch {
-    return null
   }
 }
 
-async function runSchemaGates(instance: LoopInstance): Promise<string[]> {
+function collectRuleObservationFailures(
+  ast: Parameters<typeof evaluateBool>[0],
+  observationResults: Readonly<Record<string, ObservationResult>>,
+): Array<{ name: string; result: ObservationResult }> {
+  return collectRefs(ast)
+    .filter(name => observationResults[name] !== undefined)
+    .map(name => ({ name, result: observationResults[name]! }))
+}
+
+function applyObservationFailurePolicy(
+  policy: ObservationFailurePolicy,
+  label: string,
+  state: 'absent' | 'error',
+  detail: string,
+  warnings: string[],
+): ObservationRuleResult {
+  warnings.push(`${label} ${state} (${detail}); applied ${policy}`)
+  return policy === 'fail_stop'
+    ? { kind: 'fail_stop', reason: `${label} ${state}: ${detail}` }
+    : { kind: 'no_match' }
+}
+
+function evaluateMetricObjective(
+  charter: FrozenCharter,
+  judge: SeatResult | null,
+  warnings: string[],
+): { value: number | null; failStopReason?: string } {
+  const raw = judge?.data['metric']
+  if (typeof raw === 'number' && Number.isFinite(raw)) return { value: raw }
+
+  const state: 'absent' | 'error' | 'null' = judge === null
+    ? 'absent'
+    : !judge.ok || raw !== null
+      ? 'error'
+      : 'null'
+  const policy: ObjectiveFailurePolicy = state === 'absent'
+    ? (charter.metric?.onAbsent ?? 'skip_update')
+    : state === 'error'
+      ? (charter.metric?.onError ?? 'skip_update')
+      : (charter.metric?.onNull ?? 'skip_update')
+  warnings.push(`objective 'metric' ${state}; applied ${policy}`)
+  return policy === 'fail_stop'
+    ? { value: null, failStopReason: `objective 'metric' ${state}` }
+    : { value: null }
+}
+
+async function runSchemaGates(instance: LoopInstance, gateIds: readonly string[]): Promise<string[]> {
   const errs: string[] = []
-  for (const gate of Object.values(instance.charter.gates ?? {})) {
+  for (const gateId of gateIds) {
+    const gate = instance.charter.gates?.[gateId]
+    if (!gate) {
+      errs.push(`frozen schema GateBinding references missing gate '${gateId}'`)
+      continue
+    }
     if (gate.kind !== 'schema') continue
     for (const rel of gate.files) {
       try {
@@ -1072,11 +1423,13 @@ function validateShape(value: unknown, spec: ShapeSpec, at: string): string[] {
   return errs
 }
 
-function judgeEvidence(charter: FrozenCharter): string[] {
-  for (const gate of Object.values(charter.gates ?? {})) {
-    if (gate.kind === 'judge') return gate.evidence
+function judgeEvidence(charter: FrozenCharter, gateIds: readonly string[]): string[] {
+  const evidence: string[] = []
+  for (const gateId of gateIds) {
+    const gate = charter.gates?.[gateId]
+    if (gate?.kind === 'judge') evidence.push(...gate.evidence)
   }
-  return []
+  return [...new Set(evidence)]
 }
 
 /**
@@ -1084,20 +1437,44 @@ function judgeEvidence(charter: FrozenCharter): string[] {
  * every value has exactly one producer, and 'completed' is written only when
  * the loop actually terminates.
  */
-function statusFor(
+function applyHealthPolicy(
   route: RouteDecision,
   charter: FrozenCharter,
   ctx: EvalContext,
+  observationResults: Readonly<Record<string, ObservationResult>>,
+  warnings: string[],
   meters: Record<string, number>,
-): ProgressStatus {
+): { route: RouteDecision; status: ProgressStatus } {
   switch (route.kind) {
-    case 'finalize': return 'completed'
-    case 'escalate': return 'paused_attention'
-    case 'pivot': return 'pivot_scheduled'
+    case 'finalize': return { route, status: 'completed' }
+    case 'escalate': return { route, status: 'paused_attention' }
+    case 'pivot': return { route, status: 'pivot_scheduled' }
     case 'continue': {
       const healthAst = charter.frozen.healthAst
-      if (healthAst) return safeEval(healthAst, ctx, false) ? 'stale' : 'healthy'
-      return (meters['stale_count'] ?? 0) > 0 ? 'stale' : 'healthy'
+      if (healthAst && charter.health) {
+        const result = evaluateObservationRule(
+          healthAst,
+          ctx,
+          observationResults,
+          charter.health.onAbsent ?? 'false',
+          charter.health.onError ?? 'false',
+          'health',
+          warnings,
+        )
+        if (result.kind === 'fail_stop') {
+          const failedRoute: RouteDecision = {
+            kind: 'escalate',
+            cause: 'rule_error',
+            reason: result.reason,
+          }
+          return { route: failedRoute, status: 'paused_attention' }
+        }
+        return { route, status: result.kind === 'match' ? 'stale' : 'healthy' }
+      }
+      return {
+        route,
+        status: (meters['stale_count'] ?? 0) > 0 ? 'stale' : 'healthy',
+      }
     }
   }
 }
@@ -1191,7 +1568,7 @@ async function terminate(
     }
   }
 
-  const report = await renderReport(instance, reason, narrative)
+  const report = await scenarioRuntimeFor(instance.charter).renderReport(instance, reason, narrative)
   const reportName = escalated ? 'attention_report.md' : 'final_report.md'
   await atomicWriteFile(join(paths.reportsDir, reportName), report)
   await deps.wakeStore.cancelForLoop(instance.record.instanceId)
@@ -1206,34 +1583,6 @@ async function terminate(
     route: renderRoute(input.route),
     status: terminalStatus, costUsd: input.costUsd + finalizerCost,
   }
-}
-
-async function renderReport(instance: LoopInstance, reason: string, narrative?: string): Promise<string> {
-  const view = await instance.ledger.readView(50)
-  const lines = [
-    `# Loop Report — ${instance.record.instanceId}`,
-    '',
-    `- reason: ${reason}`,
-    `- rounds: ${view.progress.iteration}`,
-    `- status: ${view.progress.status}`,
-    `- best_metric (${instance.charter.metric?.direction ?? 'max'}): ${view.progress.bestMetric ?? 'null'}`,
-    `- total findings: ${view.findingsCount}`,
-    `- total cost: $${view.progress.totalCostUsd.toFixed(2)}`,
-    ...(narrative ? ['', '## Narrative (finalizer seat)', '', narrative] : []),
-    '',
-    '## Rounds',
-    ...view.lastRounds.map(r =>
-      `- #${r.round} [${r.mode}] route=${renderRoute(r.route)} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
-    '',
-    '## Directions tried',
-    ...view.directions.map(d => `- ${JSON.stringify(d)}`),
-    '',
-    '## Findings',
-    ...view.lastFindings.map(f => `- ${JSON.stringify(f)}`),
-    '',
-    `Generated at ${new Date().toISOString()} from the ledger (code template).`,
-  ]
-  return lines.join('\n') + '\n'
 }
 
 function truncate(s: string, n = 300): string {

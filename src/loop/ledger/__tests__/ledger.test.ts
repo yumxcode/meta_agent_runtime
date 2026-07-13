@@ -55,6 +55,18 @@ describe('Ledger', () => {
     expect(await ledger.readJsonl(paths.roundsJsonl)).toEqual([])
   })
 
+  it('validates tri-state observation results while accepting legacy rounds without them', async () => {
+    const { ledger, paths } = await freshLedger()
+    await ledger.appendRound(round(1))
+    await expect(ledger.appendJsonl(paths.roundsJsonl, {
+      ...round(2),
+      observationResults: {
+        score: { status: 'present', source: 'judge:score', observedAt: 1, provenance: [] },
+      },
+    })).rejects.toThrow(/value is required when present/)
+    expect(await ledger.readJsonl<RoundEntry>(paths.roundsJsonl)).toHaveLength(1)
+  })
+
   it('readJsonl survives a torn line without losing the rest', async () => {
     const { ledger, paths } = await freshLedger()
     await ledger.appendRound(round(1))

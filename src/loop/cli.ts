@@ -18,12 +18,15 @@ import { distillCharter } from './distill/Distiller.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { tickOnce, runUntilQuiescent } from './runner.js'
 import { instancePaths, renderRoute, type LoopInstanceRecord } from './types.js'
+import type { EffectAdapterRegistry } from './effects/EffectAdapter.js'
 
 export interface LoopCliDeps {
   projectDir: string
   /** Required only for `tick`. */
   dispatcher?: ISubAgentDispatcher
   signal?: AbortSignal
+  /** Host-owned adapters available to tick/lifecycle operations. */
+  effectAdapters?: EffectAdapterRegistry
   /** Live per-round/seat progress for `tick` (CLI renders it). */
   observer?: (event: import('./kernel/LoopKernel.js').LoopEvent) => void
 }
@@ -107,7 +110,10 @@ async function cmdLifecycle(
   const instance = await loadInstance(deps.projectDir, id)
   if (!instance) return `instance ${id} not found`
   const reason = flagValue(rest, '--reason')
-  const lifecycleDeps = { wakeStore: new WakeStore(deps.projectDir), projectDir: deps.projectDir }
+  const lifecycleDeps = {
+    wakeStore: new WakeStore(deps.projectDir), projectDir: deps.projectDir,
+    effectAdapters: deps.effectAdapters,
+  }
   const result = action === 'pause'
     ? await pauseInstance(instance, lifecycleDeps, reason)
     : action === 'resume'
@@ -215,7 +221,10 @@ async function cmdTick(rest: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.dispatcher) {
     throw new Error('loop tick needs a backend dispatcher (host CLI wires this; see orch-scheduler bootstrap)')
   }
-  const tickDeps = { dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: deps.signal, observer: deps.observer }
+  const tickDeps = {
+    dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: deps.signal,
+    observer: deps.observer, effectAdapters: deps.effectAdapters,
+  }
   if (rest.includes('--until-quiescent')) {
     const results = await runUntilQuiescent(tickDeps)
     const total = results.reduce((n, r) => n + r.claimed, 0)

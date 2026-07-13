@@ -2,12 +2,32 @@ import { describe, expect, it } from 'vitest'
 import { mkdtemp } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { validateCharter, freezeCharter } from '../CharterValidate.js'
+import { freezeCharter, normalizeFrozenCharterForRuntime, validateCharter } from '../CharterValidate.js'
 import { CharterStore } from '../CharterStore.js'
-import { evaluateBool } from '../../expr/Expr.js'
+import { collectRefs, evaluateBool, parse } from '../../expr/Expr.js'
 import { walkResearchCharter } from '../../__tests__/testCharter.js'
 
 describe('validateCharter', () => {
+  it('freezes versioned EffectBindings and their typed rule ASTs', () => {
+    const charter = walkResearchCharter({
+      effects: {
+        training: {
+          adapter: 'vendor/training@2',
+          observations: { status: { pointer: '/state', type: 'string' } },
+          rules: [{
+            when: "status == 'succeeded'", then: { act: 'harvest', verdict: 'done' },
+            onAbsent: 'fail_stop', onError: 'fail_stop',
+          }],
+          admission: { maxConcurrentCalls: 2, minIntervalMs: 10 },
+        },
+      },
+    })
+    expect(validateCharter(charter)).toEqual([])
+    expect(freezeCharter(charter).effects.training).toMatchObject({
+      adapter: 'vendor/training@2',
+      frozen: { ruleAsts: [{ kind: 'binary', op: '==' }] },
+    })
+  })
   it('accepts the walk-research fixture', () => {
     expect(validateCharter(walkResearchCharter())).toEqual([])
   })
@@ -42,6 +62,15 @@ describe('validateCharter', () => {
       ],
     }))
     expect(errs.some(e => e.includes('metric_delta') && e.includes("needs a non-empty 'key'"))).toBe(true)
+  })
+
+  it("reserves the kernel's producer_ok observable name", () => {
+    const errs = validateCharter(walkResearchCharter({
+      observables: [
+        { name: 'producer_ok', source: { from: 'judge', key: 'producer_ok' } },
+      ],
+    }))
+    expect(errs.some(e => e.includes("'producer_ok'") && e.includes('reserved by the kernel'))).toBe(true)
   })
 
   it('rejects a loop with no guaranteed terminator (no stop tripwire and no lifetime budget)', () => {
@@ -89,6 +118,46 @@ describe('validateCharter', () => {
     const errs = validateCharter(walkResearchCharter({ health: { staleWhen: 'nope_meter > 1' } }))
     expect(errs.some(e => e.includes('health.staleWhen') && e.includes('undeclared'))).toBe(true)
     expect(validateCharter(walkResearchCharter({ health: { staleWhen: 'stale_count >= 2' } }))).toEqual([])
+  })
+
+  it('validates and freezes explicit observation failure policies', () => {
+    const charter = walkResearchCharter({
+      health: { staleWhen: 'new_findings == 0', onAbsent: 'skip', onError: 'fail_stop' },
+      tripwires: [
+        {
+          when: 'new_findings == 0',
+          then: { act: 'finalize' },
+          onAbsent: 'skip',
+          onError: 'fail_stop',
+        },
+      ],
+    })
+    expect(validateCharter(charter)).toEqual([])
+    const frozen = freezeCharter(charter)
+    expect(frozen.tripwires[0]).toMatchObject({ onAbsent: 'skip', onError: 'fail_stop' })
+    expect(frozen.health).toMatchObject({ onAbsent: 'skip', onError: 'fail_stop' })
+
+    const invalid = walkResearchCharter()
+    invalid.tripwires[0]!.onError = 'ignore' as never
+    expect(validateCharter(invalid).some(e => e.includes('tripwire[0].onError'))).toBe(true)
+  })
+
+  it('validates and freezes objective absent/error/null policies', () => {
+    const charter = walkResearchCharter({
+      metric: {
+        direction: 'max',
+        onAbsent: 'skip_update',
+        onError: 'fail_stop',
+        onNull: 'skip_update',
+      },
+    })
+    expect(validateCharter(charter)).toEqual([])
+    expect(freezeCharter(charter).metric).toMatchObject({
+      onAbsent: 'skip_update', onError: 'fail_stop', onNull: 'skip_update',
+    })
+
+    const invalid = walkResearchCharter({ metric: { direction: 'max', onNull: 'ignore' as never } })
+    expect(validateCharter(invalid).some(e => e.includes('metric.onNull'))).toBe(true)
   })
 
   it('migrates pre-v3 tripwire actions on validate/freeze (attention→escalate, stop→finalize)', () => {
@@ -164,9 +233,53 @@ describe('freezeCharter', () => {
     expect(frozen.frozen.tripwireAsts).toHaveLength(3)
     expect(frozen.frozen.meterAsts['stale_count']!.incWhen).toBeDefined()
     expect(frozen.frozen.declaredIdentifiers).toContain('new_findings')
+    expect(frozen.frozen.declaredIdentifiers).toContain('producer_ok')
     // The frozen AST evaluates — end-to-end through the JSON round trip (D9).
     const revived = JSON.parse(JSON.stringify(frozen)) as typeof frozen
     expect(evaluateBool(revived.frozen.tripwireAsts[1]!, { stale_count: 2 })).toBe(true)
+  })
+
+  it('adds producer_ok only to judge-dependent incWhen ASTs', () => {
+    const charter = walkResearchCharter()
+    charter.meters.push({ name: 'meter_only', incWhen: 'iteration > 99' })
+    const frozen = freezeCharter(charter)
+    const judgeDependent = frozen.frozen.meterAsts['stale_count']!.incWhen!
+    const meterOnly = frozen.frozen.meterAsts['meter_only']!.incWhen!
+
+    expect(collectRefs(judgeDependent)).toContain('producer_ok')
+    expect(collectRefs(meterOnly)).not.toContain('producer_ok')
+    expect(evaluateBool(judgeDependent, { producer_ok: false })).toBe(true)
+    expect(() => evaluateBool(judgeDependent, { producer_ok: true })).toThrow(/missing from context/)
+    expect(evaluateBool(meterOnly, { iteration: 0, producer_ok: false })).toBe(false)
+    expect(frozen.frozen.observableObligations['new_findings']).toMatchObject({
+      source: 'judge', outputKey: 'new_findings_count',
+      consumers: expect.arrayContaining([
+        { kind: 'meter', id: 'stale_count', field: 'incWhen' },
+      ]),
+    })
+    expect(frozen.frozen.observableObligations['producer_ok']?.consumers).toContainEqual({
+      kind: 'meter', id: 'stale_count', field: 'incWhen',
+    })
+  })
+
+  it('upgrades pre-G0 frozen meter ASTs in memory and is idempotent', () => {
+    const legacy = freezeCharter(walkResearchCharter())
+    legacy.frozen.meterAsts['stale_count']!.incWhen = parse(
+      'new_findings == 0 || metric_delta < 0',
+      new Set(['new_findings', 'metric_delta']),
+    )
+    legacy.frozen.declaredIdentifiers = legacy.frozen.declaredIdentifiers
+      .filter(name => name !== 'producer_ok')
+    delete (legacy.frozen as { observableObligations?: unknown }).observableObligations
+    delete (legacy.frozen as { executionPlan?: unknown }).executionPlan
+
+    const upgraded = normalizeFrozenCharterForRuntime(legacy)
+    expect(collectRefs(upgraded.frozen.meterAsts['stale_count']!.incWhen!)).toContain('producer_ok')
+    expect(upgraded.frozen.declaredIdentifiers).toContain('producer_ok')
+    expect(upgraded.frozen.observableObligations['new_findings']?.consumers).not.toHaveLength(0)
+    expect(upgraded.frozen.executionPlan.seats.producer).toBe('worker')
+    expect(upgraded.frozen.executionPlan.gates.some(gate => gate.id === 'judge')).toBe(true)
+    expect(normalizeFrozenCharterForRuntime(upgraded)).toEqual(upgraded)
   })
 
   it('throws (instructive, multi-line) on an invalid charter', () => {

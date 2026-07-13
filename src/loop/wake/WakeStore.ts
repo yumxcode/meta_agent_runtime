@@ -29,7 +29,7 @@ import {
 } from '../../infra/persist/index.js'
 import type { LoopInstanceId } from '../types.js'
 
-export type WakeKind = 'timer' | 'event' | 'manual'
+export type WakeKind = 'timer' | 'event' | 'effect_poll' | 'manual'
 export type WakeStatus = 'pending' | 'claimed' | 'done' | 'cancelled'
 
 export interface WakeRecord {
@@ -99,11 +99,12 @@ export class WakeStore {
   }): Promise<WakeRecord> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
-      if (input.kind === 'timer') {
+      if (input.kind === 'timer' || input.kind === 'effect_poll') {
         for (const existing of await this.listUnlocked()) {
           if (
             existing.loopId === input.loopId &&
-            existing.kind === 'timer' &&
+            existing.kind === input.kind &&
+            (input.kind !== 'effect_poll' || existing.effectKey === input.effectKey) &&
             existing.status === 'pending'
           ) {
             const replaced: WakeRecord = {

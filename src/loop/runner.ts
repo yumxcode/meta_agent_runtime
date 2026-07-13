@@ -20,11 +20,17 @@ import { ingestEvents, reconcileWaiting } from './effects/WaitOps.js'
 import { HALTED_STATUSES } from './types.js'
 import { LedgerCorruptionError } from './ledger/LedgerApi.js'
 import { CharterEnforcementError } from './security/PathSafety.js'
+import {
+  defaultEffectAdapterRegistry,
+  EffectConfigurationError,
+  type EffectAdapterRegistry,
+} from './effects/EffectAdapter.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
   projectDir: string
   signal?: AbortSignal
+  effectAdapters?: EffectAdapterRegistry
   /** Live per-round/seat progress (CLI renders it). */
   observer?: (event: LoopEvent) => void
 }
@@ -47,20 +53,29 @@ export async function prepareAndClaim(
   const wakeStore = new WakeStore(deps.projectDir)
   await wakeStore.reconcileOrphans(now)
 
-  const waitDeps = { wakeStore, projectDir: deps.projectDir }
+  const waitDeps = {
+    wakeStore, projectDir: deps.projectDir,
+    effectAdapters: deps.effectAdapters ?? defaultEffectAdapterRegistry(),
+  }
   const allWakes = await wakeStore.list()
   for (const record of await listInstanceRecords(deps.projectDir)) {
     if (HALTED_STATUSES.has(record.status)) continue
     const instance = await loadInstance(deps.projectDir, record.instanceId)
     if (!instance) continue
-    await ingestEvents(instance, waitDeps).catch(() => 0)
-    const hasLiveWake = allWakes.some(
-      w => w.loopId === record.instanceId && (w.status === 'pending' || w.status === 'claimed'),
-    )
-    if (record.status === 'waiting' && !hasLiveWake) {
-      await reconcileWaiting(instance, waitDeps).catch(() => [])
-    } else if (record.status === 'idle' && !hasLiveWake) {
-      await wakeStore.schedule({ loopId: record.instanceId, kind: 'timer', fireAt: now })
+    try {
+      await ingestEvents(instance, waitDeps)
+      const hasLiveWake = allWakes.some(
+        w => w.loopId === record.instanceId && (w.status === 'pending' || w.status === 'claimed'),
+      )
+      if (record.status === 'waiting' && !hasLiveWake) {
+        await reconcileWaiting(instance, waitDeps)
+      } else if (record.status === 'idle' && !hasLiveWake) {
+        await wakeStore.schedule({ loopId: record.instanceId, kind: 'timer', fireAt: now })
+      }
+    } catch (error) {
+      if (!(error instanceof LedgerCorruptionError)) throw error
+      await setInstanceStatus(instance, 'failed', `ledger recovery failed: ${error.message}`)
+      await wakeStore.cancelForLoop(record.instanceId)
     }
   }
   return { wakeStore, wakes: await wakeStore.claimDue(now, undefined, maxClaims) }
@@ -88,11 +103,22 @@ export async function runClaimedWake(
       projectDir: deps.projectDir,
       signal: deps.signal ?? new AbortController().signal,
       wakeStore,
+      effectAdapters: deps.effectAdapters,
       observer: deps.observer,
     })
     await wakeStore.release(wake.wakeId, outcome.route === 'stale-wake' ? 'cancelled' : 'done')
     return { loopId: wake.loopId, outcome }
   } catch (err) {
+    if (err instanceof EffectConfigurationError) {
+      const instance = await loadInstance(deps.projectDir, wake.loopId)
+      if (instance) {
+        await setInstanceStatus(instance, 'failed', `effect configuration failed: ${err.message}`).catch(() => undefined)
+        await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
+      } else {
+        await wakeStore.release(wake.wakeId, 'cancelled').catch(() => undefined)
+      }
+      return { loopId: wake.loopId, error: err.message }
+    }
     if (err instanceof LedgerCorruptionError) {
       const instance = await loadInstance(deps.projectDir, wake.loopId)
       if (instance) {

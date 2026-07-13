@@ -11,13 +11,14 @@ import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentRecord } from '../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../subagent/types.js'
-import { createInstance, loadInstance } from '../instance/InstanceStore.js'
+import { createInstance, loadInstance, setInstanceStatus } from '../instance/InstanceStore.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import { tickOnce } from '../runner.js'
 import { instancePaths, type RoundEntry } from '../types.js'
 import { EffectLedger } from '../effects/EffectLedger.js'
 import { Ledger } from '../ledger/LedgerApi.js'
-import { reconcileWaiting, readPendingRound } from '../effects/WaitOps.js'
+import { reconcileWaiting, readPendingRound, writePendingRound } from '../effects/WaitOps.js'
+import { EffectAdapterRegistry, type EffectAdapter } from '../effects/EffectAdapter.js'
 import { walkResearchCharter } from './testCharter.js'
 
 type SeatScript = (task: string) => Promise<Record<string, unknown>>
@@ -101,6 +102,116 @@ async function dropEvent(paths: ReturnType<typeof instancePaths>, name: string, 
 }
 
 describe('waiting rounds — event driven', () => {
+  it('effect_poll advances hard state without spawning an LLM seat until terminal', async () => {
+    const { dir, paths } = await setup({
+      effects: {
+        kernel_poll: {
+          adapter: 'test/kernel-poll@1', observations: {}, rules: [],
+          admission: { maxConcurrentCalls: 1 },
+        },
+      },
+    })
+    const base = trainingScript(paths)
+    const dispatcher = scriptedDispatcher(async task => {
+      const result = await base(task)
+      return isWorker(task) && !isHarvest(task)
+        ? { ...result, adapterId: 'test/kernel-poll@1' }
+        : result
+    })
+    let inspections = 0
+    const adapter: EffectAdapter = {
+      id: 'test/kernel-poll@1',
+      async submit() { return { inspectAfterMs: 10 } },
+      async inspect() {
+        inspections++
+        return inspections === 1
+          ? { state: 'pending', inspectAfterMs: 10 }
+          : { state: 'succeeded', verdict: 'done', data: { final: 0.61 } }
+      },
+      async cancel() { return { state: 'cancelled' } },
+    }
+    const deps = {
+      dispatcher, projectDir: dir,
+      effectAdapters: new EffectAdapterRegistry([adapter]),
+    }
+    await tickOnce(deps)
+    expect(dispatcher.spawns).toHaveLength(1)
+    await new Promise(resolve => setTimeout(resolve, 12))
+    await tickOnce(deps)
+    expect(inspections).toBe(1)
+    expect(dispatcher.spawns).toHaveLength(1)
+    await new Promise(resolve => setTimeout(resolve, 12))
+    await pump(deps, async () => JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status === 'done')
+    expect(inspections).toBe(2)
+    expect(dispatcher.spawns.filter(isHarvest)).toHaveLength(1)
+  })
+
+  it('routes a frozen Effect Rule escalation directly to paused_attention', async () => {
+    const { dir, paths } = await setup({
+      effects: {
+        quota_guard: {
+          adapter: 'test/quota@1',
+          observations: { exhausted: { pointer: '/data/exhausted', type: 'boolean' } },
+          rules: [{
+            when: 'exhausted', then: { act: 'escalate', reason: 'remote quota exhausted' },
+            onAbsent: 'fail_stop', onError: 'fail_stop',
+          }],
+          admission: { maxConcurrentCalls: 1 },
+        },
+      },
+    })
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task) && !isHarvest(task)) {
+        return { label: 'wait', effectKey: 'quota-job', effectBinding: 'quota_guard' }
+      }
+      throw new Error('Effect Rule escalation must not spawn another seat')
+    })
+    const adapter: EffectAdapter = {
+      id: 'test/quota@1',
+      async submit() { return { inspectAfterMs: 10 } },
+      async inspect() { return { state: 'pending', data: { exhausted: true }, inspectAfterMs: 10 } },
+      async cancel() { return { state: 'cancelled' } },
+    }
+    const deps = {
+      dispatcher, projectDir: dir,
+      effectAdapters: new EffectAdapterRegistry([adapter]),
+    }
+    await tickOnce(deps)
+    await new Promise(resolve => setTimeout(resolve, 12))
+    const tick = await tickOnce(deps)
+    expect(tick.outcomes[0]?.outcome).toMatchObject({
+      route: 'escalate:remote quota exhausted', status: 'paused_attention',
+    })
+    expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('paused_attention')
+    expect(dispatcher.spawns).toHaveLength(1)
+  })
+
+  it('fail-stops immediately when a frozen EffectBinding has no host adapter registration', async () => {
+    const { dir, paths } = await setup({
+      effects: {
+        unavailable: {
+          adapter: 'test/unavailable@1', observations: {}, rules: [],
+          admission: { maxConcurrentCalls: 1 },
+        },
+      },
+    })
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) return {
+        label: 'wait', effectKey: 'unavailable-job', effectBinding: 'unavailable',
+      }
+      throw new Error('host configuration errors are not model-correctable')
+    })
+    const tick = await tickOnce({ projectDir: dir, dispatcher })
+    expect(tick.outcomes[0]?.error).toContain("EffectAdapter 'test/unavailable@1' is not registered")
+    expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8'))).toMatchObject({
+      status: 'failed', statusReason: expect.stringContaining('effect configuration failed'),
+    })
+    expect(dispatcher.spawns).toHaveLength(1)
+    expect((await new WakeStore(dir).list()).filter(wake =>
+      wake.status === 'pending' || wake.status === 'claimed',
+    )).toHaveLength(0)
+  })
+
   it('submit(event wait) → external event concludes → harvest completes the SAME round', async () => {
     const { dir, paths } = await setup()
     const dispatcher = scriptedDispatcher(trainingScript(paths))
@@ -163,6 +274,51 @@ describe('waiting rounds — RECONCILE crash matrix', () => {
     const effects = new EffectLedger(new Ledger(paths), paths)
     return { dir, paths, instance, wakeStore, effects, dispatcher }
   }
+
+  it('fail-stops in the same reconciliation pass when recovered typed observations are invalid', async () => {
+    const { dir, paths } = await setup({
+      effects: {
+        recovered: {
+          adapter: 'test/recovered@1',
+          observations: { balance: { pointer: '/data/balance', type: 'number' } },
+          rules: [{
+            when: 'balance <= 0', then: { act: 'harvest', verdict: 'empty' },
+            onAbsent: 'fail_stop', onError: 'fail_stop',
+          }],
+        },
+      },
+    })
+    const instance = (await loadInstance(dir, 'walk-research-v1'))!
+    const wakeStore = new WakeStore(dir)
+    await wakeStore.cancelForLoop(instance.record.instanceId)
+    const effects = new EffectLedger(new Ledger(paths), paths)
+    await effects.submit({
+      effectKey: 'recovered-job', kind: 'adapter', waitName: 'effect_adapter',
+      adapterId: 'test/recovered@1', effectBindingId: 'recovered',
+      deadlineAt: Date.now() + 60_000,
+      retryPolicy: { maxAttempts: 2, baseDelayMs: 10, maxDelayMs: 20, callTimeoutMs: 100 },
+    })
+    await writePendingRound(instance, {
+      round: 1, mode: 'normal', kind: 'effect', effectKey: 'recovered-job',
+      waitName: 'event', expiresAt: Date.now() + 60_000, startedAt: Date.now(),
+      costUsdSoFar: 0, seatSummaries: {}, correctiveRetries: 0,
+      submitSummary: 'crashed after remote submit', createdAt: Date.now(),
+    })
+    await setInstanceStatus(instance, 'waiting')
+    const adapter: EffectAdapter = {
+      id: 'test/recovered@1',
+      async submit() { throw new Error('must reconcile before any resubmit') },
+      async inspect() { return { state: 'pending', inspectAfterMs: 10 } },
+      async reconcile() { return { state: 'pending', data: { balance: 'invalid' }, inspectAfterMs: 10 } },
+      async cancel() { return { state: 'cancelled' } },
+    }
+    const actions = await reconcileWaiting(instance, {
+      wakeStore, projectDir: dir, effectAdapters: new EffectAdapterRegistry([adapter]),
+    })
+    expect(actions).toContain('fail-stopped on failed effect recovered-job')
+    expect((await loadInstance(dir, instance.record.instanceId))?.record.status).toBe('failed')
+    expect((await effects.get('recovered-job'))?.lastError).toContain('Effect Rule fail-stop')
+  })
 
   it('heals a lost harvest wake (effect concluded, wake gone)', async () => {
     const { instance, wakeStore, effects, dir } = await crashedInstance()

@@ -11,7 +11,7 @@ import { mkdir, readdir } from 'fs/promises'
 import { join, resolve } from 'path'
 import { atomicWriteJson, readJsonFile, withFileLock } from '../../infra/persist/index.js'
 import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
-import { freezeCharter, normalizeCharter } from '../charter/CharterValidate.js'
+import { freezeCharter, normalizeFrozenCharterForRuntime } from '../charter/CharterValidate.js'
 import { Ledger, withBuiltinSchemas } from '../ledger/LedgerApi.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import {
@@ -107,7 +107,7 @@ async function loadInstanceFrom(paths: InstancePaths, record: LoopInstanceRecord
     record,
     // Pre-v3 frozen snapshots carry legacy tripwire actions; normalize on every
     // load (deterministic, in-memory only — the on-disk snapshot/hash is untouched).
-    charter: normalizeCharter(charter),
+    charter: normalizeFrozenCharterForRuntime(charter),
     paths,
     ledger: withBuiltinSchemas(new Ledger(paths), paths),
   }
