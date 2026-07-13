@@ -7,6 +7,7 @@ import {
   resolveConfiguredWriteAllowPaths,
   resolveHostPathRequirement,
 } from '../../sandbox/configuredWritePaths.js'
+import { resolveExistingInside } from './PathSafety.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -54,6 +55,26 @@ export async function preflightCharterCapabilities(
       const detail = error instanceof Error ? error.message : String(error)
       throw new Error(`worker vcsPublish requires a git repository with remote '${remote}': ${detail}`)
     }
+  }
+
+
+  const workspaceEvidence = [
+    ...Object.values(charter.seats ?? {}).flatMap(seat => seat?.inputs ?? []),
+    ...Object.values(charter.gates ?? {}).flatMap(gate =>
+      gate.kind === 'judge' ? gate.evidence : []),
+  ].filter(value => value.startsWith('workspace:'))
+  const missingEvidence: string[] = []
+  for (const value of [...new Set(workspaceEvidence)]) {
+    try {
+      await resolveExistingInside(projectDir, value.slice('workspace:'.length))
+    } catch {
+      missingEvidence.push(value)
+    }
+  }
+  if (missingEvidence.length > 0) {
+    throw new Error(
+      `workspace evidence required by isolated seats is unavailable: ${missingEvidence.join(', ')}`,
+    )
   }
 }
 

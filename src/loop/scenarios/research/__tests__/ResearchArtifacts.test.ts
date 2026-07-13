@@ -84,6 +84,33 @@ describe('ResearchArtifacts', () => {
     expect(JSON.parse(await readFile(instance.paths.directionsJson, 'utf-8')).directions).toHaveLength(1)
   })
 
+  it('commits only judge-accepted finding indexes from a mixed draft', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'research-artifacts-per-item-'))
+    const instance = await createInstance({
+      projectDir: dir, charter: walkResearchCharter(), wakeStore: new WakeStore(dir),
+    })
+    await reconcileResearchArtifacts(instance)
+    await writeFile(join(instance.paths.draftsDir, 'findings_draft.json'), JSON.stringify([
+      { claim: 'valid', evidence: 'complete' },
+      { claim: 'invalid', evidence: 'missing task id' },
+      { claim: 'also-valid', evidence: 'complete' },
+    ]))
+    const result = await commitResearchArtifacts(instance, {
+      round: 1, producerOk: true, judgeRequired: true,
+      judge: {
+        ok: true,
+        data: {
+          verdict: 'pass', accepted_finding_indexes: [0, 2],
+          new_findings_count: 2, messages: ['finding 1 missing task id'],
+        },
+      },
+    })
+    expect(result).toMatchObject({ committed: { finding: 2 }, admittedItems: 2, rejected: 1 })
+    const findings = (await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')
+      .map(line => JSON.parse(line) as { claim: string })
+    expect(findings.map(finding => finding.claim)).toEqual(['valid', 'also-valid'])
+  })
+
   it('appends the compatibility finding projection on the hot path and rebuilds a lost watermark', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'research-projection-index-'))
     const instance = await createInstance({

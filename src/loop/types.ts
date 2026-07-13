@@ -249,6 +249,10 @@ export interface PendingRound {
   /** self_timer only: why the worker parked, and when the timer resumes it. */
   reason?: string
   fireAt?: number
+  /** self_timer liveness state. Missing legacy fields are normalized to one
+   * park and a deadline derived from startedAt. */
+  parkCount?: number
+  waitDeadlineAt?: number
   /** Effect wait only: deterministic liveness deadline and reconciliation mark. */
   expiresAt?: number
   timedOutAt?: number

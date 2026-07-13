@@ -95,7 +95,14 @@ export async function commitResearchArtifacts(
       proposals,
       specs,
       existingEvents: [],
-      gateResults: (proposal, spec) => gateResults(spec, proposal, input, committedDirections),
+      gateResults: (proposal, spec) => gateResults(
+        spec, proposal,
+        {
+          ...input,
+          findingProposalCount: proposals.filter(item => item.artifactId === 'finding').length,
+        },
+        committedDirections,
+      ),
       append: async event => {
         await instance.ledger.appendJsonl(instance.paths.artifactsJsonl, event)
       },
@@ -191,7 +198,12 @@ async function readResearchProposals(
 function gateResults(
   spec: ArtifactSpec,
   proposal: ArtifactProposal,
-  input: { producerOk: boolean; judgeRequired: boolean; judge: ResearchJudgeResult | null },
+  input: {
+    producerOk: boolean
+    judgeRequired: boolean
+    judge: ResearchJudgeResult | null
+    findingProposalCount: number
+  },
   committedDirections: unknown[],
 ): ArtifactGateResult[] {
   const results: ArtifactGateResult[] = [{
@@ -202,18 +214,32 @@ function gateResults(
     evidence: [proposal.contentHash],
   }]
   if (spec.id === 'finding' && spec.requiredGates.includes('judge')) {
+    const acceptedIndexes = input.judge?.data['accepted_finding_indexes']
+    const proposalIndex = findingProposalIndex(proposal.proposalId)
+    const perFindingAccepted = Array.isArray(acceptedIndexes)
+      ? proposalIndex !== null && acceptedIndexes.some(value => value === proposalIndex)
+      : input.findingProposalCount === 1 ||
+          input.judge?.data['new_findings_count'] === input.findingProposalCount
+        ? null
+        : false
     const verdict: ArtifactGateResult['verdict'] = !input.judgeRequired
       ? 'pass'
       : !input.judge || !input.judge.ok
         ? 'error'
         : input.judge.data['verdict'] === 'fail'
           ? 'fail'
-          : 'pass'
+          : perFindingAccepted === null
+            ? 'pass' // unambiguous legacy single/all-valid batch compatibility
+            : perFindingAccepted ? 'pass' : 'fail'
+    const messages = Array.isArray(input.judge?.data['messages'])
+      ? (input.judge!.data['messages'] as unknown[]).map(String)
+      : []
+    if (perFindingAccepted === false && messages.length === 0) {
+      messages.push(`finding proposal index ${proposalIndex ?? '?'} was not accepted by the judge`)
+    }
     results.push({
       proposalId: proposal.proposalId, gateId: 'judge', verdict,
-      messages: Array.isArray(input.judge?.data['messages'])
-        ? (input.judge!.data['messages'] as unknown[]).map(String)
-        : [],
+      messages,
       evidence: [proposal.contentHash],
     })
   } else if (spec.id === 'direction' && spec.requiredGates.includes('direction_diversity')) {
@@ -228,6 +254,13 @@ function gateResults(
     })
   }
   return results
+}
+
+function findingProposalIndex(proposalId: string): number | null {
+  const match = proposalId.match(/:finding:(\d+)$/)
+  if (!match) return null
+  const value = Number(match[1])
+  return Number.isSafeInteger(value) ? value : null
 }
 
 async function projectResearchArtifacts(

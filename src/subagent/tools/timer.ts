@@ -51,7 +51,7 @@ Choosing the delay — don't set it too short or too long:
   longer than 3 h is a design smell — split it into repeated shorter waits.
 - Pick a delay proportional to how long the slow task actually needs to make
   visible progress (e.g. ~30 min for a training run to move its reward curve).
-- reason:  short reason shown to you on resume (e.g. "check gradmotion progress").`,
+- reason:  short reason shown to you on resume (e.g. "check remote job progress").`,
     inputSchema: {
       type: 'object',
       required: ['minutes', 'reason'],

@@ -56,7 +56,9 @@ describe('Loop capability closure', () => {
     await writeFile(join(projectDir, 'src', 'model.txt'), 'v2\n')
     await writeFile(join(projectDir, 'outside.txt'), 'must-not-publish\n')
     const tool = makeVcsPublishTool({ projectDir, writeScope: ['src/**'], remote: 'origin' })
-    const result = await tool.call({ message: 'train: update model' }, {} as never)
+    const result = await tool.call({
+      message: 'train: update model', paths: ['src/model.txt'],
+    }, {} as never)
     expect(result.isError).toBe(false)
 
     const remoteFile = (await git(root, ['--git-dir', remote, 'show', 'main:src/model.txt'])).trim()
@@ -65,6 +67,19 @@ describe('Loop capability closure', () => {
     expect(localOutside).toBe('must-not-publish\n')
     const remoteOutside = (await git(root, ['--git-dir', remote, 'show', 'main:outside.txt'])).trim()
     expect(remoteOutside).toBe('keep')
+  })
+
+  it('preflights explicit workspace evidence without importing it into the ledger', async () => {
+    const projectDir = await mkdtemp(join(tmpdir(), 'loop-cap-history-'))
+    const charter = walkResearchCharter()
+    charter.seats.pivoter!.inputs = ['workspace:docs/research-history.md']
+    await expect(createInstance({ projectDir, charter })).rejects.toThrow(/workspace evidence/)
+
+    await mkdir(join(projectDir, 'docs'), { recursive: true })
+    await writeFile(join(projectDir, 'docs', 'research-history.md'), '# Dead Ends\n- repeated-direction\n')
+    const instance = await createInstance({ projectDir, charter })
+    expect(await instance.ledger.readJsonl(instance.paths.findingsJsonl)).toEqual([])
+    expect((await instance.ledger.readProgress()).bestMetric).toBeNull()
   })
 })
 

@@ -29,6 +29,22 @@ function resolveTimeoutMs(raw: unknown): number {
   return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, raw))
 }
 
+/** Last-resort transcript guard for CLIs that print credentials despite the
+ * filtered environment. Workflows should still capture secrets and consume
+ * them inside one shell process; this prevents common JSON/env shapes from
+ * entering model context, debug logs, and long-lived lineage sessions. */
+export function redactSensitiveShellOutput(value: string): string {
+  return value
+    .replace(
+      /(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|credential)["']?\s*[:=]\s*)["']?[^\s,"'}]+["']?/gi,
+      '$1[REDACTED]',
+    )
+    .replace(
+      /\b((?:GM|OPENAI|ANTHROPIC|DEEPSEEK|QWEN|AWS|GITHUB|GITLAB)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=([^\s]+)/g,
+      '$1=[REDACTED]',
+    )
+}
+
 /**
  * H5: Build the env passed to the spawned shell.
  *
@@ -303,7 +319,10 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
       // must not be re-resolved against process.cwd() at spawn time.
       const cwd = resolvedCwd.path
       const limit = getMaxOut()
-      const trunc = (s: string) => s.length > limit ? s.slice(0, limit) + `\n[Truncated — ${s.length} bytes]` : s
+      const trunc = (raw: string) => {
+        const s = redactSensitiveShellOutput(raw)
+        return s.length > limit ? s.slice(0, limit) + `\n[Truncated — ${s.length} bytes]` : s
+      }
 
       // Resolve exec spec — priority order:
       //   1. ctx.sandboxHandle  injected by MetaAgentSession._wrapTool() for main-agent calls

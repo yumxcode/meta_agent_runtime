@@ -429,6 +429,8 @@ type WaitRequest =
 const DEFAULT_EVENT_MAX_WAIT_MS = 7 * 24 * 60 * 60_000
 const MIN_EVENT_MAX_WAIT_MS = 60_000
 const MAX_EVENT_MAX_WAIT_MS = 30 * 24 * 60 * 60_000
+const DEFAULT_SELF_TIMER_MAX_PARKS = 48
+const DEFAULT_SELF_TIMER_MAX_ELAPSED_MS = 24 * 60 * 60_000
 const DEFAULT_EFFECT_RETRY: EffectRetryPolicy = {
   maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 60_000, callTimeoutMs: 30_000,
 }
@@ -742,6 +744,8 @@ interface SubmitInput {
   correctiveRetries: number
   waitRequest: WaitRequest
   submitSummary: string
+  /** Existing self-timer chain state when a harvest segment parks again. */
+  priorSelfTimer?: PendingRound
 }
 
 async function submitSegment(
@@ -763,9 +767,14 @@ async function submitSegment(
   // Self-timer park: no effect ledger — just persist the round and schedule a
   // plain timer wake that resumes it at fireAt.
   if (input.waitRequest.mode === 'self_timer') {
-    const fireAt = Date.now() + input.waitRequest.afterMs
+    const policy = selfTimerPolicy(instance.charter)
+    const parkCount = (input.priorSelfTimer?.parkCount ?? 0) + 1
+    const waitDeadlineAt = input.priorSelfTimer?.waitDeadlineAt ??
+      input.startedAt + policy.maxRoundElapsedMs
+    const fireAt = Math.min(Date.now() + input.waitRequest.afterMs, waitDeadlineAt)
     await writePendingRound(instance, {
       ...base, kind: 'self_timer', reason: input.waitRequest.reason, fireAt,
+      parkCount, waitDeadlineAt,
     } satisfies PendingRound)
     await deps.wakeStore.schedule({ loopId: instance.record.instanceId, kind: 'timer', fireAt })
     await setInstanceStatus(instance, 'waiting', `self-timer: ${input.waitRequest.reason}`)
@@ -825,6 +834,7 @@ async function harvestSegment(
   const effectKey = isSelfTimer ? null : pending.effectKey!
   const progress = await ledger.readProgress()
   const mode = normalizeRoundMode(pending.mode)
+  const selfTimerLimit = isSelfTimer ? selfTimerLimitState(charter, pending) : null
 
   // Replay guard: if this round is ALREADY accounted (a crash landed between
   // completeRound's ledger writes and clearPendingRound), re-running the
@@ -870,6 +880,10 @@ async function harvestSegment(
       reason: pending.reason,
       submitSummary: pending.submitSummary,
     })
+    if (selfTimerLimit?.reached) {
+      preface += `\n【最终收割】self-timer 已达到确定性上限（${selfTimerLimit.reason}）。` +
+        '本段必须停止/取消仍在运行的远端任务并整理现有证据；禁止再次 timer。'
+    }
   } else {
     const effect = (await effects.get(effectKey!))!
     preface = scenarioRuntimeFor(instance.charter).harvestPreface({
@@ -888,12 +902,32 @@ async function harvestSegment(
   if (seatLoop.kind === 'wait') {
     // Chained wait / self-timer re-park: same round parks again.
     if (effectKey) await effects.markHarvested(effectKey)
+    if (isSelfTimer && selfTimerLimit?.reached && seatLoop.waitRequest?.mode === 'self_timer') {
+      const outcome = await terminate(instance, deps, {
+        round: pending.round, mode,
+        route: {
+          kind: 'escalate', cause: 'rule_error',
+          reason: `worker attempted to re-park after self-timer limit: ${selfTimerLimit.reason}`,
+        },
+        startedAt: pending.startedAt,
+        costUsd,
+        seatSummaries,
+        correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
+        observables: {},
+        meters: progress.meters,
+      })
+      await clearPendingRound(instance)
+      return outcome
+    }
     return submitSegment(instance, deps, {
       round: pending.round, mode, startedAt: pending.startedAt,
       costUsd, seatSummaries,
       correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
       waitRequest: seatLoop.waitRequest!,
       submitSummary: seatLoop.worker?.summary ?? '',
+      ...(isSelfTimer && seatLoop.waitRequest?.mode === 'self_timer'
+        ? { priorSelfTimer: pending }
+        : {}),
     })
   }
 
@@ -910,6 +944,34 @@ async function harvestSegment(
   await clearPendingRound(instance)
   if (effectKey) await effects.markHarvested(effectKey)
   return outcome
+}
+
+function selfTimerPolicy(charter: FrozenCharter): {
+  maxParksPerRound: number
+  maxRoundElapsedMs: number
+} {
+  return {
+    maxParksPerRound: charter.waitPolicy?.selfTimer?.maxParksPerRound ??
+      DEFAULT_SELF_TIMER_MAX_PARKS,
+    maxRoundElapsedMs: (charter.waitPolicy?.selfTimer?.maxRoundElapsedMin ??
+      DEFAULT_SELF_TIMER_MAX_ELAPSED_MS / 60_000) * 60_000,
+  }
+}
+
+function selfTimerLimitState(
+  charter: FrozenCharter,
+  pending: PendingRound,
+): { reached: boolean; reason: string } {
+  const policy = selfTimerPolicy(charter)
+  const parkCount = pending.parkCount ?? 1
+  const deadlineAt = pending.waitDeadlineAt ?? pending.startedAt + policy.maxRoundElapsedMs
+  if (parkCount >= policy.maxParksPerRound) {
+    return { reached: true, reason: `park ${parkCount}/${policy.maxParksPerRound}` }
+  }
+  if (Date.now() >= deadlineAt) {
+    return { reached: true, reason: `round wait deadline ${new Date(deadlineAt).toISOString()}` }
+  }
+  return { reached: false, reason: `park ${parkCount}/${policy.maxParksPerRound}` }
 }
 
 // ── complete: METER ▸ LEDGER ▸ ROUTE ──────────────────────────────────────────

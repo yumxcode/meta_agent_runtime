@@ -234,8 +234,23 @@ export interface SeatSpec {
    * is free because the process is dead while parked.
    */
   budgetPerRound?: { usd?: number; turns?: number; wallclockMin?: number }
-  /** Evidence whitelist for isolated seats (paths relative to stateRoot). */
+  /** Evidence whitelist for isolated seats. Plain paths are relative to the
+   * instance state root. `workspace:<relative-path>` is an explicitly reviewed,
+   * read-only, symlink-safe reference to a file in the project workspace. No
+   * directory convention or project-specific history layout is assumed. */
   inputs?: string[]
+}
+
+export interface WaitPolicySpec {
+  /** Bounds semantic self-timer polling inside one round. Segment wallclock and
+   * lifetime round budgets do not advance while a process is parked, so these
+   * limits are independently required for deterministic liveness. */
+  selfTimer?: {
+    /** Number of timer parks allowed before the next wake becomes final harvest. */
+    maxParksPerRound: number
+    /** Absolute submit-to-final-harvest elapsed limit for one round. */
+    maxRoundElapsedMin: number
+  }
 }
 
 export interface BudgetSpec {
@@ -287,6 +302,9 @@ export interface Charter {
     onError?: ObservationFailurePolicy
   }
   budgets?: BudgetSpec
+  /** Deterministic bounds for between-segment waits. Safe defaults are applied
+   * at runtime for legacy charters that omit this field. */
+  waitPolicy?: WaitPolicySpec
   /** repo write scope for the worker seat (D8); empty = state-only loop. */
   writeScope?: string[]
   /** Cadence of the next-round timer, ms after a round ends. Default 0 = immediate. */

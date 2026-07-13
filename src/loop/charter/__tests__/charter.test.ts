@@ -10,9 +10,9 @@ import { walkResearchCharter } from '../../__tests__/testCharter.js'
 describe('validateCharter', () => {
   it('validates declarative worker capability requirements and authoritative judge rubric', () => {
     const valid = walkResearchCharter()
-    valid.seats.worker.skills = ['gradmotion']
+    valid.seats.worker.skills = ['domain-runner']
     valid.seats.worker.capabilities = { vcsPublish: { remote: 'origin' } }
-    valid.seats.worker.hostRequirements = { writePaths: ['~/.account-pool'] }
+    valid.seats.worker.hostRequirements = { writePaths: ['~/.external-store'] }
     valid.writeScope = ['src/**']
     expect(validateCharter(valid)).toEqual([])
 
@@ -245,6 +245,31 @@ describe('validateCharter', () => {
     const charter = walkResearchCharter()
     charter.gates.state_gate = { kind: 'schema', files: ['ledger/progress.json'] }
     expect(validateCharter(charter).some(e => e.includes('requires a versioned spec'))).toBe(true)
+  })
+
+  it('validates deterministic self-timer bounds', () => {
+    const valid = walkResearchCharter({
+      waitPolicy: { selfTimer: { maxParksPerRound: 12, maxRoundElapsedMin: 360 } },
+    })
+    expect(validateCharter(valid)).toEqual([])
+    valid.waitPolicy!.selfTimer!.maxParksPerRound = 0
+    valid.waitPolicy!.selfTimer!.maxRoundElapsedMin = 4
+    const errs = validateCharter(valid)
+    expect(errs.some(e => e.includes('maxParksPerRound'))).toBe(true)
+    expect(errs.some(e => e.includes('maxRoundElapsedMin'))).toBe(true)
+  })
+
+  it('allows explicit workspace-relative evidence without imposing a directory convention', () => {
+    const valid = walkResearchCharter()
+    valid.seats.pivoter!.inputs = ['workspace:docs/research-history.md']
+    valid.gates.findings_gate = {
+      kind: 'judge',
+      evidence: ['drafts/findings_draft.json', 'workspace:docs/research-history.md'],
+      rubric: 'strict',
+    }
+    expect(validateCharter(valid)).toEqual([])
+    valid.seats.pivoter!.inputs = ['workspace:../outside.md']
+    expect(validateCharter(valid).some(e => e.includes("must not contain '..'"))).toBe(true)
   })
 })
 

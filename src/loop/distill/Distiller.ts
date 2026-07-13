@@ -34,7 +34,10 @@ export async function distillCharter(doc: string, deps: DistillDeps): Promise<Di
     ? await listAllSkillNames(deps.projectDir, 'simple_auto')
     : []
   const systemPrompt = deps.promptCatalog || discoveredSkills.length > 0
-    ? buildDistillerSystem({ ...deps.promptCatalog, skillNames: deps.promptCatalog?.skillNames ?? discoveredSkills })
+    ? buildDistillerSystem({
+        ...deps.promptCatalog,
+        skillNames: deps.promptCatalog?.skillNames ?? discoveredSkills,
+      })
     : DISTILLER_SYSTEM
   let lastErrors: string[] = []
   for (let attempt = 1; attempt <= maxAttempts; attempt++) {
@@ -58,6 +61,7 @@ export async function distillCharter(doc: string, deps: DistillDeps): Promise<Di
         useEventDriven: false,
         pollIntervalMs: 500,
         checkpointEveryNTurns: 0,
+        ...(deps.projectDir ? { projectDir: deps.projectDir } : {}),
       },
       signal,
     )

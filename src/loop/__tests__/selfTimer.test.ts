@@ -58,7 +58,7 @@ async function writeHarvestDrafts(paths: ReturnType<typeof instancePaths>): Prom
     JSON.stringify([{ claim: 'watched training to done', evidence: 'curve' }]), 'utf-8')
 }
 
-async function setup() {
+async function setup(waitPolicy?: { selfTimer: { maxParksPerRound: number; maxRoundElapsedMin: number } }) {
   const dir = await mkdtemp(join(tmpdir(), 'loop-selftimer-'))
   const paths = instancePaths(dir, 'walk-research-v1')
   const charter = walkResearchCharter({
@@ -67,6 +67,7 @@ async function setup() {
       judge: { context: 'isolated', prompt: 'J', inputs: ['drafts/findings_draft.json'] },
     },
     tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+    ...(waitPolicy ? { waitPolicy } : {}),
   })
   await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
   return { dir, paths }
@@ -133,5 +134,32 @@ describe('self_timer wait', () => {
     expect(captured).toEqual({ tooShort: true, tooLong: true })
     // No timer_cancel tool is offered anymore.
     // (park is enforced by the runner on the timer tool_result — see SubAgentRunner.)
+  })
+
+  it('forces a final harvest at the self-timer bound and escalates a forbidden re-park', async () => {
+    const { dir, paths } = await setup({
+      selfTimer: { maxParksPerRound: 1, maxRoundElapsedMin: 60 },
+    })
+    const dispatcher = scriptedDispatcher(async (task, config) => {
+      if (isWorker(task)) {
+        await callTimer(config, 30, '继续等待')
+        return { label: 'wait' }
+      }
+      throw new Error('unexpected seat')
+    })
+    const deps = { dispatcher, projectDir: dir }
+    await tickOnce(deps)
+    const instance = (await loadInstance(dir, 'walk-research-v1'))!
+    const pending = (await readPendingRound(instance))!
+    expect(pending.parkCount).toBe(1)
+    expect(pending.waitDeadlineAt).toBeGreaterThan(pending.startedAt)
+
+    await atomicWriteJson(paths.pendingRoundJson, { ...pending, fireAt: Date.now() - 1 })
+    await new WakeStore(dir).schedule({ loopId: 'walk-research-v1', kind: 'timer', fireAt: Date.now() })
+    await tickOnce(deps)
+
+    expect(dispatcher.spawns.some(task => task.includes('【最终收割】'))).toBe(true)
+    expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('paused_attention')
+    expect(await readPendingRound((await loadInstance(dir, 'walk-research-v1'))!)).toBeNull()
   })
 })

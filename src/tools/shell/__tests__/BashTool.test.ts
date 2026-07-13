@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mkdtemp } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
-import { createBashTool } from '../bash/index.js'
+import { createBashTool, redactSensitiveShellOutput } from '../bash/index.js'
 import type { ToolCallContext } from '../../../core/types.js'
 
 function makeCtx(workspaceRoot: string): ToolCallContext {
@@ -75,5 +75,16 @@ describe('bash tool — regression fixes (H4 / H5)', () => {
       if (prev === undefined) delete process.env['ANTHROPIC_API_KEY']
       else process.env['ANTHROPIC_API_KEY'] = prev
     }
+  })
+
+  it('redacts common credential fields before shell output enters model context', () => {
+    const output = redactSensitiveShellOutput(
+      '{"api_key":"service-secret","access_token":"token-secret","status":"ok"}\nSERVICE_API_KEY=raw-secret',
+    )
+    expect(output).not.toContain('service-secret')
+    expect(output).not.toContain('token-secret')
+    expect(output).not.toContain('raw-secret')
+    expect(output).toContain('"api_key":[REDACTED]')
+    expect(output).toContain('"status":"ok"')
   })
 })

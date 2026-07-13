@@ -10,7 +10,7 @@ import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentConfig, SubAgentRecord } from '../../subagent/types.js'
 import { makeSubAgentTaskId } from '../../subagent/types.js'
-import { DISTILLER_SYSTEM, distillCharter } from '../distill/Distiller.js'
+import { DISTILLER_SYSTEM, buildDistillerSystem, distillCharter } from '../distill/Distiller.js'
 import { migrateInstance } from '../instance/Migrate.js'
 import { createInstance, loadInstance, setInstanceStatus } from '../instance/InstanceStore.js'
 import { CharterStore } from '../charter/CharterStore.js'
@@ -74,8 +74,23 @@ describe('distillCharter', () => {
     expect(DISTILLER_SYSTEM).toContain('builtin/generic@1')
     expect(DISTILLER_SYSTEM).toContain('skill、timer、return_result 是内核基础工具')
     expect(DISTILLER_SYSTEM).toContain('vcs_publish')
+    expect(DISTILLER_SYSTEM).toContain('accepted_finding_indexes')
+    expect(DISTILLER_SYSTEM).toContain('waitPolicy.selfTimer')
+    expect(DISTILLER_SYSTEM).toContain('workspace:<项目相对路径>')
+    expect(DISTILLER_SYSTEM).toContain('不预设任何目录名')
+    expect(DISTILLER_SYSTEM).toContain('既有进展/失败尝试/决策记录')
+    expect(DISTILLER_SYSTEM).toContain('不得假设固定目录名')
+    expect(DISTILLER_SYSTEM).toContain('paths 必须逐项列出')
     expect(DISTILLER_SYSTEM).toContain('完整可运行 Research 示例')
     expect(DISTILLER_SYSTEM).toContain('taskSpec 是人工审阅/部署清单')
+  })
+
+  it('keeps the default mechanism free of project-specific conventions', () => {
+    const defaultPrompt = DISTILLER_SYSTEM.toLowerCase()
+    for (const projectToken of ['.oma', 'agibot', 'gradmotion', 'account-pool', 'humanoid/envs/x1']) {
+      expect(defaultPrompt).not.toContain(projectToken)
+    }
+    expect(DISTILLER_SYSTEM).toContain('绝不能把示例值提升为 Loop 的通用约定')
   })
 
   it('feeds validation errors back and succeeds on the corrected attempt', async () => {
@@ -105,6 +120,12 @@ describe('distillCharter', () => {
     expect(json).toBeTruthy()
     const parsed = JSON.parse(json!) as { charter: Parameters<typeof validateCharter>[0] }
     expect(validateCharter(parsed.charter)).toEqual([])
+  })
+
+  it('injects only explicitly supplied project evidence without a ledger import', () => {
+    const prompt = buildDistillerSystem({ workspaceEvidencePaths: ['docs/research-history.md'] })
+    expect(prompt).toContain('workspace:docs/research-history.md')
+    expect(prompt).toContain('不导入/改写 Ledger baseline')
   })
 
   it('gives up with the accumulated errors after max attempts', async () => {
@@ -302,11 +323,16 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-sbx-'))
     const paths = instancePaths(dir, 'walk-research-v1')
     const dispatcher = scriptedDispatcher(async t => passingSeats(paths)(t))
+    await mkdir(join(dir, 'docs'), { recursive: true })
+    await writeFile(join(dir, 'docs', 'research-history.md'), 'DEAD-END-MARKER: do-not-repeat', 'utf-8')
+    const charter = walkResearchCharter({
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+    })
+    const judgeGate = charter.gates.findings_gate
+    if (judgeGate?.kind === 'judge') judgeGate.evidence.push('workspace:docs/research-history.md')
     await createInstance({
       projectDir: dir,
-      charter: walkResearchCharter({
-        tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
-      }),
+      charter,
       wakeStore: new WakeStore(dir),
     })
     await runUntilQuiescent({ dispatcher, projectDir: dir })
@@ -326,6 +352,8 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
     expect(judge.sandbox).toBeUndefined()
     expect(judge.allowedTools).toEqual([])
     expect(judge.taskDescription).toContain('每条 finding 必须有训练数据支撑')
+    expect(judge.taskDescription).toContain('accepted_finding_indexes')
+    expect(judge.taskDescription).toContain('DEAD-END-MARKER: do-not-repeat')
   })
 
   it('emits the full observer event sequence for a round', async () => {

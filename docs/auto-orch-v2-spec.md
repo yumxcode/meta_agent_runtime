@@ -1,5 +1,9 @@
 # auto_orch v2 开发 Spec — 章程驱动的长周期 Loop 运行时
 
+> 历史说明：本文是早期、以训练项目为验收样本的开发规格，保留用于决策追溯。
+> 文中的项目目录、平台适配器和命令不是当前 Loop 通用机制；现行契约以
+> `loop-structural-generalization-plan-2026-07-13.md` 和运行时代码为准。
+
 > 状态：待评审 | 上游设计：`docs/auto-orch-v2-design.md` | 本文为可开发规格：
 > 组件接口、数据 schema、已定决议、任务分解（WBS）、开发时刻表、验收标准。
 

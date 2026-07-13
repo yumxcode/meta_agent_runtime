@@ -29,6 +29,7 @@ import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
 import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
+import { DEFAULT_SCENARIO_ID } from '../scenarios/ScenarioDefinitions.js'
 import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import { preflightCharterCapabilities } from '../security/CapabilityPreflight.js'
 import { makeVcsPublishTool } from './VcsPublishTool.js'
@@ -39,6 +40,7 @@ import {
 } from './InnerOrchWorker.js'
 
 const EVIDENCE_CAP_CHARS = 6_000
+const WORKSPACE_EVIDENCE_CAP_CHARS = 24_000
 const DEFAULT_WORKER_TOOLS = ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash']
 
 export interface SeatResult {
@@ -152,8 +154,8 @@ export async function runWorkerSeat(
       throw new CharterEnforcementError(`writeScope '${scope}' cannot be enforced: ${(err as Error).message}`)
     }
   }))
-  // Operator grants may expose host-local stores (for example an account-pool
-  // SQLite directory). Never inherit a configured path inside the workspace:
+  // Operator grants may expose host-local stores (for example an external CLI
+  // state directory). Never inherit a configured path inside the workspace:
   // Charter writeScope remains the sole authority there.
   const externalWriteRoots = resolveConfiguredWriteAllowPaths(deps.projectDir)
     .filter(path => !pathIsUnder(path, deps.projectDir))
@@ -221,19 +223,23 @@ export function extraJudgeKeys(charter: FrozenCharter): string[] {
   return extras
 }
 
-export function buildJudgeContract(extraKeys: string[]): string {
+export function buildJudgeContract(extraKeys: string[], perFinding = false): string {
   const extraClause = extraKeys.length
     ? `\n【charter 观测字段（同样必须输出）】除上述固定字段外，data 还必须包含：${extraKeys.map(k => `"${k}"`).join('、')}。` +
       '其语义与取值标准以上方评审指令的定义为准；值只能是 number/boolean/string。' +
       '任何一个缺失都会让内核依赖它的规则失效，因此每轮都要输出全部字段。'
     : ''
+  const findingClause = perFinding
+    ? '\n【Research 逐条裁决】data 还必须包含 "accepted_finding_indexes"：本轮 findings_draft 数组中通过全部 rubric 的零基索引数组。不得因一条合格而放行同批不合格 finding；new_findings_count 必须等于该数组长度。'
+    : ''
+  const findingField = perFinding ? ',"accepted_finding_indexes":[<zero-based int>,...]' : ''
   return `\
 你是隔离评审座位：你看不到执行座位的任何推理过程，只能依据下方内嵌证据作出裁决。
 必须调用 return_result，data 写：
-{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]}${extraClause}
+{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]${findingField}}${extraClause}
 每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
 metric_delta 的符号与原始指标方向无关：大于 0 永远表示改善，小于 0 表示退化；原始 metric 的最优方向由 charter 定义。
-【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。`
+【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。${findingClause}`
 }
 
 export async function runJudgeSeat(
@@ -247,7 +253,9 @@ export async function runJudgeSeat(
   if (!seat) throw new Error('charter has no judge seat')
   // A declared judge Gate owns both rubric and evidence. seat.inputs remains a
   // legacy fallback only for judge seats with no Gate-bound evidence.
-  const evidence = await inlineEvidence(paths, evidencePaths.length > 0 ? evidencePaths : (seat.inputs ?? []))
+  const evidence = await inlineEvidence(
+    paths, deps.projectDir, evidencePaths.length > 0 ? evidencePaths : (seat.inputs ?? []),
+  )
   const gateRubric = Object.entries(charter.gates)
     .filter(([, gate]) => gate.kind === 'judge')
     .map(([id, gate]) => `【Judge Gate rubric: ${id}】\n${gate.kind === 'judge' ? gate.rubric : ''}`)
@@ -256,7 +264,9 @@ export async function runJudgeSeat(
   // acceptance mechanism works for every loop with a judge.
   const task = [
     `【验收目标】${charter.goal}`,
-    seat.prompt, gateRubric, buildJudgeContract(extraJudgeKeys(charter)), '【证据（内嵌，只此为界）】', evidence,
+    seat.prompt, gateRubric,
+    buildJudgeContract(extraJudgeKeys(charter), charter.scenario === DEFAULT_SCENARIO_ID),
+    '【证据（内嵌，只此为界）】', evidence,
   ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
   return runSeat(deps, seat, task, [], undefined, undefined, undefined, undefined, undefined, budgetOverride)
@@ -276,7 +286,7 @@ export async function runPivoterSeat(
 ): Promise<SeatResult> {
   const seat = charter.seats.pivoter
   if (!seat) throw new Error('charter has no pivoter seat')
-  const evidence = await inlineEvidence(paths, seat.inputs ?? [])
+  const evidence = await inlineEvidence(paths, deps.projectDir, seat.inputs ?? [])
   const task = [renderCapsule(capsule), seat.prompt, PIVOTER_CONTRACT, '【证据（内嵌）】', evidence]
     .filter(Boolean).join('\n\n')
   return runSeat(deps, seat, task, [], undefined, undefined, undefined, undefined, undefined, budgetOverride)
@@ -297,7 +307,7 @@ export async function runFinalizerSeat(
 ): Promise<SeatResult> {
   const seat = charter.seats.finalizer
   if (!seat) throw new Error('charter has no finalizer seat')
-  const evidence = await inlineEvidence(paths, seat.inputs ?? FINALIZER_DEFAULT_INPUTS)
+  const evidence = await inlineEvidence(paths, deps.projectDir, seat.inputs ?? FINALIZER_DEFAULT_INPUTS)
   const task = [
     `【终止原因】${reason}`,
     `【验收目标】${charter.goal}`,
@@ -420,12 +430,19 @@ function lastJsonBlock(text: string): Record<string, unknown> | null {
   return null
 }
 
-async function inlineEvidence(paths: InstancePaths, relPaths: string[]): Promise<string> {
+async function inlineEvidence(
+  paths: InstancePaths,
+  projectDir: string,
+  relPaths: string[],
+): Promise<string> {
   const sections: string[] = []
   for (const rel of relPaths) {
     let abs: string
+    const workspaceEvidence = rel.startsWith('workspace:')
     try {
-      abs = await resolveExistingInside(paths.root, rel)
+      abs = workspaceEvidence
+        ? await resolveExistingInside(projectDir, rel.slice('workspace:'.length))
+        : await resolveExistingInside(paths.root, rel)
     } catch (err) {
       // Unsafe paths and symlink escapes are configuration/security failures,
       // not optional missing evidence. Preserve fail-closed behavior.
@@ -435,7 +452,8 @@ async function inlineEvidence(paths: InstancePaths, relPaths: string[]): Promise
     }
     try {
       const raw = await readFile(abs, 'utf-8')
-      const capped = raw.length > EVIDENCE_CAP_CHARS ? raw.slice(-EVIDENCE_CAP_CHARS) : raw
+      const limit = workspaceEvidence ? WORKSPACE_EVIDENCE_CAP_CHARS : EVIDENCE_CAP_CHARS
+      const capped = raw.length > limit ? raw.slice(-limit) : raw
       sections.push(`--- ${rel} ---\n${capped}`)
     } catch {
       sections.push(`--- ${rel} ---\n(不存在)`)

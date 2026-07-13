@@ -237,7 +237,7 @@ export function validateCharter(rawCharter: Charter): string[] {
       errs.push(`seats.${name}.prompt references .meta-agent/ — runtime-internal, writes there are discarded`)
     }
     for (const input of seat.inputs ?? []) {
-      const pathErr = relativePathError(input)
+      const pathErr = evidencePathError(input)
       if (pathErr) errs.push(`seats.${name}.inputs '${input}' ${pathErr}`)
     }
     if (seat.skills !== undefined && !Array.isArray(seat.skills)) {
@@ -294,6 +294,18 @@ export function validateCharter(rawCharter: Charter): string[] {
     errs.push('seats.worker.capabilities.vcsPublish requires a non-empty writeScope')
   }
 
+  const selfTimer = charter.waitPolicy?.selfTimer
+  if (selfTimer) {
+    if (!Number.isInteger(selfTimer.maxParksPerRound) ||
+        selfTimer.maxParksPerRound < 1 || selfTimer.maxParksPerRound > 100) {
+      errs.push('waitPolicy.selfTimer.maxParksPerRound must be an integer from 1 to 100')
+    }
+    if (!Number.isFinite(selfTimer.maxRoundElapsedMin) ||
+        selfTimer.maxRoundElapsedMin < 5 || selfTimer.maxRoundElapsedMin > 30 * 24 * 60) {
+      errs.push('waitPolicy.selfTimer.maxRoundElapsedMin must be from 5 to 43200 minutes')
+    }
+  }
+
   // Gates.
   const judgeGateNames: string[] = []
   for (const [name, gate] of Object.entries(charter.gates ?? {})) {
@@ -306,7 +318,7 @@ export function validateCharter(rawCharter: Charter): string[] {
         errs.push(`gate[${name}].rubric must be a non-empty authoritative judge rubric`)
       }
       for (const evidence of gate.evidence) {
-        const pathErr = relativePathError(evidence)
+        const pathErr = evidencePathError(evidence)
         if (pathErr) errs.push(`gate[${name}].evidence '${evidence}' ${pathErr}`)
       }
     }
@@ -368,6 +380,15 @@ export function validateCharter(rawCharter: Charter): string[] {
   }
 
   return errs
+}
+
+/** Isolated-seat evidence normally lives under the instance root. An explicit
+ * workspace: reference selects one reviewed project-relative file; runtime
+ * realpath containment keeps the read-only channel inside the workspace. */
+function evidencePathError(value: string): string | null {
+  if (!value.startsWith('workspace:')) return relativePathError(value)
+  const rel = value.slice('workspace:'.length)
+  return relativePathError(rel)
 }
 
 function validateShapeSpec(spec: ShapeSpec, at: string): string[] {

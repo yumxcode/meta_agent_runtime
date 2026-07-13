@@ -10,8 +10,8 @@ export interface ToolRuntimeGuardsOptions {
    * Extra absolute host paths the OS sandbox should mount WRITABLE for every
    * sandboxed tool (bash). Sourced from config.json `sandbox.writeAllowPaths`.
    * Use for host-local stores the agent legitimately needs to read/write but
-   * that live outside the workspace — e.g. account-pool's SQLite DB dir
-   * (~/.account-pool), a shared credential store, etc. Callers should expand
+   * that live outside the workspace — e.g. an external CLI state directory
+   * or a shared credential store. Callers should expand
    * `~` and drop non-existent paths before passing them (bwrap fails if a bind
    * source is missing).
    */

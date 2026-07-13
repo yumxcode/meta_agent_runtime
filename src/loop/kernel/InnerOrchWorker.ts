@@ -110,7 +110,7 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
     ? `## 宿主状态路径\n操作员已预先批准本工作流所需的宿主写路径：${opts.hostWritePaths.join(', ')}。它们只用于对应 CLI/凭据状态，不得存放业务产物。`
     : ''
   const vcsNote = opts.vcsPublishRemote !== undefined
-    ? `## 版本发布\nCharter 已授权受限工具 vcs_publish；它只会暂存 writeScope、提交并推送到 ${opts.vcsPublishRemote || 'origin'}。必须使用该工具，禁止用 bash 直接执行 git add/commit/push。`
+    ? `## 版本发布\nCharter 已授权受限工具 vcs_publish；调用时 paths 必须逐项列出本轮实际修改的精确文件（禁止目录和 glob），工具只暂存这些文件并推送到 ${opts.vcsPublishRemote || 'origin'}。必须使用该工具，禁止用 bash 直接执行 git add/commit/push。`
     : ''
   const effectNote = Object.keys(opts.effectBindings ?? {}).length > 0
     ? `## 确定性外部 Effect\n若已提交由内核 adapter 跟踪的外部任务，使用 return_result data={"label":"wait","effectKey":"<稳定幂等ID>","effectBinding":"<绑定ID>"}。只能选择以下 Charter 冻结绑定：${Object.entries(opts.effectBindings ?? {}).map(([id, binding]) => `${id}→${binding.adapter}`).join(', ')}。不要自行填写 adapterId。`
