@@ -22,6 +22,7 @@ import {
   type LoopInstanceRecord,
   type LoopInstanceStatus,
 } from '../types.js'
+import { ensureWorkspaceIdentity, withWorkspaceOperationLock } from '../workspace/WorkspaceIdentity.js'
 
 export interface CreateInstanceInput {
   projectDir: string
@@ -41,11 +42,16 @@ export interface LoopInstance {
 }
 
 export async function createInstance(input: CreateInstanceInput): Promise<LoopInstance> {
+  return withWorkspaceOperationLock(input.projectDir, () => createInstanceUnlocked(input))
+}
+
+async function createInstanceUnlocked(input: CreateInstanceInput): Promise<LoopInstance> {
   const instanceId = input.instanceId ?? `${input.charter.id}-v${input.charter.version}`
   const paths = instancePaths(input.projectDir, instanceId)
+  const workspace = await ensureWorkspaceIdentity(input.projectDir)
 
   const existing = await readJsonFile<LoopInstanceRecord>(paths.instanceJson)
-  if (existing) return loadInstanceFrom(paths, existing)
+  if (existing) return loadInstanceFrom(paths, await bindRecordToWorkspace(paths, existing, workspace.workspaceId))
 
   const frozen = freezeCharter(input.charter)   // throws on invalid charter
   await preflightCharterCapabilities(frozen, input.projectDir)
@@ -73,6 +79,7 @@ export async function createInstance(input: CreateInstanceInput): Promise<LoopIn
 
   const record: LoopInstanceRecord = {
     schemaVersion: '1.0',
+    workspaceId: workspace.workspaceId,
     instanceId,
     charterId: frozen.id,
     charterVersion: frozen.version,
@@ -102,7 +109,31 @@ export async function loadInstance(
   const paths = instancePaths(projectDir, instanceId)
   const record = await readJsonFile<LoopInstanceRecord>(paths.instanceJson)
   if (!record) return null
-  return loadInstanceFrom(paths, record)
+  const workspace = await ensureWorkspaceIdentity(projectDir)
+  return loadInstanceFrom(paths, await bindRecordToWorkspace(paths, record, workspace.workspaceId))
+}
+
+async function bindRecordToWorkspace(
+  paths: InstancePaths,
+  record: LoopInstanceRecord,
+  workspaceId: string,
+): Promise<LoopInstanceRecord> {
+  if (record.workspaceId && record.workspaceId !== workspaceId) {
+    throw new Error(
+      `instance ${record.instanceId} belongs to workspace '${record.workspaceId}', ` +
+      `but the current workspace identity is '${workspaceId}'; run loop workspace-fork only on an intentional copy`,
+    )
+  }
+  if (record.workspaceId === workspaceId) return record
+  return withFileLock(paths.instanceJson, async () => {
+    const latest = await readJsonFile<LoopInstanceRecord>(paths.instanceJson) ?? record
+    if (latest.workspaceId && latest.workspaceId !== workspaceId) {
+      throw new Error(`instance ${latest.instanceId} workspace identity changed concurrently`)
+    }
+    const migrated = { ...latest, workspaceId, updatedAt: Date.now() }
+    await atomicWriteJson(paths.instanceJson, migrated)
+    return migrated
+  })
 }
 
 async function loadInstanceFrom(paths: InstancePaths, record: LoopInstanceRecord): Promise<LoopInstance> {

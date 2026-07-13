@@ -103,6 +103,8 @@ export type LoopInstanceStatus =
 
 export interface LoopInstanceRecord {
   schemaVersion: '1.0'
+  /** Stable host-wide workspace namespace. Optional only while loading legacy records. */
+  workspaceId?: string
   instanceId: LoopInstanceId
   charterId: string
   charterVersion: number

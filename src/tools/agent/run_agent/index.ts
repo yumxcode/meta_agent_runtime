@@ -3,6 +3,7 @@ import { loadToolPrompt } from '../../util.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
+import { loopTaskScopeFromSessionId } from '../../../subagent/loopScope.js'
 
 export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
@@ -61,6 +62,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
         })
 
       try {
+        const loopScope = loopTaskScopeFromSessionId(ctx.sessionId)
         const record = await bridge.spawnSubAgent({
           config: {
             taskDescription: withReturnResultHint(taskDescription),
@@ -74,6 +76,7 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
             checkpointEveryNTurns: 0,
             workspaceMode,
             isolateWorktree: workspaceMode === 'isolated_write',
+            ...(loopScope ?? {}),
           },
           abortSignal: ctx.abortSignal,
         })

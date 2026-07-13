@@ -9,6 +9,7 @@
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../core/types.js'
 import type { SubAgentBridge } from '../SubAgentBridge.js'
 import { withReturnResultHint } from './return_result.js'
+import { loopTaskScopeFromSessionId } from '../loopScope.js'
 
 export function makeSpawnSubAgentTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
@@ -157,6 +158,7 @@ would corrupt the tree.`,
       }
 
       try {
+        const loopScope = loopTaskScopeFromSessionId(ctx.sessionId)
         // Parse optional sandbox config from input
         const sandboxInput = input['sandbox'] as Record<string, unknown> | undefined
         const sandboxConfig = sandboxInput
@@ -190,6 +192,7 @@ would corrupt the tree.`,
                 ? 'isolated_write'
                 : 'shared_readonly',
             isolateWorktree: input['workspace_mode'] === 'isolated_write',
+            ...(loopScope ?? {}),
           },
           abortSignal: ctx.abortSignal,
         })

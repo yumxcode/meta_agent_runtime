@@ -62,7 +62,9 @@ describe('inner_orch_worker seat wiring', () => {
   it('lineage_loop → resumes a stable session id + lineage prompt + externalPromptAssembly', async () => {
     const cfg = await runWith('lineage_loop')
     expect(cfg.externalPromptAssembly).toBe(true)
-    expect(cfg.lineageSessionId).toBe('loop-walk-research-v1-worker')
+    expect(cfg.lineageSessionId).toMatch(/^loop-ws-[0-9a-f-]+-walk-research-v1-worker$/)
+    expect(cfg.workspaceId).toMatch(/^ws-/)
+    expect(cfg.loopInstanceId).toBe('walk-research-v1')
     expect(cfg.systemPrompt).toContain('WORKER_ROLE')
     expect(cfg.systemPrompt).toContain('自动压缩')        // lineage continuity clause
     expect(cfg.taskDescription.startsWith('<context>')).toBe(true)

@@ -58,7 +58,7 @@ export function buildDistillerSystem(catalog: DistillerPromptCatalog = {}): stri
   "tripwires": [{"when":"表达式","then":{"act":"pivot"}|{"act":"finalize","reason":"..."?}|{"act":"escalate","reason":"...","onResume":{"resetMeters":["stale_count"]}?},"onAbsent":"skip|false|fail_stop","onError":"skip|false|fail_stop"}],
   "gates": {"quality":{"kind":"judge","evidence":["drafts/x.json"],"rubric":"完整且权威的判断语义"}|{"kind":"schema","files":["drafts/x.json"],"spec":{"type":"object"}}},
   "seats": {
-    "worker":{"context":"lineage_round|lineage_loop|isolated","prompt":"仅领域动作","skills":["required-skill"]?,"tools":["read_file","edit_file","write_file","grep","glob","bash","spawn_sub_agent"]?,"capabilities":{"vcsPublish":{"remote":"origin"?}}?,"hostRequirements":{"writePaths":["~/.external-store"]}?,"budgetPerRound":{"usd":4,"turns":80,"wallclockMin":60}},
+    "worker":{"context":"lineage_round|lineage_loop|isolated","prompt":"仅领域动作","skills":["required-skill"]?,"tools":["read_file","edit_file","write_file","grep","glob","bash","spawn_sub_agent"]?,"capabilities":{"vcsPublish":{"remote":"origin"?}}?,"hostRequirements":{"writePaths":["~/.external-store"],"resources":[{"id":"external-system:stable-resource-id","mode":"exclusive|shared","maxConcurrent":2?}]}?,"budgetPerRound":{"usd":4,"turns":80,"wallclockMin":60}},
     "judge":{"context":"isolated","prompt":"评审角色和关注点","inputs":["drafts/x.json"]?},
     "pivoter":{"context":"isolated","prompt":"只依据内嵌证据给出结构性 directive","inputs":["ledger/directions.json","workspace:<project-relative-evidence-file>"]?}?,
     "finalizer":{"context":"isolated","prompt":"只依据内嵌证据收尾","inputs":["ledger/progress.json","ledger/findings.jsonl","ledger/directions.json"]?}?
@@ -98,6 +98,8 @@ export function buildDistillerSystem(catalog: DistillerPromptCatalog = {}): stri
 - 临时 payload、中间 JSON、CLI 输入统一使用内核注入的实例 scratch 目录；需要 ./payload.json 的 CLI 先 cd 到 scratch。不得写仓库根目录临时文件。
 - writeScope 只授权业务文件：现有文件或 path/**。它不授权 .git、ledger、events、inbox、drafts、宿主 HOME。
 - 需要宿主本地状态库时，在 hostRequirements.writePaths 声明需求；它不授予权限，create 只在操作员已通过 sandbox.writeAllowPaths 精确授权后通过。
+- 多个 workspace 可能操作同一宿主/远端资源时，在 hostRequirements.resources 声明稳定、无 secret 的资源 ID。exclusive 严格串行；只有外部系统确认并发安全时才用 shared + maxConcurrent。多个资源按 ID 排序原子获取，不要把 token/key 写进 ID。
+- 声明 hostRequirements.resources 的 worker 不得使用 spawn_sub_agent/run_agent：派生任务可能在 worker segment 结束后继续运行，从而逃逸资源租约。需要并行时拆成独立 Loop/round 或迁入 EffectAdapter。
 - 需要提交并推送代码时声明 capabilities.vcsPublish，并在 worker prompt 中调用 vcs_publish(message, paths)。paths 必须逐项列出本轮实际修改的精确文件，禁止目录/glob；绝不要求 worker 用 bash 执行 git add/commit/push，也绝不把 .git/** 放进 writeScope。
 - 获取宿主凭据时不得把 secret 打印给模型：在同一个 bash 进程内捕获、使用并 unset；禁止单独执行会回显 api_key/token 的命令。bash 输出另有通用凭据字段脱敏兜底。
 - drafts 与 scratch 自动可写；worker 永远不能写 Kernel ledger/events/inbox。
@@ -160,7 +162,7 @@ export function buildDistillerSystem(catalog: DistillerPromptCatalog = {}): stri
         "skills":["${domainSkill}"],
         "tools":["read_file","edit_file","write_file","grep","glob","bash"],
         "capabilities":{"vcsPublish":{"remote":"origin"}},
-        "hostRequirements":{"writePaths":["~/.experiment-runner"]},
+        "hostRequirements":{"writePaths":["~/.experiment-runner"],"resources":[{"id":"experiment-service:default-project","mode":"exclusive"}]},
         "budgetPerRound":{"usd":4,"turns":80,"wallclockMin":60}
       },
       "judge":{"context":"isolated","prompt":"你是严格、保守、只认证据的实验评审。","budgetPerRound":{"usd":0.5,"turns":10}},

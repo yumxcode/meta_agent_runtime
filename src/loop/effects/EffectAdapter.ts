@@ -1,5 +1,15 @@
+import {
+  HostSchedulerCoordinator,
+  adapterResourceId,
+} from '../host/HostSchedulerCoordinator.js'
+import type { ExecutionScope } from '../workspace/WorkspaceIdentity.js'
+
 export interface EffectAdapterContext {
+  workspaceId: string
+  instanceId: string
   effectKey: string
+  /** Stable adapter-facing idempotency identity; never use bare effectKey cross-workspace. */
+  externalIdempotencyKey: string
   payload?: Record<string, unknown>
   receipt?: Record<string, unknown>
   attempt: number
@@ -30,6 +40,8 @@ export type EffectCancellation =
 
 export interface EffectAdapter {
   readonly id: string
+  /** Non-secret host credential/profile identity used for shared admission. */
+  readonly credentialProfile?: string
   /** Host-wide safety ceiling; frozen bindings may only tighten it. */
   readonly admission?: Partial<EffectAdmissionPolicy>
   submit(context: EffectAdapterContext): Promise<EffectSubmitResult>
@@ -49,8 +61,10 @@ export class EffectConfigurationError extends Error {
 export class EffectAdapterRegistry {
   private readonly adapters = new Map<string, EffectAdapter>()
   private readonly admission = new Map<string, AdmissionState>()
+  private readonly hostCoordinator: HostSchedulerCoordinator
 
-  constructor(adapters: readonly EffectAdapter[] = []) {
+  constructor(adapters: readonly EffectAdapter[] = [], hostCoordinator = new HostSchedulerCoordinator()) {
+    this.hostCoordinator = hostCoordinator
     for (const adapter of adapters) this.register(adapter)
   }
 
@@ -76,13 +90,15 @@ export class EffectAdapterRegistry {
   ids(): readonly string[] { return [...this.adapters.keys()].sort() }
 
   /** FIFO, abortable per-adapter admission. Binding limits monotonically tighten host limits. */
-  runWithAdmission<T>(
+  async runWithAdmission<T>(
     id: string,
     requested: Partial<EffectAdmissionPolicy> | undefined,
     signal: AbortSignal,
     call: () => Promise<T>,
+    scope?: ExecutionScope,
   ): Promise<T> {
     this.resolve(id)
+    const adapter = this.resolve(id)
     const state = this.admission.get(id)!
     if (requested?.maxConcurrentCalls !== undefined) {
       state.maxConcurrentCalls = Math.min(
@@ -92,16 +108,41 @@ export class EffectAdapterRegistry {
     if (requested?.minIntervalMs !== undefined) {
       state.minIntervalMs = Math.max(state.minIntervalMs, boundedInterval(requested.minIntervalMs))
     }
-    return new Promise<T>((resolve, reject) => {
-      const request: AdmissionRequest<T> = { signal, call, resolve, reject }
+    const runLocal = (activeSignal: AbortSignal): Promise<T> => new Promise<T>((resolve, reject) => {
+      const request: AdmissionRequest<T> = { signal: activeSignal, call, resolve, reject }
       state.queue.push(request as AdmissionRequest<unknown>)
-      signal.addEventListener('abort', () => {
+      activeSignal.addEventListener('abort', () => {
         const index = state.queue.indexOf(request as AdmissionRequest<unknown>)
         if (index >= 0) state.queue.splice(index, 1)
-        reject(signal.reason ?? new Error(`EffectAdapter '${id}' admission aborted`))
+        reject(activeSignal.reason ?? new Error(`EffectAdapter '${id}' admission aborted`))
       }, { once: true })
       this.pumpAdmission(state)
     })
+    if (!scope) return runLocal(signal)
+    const coordinationAbort = new AbortController()
+    const forwardAbort = (): void => coordinationAbort.abort(signal.reason)
+    if (signal.aborted) forwardAbort()
+    else signal.addEventListener('abort', forwardAbort, { once: true })
+    const handle = await this.hostCoordinator.acquireAdapterCall(
+      scope,
+      adapterResourceId(id, adapter.credentialProfile ?? 'default'),
+      state.maxConcurrentCalls,
+      state.minIntervalMs,
+      coordinationAbort.signal,
+    )
+    const heartbeat = setInterval(() => {
+      void handle.heartbeat().then(ok => {
+        if (!ok) coordinationAbort.abort(new Error('host adapter-call lease lost'))
+      }).catch(() => coordinationAbort.abort(new Error('host adapter-call heartbeat failed')))
+    }, this.hostCoordinator.heartbeatIntervalMs)
+    heartbeat.unref?.()
+    try {
+      return await runLocal(coordinationAbort.signal)
+    } finally {
+      clearInterval(heartbeat)
+      signal.removeEventListener('abort', forwardAbort)
+      await handle.release().catch(() => undefined)
+    }
   }
 
   private pumpAdmission(state: AdmissionState): void {

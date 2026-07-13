@@ -162,4 +162,33 @@ describe('runLoopScheduler', () => {
     expect(result.exitReason).toBe('idle')
     expect(completionOrder.slice(0, 2)).toEqual(['fast', 'slow'])
   }, 15_000)
+
+  it('runs different workspaces in parallel processes while respecting one host-wide round slot', async () => {
+    const state = await mkdtemp(join(tmpdir(), 'loop-daemon-host-state-'))
+    const a = await mkdtemp(join(tmpdir(), 'loop-daemon-workspace-a-'))
+    const b = await mkdtemp(join(tmpdir(), 'loop-daemon-workspace-b-'))
+    let activeWorkers = 0
+    let maxActiveWorkers = 0
+    const dispatcher = scriptedDispatcher(async task => {
+      if (task.includes('隔离评审座位')) {
+        return { verdict: 'pass', new_findings_count: 0, metric_delta: 0, metric: 0, messages: [] }
+      }
+      activeWorkers++
+      maxActiveWorkers = Math.max(maxActiveWorkers, activeWorkers)
+      await new Promise(resolve => setTimeout(resolve, 80))
+      activeWorkers--
+      return { label: 'ok' }
+    })
+    const terminal = [{ when: 'iteration >= 1', then: { act: 'finalize' as const } }]
+    await createInstance({ projectDir: a, charter: walkResearchCharter({ tripwires: terminal }) })
+    await createInstance({ projectDir: b, charter: walkResearchCharter({ tripwires: terminal }) })
+    const options = { rootDir: state, maxConcurrentRounds: 1, maxConcurrentModelCalls: 1, pollMs: 10 }
+    const [left, right] = await Promise.all([
+      runLoopScheduler({ dispatcher, projectDir: a, pollMs: 10, idleExitMs: 20, hostCoordinatorOptions: options }),
+      runLoopScheduler({ dispatcher, projectDir: b, pollMs: 10, idleExitMs: 20, hostCoordinatorOptions: options }),
+    ])
+    expect(left.exitReason).toBe('idle')
+    expect(right.exitReason).toBe('idle')
+    expect(maxActiveWorkers).toBe(1)
+  }, 15_000)
 })

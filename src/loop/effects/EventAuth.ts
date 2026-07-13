@@ -18,6 +18,8 @@ interface EventAuthSecret {
 export interface AuthenticatedEffectEvent {
   schemaVersion: '1.0'
   keyId: string
+  workspaceId: string
+  instanceId: string
   issuedAt: number
   expiresAt: number
   nonce: string
@@ -74,6 +76,7 @@ export async function signEffectEvent(
   const secret = await requireSecret(instance.paths)
   const event = {
     schemaVersion: '1.0' as const, keyId: secret.keyId,
+    workspaceId: requireWorkspaceId(instance), instanceId: instance.record.instanceId,
     issuedAt, expiresAt, nonce,
     principal, roles,
     effectKey, verdict,
@@ -102,6 +105,7 @@ export async function verifyEffectEvent(
   if (!value || typeof value !== 'object') return { ok: false, reason: 'event must be an object' }
   const event = value as Partial<AuthenticatedEffectEvent>
   if (event.schemaVersion !== '1.0' || typeof event.keyId !== 'string' ||
+      typeof event.workspaceId !== 'string' || typeof event.instanceId !== 'string' ||
       typeof event.issuedAt !== 'number' || typeof event.expiresAt !== 'number' ||
       typeof event.nonce !== 'string' || !safeNonce(event.nonce) ||
       typeof event.principal !== 'string' || !event.principal.trim() || event.principal.length > 256 ||
@@ -110,6 +114,10 @@ export async function verifyEffectEvent(
       typeof event.effectKey !== 'string' || !event.effectKey || event.effectKey.length > 512 ||
       typeof event.verdict !== 'string' || !event.verdict || event.verdict.length > 128 ||
       typeof event.signature !== 'string') return { ok: false, reason: 'invalid authenticated event schema' }
+  const workspaceId = requireWorkspaceId(instance)
+  if (event.workspaceId !== workspaceId || event.instanceId !== instance.record.instanceId) {
+    return { ok: false, reason: 'authenticated event workspace/instance scope mismatch' }
+  }
   if (event.issuedAt > now + 5 * 60_000) return { ok: false, reason: 'event issuedAt is too far in the future' }
   if (now > event.expiresAt) return { ok: false, reason: 'authenticated event has expired' }
   let secret: EventAuthSecret
@@ -121,6 +129,7 @@ export async function verifyEffectEvent(
   if (event.keyId !== secret.keyId) return { ok: false, reason: 'unknown event keyId' }
   const expected = signature(secret.secret, {
     schemaVersion: event.schemaVersion, keyId: event.keyId,
+    workspaceId: event.workspaceId, instanceId: event.instanceId,
     issuedAt: event.issuedAt, expiresAt: event.expiresAt,
     nonce: event.nonce, principal: event.principal, roles: event.roles,
     effectKey: event.effectKey, verdict: event.verdict,
@@ -144,11 +153,17 @@ async function requireSecret(paths: InstancePaths): Promise<EventAuthSecret> {
 
 function signature(secret: string, event: Omit<AuthenticatedEffectEvent, 'signature'>): string {
   const body = [
-    event.schemaVersion, event.keyId, String(event.issuedAt), event.nonce,
+    event.schemaVersion, event.keyId, event.workspaceId, event.instanceId,
+    String(event.issuedAt), event.nonce,
     String(event.expiresAt), event.principal, JSON.stringify(event.roles), event.effectKey, event.verdict,
     hashArtifactContent(event.data ?? null),
   ].join('\n')
   return createHmac('sha256', secret).update(body).digest('base64url')
+}
+
+function requireWorkspaceId(instance: LoopInstance): string {
+  if (!instance.record.workspaceId) throw new Error(`instance ${instance.record.instanceId} has no workspace identity`)
+  return instance.record.workspaceId
 }
 
 /** Secret deliberately lives outside the worker-visible instance workspace. */

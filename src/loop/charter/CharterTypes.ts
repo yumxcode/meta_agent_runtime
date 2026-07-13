@@ -226,6 +226,9 @@ export interface SeatSpec {
    * `sandbox.writeAllowPaths`. */
   hostRequirements?: {
     writePaths?: string[]
+    /** Host-wide resources used by the worker segment. This coordinates use;
+     * it does not grant filesystem or network capabilities. */
+    resources?: HostResourceSpec[]
   }
   /**
    * Per-SEGMENT circuit breakers for a seat call. `wallclockMin` sets the seat's
@@ -239,6 +242,13 @@ export interface SeatSpec {
    * read-only, symlink-safe reference to a file in the project workspace. No
    * directory convention or project-specific history layout is assumed. */
   inputs?: string[]
+}
+
+export interface HostResourceSpec {
+  id: string
+  mode: 'exclusive' | 'shared'
+  /** Required for useful shared admission; defaults to one. */
+  maxConcurrent?: number
 }
 
 export interface WaitPolicySpec {

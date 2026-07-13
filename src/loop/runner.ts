@@ -25,6 +25,9 @@ import {
   EffectConfigurationError,
   type EffectAdapterRegistry,
 } from './effects/EffectAdapter.js'
+import type { HostAdmissionHandle } from './host/HostSchedulerCoordinator.js'
+import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+import type { WorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
@@ -33,6 +36,9 @@ export interface TickDeps {
   effectAdapters?: EffectAdapterRegistry
   /** Live per-round/seat progress (CLI renders it). */
   observer?: (event: LoopEvent) => void
+  /** Host-wide coordination is injected by loop-scheduler and the host CLI tick path. */
+  hostCoordinator?: HostSchedulerCoordinator
+  workspaceIdentity?: WorkspaceIdentity
 }
 
 export interface TickResult {
@@ -88,6 +94,17 @@ export async function runClaimedWake(
   wakeStore: WakeStore,
   wake: WakeRecord,
 ): Promise<TickOutcome> {
+  const coordinationAbort = new AbortController()
+  const forwardAbort = (): void => coordinationAbort.abort(deps.signal?.reason)
+  if (deps.signal?.aborted) forwardAbort()
+  else deps.signal?.addEventListener('abort', forwardAbort, { once: true })
+  const wakeHeartbeat = setInterval(() => {
+    void wakeStore.heartbeat(wake.wakeId).catch(() => undefined)
+  }, 60_000)
+  wakeHeartbeat.unref?.()
+  let roundLease: HostAdmissionHandle | null = null
+  let resourceLease: HostAdmissionHandle | null = null
+  let leaseHeartbeat: ReturnType<typeof setInterval> | null = null
   try {
     const instance = await loadInstance(deps.projectDir, wake.loopId)
     if (!instance) {
@@ -98,13 +115,35 @@ export async function runClaimedWake(
       await wakeStore.release(wake.wakeId, 'cancelled')
       return { loopId: wake.loopId, error: `instance is ${instance.record.status}` }
     }
+    if (deps.hostCoordinator && deps.workspaceIdentity) {
+      const scope = {
+        workspaceId: deps.workspaceIdentity.workspaceId,
+        instanceId: instance.record.instanceId,
+        wakeId: wake.wakeId,
+      }
+      roundLease = await deps.hostCoordinator.acquireRound(scope, coordinationAbort.signal)
+      leaseHeartbeat = setInterval(() => {
+        void Promise.all([
+          roundLease?.heartbeat() ?? Promise.resolve(true),
+          resourceLease?.heartbeat() ?? Promise.resolve(true),
+        ]).then(results => {
+          if (results.some(ok => !ok)) coordinationAbort.abort(new Error('host coordination lease lost'))
+        }).catch(() => coordinationAbort.abort(new Error('host coordination heartbeat failed')))
+      }, deps.hostCoordinator.heartbeatIntervalMs)
+      leaseHeartbeat.unref?.()
+      const resources = instance.charter.seats.worker.hostRequirements?.resources ?? []
+      resourceLease = await deps.hostCoordinator.acquireResources(scope, resources, coordinationAbort.signal)
+    }
     const outcome = await runRound(instance, wake, {
       dispatcher: deps.dispatcher,
       projectDir: deps.projectDir,
-      signal: deps.signal ?? new AbortController().signal,
+      signal: coordinationAbort.signal,
       wakeStore,
       effectAdapters: deps.effectAdapters,
       observer: deps.observer,
+      hostCoordinator: deps.hostCoordinator,
+      workspaceIdentity: deps.workspaceIdentity,
+      loopInstanceId: instance.record.instanceId,
     })
     await wakeStore.release(wake.wakeId, outcome.route === 'stale-wake' ? 'cancelled' : 'done')
     return { loopId: wake.loopId, outcome }
@@ -163,6 +202,12 @@ export async function runClaimedWake(
     }
     await wakeStore.release(wake.wakeId, 'pending').catch(() => undefined)
     return { loopId: wake.loopId, error: err instanceof Error ? err.message : String(err) }
+  } finally {
+    if (leaseHeartbeat) clearInterval(leaseHeartbeat)
+    await resourceLease?.release().catch(() => undefined)
+    await roundLease?.release().catch(() => undefined)
+    clearInterval(wakeHeartbeat)
+    deps.signal?.removeEventListener('abort', forwardAbort)
   }
 }
 

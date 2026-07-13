@@ -14,6 +14,7 @@ import type { KernelConfig, ThinkingConfig } from '../types/KernelConfig.js'
 import type { APIMessage } from '../messages/MessageNormalizer.js'
 import { buildThinkingParam } from '../utils/ThinkingConfig.js'
 import { DebugWriter } from './DebugWriter.js'
+import { acquireRegisteredModelCall } from '../../infra/modelCallAdmission.js'
 import {
   isRetryableError,
   isPromptTooLongError,
@@ -205,6 +206,8 @@ export async function* streamMessages(
     ...(toolsParam.length > 0 ? { tools: toolsParam } : {}),
     ...(thinkingParam ? { thinking: thinkingParam } : {}),
   }
+  const modelAdmission = await acquireRegisteredModelCall(params.sessionId, params.abortSignal)
+  const activeAbortSignal = modelAdmission?.signal ?? params.abortSignal
 
   // Open debug file once (outside retry loop — one file per logical call)
   const writer = await DebugWriter.open(params.sessionId, params.model, config.debug)
@@ -225,7 +228,7 @@ export async function* streamMessages(
     while (true) {
       try {
         const stream = await client.messages.create(requestParams, {
-          signal: params.abortSignal,
+          signal: activeAbortSignal,
         })
 
         for await (const event of stream) {
@@ -253,7 +256,7 @@ export async function* streamMessages(
         if (yieldedAny) throw error
 
         const maxRetries = config.maxRetries ?? DEFAULT_MAX_RETRIES
-        if (isRetryableError(error) && attempt >= maxRetries && !params.abortSignal.aborted) {
+        if (isRetryableError(error) && attempt >= maxRetries && !activeAbortSignal.aborted) {
           throw new AvailabilityFallbackTriggeredError(
             error instanceof Error ? error.message : 'Provider unavailable after retries',
           )
@@ -262,7 +265,7 @@ export async function* streamMessages(
         if (
           !isRetryableError(error) ||
           attempt >= maxRetries ||
-          params.abortSignal.aborted
+          activeAbortSignal.aborted
         ) {
           throw error
         }
@@ -272,7 +275,7 @@ export async function* streamMessages(
         const jitter = Math.random() * 0.25 * base
         const delayMs = Math.floor(base + jitter)
         onRetry?.(attempt, maxRetries, delayMs, getErrorStatus(error))
-        const completed = await abortableSleep(delayMs, params.abortSignal)
+        const completed = await abortableSleep(delayMs, activeAbortSignal)
         if (!completed) {
           // Aborted mid-backoff — rethrow the original error so KernelLoop can
           // surface the interruption rather than silently retrying.
@@ -281,6 +284,7 @@ export async function* streamMessages(
       }
     }
   } finally {
+    await modelAdmission?.release().catch(() => undefined)
     // Single close point: covers normal completion, every throw path, AND the
     // consumer abandoning the generator mid-stream (break / early return),
     // which previously leaked the debug file handle.

@@ -30,7 +30,8 @@ import * as readline from 'node:readline'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { Writable } from 'node:stream'
-import { isAbsolute, resolve, join, basename } from 'node:path'
+import { isAbsolute, resolve, join, basename, relative } from 'node:path'
+import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
@@ -90,6 +91,7 @@ import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { CLI_VERSION } from './version.js'
+import { ensureWorkspaceIdentity } from '../loop/workspace/WorkspaceIdentity.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -5130,10 +5132,11 @@ async function askLine(question: string): Promise<string> {
 }
 
 /** Stable distill session id derived from the requirement doc (or an explicit --session). */
-function distillSessionId(docFile: string, override?: string): string {
-  if (override) return override
-  const slug = basename(docFile).replace(/\.[^.]+$/, '').replace(/[^a-zA-Z0-9_-]/g, '-').toLowerCase()
-  return `loop-distill-${slug || 'charter'}`
+function distillSessionId(projectDir: string, workspaceId: string, docFile: string, override?: string): string {
+  const relativeDoc = relative(resolve(projectDir), resolve(projectDir, docFile)).replace(/\\/g, '/')
+  const key = override ? `override:${override}` : `doc:${relativeDoc}`
+  const digest = createHash('sha256').update(key).digest('hex').slice(0, 16)
+  return `loop-distill-${workspaceId}-${digest}`
 }
 
 /**
@@ -5157,11 +5160,16 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
   const docFile = args.slice(1).find(a => !a.startsWith('--') && !skip.has(a))
   if (!docFile) throw new Error('loop distill: requirement doc path required')
   const doc = readFileSync(resolve(projectDir, docFile), 'utf-8')
-  const sessionId = distillSessionId(docFile, sessionOverride)
+  const workspaceIdentity = await ensureWorkspaceIdentity(projectDir)
+  const sessionId = distillSessionId(projectDir, workspaceIdentity.workspaceId, docFile, sessionOverride)
 
   assertApiKeyConfigured(opts)
 
   // Resume: preload the prior distill transcript so the agent keeps context.
+  const priorMeta = isResume ? await SessionStore.getSession(sessionId) : null
+  if (priorMeta && priorMeta.workspaceId !== workspaceIdentity.workspaceId) {
+    throw new Error(`distill 会话 ${sessionId} 的 workspace identity 不匹配，拒绝恢复。`)
+  }
   const priorMessages = isResume ? await SessionStore.loadHistory(sessionId) : []
   if (isResume && priorMessages.length === 0) {
     throw new Error(`没有可恢复的 distill 会话（${sessionId}）。请先不带 --resume 跑一次。`)
@@ -5224,7 +5232,8 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
     await SessionStore.replace(
       sessionId,
       { mode: 'agentic', startTime: Date.now(), lastActivity: Date.now(),
-        messageCount: router.getMessages().length, firstPrompt: `loop distill ${docFile}`, workspace: projectDir },
+        messageCount: router.getMessages().length, firstPrompt: `loop distill ${docFile}`,
+        workspace: projectDir, workspaceId: workspaceIdentity.workspaceId },
       router.getMessages(),
     ).catch(() => undefined)
     if (!wrote) {

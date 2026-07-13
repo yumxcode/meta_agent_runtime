@@ -28,6 +28,14 @@ import {
 } from './runner.js'
 import { listInstanceRecords } from './instance/InstanceStore.js'
 import { WakeStore } from './wake/WakeStore.js'
+import {
+  HostSchedulerCoordinator,
+  WorkspaceIdentityConflictError,
+  type HostCoordinatorOptions,
+  type HostAdmissionHandle,
+} from './host/HostSchedulerCoordinator.js'
+import { ensureWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
+import { CLI_VERSION } from '../cli/version.js'
 
 export interface DaemonOptions extends TickDeps {
   pollMs?: number
@@ -43,12 +51,14 @@ export interface DaemonOptions extends TickDeps {
   lockHeartbeatMs?: number
   /** Maximum rounds executing concurrently in this daemon. Default 4. */
   maxConcurrentRounds?: number
+  /** Host coordinator configuration; primarily deployment policy and test isolation. */
+  hostCoordinatorOptions?: HostCoordinatorOptions
 }
 
 export interface DaemonResult {
   ticks: number
   roundsRun: number
-  exitReason: 'idle' | 'aborted' | 'lock_held'
+  exitReason: 'idle' | 'aborted' | 'lock_held' | 'workspace_identity_conflict'
 }
 
 const LOCK_FILE = 'daemon.lock'
@@ -68,10 +78,26 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS,
     Math.max(10, Math.floor(lockFreshMs / 3)),
   ))
-  const lockToken = await acquireLock(lockPath, lockFreshMs)
+  const lockToken = await acquireDaemonLock(lockPath, lockFreshMs)
   if (!lockToken) {
     return { ticks: 0, roundsRun: 0, exitReason: 'lock_held' }
   }
+  const workspaceIdentity = await ensureWorkspaceIdentity(opts.projectDir)
+  const hostCoordinator = opts.hostCoordinator ?? new HostSchedulerCoordinator(opts.hostCoordinatorOptions)
+  let workspaceLease: HostAdmissionHandle
+  try {
+    workspaceLease = await hostCoordinator.acquireWorkspaceLease(workspaceIdentity, opts.projectDir, CLI_VERSION)
+  } catch (error) {
+    await releaseDaemonLock(lockPath, lockToken)
+    if (error instanceof WorkspaceIdentityConflictError) {
+      return { ticks: 0, roundsRun: 0, exitReason: 'workspace_identity_conflict' }
+    }
+    throw error
+  }
+  const schedulerAbort = new AbortController()
+  const forwardAbort = (): void => schedulerAbort.abort(opts.signal?.reason)
+  if (opts.signal?.aborted) forwardAbort()
+  else opts.signal?.addEventListener('abort', forwardAbort, { once: true })
   // This timer is independent of tickOnce(): a model seat can legally run for
   // hours, so refreshing only between ticks lets a cross-host observer reap a
   // live daemon's 5-minute lease mid-round.
@@ -79,6 +105,12 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     void refreshLock(lockPath, lockToken).catch(() => undefined)
   }, lockHeartbeatMs)
   lockHeartbeat.unref?.()
+  const workspaceHeartbeat = setInterval(() => {
+    void workspaceLease.heartbeat().then(ok => {
+      if (!ok) schedulerAbort.abort(new Error('workspace scheduler lease lost'))
+    }).catch(() => schedulerAbort.abort(new Error('workspace scheduler heartbeat failed')))
+  }, hostCoordinator.heartbeatIntervalMs)
+  workspaceHeartbeat.unref?.()
   const wakeStore = new WakeStore(opts.projectDir)
   let ticks = 0
   let roundsRun = 0
@@ -89,9 +121,11 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
   const tickDeps: TickDeps = {
     dispatcher: opts.dispatcher,
     projectDir: opts.projectDir,
-    signal: opts.signal,
+    signal: schedulerAbort.signal,
     effectAdapters: opts.effectAdapters,
     observer: opts.observer,
+    hostCoordinator,
+    workspaceIdentity,
   }
   try {
     for (;;) {
@@ -101,7 +135,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
         roundsRun += outcomes.filter(o => o.outcome).length
         opts.onTick?.(result)
       }
-      if (opts.signal?.aborted) {
+      if (schedulerAbort.signal.aborted) {
         // Keep the host lock until every task has observed cancellation and its
         // wake disposition is durable. This prevents a replacement daemon from
         // replaying work beside an old live worker.
@@ -158,11 +192,14 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       } else {
         idleSince = null
       }
-      await sleep(pollMs, opts.signal)
+      await sleep(pollMs, schedulerAbort.signal)
     }
   } finally {
     clearInterval(lockHeartbeat)
-    await releaseLock(lockPath, lockToken)
+    clearInterval(workspaceHeartbeat)
+    opts.signal?.removeEventListener('abort', forwardAbort)
+    await workspaceLease.release().catch(() => undefined)
+    await releaseDaemonLock(lockPath, lockToken)
   }
 }
 
@@ -178,7 +215,7 @@ interface DaemonLockRecord {
   at: number
 }
 
-async function acquireLock(lockPath: string, freshMs: number): Promise<string | null> {
+export async function acquireDaemonLock(lockPath: string, freshMs = LOCK_FRESH_MS): Promise<string | null> {
   await mkdir(join(lockPath, '..'), { recursive: true }).catch(() => undefined)
   try {
     const raw = await readFile(lockPath, 'utf-8')
@@ -230,7 +267,7 @@ async function refreshLock(lockPath: string, token: string): Promise<void> {
   }
 }
 
-async function releaseLock(lockPath: string, token: string): Promise<void> {
+export async function releaseDaemonLock(lockPath: string, token: string): Promise<void> {
   try {
     const held = JSON.parse(await readFile(lockPath, 'utf-8')) as DaemonLockRecord
     if (held.pid === process.pid && held.host === hostname() && held.token === token) {

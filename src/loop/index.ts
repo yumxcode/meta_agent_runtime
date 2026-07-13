@@ -28,7 +28,22 @@ export {
   type AuthenticatedEffectEvent,
 } from './effects/EventAuth.js'
 export { ingestEvents, reconcileWaiting, readPendingRound } from './effects/WaitOps.js'
-export { runLoopScheduler, type DaemonOptions, type DaemonResult } from './daemon.js'
+export {
+  runLoopScheduler, acquireDaemonLock, releaseDaemonLock,
+  type DaemonOptions, type DaemonResult,
+} from './daemon.js'
+export {
+  ensureWorkspaceIdentity, readWorkspaceIdentity, forkWorkspaceIdentity,
+  canonicalWorkspaceRoot, workspaceIdentityPath, workspaceScopedLineage,
+  withWorkspaceOperationLock,
+  type WorkspaceIdentity, type ExecutionScope,
+} from './workspace/WorkspaceIdentity.js'
+export {
+  HostSchedulerCoordinator, WorkspaceIdentityConflictError, adapterResourceId,
+  type HostCoordinatorOptions, type HostCoordinatorSnapshot,
+  type HostAdmissionHandle, type HostAdmissionLease, type HostResourceRequirement,
+  type WorkspaceSchedulerLease,
+} from './host/HostSchedulerCoordinator.js'
 export {
   distillCharter, DISTILLER_SYSTEM, buildDistillerSystem, parseDistillOutput,
   type DistillResult, type DistillDeps, type DistillerPromptCatalog,

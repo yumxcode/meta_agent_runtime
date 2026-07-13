@@ -26,6 +26,7 @@ import type {
 
 const ID_RE = /^[a-z][a-z0-9_-]*$/i
 const CAPABILITY_NAME_RE = /^[a-zA-Z0-9._-]+$/
+const HOST_RESOURCE_ID_RE = /^[A-Za-z0-9][A-Za-z0-9._:/@#=+-]{0,511}$/
 const KERNEL_WORKER_TOOLS = new Set(['skill', 'timer', 'return_result', 'vcs_publish'])
 const META_AGENT_RE = /\.meta-agent[/\\]/
 
@@ -281,6 +282,38 @@ export function validateCharter(rawCharter: Charter): string[] {
       if (typeof path !== 'string' || !(path.startsWith('/') || path.startsWith('~/'))) {
         errs.push(`seats.${name}.hostRequirements.writePaths '${String(path)}' must be absolute or start with '~/'`)
       }
+    }
+    const hostResources = seat.hostRequirements?.resources
+    if (hostResources !== undefined && !Array.isArray(hostResources)) {
+      errs.push(`seats.${name}.hostRequirements.resources must be an array`)
+    }
+    const seenResources = new Set<string>()
+    for (const resource of Array.isArray(hostResources) ? hostResources : []) {
+      if (!resource || typeof resource !== 'object' ||
+          typeof resource.id !== 'string' || !HOST_RESOURCE_ID_RE.test(resource.id) ||
+          /(?:token|secret|password|key)=/i.test(resource.id)) {
+        errs.push(`seats.${name}.hostRequirements.resources contains an invalid or secret-bearing resource id`)
+        continue
+      }
+      if (seenResources.has(resource.id)) errs.push(`seats.${name}.hostRequirements.resources contains duplicate '${resource.id}'`)
+      seenResources.add(resource.id)
+      if (resource.mode !== 'exclusive' && resource.mode !== 'shared') {
+        errs.push(`seats.${name}.hostRequirements.resources '${resource.id}' mode must be exclusive|shared`)
+      }
+      if (resource.mode === 'exclusive' && resource.maxConcurrent !== undefined) {
+        errs.push(`seats.${name}.hostRequirements.resources '${resource.id}' exclusive mode cannot set maxConcurrent`)
+      }
+      if (resource.mode === 'shared' && resource.maxConcurrent !== undefined &&
+          (!Number.isInteger(resource.maxConcurrent) || resource.maxConcurrent < 1 || resource.maxConcurrent > 1_000)) {
+        errs.push(`seats.${name}.hostRequirements.resources '${resource.id}' maxConcurrent must be an integer from 1 to 1000`)
+      }
+    }
+    if (Array.isArray(hostResources) && hostResources.length > 0 &&
+        (seat.tools ?? []).some(tool => tool === 'spawn_sub_agent' || tool === 'run_agent')) {
+      errs.push(
+        `seats.${name} cannot combine hostRequirements.resources with spawn_sub_agent/run_agent: ` +
+        `a descendant may outlive the worker segment and escape its resource lease`,
+      )
     }
     const wc = seat.budgetPerRound?.wallclockMin
     if (wc !== undefined && (!Number.isFinite(wc) || wc < 1)) {

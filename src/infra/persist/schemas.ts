@@ -269,6 +269,8 @@ export const SessionMetaSchema = z.object({
   messageCount:  z.number(),
   firstPrompt:   z.string(),
   workspace:     z.string().optional(),
+  workspaceId:   z.string().optional(),
+  loopInstanceId: z.string().optional(),
   /** Flash-generated concise session title (≤ ~16 chars), shown in pickers. */
   title:         z.string().optional(),
   /** messageCount at the moment the title was generated (refresh cadence). */

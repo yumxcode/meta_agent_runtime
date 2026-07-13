@@ -18,6 +18,7 @@ import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import type { MetaAgentTool } from '../core/types.js'
 import { SessionStore } from '../core/SessionStore.js'
+import { registerModelCallScope } from '../infra/modelCallAdmission.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
 import { writeTask, readTask, mutateTask, releaseWriteChain } from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
@@ -281,6 +282,7 @@ export class SubAgentRunner {
     // sandbox handle — previously an exception thrown between handle creation
     // and the old try boundary leaked the handle.
     let durationTimer: ReturnType<typeof setTimeout> | undefined
+    let unregisterModelScope: (() => void) | null = null
     try { // ← outer try: ensures sandboxHandle.destroy() always runs
 
     // Build the isolated session config.
@@ -329,10 +331,34 @@ export class SubAgentRunner {
     // Lineage seat (loop inner_orch_worker): resume the prior transcript under a
     // stable session id so accumulated context carries across rounds. Isolated /
     // ordinary sub-agents leave lineageSessionId unset and start fresh.
-    const priorMessages = cfg.lineageSessionId
+    let priorMessages = cfg.lineageSessionId
       ? await SessionStore.loadHistory(cfg.lineageSessionId)
       : []
+    if (cfg.lineageSessionId && (cfg.workspaceId || cfg.loopInstanceId)) {
+      const meta = await SessionStore.getSession(cfg.lineageSessionId)
+      const mismatch = meta && (
+        (cfg.workspaceId !== undefined && meta.workspaceId !== cfg.workspaceId) ||
+        (cfg.loopInstanceId !== undefined && meta.loopInstanceId !== cfg.loopInstanceId)
+      )
+      if (mismatch) {
+        console.warn(`[SubAgentRunner] Refusing mismatched lineage history for ${cfg.lineageSessionId}`)
+        priorMessages = []
+      }
+    }
 
+    const scopedSessionId = cfg.lineageSessionId ?? (cfg.workspaceId
+      ? `loop-seat-${cfg.workspaceId}-${this.taskId}`
+      : undefined)
+    if (scopedSessionId && cfg.workspaceId) {
+      unregisterModelScope = registerModelCallScope(scopedSessionId, {
+        workspaceId: cfg.workspaceId,
+        instanceId: cfg.loopInstanceId ?? '$loop-subagent',
+        ...(cfg.hostCoordinatorRoot ? { coordinatorRoot: cfg.hostCoordinatorRoot } : {}),
+        ...(cfg.hostMaxConcurrentModelCalls !== undefined
+          ? { maxConcurrentModelCalls: cfg.hostMaxConcurrentModelCalls }
+          : {}),
+      })
+    }
     const sessionConfig: MetaAgentConfig = {
       systemPrompt: cfg.systemPrompt ?? DEFAULT_SUB_AGENT_SYSTEM_PROMPT,
       skipMemoryRecall: cfg.skipMemoryRecall ?? true,
@@ -351,7 +377,7 @@ export class SubAgentRunner {
       ...(cfg.autonomy   !== undefined && { autonomy:   cfg.autonomy }),
       ...(cfg.projectDir !== undefined && { projectDir: cfg.projectDir }),
       ...(cfg.externalPromptAssembly ? { externalPromptAssembly: true } : {}),
-      ...(cfg.lineageSessionId ? { sessionId: cfg.lineageSessionId } : {}),
+      ...(scopedSessionId ? { sessionId: scopedSessionId } : {}),
       ...(priorMessages.length ? { initialMessages: priorMessages } : {}),
     }
 
@@ -553,6 +579,7 @@ export class SubAgentRunner {
     }
     } finally {
       if (durationTimer) clearTimeout(durationTimer)
+      unregisterModelScope?.()
       this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
       await this._persistLineageHistory().catch(() => undefined)
@@ -681,6 +708,8 @@ export class SubAgentRunner {
       messageCount: messages.length,
       firstPrompt: this.record.config.taskDescription.slice(0, 80),
       workspace: this.record.config.projectDir,
+      ...(this.record.config.workspaceId ? { workspaceId: this.record.config.workspaceId } : {}),
+      ...(this.record.config.loopInstanceId ? { loopInstanceId: this.record.config.loopInstanceId } : {}),
     }, messages)
   }
 

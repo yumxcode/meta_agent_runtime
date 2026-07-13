@@ -80,6 +80,12 @@ export interface SubAgentConfig {
    * written back. Absent = fresh one-shot session (the default / isolated).
    */
   lineageSessionId?: string
+  /** Loop-owned namespace metadata. Persisted with the task/session and checked on resume. */
+  workspaceId?: string
+  loopInstanceId?: string
+  /** Host coordinator policy inherited by loop-owned descendant tasks. */
+  hostCoordinatorRoot?: string
+  hostMaxConcurrentModelCalls?: number
   /**
    * Names of tools the sub-agent may call.  The SubAgentRunner looks these up
    * in the tool registry passed at spawn time.  When omitted the sub-agent

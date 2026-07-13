@@ -1,9 +1,12 @@
 import { execFile } from 'child_process'
 import { promisify } from 'util'
+import { createHash } from 'crypto'
 import { isAbsolute, relative, resolve, sep } from 'path'
 import { stat } from 'fs/promises'
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
 import { parseWriteScope, relativePathError } from '../security/PathSafety.js'
+import { HostSchedulerCoordinator } from '../host/HostSchedulerCoordinator.js'
+import { ensureWorkspaceIdentity } from '../workspace/WorkspaceIdentity.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -16,6 +19,8 @@ export function makeVcsPublishTool(input: {
   projectDir: string
   writeScope: string[]
   remote?: string
+  instanceId?: string
+  hostCoordinator?: HostSchedulerCoordinator
 }): MetaAgentTool {
   const remote = input.remote ?? 'origin'
   const roots = [...new Set(input.writeScope.map(scope => parseWriteScope(scope).root))]
@@ -73,14 +78,41 @@ export function makeVcsPublishTool(input: {
           // A missing path may be a tracked deletion; git add below decides.
         }
       }
+      let gitLease: Awaited<ReturnType<HostSchedulerCoordinator['acquireResources']>> = null
+      let gitLeaseHeartbeat: ReturnType<typeof setInterval> | null = null
       try {
         const branch = (await git(input.projectDir, ['symbolic-ref', '--quiet', '--short', 'HEAD'])).trim()
         if (!branch) throw new Error('detached HEAD cannot be published')
+        const remoteUrl = (await git(input.projectDir, ['remote', 'get-url', remote])).trim()
+        if (!remoteUrl) throw new Error(`remote '${remote}' has no URL`)
+        const workspace = await ensureWorkspaceIdentity(input.projectDir)
+        const coordinator = input.hostCoordinator ?? new HostSchedulerCoordinator()
+        const descriptiveResource = `git:${canonicalRemoteIdentity(remoteUrl)}#${branch}`
+        const resourceId = /^[A-Za-z0-9][A-Za-z0-9._:/@#=+-]{0,511}$/.test(descriptiveResource)
+          ? descriptiveResource
+          : `git:${createHash('sha256')
+          .update(`${canonicalRemoteIdentity(remoteUrl)}\n${branch}`)
+          .digest('hex').slice(0, 32)}`
+        gitLease = await coordinator.acquireResources({
+          workspaceId: workspace.workspaceId,
+          instanceId: input.instanceId ?? '$vcs-publish',
+        }, [{ id: resourceId, mode: 'exclusive' }], new AbortController().signal)
+        gitLeaseHeartbeat = setInterval(() => {
+          void gitLease?.heartbeat().catch(() => undefined)
+        }, coordinator.heartbeatIntervalMs)
+        gitLeaseHeartbeat.unref?.()
         await git(input.projectDir, ['add', '--', ...requested])
         const staged = await gitExit(input.projectDir, ['diff', '--cached', '--quiet', '--', ...requested])
         if (staged === 1) await git(input.projectDir, ['commit', '-m', message, '--', ...requested], 120_000)
         else if (staged !== 0) throw new Error(`git diff --cached failed with exit ${staged}`)
         const commit = (await git(input.projectDir, ['rev-parse', 'HEAD'])).trim()
+        const remoteHead = (await git(input.projectDir, ['ls-remote', '--heads', remote, `refs/heads/${branch}`])).trim()
+        if (remoteHead) {
+          await git(input.projectDir, ['fetch', '--no-tags', remote, `refs/heads/${branch}`], 120_000)
+          const fastForward = await gitExit(input.projectDir, ['merge-base', '--is-ancestor', 'FETCH_HEAD', commit])
+          if (fastForward === 1) throw new Error(`remote ${remote}/${branch} advanced; refusing non-fast-forward publish`)
+          if (fastForward !== 0) throw new Error(`could not verify fast-forward against ${remote}/${branch}`)
+        }
         await git(input.projectDir, ['push', remote, `${branch}:${branch}`], 120_000)
         return {
           content: JSON.stringify({ status: staged === 1 ? 'committed_and_pushed' : 'pushed_existing_head', remote, branch, commit }),
@@ -91,8 +123,26 @@ export function makeVcsPublishTool(input: {
           content: `Error: vcs_publish failed: ${error instanceof Error ? error.message : String(error)}`,
           isError: true,
         }
+      } finally {
+        if (gitLeaseHeartbeat) clearInterval(gitLeaseHeartbeat)
+        await gitLease?.release().catch(() => undefined)
       }
     },
+  }
+}
+
+function canonicalRemoteIdentity(value: string): string {
+  try {
+    const url = new URL(value)
+    url.username = ''
+    url.password = ''
+    url.search = ''
+    url.hash = ''
+    return url.toString().replace(/\/$/, '')
+  } catch {
+    // SCP-like git syntax. Strip a possible user prefix; the result is hashed
+    // before persistence, so neither credentials nor repository names are exposed.
+    return value.replace(/^[^@/]+@/, '').replace(/\/$/, '')
   }
 }
 

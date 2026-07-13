@@ -19,6 +19,13 @@ import { WakeStore } from './wake/WakeStore.js'
 import { tickOnce, runUntilQuiescent } from './runner.js'
 import { instancePaths, renderRoute, type LoopInstanceRecord } from './types.js'
 import type { EffectAdapterRegistry } from './effects/EffectAdapter.js'
+import {
+  ensureWorkspaceIdentity,
+  forkWorkspaceIdentity,
+  canonicalWorkspaceRoot,
+} from './workspace/WorkspaceIdentity.js'
+import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
 
 export interface LoopCliDeps {
   projectDir: string
@@ -44,6 +51,10 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'pause': return cmdLifecycle('pause', rest, deps)
     case 'resume': return cmdLifecycle('resume', rest, deps)
     case 'stop': return cmdLifecycle('stop', rest, deps)
+    case 'workspace-info': return cmdWorkspaceInfo(deps)
+    case 'workspace-fork': return cmdWorkspaceFork(deps)
+    case 'schedulers': return cmdSchedulers()
+    case 'host-capacity': return cmdHostCapacity()
     default:
       return [
         'Usage: meta-agent loop <command>',
@@ -53,12 +64,69 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
         '  pause <instanceId> [--reason …]             Freeze an idle|waiting instance (wakes cancelled, events untouched)',
         '  resume <instanceId> [--reason …]            Un-pause (rebuilds wakes) / light-ack a paused escalation (resets its meters)',
         '  stop <instanceId> [--reason …]              Graceful terminate → final_report.md (finalizer seat runs when a backend is wired)',
+        '  workspace-info                              Show the stable workspace identity and canonical root',
+        '  workspace-fork                              Assign an intentionally copied workspace a new identity',
+        '  schedulers                                  Show live host schedulers and queued/active work',
+        '  host-capacity                               Show host-wide Loop admission usage',
         '  list                                        List loop instances in this workspace',
         '  inspect <instanceId>                        Status + progress + recent rounds',
         '  inbox <instanceId> <message…>               Drop feedback for the next round',
         '  tick [--until-quiescent]                    Claim due wakes and run rounds (needs backend)',
       ].join('\n')
   }
+}
+
+async function cmdWorkspaceInfo(deps: LoopCliDeps): Promise<string> {
+  const identity = await ensureWorkspaceIdentity(deps.projectDir)
+  return [
+    `workspaceId: ${identity.workspaceId}`,
+    `root: ${await canonicalWorkspaceRoot(deps.projectDir)}`,
+    `createdAt: ${new Date(identity.createdAt).toISOString()}`,
+    ...(identity.forkedFrom ? [`forkedFrom: ${identity.forkedFrom}`] : []),
+  ].join('\n')
+}
+
+async function cmdWorkspaceFork(deps: LoopCliDeps): Promise<string> {
+  const daemonLockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
+  const daemonToken = await acquireDaemonLock(daemonLockPath)
+  if (!daemonToken) throw new Error('loop workspace-fork requires the workspace scheduler to be stopped')
+  try {
+  const current = await ensureWorkspaceIdentity(deps.projectDir)
+  const coordinator = new HostSchedulerCoordinator()
+  if (await coordinator.hasLiveWorkspaceLease(current.workspaceId)) {
+    throw new Error('loop workspace-fork requires the workspace scheduler to be stopped')
+  }
+  const next = await forkWorkspaceIdentity(deps.projectDir)
+  return `workspace forked: ${current.workspaceId} -> ${next.workspaceId}`
+  } finally {
+    await releaseDaemonLock(daemonLockPath, daemonToken)
+  }
+}
+
+async function cmdSchedulers(): Promise<string> {
+  const snapshot = await new HostSchedulerCoordinator().snapshot()
+  if (snapshot.workspaces.length === 0) return '(no live loop schedulers)'
+  return snapshot.workspaces
+    .sort((a, b) => a.workspaceId.localeCompare(b.workspaceId))
+    .map(workspace => {
+      const active = snapshot.leases.filter(lease => lease.scope.workspaceId === workspace.workspaceId).length
+      const queued = snapshot.tickets.filter(ticket => ticket.scope.workspaceId === workspace.workspaceId).length
+      return `${workspace.workspaceId}  pid=${workspace.pid}  active=${active} queued=${queued}  ` +
+        `heartbeat=${new Date(workspace.heartbeatAt).toISOString()}  root=${workspace.workspaceRoot}`
+    }).join('\n')
+}
+
+async function cmdHostCapacity(): Promise<string> {
+  const snapshot = await new HostSchedulerCoordinator().snapshot()
+  const rounds = snapshot.leases.filter(lease => lease.kind === 'round').length
+  const models = snapshot.leases.filter(lease => lease.kind === 'model_call').length
+  const queuedRounds = snapshot.tickets.filter(ticket => ticket.kind === 'round').length
+  return [
+    `rounds: ${rounds}/${snapshot.maxConcurrentRounds} active, ${queuedRounds} queued`,
+    `modelCalls: ${models}/${snapshot.maxConcurrentModelCalls} active`,
+    `resourceLeases: ${snapshot.leases.filter(lease => lease.kind === 'resource').length}`,
+    `adapterCalls: ${snapshot.leases.filter(lease => lease.kind === 'adapter_call').length}`,
+  ].join('\n')
 }
 
 async function cmdDistill(rest: string[], deps: LoopCliDeps): Promise<string> {
@@ -227,22 +295,49 @@ async function cmdTick(rest: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.dispatcher) {
     throw new Error('loop tick needs a backend dispatcher (host CLI wires this; see orch-scheduler bootstrap)')
   }
-  const tickDeps = {
-    dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: deps.signal,
-    observer: deps.observer, effectAdapters: deps.effectAdapters,
+  const coordinator = new HostSchedulerCoordinator()
+  const workspaceIdentity = await ensureWorkspaceIdentity(deps.projectDir)
+  const daemonLockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
+  const daemonToken = await acquireDaemonLock(daemonLockPath)
+  if (!daemonToken) throw new Error('loop tick refused: another scheduler/tick owns this workspace')
+  let workspaceLease: Awaited<ReturnType<HostSchedulerCoordinator['acquireWorkspaceLease']>> | null = null
+  let workspaceHeartbeat: ReturnType<typeof setInterval> | null = null
+  const tickAbort = new AbortController()
+  const forwardAbort = (): void => tickAbort.abort(deps.signal?.reason)
+  if (deps.signal?.aborted) forwardAbort()
+  else deps.signal?.addEventListener('abort', forwardAbort, { once: true })
+  try {
+    workspaceLease = await coordinator.acquireWorkspaceLease(workspaceIdentity, deps.projectDir)
+    workspaceHeartbeat = setInterval(() => {
+      void workspaceLease?.heartbeat().then(ok => {
+        if (ok === false) tickAbort.abort(new Error('workspace scheduler lease lost'))
+      }).catch(() => tickAbort.abort(new Error('workspace scheduler heartbeat failed')))
+    }, coordinator.heartbeatIntervalMs)
+    workspaceHeartbeat.unref?.()
+    const tickDeps = {
+      dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: tickAbort.signal,
+      observer: deps.observer, effectAdapters: deps.effectAdapters,
+      hostCoordinator: coordinator,
+      workspaceIdentity,
+    }
+    if (rest.includes('--until-quiescent')) {
+      const results = await runUntilQuiescent(tickDeps)
+      const total = results.reduce((n, r) => n + r.claimed, 0)
+      return `ran ${total} round(s) across ${results.length} tick(s); now quiescent`
+    }
+    const result = await tickOnce(tickDeps)
+    if (result.claimed === 0) return 'no wakes due'
+    return result.outcomes
+      .map(o => o.outcome
+        ? `${o.loopId}: round ${o.outcome.round} [${o.outcome.mode}] route=${o.outcome.route} status=${o.outcome.status}`
+        : `${o.loopId}: ERROR ${o.error}`)
+      .join('\n')
+  } finally {
+    if (workspaceHeartbeat) clearInterval(workspaceHeartbeat)
+    deps.signal?.removeEventListener('abort', forwardAbort)
+    await workspaceLease?.release().catch(() => undefined)
+    await releaseDaemonLock(daemonLockPath, daemonToken)
   }
-  if (rest.includes('--until-quiescent')) {
-    const results = await runUntilQuiescent(tickDeps)
-    const total = results.reduce((n, r) => n + r.claimed, 0)
-    return `ran ${total} round(s) across ${results.length} tick(s); now quiescent`
-  }
-  const result = await tickOnce(tickDeps)
-  if (result.claimed === 0) return 'no wakes due'
-  return result.outcomes
-    .map(o => o.outcome
-      ? `${o.loopId}: round ${o.outcome.round} [${o.outcome.mode}] route=${o.outcome.route} status=${o.outcome.status}`
-      : `${o.loopId}: ERROR ${o.error}`)
-    .join('\n')
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

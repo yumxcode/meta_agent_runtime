@@ -52,7 +52,7 @@ export async function submitEffect(
       ),
     },
   })
-  await dispatchSubmit(ledger, input.effectKey, registry)
+  await dispatchSubmit(instance, ledger, input.effectKey, registry)
   const effect = (await ledger.get(input.effectKey))!
   if (effect.status === 'concluded') {
     await wakeStore.schedule({
@@ -77,7 +77,7 @@ export async function advanceEffect(
   let effect = await ledger.get(effectKey)
   if (!effect || isTerminal(effect.status)) return effect
   if (Date.now() >= effect.deadlineAt) {
-    await cancelAtDeadline(ledger, effect, registry)
+    await cancelAtDeadline(instance, ledger, effect, registry)
     return ledger.get(effectKey)
   }
   if (effect.status === 'dispatching') {
@@ -87,7 +87,7 @@ export async function advanceEffect(
         // Reconcile by the stable effectKey before considering another submit.
         await runInspection(instance, ledger, effect, registry, 'reconcile')
       } else {
-        await dispatchSubmit(ledger, effectKey, registry)
+        await dispatchSubmit(instance, ledger, effectKey, registry)
       }
     }
   } else if (effect.status === 'retry_wait') {
@@ -95,10 +95,10 @@ export async function advanceEffect(
       const retryReconcile = effect.lastOperation === 'reconcile' && registry.resolve(effect.adapterId).reconcile
       if (retryReconcile) await runInspection(instance, ledger, effect, registry, 'reconcile')
       else if (effect.adapterAcknowledged) await runInspection(instance, ledger, effect, registry, 'inspect')
-      else await dispatchSubmit(ledger, effectKey, registry)
+      else await dispatchSubmit(instance, ledger, effectKey, registry)
     }
   } else if (effect.status === 'cancelling') {
-    await runCancel(ledger, effect, registry, false)
+    await runCancel(instance, ledger, effect, registry, false)
   } else {
     await runInspection(instance, ledger, effect, registry, operation)
   }
@@ -117,13 +117,14 @@ export async function cancelEffect(
   const effect = await ledger.get(effectKey)
   if (!effect || isTerminal(effect.status)) return effect
   await ledger.requestCancel(effectKey)
-  await runCancel(ledger, { ...effect, status: 'cancelling' }, registry, true)
+  await runCancel(instance, ledger, { ...effect, status: 'cancelling' }, registry, true)
   const updated = await ledger.get(effectKey)
   if (updated && wakeStore) await scheduleNext(instance, wakeStore, updated)
   return updated
 }
 
 async function dispatchSubmit(
+  instance: LoopInstance,
   ledger: EffectLedger,
   effectKey: string,
   registry: EffectAdapterRegistry,
@@ -132,7 +133,7 @@ async function dispatchSubmit(
   if (!effect || isTerminal(effect.status) || effect.adapterAcknowledged) return
   const adapter = registry.resolve(effect.adapterId)
   try {
-    const result = await adapterCall(effect, registry, signal => adapter.submit(context(effect, signal)))
+    const result = await adapterCall(instance, effect, registry, signal => adapter.submit(context(instance, effect, signal)))
     validateSubmitResult(result)
     await ledger.acknowledgeAdapter(effectKey, {
       receipt: result.receipt,
@@ -153,10 +154,10 @@ async function runInspection(
 ): Promise<void> {
   const adapter = registry.resolve(effect.adapterId)
   try {
-    const result = await adapterCall(effect, registry, signal =>
+    const result = await adapterCall(instance, effect, registry, signal =>
       operation === 'reconcile' && adapter.reconcile
-        ? adapter.reconcile(context(effect, signal))
-        : adapter.inspect(context(effect, signal)))
+        ? adapter.reconcile(context(instance, effect, signal))
+        : adapter.inspect(context(instance, effect, signal)))
     validateInspection(result)
     const latest = await ledger.get(effect.effectKey)
     if (!latest || isTerminal(latest.status)) return
@@ -180,7 +181,7 @@ async function runInspection(
         return
       }
       if (decision.action) {
-        await applyRuleDecision(ledger, effect, registry, result, decision)
+        await applyRuleDecision(instance, ledger, effect, registry, result, decision)
         return
       }
     }
@@ -191,6 +192,7 @@ async function runInspection(
 }
 
 async function applyRuleDecision(
+  instance: LoopInstance,
   ledger: EffectLedger,
   effect: EffectRecord,
   registry: EffectAdapterRegistry,
@@ -222,7 +224,7 @@ async function applyRuleDecision(
   }
   const adapter = registry.resolve(effect.adapterId)
   try {
-    const cancellation = await adapterCall(effect, registry, signal => adapter.cancel(context(effect, signal)))
+    const cancellation = await adapterCall(instance, effect, registry, signal => adapter.cancel(context(instance, effect, signal)))
     validateCancellation(cancellation)
     if (cancellation.state === 'cancelled') {
       await ledger.conclude(effect.effectKey, action.verdict, 'poll', {
@@ -264,13 +266,16 @@ async function applyInspection(
 }
 
 async function cancelAtDeadline(
+  instance: LoopInstance,
   ledger: EffectLedger,
   effect: EffectRecord,
   registry: EffectAdapterRegistry,
 ): Promise<void> {
   const adapter = registry.resolve(effect.adapterId)
   try {
-    const result = await adapterCall(effect, registry, signal => adapter.cancel(context(effect, signal)))
+    const result = await adapterCall(
+      instance, effect, registry, signal => adapter.cancel(context(instance, effect, signal)), true,
+    )
     validateCancellation(result)
     if (result.state === 'cancelled') {
       await ledger.conclude(effect.effectKey, 'deadline_exceeded', 'poll', {
@@ -293,6 +298,7 @@ async function cancelAtDeadline(
 }
 
 async function runCancel(
+  instance: LoopInstance,
   ledger: EffectLedger,
   effect: EffectRecord,
   registry: EffectAdapterRegistry,
@@ -300,7 +306,7 @@ async function runCancel(
 ): Promise<void> {
   const adapter = registry.resolve(effect.adapterId)
   try {
-    const result = await adapterCall(effect, registry, signal => adapter.cancel(context(effect, signal)))
+    const result = await adapterCall(instance, effect, registry, signal => adapter.cancel(context(instance, effect, signal)))
     validateCancellation(result)
     if (result.state === 'cancelled') await ledger.markCancelled(effect.effectKey, result.data)
     else if (result.state === 'failed') await ledger.markFailed(effect.effectKey, result.reason)
@@ -349,27 +355,43 @@ async function scheduleNext(
   })
 }
 
-function context(effect: EffectRecord, signal: AbortSignal): EffectAdapterContext {
+function context(instance: LoopInstance, effect: EffectRecord, signal: AbortSignal): EffectAdapterContext {
+  const workspaceId = instance.record.workspaceId
+  if (!workspaceId) throw new Error(`instance ${instance.record.instanceId} has no workspace identity`)
   return {
-    effectKey: effect.effectKey, payload: effect.payload, receipt: effect.receipt,
+    workspaceId,
+    instanceId: instance.record.instanceId,
+    effectKey: effect.effectKey,
+    externalIdempotencyKey: `${workspaceId}/${instance.record.instanceId}/${effect.effectKey}`,
+    payload: effect.payload, receipt: effect.receipt,
     attempt: effect.attempts, deadlineAt: effect.deadlineAt, signal,
   }
 }
 
 async function adapterCall<T>(
+  instance: LoopInstance,
   effect: EffectRecord,
   registry: EffectAdapterRegistry,
   call: (signal: AbortSignal) => Promise<T>,
+  allowPastDeadline = false,
 ): Promise<T> {
   const controller = new AbortController()
-  const timeoutMs = Math.max(1, Math.min(
-    effect.retryPolicy.callTimeoutMs,
-    Math.max(1, effect.deadlineAt - Date.now()),
-  ))
+  const timeoutMs = allowPastDeadline
+    ? Math.max(1, effect.retryPolicy.callTimeoutMs)
+    : Math.max(1, Math.min(
+        effect.retryPolicy.callTimeoutMs,
+        Math.max(1, effect.deadlineAt - Date.now()),
+      ))
   let timer: ReturnType<typeof setTimeout> | undefined
   try {
     const result = await Promise.race([
-      registry.runWithAdmission(effect.adapterId, effect.admission, controller.signal, () => call(controller.signal)),
+      registry.runWithAdmission(
+        effect.adapterId, effect.admission, controller.signal, () => call(controller.signal),
+        {
+          workspaceId: instance.record.workspaceId!,
+          instanceId: instance.record.instanceId,
+        },
+      ),
       new Promise<never>((_, reject) => {
         timer = setTimeout(() => {
           controller.abort(new Error('EffectAdapter call timed out'))

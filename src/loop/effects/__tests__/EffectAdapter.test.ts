@@ -11,7 +11,7 @@ import {
 } from '../EffectAdapter.js'
 import { EffectLedger } from '../EffectLedger.js'
 import { advanceEffect, cancelEffect, submitEffect } from '../EffectRuntime.js'
-import { eventAuthSecretPath, signEffectEvent } from '../EventAuth.js'
+import { eventAuthSecretPath, signEffectEvent, verifyEffectEvent } from '../EventAuth.js'
 
 const retryPolicy = {
   maxAttempts: 3, baseDelayMs: 10, maxDelayMs: 20, callTimeoutMs: 50,
@@ -68,6 +68,31 @@ describe('EffectAdapter ABI', () => {
     expect(order).toEqual([1, 2, 3])
     expect(maxActive).toBe(1)
     expect(starts[1]! - starts[0]!).toBeGreaterThanOrEqual(8)
+  })
+
+  it('binds adapter idempotency and authenticated events to the full workspace scope', async () => {
+    const a = await fixture('effect-scope-a')
+    const b = await fixture('effect-scope-b')
+    let observed: { workspaceId: string; instanceId: string; externalIdempotencyKey: string } | undefined
+    const adapter: EffectAdapter = {
+      ...pendingAdapter('test/scoped@1'),
+      async submit(context) {
+        observed = context
+        return {}
+      },
+    }
+    await submitEffect(a.instance, a.wakeStore, input('same-key', adapter.id), new EffectAdapterRegistry([adapter]))
+    expect(observed).toMatchObject({
+      workspaceId: a.instance.record.workspaceId,
+      instanceId: a.instance.record.instanceId,
+      externalIdempotencyKey: `${a.instance.record.workspaceId}/${a.instance.record.instanceId}/same-key`,
+    })
+    const event = await signEffectEvent(a.instance, {
+      principal: 'alice', roles: ['approver'], effectKey: 'same-key', verdict: 'approved',
+    })
+    await expect(verifyEffectEvent(b.instance, event)).resolves.toEqual({
+      ok: false, reason: 'authenticated event workspace/instance scope mismatch',
+    })
   })
 
   it('uses one ledger CAS for poll/event first-wins in both orders', async () => {
@@ -205,14 +230,16 @@ describe('EffectAdapter ABI', () => {
       async cancel() { cancellations++; return { state: 'cancelled' } },
     }
     const registry = new EffectAdapterRegistry([adapter])
-    const deadlineAt = Date.now() + 15
+    // Leave room for the durable host-admission filesystem round-trip; the
+    // property under test is deadline scheduling/cancellation, not sub-10ms latency.
+    const deadlineAt = Date.now() + 100
     await submitEffect(instance, wakeStore, {
       ...input('deadline', adapter.id), deadlineAt,
     }, registry)
     expect((await wakeStore.list()).some(wake =>
       wake.kind === 'effect_poll' && wake.effectKey === 'deadline' && wake.fireAt === deadlineAt,
     )).toBe(true)
-    await delay(20)
+    await delay(120)
     await advanceEffect(instance, wakeStore, 'deadline', registry)
     expect(cancellations).toBe(1)
     expect((await ledger.get('deadline'))?.outcome?.verdict).toBe('deadline_exceeded')
@@ -236,10 +263,11 @@ describe('EffectAdapter ABI', () => {
       async cancel() { return { state: 'pending', inspectAfterMs: 10 } },
     }
     const registry = new EffectAdapterRegistry([adapter])
+    const deadlineAt = Date.now() + 100
     await submitEffect(instance, wakeStore, {
-      ...input('cancel-unconfirmed', adapter.id), deadlineAt: Date.now() + 10,
+      ...input('cancel-unconfirmed', adapter.id), deadlineAt,
     }, registry)
-    await delay(12)
+    await delay(Math.max(0, deadlineAt - Date.now()) + 20)
     await advanceEffect(instance, wakeStore, 'cancel-unconfirmed', registry)
     expect(await ledger.get('cancel-unconfirmed')).toMatchObject({
       status: 'failed', lastError: expect.stringContaining('operator reconciliation required'),

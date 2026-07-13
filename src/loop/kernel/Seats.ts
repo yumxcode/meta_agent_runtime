@@ -33,6 +33,8 @@ import { DEFAULT_SCENARIO_ID } from '../scenarios/ScenarioDefinitions.js'
 import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import { preflightCharterCapabilities } from '../security/CapabilityPreflight.js'
 import { makeVcsPublishTool } from './VcsPublishTool.js'
+import { ensureWorkspaceIdentity, workspaceScopedLineage } from '../workspace/WorkspaceIdentity.js'
+import type { WorkspaceIdentity } from '../workspace/WorkspaceIdentity.js'
 import {
   assembleInnerWorkerSystemPrompt,
   renderInnerWorkerUserMessage,
@@ -68,6 +70,9 @@ export interface SeatRunnerDeps {
   projectDir: string
   signal: AbortSignal
   spawnOpts?: SpawnWaitOptions
+  hostCoordinator?: import('../host/HostSchedulerCoordinator.js').HostSchedulerCoordinator
+  workspaceIdentity?: WorkspaceIdentity
+  loopInstanceId?: string
 }
 
 /** seat.context → inner_orch_worker variant (spec D5). Both lineage modes
@@ -116,10 +121,12 @@ export async function runWorkerSeat(
   })
   // lineage → resume a stable per-(instance,worker) session across rounds;
   // isolated → fresh each round. instanceId is the .loop/<id> dir name.
+  const workspaceIdentity = await ensureWorkspaceIdentity(deps.projectDir)
+  const instanceId = basename(paths.root)
   const lineageSessionId = seat.context === 'lineage_loop'
-    ? `loop-${basename(paths.root)}-worker`
+    ? workspaceScopedLineage(workspaceIdentity, instanceId, 'worker')
     : seat.context === 'lineage_round'
-      ? `loop-${basename(paths.root)}-round-${capsule.round}-worker`
+      ? workspaceScopedLineage(workspaceIdentity, instanceId, `round:${capsule.round}:worker`)
       : undefined
   // Self-park channel: the worker may call timer(...) to be woken later this
   // round. Calling timer HARD-PARKS the segment — the sink records the intent
@@ -135,6 +142,7 @@ export async function runWorkerSeat(
   if (seat.capabilities?.vcsPublish) {
     baseTools.push(makeVcsPublishTool({
       projectDir: deps.projectDir,
+      instanceId,
       writeScope: charter.writeScope ?? [],
       remote: seat.capabilities.vcsPublish.remote,
     }))
@@ -181,6 +189,7 @@ export async function runWorkerSeat(
   const result = await runSeat(
     deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, baseTools, parkSignal,
     budgetOverride,
+    { workspaceId: workspaceIdentity.workspaceId, instanceId },
   )
   return timerIntent ? { ...result, timer: timerIntent } : result
 }
@@ -248,6 +257,7 @@ export async function runJudgeSeat(
   paths: InstancePaths,
   evidencePaths: string[],
   budgetOverride?: { usd?: number },
+  lineageScope?: { workspaceId: string; instanceId: string },
 ): Promise<SeatResult> {
   const seat = charter.seats.judge
   if (!seat) throw new Error('charter has no judge seat')
@@ -334,6 +344,7 @@ async function runSeat(
   /** Shared park signal — a self-park tool flips it to end the segment (worker). */
   parkSignal?: { requested: boolean },
   budgetOverride?: { usd?: number },
+  lineageScope?: { workspaceId: string; instanceId: string },
 ): Promise<SeatResult> {
   // Per-segment wall-clock: a research submit segment can legitimately need
   // >30 min (read + design + implement + submit). Configurable per charter;
@@ -349,9 +360,15 @@ async function runSeat(
     ...deps.spawnOpts,
     maxWaitMs: Math.max(deps.spawnOpts?.maxWaitMs ?? 0, seatMaxDurationMs + 60_000),
   }
-  const spawn = await spawnAndWaitDetailed(
-    deps.dispatcher,
-    {
+  const taskScope = lineageScope ?? (
+    deps.workspaceIdentity
+      ? { workspaceId: deps.workspaceIdentity.workspaceId, instanceId: deps.loopInstanceId ?? '$loop-seat' }
+      : undefined
+  )
+  let spawn: Awaited<ReturnType<typeof spawnAndWaitDetailed>>
+  spawn = await spawnAndWaitDetailed(
+      deps.dispatcher,
+      {
       taskDescription,
       allowedTools: seat.tools ?? defaultTools,
       maxTurns: seat.budgetPerRound?.turns ?? 30,
@@ -367,12 +384,20 @@ async function runSeat(
         ? { systemPrompt: systemPromptOverride, externalPromptAssembly: true }
         : {}),
       ...(lineageSessionId ? { lineageSessionId } : {}),
+      ...(taskScope ? {
+        workspaceId: taskScope.workspaceId,
+        loopInstanceId: taskScope.instanceId,
+        ...(deps.hostCoordinator ? {
+          hostCoordinatorRoot: deps.hostCoordinator.rootDir,
+          hostMaxConcurrentModelCalls: deps.hostCoordinator.maxConcurrentModelCalls,
+        } : {}),
+      } : {}),
       ...(extraTools?.length ? { extraTools } : {}),
       ...(parkSignal ? { parkSignal } : {}),
-    },
-    deps.signal,
-    spawnOpts,
-  )
+      },
+      deps.signal,
+      spawnOpts,
+    )
   const rec = spawn.record
   const result = rec?.result
   const { data, structured } = extractData(result?.output, result?.summary)

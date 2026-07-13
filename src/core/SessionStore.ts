@@ -50,6 +50,10 @@ export interface SessionMeta {
   /** First ~80 chars of the first user prompt — picker fallback when no title. */
   firstPrompt: string
   workspace?: string
+  /** Stable loop workspace identity for cross-workspace resume isolation. */
+  workspaceId?: string
+  /** Loop instance within workspaceId, when this is a lineage seat. */
+  loopInstanceId?: string
   /** Flash-generated concise title (≤ ~16 chars). Preferred picker display. */
   title?: string
   /** messageCount when the title was generated — drives refresh cadence. */
