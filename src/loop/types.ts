@@ -186,6 +186,8 @@ export interface InstancePaths {
   /** Persisted mid-round state while an external effect is pending (M2). */
   pendingRoundJson: string
   draftsDir: string
+  /** Worker-owned ephemeral files. Unlike drafts, never committed as Artifacts. */
+  scratchDir: string
   inboxDir: string
   processedDir: string
   eventsDir: string
@@ -220,6 +222,7 @@ export function instancePaths(taskDir: string, instanceId: LoopInstanceId): Inst
     lifecycleJsonl: join(ledgerDir, 'lifecycle.jsonl'),
     pendingRoundJson: join(ledgerDir, 'pending_round.json'),
     draftsDir: join(root, 'drafts'),
+    scratchDir: join(root, 'scratch'),
     inboxDir: join(root, 'inbox'),
     processedDir: join(root, 'inbox', 'processed'),
     eventsDir: join(root, 'events'),

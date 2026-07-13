@@ -6,6 +6,7 @@
  */
 import { describe, expect, it } from 'vitest'
 import { join } from 'path'
+import { tmpdir } from 'os'
 import { wrapWithSandboxWriteGuard } from '../SubAgentRunner.js'
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
 
@@ -29,6 +30,13 @@ async function invoke(tool: MetaAgentTool, filePath: string): Promise<ToolResult
 }
 
 describe('wrapWithSandboxWriteGuard', () => {
+  it('keeps tool writes to the OS-approved temporary directory writable', async () => {
+    const calls: string[] = []
+    const tool = wrapWithSandboxWriteGuard(writeTool(calls), ROOT, { readonlyWorkspace: true })
+    const result = await invoke(tool, join(tmpdir(), 'payload.json'))
+    expect(result.isError).toBe(false)
+    expect(calls).toHaveLength(1)
+  })
   it('readonly workspace: blocks workspace writes outside writeAllowPaths', async () => {
     const calls: string[] = []
     const tool = wrapWithSandboxWriteGuard(writeTool(calls), ROOT, {

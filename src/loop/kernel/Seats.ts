@@ -15,10 +15,13 @@
  *           section of the final report from inlined ledger evidence.
  */
 import { readFile } from 'fs/promises'
-import { basename, join } from 'path'
+import { basename, isAbsolute, join, relative, resolve, sep } from 'path'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import type { MetaAgentTool } from '../../core/types.js'
 import { makeTimerTool, type TimerIntent } from '../../subagent/tools/timer.js'
+import { createSkillTool } from '../../tools/system/skill/index.js'
+import { resolveConfiguredWriteAllowPaths } from '../../sandbox/configuredWritePaths.js'
+import type { SandboxConfig } from '../../sandbox/types.js'
 import { spawnAndWaitDetailed, type SpawnWaitOptions, type SpawnWaitKind } from '../seatSpawn.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../subagent/types.js'
 import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
@@ -27,6 +30,8 @@ import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
 import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
+import { preflightCharterCapabilities } from '../security/CapabilityPreflight.js'
+import { makeVcsPublishTool } from './VcsPublishTool.js'
 import {
   assembleInnerWorkerSystemPrompt,
   renderInnerWorkerUserMessage,
@@ -78,6 +83,13 @@ export async function runWorkerSeat(
   budgetOverride?: { usd?: number },
 ): Promise<SeatResult> {
   const seat = charter.seats.worker
+  try {
+    await preflightCharterCapabilities(charter, deps.projectDir)
+  } catch (error) {
+    throw new CharterEnforcementError(
+      `worker capability preflight failed: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
   const variant = workerVariant(seat)
   // System = the lean inner_orch_worker prompt (loop-owned, externalPromptAssembly);
   // user = <context> capsule + round instruction + output contract.
@@ -86,6 +98,12 @@ export async function runWorkerSeat(
     projectDir: deps.projectDir,
     variant,
     writeScope: charter.writeScope,
+    scratchDir: paths.scratchDir,
+    requiredSkills: seat.skills,
+    hostWritePaths: seat.hostRequirements?.writePaths,
+    vcsPublishRemote: seat.capabilities?.vcsPublish
+      ? (seat.capabilities.vcsPublish.remote ?? 'origin')
+      : undefined,
     effectBindings: charter.effects,
   })
   const userMessage = renderInnerWorkerUserMessage({
@@ -108,9 +126,17 @@ export async function runWorkerSeat(
   // cannot keep working after parking (no reliance on a follow-up return_result).
   let timerIntent: TimerIntent | null = null
   const parkSignal = { requested: false }
-  const timerTools: MetaAgentTool[] = [
+  const baseTools: MetaAgentTool[] = [
     makeTimerTool(i => { timerIntent = i; parkSignal.requested = true }),
+    await createSkillTool(deps.projectDir, 'simple_auto'),
   ]
+  if (seat.capabilities?.vcsPublish) {
+    baseTools.push(makeVcsPublishTool({
+      projectDir: deps.projectDir,
+      writeScope: charter.writeScope ?? [],
+      remote: seat.capabilities.vcsPublish.remote,
+    }))
+  }
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
   // the sandbox level for the worker's bash — the prompt contract is the
   // instruction, this is the guarantee. Drafts/inbox stay writable.
@@ -126,8 +152,13 @@ export async function runWorkerSeat(
       throw new CharterEnforcementError(`writeScope '${scope}' cannot be enforced: ${(err as Error).message}`)
     }
   }))
-  const writeAllowPaths = [paths.draftsDir, ...scopeRoots]
-  const sandbox = {
+  // Operator grants may expose host-local stores (for example an account-pool
+  // SQLite directory). Never inherit a configured path inside the workspace:
+  // Charter writeScope remains the sole authority there.
+  const externalWriteRoots = resolveConfiguredWriteAllowPaths(deps.projectDir)
+    .filter(path => !pathIsUnder(path, deps.projectDir))
+  const writeAllowPaths = [paths.draftsDir, paths.scratchDir, ...scopeRoots, ...externalWriteRoots]
+  const sandbox: SandboxConfig = {
     readonlyWorkspace: true,
     writeAllowPaths,
     writeDenyPaths: [
@@ -146,10 +177,15 @@ export async function runWorkerSeat(
     ],
   }
   const result = await runSeat(
-    deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, timerTools, parkSignal,
+    deps, seat, userMessage, DEFAULT_WORKER_TOOLS, sandbox, systemPrompt, lineageSessionId, baseTools, parkSignal,
     budgetOverride,
   )
   return timerIntent ? { ...result, timer: timerIntent } : result
+}
+
+function pathIsUnder(target: string, root: string): boolean {
+  const rel = relative(resolve(root), resolve(target))
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
 
 /**
@@ -209,12 +245,18 @@ export async function runJudgeSeat(
 ): Promise<SeatResult> {
   const seat = charter.seats.judge
   if (!seat) throw new Error('charter has no judge seat')
-  const evidence = await inlineEvidence(paths, seat.inputs ?? evidencePaths)
+  // A declared judge Gate owns both rubric and evidence. seat.inputs remains a
+  // legacy fallback only for judge seats with no Gate-bound evidence.
+  const evidence = await inlineEvidence(paths, evidencePaths.length > 0 ? evidencePaths : (seat.inputs ?? []))
+  const gateRubric = Object.entries(charter.gates)
+    .filter(([, gate]) => gate.kind === 'judge')
+    .map(([id, gate]) => `【Judge Gate rubric: ${id}】\n${gate.kind === 'judge' ? gate.rubric : ''}`)
+    .join('\n\n')
   // The goal is injected by the kernel (not charter-specific) so the built-in
   // acceptance mechanism works for every loop with a judge.
   const task = [
     `【验收目标】${charter.goal}`,
-    seat.prompt, buildJudgeContract(extraJudgeKeys(charter)), '【证据（内嵌，只此为界）】', evidence,
+    seat.prompt, gateRubric, buildJudgeContract(extraJudgeKeys(charter)), '【证据（内嵌，只此为界）】', evidence,
   ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
   return runSeat(deps, seat, task, [], undefined, undefined, undefined, undefined, undefined, budgetOverride)
@@ -272,7 +314,7 @@ async function runSeat(
   seat: SeatSpec,
   taskDescription: string,
   defaultTools: string[],
-  sandbox?: { writeDenyPaths?: string[] },
+  sandbox?: SandboxConfig,
   /** inner_orch_worker: a loop-composed system prompt used verbatim. */
   systemPromptOverride?: string,
   /** inner_orch_worker lineage: stable session id to resume/persist across rounds. */

@@ -78,6 +78,14 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
   skillMode?: AgentMode
   /** Optional repo write-scope note (stable per charter). */
   writeScope?: string[]
+  /** Instance-owned temporary directory writable through every write channel. */
+  scratchDir?: string
+  /** Skills required by the reviewed Charter and preflighted at create time. */
+  requiredSkills?: string[]
+  /** Operator-granted host paths required by this workflow. */
+  hostWritePaths?: string[]
+  /** Enables the constrained host-owned VCS publishing lane. */
+  vcsPublishRemote?: string
   /** Frozen deterministic external-effect bindings exposed by ID, never raw adapter selection. */
   effectBindings?: Record<string, { adapter: string }>
 }): Promise<string> {
@@ -92,6 +100,18 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
   const scopeNote = opts.writeScope?.length
     ? `## 写入范围\n除 drafts/ 外，仅允许修改：${opts.writeScope.join(', ')}`
     : '## 写入范围\n本 loop 不允许修改仓库文件；只允许写入本轮 drafts/。'
+  const scratchNote = opts.scratchDir
+    ? `## 临时文件\n所有 payload、CLI 输入和可删除中间文件统一写入 ${opts.scratchDir}。需要相对路径的 CLI，应先把 cwd 切到该目录再使用 ./文件名。不要把临时文件写到仓库根目录。`
+    : ''
+  const requiredSkillNote = opts.requiredSkills?.length
+    ? `## 必需 Skills\n本 Charter 已在创建时确认以下 skill 存在：${opts.requiredSkills.join(', ')}。需要其说明时调用 skill(action="load", name="<name>")。skill 是内核基础工具，不需要出现在 seat.tools。`
+    : '## Skills\nskill 是内核基础工具；仅在确有需要时从下方 manifest 选择并加载。'
+  const hostPathNote = opts.hostWritePaths?.length
+    ? `## 宿主状态路径\n操作员已预先批准本工作流所需的宿主写路径：${opts.hostWritePaths.join(', ')}。它们只用于对应 CLI/凭据状态，不得存放业务产物。`
+    : ''
+  const vcsNote = opts.vcsPublishRemote !== undefined
+    ? `## 版本发布\nCharter 已授权受限工具 vcs_publish；它只会暂存 writeScope、提交并推送到 ${opts.vcsPublishRemote || 'origin'}。必须使用该工具，禁止用 bash 直接执行 git add/commit/push。`
+    : ''
   const effectNote = Object.keys(opts.effectBindings ?? {}).length > 0
     ? `## 确定性外部 Effect\n若已提交由内核 adapter 跟踪的外部任务，使用 return_result data={"label":"wait","effectKey":"<稳定幂等ID>","effectBinding":"<绑定ID>"}。只能选择以下 Charter 冻结绑定：${Object.entries(opts.effectBindings ?? {}).map(([id, binding]) => `${id}→${binding.adapter}`).join(', ')}。不要自行填写 adapterId。`
     : ''
@@ -104,6 +124,10 @@ export async function assembleInnerWorkerSystemPrompt(opts: {
     WAIT_TOOLS,
     effectNote,
     scopeNote,
+    scratchNote,
+    requiredSkillNote,
+    hostPathNote,
+    vcsNote,
     skillManifest,
   ].filter(Boolean).join('\n\n')
 }

@@ -17,6 +17,7 @@ import { CharterStore } from '../charter/CharterStore.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import { runUntilQuiescent } from '../runner.js'
 import { runRound, type LoopEvent } from '../kernel/LoopKernel.js'
+import { validateCharter } from '../charter/CharterValidate.js'
 import { instancePaths } from '../types.js'
 import { runLoopCli } from '../cli.js'
 import { walkResearchCharter } from './testCharter.js'
@@ -67,6 +68,14 @@ describe('distillCharter', () => {
     expect(DISTILLER_SYSTEM).toContain('"onNull":"skip_update"|"fail_stop"')
     expect(DISTILLER_SYSTEM).toContain('禁止隐式回退')
     expect(DISTILLER_SYSTEM).not.toContain('混用在运行时按"缺值"回退处理')
+    expect(DISTILLER_SYSTEM).toContain('"artifacts"')
+    expect(DISTILLER_SYSTEM).toContain('"gateBindings"')
+    expect(DISTILLER_SYSTEM).toContain('"projections"')
+    expect(DISTILLER_SYSTEM).toContain('builtin/generic@1')
+    expect(DISTILLER_SYSTEM).toContain('skill、timer、return_result 是内核基础工具')
+    expect(DISTILLER_SYSTEM).toContain('vcs_publish')
+    expect(DISTILLER_SYSTEM).toContain('完整可运行 Research 示例')
+    expect(DISTILLER_SYSTEM).toContain('taskSpec 是人工审阅/部署清单')
   })
 
   it('feeds validation errors back and succeeds on the corrected attempt', async () => {
@@ -88,6 +97,14 @@ describe('distillCharter', () => {
     // The retry prompt carried the exact validation failure.
     expect(tasks[1]).toContain('未通过校验')
     expect(tasks[1]).toMatch(/stop|finalize/)
+  })
+
+  it('contains a parseable and structurally valid complete Research example', () => {
+    const section = DISTILLER_SYSTEM.split('## 8. 完整可运行 Research 示例')[1] ?? ''
+    const json = section.match(/```json\n([\s\S]*?)\n```/)?.[1]
+    expect(json).toBeTruthy()
+    const parsed = JSON.parse(json!) as { charter: Parameters<typeof validateCharter>[0] }
+    expect(validateCharter(parsed.charter)).toEqual([])
   })
 
   it('gives up with the accumulated errors after max attempts', async () => {
@@ -301,12 +318,14 @@ describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {
       writeAllowPaths?: string[]
     }
     expect(workerSandbox.readonlyWorkspace).toBe(true)
-    expect(workerSandbox.writeAllowPaths).toEqual([paths.draftsDir])
+    expect(workerSandbox.writeAllowPaths).toEqual([paths.draftsDir, paths.scratchDir])
+    expect(worker.extraTools?.map(tool => tool.name)).toEqual(expect.arrayContaining(['timer', 'skill']))
     expect(denied).toContain(paths.ledgerDir)
     expect(denied).toContain(paths.instanceJson)
     const judge = dispatcher.configs.find(c => c.taskDescription!.includes('隔离评审座位'))!
     expect(judge.sandbox).toBeUndefined()
     expect(judge.allowedTools).toEqual([])
+    expect(judge.taskDescription).toContain('每条 finding 必须有训练数据支撑')
   })
 
   it('emits the full observer event sequence for a round', async () => {

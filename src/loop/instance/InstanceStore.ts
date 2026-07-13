@@ -14,6 +14,7 @@ import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
 import { freezeCharter, normalizeFrozenCharterForRuntime } from '../charter/CharterValidate.js'
 import { Ledger, withBuiltinSchemas } from '../ledger/LedgerApi.js'
 import { WakeStore } from '../wake/WakeStore.js'
+import { preflightCharterCapabilities } from '../security/CapabilityPreflight.js'
 import {
   instancePaths,
   type InstancePaths,
@@ -47,9 +48,13 @@ export async function createInstance(input: CreateInstanceInput): Promise<LoopIn
   if (existing) return loadInstanceFrom(paths, existing)
 
   const frozen = freezeCharter(input.charter)   // throws on invalid charter
+  await preflightCharterCapabilities(frozen, input.projectDir)
   const charterHash = createHash('sha256').update(JSON.stringify(frozen)).digest('hex')
 
-  for (const dir of [paths.ledgerDir, paths.draftsDir, paths.inboxDir, paths.processedDir, paths.eventsDir, paths.reportsDir]) {
+  for (const dir of [
+    paths.ledgerDir, paths.draftsDir, paths.scratchDir, paths.inboxDir,
+    paths.processedDir, paths.eventsDir, paths.reportsDir,
+  ]) {
     await mkdir(dir, { recursive: true })
   }
   await atomicWriteJson(paths.frozenCharter, frozen)

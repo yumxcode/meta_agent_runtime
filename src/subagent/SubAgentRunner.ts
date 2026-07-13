@@ -35,6 +35,7 @@ import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
 import { isAbsolute, relative, resolve, sep } from 'path'
+import { tmpdir } from 'os'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -833,6 +834,11 @@ export function wrapWithSandboxWriteGuard(
   const denyRoots = (sandbox.writeDenyPaths ?? []).map(p => resolve(p))
   const allowRoots = [
     ...(sandbox.writeAllowPaths ?? []).map(p => resolve(p)),
+    // Match the OS sandbox profiles: temporary storage is always writable.
+    // This keeps write_file/edit_file and bash on the same policy.
+    resolve(tmpdir()),
+    resolve('/tmp'),
+    resolve('/private/tmp'),
     ...(sandbox.readonlyWorkspace ? [] : [resolve(workspaceRoot)]),
   ]
   return {

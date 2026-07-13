@@ -8,6 +8,27 @@ import { collectRefs, evaluateBool, parse } from '../../expr/Expr.js'
 import { walkResearchCharter } from '../../__tests__/testCharter.js'
 
 describe('validateCharter', () => {
+  it('validates declarative worker capability requirements and authoritative judge rubric', () => {
+    const valid = walkResearchCharter()
+    valid.seats.worker.skills = ['gradmotion']
+    valid.seats.worker.capabilities = { vcsPublish: { remote: 'origin' } }
+    valid.seats.worker.hostRequirements = { writePaths: ['~/.account-pool'] }
+    valid.writeScope = ['src/**']
+    expect(validateCharter(valid)).toEqual([])
+
+    const invalid = walkResearchCharter()
+    invalid.seats.worker.skills = ['bad skill', 'bad skill']
+    invalid.seats.worker.tools = ['read_file', 'skill']
+    invalid.seats.judge!.capabilities = { vcsPublish: {} }
+    ;(invalid.gates.findings_gate as { rubric: string }).rubric = ''
+    const errors = validateCharter(invalid)
+    expect(errors).toEqual(expect.arrayContaining([
+      expect.stringContaining('invalid skill name'),
+      expect.stringContaining("kernel-injected tool 'skill'"),
+      expect.stringContaining('isolated seats have no tools'),
+      expect.stringContaining('authoritative judge rubric'),
+    ]))
+  })
   it('freezes versioned EffectBindings and their typed rule ASTs', () => {
     const charter = walkResearchCharter({
       effects: {

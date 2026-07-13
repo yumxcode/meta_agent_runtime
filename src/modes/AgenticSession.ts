@@ -14,47 +14,13 @@ import { KernelSession } from '../kernel/index.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import { resolveConfig } from '../core/config.js'
-import { getValue as getConfigValue } from '../core/config/ConfigService.js'
-import { homedir } from 'os'
-import { existsSync } from 'fs'
 import { instrumentTool } from '../runtime/instrumentTool.js'
 import { toKernelTool } from './toolAdapter.js'
 import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
 import { toKernelMessages } from './messageBridge.js'
 import { ToolRuntimeGuards } from './toolRuntimeGuards.js'
-
-/**
- * Resolve operator-configured extra writable sandbox paths from config.json
- * (`sandbox.writeAllowPaths`, merged global < project). Each entry:
- *   - leading `~` / `~/` is expanded to the user's home dir,
- *   - must be an absolute path,
- *   - must EXIST on disk (bwrap fails if a bind source is missing) — missing
- *     paths are silently dropped so a stale entry never breaks every bash call.
- * Returns [] when unset/invalid. Lets the agent read/write host-local stores it
- * legitimately needs outside the workspace (e.g. account-pool's ~/.account-pool
- * SQLite DB) without unlocking the whole jail.
- */
-function resolveSandboxWriteAllowPaths(projectDir: string): string[] {
-  try {
-    const raw = getConfigValue('sandbox.writeAllowPaths', { projectDir })
-    if (!Array.isArray(raw)) return []
-    const home = homedir()
-    const out: string[] = []
-    for (const entry of raw) {
-      if (typeof entry !== 'string' || !entry.trim()) continue
-      let p = entry.trim()
-      if (p === '~') p = home
-      else if (p.startsWith('~/')) p = home + p.slice(1)
-      if (!p.startsWith('/')) continue          // absolute paths only
-      if (!existsSync(p)) continue              // drop missing → never break bwrap
-      if (!out.includes(p)) out.push(p)
-    }
-    return out
-  } catch {
-    return []
-  }
-}
+import { resolveConfiguredWriteAllowPaths } from '../sandbox/configuredWritePaths.js'
 
 export class AgenticSession {
   private readonly _engine: KernelSession
@@ -81,7 +47,7 @@ export class AgenticSession {
     this._runtimeGuards = new ToolRuntimeGuards({
       projectDir: resolved.projectDir ?? process.cwd(),
       autonomy: config.autonomy,
-      extraWriteAllowPaths: resolveSandboxWriteAllowPaths(resolved.projectDir ?? process.cwd()),
+      extraWriteAllowPaths: resolveConfiguredWriteAllowPaths(resolved.projectDir ?? process.cwd()),
     })
     // Anthropic-format providers that don't accept the thinking param (e.g. Qwen)
     // must not receive it; OpenAI-protocol providers map thinking → reasoning_effort

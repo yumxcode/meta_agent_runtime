@@ -208,7 +208,25 @@ export interface SeatSpec {
   /** D5/D6: worker defaults lineage_round, judge/pivoter isolated. */
   context: SeatContext
   prompt: string
+  /** Skills that must exist before an instance can be created. The loop base
+   * injects the read-only `skill` loader; these names are capability
+   * requirements, not prompt hints. */
+  skills?: string[]
   tools?: string[]
+  /** Host-owned capabilities explicitly authorized by the reviewed Charter.
+   * They are implemented as constrained tools and never widen bash/write_file. */
+  capabilities?: {
+    vcsPublish?: {
+      /** Fixed git remote. Defaults to origin. */
+      remote?: string
+    }
+  }
+  /** Host paths the workflow requires. This field never grants access: create
+   * succeeds only when the operator already granted a containing path through
+   * `sandbox.writeAllowPaths`. */
+  hostRequirements?: {
+    writePaths?: string[]
+  }
   /**
    * Per-SEGMENT circuit breakers for a seat call. `wallclockMin` sets the seat's
    * wall-clock cap in minutes (default 30). A research submit segment (read +

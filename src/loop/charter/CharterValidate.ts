@@ -25,6 +25,8 @@ import type {
 } from './CharterTypes.js'
 
 const ID_RE = /^[a-z][a-z0-9_-]*$/i
+const CAPABILITY_NAME_RE = /^[a-zA-Z0-9._-]+$/
+const KERNEL_WORKER_TOOLS = new Set(['skill', 'timer', 'return_result', 'vcs_publish'])
 const META_AGENT_RE = /\.meta-agent[/\\]/
 
 // ── v3 migration: legacy {mode?, escalate?, stop?} → discriminated union ──────
@@ -238,6 +240,48 @@ export function validateCharter(rawCharter: Charter): string[] {
       const pathErr = relativePathError(input)
       if (pathErr) errs.push(`seats.${name}.inputs '${input}' ${pathErr}`)
     }
+    if (seat.skills !== undefined && !Array.isArray(seat.skills)) {
+      errs.push(`seats.${name}.skills must be an array`)
+    }
+    const seenSkills = new Set<string>()
+    for (const skill of Array.isArray(seat.skills) ? seat.skills : []) {
+      if (typeof skill !== 'string' || !CAPABILITY_NAME_RE.test(skill)) {
+        errs.push(`seats.${name}.skills contains invalid skill name '${String(skill)}'`)
+      } else if (seenSkills.has(skill)) {
+        errs.push(`seats.${name}.skills contains duplicate '${skill}'`)
+      }
+      seenSkills.add(skill)
+    }
+    if (seat.tools !== undefined && !Array.isArray(seat.tools)) {
+      errs.push(`seats.${name}.tools must be an array`)
+    }
+    const seenTools = new Set<string>()
+    for (const tool of Array.isArray(seat.tools) ? seat.tools : []) {
+      if (typeof tool !== 'string' || !CAPABILITY_NAME_RE.test(tool)) {
+        errs.push(`seats.${name}.tools contains invalid tool name '${String(tool)}'`)
+      } else if (KERNEL_WORKER_TOOLS.has(tool)) {
+        errs.push(`seats.${name}.tools must not list kernel-injected tool '${tool}'`)
+      } else if (seenTools.has(tool)) {
+        errs.push(`seats.${name}.tools contains duplicate '${tool}'`)
+      }
+      seenTools.add(tool)
+    }
+    if (name !== 'worker' && ((seat.skills?.length ?? 0) > 0 || seat.capabilities || seat.hostRequirements)) {
+      errs.push(`seats.${name} cannot declare skills/capabilities/hostRequirements; isolated seats have no tools`)
+    }
+    const remote = seat.capabilities?.vcsPublish?.remote
+    if (remote !== undefined && !CAPABILITY_NAME_RE.test(remote)) {
+      errs.push(`seats.${name}.capabilities.vcsPublish.remote must be a git remote name`)
+    }
+    const hostWritePaths = seat.hostRequirements?.writePaths
+    if (hostWritePaths !== undefined && !Array.isArray(hostWritePaths)) {
+      errs.push(`seats.${name}.hostRequirements.writePaths must be an array`)
+    }
+    for (const path of Array.isArray(hostWritePaths) ? hostWritePaths : []) {
+      if (typeof path !== 'string' || !(path.startsWith('/') || path.startsWith('~/'))) {
+        errs.push(`seats.${name}.hostRequirements.writePaths '${String(path)}' must be absolute or start with '~/'`)
+      }
+    }
     const wc = seat.budgetPerRound?.wallclockMin
     if (wc !== undefined && (!Number.isFinite(wc) || wc < 1)) {
       errs.push(`seats.${name}.budgetPerRound.wallclockMin must be a positive number of minutes`)
@@ -245,6 +289,9 @@ export function validateCharter(rawCharter: Charter): string[] {
   }
   if (charter.seats?.worker && charter.seats.worker.context === undefined) {
     errs.push("seats.worker.context is required ('lineage_loop' to accumulate context across rounds, or 'isolated' for fresh-eyes rounds)")
+  }
+  if (charter.seats?.worker?.capabilities?.vcsPublish && (charter.writeScope?.length ?? 0) === 0) {
+    errs.push('seats.worker.capabilities.vcsPublish requires a non-empty writeScope')
   }
 
   // Gates.
@@ -254,6 +301,9 @@ export function validateCharter(rawCharter: Charter): string[] {
       judgeGateNames.push(name)
       if (!charter.seats?.judge) {
         errs.push(`gate[${name}] is a judge gate but no judge seat is declared`)
+      }
+      if (typeof gate.rubric !== 'string' || !gate.rubric.trim()) {
+        errs.push(`gate[${name}].rubric must be a non-empty authoritative judge rubric`)
       }
       for (const evidence of gate.evidence) {
         const pathErr = relativePathError(evidence)

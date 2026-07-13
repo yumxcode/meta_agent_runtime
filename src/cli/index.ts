@@ -34,12 +34,13 @@ import { isAbsolute, resolve, join, basename } from 'node:path'
 import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { runLoopCli, runLoopScheduler, DISTILLER_SYSTEM, parseDistillOutput, validateCharter, type LoopEvent } from '../loop/index.js'
+import { runLoopCli, runLoopScheduler, buildDistillerSystem, parseDistillOutput, validateCharter, type LoopEvent } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
+import { listAllSkillNames } from '../tools/system/skill/index.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
@@ -5182,8 +5183,11 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
   })
   for (const tool of tools) router.registerTool(tool)
 
+  const distillerSystem = buildDistillerSystem({
+    skillNames: await listAllSkillNames(projectDir, 'agentic'),
+  })
   const freshPrompt =
-    `${DISTILLER_SYSTEM}\n\n【loop 需求描述】\n${doc}\n\n` +
+    `${distillerSystem}\n\n【loop 需求描述】\n${doc}\n\n` +
     '你可以用 read_file/grep/glob 读工作区来理解项目。最后在一个 ```json 代码块里输出最终结果：' +
     '{"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。'
   const resumePrompt =
@@ -5208,6 +5212,7 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
         if (parsed.taskSpec) writeFileSync(resolve(projectDir, 'task_spec.draft.md'), parsed.taskSpec, 'utf-8')
         wrote = true
         console.log(green(`\n✓ charter 草案已写入 ${out}（第 ${attempt} 次尝试，已通过校验）`))
+        if (parsed.taskSpec) console.log(dim('  task_spec.draft.md 仅供人工部署/审阅，不会被 loop create 执行'))
         console.log(dim(`  审阅后运行:   meta-agent -w ${projectDir} loop create ${out}`))
         console.log(dim(`  继续共创修订: meta-agent -w ${projectDir} loop distill ${docFile} --resume --note "你的意见"`))
         break

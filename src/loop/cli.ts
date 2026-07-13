@@ -67,13 +67,19 @@ async function cmdDistill(rest: string[], deps: LoopCliDeps): Promise<string> {
   if (!file) throw new Error('loop distill: requirement doc path required')
   const out = flagValue(rest, '--out') ?? 'charter.draft.json'
   const doc = await readFile(resolve(deps.projectDir, file), 'utf-8')
-  const result = await distillCharter(doc, { dispatcher: deps.dispatcher, signal: deps.signal })
+  const result = await distillCharter(doc, {
+    dispatcher: deps.dispatcher,
+    signal: deps.signal,
+    projectDir: deps.projectDir,
+    promptCatalog: deps.effectAdapters ? { effectAdapterIds: deps.effectAdapters.ids() } : undefined,
+  })
   await writeFile(resolve(deps.projectDir, out), JSON.stringify(result.charter, null, 2), 'utf-8')
   if (result.taskSpec) {
     await writeFile(resolve(deps.projectDir, 'task_spec.draft.md'), result.taskSpec, 'utf-8')
   }
   return [
     `charter draft written to ${out} (validated, ${result.attempts} attempt(s))`,
+    ...(result.taskSpec ? ['task_spec.draft.md written as a human-only deployment/review checklist'] : []),
     `review it, then approve by running: meta-agent loop create ${out}`,
   ].join('\n')
 }

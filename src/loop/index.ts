@@ -29,7 +29,10 @@ export {
 } from './effects/EventAuth.js'
 export { ingestEvents, reconcileWaiting, readPendingRound } from './effects/WaitOps.js'
 export { runLoopScheduler, type DaemonOptions, type DaemonResult } from './daemon.js'
-export { distillCharter, DISTILLER_SYSTEM, parseDistillOutput, type DistillResult, type DistillDeps } from './distill/Distiller.js'
+export {
+  distillCharter, DISTILLER_SYSTEM, buildDistillerSystem, parseDistillOutput,
+  type DistillResult, type DistillDeps, type DistillerPromptCatalog,
+} from './distill/Distiller.js'
 export { migrateInstance, type MigrationEntry } from './instance/Migrate.js'
 export { spawnAndWait, type SpawnWaitOptions } from './seatSpawn.js'
 export type { LoopEvent } from './kernel/LoopKernel.js'
