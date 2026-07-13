@@ -25,7 +25,7 @@ import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
-import { resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
+import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import {
   assembleInnerWorkerSystemPrompt,
   renderInnerWorkerUserMessage,
@@ -111,10 +111,19 @@ export async function runWorkerSeat(
   // D7 made structural (T4.2): the ledger and instance internals are DENIED at
   // the sandbox level for the worker's bash — the prompt contract is the
   // instruction, this is the guarantee. Drafts/inbox stay writable.
-  const writeAllowPaths = [
-    paths.draftsDir,
-    ...await Promise.all((charter.writeScope ?? []).map(scope => resolveWriteScopeRoot(deps.projectDir, scope))),
-  ]
+  // Any writeScope resolution failure (missing literal, symlink escape, …) is a
+  // charter/workspace mismatch — retrying the round can never fix it, so
+  // surface it as CharterEnforcementError and let the runner fail-stop the
+  // instance instead of hot-looping the wake.
+  const scopeRoots = await Promise.all((charter.writeScope ?? []).map(async scope => {
+    try {
+      return await resolveWriteScopeRoot(deps.projectDir, scope)
+    } catch (err) {
+      if (err instanceof CharterEnforcementError) throw err
+      throw new CharterEnforcementError(`writeScope '${scope}' cannot be enforced: ${(err as Error).message}`)
+    }
+  }))
+  const writeAllowPaths = [paths.draftsDir, ...scopeRoots]
   const sandbox = {
     readonlyWorkspace: true,
     writeAllowPaths,

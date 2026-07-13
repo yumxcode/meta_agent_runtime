@@ -1,8 +1,21 @@
 import { isAbsolute, relative, resolve, sep } from 'path'
-import { realpath, stat } from 'fs/promises'
+import { mkdir, realpath, stat } from 'fs/promises'
 
 const GLOB_META_RE = /[*?[\]{}]/
 const WINDOWS_ABSOLUTE_RE = /^[a-zA-Z]:[\\/]/
+
+/**
+ * A charter declaration the kernel cannot enforce at runtime (e.g. a writeScope
+ * literal that does not exist on disk). This is a CONFIGURATION failure, not a
+ * transient one: retrying the round can never fix it, so the runner must
+ * fail-stop the instance instead of requeueing the wake into a hot crash loop.
+ */
+export class CharterEnforcementError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'CharterEnforcementError'
+  }
+}
 
 /** Validate a charter path before it is frozen. Both POSIX and Windows
  * separators are treated as separators so a charter cannot become unsafe when
@@ -49,6 +62,13 @@ export async function resolveExistingInside(root: string, rel: string): Promise<
  * Arbitrary globs such as `src/**\/*.ts` cannot be represented by Seatbelt or
  * bwrap and are rejected instead of silently widening access. */
 export function writeScopeRoot(scope: string): string {
+  return parseWriteScope(scope).root
+}
+
+/** Split a writeScope declaration into its root path and whether it is the
+ * directory-tree form (`path/**`) — the tree form implies a DIRECTORY the
+ * worker is allowed to populate, so the kernel may create it on demand. */
+export function parseWriteScope(scope: string): { root: string; tree: boolean } {
   const err = relativePathError(scope)
   if (err) throw new Error(err)
   const normalized = scope.replace(/\\/g, '/')
@@ -57,15 +77,31 @@ export function writeScopeRoot(scope: string): string {
   if (GLOB_META_RE.test(root)) {
     throw new Error("only a literal path or trailing '/**' directory tree is supported")
   }
-  return root
+  return { root, tree: root !== normalized }
 }
 
 /** Runtime write-side validation. bwrap bind sources must exist, and resolving
  * the real path prevents a declared symlink from granting a path outside the
- * workspace. */
+ * workspace.
+ *
+ * Tree scopes (`path/**`) declare a directory the worker will populate — it may
+ * legitimately not exist yet (first round of a fresh workspace), so it is
+ * created on demand. A missing LITERAL scope is a charter/workspace mismatch
+ * retries can never fix → CharterEnforcementError (runner fail-stops). */
 export async function resolveWriteScopeRoot(projectDir: string, scope: string): Promise<string> {
-  const root = writeScopeRoot(scope)
-  const target = await resolveExistingInside(projectDir, root)
-  await stat(target) // make the existence requirement explicit in diagnostics
-  return target
+  const { root, tree } = parseWriteScope(scope)
+  if (tree) await mkdir(resolveInside(projectDir, root), { recursive: true })
+  try {
+    const target = await resolveExistingInside(projectDir, root)
+    await stat(target) // make the existence requirement explicit in diagnostics
+    return target
+  } catch (err) {
+    if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+      throw new CharterEnforcementError(
+        `writeScope '${scope}' points at a missing path — create it in the workspace, ` +
+        `or declare the directory-tree form '${root}/**' to let the kernel create it`,
+      )
+    }
+    throw err
+  }
 }

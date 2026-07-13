@@ -19,6 +19,7 @@ import { setInstanceStatus } from './instance/InstanceStore.js'
 import { ingestEvents, reconcileWaiting } from './effects/WaitOps.js'
 import { HALTED_STATUSES } from './types.js'
 import { LedgerCorruptionError } from './ledger/LedgerApi.js'
+import { CharterEnforcementError } from './security/PathSafety.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
@@ -33,7 +34,7 @@ export interface TickResult {
   outcomes: TickOutcome[]
 }
 
-export type TickOutcome = { loopId: string; outcome?: RoundOutcome; probe?: string; error?: string }
+export type TickOutcome = { loopId: string; outcome?: RoundOutcome; error?: string }
 const DEFAULT_TICK_MAX_CLAIMS = 4
 
 /** Fast scheduler phase: reconcile durable state and atomically claim a bounded
@@ -102,6 +103,19 @@ export async function runClaimedWake(
       }
       return { loopId: wake.loopId, error: err.message }
     }
+    if (err instanceof CharterEnforcementError) {
+      // Charter/workspace mismatch (e.g. writeScope pointing at a missing
+      // file): deterministic, retries can never fix it. Fail-stop instead of
+      // requeueing the wake into a hot crash loop.
+      const instance = await loadInstance(deps.projectDir, wake.loopId)
+      if (instance) {
+        await setInstanceStatus(instance, 'failed', `charter enforcement failed: ${err.message}`).catch(() => undefined)
+        await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
+      } else {
+        await wakeStore.release(wake.wakeId, 'cancelled').catch(() => undefined)
+      }
+      return { loopId: wake.loopId, error: err.message }
+    }
     if (err instanceof RoundExecutionUncertainError) {
       const instance = await loadInstance(deps.projectDir, wake.loopId)
       if (instance) {
@@ -127,11 +141,10 @@ export async function runClaimedWake(
 }
 
 /**
- * Claim every due wake for this workspace and handle it:
- *   probe wakes → pure-code probe (cheap, in-process, no LLM);
- *   timer/event/manual → a full kernel round (LLM seats).
- * Event files are ingested up front so a dropped completion event converts
- * into a harvest wake within the same tick.
+ * Claim every due wake for this workspace and handle it (timer/event/manual —
+ * each is a full kernel round; there are no code probes). Event files are
+ * ingested up front so a dropped completion event converts into a harvest wake
+ * within the same tick.
  */
 export async function tickOnce(deps: TickDeps, now = Date.now()): Promise<TickResult> {
   const { wakeStore, wakes } = await prepareAndClaim(deps, now, DEFAULT_TICK_MAX_CLAIMS)

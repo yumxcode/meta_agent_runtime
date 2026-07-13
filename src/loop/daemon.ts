@@ -2,11 +2,11 @@
  * daemon — the loop-scheduler poll loop (spec C8/T2.4; SchedulerKeepAlive
  * layer B generalised).
  *
- * The daemon owns exactly three verbs: CLAIM (via tickOnce), PROBE (inline,
- * pure code), DISPATCH (rounds — in-process here; the child-process spawn is
- * an ops refinement that does not change this contract). It is stateless: all
- * truth lives in charter/ledger/effects/wakes, so killing the daemon at any
- * point loses nothing (D11).
+ * The daemon owns exactly two verbs: CLAIM (prepareAndClaim) and DISPATCH
+ * (rounds — in-process, bounded by maxConcurrentRounds). There are no code
+ * probes: waits are worker-driven (self-timer) or event-driven. It is
+ * stateless: all truth lives in charter/ledger/effects/wakes, so killing the
+ * daemon at any point loses nothing (D11).
  *
  * Lifecycle:
  *   • host lock — at most one daemon per workspace (stale locks from dead
@@ -48,7 +48,6 @@ export interface DaemonOptions extends TickDeps {
 export interface DaemonResult {
   ticks: number
   roundsRun: number
-  probesRun: number
   exitReason: 'idle' | 'aborted' | 'lock_held'
 }
 
@@ -71,7 +70,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
   ))
   const lockToken = await acquireLock(lockPath, lockFreshMs)
   if (!lockToken) {
-    return { ticks: 0, roundsRun: 0, probesRun: 0, exitReason: 'lock_held' }
+    return { ticks: 0, roundsRun: 0, exitReason: 'lock_held' }
   }
   // This timer is independent of tickOnce(): a model seat can legally run for
   // hours, so refreshing only between ticks lets a cross-host observer reap a
@@ -83,7 +82,6 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
   const wakeStore = new WakeStore(opts.projectDir)
   let ticks = 0
   let roundsRun = 0
-  let probesRun = 0
   let idleSince: number | null = null
   let nextHousekeepingAt = 0
   const inFlight = new Map<string, Promise<void>>()
@@ -100,7 +98,6 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
         const outcomes = completed.splice(0)
         const result: TickResult = { claimed: outcomes.length, outcomes }
         roundsRun += outcomes.filter(o => o.outcome).length
-        probesRun += outcomes.filter(o => o.probe).length
         opts.onTick?.(result)
       }
       if (opts.signal?.aborted) {
@@ -111,10 +108,9 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
         if (completed.length > 0) {
           const outcomes = completed.splice(0)
           roundsRun += outcomes.filter(o => o.outcome).length
-          probesRun += outcomes.filter(o => o.probe).length
           opts.onTick?.({ claimed: outcomes.length, outcomes })
         }
-        return { ticks, roundsRun, probesRun, exitReason: 'aborted' }
+        return { ticks, roundsRun, exitReason: 'aborted' }
       }
 
       await refreshLock(lockPath, lockToken)
@@ -156,7 +152,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       if (live.length === 0 && !hasWaiting && inFlight.size === 0) {
         idleSince ??= now()
         if (now() - idleSince >= idleExitMs) {
-          return { ticks, roundsRun, probesRun, exitReason: 'idle' }
+          return { ticks, roundsRun, exitReason: 'idle' }
         }
       } else {
         idleSince = null

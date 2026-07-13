@@ -65,13 +65,10 @@ export class EffectLedger {
     })
   }
 
-  async recordProbe(effectKey: string, verdict: string, data?: unknown): Promise<void> {
-    await this.locked(() => this.append({ t: 'probe', effectKey, verdict, data, at: Date.now() }))
-  }
-
-  async recordResubmit(effectKey: string, payload?: Record<string, unknown>): Promise<void> {
-    await this.locked(() => this.append({ t: 'resubmit', effectKey, payload, at: Date.now() }))
-  }
+  // NOTE: probe/resubmit WRITE APIs are retired with the code-probe machinery
+  // (waits are worker-driven: self-timer or external event). The 'probe' and
+  // 'resubmit' branches in fold() are kept so pre-retirement effects.jsonl
+  // histories still fold correctly.
 
   /** Conclude exactly once: the first conclude wins, later ones are no-ops.
    * This is the probe/event idempotency point (both paths call it). */

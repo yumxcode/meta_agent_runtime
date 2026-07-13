@@ -34,7 +34,7 @@ import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
-import { isAbsolute, relative, resolve } from 'path'
+import { isAbsolute, relative, resolve, sep } from 'path'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -591,6 +591,19 @@ export class SubAgentRunner {
       tools = tools.map(t => wrapWithDiscardedPathGuard(t, root))
     }
 
+    // Sandbox write policy must bind ALL write channels, not just bash: the OS
+    // sandbox only wraps the bash tool, so write_file/edit_file/notebook_edit
+    // would otherwise bypass readonlyWorkspace/writeAllowPaths entirely. Mirror
+    // the OS-level policy onto every write-category tool (deny wins over allow).
+    const sandboxCfg = this.record.config.sandbox
+    if (
+      sandboxCfg &&
+      (sandboxCfg.readonlyWorkspace || sandboxCfg.writeAllowPaths?.length || sandboxCfg.writeDenyPaths?.length)
+    ) {
+      const root = this.record.config.projectDir ?? process.cwd()
+      tools = tools.map(t => wrapWithSandboxWriteGuard(t, root, sandboxCfg))
+    }
+
     if (!sandboxHandle) return tools
 
     // Replace the 'bash' tool with a sandboxed version
@@ -798,4 +811,59 @@ function pathIsUnderMetaAgent(raw: string, workspaceRoot: string): boolean {
   const abs = isAbsolute(raw) ? raw : resolve(workspaceRoot, raw)
   const rel = relative(resolve(workspaceRoot), abs).replace(/\\/g, '/')
   return rel === '.meta-agent' || rel.startsWith('.meta-agent/')
+}
+
+/**
+ * Mirror the OS sandbox's write policy onto write-category TOOLS. The OS
+ * sandbox (Seatbelt/bwrap) only wraps the bash tool; write_file/edit_file/
+ * notebook_edit run in-process and would otherwise bypass readonlyWorkspace/
+ * writeAllowPaths/writeDenyPaths. Semantics match the OS layer exactly:
+ *   • a path under any writeDenyPaths is blocked (deny wins over allow);
+ *   • the workspaceRoot is implicitly writable UNLESS readonlyWorkspace;
+ *   • writeAllowPaths grant additional writable roots.
+ * Lexical containment only — the OS layer remains the backstop for bash.
+ */
+export function wrapWithSandboxWriteGuard(
+  tool: MetaAgentTool,
+  workspaceRoot: string,
+  sandbox: import('../sandbox/types.js').SandboxConfig,
+): MetaAgentTool {
+  const pathFields = tool.permission?.pathFields
+  if (tool.permission?.category !== 'write' || !pathFields || pathFields.length === 0) return tool
+  const denyRoots = (sandbox.writeDenyPaths ?? []).map(p => resolve(p))
+  const allowRoots = [
+    ...(sandbox.writeAllowPaths ?? []).map(p => resolve(p)),
+    ...(sandbox.readonlyWorkspace ? [] : [resolve(workspaceRoot)]),
+  ]
+  return {
+    ...tool,
+    call: async (input, ctx) => {
+      for (const field of pathFields) {
+        const raw = input[field]
+        if (typeof raw !== 'string' || !raw) continue
+        const abs = isAbsolute(raw) ? resolve(raw) : resolve(workspaceRoot, raw)
+        if (denyRoots.some(root => pathIsUnder(abs, root))) {
+          return {
+            content: `Error: '${raw}' is write-protected for this seat (sandbox writeDenyPaths). ` +
+              `(blocked ${tool.name}.${field})`,
+            isError: true,
+          }
+        }
+        if (!allowRoots.some(root => pathIsUnder(abs, root))) {
+          const writable = allowRoots.length > 0 ? allowRoots.join(', ') : '(none)'
+          return {
+            content: `Error: '${raw}' is outside this seat's write scope (sandbox policy). ` +
+              `Writable roots: ${writable}. (blocked ${tool.name}.${field})`,
+            isError: true,
+          }
+        }
+      }
+      return tool.call(input, ctx)
+    },
+  }
+}
+
+function pathIsUnder(abs: string, root: string): boolean {
+  const rel = relative(root, abs)
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
 }
