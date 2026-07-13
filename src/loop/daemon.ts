@@ -19,7 +19,13 @@ import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'fs/promise
 import { join, resolve } from 'path'
 import { hostname } from 'os'
 import { randomUUID } from 'crypto'
-import { tickOnce, type TickDeps, type TickResult } from './runner.js'
+import {
+  prepareAndClaim,
+  runClaimedWake,
+  type TickDeps,
+  type TickOutcome,
+  type TickResult,
+} from './runner.js'
 import { listInstanceRecords } from './instance/InstanceStore.js'
 import { WakeStore } from './wake/WakeStore.js'
 
@@ -35,6 +41,8 @@ export interface DaemonOptions extends TickDeps {
   lockFreshMs?: number
   /** Independent lease heartbeat interval. Default 60 s. Primarily a test hook. */
   lockHeartbeatMs?: number
+  /** Maximum rounds executing concurrently in this daemon. Default 4. */
+  maxConcurrentRounds?: number
 }
 
 export interface DaemonResult {
@@ -45,10 +53,13 @@ export interface DaemonResult {
 }
 
 const LOCK_FILE = 'daemon.lock'
+const WAKE_RETENTION_MS = 7 * 24 * 60 * 60_000
+const HOUSEKEEPING_INTERVAL_MS = 60 * 60_000
 
 export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResult> {
   const pollMs = Math.max(10, opts.pollMs ?? 2_000)
   const idleExitMs = opts.idleExitMs ?? 60_000
+  const maxConcurrentRounds = Math.max(1, Math.floor(opts.maxConcurrentRounds ?? 4))
   const now = opts.now ?? Date.now
   const lockDir = join(resolve(opts.projectDir), '.loop')
   const lockPath = join(lockDir, LOCK_FILE)
@@ -74,22 +85,63 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
   let roundsRun = 0
   let probesRun = 0
   let idleSince: number | null = null
+  let nextHousekeepingAt = 0
+  const inFlight = new Map<string, Promise<void>>()
+  const completed: TickOutcome[] = []
+  const tickDeps: TickDeps = {
+    dispatcher: opts.dispatcher,
+    projectDir: opts.projectDir,
+    signal: opts.signal,
+    observer: opts.observer,
+  }
   try {
     for (;;) {
-      if (opts.signal?.aborted) return { ticks, roundsRun, probesRun, exitReason: 'aborted' }
+      if (completed.length > 0) {
+        const outcomes = completed.splice(0)
+        const result: TickResult = { claimed: outcomes.length, outcomes }
+        roundsRun += outcomes.filter(o => o.outcome).length
+        probesRun += outcomes.filter(o => o.probe).length
+        opts.onTick?.(result)
+      }
+      if (opts.signal?.aborted) {
+        // Keep the host lock until every task has observed cancellation and its
+        // wake disposition is durable. This prevents a replacement daemon from
+        // replaying work beside an old live worker.
+        await Promise.allSettled([...inFlight.values()])
+        if (completed.length > 0) {
+          const outcomes = completed.splice(0)
+          roundsRun += outcomes.filter(o => o.outcome).length
+          probesRun += outcomes.filter(o => o.probe).length
+          opts.onTick?.({ claimed: outcomes.length, outcomes })
+        }
+        return { ticks, roundsRun, probesRun, exitReason: 'aborted' }
+      }
 
       await refreshLock(lockPath, lockToken)
-      const result = await tickOnce(
-        { dispatcher: opts.dispatcher, projectDir: opts.projectDir, signal: opts.signal, observer: opts.observer },
-        now(),
-      )
+      const tickNow = now()
+      if (tickNow >= nextHousekeepingAt) {
+        await wakeStore.prune(WAKE_RETENTION_MS, tickNow).catch(() => 0)
+        nextHousekeepingAt = tickNow + HOUSEKEEPING_INTERVAL_MS
+      }
+      const available = maxConcurrentRounds - inFlight.size
+      const claimed = available > 0
+        ? await prepareAndClaim(tickDeps, tickNow, available)
+        : { wakeStore, wakes: [] }
       ticks++
-      if (result.claimed > 0) {
-        roundsRun += result.outcomes.filter(o => o.outcome).length
-        probesRun += result.outcomes.filter(o => o.probe).length
-        opts.onTick?.(result)
+      if (claimed.wakes.length > 0) {
+        for (const wake of claimed.wakes) {
+          const task = runClaimedWake(tickDeps, claimed.wakeStore, wake)
+            .then(outcome => { completed.push(outcome) })
+            .catch(err => {
+              completed.push({
+                loopId: wake.loopId,
+                error: err instanceof Error ? err.message : String(err),
+              })
+            })
+            .finally(() => { inFlight.delete(wake.wakeId) })
+          inFlight.set(wake.wakeId, task)
+        }
         idleSince = null
-        continue // drain immediately while there is work
       }
 
       // Idle detection: pending OR claimed wakes (even future ones) keep us
@@ -101,7 +153,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       )
       const hasWaiting = live.length === 0 &&
         (await listInstanceRecords(opts.projectDir)).some(r => r.status === 'waiting')
-      if (live.length === 0 && !hasWaiting) {
+      if (live.length === 0 && !hasWaiting && inFlight.size === 0) {
         idleSince ??= now()
         if (now() - idleSince >= idleExitMs) {
           return { ticks, roundsRun, probesRun, exitReason: 'idle' }

@@ -64,11 +64,14 @@ describe('Ledger', () => {
     const rows = await ledger.readJsonl<RoundEntry>(paths.roundsJsonl)
     expect(rows).toHaveLength(1)
     expect(rows[0]!.round).toBe(1)
+    expect((await ledger.readJsonl<RoundEntry>(paths.roundsJsonl, 1))[0]!.round).toBe(1)
   })
 
   it('readView derives progress/lastRounds/findings/directions from disk', async () => {
     const { ledger, paths } = await freshLedger()
-    await ledger.appendRound(round(1))
+    const committed = round(1)
+    committed.postState = { ...committed.postState!, totalFindings: 1 }
+    await ledger.appendRound(committed)
     await ledger.appendJsonl(paths.findingsJsonl, { id: 'f1', claim: 'works' })
     await ledger.replaceJson(paths.directionsJson, { directions: [{ key: 'd1' }] })
     const view = await ledger.readView()

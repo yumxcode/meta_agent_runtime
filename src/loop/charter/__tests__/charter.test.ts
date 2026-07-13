@@ -150,6 +150,12 @@ describe('validateCharter', () => {
     expect(validateCharter(walkResearchCharter({ tripwires: [] }))
       .some(e => e.includes('at least one tripwire'))).toBe(true)
   })
+
+  it('requires a shape spec for newly frozen schema gates', () => {
+    const charter = walkResearchCharter()
+    charter.gates.state_gate = { kind: 'schema', files: ['ledger/progress.json'] }
+    expect(validateCharter(charter).some(e => e.includes('requires a versioned spec'))).toBe(true)
+  })
 })
 
 describe('freezeCharter', () => {

@@ -12,8 +12,8 @@
  * frame. The per-round contract (capsule) rides in the user message `<context>`.
  *
  * Two variants (spec D5 seat.context):
- *   • 'lineage'  — resumes its session across rounds; may rely on accumulated
- *                  context (the compaction rule applies).
+ *   • 'lineage'  — resumes its session for the configured lineage lifetime
+ *                  (one round or the whole loop; compaction applies).
  *   • 'isolated' — fresh session every round; no history, decides from the
  *                  capsule + evidence alone (the "overturn assumptions" worker).
  */
@@ -58,7 +58,8 @@ const WAIT_TOOLS = `\
 你的一轮可能被"等待"切成多段，段与段之间进程是关闭的——由内核负责在合适时机把你原样唤醒。
 - **发起了必须等结果的慢任务（如远端训练）后，立刻调 timer({minutes, reason})。调用 timer 即刻结束本段**——不需要再 return_result，也不要在本段继续做别的事（不要轮询、不要 sleep、不要再扇活）。minutes 取 5..180，按慢任务真正需要多久才有可见进展来定（如训练约 30 分钟看一次曲线）。
 - 到点后内核会 **resume 你（同一会话）**，user 消息会带"继续/收割"提示并附上提交段摘要。此时你亲自查状态：还需要等就**再调一次 timer**（再次 park），可以收割了就整理 findings/direction 后 return_result data={"label":"ok"}。
-- 因此"盯训练直到平台期再终止"这类判断发生在**被唤醒后的收割段**，而不是提交段里内联死等。`
+- 因此"盯训练直到平台期再终止"这类判断发生在**被唤醒后的收割段**，而不是提交段里内联死等。
+- 若外部系统会主动投递完成事件，也可 return_result data={"label":"wait","effectKey":"<外部任务稳定ID>","maxWaitMs":<60000..2592000000>}。事件由 events/ 通道唤醒；maxWaitMs 可省略（默认 7 天），超时后内核确定性升级给人工，禁止永久挂起。`
 
 function contextConventions(variant: InnerWorkerVariant): string {
   const base = `\

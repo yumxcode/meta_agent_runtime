@@ -74,4 +74,18 @@ describe('inner_orch_worker seat wiring', () => {
     expect(cfg.lineageSessionId).toBeUndefined()
     expect(cfg.systemPrompt).toContain('没有历史对话')     // isolated clause
   })
+
+  it('lineage_round → stable within a round but changes on the next round', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'seat-round-wire-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const charter = walkResearchCharter()
+    charter.seats.worker.context = 'lineage_round'
+    const dispatcher = capturing()
+    const seatDeps = { dispatcher, projectDir: dir, signal: new AbortController().signal }
+    await runWorkerSeat(seatDeps, freezeCharter(charter), paths, capsule)
+    await runWorkerSeat(seatDeps, freezeCharter(charter), paths, { ...capsule, round: 2 })
+    expect(dispatcher.configs[0]!.lineageSessionId).toContain('-round-1-worker')
+    expect(dispatcher.configs[1]!.lineageSessionId).toContain('-round-2-worker')
+    expect(dispatcher.configs[0]!.lineageSessionId).not.toBe(dispatcher.configs[1]!.lineageSessionId)
+  })
 })

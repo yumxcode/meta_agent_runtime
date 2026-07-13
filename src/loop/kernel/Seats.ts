@@ -62,9 +62,10 @@ export interface SeatRunnerDeps {
   spawnOpts?: SpawnWaitOptions
 }
 
-/** seat.context → inner_orch_worker variant (spec D5). Only lineage_loop resumes. */
+/** seat.context → inner_orch_worker variant (spec D5). Both lineage modes
+ * resume; their session ids differ in lifetime. */
 function workerVariant(seat: SeatSpec): InnerWorkerVariant {
-  return seat.context === 'lineage_loop' ? 'lineage' : 'isolated'
+  return seat.context === 'isolated' ? 'isolated' : 'lineage'
 }
 
 export async function runWorkerSeat(
@@ -92,9 +93,11 @@ export async function runWorkerSeat(
   })
   // lineage → resume a stable per-(instance,worker) session across rounds;
   // isolated → fresh each round. instanceId is the .loop/<id> dir name.
-  const lineageSessionId = variant === 'lineage'
+  const lineageSessionId = seat.context === 'lineage_loop'
     ? `loop-${basename(paths.root)}-worker`
-    : undefined
+    : seat.context === 'lineage_round'
+      ? `loop-${basename(paths.root)}-round-${capsule.round}-worker`
+      : undefined
   // Self-park channel: the worker may call timer(...) to be woken later this
   // round. Calling timer HARD-PARKS the segment — the sink records the intent
   // AND flips parkSignal, which the runner detects on the timer tool_result to
@@ -173,6 +176,7 @@ export function buildJudgeContract(extraKeys: string[]): string {
 必须调用 return_result，data 写：
 {"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]}${extraClause}
 每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
+metric_delta 的符号与原始指标方向无关：大于 0 永远表示改善，小于 0 表示退化；原始 metric 的最优方向由 charter 定义。
 【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。`
 }
 

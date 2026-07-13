@@ -152,8 +152,17 @@ export async function reconcileWaiting(instance: LoopInstance, deps: WaitOpsDeps
         actions.push(`scheduled missing harvest wake for ${pending.effectKey}`)
       }
     } else if (effect.status === 'submitted' || effect.status === 'probing') {
-      // Event wait: nothing to re-arm — it concludes when an external events/
-      // file arrives (ingested at the top of every round). Just keep waiting.
+      const expiresAt = pending.expiresAt ?? pending.createdAt + 7 * 24 * 60 * 60_000
+      if (Date.now() >= expiresAt) {
+        if (!pending.timedOutAt) {
+          await writePendingRound(instance, { ...pending, timedOutAt: Date.now() })
+        }
+        if (!wakes.some(w => w.kind === 'event' && w.effectKey === pending.effectKey)) {
+          await scheduleHarvestWake(instance, deps, pending.effectKey!)
+        }
+        actions.push(`event wait timed out for ${pending.effectKey}`)
+      }
+      // Otherwise nothing to re-arm: the external events/ file owns progress.
     } else {
       // failed/harvested with a pending round left behind → drop and move on.
       await clearPendingRound(instance)

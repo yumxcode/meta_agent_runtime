@@ -81,8 +81,22 @@ export interface TripwireSpec {
   then: TripwireAction
 }
 
+export type ShapeSpec =
+  | {
+      type: 'object'
+      required?: string[]
+      properties?: Record<string, ShapeSpec>
+      additionalProperties?: boolean
+    }
+  | { type: 'array'; minItems?: number; items?: ShapeSpec }
+  | { type: 'string'; minLength?: number; enum?: string[] }
+  | { type: 'number'; minimum?: number; maximum?: number }
+  | { type: 'integer'; minimum?: number; maximum?: number }
+  | { type: 'boolean' }
+  | { type: 'null' }
+
 export type GateSpec =
-  | { kind: 'schema'; files: string[] }
+  | { kind: 'schema'; files: string[]; /** Optional only for loading legacy frozen charters. */ spec?: ShapeSpec }
   | { kind: 'judge'; evidence: string[]; rubric: string }
 
 export type SeatContext = 'lineage_round' | 'lineage_loop' | 'isolated'
@@ -112,6 +126,8 @@ export interface Charter {
   id: string
   version: number
   goal: string
+  /** Optimization direction for judge.data.metric. Default max for legacy charters. */
+  metric?: { direction: 'max' | 'min' }
   observables: ObservableSpec[]
   meters: MeterSpec[]
   tripwires: TripwireSpec[]

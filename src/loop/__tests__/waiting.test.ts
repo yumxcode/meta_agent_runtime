@@ -195,4 +195,21 @@ describe('waiting rounds — RECONCILE crash matrix', () => {
     expect(actions.some(a => a.includes('settled post-harvest'))).toBe(true)
     expect((await effects.get('exp-42'))!.status).toBe('harvested')
   })
+
+  it('deterministically escalates an event wait whose deadline expired', async () => {
+    const { instance, wakeStore, paths, dir, dispatcher, effects } = await crashedInstance()
+    const pending = (await readPendingRound(instance))!
+    const { atomicWriteJson } = await import('../../infra/persist/index.js')
+    await atomicWriteJson(paths.pendingRoundJson, { ...pending, expiresAt: Date.now() - 1 })
+
+    const actions = await reconcileWaiting(instance, { wakeStore, projectDir: dir })
+    expect(actions.some(a => a.includes('event wait timed out'))).toBe(true)
+    await tickOnce({ dispatcher, projectDir: dir })
+
+    expect(JSON.parse(await readFile(paths.instanceJson, 'utf-8')).status).toBe('paused_attention')
+    expect(await readPendingRound(instance)).toBeNull()
+    expect((await effects.get('exp-42'))!.status).toBe('failed')
+    await expect(readFile(join(paths.reportsDir, 'attention_report.md'), 'utf-8'))
+      .resolves.toContain('did not arrive before its deadline')
+  })
 })

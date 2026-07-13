@@ -30,7 +30,7 @@ import { readFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { resolveExistingInside } from '../security/PathSafety.js'
 import { evaluateBool, type EvalContext } from '../expr/Expr.js'
-import type { FrozenCharter, TripwireAction } from '../charter/CharterTypes.js'
+import type { FrozenCharter, ShapeSpec, TripwireAction } from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
 import { setInstanceStatus } from '../instance/InstanceStore.js'
 import { buildCapsule, consumeInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
@@ -175,6 +175,35 @@ export async function runRound(
       }
     }
     if (pending) {
+      if (pending.kind !== 'self_timer' && pending.timedOutAt) {
+        const progress = await instance.ledger.readProgress()
+        if (progress.iteration >= pending.round) {
+          await clearPendingRound(instance)
+          await effectLedgerFor(instance).markFailed(pending.effectKey!, 'event wait timed out')
+          return {
+            round: pending.round, mode: normalizeRoundMode(pending.mode),
+            route: 'already-accounted', status: progress.status, costUsd: 0,
+          }
+        }
+        await setInstanceStatus(instance, 'running')
+        const outcome = await terminate(instance, deps, {
+          round: pending.round,
+          mode: normalizeRoundMode(pending.mode),
+          route: {
+            kind: 'escalate', cause: 'effect_timeout',
+            reason: `external event '${pending.effectKey}' did not arrive before its deadline`,
+          },
+          startedAt: pending.startedAt,
+          costUsd: pending.costUsdSoFar + (wake.abortedCostUsd ?? 0),
+          seatSummaries: pending.seatSummaries,
+          correctiveRetries: pending.correctiveRetries,
+          observables: {},
+          meters: progress.meters,
+        })
+        await clearPendingRound(instance)
+        await effectLedgerFor(instance).markFailed(pending.effectKey!, 'event wait timed out')
+        return outcome
+      }
       if (pending.kind === 'self_timer') {
         // Self-timer park: the firing timer wake IS the resume signal. If it fired
         // early (coalesced), keep waiting until fireAt.
@@ -322,8 +351,19 @@ function terminalRouteForExhaustion(charter: FrozenCharter, ctx: EvalContext): R
  * remedial action (account rotation, plateau judgement) live in the worker.
  */
 type WaitRequest =
-  | { mode: 'event'; effectKey: string; payload?: Record<string, unknown> }
+  | { mode: 'event'; effectKey: string; payload?: Record<string, unknown>; maxWaitMs: number }
   | { mode: 'self_timer'; afterMs: number; reason: string }
+
+const DEFAULT_EVENT_MAX_WAIT_MS = 7 * 24 * 60 * 60_000
+const MIN_EVENT_MAX_WAIT_MS = 60_000
+const MAX_EVENT_MAX_WAIT_MS = 30 * 24 * 60 * 60_000
+
+function eventMaxWaitMs(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) &&
+    value >= MIN_EVENT_MAX_WAIT_MS && value <= MAX_EVENT_MAX_WAIT_MS
+    ? Math.floor(value)
+    : DEFAULT_EVENT_MAX_WAIT_MS
+}
 
 interface SeatLoopOutcome {
   kind: 'complete' | 'wait'
@@ -387,6 +427,7 @@ async function runSeatLoop(
             mode: 'event',
             effectKey,
             payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
+            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
           },
         }
       }
@@ -418,6 +459,14 @@ async function runSeatLoop(
       corrective = `【纠偏重试】state 校验失败：${schemaErrs.join('; ')}`
       correctiveRetries++
       continue
+    }
+    if (schemaErrs.length > 0) {
+      worker = {
+        ...worker,
+        ok: false,
+        summary: `schema gate failed after corrective retry: ${schemaErrs.join('; ')}; ${worker.summary}`,
+      }
+      break
     }
     if (charter.seats.judge) {
       const judgeLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
@@ -530,6 +579,7 @@ async function submitSegment(
     ...base, kind: 'effect',
     effectKey: input.waitRequest.effectKey,
     waitName: 'event',
+    expiresAt: Date.now() + input.waitRequest.maxWaitMs,
   } satisfies PendingRound)
   await setInstanceStatus(instance, 'waiting', `waiting on event ${input.waitRequest.effectKey}`)
   deps.observer?.({
@@ -689,7 +739,11 @@ async function completeRound(
   // ── 8. LEDGER: admit drafts, then account the round ───────────────────────
   const admitted = await admitDrafts(instance, input.judge)
   const metric = typeof input.judge?.data['metric'] === 'number' ? (input.judge.data['metric'] as number) : null
-  const bestMetric = metric !== null && (progress.bestMetric === null || metric > progress.bestMetric)
+  const metricImproved = metric !== null && (
+    progress.bestMetric === null ||
+    (charter.metric?.direction === 'min' ? metric < progress.bestMetric : metric > progress.bestMetric)
+  )
+  const bestMetric = metricImproved
     ? metric
     : progress.bestMetric
 
@@ -954,11 +1008,66 @@ async function runSchemaGates(instance: LoopInstance): Promise<string[]> {
     for (const rel of gate.files) {
       try {
         const abs = await resolveExistingInside(instance.paths.root, rel)
-        JSON.parse(await readFile(abs, 'utf-8'))
+        const value = JSON.parse(await readFile(abs, 'utf-8')) as unknown
+        // spec-less gates exist only in legacy frozen charters. Keep their old
+        // parse-only behavior; validateCharter refuses to freeze new ones.
+        if (gate.spec) errs.push(...validateShape(value, gate.spec, rel))
       } catch (err) {
         errs.push(`${rel}: ${(err as Error).message}`)
       }
     }
+  }
+  return errs
+}
+
+function validateShape(value: unknown, spec: ShapeSpec, at: string): string[] {
+  const errs: string[] = []
+  switch (spec.type) {
+    case 'null':
+      if (value !== null) errs.push(`${at}: expected null`)
+      break
+    case 'boolean':
+      if (typeof value !== 'boolean') errs.push(`${at}: expected boolean`)
+      break
+    case 'string':
+      if (typeof value !== 'string') errs.push(`${at}: expected string`)
+      else {
+        if (spec.minLength !== undefined && value.length < spec.minLength) errs.push(`${at}: string shorter than ${spec.minLength}`)
+        if (spec.enum && !spec.enum.includes(value)) errs.push(`${at}: value is not in enum`)
+      }
+      break
+    case 'number':
+    case 'integer':
+      if (typeof value !== 'number' || !Number.isFinite(value) || (spec.type === 'integer' && !Number.isInteger(value))) {
+        errs.push(`${at}: expected ${spec.type}`)
+      } else {
+        if (spec.minimum !== undefined && value < spec.minimum) errs.push(`${at}: value is below minimum ${spec.minimum}`)
+        if (spec.maximum !== undefined && value > spec.maximum) errs.push(`${at}: value is above maximum ${spec.maximum}`)
+      }
+      break
+    case 'array':
+      if (!Array.isArray(value)) errs.push(`${at}: expected array`)
+      else {
+        if (spec.minItems !== undefined && value.length < spec.minItems) errs.push(`${at}: array has fewer than ${spec.minItems} items`)
+        if (spec.items) value.forEach((item, i) => errs.push(...validateShape(item, spec.items!, `${at}[${i}]`)))
+      }
+      break
+    case 'object':
+      if (typeof value !== 'object' || value === null || Array.isArray(value)) errs.push(`${at}: expected object`)
+      else {
+        const record = value as Record<string, unknown>
+        for (const key of spec.required ?? []) {
+          if (!(key in record)) errs.push(`${at}: missing required property '${key}'`)
+        }
+        for (const [key, child] of Object.entries(spec.properties ?? {})) {
+          if (key in record) errs.push(...validateShape(record[key], child, `${at}.${key}`))
+        }
+        if (spec.additionalProperties === false) {
+          const allowed = new Set(Object.keys(spec.properties ?? {}))
+          for (const key of Object.keys(record)) if (!allowed.has(key)) errs.push(`${at}: unknown property '${key}'`)
+        }
+      }
+      break
   }
   return errs
 }
@@ -1107,7 +1216,7 @@ async function renderReport(instance: LoopInstance, reason: string, narrative?: 
     `- reason: ${reason}`,
     `- rounds: ${view.progress.iteration}`,
     `- status: ${view.progress.status}`,
-    `- best_metric: ${view.progress.bestMetric ?? 'null'}`,
+    `- best_metric (${instance.charter.metric?.direction ?? 'max'}): ${view.progress.bestMetric ?? 'null'}`,
     `- total findings: ${view.findingsCount}`,
     `- total cost: $${view.progress.totalCostUsd.toFixed(2)}`,
     ...(narrative ? ['', '## Narrative (finalizer seat)', '', narrative] : []),

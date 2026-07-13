@@ -6,7 +6,7 @@
  */
 import { parse, type Ast } from '../expr/Expr.js'
 import { relativePathError, writeScopeRoot } from '../security/PathSafety.js'
-import type { Charter, FrozenCharter, LegacyTripwireAction, MeterSpec, TripwireAction, TripwireSpec } from './CharterTypes.js'
+import type { Charter, FrozenCharter, LegacyTripwireAction, MeterSpec, ShapeSpec, TripwireAction, TripwireSpec } from './CharterTypes.js'
 
 const ID_RE = /^[a-z][a-z0-9_-]*$/i
 const META_AGENT_RE = /\.meta-agent[/\\]/
@@ -54,6 +54,9 @@ export function validateCharter(rawCharter: Charter): string[] {
   if (!charter.id || !ID_RE.test(charter.id)) errs.push('charter.id must match [a-z][a-z0-9_-]*')
   if (!Number.isInteger(charter.version) || charter.version < 1) errs.push('charter.version must be a positive integer')
   if (!charter.goal?.trim()) errs.push('charter.goal is required')
+  if (charter.metric && charter.metric.direction !== 'max' && charter.metric.direction !== 'min') {
+    errs.push("metric.direction must be 'max' or 'min'")
+  }
 
   // Declared identifier universe for the DSL static check.
   const declared = new Set<string>(['budget.lifetime.exhausted'])
@@ -176,6 +179,8 @@ export function validateCharter(rawCharter: Charter): string[] {
       errs.push(`gate[${name}] declares no files`)
     }
     if (gate.kind === 'schema') {
+      if (!gate.spec) errs.push(`gate[${name}] schema gate requires a versioned spec (legacy parse-only gates may only be loaded, not newly frozen)`)
+      else errs.push(...validateShapeSpec(gate.spec, `gate[${name}].spec`))
       for (const file of gate.files) {
         const pathErr = relativePathError(file)
         if (pathErr) errs.push(`gate[${name}].files '${file}' ${pathErr}`)
@@ -217,6 +222,61 @@ export function validateCharter(rawCharter: Charter): string[] {
     }
   }
 
+  return errs
+}
+
+function validateShapeSpec(spec: ShapeSpec, at: string): string[] {
+  const errs: string[] = []
+  if (!spec || typeof spec !== 'object' || typeof (spec as { type?: unknown }).type !== 'string') {
+    return [`${at} must declare a type`]
+  }
+  const common = new Set(['type'])
+  const allowedByType: Record<string, string[]> = {
+    object: ['required', 'properties', 'additionalProperties'],
+    array: ['minItems', 'items'],
+    string: ['minLength', 'enum'],
+    number: ['minimum', 'maximum'],
+    integer: ['minimum', 'maximum'],
+    boolean: [],
+    null: [],
+  }
+  const allowed = new Set([...common, ...(allowedByType[spec.type] ?? [])])
+  for (const key of Object.keys(spec)) if (!allowed.has(key)) errs.push(`${at}.${key} is not supported`)
+  switch (spec.type) {
+    case 'object': {
+      if (spec.required && (!Array.isArray(spec.required) || spec.required.some(k => typeof k !== 'string' || !k))) {
+        errs.push(`${at}.required must contain non-empty strings`)
+      }
+      for (const [key, child] of Object.entries(spec.properties ?? {})) {
+        errs.push(...validateShapeSpec(child, `${at}.properties.${key}`))
+      }
+      break
+    }
+    case 'array':
+      if (spec.minItems !== undefined && (!Number.isInteger(spec.minItems) || spec.minItems < 0)) {
+        errs.push(`${at}.minItems must be a non-negative integer`)
+      }
+      if (spec.items) errs.push(...validateShapeSpec(spec.items, `${at}.items`))
+      break
+    case 'string':
+      if (spec.minLength !== undefined && (!Number.isInteger(spec.minLength) || spec.minLength < 0)) {
+        errs.push(`${at}.minLength must be a non-negative integer`)
+      }
+      break
+    case 'number':
+    case 'integer':
+      if (spec.minimum !== undefined && !Number.isFinite(spec.minimum)) errs.push(`${at}.minimum must be finite`)
+      if (spec.maximum !== undefined && !Number.isFinite(spec.maximum)) errs.push(`${at}.maximum must be finite`)
+      if (spec.minimum !== undefined && spec.maximum !== undefined && spec.minimum > spec.maximum) {
+        errs.push(`${at}.minimum must not exceed maximum`)
+      }
+      break
+    case 'boolean':
+    case 'null':
+      break
+    default:
+      errs.push(`${at}.type is unsupported`)
+  }
   return errs
 }
 

@@ -130,4 +130,36 @@ describe('runLoopScheduler', () => {
     abort.abort()
     await run
   }, 15_000)
+
+  it('runs independent loops concurrently without head-of-line blocking', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-daemon-concurrent-'))
+    const completionOrder: string[] = []
+    const dispatcher = scriptedDispatcher(async task => {
+      if (task.includes('隔离评审座位')) {
+        return { verdict: 'pass', new_findings_count: 0, metric_delta: 0, metric: 0, messages: [] }
+      }
+      if (task.includes('slow-loop')) {
+        await new Promise(resolve => setTimeout(resolve, 180))
+        completionOrder.push('slow')
+      } else if (task.includes('fast-loop')) {
+        completionOrder.push('fast')
+      }
+      return { label: 'ok' }
+    })
+    const terminal = [{ when: 'iteration >= 1', then: { act: 'finalize' as const } }]
+    await createInstance({
+      projectDir: dir, instanceId: 'slow', wakeStore: new WakeStore(dir),
+      charter: walkResearchCharter({ goal: 'slow-loop', tripwires: terminal }),
+    })
+    await createInstance({
+      projectDir: dir, instanceId: 'fast', wakeStore: new WakeStore(dir),
+      charter: walkResearchCharter({ goal: 'fast-loop', tripwires: terminal }),
+    })
+
+    const result = await runLoopScheduler({
+      dispatcher, projectDir: dir, pollMs: 10, idleExitMs: 30, maxConcurrentRounds: 2,
+    })
+    expect(result.exitReason).toBe('idle')
+    expect(completionOrder.slice(0, 2)).toEqual(['fast', 'slow'])
+  }, 15_000)
 })

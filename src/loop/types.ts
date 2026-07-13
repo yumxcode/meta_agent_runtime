@@ -33,7 +33,7 @@ export function normalizeRoundMode(mode: unknown): RoundMode {
 export interface RouteDecision {
   kind: 'continue' | 'pivot' | 'finalize' | 'escalate'
   /** What triggered a non-continue kind ('manual' = `loop stop`). */
-  cause?: 'accepted' | 'budget' | 'tripwire' | 'manual'
+  cause?: 'accepted' | 'budget' | 'tripwire' | 'manual' | 'effect_timeout'
   /** Set when cause is 'tripwire' (index into charter.tripwires). */
   tripwireIndex?: number
   /** Human-readable reason (tripwire action reason, 'goal_satisfied', 'budget'…). */
@@ -200,6 +200,9 @@ export interface PendingRound {
   /** self_timer only: why the worker parked, and when the timer resumes it. */
   reason?: string
   fireAt?: number
+  /** Effect wait only: deterministic liveness deadline and reconciliation mark. */
+  expiresAt?: number
+  timedOutAt?: number
   startedAt: number
   costUsdSoFar: number
   seatSummaries: Record<string, string>

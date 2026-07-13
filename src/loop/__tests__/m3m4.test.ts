@@ -238,6 +238,39 @@ describe('per-round USD budget', () => {
   })
 })
 
+describe('shape schema gates', () => {
+  it('retries once then fails closed when structured output remains invalid', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-shape-gate-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    const dispatcher = scriptedDispatcher(async task => {
+      if (task.includes('产出契约')) {
+        await mkdir(paths.draftsDir, { recursive: true })
+        await writeFile(join(paths.draftsDir, 'findings_draft.json'), JSON.stringify([{ claim: 'missing evidence' }]))
+        return { label: 'ok' }
+      }
+      throw new Error('judge must not run after a failed shape gate')
+    })
+    const charter = walkResearchCharter({
+      tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
+    })
+    charter.gates.draft_shape = {
+      kind: 'schema', files: ['drafts/findings_draft.json'],
+      spec: {
+        type: 'array', minItems: 1,
+        items: {
+          type: 'object', required: ['claim', 'evidence'],
+          properties: { claim: { type: 'string' }, evidence: { type: 'string', minLength: 1 } },
+        },
+      },
+    }
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+    expect(dispatcher.configs).toHaveLength(2) // worker + one corrective retry; no judge
+    const instance = (await loadInstance(dir, 'walk-research-v1'))!
+    expect((await instance.ledger.readView()).findingsCount).toBe(0)
+  })
+})
+
 // ── T4.2 sandbox denial + T4.4 observer ───────────────────────────────────────
 
 describe('worker sandbox + kernel observer (T4.2/T4.4)', () => {

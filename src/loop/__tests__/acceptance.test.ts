@@ -66,6 +66,37 @@ async function writeWorkerDrafts(draftsDir: string, key: string, findings: unkno
 }
 
 describe('M1 acceptance — walk-research loop, simulated seats', () => {
+  it('tracks the minimum metric when charter.metric.direction is min', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-min-metric-'))
+    const paths = instancePaths(dir, 'walk-research-v1')
+    let workerRound = 0
+    const metrics = [10, 8]
+    const dispatcher = scriptedDispatcher(async task => {
+      if (isWorker(task)) {
+        workerRound++
+        await writeWorkerDrafts(paths.draftsDir, `min-${workerRound}`, [])
+        return { label: 'ok' }
+      }
+      if (isJudge(task)) {
+        return {
+          verdict: 'pass', new_findings_count: 0, metric_delta: 1,
+          metric: metrics.shift(), messages: [],
+        }
+      }
+      throw new Error('unexpected seat')
+    })
+    await createInstance({
+      projectDir: dir, wakeStore: new WakeStore(dir),
+      charter: walkResearchCharter({
+        metric: { direction: 'min' },
+        tripwires: [{ when: 'iteration >= 2', then: { act: 'finalize' } }],
+      }),
+    })
+    await runUntilQuiescent({ dispatcher, projectDir: dir })
+    const progress = JSON.parse(await readFile(paths.progressJson, 'utf-8'))
+    expect(progress.bestMetric).toBe(8)
+  })
+
   it('runs 3 rounds unattended, hits the finalize tripwire, leaves a full ledger', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-accept-'))
     const paths = instancePaths(dir, 'walk-research-v1')

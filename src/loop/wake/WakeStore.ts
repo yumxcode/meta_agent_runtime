@@ -151,7 +151,11 @@ export class WakeStore {
    * Atomically claim due wakes. At most one claim per loop: if the loop
    * already has a live (unexpired) claim, its due wakes stay pending.
    */
-  async claimDue(now = Date.now(), owner = wakeClaimOwner()): Promise<WakeRecord[]> {
+  async claimDue(
+    now = Date.now(),
+    owner = wakeClaimOwner(),
+    limit = Number.POSITIVE_INFINITY,
+  ): Promise<WakeRecord[]> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
       const all = await this.listUnlocked()
@@ -162,6 +166,7 @@ export class WakeStore {
       )
       const claimed: WakeRecord[] = []
       for (const record of all) {
+        if (claimed.length >= limit) break
         if (record.status !== 'pending' || record.fireAt > now) continue
         if (liveClaimedLoops.has(record.loopId)) continue
         const next: WakeRecord = {

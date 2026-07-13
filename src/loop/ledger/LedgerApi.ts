@@ -16,7 +16,7 @@
  *     so CapsuleBuilder and budget checks share one truth (D13: ledger is the
  *     authority for lifetime accounting).
  */
-import { appendFile, mkdir, readFile, rename } from 'fs/promises'
+import { appendFile, mkdir, open, readFile, rename } from 'fs/promises'
 import { dirname } from 'path'
 import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
 import type { InstancePaths, ProgressStatus, RoundEntry } from '../types.js'
@@ -108,6 +108,7 @@ export class Ledger {
   }
 
   async readJsonl<T = unknown>(filePath: string, lastK?: number): Promise<T[]> {
+    if (lastK !== undefined) return readJsonlTail<T>(filePath, lastK)
     let raw: string
     try {
       raw = await readFile(filePath, 'utf-8')
@@ -125,7 +126,7 @@ export class Ledger {
         // surfaced by RECONCILE via count mismatch rather than thrown here.
       }
     }
-    return lastK !== undefined ? rows.slice(-lastK) : rows
+    return rows
   }
 
   async readProgress(): Promise<ProgressView> {
@@ -143,14 +144,7 @@ export class Ledger {
       }
     }
 
-    const rounds = await this.readJsonl<RoundEntry>(this.paths.roundsJsonl)
-    for (let i = 1; i < rounds.length; i++) {
-      if (rounds[i]!.round <= rounds[i - 1]!.round) {
-        throw new LedgerCorruptionError(
-          `round ledger is not strictly increasing at ${rounds[i - 1]!.round} → ${rounds[i]!.round}`,
-        )
-      }
-    }
+    const rounds = await this.readJsonl<RoundEntry>(this.paths.roundsJsonl, 1)
     const last = rounds.at(-1)
     if (!progress) {
       if (!last && !corrupt) return { ...DEFAULT_PROGRESS }
@@ -187,16 +181,58 @@ export class Ledger {
     const [progress, lastRounds, findings, directionsFile] = await Promise.all([
       this.readProgress(),
       this.readJsonl<RoundEntry>(this.paths.roundsJsonl, lastK),
-      this.readJsonl<unknown>(this.paths.findingsJsonl),
+      this.readJsonl<unknown>(this.paths.findingsJsonl, lastK),
       readJsonFile<{ directions?: unknown[] }>(this.paths.directionsJson),
     ])
     return {
       progress,
       lastRounds,
-      lastFindings: findings.slice(-lastK),
-      findingsCount: findings.length,
+      lastFindings: findings,
+      findingsCount: progress.totalFindings,
       directions: directionsFile?.directions ?? [],
     }
+  }
+}
+
+/** Read the newest valid JSONL records without parsing the historical prefix.
+ * Byte-wise newline scanning preserves UTF-8 characters split across chunks;
+ * an incomplete/torn tail is skipped just like the full reader. */
+async function readJsonlTail<T>(filePath: string, lastK: number): Promise<T[]> {
+  if (lastK <= 0) return []
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    handle = await open(filePath, 'r')
+  } catch {
+    return []
+  }
+  try {
+    const size = (await handle.stat()).size
+    const rows: T[] = []
+    let position = size
+    let carry = Buffer.alloc(0)
+    const parseLine = (line: Buffer): void => {
+      const text = line.toString('utf-8').trim()
+      if (!text) return
+      try { rows.push(JSON.parse(text) as T) } catch { /* torn/corrupt line */ }
+    }
+    while (position > 0 && rows.length < lastK) {
+      const length = Math.min(64 * 1024, position)
+      position -= length
+      const chunk = Buffer.allocUnsafe(length)
+      await handle.read(chunk, 0, length, position)
+      const data = Buffer.concat([chunk, carry])
+      let end = data.length
+      for (let i = data.length - 1; i >= 0 && rows.length < lastK; i--) {
+        if (data[i] !== 0x0a) continue
+        parseLine(data.subarray(i + 1, end))
+        end = i
+      }
+      carry = data.subarray(0, end)
+    }
+    if (position === 0 && rows.length < lastK) parseLine(carry)
+    return rows.reverse()
+  } finally {
+    await handle.close()
   }
 }
 

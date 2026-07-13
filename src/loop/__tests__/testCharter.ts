@@ -27,7 +27,18 @@ export function walkResearchCharter(overrides?: Partial<Charter>): Charter {
       { when: 'iteration >= 3', then: { act: 'finalize' } },
     ],
     gates: {
-      state_gate: { kind: 'schema', files: ['ledger/progress.json'] },
+      state_gate: {
+        kind: 'schema', files: ['ledger/progress.json'],
+        spec: {
+          type: 'object', required: ['iteration', 'status', 'meters', 'totalCostUsd'],
+          properties: {
+            iteration: { type: 'integer', minimum: 0 },
+            status: { type: 'string', minLength: 1 },
+            meters: { type: 'object' },
+            totalCostUsd: { type: 'number', minimum: 0 },
+          },
+        },
+      },
       findings_gate: {
         kind: 'judge',
         evidence: ['drafts/findings_draft.json', 'ledger/findings.jsonl'],
