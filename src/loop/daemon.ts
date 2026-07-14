@@ -221,7 +221,14 @@ export async function acquireDaemonLock(lockPath: string, freshMs = LOCK_FRESH_M
     const raw = await readFile(lockPath, 'utf-8')
     const held = JSON.parse(raw) as DaemonLockRecord
     if (held.host === hostname()) {
-      if (isAlive(held.pid)) return null
+      // pid liveness alone is not enough: an OS-recycled pid would hold the
+      // lock forever. A live daemon refreshes mtime every heartbeat, so
+      // "alive AND fresh" is the real ownership test; alive-but-stale is a
+      // recycled pid (or a wedged daemon past its own lease) — reap it.
+      if (isAlive(held.pid)) {
+        const st = await stat(lockPath).catch(() => null)
+        if (!st || Date.now() - st.mtimeMs < freshMs) return null
+      }
     } else {
       // Cross-host (shared dir): pid liveness is unknowable here — judge by
       // lock freshness instead of reaping unconditionally, which would let two

@@ -40,7 +40,7 @@ import type {
 } from '../charter/CharterTypes.js'
 import type { LoopInstance } from '../instance/InstanceStore.js'
 import { setInstanceStatus } from '../instance/InstanceStore.js'
-import { buildCapsule, consumeInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
+import { archiveInbox, buildCapsule, readInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
 import { runFinalizerSeat, runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
 import { WakeStore, type WakeRecord } from '../wake/WakeStore.js'
 import { atomicWriteFile } from '../../infra/persist/index.js'
@@ -158,6 +158,33 @@ function lifetimeExhausted(
   )
 }
 
+/**
+ * Guarded kernel status transition. `expectFrom` re-validates against DISK
+ * under the file lock, closing the pause-vs-claimed-wake race: a human pause
+ * committed after the runner's HALTED check must not be silently overwritten
+ * by a blind 'running' write (the round would run while the audit says
+ * paused). Returns false when refused — the caller treats the wake as stale.
+ */
+async function tryStatus(
+  instance: LoopInstance,
+  status: 'running' | 'waiting',
+  reason?: string,
+): Promise<boolean> {
+  try {
+    await setInstanceStatus(instance, status, reason, {
+      expectFrom: ['idle', 'waiting', 'running'],
+    })
+    return true
+  } catch {
+    return false
+  }
+}
+
+/** Outcome for a wake refused by a concurrent pause/terminal transition. */
+function staleOutcome(round: number, mode: RoundMode, status: string): RoundOutcome {
+  return { round, mode, route: 'stale-wake', status, costUsd: 0 }
+}
+
 export async function runRound(
   instance: LoopInstance,
   wake: WakeRecord,
@@ -169,6 +196,8 @@ export async function runRound(
   // than the claim TTL (wallclockMin can be hours vs a 10-min TTL), and an
   // expired claim would let a concurrent `loop tick` re-pend + re-claim this
   // wake and run a duplicate round (double spend, interleaved ledger writes).
+  // (The runner heartbeats the same wake around runClaimedWake; this interval
+  // additionally covers direct runRound callers such as tests/CLI one-shots.)
   const heartbeat = setInterval(() => {
     void deps.wakeStore.heartbeat(wake.wakeId).catch(() => undefined)
   }, 60_000)
@@ -212,7 +241,7 @@ export async function runRound(
           }
         }
         if (advanced?.status !== 'concluded') {
-          await setInstanceStatus(instance, 'waiting')
+          await tryStatus(instance, 'waiting')
           return {
             round: pending.round, mode: normalizeRoundMode(pending.mode),
             route: 'still-waiting', status: 'waiting', costUsd: 0,
@@ -229,7 +258,9 @@ export async function runRound(
             route: 'already-accounted', status: progress.status, costUsd: 0,
           }
         }
-        await setInstanceStatus(instance, 'running')
+        if (!await tryStatus(instance, 'running')) {
+          return staleOutcome(pending.round, normalizeRoundMode(pending.mode), instance.record.status)
+        }
         const outcome = await terminate(instance, deps, {
           round: pending.round,
           mode: normalizeRoundMode(pending.mode),
@@ -252,7 +283,9 @@ export async function runRound(
         // Self-timer park: the firing timer wake IS the resume signal. If it fired
         // early (coalesced), keep waiting until fireAt.
         if (Date.now() >= (pending.fireAt ?? 0)) {
-          await setInstanceStatus(instance, 'running')
+          if (!await tryStatus(instance, 'running')) {
+            return staleOutcome(pending.round, pending.mode, instance.record.status)
+          }
           return await harvestSegment(instance, deps, pending, wake.abortedCostUsd ?? 0)
         }
         // Fired early (a coalesced/foreign timer): this wake is consumed on
@@ -262,7 +295,7 @@ export async function runRound(
         await deps.wakeStore.schedule({
           loopId: instance.record.instanceId, kind: 'timer', fireAt: pending.fireAt ?? Date.now(),
         })
-        await setInstanceStatus(instance, 'waiting')
+        await tryStatus(instance, 'waiting')
         return {
           round: pending.round, mode: pending.mode,
           route: 'still-waiting', status: 'waiting', costUsd: 0,
@@ -276,7 +309,9 @@ export async function runRound(
           const reason = typeof data['reason'] === 'string'
             ? data['reason']
             : `Effect Rule escalated '${pending.effectKey}'`
-          await setInstanceStatus(instance, 'running')
+          if (!await tryStatus(instance, 'running')) {
+            return staleOutcome(pending.round, normalizeRoundMode(pending.mode), instance.record.status)
+          }
           const outcome = await terminate(instance, deps, {
             round: pending.round,
             mode: normalizeRoundMode(pending.mode),
@@ -292,18 +327,23 @@ export async function runRound(
           await effectLedgerFor(instance).markHarvested(pending.effectKey!)
           return outcome
         }
-        await setInstanceStatus(instance, 'running')
+        if (!await tryStatus(instance, 'running')) {
+          return staleOutcome(pending.round, normalizeRoundMode(pending.mode), instance.record.status)
+        }
         return await harvestSegment(instance, deps, pending, wake.abortedCostUsd ?? 0)
       }
       // A coalesced timer fired while we wait — the probe/event owns progress.
-      await setInstanceStatus(instance, 'waiting')
+      await tryStatus(instance, 'waiting')
       return {
         round: pending.round, mode: normalizeRoundMode(pending.mode),
         route: 'still-waiting', status: 'waiting', costUsd: 0,
       }
     }
 
-    await setInstanceStatus(instance, 'running')
+    if (!await tryStatus(instance, 'running')) {
+      const progress = await instance.ledger.readProgress()
+      return staleOutcome(progress.iteration + 1, 'normal', instance.record.status)
+    }
     return await freshRound(instance, deps, wake.abortedCostUsd ?? 0)
   } finally {
     clearInterval(heartbeat)
@@ -341,13 +381,14 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
   }
 
   // ── 4+5a. CAPSULE (+ pivoter when this is a pivot round) ────────────────────
+  // Inbox consumption is TRANSACTIONAL with the round: read (non-destructive)
+  // here, archive to processed/ only after the round durably commits
+  // (completeRound / submitSegment). An aborted or replayed round therefore
+  // re-reads the same human feedback instead of silently losing it.
+  const inbox = await readInbox(paths)
+  const inboxMessages = inbox.messages
   let pivotDirective: string | undefined
-  let inboxMessages: string[] | undefined
   if (mode === 'pivot' && charter.seats.pivoter) {
-    // Consume the inbox ONCE per round: buildCapsule moves messages to
-    // processed/, so letting the pivoter's build consume them would silently
-    // drop the human feedback from the worker's capsule (the second build).
-    inboxMessages = await consumeInbox(paths)
     const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, inboxMessages })
     const pivotLimit = remainingSeatUsd(charter, progress.totalCostUsd, costUsd)
     const pivot = pivotLimit !== undefined && pivotLimit <= 0
@@ -380,6 +421,7 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
       correctiveRetries: seatLoop.correctiveRetries,
       waitRequest: seatLoop.waitRequest!,
       submitSummary: seatLoop.worker?.summary ?? '',
+      inboxFiles: inbox.files,
     })
   }
 
@@ -388,6 +430,7 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
     correctiveRetries: seatLoop.correctiveRetries,
     worker: seatLoop.worker, judge: seatLoop.judge,
     baseProgress: progress,
+    inboxFiles: inbox.files,
   })
 }
 
@@ -697,10 +740,12 @@ async function runSeatLoop(
       seatSummaries['judge'] = truncate(judge.summary)
       deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
       assertReplaySafeSeat(judge, costUsd)
-      if (!judge.ok && !retried.judgeCrash && executionRetryEnabled('judge')) {
-        // A crashed judge (API error / timeout, no verdict) must not silently
-        // pass its gate: one in-round rerun; if it crashes again, Artifact
-        // commit fails closed instead of admitting unreviewed proposals.
+      if ((!judge.ok || !judge.structured) && !retried.judgeCrash && executionRetryEnabled('judge')) {
+        // A crashed judge (API error / timeout, no verdict) — or one that only
+        // produced free text instead of a structured return_result — must not
+        // silently pass its gate: one in-round rerun; if it fails again,
+        // Artifact commit fails closed instead of admitting unreviewed
+        // proposals (unstructured output is never trusted as a verdict).
         retried.judgeCrash = true
         const retryLimit = remainingSeatUsd(charter, progress.totalCostUsd, spentBeforeUsd + costUsd)
         if (retryLimit !== undefined && retryLimit <= 0) {
@@ -715,7 +760,8 @@ async function runSeatLoop(
         deps.observer?.({ type: 'seat_completed', round: capsule.round, seat: 'judge', ok: judge.ok, costUsd: judge.costUsd })
         assertReplaySafeSeat(judge, costUsd)
       }
-      const judgeFailed = judge.data['verdict'] === 'fail'
+      // Only a structured verdict is a verdict (free-text scrapes are noise).
+      const judgeFailed = judge.structured && judge.data['verdict'] === 'fail'
       const failMessages = judgeFailed
         ? (Array.isArray(judge.data['messages']) ? (judge.data['messages'] as unknown[]).map(String) : [])
         : []
@@ -746,6 +792,8 @@ interface SubmitInput {
   submitSummary: string
   /** Existing self-timer chain state when a harvest segment parks again. */
   priorSelfTimer?: PendingRound
+  /** Inbox files this segment consumed — archived once the park is durable. */
+  inboxFiles?: string[]
 }
 
 async function submitSegment(
@@ -769,13 +817,18 @@ async function submitSegment(
   if (input.waitRequest.mode === 'self_timer') {
     const policy = selfTimerPolicy(instance.charter)
     const parkCount = (input.priorSelfTimer?.parkCount ?? 0) + 1
+    // The deadline bounds the SELF-TIMER CHAIN's wallclock, anchored at the
+    // first park — not at round start. Anchoring at startedAt would make a
+    // round that legitimately spent days in an event wait hit the limit the
+    // instant it first parks.
     const waitDeadlineAt = input.priorSelfTimer?.waitDeadlineAt ??
-      input.startedAt + policy.maxRoundElapsedMs
+      Date.now() + policy.maxRoundElapsedMs
     const fireAt = Math.min(Date.now() + input.waitRequest.afterMs, waitDeadlineAt)
     await writePendingRound(instance, {
       ...base, kind: 'self_timer', reason: input.waitRequest.reason, fireAt,
       parkCount, waitDeadlineAt,
     } satisfies PendingRound)
+    if (input.inboxFiles?.length) await archiveInbox(instance.paths, input.inboxFiles)
     await deps.wakeStore.schedule({ loopId: instance.record.instanceId, kind: 'timer', fireAt })
     await setInstanceStatus(instance, 'waiting', `self-timer: ${input.waitRequest.reason}`)
     deps.observer?.({
@@ -797,6 +850,7 @@ async function submitSegment(
   // Persist the resumable round before crossing the adapter boundary. A crash
   // after the remote side effect but before ack can then reconcile by effectKey.
   await writePendingRound(instance, pending)
+  if (input.inboxFiles?.length) await archiveInbox(instance.paths, input.inboxFiles)
   await submitEffect(instance, deps.wakeStore, {
     effectKey: input.waitRequest.effectKey,
     adapterId: input.waitRequest.adapterId,
@@ -856,6 +910,12 @@ async function harvestSegment(
         fireAt: Date.now() + (charter.roundIntervalMs ?? 0),
       })
       await setInstanceStatus(instance, 'idle')
+      // Aborted-attempt cost carried by this wake belongs to the lifetime USD
+      // ledger — park it on the freshly scheduled wake so the next accounted
+      // round folds it in instead of dropping it here.
+      if (carriedCostUsd > 0) {
+        await deps.wakeStore.transferAbortedCost(instance.record.instanceId, carriedCostUsd)
+      }
     }
     return {
       round: pending.round, mode,
@@ -868,8 +928,12 @@ async function harvestSegment(
     effectKey: effectKey ?? `self_timer:${pending.reason ?? ''}`,
   })
 
+  // Transactional inbox read (see freshRound): archive only after this
+  // segment durably commits (completeRound / the next submitSegment).
+  const inbox = await readInbox(paths)
   const capsule = await buildCapsule({
     paths, ledger, goal: charter.goal, round: pending.round, mode,
+    inboxMessages: inbox.messages,
   })
   // Lineage digest (D5): the harvest/continue worker knows WHAT it parked on and
   // WHY, via the submit summary — not via a shared transcript.
@@ -901,7 +965,6 @@ async function harvestSegment(
 
   if (seatLoop.kind === 'wait') {
     // Chained wait / self-timer re-park: same round parks again.
-    if (effectKey) await effects.markHarvested(effectKey)
     if (isSelfTimer && selfTimerLimit?.reached && seatLoop.waitRequest?.mode === 'self_timer') {
       const outcome = await terminate(instance, deps, {
         round: pending.round, mode,
@@ -919,16 +982,24 @@ async function harvestSegment(
       await clearPendingRound(instance)
       return outcome
     }
-    return submitSegment(instance, deps, {
+    const outcome = await submitSegment(instance, deps, {
       round: pending.round, mode, startedAt: pending.startedAt,
       costUsd, seatSummaries,
       correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
       waitRequest: seatLoop.waitRequest!,
       submitSummary: seatLoop.worker?.summary ?? '',
+      inboxFiles: inbox.files,
       ...(isSelfTimer && seatLoop.waitRequest?.mode === 'self_timer'
         ? { priorSelfTimer: pending }
         : {}),
     })
+    // Settle the OLD effect only after the NEW pending round is durable: the
+    // reverse order had a crash window where reconcile saw {old pending ×
+    // harvested effect}, dropped the pending, and lost its accumulated
+    // costUsdSoFar from the lifetime ledger. A dangling concluded effect is
+    // harmless (settled later by reconcileWaiting's no-pending sweep).
+    if (effectKey) await effects.markHarvested(effectKey)
+    return outcome
   }
 
   const outcome = await completeRound(instance, deps, {
@@ -937,6 +1008,7 @@ async function harvestSegment(
     correctiveRetries: pending.correctiveRetries + seatLoop.correctiveRetries,
     worker: seatLoop.worker, judge: seatLoop.judge,
     baseProgress: progress,
+    inboxFiles: inbox.files,
   })
   // Order matters for crash recovery: round ledger writes happened inside
   // completeRound → clear pending → settle the effect. reconcileWaiting heals
@@ -968,6 +1040,8 @@ function selfTimerLimitState(
   if (parkCount >= policy.maxParksPerRound) {
     return { reached: true, reason: `park ${parkCount}/${policy.maxParksPerRound}` }
   }
+  // (Legacy pendings without waitDeadlineAt anchor at startedAt via the ??
+  // fallback above — new pendings always persist a first-park-anchored value.)
   if (Date.now() >= deadlineAt) {
     return { reached: true, reason: `round wait deadline ${new Date(deadlineAt).toISOString()}` }
   }
@@ -986,6 +1060,22 @@ interface CompleteInput {
   worker: SeatResult | null
   judge: SeatResult | null
   baseProgress: Awaited<ReturnType<LoopInstance['ledger']['readProgress']>>
+  /** Inbox files this round consumed — archived after the ledger commit. */
+  inboxFiles?: string[]
+}
+
+/**
+ * Trust boundary for judge output: every field that drives control flow —
+ * goal_satisfied (terminates the loop), verdict, metric, charter observables —
+ * may ONLY come from the structured return_result payload. A free-text JSON
+ * scrape (Seats.extractData fallback) can contain the contract's own example
+ * block; treating it as data could accept a loop that never passed review.
+ * An unstructured judge is normalized to "ran but emitted nothing": its
+ * observables resolve via their onError policies, loudly.
+ */
+function sanitizeJudge(judge: SeatResult | null): SeatResult | null {
+  if (!judge || judge.structured) return judge
+  return { ...judge, data: {} }
 }
 
 async function completeRound(
@@ -995,12 +1085,13 @@ async function completeRound(
 ): Promise<RoundOutcome> {
   const { charter, ledger } = instance
   const { baseProgress: progress } = input
+  const judge = sanitizeJudge(input.judge)
 
   // ── 7. METER ──────────────────────────────────────────────────────────────
   const producerOk = input.worker?.ok === true
   const { observables, observationResults, warnings } = collectObservables(
     charter,
-    input.judge,
+    judge,
     producerOk,
   )
   // Budget exhaustion is recomputed WITH this round accounted (iteration+cost),
@@ -1021,10 +1112,10 @@ async function completeRound(
     round: input.round,
     producerOk,
     judgeRequired: !!charter.seats.judge,
-    judge: input.judge,
+    judge,
   })
   const legacyFindingDelta = artifactCommit.legacyFindingDelta
-  const objective = evaluateMetricObjective(charter, input.judge, warnings)
+  const objective = evaluateMetricObjective(charter, judge, warnings)
   const metric = objective.value
   const metricImproved = metric !== null && (
     progress.bestMetric === null ||
@@ -1046,7 +1137,7 @@ async function completeRound(
         postCtx,
         observationResults,
         warnings,
-        input.judge,
+        judge,
         budgetExhausted,
       )
   const { route, status } = applyHealthPolicy(
@@ -1079,6 +1170,10 @@ async function completeRound(
     ...postState,
     updatedAt: Date.now(),
   })
+  // Round is durably accounted — NOW the consumed inbox files may be archived
+  // (transactional consumption: a crash before this point replays the round
+  // with the same feedback; after it, the replay guard settles everything).
+  if (input.inboxFiles?.length) await archiveInbox(instance.paths, input.inboxFiles)
 
   if (route.kind === 'finalize' || route.kind === 'escalate') {
     return terminate(instance, deps, {
@@ -1109,7 +1204,9 @@ function decideRoute(
   judge: SeatResult | null,
   budgetExhausted: boolean,
 ): RouteDecision {
-  if (judge?.data['goal_satisfied'] === true) {
+  // Defense in depth: acceptance requires a STRUCTURED judge verdict — a
+  // free-text scrape must never terminate the loop (see sanitizeJudge).
+  if (judge?.structured && judge.data['goal_satisfied'] === true) {
     return { kind: 'finalize', cause: 'accepted', reason: 'goal_satisfied' }
   }
   const hit = firstTripwire(charter, ctx, observationResults, warnings)

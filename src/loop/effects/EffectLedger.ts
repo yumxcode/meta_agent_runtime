@@ -1,3 +1,4 @@
+import { open } from 'fs/promises'
 import type { Ledger } from '../ledger/LedgerApi.js'
 import type { InstancePaths } from '../types.js'
 import { withFileLock } from '../../infra/persist/index.js'
@@ -200,10 +201,66 @@ export class EffectLedger {
       .filter(effect => !['harvested', 'cancelled', 'failed'].includes(effect.status))
   }
 
-  private async fold(): Promise<Map<string, EffectRecord>> {
-    const events = await this.ledger.readJsonl<EffectEvent>(this.paths.effectsJsonl)
-    const out = new Map<string, EffectRecord>()
-    for (const event of events) {
+  /**
+   * Fold with an incremental, append-only cache: the events file only ever
+   * grows, so each fold re-reads just the bytes appended since the cached
+   * offset instead of re-parsing + replaying the whole history on every
+   * get/conclude/pending (which trended O(N²) over a loop's lifetime).
+   * Serialised per path so concurrent folds cannot interleave cache updates;
+   * a shrunken file (never happens in normal operation) resets the cache.
+   */
+  private fold(): Promise<Map<string, EffectRecord>> {
+    const path = this.paths.effectsJsonl
+    const prev = foldQueues.get(path) ?? Promise.resolve()
+    const next = prev.catch(() => undefined).then(() => foldIncremental(path))
+    foldQueues.set(path, next.catch(() => new Map<string, EffectRecord>()))
+    return next
+  }
+}
+
+const foldQueues = new Map<string, Promise<unknown>>()
+const foldCaches = new Map<string, { offset: number; map: Map<string, EffectRecord> }>()
+
+async function foldIncremental(path: string): Promise<Map<string, EffectRecord>> {
+  let handle: Awaited<ReturnType<typeof open>>
+  try {
+    handle = await open(path, 'r')
+  } catch {
+    foldCaches.delete(path)
+    return new Map()
+  }
+  try {
+    const size = (await handle.stat()).size
+    let cache = foldCaches.get(path)
+    if (!cache || cache.offset > size) cache = { offset: 0, map: new Map() }
+    if (cache.offset < size) {
+      const chunk = Buffer.allocUnsafe(size - cache.offset)
+      await handle.read(chunk, 0, chunk.length, cache.offset)
+      // Only consume complete lines: a torn tail (concurrent append) stays
+      // before the offset watermark and is re-read once its newline lands.
+      const lastNewline = chunk.lastIndexOf(0x0a)
+      if (lastNewline >= 0) {
+        for (const line of chunk.subarray(0, lastNewline + 1).toString('utf-8').split('\n')) {
+          const trimmed = line.trim()
+          if (!trimmed) continue
+          try {
+            applyEffectEvent(cache.map, JSON.parse(trimmed) as EffectEvent)
+          } catch { /* corrupt line — skipped, same tolerance as readJsonl */ }
+        }
+        cache.offset += lastNewline + 1
+      }
+    }
+    foldCaches.set(path, cache)
+    return cache.map
+  } finally {
+    await handle.close()
+  }
+}
+
+// eslint-disable-next-line complexity -- exhaustive event-type reducer
+function applyEffectEvent(out: Map<string, EffectRecord>, event: EffectEvent): void {
+  {
+    {
       const current = out.get(event.effectKey)
       switch (event.t) {
         case 'submit':
@@ -292,7 +349,6 @@ export class EffectLedger {
           break
       }
     }
-    return out
   }
 }
 

@@ -411,7 +411,11 @@ async function runSeat(
       ? `seat failed: ${result.error}`
       : `seat did not complete (${rec?.status ?? 'no record'})`
   return {
-    ok: rec?.status === 'completed' && result?.success === true && data['label'] !== 'error',
+    // label:'error' downgrades ok ONLY from the structured payload: a JSON
+    // block scraped out of free text (structured=false) is not a control
+    // signal — same trust boundary as label:'wait' in the kernel.
+    ok: rec?.status === 'completed' && result?.success === true &&
+      !(structured && data['label'] === 'error'),
     summary,
     data,
     structured,

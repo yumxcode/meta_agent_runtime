@@ -2,7 +2,7 @@ import { describe, expect, it } from 'vitest'
 import { mkdtemp, writeFile, readdir, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
-import { buildCapsule, renderCapsule } from '../CapsuleBuilder.js'
+import { archiveInbox, buildCapsule, readInbox, renderCapsule } from '../CapsuleBuilder.js'
 import { createInstance } from '../../instance/InstanceStore.js'
 import { WakeStore } from '../../wake/WakeStore.js'
 import { walkResearchCharter } from '../../__tests__/testCharter.js'
@@ -50,7 +50,7 @@ describe('createInstance', () => {
 })
 
 describe('buildCapsule', () => {
-  it('digests ledger state and consumes the inbox exactly once', async () => {
+  it('digests ledger state; inbox consumption is transactional (read stays, archive moves)', async () => {
     const { instance } = await freshInstance()
     await instance.ledger.appendJsonl(instance.paths.findingsJsonl, { id: 'f1', claim: 'single_foot_contact 提升步态' })
     await instance.ledger.replaceJson(instance.paths.directionsJson, { directions: [{ key: 'reward-shaping' }] })
@@ -65,7 +65,18 @@ describe('buildCapsule', () => {
     expect(capsule.recentFindings).toHaveLength(1)
     expect(capsule.inboxMessages).toEqual(['别再调 sigma 了'])
 
-    // Inbox consumed: moved to processed/, second build sees nothing new.
+    // NON-destructive: buildCapsule never moves inbox files — an aborted or
+    // replayed round re-reads the same feedback (transactional consumption).
+    const rebuilt = await buildCapsule({
+      paths: instance.paths, ledger: instance.ledger,
+      goal: instance.charter.goal, round: 1, mode: 'normal',
+    })
+    expect(rebuilt.inboxMessages).toEqual(['别再调 sigma 了'])
+
+    // The kernel archives AFTER the round durably commits; then it is gone.
+    const inbox = await readInbox(instance.paths)
+    expect(inbox.files).toEqual(['001.json'])
+    await archiveInbox(instance.paths, inbox.files)
     expect(await readdir(instance.paths.processedDir)).toHaveLength(1)
     const again = await buildCapsule({
       paths: instance.paths, ledger: instance.ledger,

@@ -48,22 +48,24 @@ export interface BuildCapsuleInput {
   mode: RoundMode
   pivotDirective?: string
   /**
-   * Pre-consumed inbox messages. When the kernel builds MULTIPLE capsules in
-   * one round (pivot rounds: pivoter + worker) it must consume the inbox once
-   * and pass the messages here — otherwise the first build would move them to
-   * processed/ and the later capsules would silently lose the human feedback.
+   * Pre-read inbox messages (kernel: readInbox at round start, archiveInbox
+   * only after the round durably commits). Passing them here keeps every
+   * capsule of the round (pivoter + worker) seeing the same feedback. When
+   * absent, the build does a NON-destructive read — buildCapsule never moves
+   * inbox files itself, so an aborted/replayed round cannot lose feedback.
    */
   inboxMessages?: string[]
 }
 
 /**
- * Build the capsule AND consume the inbox: messages are moved to processed/
- * so each piece of feedback influences exactly one round (auditable in the
- * capsule it entered through).
+ * Build the capsule from the ledger + inbox. Inbox consumption is
+ * transactional with the round: the kernel archives the files it read only
+ * after the round's durable commit (completeRound / submitSegment), so a
+ * crash or abort before that point replays the round WITH the feedback.
  */
 export async function buildCapsule(input: BuildCapsuleInput): Promise<Capsule> {
   const view = await input.ledger.readView(MAX_LIST_ITEMS)
-  const inboxMessages = input.inboxMessages ?? await consumeInbox(input.paths)
+  const inboxMessages = input.inboxMessages ?? (await readInbox(input.paths)).messages
 
   const capsule: Capsule = {
     builtAt: Date.now(),
@@ -111,18 +113,29 @@ export function renderCapsule(capsule: Capsule): string {
   return lines.join('\n')
 }
 
-/** Consume the inbox (messages move to processed/). Exported for the kernel's
- * once-per-round consumption on multi-capsule (pivot) rounds. */
-export async function consumeInbox(paths: InstancePaths): Promise<string[]> {
-  let files: string[]
+/**
+ * Read the inbox WITHOUT moving anything. Returns the digested messages plus
+ * the file names that produced them, so the kernel can archive exactly those
+ * files once the round durably commits (transactional consumption: an
+ * abort/replay between read and commit re-reads the same feedback).
+ *
+ * Unparseable .json items are quarantined LOUDLY as `.bad` (same philosophy
+ * as events/): silently retrying them every round forever hides the
+ * producer's bug. `.bad` falls out of the extension filter, so this is a
+ * one-time action.
+ */
+export async function readInbox(
+  paths: InstancePaths,
+): Promise<{ messages: string[]; files: string[] }> {
+  let entries: string[]
   try {
-    files = (await readdir(paths.inboxDir)).filter(f => f.endsWith('.json') || f.endsWith('.txt')).sort()
+    entries = (await readdir(paths.inboxDir)).filter(f => f.endsWith('.json') || f.endsWith('.txt')).sort()
   } catch {
-    return []
+    return { messages: [], files: [] }
   }
   const messages: string[] = []
-  await mkdir(paths.processedDir, { recursive: true })
-  for (const file of files) {
+  const files: string[] = []
+  for (const file of entries) {
     const from = join(paths.inboxDir, file)
     try {
       const raw = await readFile(from, 'utf-8')
@@ -132,10 +145,32 @@ export async function consumeInbox(paths: InstancePaths): Promise<string[]> {
       } else {
         messages.push(digestLine(raw.trim()))
       }
-      await rename(from, join(paths.processedDir, file))
-    } catch {
-      // Unreadable inbox item: leave in place for the next round / human.
+      files.push(file)
+    } catch (err) {
+      console.error(
+        `[loop] unreadable inbox file ${from} — quarantined as .bad:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      await rename(from, `${from}.bad`).catch(() => undefined)
     }
   }
+  return { messages, files }
+}
+
+/** Archive consumed inbox files to processed/ — call ONLY after the round's
+ * durable commit. Already-moved files (concurrent archiver) are ignored. */
+export async function archiveInbox(paths: InstancePaths, files: string[]): Promise<void> {
+  if (files.length === 0) return
+  await mkdir(paths.processedDir, { recursive: true })
+  for (const file of files) {
+    await rename(join(paths.inboxDir, file), join(paths.processedDir, file)).catch(() => undefined)
+  }
+}
+
+/** @deprecated Legacy destructive read — use readInbox + archiveInbox so
+ * consumption stays transactional with round completion. */
+export async function consumeInbox(paths: InstancePaths): Promise<string[]> {
+  const { messages, files } = await readInbox(paths)
+  await archiveInbox(paths, files)
   return messages
 }

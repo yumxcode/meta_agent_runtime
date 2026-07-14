@@ -26,7 +26,7 @@ import {
   type EffectAdapterRegistry,
 } from './EffectAdapter.js'
 import { advanceEffect } from './EffectRuntime.js'
-import { verifyEffectEvent } from './EventAuth.js'
+import { consumeEventNonce, verifyEffectEvent } from './EventAuth.js'
 
 const MAX_EVENT_FILES_PER_INGEST = 256
 const MAX_EVENT_FILE_BYTES = 1_048_576
@@ -81,6 +81,7 @@ export async function ingestEvents(instance: LoopInstance, deps: WaitOpsDeps): P
     if (isMissingFile(error)) return 0
     throw error
   }
+  if (files.length === 0) return 0
   const effects = effectLedgerFor(instance)
   await mkdir(instance.paths.eventsProcessedDir, { recursive: true })
   let concluded = 0
@@ -123,6 +124,14 @@ export async function ingestEvents(instance: LoopInstance, deps: WaitOpsDeps): P
         if (!verified.ok) {
           console.error(`[loop] unauthorized event file ${from}: ${verified.reason}`)
           await renameUnlessMissing(from, `${from}.unauthorized`)
+          continue
+        }
+        // Replay protection: each authenticated nonce is consumed exactly
+        // once. Without this, a captured signed event could conclude a LATER
+        // wait that reuses the same effectKey inside the signature's expiry.
+        if (!await consumeEventNonce(instance, verified.event)) {
+          console.error(`[loop] replayed authenticated event ${from} (nonce already consumed)`)
+          await renameUnlessMissing(from, `${from}.replayed`)
           continue
         }
         const event = verified.event
@@ -276,6 +285,22 @@ export async function reconcileWaiting(instance: LoopInstance, deps: WaitOpsDeps
         await effects.markHarvested(effect.effectKey)
         actions.push(`settled post-harvest effect ${effect.effectKey}`)
       }
+    }
+    // Self-heal a 'waiting' instance with NO pending round (e.g. a crash
+    // between `loop stop`'s clearPendingRound and its terminal write): nothing
+    // else would ever schedule a wake for it, so it would stay wedged forever
+    // — and keep the daemon alive polling it. Flip to idle and let the
+    // scheduler run a fresh round.
+    if (instance.record.status === 'waiting') {
+      try {
+        await setInstanceStatus(instance, 'idle', 'reconcile: waiting without pending_round', {
+          expectFrom: ['waiting'],
+        })
+        await deps.wakeStore.schedule({
+          loopId: instance.record.instanceId, kind: 'timer', fireAt: Date.now(),
+        })
+        actions.push('healed waiting instance with no pending_round → idle')
+      } catch { /* concurrent transition owns the status — nothing to heal */ }
     }
   }
   return actions

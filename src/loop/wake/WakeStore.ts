@@ -210,8 +210,14 @@ export class WakeStore {
     })
   }
 
-  /** Terminal release: 'done' on success; 'pending' re-queues (retry). */
-  async release(wakeId: string, outcome: 'done' | 'cancelled' | 'pending'): Promise<void> {
+  /** Terminal release: 'done' on success; 'pending' re-queues (retry).
+   * `opts.fireAt` (pending only) re-queues with a backoff instead of firing
+   * immediately — the runner uses it so a deterministic error cannot hot-loop. */
+  async release(
+    wakeId: string,
+    outcome: 'done' | 'cancelled' | 'pending',
+    opts?: { fireAt?: number },
+  ): Promise<void> {
     await withFileLock(this.lockPath(), async () => {
       const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
       if (!record) return
@@ -219,8 +225,32 @@ export class WakeStore {
         ...record,
         status: outcome,
         claim: outcome === 'pending' ? undefined : record.claim,
+        ...(outcome === 'pending' && opts?.fireAt !== undefined ? { fireAt: opts.fireAt } : {}),
         updatedAt: Date.now(),
       })
+    })
+  }
+
+  /**
+   * Move aborted-attempt cost onto the loop's earliest live wake, so releasing
+   * a stale wake as done/cancelled cannot silently drop money from the
+   * lifetime USD ledger. Returns false when the loop has no live wake to
+   * carry the cost (caller should log — the invariant cannot be kept).
+   */
+  async transferAbortedCost(loopId: LoopInstanceId, costUsd: number): Promise<boolean> {
+    if (!Number.isFinite(costUsd) || costUsd <= 0) return true
+    return withFileLock(this.lockPath(), async () => {
+      const candidates = (await this.listUnlocked()).filter(
+        r => r.loopId === loopId && (r.status === 'pending' || r.status === 'claimed'),
+      )
+      const target = candidates[0]
+      if (!target) return false
+      await atomicWriteJson(this.pathFor(target.wakeId), {
+        ...target,
+        abortedCostUsd: (target.abortedCostUsd ?? 0) + costUsd,
+        updatedAt: Date.now(),
+      })
+      return true
     })
   }
 

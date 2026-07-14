@@ -89,7 +89,13 @@ export class EffectAdapterRegistry {
 
   ids(): readonly string[] { return [...this.adapters.keys()].sort() }
 
-  /** FIFO, abortable per-adapter admission. Binding limits monotonically tighten host limits. */
+  /**
+   * FIFO, abortable per-adapter admission. A binding's limits tighten the
+   * host ceiling FOR ITS OWN CALLS ONLY (effective = min/max of host and
+   * requested, computed per request): the shared adapter state is never
+   * mutated, so one charter with maxConcurrentCalls:1 cannot permanently
+   * throttle every other loop in the process.
+   */
   async runWithAdmission<T>(
     id: string,
     requested: Partial<EffectAdmissionPolicy> | undefined,
@@ -97,19 +103,18 @@ export class EffectAdapterRegistry {
     call: () => Promise<T>,
     scope?: ExecutionScope,
   ): Promise<T> {
-    this.resolve(id)
     const adapter = this.resolve(id)
     const state = this.admission.get(id)!
-    if (requested?.maxConcurrentCalls !== undefined) {
-      state.maxConcurrentCalls = Math.min(
-        state.maxConcurrentCalls, boundedConcurrency(requested.maxConcurrentCalls),
-      )
-    }
-    if (requested?.minIntervalMs !== undefined) {
-      state.minIntervalMs = Math.max(state.minIntervalMs, boundedInterval(requested.minIntervalMs))
+    const effective: EffectAdmissionPolicy = {
+      maxConcurrentCalls: requested?.maxConcurrentCalls !== undefined
+        ? Math.min(state.maxConcurrentCalls, boundedConcurrency(requested.maxConcurrentCalls))
+        : state.maxConcurrentCalls,
+      minIntervalMs: requested?.minIntervalMs !== undefined
+        ? Math.max(state.minIntervalMs, boundedInterval(requested.minIntervalMs))
+        : state.minIntervalMs,
     }
     const runLocal = (activeSignal: AbortSignal): Promise<T> => new Promise<T>((resolve, reject) => {
-      const request: AdmissionRequest<T> = { signal: activeSignal, call, resolve, reject }
+      const request: AdmissionRequest<T> = { signal: activeSignal, call, resolve, reject, limits: effective }
       state.queue.push(request as AdmissionRequest<unknown>)
       activeSignal.addEventListener('abort', () => {
         const index = state.queue.indexOf(request as AdmissionRequest<unknown>)
@@ -126,8 +131,8 @@ export class EffectAdapterRegistry {
     const handle = await this.hostCoordinator.acquireAdapterCall(
       scope,
       adapterResourceId(id, adapter.credentialProfile ?? 'default'),
-      state.maxConcurrentCalls,
-      state.minIntervalMs,
+      effective.maxConcurrentCalls,
+      effective.minIntervalMs,
       coordinationAbort.signal,
     )
     const heartbeat = setInterval(() => {
@@ -146,8 +151,13 @@ export class EffectAdapterRegistry {
   }
 
   private pumpAdmission(state: AdmissionState): void {
-    if (state.timer || state.active >= state.maxConcurrentCalls || state.queue.length === 0) return
-    const waitMs = Math.max(0, state.lastStartedAt + state.minIntervalMs - Date.now())
+    if (state.timer || state.queue.length === 0) return
+    // FIFO: the HEAD request's effective limits gate the next start (a
+    // tighter binding briefly gating a looser one behind it is the price of
+    // strict FIFO fairness — and strictly better than the old global ratchet).
+    const head = state.queue[0]!
+    if (state.active >= head.limits.maxConcurrentCalls) return
+    const waitMs = Math.max(0, state.lastStartedAt + head.limits.minIntervalMs - Date.now())
     if (waitMs > 0) {
       state.timer = setTimeout(() => {
         state.timer = undefined
@@ -174,6 +184,8 @@ interface AdmissionRequest<T> {
   call: () => Promise<T>
   resolve: (value: T) => void
   reject: (reason: unknown) => void
+  /** Per-request effective limits (host ceiling ∩ binding request). */
+  limits: EffectAdmissionPolicy
 }
 
 interface AdmissionState {

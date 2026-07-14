@@ -143,6 +143,42 @@ export async function verifyEffectEvent(
   return { ok: true, event: event as AuthenticatedEffectEvent }
 }
 
+interface EventNonceFile {
+  schemaVersion: '1.0'
+  /** nonce → expiresAt. Entries are pruned once expired (bounded growth). */
+  nonces: Record<string, number>
+}
+
+function eventNoncePath(paths: InstancePaths): string {
+  // Lives in ledgerDir: kernel-only territory, denied to the worker sandbox.
+  return join(paths.ledgerDir, 'event-nonces.json')
+}
+
+/**
+ * Consume an authenticated event's nonce exactly once. Returns false when the
+ * nonce was already consumed (replayed signed event). Expired entries are
+ * pruned on each write, so the file stays bounded by the events in flight
+ * inside their expiry windows.
+ */
+export async function consumeEventNonce(
+  instance: LoopInstance,
+  event: Pick<AuthenticatedEffectEvent, 'nonce' | 'expiresAt'>,
+  now = Date.now(),
+): Promise<boolean> {
+  const path = eventNoncePath(instance.paths)
+  return withFileLock(path, async () => {
+    const file = await readJsonFile<EventNonceFile>(path)
+    const nonces: Record<string, number> = {}
+    for (const [nonce, expiresAt] of Object.entries(file?.nonces ?? {})) {
+      if (typeof expiresAt === 'number' && expiresAt > now) nonces[nonce] = expiresAt
+    }
+    if (event.nonce in nonces) return false
+    nonces[event.nonce] = event.expiresAt
+    await atomicWriteJson(path, { schemaVersion: '1.0', nonces } satisfies EventNonceFile)
+    return true
+  })
+}
+
 async function requireSecret(paths: InstancePaths): Promise<EventAuthSecret> {
   const secret = await readJsonFile<EventAuthSecret>(eventAuthSecretPath(paths))
   if (!secret || secret.schemaVersion !== '1.0' || !secret.keyId || !secret.secret) {
