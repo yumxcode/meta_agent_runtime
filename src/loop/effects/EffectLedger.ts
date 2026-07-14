@@ -71,11 +71,18 @@ type EffectEvent =
 const LEGACY_RETRY: EffectRetryPolicy = {
   maxAttempts: 3, baseDelayMs: 1_000, maxDelayMs: 60_000, callTimeoutMs: 30_000,
 }
+const MAX_EFFECT_EVENT_BYTES = 1 * 1024 * 1024
+const MAX_EFFECT_HISTORY_ITEMS = 256
+const MAX_EFFECT_KEYS_PER_INSTANCE = 100_000
 
 export class EffectLedger {
   constructor(private readonly ledger: Ledger, private readonly paths: InstancePaths) {}
 
   private append(event: EffectEvent): Promise<void> {
+    const bytes = Buffer.byteLength(JSON.stringify(event))
+    if (bytes > MAX_EFFECT_EVENT_BYTES) {
+      throw new Error(`effect event exceeds ${MAX_EFFECT_EVENT_BYTES} bytes (${bytes})`)
+    }
     return this.ledger.appendJsonl(this.paths.effectsJsonl, event)
   }
 
@@ -91,7 +98,13 @@ export class EffectLedger {
     admission?: { maxConcurrentCalls: number; minIntervalMs: number }
   }): Promise<void> {
     await this.locked(async () => {
-      if (await this.get(input.effectKey)) return
+      const effects = await this.fold()
+      if (effects.has(input.effectKey)) return
+      if (effects.size >= MAX_EFFECT_KEYS_PER_INSTANCE) {
+        throw new Error(
+          `effect-key limit ${MAX_EFFECT_KEYS_PER_INSTANCE} reached; rotate to a new loop instance`,
+        )
+      }
       await this.append({
         t: 'submit', ...input, at: Date.now(),
         adapterId: input.adapterId ?? EVENT_EFFECT_ADAPTER_ID,
@@ -302,6 +315,7 @@ function applyEffectEvent(out: Map<string, EffectRecord>, event: EffectEvent): v
             current.status = current.status === 'cancelling' ? 'cancelling' : 'probing'
             current.nextInspectAt = event.nextInspectAt; current.updatedAt = event.at
             current.probes.push({ at: event.at, verdict: 'pending', data: event.data })
+            trimHistory(current.probes)
           }
           break
         case 'rule_evaluated':
@@ -311,12 +325,14 @@ function applyEffectEvent(out: Map<string, EffectRecord>, event: EffectEvent): v
               action: event.action, observations: event.observations,
               diagnostic: event.diagnostic,
             })
+            trimHistory(current.ruleEvaluations)
             current.updatedAt = event.at
           }
           break
         case 'probe':
           if (current && !terminal(current.status)) {
             current.status = 'probing'; current.probes.push({ at: event.at, verdict: event.verdict, data: event.data })
+            trimHistory(current.probes)
             current.updatedAt = event.at
           }
           break
@@ -330,7 +346,10 @@ function applyEffectEvent(out: Map<string, EffectRecord>, event: EffectEvent): v
           if (current && !terminal(current.status)) { current.status = 'cancelling'; current.updatedAt = event.at }
           break
         case 'cancelled':
-          if (current && !terminal(current.status)) { current.status = 'cancelled'; current.updatedAt = event.at }
+          if (current && !terminal(current.status)) {
+            current.status = 'cancelled'; current.updatedAt = event.at
+            releaseTerminalPayloads(current)
+          }
           break
         case 'conclude':
           if (current && !terminal(current.status)) {
@@ -340,16 +359,36 @@ function applyEffectEvent(out: Map<string, EffectRecord>, event: EffectEvent): v
           }
           break
         case 'harvested':
-          if (current?.status === 'concluded') { current.status = 'harvested'; current.updatedAt = event.at }
+          if (current?.status === 'concluded') {
+            current.status = 'harvested'; current.updatedAt = event.at
+            releaseTerminalPayloads(current)
+          }
           break
         case 'failed':
           if (current && !terminal(current.status)) {
             current.status = 'failed'; current.lastError = event.reason; current.updatedAt = event.at
+            releaseTerminalPayloads(current)
           }
           break
       }
     }
   }
+}
+
+function trimHistory<T>(items: T[]): void {
+  if (items.length > MAX_EFFECT_HISTORY_ITEMS) {
+    items.splice(0, items.length - MAX_EFFECT_HISTORY_ITEMS)
+  }
+}
+
+/** The append-only journal retains the audit; the hot fold keeps only exact
+ * idempotency/status metadata once no future harvest needs the payload. */
+function releaseTerminalPayloads(record: EffectRecord): void {
+  record.payload = undefined
+  record.receipt = undefined
+  record.probes = []
+  record.ruleEvaluations = []
+  if (record.status !== 'harvested') record.outcome = undefined
 }
 
 function terminal(status: EffectStatus): boolean {

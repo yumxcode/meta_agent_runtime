@@ -7,6 +7,7 @@
  * saved/reused/versioned across runs is exactly this object.
  */
 import type { Ast } from '../expr/Expr.js'
+import type { FrozenScenarioPluginRef } from '../scenarios/ScenarioPlugin.js'
 
 /** Reserved kernel-produced observable; charters/plugins cannot redeclare it. */
 export const PRODUCER_OK_OBSERVABLE = 'producer_ok' as const
@@ -14,13 +15,10 @@ export const PRODUCER_OK_OBSERVABLE = 'producer_ok' as const
 /**
  * Where an observable's value is collected from each round (spec §3.1).
  *
- * ONLY `judge` is wired: `collectObservables` reads the value from the judge's
- * return_result `data[key]`. Other sources (ledger/meter) were declared but never
- * implemented, so they are NOT part of the contract — a charter that uses them
- * would silently produce an unpopulated observable (dead tripwires/meters). If a
- * new source is ever added, wire it in `collectObservables`, extend this union,
- * AND allow it in `validateCharter` together — the validator is the source of
- * truth for what the kernel can actually honor.
+ * `judge` reads return_result data; `projection` reads a scalar through an RFC
+ * 6901 pointer from the post-commit Artifact projection. Both are resolved by
+ * collectObservables and validated at freeze time, so meters/routes never bind
+ * a declared-but-unpopulated source silently.
  *
  * `key` may be one of the kernel's core judge keys (JUDGE_CORE_KEYS in Seats.ts)
  * or a charter-invented extra key: every declared key is INJECTED into the
@@ -30,6 +28,7 @@ export const PRODUCER_OK_OBSERVABLE = 'producer_ok' as const
  */
 export type ObservableSource =
   | { from: 'judge'; key: string }              // judge return_result data field
+  | { from: 'projection'; id: string; pointer: string }
 
 export interface ObservableSpec {
   name: string
@@ -54,7 +53,7 @@ export interface ObservableConsumer {
 }
 
 export interface ObservableObligation {
-  source: 'judge' | 'kernel'
+  source: 'judge' | 'kernel' | 'projection'
   outputKey: string
   consumers: ObservableConsumer[]
 }
@@ -75,6 +74,11 @@ export interface ArtifactSpec {
   stream: string
   commitMode: ArtifactCommitMode
   requiredGates: string[]
+  /** Declarative draft decoding and production obligation. Legacy omission is one/optional. */
+  draft?: {
+    cardinality: 'one' | 'many'
+    requirement: 'each_round' | 'on_finalize' | 'optional'
+  }
 }
 
 export interface ProjectionBinding {
@@ -274,6 +278,8 @@ export interface Charter {
   goal: string
   /** Built-in or plugin Scenario registry identity. Legacy omission resolves to builtin/research@1. */
   scenario?: string
+  /** JSON configuration interpreted and validated by the selected Scenario plugin. */
+  scenarioConfig?: import('../scenarios/ScenarioPlugin.js').ScenarioJson
   /** Proposal streams and their required Gate bindings. Defaults come from the selected Scenario. */
   artifacts?: Record<string, ArtifactSpec>
   /** Complete ordered Gate execution policy. Defaults are frozen at instantiation. */
@@ -329,6 +335,8 @@ export interface FrozenCharter extends Charter {
   projections: ProjectionBinding[]
   effects: Record<string, FrozenEffectBinding>
   frozen: {
+    /** Exact trusted Scenario implementation identity used to create this instance. */
+    scenarioPlugin?: FrozenScenarioPluginRef
     meterAsts: Record<string, { incWhen?: Ast; resetWhen?: Ast }>
     tripwireAsts: Ast[]
     /** Parsed charter.health.staleWhen, when declared. */

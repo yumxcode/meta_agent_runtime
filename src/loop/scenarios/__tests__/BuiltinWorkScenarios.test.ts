@@ -57,6 +57,27 @@ async function pump(projectDir: string, seat: ISubAgentDispatcher, instanceId: s
 }
 
 describe('built-in Release and Compliance Scenarios', () => {
+  it('fails closed when required Release artifacts are absent', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-release-required-'))
+    const instanceId = 'release-required-v1'
+    const paths = instancePaths(dir, instanceId)
+    await createInstance({
+      projectDir: dir, instanceId, charter: charter('release-required', RELEASE_SCENARIO_ID),
+      wakeStore: new WakeStore(dir),
+    })
+    let attempts = 0
+    await tickOnce({
+      projectDir: dir,
+      dispatcher: dispatcher(async () => { attempts++; return { label: 'ok' } }),
+    })
+    const instance = (await loadInstance(dir, instanceId))!
+    expect(attempts).toBe(2)
+    expect(instance.record.status).toBe('paused_attention')
+    expect(instance.record.status).not.toBe('done')
+    const checkpoint = JSON.parse(await readFile(paths.artifactsCheckpointJson, 'utf-8'))
+    expect(checkpoint.streamStates).toEqual({})
+  })
+
   it('runs Release with fixed replace/versioned artifacts through the unchanged Kernel', async () => {
     const dir = await mkdtemp(join(tmpdir(), 'loop-release-'))
     const instanceId = 'release-work-v1'

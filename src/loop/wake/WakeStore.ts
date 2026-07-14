@@ -43,7 +43,7 @@ export interface WakeRecord {
   /** Effect this probe/event wake belongs to (M2). */
   effectKey?: string
   status: WakeStatus
-  claim?: { owner: string; claimedAt: number; expiresAt: number }
+  claim?: { owner: string; token?: string; claimedAt: number; expiresAt: number }
   attempts: number
   /** Cost observed on safely-cancelled attempts before this wake completed.
    * It is carried into the eventual RoundEntry so abort/restart cannot reset
@@ -64,6 +64,13 @@ const DEFAULT_CLAIM_TTL_MS = 10 * 60_000
 
 export function wakeClaimOwner(): string {
   return `${hostname()}#${process.pid}`
+}
+
+export class WakeClaimLostError extends Error {
+  constructor(wakeId: string) {
+    super(`wake claim '${wakeId}' is no longer owned by this execution`)
+    this.name = 'WakeClaimLostError'
+  }
 }
 
 export class WakeStore {
@@ -156,6 +163,7 @@ export class WakeStore {
     now = Date.now(),
     owner = wakeClaimOwner(),
     limit = Number.POSITIVE_INFINITY,
+    excludeLoopIds: ReadonlySet<string> = new Set(),
   ): Promise<WakeRecord[]> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
@@ -169,11 +177,12 @@ export class WakeStore {
       for (const record of all) {
         if (claimed.length >= limit) break
         if (record.status !== 'pending' || record.fireAt > now) continue
+        if (excludeLoopIds.has(record.loopId)) continue
         if (liveClaimedLoops.has(record.loopId)) continue
         const next: WakeRecord = {
           ...record,
           status: 'claimed',
-          claim: { owner, claimedAt: now, expiresAt: now + this.claimTtlMs },
+          claim: { owner, token: randomUUID(), claimedAt: now, expiresAt: now + this.claimTtlMs },
           attempts: record.attempts + 1,
           updatedAt: now,
         }
@@ -185,28 +194,58 @@ export class WakeStore {
     })
   }
 
-  async heartbeat(wakeId: string, now = Date.now()): Promise<void> {
-    await withFileLock(this.lockPath(), async () => {
+  async heartbeat(wakeId: string, now = Date.now(), claimToken?: string): Promise<boolean> {
+    return withFileLock(this.lockPath(), async () => {
       const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
-      if (!record || record.status !== 'claimed' || !record.claim) return
+      if (!record || record.status !== 'claimed' || !record.claim ||
+          (record.claim.token !== undefined && record.claim.token !== claimToken)) return false
       await atomicWriteJson(this.pathFor(wakeId), {
         ...record,
         claim: { ...record.claim, expiresAt: now + this.claimTtlMs },
         updatedAt: now,
       })
+      return true
     })
   }
 
-  async addAbortedCost(wakeId: string, costUsd: number): Promise<void> {
-    if (!Number.isFinite(costUsd) || costUsd <= 0) return
-    await withFileLock(this.lockPath(), async () => {
+  async assertClaim(wakeId: string, claimToken: string): Promise<void> {
+    const owned = await withFileLock(this.lockPath(), async () => {
       const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
-      if (!record) return
+      return !!record && record.status === 'claimed' && record.claim?.token === claimToken
+    })
+    if (!owned) throw new WakeClaimLostError(wakeId)
+  }
+
+  /**
+   * Run `fn` INSIDE the wake-store critical section after validating claim
+   * ownership. Because claim recovery (reconcileOrphans) and re-claiming
+   * (claimDue) both require this same lock, nothing can steal the claim while
+   * `fn` runs — this is what makes an authoritative ledger commit truly
+   * fenced, not merely check-then-write. `fn` MUST be fast (file appends /
+   * atomic writes) and MUST NOT call back into this WakeStore (the lock is
+   * not reentrant).
+   */
+  async withClaim<T>(wakeId: string, claimToken: string, fn: () => Promise<T>): Promise<T> {
+    return withFileLock(this.lockPath(), async () => {
+      const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
+      if (!record || record.status !== 'claimed' || record.claim?.token !== claimToken) {
+        throw new WakeClaimLostError(wakeId)
+      }
+      return fn()
+    })
+  }
+
+  async addAbortedCost(wakeId: string, costUsd: number, claimToken?: string): Promise<boolean> {
+    if (!Number.isFinite(costUsd) || costUsd <= 0) return true
+    return withFileLock(this.lockPath(), async () => {
+      const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
+      if (!record || (record.claim?.token !== undefined && record.claim.token !== claimToken)) return false
       await atomicWriteJson(this.pathFor(wakeId), {
         ...record,
         abortedCostUsd: (record.abortedCostUsd ?? 0) + costUsd,
         updatedAt: Date.now(),
       })
+      return true
     })
   }
 
@@ -216,11 +255,11 @@ export class WakeStore {
   async release(
     wakeId: string,
     outcome: 'done' | 'cancelled' | 'pending',
-    opts?: { fireAt?: number },
-  ): Promise<void> {
-    await withFileLock(this.lockPath(), async () => {
+    opts?: { fireAt?: number; claimToken?: string },
+  ): Promise<boolean> {
+    return withFileLock(this.lockPath(), async () => {
       const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
-      if (!record) return
+      if (!record || (record.claim?.token !== undefined && record.claim.token !== opts?.claimToken)) return false
       await atomicWriteJson(this.pathFor(wakeId), {
         ...record,
         status: outcome,
@@ -228,6 +267,7 @@ export class WakeStore {
         ...(outcome === 'pending' && opts?.fireAt !== undefined ? { fireAt: opts.fireAt } : {}),
         updatedAt: Date.now(),
       })
+      return true
     })
   }
 
@@ -254,11 +294,24 @@ export class WakeStore {
     })
   }
 
-  async cancelForLoop(loopId: LoopInstanceId): Promise<number> {
+  async cancelForLoop(
+    loopId: LoopInstanceId,
+    fence?: { wakeId: string; claimToken: string },
+  ): Promise<number> {
     return withFileLock(this.lockPath(), async () => {
+      if (fence) {
+        const owner = await readJsonFile<WakeRecord>(this.pathFor(fence.wakeId))
+        if (!owner || owner.status !== 'claimed' || owner.claim?.token !== fence.claimToken) {
+          throw new WakeClaimLostError(fence.wakeId)
+        }
+      }
       let n = 0
       for (const record of await this.listUnlocked()) {
         if (record.loopId !== loopId || record.status === 'done' || record.status === 'cancelled') continue
+        // The fence holder's own wake is NOT cancelled here: the runner owns
+        // its terminal disposition (release done/cancelled), keeping the wake
+        // audit trail a clean claimed→done instead of claimed→cancelled→done.
+        if (fence && record.wakeId === fence.wakeId) continue
         await atomicWriteJson(this.pathFor(record.wakeId), {
           ...record,
           status: 'cancelled',

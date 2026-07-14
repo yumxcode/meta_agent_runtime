@@ -290,3 +290,17 @@ export type {
 export { createResearchDispatchTool, RESEARCH_MAX_DURATION_MS } from './tools/research/research_dispatch/index.js'
 export { ResearchStore, buildResearchArtifactAnchors, researchRootDir } from './research/ResearchStore.js'
 export type { ResearchIndexEntry, SaveResearchResultOptions } from './research/ResearchStore.js'
+
+// ── Long-running Loop Scenario plugin ABI ────────────────────────────────────
+export { ScenarioRegistry, ScenarioPluginError } from './loop/scenarios/ScenarioRegistry.js'
+export { loadScenarioPlugins } from './loop/scenarios/ScenarioLoader.js'
+export {
+  SCENARIO_PLUGIN_API_VERSION,
+  type ScenarioPluginV1,
+  type ScenarioPluginManifest,
+  type ScenarioDefinition,
+  type ScenarioRuntime,
+  type ScenarioCapsuleView,
+  type ScenarioCapsuleSection,
+  type ScenarioJson,
+} from './loop/scenarios/ScenarioPlugin.js'

@@ -26,6 +26,8 @@ import {
 } from './workspace/WorkspaceIdentity.js'
 import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
 import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
+import type { ScenarioRegistry } from './scenarios/ScenarioRegistry.js'
+import { defaultScenarioRegistry } from './scenarios/BuiltinScenarioPlugins.js'
 
 export interface LoopCliDeps {
   projectDir: string
@@ -36,6 +38,7 @@ export interface LoopCliDeps {
   effectAdapters?: EffectAdapterRegistry
   /** Live per-round/seat progress for `tick` (CLI renders it). */
   observer?: (event: import('./kernel/LoopKernel.js').LoopEvent) => void
+  scenarios?: ScenarioRegistry
 }
 
 export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<string> {
@@ -55,6 +58,7 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'workspace-fork': return cmdWorkspaceFork(deps)
     case 'schedulers': return cmdSchedulers()
     case 'host-capacity': return cmdHostCapacity()
+    case 'scenarios': return cmdScenarios(deps)
     default:
       return [
         'Usage: meta-agent loop <command>',
@@ -68,12 +72,21 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
         '  workspace-fork                              Assign an intentionally copied workspace a new identity',
         '  schedulers                                  Show live host schedulers and queued/active work',
         '  host-capacity                               Show host-wide Loop admission usage',
+        '  scenarios                                   List loaded trusted Scenario plugins',
         '  list                                        List loop instances in this workspace',
         '  inspect <instanceId>                        Status + progress + recent rounds',
         '  inbox <instanceId> <message…>               Drop feedback for the next round',
         '  tick [--until-quiescent]                    Claim due wakes and run rounds (needs backend)',
       ].join('\n')
   }
+}
+
+function cmdScenarios(deps: LoopCliDeps): string {
+  const registry = deps.scenarios ?? defaultScenarioRegistry
+  return registry.ids().map(id => {
+    const manifest = registry.require(id).manifest
+    return `${id}  api=${manifest.apiVersion} version=${manifest.version} integrity=${manifest.integrity}`
+  }).join('\n') || '(no Scenario plugins loaded)'
 }
 
 async function cmdWorkspaceInfo(deps: LoopCliDeps): Promise<string> {
@@ -139,6 +152,7 @@ async function cmdDistill(rest: string[], deps: LoopCliDeps): Promise<string> {
     dispatcher: deps.dispatcher,
     signal: deps.signal,
     projectDir: deps.projectDir,
+    scenarios: deps.scenarios,
     promptCatalog: deps.effectAdapters ? { effectAdapterIds: deps.effectAdapters.ids() } : undefined,
   })
   await writeFile(resolve(deps.projectDir, out), JSON.stringify(result.charter, null, 2), 'utf-8')
@@ -155,9 +169,9 @@ async function cmdDistill(rest: string[], deps: LoopCliDeps): Promise<string> {
 async function cmdMigrate(rest: string[], deps: LoopCliDeps): Promise<string> {
   const id = rest.find(a => !a.startsWith('--'))
   if (!id) throw new Error('loop migrate: instanceId required')
-  const instance = await loadInstance(deps.projectDir, id)
+  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
   if (!instance) return `instance ${id} not found`
-  const store = new CharterStore(deps.projectDir)
+  const store = new CharterStore(deps.projectDir, { scenarios: deps.scenarios })
   const versionFlag = flagValue(rest, '--version')
   const version = versionFlag ? Number(versionFlag) : undefined
   const charter = await store.load(instance.record.charterId, version)
@@ -181,7 +195,7 @@ async function cmdLifecycle(
 ): Promise<string> {
   const id = rest.find(a => !a.startsWith('--'))
   if (!id) throw new Error(`loop ${action}: instanceId required`)
-  const instance = await loadInstance(deps.projectDir, id)
+  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
   if (!instance) return `instance ${id} not found`
   const reason = flagValue(rest, '--reason')
   const lifecycleDeps = {
@@ -203,6 +217,7 @@ async function cmdLifecycle(
                   dispatcher: deps.dispatcher,
                   projectDir: deps.projectDir,
                   signal: deps.signal ?? new AbortController().signal,
+                  scenarios: deps.scenarios,
                 },
               }
             : {}),
@@ -218,13 +233,14 @@ async function cmdCreate(rest: string[], deps: LoopCliDeps): Promise<string> {
   const charter = JSON.parse(raw) as Charter
 
   // Save into the charter library (versioned), then instantiate that version.
-  const store = new CharterStore(deps.projectDir)
+  const store = new CharterStore(deps.projectDir, { scenarios: deps.scenarios })
   const ref = await store.save(charter)
   const saved = (await store.load(ref.charterId, ref.version))!
   const instance = await createInstance({
     projectDir: deps.projectDir,
     charter: saved,
     instanceId: idFlag,
+    scenarios: deps.scenarios,
   })
   return [
     `charter ${ref.charterId}@v${ref.version} saved`,
@@ -258,7 +274,7 @@ async function cmdList(deps: LoopCliDeps): Promise<string> {
 async function cmdInspect(rest: string[], deps: LoopCliDeps): Promise<string> {
   const id = rest[0]
   if (!id) throw new Error('loop inspect: instanceId required')
-  const instance = await loadInstance(deps.projectDir, id)
+  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
   if (!instance) return `instance ${id} not found`
   const view = await instance.ledger.readView(10)
   const wakes = (await new WakeStore(deps.projectDir).list())
@@ -268,8 +284,8 @@ async function cmdInspect(rest: string[], deps: LoopCliDeps): Promise<string> {
       (instance.record.statusReason ? ` (${instance.record.statusReason})` : ''),
     `charter: ${instance.record.charterId}@v${instance.record.charterVersion}  hash: ${instance.record.charterHash.slice(0, 12)}`,
     `progress: iteration=${view.progress.iteration} status=${view.progress.status} ` +
-      `meters=${JSON.stringify(view.progress.meters)} best=${view.progress.bestMetric ?? 'null'} ` +
-      `findings=${view.findingsCount} cost=$${view.progress.totalCostUsd.toFixed(2)}`,
+      `meters=${JSON.stringify(view.progress.meters)} objectiveBest=${view.progress.objectiveBestValue ?? 'null'} ` +
+      `cost=$${view.progress.totalCostUsd.toFixed(2)}`,
     `wakes: ${wakes.map(w => `${w.kind}@${new Date(w.fireAt).toISOString()}[${w.status}]`).join(', ') || '(none)'}`,
     '',
     'recent rounds:',
@@ -319,6 +335,7 @@ async function cmdTick(rest: string[], deps: LoopCliDeps): Promise<string> {
       observer: deps.observer, effectAdapters: deps.effectAdapters,
       hostCoordinator: coordinator,
       workspaceIdentity,
+      scenarios: deps.scenarios,
     }
     if (rest.includes('--until-quiescent')) {
       const results = await runUntilQuiescent(tickDeps)

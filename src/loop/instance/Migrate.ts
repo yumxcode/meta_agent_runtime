@@ -19,16 +19,17 @@
  *     would pause again without doing any work.
  */
 import { createHash } from 'crypto'
-import { dirname, join } from 'path'
-import { atomicWriteJson } from '../../infra/persist/index.js'
+import { dirname } from 'path'
 import type { Charter, FrozenCharter } from '../charter/CharterTypes.js'
 import { freezeCharter } from '../charter/CharterValidate.js'
 import { collectRefs } from '../expr/Expr.js'
 import { WakeStore } from '../wake/WakeStore.js'
 import type { LoopInstance } from './InstanceStore.js'
 import { setInstanceStatus } from './InstanceStore.js'
+import { completePendingMigration, writeMigrationMarker } from './MigrationRecovery.js'
 
 export interface MigrationEntry {
+  migrationId: string
   at: number
   fromVersion: number
   toVersion: number
@@ -92,7 +93,7 @@ export async function migrateInstance(
     throw new Error(`cannot migrate while '${record.status}' — wait for idle or a paused escalation`)
   }
 
-  const frozen = freezeCharter(newCharter) // throws with instructive errors
+  const frozen = freezeCharter(newCharter, instance.scenarios) // throws with instructive errors
   const toHash = createHash('sha256').update(JSON.stringify(frozen)).digest('hex')
 
   // Meter carry-over by name.
@@ -115,6 +116,7 @@ export async function migrateInstance(
   for (const name of resetMeters) carried[name] = 0
 
   const entry: MigrationEntry = {
+    migrationId: `charter:${toHash}`,
     at: Date.now(),
     fromVersion: record.charterVersion,
     toVersion: frozen.version,
@@ -127,38 +129,52 @@ export async function migrateInstance(
     resetMeters,
   }
 
-  // Order: audit first (append-only), then the swap, then progress/status.
-  await ledger.appendJsonl(join(paths.ledgerDir, 'migrations.jsonl'), entry)
-  await atomicWriteJson(paths.frozenCharter, frozen)
-  instance.charter = frozen
-  instance.record = {
+  // Fence the scheduler before publishing a recoverable migration intent.
+  // A wake claimed concurrently will fail its guarded idle/waiting→running CAS.
+  await setInstanceStatus(instance, 'migrating', `migrating to v${frozen.version}`, {
+    expectFrom: [record.status],
+  })
+  const nextRecord = {
     ...record,
     charterVersion: frozen.version,
     charterHash: toHash,
+    status: 'idle' as const,
+    statusReason: `migrated to v${frozen.version}${reArming ? ' (human ack)' : ''}`,
     updatedAt: Date.now(),
   }
   // The escalation is acknowledged by this migration — clear its marker.
-  if (reArming) delete instance.record.lastEscalation
-  await atomicWriteJson(paths.instanceJson, instance.record)
-  // Re-arm also clears the terminal-ish progress status: the offending meters
-  // were just reset, and the next round's ROUTE recomputes the truth anyway.
-  await ledger.writeProgress({
+  if (reArming) delete nextRecord.lastEscalation
+  const nextProgress = {
     ...progress,
     meters: carried,
     ...(reArming ? { status: 'healthy' as const } : {}),
     updatedAt: Date.now(),
-  })
+  }
+  try {
+    await writeMigrationMarker(paths, {
+      schemaVersion: '1.0', migrationId: entry.migrationId,
+      frozenCharter: frozen, record: nextRecord, progress: nextProgress,
+      audit: entry as unknown as Record<string, unknown> & { migrationId: string },
+      createdAt: Date.now(),
+    })
+  } catch (error) {
+    await setInstanceStatus(instance, record.status, 'migration intent write failed', {
+      expectFrom: ['migrating'],
+      lastEscalation: record.lastEscalation ?? null,
+    }).catch(() => undefined)
+    throw error
+  }
+  await completePendingMigration(paths)
+  instance.charter = frozen
+  instance.record = nextRecord
 
   if (entry.reArmed) {
-    await setInstanceStatus(instance, 'idle', `migrated to v${frozen.version} (human ack)`)
     // Fallback workspace = two levels above the instance root
     // (<workspace>/.loop/<id>): a WakeStore rooted at paths.root would write
     // wakes into <instance>/.loop/wakes, which no scheduler ever scans — the
     // re-armed loop would never wake.
     const wakeStore = opts?.wakeStore ?? new WakeStore(opts?.projectDir ?? dirname(dirname(paths.root)))
     await wakeStore.schedule({ loopId: record.instanceId, kind: 'timer', fireAt: Date.now() })
-  } else {
-    await setInstanceStatus(instance, 'idle', `migrated to v${frozen.version}`)
   }
   return entry
 }

@@ -10,6 +10,7 @@ import { join, resolve } from 'path'
 import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../../infra/persist/index.js'
 import type { Charter } from './CharterTypes.js'
 import { validateCharter } from './CharterValidate.js'
+import type { ScenarioRegistry } from '../scenarios/ScenarioRegistry.js'
 
 export interface CharterRef {
   charterId: string
@@ -25,10 +26,12 @@ interface LatestPointer {
 
 export class CharterStore {
   private readonly root: string
+  private readonly scenarios?: ScenarioRegistry
 
   /** Default root: `<projectDir>/.loop/charters`. */
-  constructor(projectDir: string, opts?: { dir?: string }) {
+  constructor(projectDir: string, opts?: { dir?: string; scenarios?: ScenarioRegistry }) {
     this.root = opts?.dir ?? join(resolve(projectDir), '.loop', 'charters')
+    this.scenarios = opts?.scenarios
   }
 
   private charterDir(id: string): string {
@@ -49,7 +52,7 @@ export class CharterStore {
    * job, not the author's (prevents gaps/collisions).
    */
   async save(charter: Charter): Promise<CharterRef> {
-    const errs = validateCharter({ ...charter, version: 1 })
+    const errs = validateCharter({ ...charter, version: 1 }, this.scenarios)
     if (errs.length > 0) throw new Error(`refusing to save invalid charter:\n- ${errs.join('\n- ')}`)
     // Version allocation is read-modify-write on latest.json — lock it so two
     // concurrent saves cannot both allocate the same version and clobber each

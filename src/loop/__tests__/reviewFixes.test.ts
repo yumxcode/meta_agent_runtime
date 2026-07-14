@@ -10,7 +10,7 @@
  *   L2 — an event wait without effectKey gets one corrective retry
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, mkdir, readFile, writeFile, access } from 'fs/promises'
+import { mkdtemp, mkdir, readFile, writeFile, access, rm } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
@@ -25,6 +25,7 @@ import { tickOnce } from '../runner.js'
 import { instancePaths, type PendingRound, type RoundEntry } from '../types.js'
 import { EffectLedger } from '../effects/EffectLedger.js'
 import { Ledger, type ProgressView } from '../ledger/LedgerApi.js'
+import { researchPaths } from '../scenarios/research/ResearchPaths.js'
 import { readPendingRound } from '../effects/WaitOps.js'
 import { walkResearchCharter } from './testCharter.js'
 
@@ -145,6 +146,32 @@ describe('M2 — harvest replay guard', () => {
   })
 })
 
+describe('terminal tail recovery', () => {
+  it('repairs report/status after a committed terminal round without replaying a seat', async () => {
+    const { dir, paths } = await setup()
+    const first = scriptedDispatcher(async task => {
+      if (isWorker(task)) { await writeDrafts(paths); return { output: { label: 'ok' } } }
+      if (isJudge(task)) return { output: PASSING_JUDGE }
+      return { output: { narrative: 'final' } }
+    })
+    await tickOnce({ dispatcher: first, projectDir: dir })
+    const completedRounds = (await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n').length
+
+    // Simulate kill -9 after progress/round commit but before report/status tail.
+    const stale = (await loadInstance(dir, INSTANCE_ID))!
+    await setInstanceStatus(stale, 'idle', 'simulated incomplete terminal tail')
+    await rm(join(paths.reportsDir, 'final_report.md'), { force: true })
+    await new WakeStore(dir).schedule({ loopId: INSTANCE_ID, kind: 'manual', fireAt: Date.now() })
+
+    const replay = scriptedDispatcher(async () => { throw new Error('no seat may replay') })
+    await tickOnce({ dispatcher: replay, projectDir: dir })
+    expect(replay.spawns).toHaveLength(0)
+    expect((await loadInstance(dir, INSTANCE_ID))?.record.status).toBe('done')
+    expect(await readFile(join(paths.reportsDir, 'final_report.md'), 'utf-8')).toContain('Loop Report')
+    expect((await readFile(paths.roundsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(completedRounds)
+  })
+})
+
 describe('M4 — status transitions re-validate on disk', () => {
   it('pause loses the race to a daemon that flipped the instance to running', async () => {
     const { dir } = await setup()
@@ -168,9 +195,7 @@ describe('M6 — crashed judge: one retry, then fail-closed', () => {
     await tickOnce({ dispatcher, projectDir: dir })
 
     expect(dispatcher.spawns.filter(isJudge)).toHaveLength(2) // one in-round rerun
-    const progress = JSON.parse(await readFile(paths.progressJson, 'utf-8')) as ProgressView
-    expect(progress.totalFindings).toBe(0) // fail-closed: drafts discarded
-    await expect(access(paths.findingsJsonl)).rejects.toThrow() // nothing admitted
+    await expect(access(researchPaths(paths).findingsJsonl)).rejects.toThrow() // nothing admitted
   })
 })
 

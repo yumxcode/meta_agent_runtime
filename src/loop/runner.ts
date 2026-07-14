@@ -7,6 +7,7 @@
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import { WakeStore } from './wake/WakeStore.js'
 import type { WakeRecord } from './wake/WakeStore.js'
+import { WakeClaimLostError } from './wake/WakeStore.js'
 import { listInstanceRecords, loadInstance } from './instance/InstanceStore.js'
 import {
   RoundAbortedError,
@@ -28,6 +29,8 @@ import {
 import type { HostAdmissionHandle } from './host/HostSchedulerCoordinator.js'
 import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
 import type { WorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
+import type { ScenarioRegistry } from './scenarios/ScenarioRegistry.js'
+import { ScenarioPluginError } from './scenarios/ScenarioRegistry.js'
 
 export interface TickDeps {
   dispatcher: ISubAgentDispatcher
@@ -39,6 +42,7 @@ export interface TickDeps {
   /** Host-wide coordination is injected by loop-scheduler and the host CLI tick path. */
   hostCoordinator?: HostSchedulerCoordinator
   workspaceIdentity?: WorkspaceIdentity
+  scenarios?: ScenarioRegistry
 }
 
 export interface TickResult {
@@ -70,12 +74,12 @@ async function failStopLoop(
   reason: string,
   errorMessage?: string,
 ): Promise<TickOutcome> {
-  const instance = await loadInstance(deps.projectDir, wake.loopId)
+  const instance = await loadInstance(deps.projectDir, wake.loopId, deps.scenarios)
   if (instance) {
     await setInstanceStatus(instance, 'failed', reason).catch(() => undefined)
     await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
   } else {
-    await wakeStore.release(wake.wakeId, 'cancelled').catch(() => undefined)
+    await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token }).catch(() => undefined)
   }
   return { loopId: wake.loopId, error: errorMessage ?? reason }
 }
@@ -95,9 +99,11 @@ export async function prepareAndClaim(
     effectAdapters: deps.effectAdapters ?? defaultEffectAdapterRegistry(),
   }
   const allWakes = await wakeStore.list()
+  const blockedPluginLoops = new Set<string>()
   for (const record of await listInstanceRecords(deps.projectDir)) {
     if (HALTED_STATUSES.has(record.status)) continue
-    const instance = await loadInstance(deps.projectDir, record.instanceId).catch(error => {
+    const instance = await loadInstance(deps.projectDir, record.instanceId, deps.scenarios).catch(error => {
+      if (error instanceof ScenarioPluginError) blockedPluginLoops.add(record.instanceId)
       console.error(`[loop] scheduler skipped instance ${record.instanceId} (load failed):`,
         error instanceof Error ? error.message : String(error))
       return null
@@ -127,7 +133,10 @@ export async function prepareAndClaim(
         error instanceof Error ? error.message : String(error))
     }
   }
-  return { wakeStore, wakes: await wakeStore.claimDue(now, undefined, maxClaims) }
+  return {
+    wakeStore,
+    wakes: await wakeStore.claimDue(now, undefined, maxClaims, blockedPluginLoops),
+  }
 }
 
 /** Slow scheduler phase for one already-claimed wake. Owns the wake's one and
@@ -142,20 +151,20 @@ export async function runClaimedWake(
   if (deps.signal?.aborted) forwardAbort()
   else deps.signal?.addEventListener('abort', forwardAbort, { once: true })
   const wakeHeartbeat = setInterval(() => {
-    void wakeStore.heartbeat(wake.wakeId).catch(() => undefined)
+    void wakeStore.heartbeat(wake.wakeId, Date.now(), wake.claim?.token).catch(() => undefined)
   }, 60_000)
   wakeHeartbeat.unref?.()
   let roundLease: HostAdmissionHandle | null = null
   let resourceLease: HostAdmissionHandle | null = null
   let leaseHeartbeat: ReturnType<typeof setInterval> | null = null
   try {
-    const instance = await loadInstance(deps.projectDir, wake.loopId)
+    const instance = await loadInstance(deps.projectDir, wake.loopId, deps.scenarios)
     if (!instance) {
-      await wakeStore.release(wake.wakeId, 'cancelled')
+      await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token })
       return { loopId: wake.loopId, error: 'instance not found' }
     }
     if (HALTED_STATUSES.has(instance.record.status)) {
-      await wakeStore.release(wake.wakeId, 'cancelled')
+      await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token })
       return { loopId: wake.loopId, error: `instance is ${instance.record.status}` }
     }
     if (deps.hostCoordinator && deps.workspaceIdentity) {
@@ -187,8 +196,13 @@ export async function runClaimedWake(
       hostCoordinator: deps.hostCoordinator,
       workspaceIdentity: deps.workspaceIdentity,
       loopInstanceId: instance.record.instanceId,
+      scenarios: deps.scenarios,
     })
-    await wakeStore.release(wake.wakeId, outcome.route === 'stale-wake' ? 'cancelled' : 'done')
+    await wakeStore.release(
+      wake.wakeId,
+      outcome.route === 'stale-wake' ? 'cancelled' : 'done',
+      { claimToken: wake.claim?.token },
+    )
     // A cancelled stale wake may carry aborted-attempt cost; move it onto the
     // loop's live wake so the lifetime USD ledger cannot silently lose it.
     if (outcome.route === 'stale-wake' && (wake.abortedCostUsd ?? 0) > 0) {
@@ -203,6 +217,11 @@ export async function runClaimedWake(
     }
     return { loopId: wake.loopId, outcome }
   } catch (err) {
+    if (err instanceof WakeClaimLostError) {
+      // A replacement execution owns the recovered wake. The stale worker may
+      // neither alter status nor release/requeue that newer claim.
+      return { loopId: wake.loopId, error: err.message }
+    }
     if (err instanceof EffectConfigurationError) {
       return failStopLoop(deps, wakeStore, wake, `effect configuration failed: ${err.message}`, err.message)
     }
@@ -225,10 +244,10 @@ export async function runClaimedWake(
     if (err instanceof RoundAbortedError) {
       // Graceful cancellation (daemon restart) — replay immediately, no cap:
       // aborts are normal operations, not failures.
-      await wakeStore.addAbortedCost(wake.wakeId, err.costUsd).catch(() => undefined)
-      const instance = await loadInstance(deps.projectDir, wake.loopId)
+      await wakeStore.addAbortedCost(wake.wakeId, err.costUsd, wake.claim?.token).catch(() => undefined)
+      const instance = await loadInstance(deps.projectDir, wake.loopId, deps.scenarios)
       if (instance) await setInstanceStatus(instance, 'idle', 'round safely cancelled; pending replay').catch(() => undefined)
-      await wakeStore.release(wake.wakeId, 'pending').catch(() => undefined)
+      await wakeStore.release(wake.wakeId, 'pending', { claimToken: wake.claim?.token }).catch(() => undefined)
       return { loopId: wake.loopId, error: err.message }
     }
     // Unclassified error: retry with exponential backoff, and fail-stop after
@@ -242,7 +261,10 @@ export async function runClaimedWake(
       )
     }
     await wakeStore
-      .release(wake.wakeId, 'pending', { fireAt: Date.now() + retryBackoffMs(wake.attempts) })
+      .release(wake.wakeId, 'pending', {
+        fireAt: Date.now() + retryBackoffMs(wake.attempts),
+        claimToken: wake.claim?.token,
+      })
       .catch(() => undefined)
     return { loopId: wake.loopId, error: message }
   } finally {

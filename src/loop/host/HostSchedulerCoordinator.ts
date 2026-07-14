@@ -334,11 +334,17 @@ export class HostSchedulerCoordinator {
       return waitingTickets.filter(value => value.kind === 'adapter_call' && value.resourceIds?.[0] === resourceId)
         .sort(ticketOrder)[0]?.ticketId === ticket.ticketId
     }
-    const firstCompatible = waitingTickets
+    const resourceTickets = waitingTickets
       .filter(value => value.kind === 'resource')
       .sort(ticketOrder)
-      .find(value => resourcesAvailable(value.resources ?? [], leases))
-    return firstCompatible?.ticketId === ticket.ticketId
+    if (!resourcesAvailable(ticket.resources ?? [], leases)) return false
+    // Writer barrier: an older incompatible request for any of the same
+    // resources blocks later compatible readers. Without this, a continuous
+    // stream of shared requests can bypass and starve an exclusive waiter.
+    const blockedByEarlierConflict = resourceTickets.some(candidate =>
+      candidate.ticketId !== ticket.ticketId && ticketOrder(candidate, ticket) < 0 &&
+      resourceRequirementsOverlap(candidate.resources ?? [], ticket.resources ?? []))
+    return !blockedByEarlierConflict
   }
 
   private async grantAvailableUnlocked(
@@ -508,6 +514,14 @@ function resourcesAvailable(requirements: HostResourceRequirement[], leases: Hos
     }
   }
   return true
+}
+
+function resourceRequirementsOverlap(
+  left: readonly HostResourceRequirement[],
+  right: readonly HostResourceRequirement[],
+): boolean {
+  const ids = new Set(left.map(requirement => requirement.id))
+  return right.some(requirement => ids.has(requirement.id))
 }
 
 function normalizeResources(requirements: readonly HostResourceRequirement[]): HostResourceRequirement[] {

@@ -169,9 +169,9 @@ describe('EffectAdapter ABI', () => {
     }
     const registry = new EffectAdapterRegistry([adapter])
     await submitEffect(instance, wakeStore, input('stable-key', adapter.id), registry)
-    await delay(12)
+    await delay(25)
     await advanceEffect(instance, wakeStore, 'stable-key', registry)
-    await delay(22)
+    await delay(45)
     await advanceEffect(instance, wakeStore, 'stable-key', registry)
     expect(keys).toEqual(['stable-key', 'stable-key', 'stable-key'])
     expect(await ledger.get('stable-key')).toMatchObject({ status: 'submitted', attempts: 3 })

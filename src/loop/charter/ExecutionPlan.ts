@@ -4,16 +4,20 @@ import type {
   FrozenGateBinding,
 } from './CharterTypes.js'
 import { DEFAULT_SCENARIO_ID, scenarioDefinition } from '../scenarios/ScenarioDefinitions.js'
+import type { ScenarioDefinition } from '../scenarios/ScenarioPlugin.js'
 
 /** Normalize the current Research Charter into the future fixed-role model. */
-export function buildExecutionPlan(charter: Charter): FrozenExecutionPlan {
+export function buildExecutionPlan(
+  charter: Charter,
+  definitionOverride?: ScenarioDefinition,
+): FrozenExecutionPlan {
   const schemaGateIds = Object.entries(charter.gates ?? {})
     .filter(([, gate]) => gate.kind === 'schema')
     .map(([id]) => id)
   const judgeGateIds = Object.entries(charter.gates ?? {})
     .filter(([, gate]) => gate.kind === 'judge')
     .map(([id]) => id)
-  const scenario = scenarioDefinition(charter.scenario ?? DEFAULT_SCENARIO_ID)
+  const scenario = definitionOverride ?? scenarioDefinition(charter.scenario ?? DEFAULT_SCENARIO_ID)
   const gates: FrozenGateBinding[] = charter.gateBindings
     ? charter.gateBindings.map(binding => ({
         ...((binding && typeof binding === 'object') ? binding : {} as FrozenGateBinding),

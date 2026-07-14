@@ -25,6 +25,7 @@ export interface DistillDeps {
   /** Actual host registry catalog; prevents the model inventing adapters. */
   promptCatalog?: DistillerPromptCatalog
   projectDir?: string
+  scenarios?: import('../scenarios/ScenarioRegistry.js').ScenarioRegistry
 }
 
 export async function distillCharter(doc: string, deps: DistillDeps): Promise<DistillResult> {
@@ -78,7 +79,7 @@ export async function distillCharter(doc: string, deps: DistillDeps): Promise<Di
       ]
       continue
     }
-    const errs = validateCharter(parsed.charter)
+    const errs = validateCharter(parsed.charter, deps.scenarios)
     if (errs.length === 0) return { charter: parsed.charter, taskSpec: parsed.taskSpec, attempts: attempt }
     lastErrors = errs
   }

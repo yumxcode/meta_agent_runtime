@@ -27,7 +27,9 @@ describe('extraJudgeKeys', () => {
     const charter = charterWithKeys([
       'new_findings_count', 'results_improved', 'coverage_ratio', 'results_improved', 'goal_satisfied',
     ])
-    expect(extraJudgeKeys(charter)).toEqual(['results_improved', 'coverage_ratio'])
+    expect(extraJudgeKeys(charter)).toEqual([
+      'new_findings_count', 'results_improved', 'coverage_ratio',
+    ])
   })
 
   it('uses the frozen obligation graph as the output-contract authority', () => {
@@ -42,7 +44,9 @@ describe('extraJudgeKeys', () => {
     // A post-freeze mutable view cannot silently change the required output;
     // the obligation snapshot remains authoritative.
     frozen.observables = []
-    expect(extraJudgeKeys(frozen)).toEqual(['coverage_ratio'])
+    expect(extraJudgeKeys(frozen)).toEqual([
+      'metric', 'new_findings_count', 'metric_delta', 'coverage_ratio',
+    ])
   })
 })
 
@@ -50,12 +54,12 @@ describe('buildJudgeContract', () => {
   it('without extras: fixed schema only, no charter clause', () => {
     const contract = buildJudgeContract([])
     for (const key of JUDGE_CORE_KEYS) expect(contract).toContain(key)
-    expect(contract).not.toContain('charter 观测字段')
+    expect(contract).not.toContain('Charter/Scenario 输出字段')
   })
 
   it('with extras: demands every charter-declared key on top of the core schema', () => {
     const contract = buildJudgeContract(['results_improved', 'coverage_ratio'])
-    expect(contract).toContain('charter 观测字段')
+    expect(contract).toContain('Charter/Scenario 输出字段')
     expect(contract).toContain('"results_improved"')
     expect(contract).toContain('"coverage_ratio"')
     // Core schema must survive untouched — extras extend it, never replace it.

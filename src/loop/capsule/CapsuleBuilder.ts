@@ -6,34 +6,42 @@
  * inbox, computed by code so it is identical for every seat and replayable.
  * Nothing in here comes from any agent's memory of previous rounds.
  */
-import { readFile, readdir, rename, mkdir } from 'fs/promises'
+import { readFile, readdir, rename, mkdir, stat } from 'fs/promises'
 import { join } from 'path'
 import { atomicWriteJson } from '../../infra/persist/index.js'
 import { renderRoute, type InstancePaths, type RoundMode } from '../types.js'
 import type { Ledger } from '../ledger/LedgerApi.js'
+import type { ScenarioCapsuleView } from '../scenarios/ScenarioPlugin.js'
 
 export interface Capsule {
+  schemaVersion: 2
   builtAt: number
   round: number
   mode: RoundMode
   goal: string
-  meters: Record<string, number>
-  bestMetric: number | null
-  totalFindings: number
-  /** Direction keys already tried (dedup guard for the worker). */
-  directionsTried: string[]
-  /** Last K findings, one-line digests. */
-  recentFindings: string[]
+  progress: {
+    meters: Record<string, number>
+    status: string
+    totalCostUsd: number
+    objective?: { bestValue: number | null }
+  }
   /** Last K round summaries (route + seat summary). */
   recentRounds: string[]
   /** Human/external feedback consumed from the inbox THIS round. */
   inboxMessages: string[]
   /** Pivot declaration from a pivoter seat, when this is a pivot round. */
   pivotDirective?: string
+  scenario: {
+    id: string
+    view: ScenarioCapsuleView
+  }
 }
 
 const MAX_LINE_CHARS = 400
 const MAX_LIST_ITEMS = 8
+const MAX_SCENARIO_DATA_CHARS = 24_000
+const MAX_INBOX_FILES_PER_ROUND = 32
+const MAX_INBOX_FILE_BYTES = 256 * 1024
 
 function digestLine(value: unknown): string {
   const s = typeof value === 'string' ? value : JSON.stringify(value)
@@ -55,6 +63,7 @@ export interface BuildCapsuleInput {
    * inbox files itself, so an aborted/replayed round cannot lose feedback.
    */
   inboxMessages?: string[]
+  scenario?: { id: string; view: ScenarioCapsuleView }
 }
 
 /**
@@ -68,25 +77,53 @@ export async function buildCapsule(input: BuildCapsuleInput): Promise<Capsule> {
   const inboxMessages = input.inboxMessages ?? (await readInbox(input.paths)).messages
 
   const capsule: Capsule = {
+    schemaVersion: 2,
     builtAt: Date.now(),
     round: input.round,
     mode: input.mode,
     goal: input.goal,
-    meters: view.progress.meters,
-    bestMetric: view.progress.bestMetric,
-    totalFindings: view.findingsCount,
-    directionsTried: view.directions
-      .map(d => (typeof d === 'object' && d !== null && 'key' in d ? String((d as { key: unknown }).key) : digestLine(d)))
-      .slice(-MAX_LIST_ITEMS * 4),
-    recentFindings: view.lastFindings.map(digestLine),
+    progress: {
+      meters: view.progress.meters,
+      status: view.progress.status,
+      totalCostUsd: view.progress.totalCostUsd,
+      ...(view.progress.objectiveBestValue !== null
+        ? { objective: { bestValue: view.progress.objectiveBestValue } }
+        : {}),
+    },
     recentRounds: view.lastRounds.map(r =>
       digestLine(`#${r.round} [${r.mode}] route=${renderRoute(r.route)} ${Object.values(r.seatSummaries)[0] ?? ''}`),
     ),
     inboxMessages,
+    scenario: input.scenario ? {
+      id: digestLine(input.scenario.id),
+      view: boundScenarioView(input.scenario.view),
+    } : {
+      id: 'unbound',
+      view: { schemaVersion: 1, data: {}, sections: [] },
+    },
     ...(input.pivotDirective ? { pivotDirective: digestLine(input.pivotDirective) } : {}),
   }
   await atomicWriteJson(input.paths.capsuleJson, capsule)
   return capsule
+}
+
+function boundScenarioView(view: ScenarioCapsuleView): ScenarioCapsuleView {
+  const serialized = JSON.stringify(view.data)
+  const data = serialized.length <= MAX_SCENARIO_DATA_CHARS
+    ? view.data
+    : {
+        truncated: true,
+        originalChars: serialized.length,
+        preview: digestLine(serialized),
+      }
+  return {
+    schemaVersion: Number.isSafeInteger(view.schemaVersion) ? view.schemaVersion : 1,
+    data,
+    sections: view.sections.slice(0, MAX_LIST_ITEMS).map(section => ({
+      title: digestLine(section.title),
+      items: section.items.slice(0, MAX_LIST_ITEMS).map(digestLine),
+    })),
+  }
 }
 
 /** Render the capsule as the prompt preamble seats receive. */
@@ -94,18 +131,20 @@ export function renderCapsule(capsule: Capsule): string {
   const lines = [
     '【本轮胶囊 — 由内核从账本确定性生成】',
     `轮次: ${capsule.round}  模式: ${capsule.mode}`,
-    `计数器: ${JSON.stringify(capsule.meters)}  best_metric: ${capsule.bestMetric ?? 'null'}  累计findings: ${capsule.totalFindings}`,
+    `进度: status=${capsule.progress.status} meters=${JSON.stringify(capsule.progress.meters)} ` +
+      `cost=$${capsule.progress.totalCostUsd.toFixed(2)}` +
+      (capsule.progress.objective ? ` objective_best=${capsule.progress.objective.bestValue}` : ''),
     `目标: ${capsule.goal}`,
+    `场景: ${capsule.scenario.id}`,
   ]
   if (capsule.pivotDirective) lines.push(`【结构性转向指令】${capsule.pivotDirective}`)
   if (capsule.inboxMessages.length) {
     lines.push('【人工/外部反馈（本轮生效）】', ...capsule.inboxMessages.map(m => `- ${m}`))
   }
-  if (capsule.directionsTried.length) {
-    lines.push(`【已试方向（禁止重复）】${capsule.directionsTried.join(' | ')}`)
-  }
-  if (capsule.recentFindings.length) {
-    lines.push('【近期 findings】', ...capsule.recentFindings.map(f => `- ${f}`))
+  for (const section of capsule.scenario.view.sections.slice(0, MAX_LIST_ITEMS)) {
+    const title = digestLine(section.title)
+    const items = section.items.slice(0, MAX_LIST_ITEMS).map(digestLine)
+    if (items.length) lines.push(`【${title}】`, ...items.map(item => `- ${item}`))
   }
   if (capsule.recentRounds.length) {
     lines.push('【近期轮次】', ...capsule.recentRounds.map(r => `- ${r}`))
@@ -129,7 +168,10 @@ export async function readInbox(
 ): Promise<{ messages: string[]; files: string[] }> {
   let entries: string[]
   try {
-    entries = (await readdir(paths.inboxDir)).filter(f => f.endsWith('.json') || f.endsWith('.txt')).sort()
+    entries = (await readdir(paths.inboxDir))
+      .filter(f => f.endsWith('.json') || f.endsWith('.txt'))
+      .sort()
+      .slice(0, MAX_INBOX_FILES_PER_ROUND)
   } catch {
     return { messages: [], files: [] }
   }
@@ -138,6 +180,12 @@ export async function readInbox(
   for (const file of entries) {
     const from = join(paths.inboxDir, file)
     try {
+      const size = (await stat(from)).size
+      if (size > MAX_INBOX_FILE_BYTES) {
+        console.error(`[loop] oversized inbox file ${from} (${size} bytes) — quarantined`)
+        await rename(from, `${from}.oversize`).catch(() => undefined)
+        continue
+      }
       const raw = await readFile(from, 'utf-8')
       if (file.endsWith('.json')) {
         const parsed = JSON.parse(raw) as { message?: unknown }

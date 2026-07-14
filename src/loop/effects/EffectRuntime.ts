@@ -12,6 +12,10 @@ import { evaluateEffectRules, type EffectRuleDecision } from './EffectRules.js'
 import type { FrozenEffectBinding } from '../charter/CharterTypes.js'
 
 const MAX_ADAPTER_RESULT_BYTES = 1_048_576
+// Host admission is durable and polls the filesystem. Keep its safety budget
+// independent from the adapter execution timeout, especially for the
+// best-effort cancellation that runs after an effect deadline.
+const MIN_HOST_ADMISSION_TIMEOUT_MS = 1_000
 
 export interface SubmitEffectInput {
   effectKey: string
@@ -375,31 +379,55 @@ async function adapterCall<T>(
   call: (signal: AbortSignal) => Promise<T>,
   allowPastDeadline = false,
 ): Promise<T> {
-  const controller = new AbortController()
-  const timeoutMs = allowPastDeadline
+  const executionTimeoutMs = allowPastDeadline
     ? Math.max(1, effect.retryPolicy.callTimeoutMs)
     : Math.max(1, Math.min(
         effect.retryPolicy.callTimeoutMs,
         Math.max(1, effect.deadlineAt - Date.now()),
       ))
-  let timer: ReturnType<typeof setTimeout> | undefined
+  const admissionTimeoutMs = allowPastDeadline
+    ? Math.max(MIN_HOST_ADMISSION_TIMEOUT_MS, effect.retryPolicy.callTimeoutMs)
+    : Math.max(1, effect.deadlineAt - Date.now())
+  const admissionController = new AbortController()
+  let admissionTimer: ReturnType<typeof setTimeout> | undefined
   try {
-    const result = await Promise.race([
-      registry.runWithAdmission(
-        effect.adapterId, effect.admission, controller.signal, () => call(controller.signal),
-        {
-          workspaceId: instance.record.workspaceId!,
-          instanceId: instance.record.instanceId,
-        },
-      ),
-      new Promise<never>((_, reject) => {
-        timer = setTimeout(() => {
-          controller.abort(new Error('EffectAdapter call timed out'))
-          reject(new Error(`EffectAdapter '${effect.adapterId}' timed out after ${timeoutMs}ms`))
-        }, timeoutMs)
-        timer.unref?.()
-      }),
-    ])
+    admissionTimer = setTimeout(() => {
+      admissionController.abort(new Error(
+        `EffectAdapter '${effect.adapterId}' admission timed out after ${admissionTimeoutMs}ms`,
+      ))
+    }, admissionTimeoutMs)
+    admissionTimer.unref?.()
+    const result = await registry.runWithAdmission(
+      effect.adapterId,
+      effect.admission,
+      admissionController.signal,
+      async () => {
+        if (admissionTimer) clearTimeout(admissionTimer)
+        admissionTimer = undefined
+        const executionController = new AbortController()
+        let executionTimer: ReturnType<typeof setTimeout> | undefined
+        try {
+          return await Promise.race([
+            call(executionController.signal),
+            new Promise<never>((_, reject) => {
+              executionTimer = setTimeout(() => {
+                executionController.abort(new Error('EffectAdapter call timed out'))
+                reject(new Error(
+                  `EffectAdapter '${effect.adapterId}' timed out after ${executionTimeoutMs}ms`,
+                ))
+              }, executionTimeoutMs)
+              executionTimer.unref?.()
+            }),
+          ])
+        } finally {
+          if (executionTimer) clearTimeout(executionTimer)
+        }
+      },
+      {
+        workspaceId: instance.record.workspaceId!,
+        instanceId: instance.record.instanceId,
+      },
+    )
     const encoded = JSON.stringify(result)
     if (encoded === undefined) throw new Error(`EffectAdapter '${effect.adapterId}' returned a non-JSON value`)
     if (Buffer.byteLength(encoded, 'utf-8') > MAX_ADAPTER_RESULT_BYTES) {
@@ -407,7 +435,7 @@ async function adapterCall<T>(
     }
     return result
   } finally {
-    if (timer) clearTimeout(timer)
+    if (admissionTimer) clearTimeout(admissionTimer)
   }
 }
 

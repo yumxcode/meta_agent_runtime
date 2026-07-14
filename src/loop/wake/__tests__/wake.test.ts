@@ -40,7 +40,7 @@ describe('WakeStore', () => {
     expect(first).toHaveLength(1)
     // Second sweep: loop already has a live claim → nothing claimable.
     expect(await store.claimDue(200)).toHaveLength(0)
-    await store.release(first[0]!.wakeId, 'done')
+    await store.release(first[0]!.wakeId, 'done', { claimToken: first[0]!.claim!.token })
     expect(await store.claimDue(200)).toHaveLength(1)
   })
 
@@ -61,7 +61,7 @@ describe('WakeStore', () => {
     const store = await freshStore(1_000)
     await store.schedule({ loopId: 'L1', kind: 'timer', fireAt: 0 })
     const [claimed] = await store.claimDue(100)
-    await store.heartbeat(claimed!.wakeId, 900)
+    await store.heartbeat(claimed!.wakeId, 900, claimed!.claim!.token)
     expect(await store.reconcileOrphans(1_500)).toHaveLength(0)   // extended to 1900
     expect((await store.reconcileOrphans(2_000)).length).toBe(1)  // expired now
   })
@@ -70,7 +70,7 @@ describe('WakeStore', () => {
     const store = await freshStore()
     await store.schedule({ loopId: 'L1', kind: 'timer', fireAt: 0 })
     const [claimed] = await store.claimDue(100)
-    await store.release(claimed!.wakeId, 'pending')
+    await store.release(claimed!.wakeId, 'pending', { claimToken: claimed!.claim!.token })
     expect((await store.list())[0]!.status).toBe('pending')
     expect(await store.cancelForLoop('L1')).toBe(1)
     expect(await store.claimDue(200)).toHaveLength(0)
@@ -80,7 +80,7 @@ describe('WakeStore', () => {
     const store = await freshStore()
     await store.schedule({ loopId: 'L1', kind: 'timer', fireAt: 0 })
     const [claimed] = await store.claimDue(100)
-    await store.release(claimed!.wakeId, 'done')
+    await store.release(claimed!.wakeId, 'done', { claimToken: claimed!.claim!.token })
     await store.schedule({ loopId: 'L2', kind: 'timer', fireAt: 0 })
     expect(await store.prune(0)).toBe(1)
     expect(await store.list()).toHaveLength(1) // L2 pending survives
@@ -99,5 +99,22 @@ describe('WakeStore', () => {
     const claimedIds = sweeps.flat().map(w => w.wakeId)
     expect(new Set(claimedIds).size).toBe(claimedIds.length) // no duplicates
     expect(claimedIds).toHaveLength(5)                        // and none lost
+  })
+
+  it('fences a stale owner after an expired wake is reclaimed', async () => {
+    const store = await freshStore(1_000)
+    await store.schedule({ loopId: 'L1', kind: 'timer', fireAt: 0 })
+    const [first] = await store.claimDue(100, 'owner-a')
+    await store.reconcileOrphans(2_000)
+    const [second] = await store.claimDue(2_001, 'owner-b')
+    expect(second!.claim!.token).not.toBe(first!.claim!.token)
+    expect(await store.heartbeat(first!.wakeId, 2_100, first!.claim!.token)).toBe(false)
+    expect(await store.release(first!.wakeId, 'done', { claimToken: first!.claim!.token })).toBe(false)
+    await expect(store.cancelForLoop('L1', {
+      wakeId: first!.wakeId, claimToken: first!.claim!.token!,
+    })).rejects.toThrow(/no longer owned/)
+    expect((await store.list())[0]).toMatchObject({
+      status: 'claimed', claim: { owner: 'owner-b', token: second!.claim!.token },
+    })
   })
 })

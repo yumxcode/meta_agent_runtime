@@ -28,8 +28,6 @@ import type { FrozenCharter, SeatSpec } from '../charter/CharterTypes.js'
 import type { InstancePaths } from '../types.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
-import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
-import { DEFAULT_SCENARIO_ID } from '../scenarios/ScenarioDefinitions.js'
 import { CharterEnforcementError, resolveExistingInside, resolveWriteScopeRoot } from '../security/PathSafety.js'
 import { preflightCharterCapabilities } from '../security/CapabilityPreflight.js'
 import { makeVcsPublishTool } from './VcsPublishTool.js'
@@ -73,6 +71,7 @@ export interface SeatRunnerDeps {
   hostCoordinator?: import('../host/HostSchedulerCoordinator.js').HostSchedulerCoordinator
   workspaceIdentity?: WorkspaceIdentity
   loopInstanceId?: string
+  scenarios?: import('../scenarios/ScenarioRegistry.js').ScenarioRegistry
 }
 
 /** seat.context → inner_orch_worker variant (spec D5). Both lineage modes
@@ -117,7 +116,8 @@ export async function runWorkerSeat(
     capsule,
     draftsDir: join(paths.draftsDir),
     preface: correctivePreface,
-    outputContract: scenarioRuntimeFor(charter).producerOutputContract(paths.draftsDir, charter.artifacts),
+    outputContract: (deps.scenarios ?? (await import('../scenarios/BuiltinScenarioPlugins.js')).defaultScenarioRegistry)
+      .runtime(charter.scenario).producerOutputContract(paths.draftsDir, charter.artifacts),
   })
   // lineage → resume a stable per-(instance,worker) session across rounds;
   // isolated → fresh each round. instanceId is the .loop/<id> dir name.
@@ -208,7 +208,7 @@ function pathIsUnder(target: string, root: string): boolean {
  * apart — the kernel is the single authority over the judge's output schema.
  */
 export const JUDGE_CORE_KEYS = [
-  'verdict', 'new_findings_count', 'metric_delta', 'metric', 'goal_satisfied', 'messages',
+  'verdict', 'goal_satisfied', 'messages',
 ] as const
 
 /** Charter-declared judge observable keys OUTSIDE the core set (deduped, in
@@ -222,33 +222,35 @@ export function extraJudgeKeys(charter: FrozenCharter): string[] {
         .filter(obligation => obligation.source === 'judge')
         .map(obligation => obligation.outputKey)
     : charter.observables
-        .filter(observable => observable.source.from === 'judge')
-        .map(observable => observable.source.key)
+        .flatMap(observable => observable.source.from === 'judge' ? [observable.source.key] : [])
   for (const key of judgeKeys) {
     if (!core.has(key) && !extras.includes(key)) {
       extras.push(key)
     }
   }
+  if (charter.metric && !extras.includes('metric')) extras.push('metric')
   return extras
 }
 
-export function buildJudgeContract(extraKeys: string[], perFinding = false): string {
-  const extraClause = extraKeys.length
-    ? `\n【charter 观测字段（同样必须输出）】除上述固定字段外，data 还必须包含：${extraKeys.map(k => `"${k}"`).join('、')}。` +
-      '其语义与取值标准以上方评审指令的定义为准；值只能是 number/boolean/string。' +
+export function buildJudgeContract(
+  extraKeys: string[],
+  extension?: { fields: string[]; instructions: string[] },
+): string {
+  const allExtraKeys = [...new Set([...extraKeys, ...(extension?.fields ?? [])])]
+  const extraClause = allExtraKeys.length
+    ? `\n【Charter/Scenario 输出字段（同样必须输出）】除固定字段外，data 还必须包含：${allExtraKeys.map(k => `"${k}"`).join('、')}。` +
+      '其语义与取值标准以上方 rubric 和 Scenario 协议为准。' +
       '任何一个缺失都会让内核依赖它的规则失效，因此每轮都要输出全部字段。'
     : ''
-  const findingClause = perFinding
-    ? '\n【Research 逐条裁决】data 还必须包含 "accepted_finding_indexes"：本轮 findings_draft 数组中通过全部 rubric 的零基索引数组。不得因一条合格而放行同批不合格 finding；new_findings_count 必须等于该数组长度。'
+  const extensionClause = extension?.instructions.length
+    ? `\n【Scenario 扩展协议】${extension.instructions.join(' ')}`
     : ''
-  const findingField = perFinding ? ',"accepted_finding_indexes":[<zero-based int>,...]' : ''
   return `\
 你是隔离评审座位：你看不到执行座位的任何推理过程，只能依据下方内嵌证据作出裁决。
 必须调用 return_result，data 写：
-{"verdict":"pass"|"fail","new_findings_count":<int>,"metric_delta":<number>,"metric":<number|null>,"goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]${findingField}}${extraClause}
-每个判断都要引用证据；无证据支撑的 finding 一律不计入 new_findings_count。
-metric_delta 的符号与原始指标方向无关：大于 0 永远表示改善，小于 0 表示退化；原始 metric 的最优方向由 charter 定义。
-【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。${findingClause}`
+{"verdict":"pass"|"fail","goal_satisfied":<bool>,"messages":["fail 时必须给出至少一条具体纠偏项"]}${extraClause}
+每个判断都要引用证据。verdict 只表示当前 Gate 是否通过。
+【验收判断（内核据此结束 loop）】goal_satisfied：仅当有证据表明"目标（下方【验收目标】）"已实质达成/成功标准全部满足时才置 true；否则 false。宁可保守——一旦为 true，内核会终止整个 loop。${extensionClause}`
 }
 
 export async function runJudgeSeat(
@@ -275,7 +277,11 @@ export async function runJudgeSeat(
   const task = [
     `【验收目标】${charter.goal}`,
     seat.prompt, gateRubric,
-    buildJudgeContract(extraJudgeKeys(charter), charter.scenario === DEFAULT_SCENARIO_ID),
+    buildJudgeContract(
+      extraJudgeKeys(charter),
+      (deps.scenarios ?? (await import('../scenarios/BuiltinScenarioPlugins.js')).defaultScenarioRegistry)
+        .runtime(charter.scenario).judgeContractExtension?.(charter),
+    ),
     '【证据（内嵌，只此为界）】', evidence,
   ].join('\n\n')
   // No tools: the judge's world is exactly the evidence block above.
@@ -283,8 +289,7 @@ export async function runJudgeSeat(
 }
 
 const PIVOTER_CONTRACT = `\
-你是结构性转向座位。不要做参数微调建议——给出改变结构性约束/研究框架的新方向
-（相反假设 / 换证据源 / 跨域类比 / 改评估指标）。
+你是结构性转向座位。不要只做局部微调——给出改变约束、工作分解、证据来源或验收策略的新方向。
 必须调用 return_result，data 写 {"directive":"<一段结构性转向指令>","key":"<新方向短标识>"}。`
 
 export async function runPivoterSeat(
@@ -307,7 +312,9 @@ const FINALIZER_CONTRACT = `\
 概述：达成了什么、证据何在、未竟之处、值得后续跟进的方向。不要编造证据之外的结论。
 必须调用 return_result，data 写 {"narrative":"<一段 markdown 叙事>"}。`
 
-const FINALIZER_DEFAULT_INPUTS = ['ledger/progress.json', 'ledger/findings.jsonl', 'ledger/directions.json']
+const FINALIZER_DEFAULT_INPUTS = [
+  'ledger/progress.json', 'ledger/rounds.jsonl', 'ledger/artifacts.checkpoint.json',
+]
 
 export async function runFinalizerSeat(
   deps: SeatRunnerDeps,
@@ -346,7 +353,7 @@ async function runSeat(
   budgetOverride?: { usd?: number },
   lineageScope?: { workspaceId: string; instanceId: string },
 ): Promise<SeatResult> {
-  // Per-segment wall-clock: a research submit segment can legitimately need
+  // Per-segment wall-clock: a long-running producer segment can legitimately need
   // >30 min (read + design + implement + submit). Configurable per charter;
   // the long wait BETWEEN segments costs nothing (the process is dead).
   const seatMaxDurationMs = seat.budgetPerRound?.wallclockMin

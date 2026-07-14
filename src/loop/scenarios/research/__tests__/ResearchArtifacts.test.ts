@@ -9,6 +9,7 @@ import {
   commitResearchArtifacts,
   reconcileResearchArtifacts,
 } from '../ResearchArtifacts.js'
+import { researchPaths } from '../ResearchPaths.js'
 
 describe('ResearchArtifacts', () => {
   it('bootstraps legacy history, commits atomically by event, and rebuilds projections', async () => {
@@ -16,8 +17,8 @@ describe('ResearchArtifacts', () => {
     const instance = await createInstance({
       projectDir: dir, charter: walkResearchCharter(), wakeStore: new WakeStore(dir),
     })
-    await instance.ledger.appendJsonl(instance.paths.findingsJsonl, { claim: 'legacy', evidence: 'e0' })
-    await instance.ledger.replaceJson(instance.paths.directionsJson, {
+    await instance.ledger.appendJsonl(researchPaths(instance.paths).findingsJsonl, { claim: 'legacy', evidence: 'e0' })
+    await instance.ledger.replaceJson(researchPaths(instance.paths).directionsJson, {
       directions: [{ key: 'legacy-direction' }],
     })
     await reconcileResearchArtifacts(instance)
@@ -33,33 +34,33 @@ describe('ResearchArtifacts', () => {
     })
     expect(result).toMatchObject({ committed: { finding: 1, direction: 1 }, rejected: 0 })
 
-    const findings = (await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')
+    const findings = (await readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).trim().split('\n')
       .map(line => JSON.parse(line))
     expect(findings.map(finding => finding.claim)).toEqual(['legacy', 'new'])
-    const directions = JSON.parse(await readFile(instance.paths.directionsJson, 'utf-8'))
+    const directions = JSON.parse(await readFile(researchPaths(instance.paths).directionsJson, 'utf-8'))
     expect(directions.directions.map((direction: { key: string }) => direction.key)).toEqual([
       'legacy-direction', 'new-direction',
     ])
-    const projectionIndex = JSON.parse(await readFile(instance.paths.researchProjectionIndexJson, 'utf-8'))
+    const projectionIndex = JSON.parse(await readFile(researchPaths(instance.paths).projectionIndexJson, 'utf-8'))
     expect(projectionIndex).toMatchObject({ lastTransactionId: 'round:1', findingsCount: 2 })
     const events = await instance.ledger.readJsonl<{ type: string }>(instance.paths.artifactsJsonl)
     expect(events.map(event => event.type)).toContain('artifact.transaction_committed')
 
     // Simulate a crash after the authoritative commit but before/between legacy
     // projection writes. RECONCILE must reproduce both files without duplicates.
-    await rm(instance.paths.findingsJsonl, { force: true })
-    await instance.ledger.replaceJson(instance.paths.directionsJson, { directions: [] })
+    await rm(researchPaths(instance.paths).findingsJsonl, { force: true })
+    await instance.ledger.replaceJson(researchPaths(instance.paths).directionsJson, { directions: [] })
     await reconcileResearchArtifacts(instance)
-    expect((await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
-    expect(JSON.parse(await readFile(instance.paths.directionsJson, 'utf-8')).directions).toHaveLength(2)
+    expect((await readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
+    expect(JSON.parse(await readFile(researchPaths(instance.paths).directionsJson, 'utf-8')).directions).toHaveLength(2)
 
     const repeated = await commitResearchArtifacts(instance, {
       round: 1, producerOk: true, judgeRequired: true,
       judge: { ok: true, data: { verdict: 'pass', messages: [] } },
     })
     expect(repeated.committed).toEqual({ finding: 1, direction: 1 })
-    expect((await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
-    expect((await stat(instance.paths.findingsJsonl)).size).toBe(projectionIndex.findingsBytes)
+    expect((await readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
+    expect((await stat(researchPaths(instance.paths).findingsJsonl)).size).toBe(projectionIndex.findingsBytes)
   })
 
   it('can reject findings while committing an independently gated direction', async () => {
@@ -80,8 +81,8 @@ describe('ResearchArtifacts', () => {
       transactionId: 'round:1', committed: { finding: 0, direction: 1 },
       admittedItems: 0, rejected: 1,
     })
-    await expect(readFile(instance.paths.findingsJsonl, 'utf-8')).rejects.toThrow()
-    expect(JSON.parse(await readFile(instance.paths.directionsJson, 'utf-8')).directions).toHaveLength(1)
+    await expect(readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).rejects.toThrow()
+    expect(JSON.parse(await readFile(researchPaths(instance.paths).directionsJson, 'utf-8')).directions).toHaveLength(1)
   })
 
   it('commits only judge-accepted finding indexes from a mixed draft', async () => {
@@ -106,7 +107,7 @@ describe('ResearchArtifacts', () => {
       },
     })
     expect(result).toMatchObject({ committed: { finding: 2 }, admittedItems: 2, rejected: 1 })
-    const findings = (await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')
+    const findings = (await readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).trim().split('\n')
       .map(line => JSON.parse(line) as { claim: string })
     expect(findings.map(finding => finding.claim)).toEqual(['valid', 'also-valid'])
   })
@@ -126,14 +127,14 @@ describe('ResearchArtifacts', () => {
         round, producerOk: true, judgeRequired: true,
         judge: { ok: true, data: { verdict: 'pass', messages: [] } },
       })
-      if (round === 1) firstInode = (await stat(instance.paths.findingsJsonl, { bigint: true })).ino
+      if (round === 1) firstInode = (await stat(researchPaths(instance.paths).findingsJsonl, { bigint: true })).ino
     }
-    expect((await stat(instance.paths.findingsJsonl, { bigint: true })).ino).toBe(firstInode)
-    expect((await readFile(instance.paths.findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
+    expect((await stat(researchPaths(instance.paths).findingsJsonl, { bigint: true })).ino).toBe(firstInode)
+    expect((await readFile(researchPaths(instance.paths).findingsJsonl, 'utf-8')).trim().split('\n')).toHaveLength(2)
 
-    await rm(instance.paths.researchProjectionIndexJson, { force: true })
+    await rm(researchPaths(instance.paths).projectionIndexJson, { force: true })
     await reconcileResearchArtifacts(instance)
-    const rebuilt = JSON.parse(await readFile(instance.paths.researchProjectionIndexJson, 'utf-8'))
+    const rebuilt = JSON.parse(await readFile(researchPaths(instance.paths).projectionIndexJson, 'utf-8'))
     expect(rebuilt).toMatchObject({ lastTransactionId: 'round:2', findingsCount: 2 })
   })
 })

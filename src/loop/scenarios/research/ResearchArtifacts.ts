@@ -17,6 +17,7 @@ import {
 import { refreshArtifactCheckpoint } from '../../projection/ArtifactCheckpoint.js'
 import { readArtifactJournal } from '../../artifacts/ArtifactSegmentStore.js'
 import { findCommittedArtifactTransaction } from '../../artifacts/ArtifactIndexes.js'
+import { researchPaths } from './ResearchPaths.js'
 
 interface ResearchJudgeResult {
   ok: boolean
@@ -129,7 +130,7 @@ export async function runResearchProducerGate(
       await readFile(artifactDraftPath(instance, researchArtifactSpecs(instance).direction), 'utf-8'),
     ) as { key?: unknown }
     if (typeof draft.key !== 'string' || !draft.key) return { verdict: 'pass', messages: [] }
-    const file = await instance.ledger.readJson<{ directions: unknown[] }>(instance.paths.directionsJson)
+    const file = await instance.ledger.readJson<{ directions: unknown[] }>(researchPaths(instance.paths).directionsJson)
     return (file?.directions ?? []).some(direction => directionKey(direction) === draft.key)
       ? {
           verdict: 'fail',
@@ -152,8 +153,8 @@ async function ensureBaseline(
   events: ResearchArtifactEvent[],
 ): Promise<ResearchArtifactEvent[]> {
   if (events.some(event => event.type === 'artifact.baseline')) return events
-  const findings = await instance.ledger.readJsonl(instance.paths.findingsJsonl)
-  const directionsFile = await instance.ledger.readJson<{ directions?: unknown[] }>(instance.paths.directionsJson)
+  const findings = await instance.ledger.readJsonl(researchPaths(instance.paths).findingsJsonl)
+  const directionsFile = await instance.ledger.readJson<{ directions?: unknown[] }>(researchPaths(instance.paths).directionsJson)
   const baseline: ResearchArtifactEvent = {
     type: 'artifact.baseline', findings, directions: directionsFile?.directions ?? [], at: Date.now(),
   }
@@ -271,13 +272,13 @@ async function projectResearchArtifacts(
   const projection = materialize(events)
   if (projection.findings.length > 0) {
     await atomicWriteFile(
-      instance.paths.findingsJsonl,
+      researchPaths(instance.paths).findingsJsonl,
       projection.findings.map(finding => JSON.stringify(finding)).join('\n') + '\n',
     )
   } else {
-    await rm(instance.paths.findingsJsonl, { force: true }).catch(() => undefined)
+    await rm(researchPaths(instance.paths).findingsJsonl, { force: true }).catch(() => undefined)
   }
-  await atomicWriteJson(instance.paths.directionsJson, { directions: projection.directions })
+  await atomicWriteJson(researchPaths(instance.paths).directionsJson, { directions: projection.directions })
   await writeProjectionIndex(instance, {
     schemaVersion: '1.0',
     authorityEventCount,
@@ -286,7 +287,7 @@ async function projectResearchArtifacts(
       ? summarize(lastCommittedEvent(events)!.transactionId, lastCommittedEvent(events)!.decisions)
       : undefined,
     findingsCount: projection.findings.length,
-    findingsBytes: await fileBytes(instance.paths.findingsJsonl),
+    findingsBytes: await fileBytes(researchPaths(instance.paths).findingsJsonl),
     directions: projection.directions,
     directionsHash: hashArtifactContent(projection.directions),
     updatedAt: Date.now(),
@@ -303,7 +304,7 @@ async function appendResearchProjectionDelta(
   const findings = decisions.filter(decision =>
     decision.verdict === 'committed' && decision.proposal.artifactId === 'finding')
   for (const decision of findings) {
-    await instance.ledger.appendJsonl(instance.paths.findingsJsonl, decision.proposal.content)
+    await instance.ledger.appendJsonl(researchPaths(instance.paths).findingsJsonl, decision.proposal.content)
   }
   const directions = [...previous.directions]
   for (const decision of decisions) {
@@ -313,12 +314,12 @@ async function appendResearchProjectionDelta(
       directions.push(decision.proposal.content)
     }
   }
-  await atomicWriteJson(instance.paths.directionsJson, { directions })
+  await atomicWriteJson(researchPaths(instance.paths).directionsJson, { directions })
   await writeProjectionIndex(instance, {
     schemaVersion: '1.0', authorityEventCount,
     lastTransactionId: summary.transactionId, lastSummary: summary,
     findingsCount: previous.findingsCount + findings.length,
-    findingsBytes: await fileBytes(instance.paths.findingsJsonl),
+    findingsBytes: await fileBytes(researchPaths(instance.paths).findingsJsonl),
     directions,
     directionsHash: hashArtifactContent(directions),
     updatedAt: Date.now(),
@@ -329,12 +330,12 @@ async function readUsableProjectionIndex(
   instance: LoopInstance,
   authorityEventCount: number,
 ): Promise<ResearchProjectionIndex | null> {
-  const index = await instance.ledger.readJson<ResearchProjectionIndex>(instance.paths.researchProjectionIndexJson)
+  const index = await instance.ledger.readJson<ResearchProjectionIndex>(researchPaths(instance.paths).projectionIndexJson)
   if (!index || index.schemaVersion !== '1.0' || index.authorityEventCount !== authorityEventCount ||
       !Number.isInteger(index.findingsCount) || index.findingsCount < 0 ||
       !Array.isArray(index.directions) || index.directionsHash !== hashArtifactContent(index.directions)) return null
-  if (await fileBytes(instance.paths.findingsJsonl) !== index.findingsBytes) return null
-  const file = await instance.ledger.readJson<{ directions?: unknown[] }>(instance.paths.directionsJson)
+  if (await fileBytes(researchPaths(instance.paths).findingsJsonl) !== index.findingsBytes) return null
+  const file = await instance.ledger.readJson<{ directions?: unknown[] }>(researchPaths(instance.paths).directionsJson)
   if (hashArtifactContent(file?.directions ?? []) !== index.directionsHash) return null
   return index
 }
@@ -343,7 +344,7 @@ async function writeProjectionIndex(
   instance: LoopInstance,
   index: ResearchProjectionIndex,
 ): Promise<void> {
-  await atomicWriteJson(instance.paths.researchProjectionIndexJson, index)
+  await atomicWriteJson(researchPaths(instance.paths).projectionIndexJson, index)
 }
 
 async function fileBytes(path: string): Promise<number> {

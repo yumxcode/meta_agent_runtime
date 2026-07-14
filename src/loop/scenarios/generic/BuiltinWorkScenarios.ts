@@ -16,6 +16,18 @@ export const releaseScenarioRuntime = createGenericScenarioRuntime({
   outputInstructions: [
     'Release manifest 使用 replace 语义，release note 使用按内容去重的 versioned 语义。',
   ],
+  buildCapsuleView: async (_instance, checkpoint) => {
+    const manifest = checkpoint.views['artifact-release_manifest']?.items.at(-1)?.content ?? null
+    const notes = checkpoint.views['artifact-release_note']?.items.map(item => String(item.content)) ?? []
+    return {
+      schemaVersion: 1,
+      data: { currentManifest: asJson(manifest), recentReleaseNotes: notes },
+      sections: [
+        { title: 'Current release manifest', items: manifest === null ? [] : [JSON.stringify(manifest)] },
+        { title: 'Recent release notes', items: notes },
+      ],
+    }
+  },
 })
 
 export const complianceScenarioRuntime = createGenericScenarioRuntime({
@@ -24,6 +36,23 @@ export const complianceScenarioRuntime = createGenericScenarioRuntime({
     'Compliance bundle 必须经过人工批准：写好草稿后以 label:"wait" 返回；',
     'runtime 会根据草稿 hash 生成审批 effectKey，禁止自行决定或伪造批准结果。',
   ],
+  buildCapsuleView: async (instance, checkpoint) => {
+    const bundle = checkpoint.views['artifact-compliance_bundle']?.items.at(-1)
+    const pending = await readPendingRound(instance)
+    const effect = pending?.effectKey ? await effectLedgerFor(instance).get(pending.effectKey) : null
+    return {
+      schemaVersion: 1,
+      data: {
+        bundleHash: bundle?.contentHash ?? null,
+        approvalStatus: effect?.status ?? 'not_requested',
+        approvalVerdict: effect?.outcome?.verdict ?? null,
+      },
+      sections: [{
+        title: 'Compliance approval',
+        items: [`status=${effect?.status ?? 'not_requested'} verdict=${effect?.outcome?.verdict ?? 'none'}`],
+      }],
+    }
+  },
   prepareEventWait: async (instance, input) => {
     const draft = await complianceDraft(instance)
     if (!draft.present || draft.error) {
@@ -61,6 +90,11 @@ export const complianceScenarioRuntime = createGenericScenarioRuntime({
     } satisfies ArtifactGateResult
   },
 })
+
+function asJson(value: unknown): import('../ScenarioPlugin.js').ScenarioJson {
+  if (value === undefined) return null
+  return JSON.parse(JSON.stringify(value)) as import('../ScenarioPlugin.js').ScenarioJson
+}
 
 async function complianceDraft(instance: LoopInstance) {
   const drafts = await readGenericDrafts(instance)

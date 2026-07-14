@@ -39,9 +39,14 @@ function capturing(): ISubAgentDispatcher & { configs: SubAgentConfig[] } {
 }
 
 const capsule: Capsule = {
+  schemaVersion: 2,
   builtAt: Date.now(), round: 1, mode: 'normal', goal: 'g',
-  meters: { iteration: 1 }, bestMetric: null, totalFindings: 0,
-  directionsTried: [], recentFindings: [], recentRounds: [], inboxMessages: [],
+  progress: { meters: { iteration: 1 }, status: 'healthy', totalCostUsd: 0 },
+  scenario: {
+    id: 'builtin/research@1',
+    view: { schemaVersion: 1, data: {}, sections: [] },
+  },
+  recentRounds: [], inboxMessages: [],
 }
 
 async function runWith(context: SeatContext): Promise<SubAgentConfig> {

@@ -89,7 +89,7 @@ export type ProgressStatus = 'healthy' | 'stale' | 'pivot_scheduled' | 'paused_a
  * until a resume. Single source of truth for runner/daemon guards.
  */
 export const HALTED_STATUSES: ReadonlySet<string> = new Set([
-  'done', 'failed', 'paused_attention', 'paused_manual',
+  'done', 'failed', 'paused_attention', 'paused_manual', 'migrating',
 ])
 
 export type LoopInstanceStatus =
@@ -98,6 +98,7 @@ export type LoopInstanceStatus =
   | 'waiting'           // external effect pending (M2)
   | 'paused_attention'  // escalated, needs human ack (resume = light ack, or migrate)
   | 'paused_manual'     // human ran `loop pause`; resume restores idle|waiting
+  | 'migrating'         // durable charter/progress swap in progress; recovery owns it
   | 'done'
   | 'failed'
 
@@ -141,6 +142,10 @@ export interface RoundEntry {
   correctiveRetries: number
   costUsd: number
   seatSummaries: Record<string, string>
+  /** Inbox files whose contents were incorporated into this committed round.
+   * RECONCILE archives these names after a crash between ledger commit and
+   * inbox rename, preventing the next round from consuming them again. */
+  consumedInboxFiles?: string[]
   startedAt: number
   finishedAt: number
   /** Kernel-detected anomalies this round (e.g. a declared observable the judge
@@ -149,12 +154,12 @@ export interface RoundEntry {
   /** Authoritative state after this round committed. progress.json is a
    * rebuildable cache of this append-only payload. */
   postState?: {
+    schemaVersion: 4
     iteration: number
     meters: Record<string, number>
     status: ProgressStatus
     nextRoundMode?: 'pivot'
-    bestMetric: number | null
-    totalFindings: number
+    objectiveBestValue: number | null
     totalCostUsd: number
   }
 }
@@ -167,12 +172,13 @@ export interface InstancePaths {
   frozenCharter: string
   ledgerDir: string
   roundsJsonl: string
-  findingsJsonl: string
-  directionsJson: string
   progressJson: string
   effectsJsonl: string
   /** Append-only authority for Artifact proposal/gate/commit transactions. */
   artifactsJsonl: string
+  /** Per-transaction obligation failures, persisted so a replay after a crash
+   * between Artifact commit and Round append re-routes identically. */
+  artifactsObligationsJsonl: string
   /** Immutable, hash-chained Artifact journal segments. */
   artifactsSegmentsDir: string
   artifactsSegmentPagesDir: string
@@ -181,12 +187,12 @@ export interface InstancePaths {
   /** Rebuildable exact indexes; sharded so checkpoint memory stays bounded. */
   artifactsTransactionIndexDir: string
   artifactsStreamIndexDir: string
-  /** Research legacy-projection watermark; the Artifact journal remains authority. */
-  researchProjectionIndexJson: string
   /** Append-only audit of manual lifecycle interventions (pause/resume/ack/stop). */
   lifecycleJsonl: string
   /** Persisted mid-round state while an external effect is pending (M2). */
   pendingRoundJson: string
+  /** Crash-recovery marker for an in-progress charter migration. */
+  migrationPendingJson: string
   draftsDir: string
   /** Worker-owned ephemeral files. Unlike drafts, never committed as Artifacts. */
   scratchDir: string
@@ -209,20 +215,19 @@ export function instancePaths(taskDir: string, instanceId: LoopInstanceId): Inst
     frozenCharter: join(root, 'charter.frozen.json'),
     ledgerDir,
     roundsJsonl: join(ledgerDir, 'rounds.jsonl'),
-    findingsJsonl: join(ledgerDir, 'findings.jsonl'),
-    directionsJson: join(ledgerDir, 'directions.json'),
     progressJson: join(ledgerDir, 'progress.json'),
     effectsJsonl: join(ledgerDir, 'effects.jsonl'),
     artifactsJsonl: join(ledgerDir, 'artifacts.jsonl'),
+    artifactsObligationsJsonl: join(ledgerDir, 'artifacts.obligations.jsonl'),
     artifactsSegmentsDir: join(ledgerDir, 'artifacts.segments'),
     artifactsSegmentPagesDir: join(ledgerDir, 'artifacts.segment-pages'),
     artifactsSegmentsManifestJson: join(ledgerDir, 'artifacts.segments.json'),
     artifactsCheckpointJson: join(ledgerDir, 'artifacts.checkpoint.json'),
     artifactsTransactionIndexDir: join(ledgerDir, 'artifacts.index', 'transactions'),
     artifactsStreamIndexDir: join(ledgerDir, 'artifacts.index', 'streams'),
-    researchProjectionIndexJson: join(ledgerDir, 'research.projection.json'),
     lifecycleJsonl: join(ledgerDir, 'lifecycle.jsonl'),
     pendingRoundJson: join(ledgerDir, 'pending_round.json'),
+    migrationPendingJson: join(ledgerDir, 'migration.pending.json'),
     draftsDir: join(root, 'drafts'),
     scratchDir: join(root, 'scratch'),
     inboxDir: join(root, 'inbox'),
@@ -264,5 +269,7 @@ export interface PendingRound {
   correctiveRetries: number
   /** Submit-segment worker summary — the lineage digest the harvest carries. */
   submitSummary: string
+  /** Inbox files already incorporated into the durable submit segment. */
+  consumedInboxFiles?: string[]
   createdAt: number
 }

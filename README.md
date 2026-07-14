@@ -198,6 +198,10 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 跨阶段、多 Agent 的长周期任务使用 `meta-agent loop create|tick|list|inspect|pause|resume|inbox|distill`，而不是会话模式。Loop 把 charter、round ledger、预算和 daemon 调度放在会话之上；座位仍使用 `auto` / `simple_auto` / `agentic` 等会话档位执行。设计与命令详情见 [`docs/auto-orch-v2-spec.md`](docs/auto-orch-v2-spec.md)。
 
+当前架构是**通用 Loop Kernel + 可插拔 Scenario**，内置 Research、Generic、Release、Compliance，并支持显式加载后续 Scenario 插件。机制、可靠性边界、并发模型、完整命令和排障方式见 [通用长周期 Loop 机制与使用指南](docs/loop-runtime-guide.md)；扩展 ABI 见 [Scenario 插件指南](docs/scenario-plugins.md)。
+
+Loop 下一代重构目标是“Kernel 可靠执行 Distill 生成的任意受约束图节点和边”。其中 Graph Node 只表达控制语义，多个强相关节点由同一个持久 Execution Lane/LLM session 执行，底层模式继续负责上下文压缩；完整方案见 [Durable Graph Loop Runtime 重构方案](docs/loop-durable-graph-runtime-plan.md)。
+
 ---
 
 ## 子代理与并发

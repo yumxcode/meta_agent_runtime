@@ -9,6 +9,8 @@ import { relativePathError, writeScopeRoot } from '../security/PathSafety.js'
 import { PRODUCER_OK_OBSERVABLE } from './CharterTypes.js'
 import { buildExecutionPlan, validateExecutionPlan } from './ExecutionPlan.js'
 import { DEFAULT_SCENARIO_ID, scenarioDefinition } from '../scenarios/ScenarioDefinitions.js'
+import type { ScenarioRegistry } from '../scenarios/ScenarioRegistry.js'
+import type { ScenarioDefinition } from '../scenarios/ScenarioPlugin.js'
 import { freezeEffectBindings, validateEffectBindings } from '../effects/EffectRules.js'
 import type {
   ArtifactSpec,
@@ -93,7 +95,7 @@ export function normalizeCharter<T extends Charter>(charter: T): T {
   }
 }
 
-export function validateCharter(rawCharter: Charter): string[] {
+export function validateCharter(rawCharter: Charter, scenarios?: ScenarioRegistry): string[] {
   const errs: string[] = []
   if (!rawCharter || typeof rawCharter !== 'object') return ['charter must be an object']
   const normalized = normalizeCharter(rawCharter)
@@ -124,9 +126,13 @@ export function validateCharter(rawCharter: Charter): string[] {
       : undefined,
   }
   const scenarioId = safeNormalized.scenario ?? DEFAULT_SCENARIO_ID
-  const definition = scenarioDefinition(scenarioId)
+  const definition = resolveScenarioDefinition(scenarioId, scenarios)
   if (!definition) errs.push(`scenario '${scenarioId}' is not registered`)
-  const executionPlan = buildExecutionPlan({ ...safeNormalized, scenario: scenarioId })
+  if (definition?.validateConfig) {
+    errs.push(...definition.validateConfig(safeNormalized.scenarioConfig)
+      .map(error => `scenarioConfig: ${error}`))
+  }
+  const executionPlan = buildExecutionPlan({ ...safeNormalized, scenario: scenarioId }, definition)
   const charter: Charter = {
     ...safeNormalized,
     scenario: scenarioId,
@@ -134,6 +140,9 @@ export function validateCharter(rawCharter: Charter): string[] {
     gateBindings: executionPlan.gates,
   }
   charter.projections = safeNormalized.projections ?? defaultProjectionBindings(charter)
+  if (Object.keys(charter.artifacts ?? {}).length > 64) {
+    errs.push('a charter may declare at most 64 Artifacts')
+  }
   if (!charter.id || !ID_RE.test(charter.id)) errs.push('charter.id must match [a-z][a-z0-9_-]*')
   if (!Number.isInteger(charter.version) || charter.version < 1) errs.push('charter.version must be a positive integer')
   if (!charter.goal?.trim()) errs.push('charter.goal is required')
@@ -160,17 +169,24 @@ export function validateCharter(rawCharter: Charter): string[] {
     const src = o.source as { from?: unknown; key?: unknown } | undefined
     if (!src || typeof src.from !== 'string') {
       errs.push(`observable[${o.name}] needs a source with a 'from'`)
-    } else if (src.from !== 'judge') {
-      errs.push(
-        `observable[${o.name}].source.from must be 'judge' — the only source the kernel resolves ` +
-        `(got '${src.from}'). Do NOT observe the worker: a failed worker round already increments ` +
-        `stale_count, so route worker errors via a stale_count tripwire (pivot/attention).`,
-      )
-    } else if (typeof src.key !== 'string' || !src.key.trim()) {
+    } else if (src.from === 'judge' && (typeof src.key !== 'string' || !src.key.trim())) {
       errs.push(`observable[${o.name}].source needs a non-empty 'key' (the judge return_result data field)`)
+    } else if (src.from === 'projection') {
+      const projection = src as unknown as { id?: unknown; pointer?: unknown }
+      if (typeof projection.id !== 'string' || !projection.id.trim()) {
+        errs.push(`observable[${o.name}].source needs a projection 'id'`)
+      } else if (!charter.projections?.some(binding => binding.id === projection.id)) {
+        errs.push(`observable[${o.name}].source references unknown projection '${String(projection.id)}'`)
+      }
+      if (typeof projection.pointer !== 'string' ||
+          (projection.pointer !== '' && !projection.pointer.startsWith('/'))) {
+        errs.push(`observable[${o.name}].source.pointer must be an RFC 6901 JSON Pointer`)
+      }
+    } else if (src.from !== 'judge') {
+      errs.push(`observable[${o.name}].source.from must be 'judge' | 'projection' (got '${src.from}')`)
     }
   }
-  if ((charter.observables?.length ?? 0) > 0 && !charter.seats?.judge) {
+  if (charter.observables?.some(observable => observable.source.from === 'judge') && !charter.seats?.judge) {
     errs.push("judge-sourced observables require seats.judge — otherwise they can never be populated")
   }
   const meterNames = new Set<string>()
@@ -568,15 +584,15 @@ function validateObjectivePolicies(
 /** Parse every expression and attach ASTs — the instantiation-time freeze (D9).
  * Pre-v3 tripwire actions are migrated here, so a frozen charter always carries
  * the v3 discriminated union (the kernel never sees the legacy shape). */
-export function freezeCharter(rawCharter: Charter): FrozenCharter {
-  const errs = validateCharter(rawCharter)
+export function freezeCharter(rawCharter: Charter, scenarios?: ScenarioRegistry): FrozenCharter {
+  const errs = validateCharter(rawCharter, scenarios)
   if (errs.length > 0) {
     throw new Error(`charter failed validation:\n- ${errs.join('\n- ')}`)
   }
   const normalized = normalizeCharter(rawCharter)
   const scenario = normalized.scenario ?? DEFAULT_SCENARIO_ID
-  const definition = scenarioDefinition(scenario)!
-  const initialPlan = buildExecutionPlan({ ...normalized, scenario })
+  const definition = resolveScenarioDefinition(scenario, scenarios)!
+  const initialPlan = buildExecutionPlan({ ...normalized, scenario }, definition)
   const baseArtifacts = normalized.artifacts ?? definition.artifacts(normalized)
   const charter: Charter & Required<Pick<Charter, 'scenario' | 'artifacts' | 'gateBindings' | 'projections' | 'effects'>> = {
     ...normalized,
@@ -587,6 +603,7 @@ export function freezeCharter(rawCharter: Charter): FrozenCharter {
       ...normalized, scenario, artifacts: baseArtifacts,
     }),
     effects: normalized.effects ?? {},
+    metric: normalized.metric ?? definition.defaultMetric,
   }
   const declared = new Set<string>(['budget.lifetime.exhausted'])
   for (const o of charter.observables) declared.add(o.name)
@@ -613,7 +630,7 @@ export function freezeCharter(rawCharter: Charter): FrozenCharter {
     tripwireAsts,
     healthAst,
   )
-  const executionPlan = buildExecutionPlan(charter)
+  const executionPlan = buildExecutionPlan(charter, definition)
   const executionPlanErrors = validateExecutionPlan(executionPlan)
   if (executionPlanErrors.length > 0) {
     throw new Error(`execution plan failed validation:\n- ${executionPlanErrors.join('\n- ')}`)
@@ -622,6 +639,7 @@ export function freezeCharter(rawCharter: Charter): FrozenCharter {
     ...charter,
     effects: freezeEffectBindings(charter.effects),
     frozen: {
+      scenarioPlugin: scenarios?.reference(scenario) ?? builtinScenarioReference(scenario),
       meterAsts,
       tripwireAsts,
       ...(healthAst ? { healthAst } : {}),
@@ -640,12 +658,15 @@ export function freezeCharter(rawCharter: Charter): FrozenCharter {
  * meaning, while pre-G0 snapshots receive the same AST compatibility rewrite
  * in memory when resumed.
  */
-export function normalizeFrozenCharterForRuntime(raw: FrozenCharter): FrozenCharter {
+export function normalizeFrozenCharterForRuntime(
+  raw: FrozenCharter,
+  scenarios?: ScenarioRegistry,
+): FrozenCharter {
   const normalized = normalizeCharter(raw)
   const scenario = normalized.scenario ?? DEFAULT_SCENARIO_ID
-  const definition = scenarioDefinition(scenario)
+  const definition = resolveScenarioDefinition(scenario, scenarios)
   if (!definition) throw new Error(`frozen charter references unregistered scenario '${scenario}'`)
-  const initialPlan = buildExecutionPlan({ ...normalized, scenario })
+  const initialPlan = buildExecutionPlan({ ...normalized, scenario }, definition)
   const charter: FrozenCharter = {
     ...normalized,
     scenario,
@@ -660,6 +681,7 @@ export function normalizeFrozenCharterForRuntime(raw: FrozenCharter): FrozenChar
       id,
       'frozen' in binding ? binding : freezeEffectBindings({ [id]: binding })[id]!,
     ])),
+    metric: normalized.metric ?? definition.defaultMetric,
   }
   const judgeObservables = new Set(
     charter.observables
@@ -683,11 +705,13 @@ export function normalizeFrozenCharterForRuntime(raw: FrozenCharter): FrozenChar
     charter.frozen.tripwireAsts,
     charter.frozen.healthAst,
   )
-  const executionPlan = buildExecutionPlan(charter)
+  const executionPlan = buildExecutionPlan(charter, definition)
   return {
     ...charter,
     frozen: {
       ...charter.frozen,
+      scenarioPlugin: charter.frozen.scenarioPlugin ??
+        scenarios?.reference(scenario) ?? builtinScenarioReference(scenario),
       meterAsts,
       observableObligations,
       executionPlan,
@@ -698,18 +722,26 @@ export function normalizeFrozenCharterForRuntime(raw: FrozenCharter): FrozenChar
   }
 }
 
+function resolveScenarioDefinition(
+  id: string,
+  scenarios?: ScenarioRegistry,
+): ScenarioDefinition | undefined {
+  return scenarios?.definition(id) ?? scenarioDefinition(id)
+}
+
+function builtinScenarioReference(id: string): import('../scenarios/ScenarioPlugin.js').FrozenScenarioPluginRef {
+  return { id, apiVersion: 1, version: '1.0.0', integrity: `builtin:${id}:1` }
+}
+
 function defaultProjectionBindings(charter: Charter): ProjectionBinding[] {
-  if (charter.scenario === DEFAULT_SCENARIO_ID) return []
   return Object.values(charter.artifacts ?? {})
     .filter((artifact): artifact is ArtifactSpec => !!artifact && typeof artifact === 'object')
     .map(artifact => ({
     id: `artifact-${artifact.id}`,
     source: { kind: 'artifact_stream' as const, stream: artifact.stream },
     reducer: 'builtin/artifact-view@1' as const,
-    mode: artifact.commitMode === 'replace' || artifact.commitMode === 'versioned'
-      ? 'latest' as const
-      : 'window' as const,
-    ...(artifact.commitMode === 'append' ? { maxItems: 100 } : {}),
+    mode: artifact.commitMode === 'replace' ? 'latest' as const : 'window' as const,
+    ...(artifact.commitMode !== 'replace' ? { maxItems: 100 } : {}),
     }))
 }
 
@@ -864,6 +896,17 @@ function validateArtifactSpec(
   if (!['append', 'replace', 'versioned'].includes(artifact.commitMode)) {
     errs.push(`${at}.commitMode is unsupported`)
   }
+  if (artifact.draft) {
+    if (!['one', 'many'].includes(artifact.draft.cardinality)) {
+      errs.push(`${at}.draft.cardinality must be 'one' | 'many'`)
+    }
+    if (!['each_round', 'on_finalize', 'optional'].includes(artifact.draft.requirement)) {
+      errs.push(`${at}.draft.requirement must be 'each_round' | 'on_finalize' | 'optional'`)
+    }
+    if (artifact.draft.cardinality === 'many' && artifact.kind !== 'json') {
+      errs.push(`${at}.draft.cardinality 'many' requires kind 'json'`)
+    }
+  }
   const seen = new Set<string>()
   for (const gateId of artifact.requiredGates ?? []) {
     if (seen.has(gateId)) errs.push(`${at}.requiredGates contains duplicate '${gateId}'`)
@@ -891,16 +934,20 @@ function buildObservableObligations(
       outputKey: PRODUCER_OK_OBSERVABLE,
       consumers: [],
     },
-    '@objective.metric': {
-      source: 'judge',
-      outputKey: 'metric',
-      consumers: [{ kind: 'objective', id: 'metric', field: 'source' }],
-    },
+    ...(charter.metric ? {
+      '@objective.metric': {
+        source: 'judge' as const,
+        outputKey: 'metric',
+        consumers: [{ kind: 'objective' as const, id: 'metric', field: 'source' }],
+      },
+    } : {}),
   }
   for (const observable of charter.observables) {
     obligations[observable.name] = {
-      source: 'judge',
-      outputKey: observable.source.key,
+      source: observable.source.from,
+      outputKey: observable.source.from === 'judge'
+        ? observable.source.key
+        : `${observable.source.id}${observable.source.pointer}`,
       consumers: [],
     }
   }

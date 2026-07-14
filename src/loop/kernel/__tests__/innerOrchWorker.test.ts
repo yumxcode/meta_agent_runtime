@@ -16,9 +16,22 @@ import type { Capsule } from '../../capsule/CapsuleBuilder.js'
 const projectDir = mkdtempSync(join(tmpdir(), 'inner-worker-'))
 
 const capsule: Capsule = {
+  schemaVersion: 2,
   builtAt: Date.now(), round: 3, mode: 'normal', goal: 'improve gait stability',
-  meters: { iteration: 3, stale_count: 1 }, bestMetric: 0.62, totalFindings: 4,
-  directionsTried: ['reward-shaping', 'curriculum'], recentFindings: ['plateau at 0.62'],
+  progress: {
+    meters: { iteration: 3, stale_count: 1 }, status: 'healthy', totalCostUsd: 1,
+    objective: { bestValue: 0.62 },
+  },
+  scenario: {
+    id: 'builtin/research@1',
+    view: {
+      schemaVersion: 1, data: { totalFindings: 4 },
+      sections: [
+        { title: 'directions', items: ['reward-shaping', 'curriculum'] },
+        { title: 'findings', items: ['plateau at 0.62'] },
+      ],
+    },
+  },
   recentRounds: ['#2 [normal] route=continue'], inboxMessages: [],
 }
 
@@ -60,9 +73,10 @@ describe('inner_orch_worker user message', () => {
     expect(msg).toContain('improve gait stability')  // capsule goal
     expect(msg).toContain('\n---\n')                 // context / instruction boundary
     expect(msg).toContain('【收割段】结果已就绪')      // harvest preface
-    // Output contract carries ABSOLUTE draft paths (not relative "drafts/…").
-    expect(msg).toContain('/tmp/x/drafts/direction.json')
-    expect(msg).toContain('/tmp/x/drafts/findings_draft.json')
+    // Generic fallback names only the absolute draft root; production seats
+    // inject their Scenario-owned Artifact contract explicitly.
+    expect(msg).toContain('draft root: /tmp/x/drafts')
+    expect(msg).not.toContain('findings_draft')
     expect(msg).toContain('产出契约')
   })
 })

@@ -1,31 +1,25 @@
 import type { ArtifactSpec, Charter, FrozenGateBinding } from '../charter/CharterTypes.js'
+import type { ScenarioDefinition } from './ScenarioPlugin.js'
 
 export const DEFAULT_SCENARIO_ID = 'builtin/research@1'
 export const GENERIC_SCENARIO_ID = 'builtin/generic@1'
 export const RELEASE_SCENARIO_ID = 'builtin/release@1'
 export const COMPLIANCE_SCENARIO_ID = 'builtin/compliance@1'
 
-export interface ScenarioDefinition {
-  id: string
-  artifacts(charter: Charter): Record<string, ArtifactSpec>
-  /** Gate verdicts this Scenario can attach to an Artifact decision. */
-  artifactGateIds: readonly string[]
-  mandatoryArtifactGateIds: readonly string[]
-  allowAdditionalArtifacts: boolean
-  gateBindings: FrozenGateBinding[]
-}
-
-const research: ScenarioDefinition = {
+export const researchScenarioDefinition: ScenarioDefinition = {
   id: DEFAULT_SCENARIO_ID,
+  defaultMetric: { direction: 'max' },
   artifacts: charter => ({
     finding: {
       id: 'finding', kind: 'json', draftPath: 'drafts/findings_draft.json',
       stream: 'findings', commitMode: 'append',
+      draft: { cardinality: 'many', requirement: 'optional' },
       requiredGates: charter.seats?.judge ? ['producer', 'judge'] : ['producer'],
     },
     direction: {
       id: 'direction', kind: 'json', draftPath: 'drafts/direction.json',
       stream: 'directions', commitMode: 'versioned',
+      draft: { cardinality: 'one', requirement: 'optional' },
       requiredGates: ['producer', 'direction_diversity'],
     },
   }),
@@ -38,7 +32,7 @@ const research: ScenarioDefinition = {
   }],
 }
 
-const generic: ScenarioDefinition = {
+export const genericScenarioDefinition: ScenarioDefinition = {
   id: GENERIC_SCENARIO_ID,
   artifacts: () => ({}),
   artifactGateIds: ['producer', 'artifact_drafts'],
@@ -50,17 +44,19 @@ const generic: ScenarioDefinition = {
   }],
 }
 
-const release: ScenarioDefinition = {
+export const releaseScenarioDefinition: ScenarioDefinition = {
   id: RELEASE_SCENARIO_ID,
   artifacts: () => ({
     release_manifest: {
       id: 'release_manifest', kind: 'json', draftPath: 'drafts/release_manifest.json',
       stream: 'release_manifest', commitMode: 'replace',
+      draft: { cardinality: 'one', requirement: 'each_round' },
       requiredGates: ['producer', 'artifact_drafts'],
     },
     release_note: {
       id: 'release_note', kind: 'text', draftPath: 'drafts/release_note.md',
       stream: 'release_notes', commitMode: 'versioned',
+      draft: { cardinality: 'one', requirement: 'each_round' },
       requiredGates: ['producer', 'artifact_drafts'],
     },
   }),
@@ -73,12 +69,13 @@ const release: ScenarioDefinition = {
   }],
 }
 
-const compliance: ScenarioDefinition = {
+export const complianceScenarioDefinition: ScenarioDefinition = {
   id: COMPLIANCE_SCENARIO_ID,
   artifacts: () => ({
     compliance_bundle: {
       id: 'compliance_bundle', kind: 'json', draftPath: 'drafts/compliance_bundle.json',
       stream: 'compliance_bundles', commitMode: 'versioned',
+      draft: { cardinality: 'one', requirement: 'each_round' },
       requiredGates: ['producer', 'artifact_drafts', 'human_approval'],
     },
   }),
@@ -97,7 +94,12 @@ const compliance: ScenarioDefinition = {
   ],
 }
 
-const DEFINITIONS = new Map([research, generic, release, compliance]
+const DEFINITIONS = new Map([
+  researchScenarioDefinition,
+  genericScenarioDefinition,
+  releaseScenarioDefinition,
+  complianceScenarioDefinition,
+]
   .map(definition => [definition.id, definition]))
 
 export function scenarioDefinition(id: string): ScenarioDefinition | undefined {

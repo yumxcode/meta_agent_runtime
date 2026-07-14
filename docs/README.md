@@ -3,6 +3,9 @@
 ## Current References
 
 - [Architecture overview](architecture/meta-agent-architecture.md)
+- [Generic long-running Loop mechanism and usage](loop-runtime-guide.md)
+- [Durable Graph Loop Runtime redesign plan](loop-durable-graph-runtime-plan.md)
+- [Loop Scenario plugin ABI](scenario-plugins.md)
 - [Permissions](permissions.md)
 - [Workflow system design](workflow-system-design.md)
 

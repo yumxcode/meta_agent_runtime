@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, readFile } from 'fs/promises'
+import { mkdir, mkdtemp, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { instancePaths, type RoundEntry } from '../../types.js'
@@ -16,8 +16,9 @@ const round = (n: number): RoundEntry => ({
   route: { kind: 'continue' }, correctiveRetries: 0, costUsd: 0.5,
   seatSummaries: {}, startedAt: 1, finishedAt: 2,
   postState: {
+    schemaVersion: 4,
     iteration: n, meters: { stale_count: 0 }, status: 'healthy',
-    bestMetric: null, totalFindings: 0, totalCostUsd: n * 0.5,
+    objectiveBestValue: null, totalCostUsd: n * 0.5,
   },
 })
 
@@ -34,8 +35,9 @@ describe('Ledger', () => {
   it('replaceJson is atomic and schema-checked', async () => {
     const { ledger, paths } = await freshLedger()
     const good: ProgressView = {
+      schemaVersion: 4,
       iteration: 1, meters: { stale_count: 0 }, status: 'healthy',
-      bestMetric: null, totalFindings: 0, totalCostUsd: 0.5, updatedAt: Date.now(),
+      objectiveBestValue: null, totalCostUsd: 0.5, updatedAt: Date.now(),
     }
     await ledger.writeProgress(good)
     expect((await ledger.readProgress()).iteration).toBe(1)
@@ -79,18 +81,15 @@ describe('Ledger', () => {
     expect((await ledger.readJsonl<RoundEntry>(paths.roundsJsonl, 1))[0]!.round).toBe(1)
   })
 
-  it('readView derives progress/lastRounds/findings/directions from disk', async () => {
+  it('readView derives only generic progress and recent rounds from disk', async () => {
     const { ledger, paths } = await freshLedger()
     const committed = round(1)
-    committed.postState = { ...committed.postState!, totalFindings: 1 }
     await ledger.appendRound(committed)
-    await ledger.appendJsonl(paths.findingsJsonl, { id: 'f1', claim: 'works' })
-    await ledger.replaceJson(paths.directionsJson, { directions: [{ key: 'd1' }] })
     const view = await ledger.readView()
     expect(view.lastRounds).toHaveLength(1)
-    expect(view.findingsCount).toBe(1)
-    expect(view.directions).toEqual([{ key: 'd1' }])
     expect(view.progress.iteration).toBe(1) // rebuilt from the committed round
+    expect(view).not.toHaveProperty('findingsCount')
+    expect(view).not.toHaveProperty('directions')
   })
 
   it('rebuilds progress from a committed round after the progress write is lost', async () => {
@@ -101,10 +100,26 @@ describe('Ledger', () => {
     expect(progress.totalCostUsd).toBe(1.5)
   })
 
+  it('normalizes a pre-v4 Research-shaped progress cache into generic v4 state', async () => {
+    const { ledger, paths } = await freshLedger()
+    await mkdir(paths.ledgerDir, { recursive: true })
+    await writeFile(paths.progressJson, JSON.stringify({
+      iteration: 0, meters: {}, status: 'healthy', bestMetric: 0.7,
+      totalFindings: 99, totalCostUsd: 1, updatedAt: 1,
+    }), 'utf-8')
+    const progress = await ledger.readProgress()
+    expect(progress).toMatchObject({
+      schemaVersion: 4, objectiveBestValue: 0.7, totalCostUsd: 1,
+    })
+    expect(progress).not.toHaveProperty('totalFindings')
+    expect(progress).not.toHaveProperty('bestMetric')
+  })
+
   it('appendJsonl entries are one line each (audit greppability)', async () => {
     const { ledger, paths } = await freshLedger()
-    await ledger.appendJsonl(paths.findingsJsonl, { id: 'f1', body: 'line1\nline2' })
-    const raw = await readFile(paths.findingsJsonl, 'utf-8')
+    const sampleJsonl = join(paths.ledgerDir, 'sample.jsonl')
+    await ledger.appendJsonl(sampleJsonl, { id: 'f1', body: 'line1\nline2' })
+    const raw = await readFile(sampleJsonl, 'utf-8')
     expect(raw.trim().split('\n')).toHaveLength(1)
   })
 })

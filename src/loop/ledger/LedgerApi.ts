@@ -24,14 +24,15 @@ import type { InstancePaths, ProgressStatus, RoundEntry } from '../types.js'
 export type SchemaValidator = (value: unknown) => string[]
 
 export interface ProgressView {
+  schemaVersion: 4
   iteration: number
   meters: Record<string, number>
   /** Total function of the last round's RouteDecision — see ProgressStatus. */
   status: ProgressStatus
   /** One-shot directive: the next round runs as a pivot round (set by ROUTE, consumed by MODE). */
   nextRoundMode?: 'pivot'
-  bestMetric: number | null
-  totalFindings: number
+  /** Best value of the optional Charter objective; absent objective stays null. */
+  objectiveBestValue: number | null
   totalCostUsd: number
   updatedAt: number
 }
@@ -39,9 +40,6 @@ export interface ProgressView {
 export interface LedgerView {
   progress: ProgressView
   lastRounds: RoundEntry[]
-  lastFindings: unknown[]
-  directions: unknown[]
-  findingsCount: number
 }
 
 export class LedgerCorruptionError extends Error {
@@ -52,11 +50,11 @@ export class LedgerCorruptionError extends Error {
 }
 
 const DEFAULT_PROGRESS: ProgressView = {
+  schemaVersion: 4,
   iteration: 0,
   meters: {},
   status: 'healthy',
-  bestMetric: null,
-  totalFindings: 0,
+  objectiveBestValue: null,
   totalCostUsd: 0,
   updatedAt: 0,
 }
@@ -133,7 +131,9 @@ export class Ledger {
     let progress: ProgressView | null = null
     let corrupt = false
     try {
-      const candidate = JSON.parse(await readFile(this.paths.progressJson, 'utf-8')) as ProgressView
+      const candidate = normalizeProgress(
+        JSON.parse(await readFile(this.paths.progressJson, 'utf-8')),
+      )
       const schemaErrors = progressSchema(candidate)
       if (schemaErrors.length > 0) throw new Error(schemaErrors.join('; '))
       progress = candidate
@@ -153,7 +153,7 @@ export class Ledger {
           `progress is ${corrupt ? 'corrupt' : 'missing'} and rounds do not contain a recoverable postState`,
         )
       }
-      const rebuilt = { ...last.postState, updatedAt: Date.now() }
+      const rebuilt = normalizeProgress({ ...last.postState, updatedAt: Date.now() })
       await this.writeProgress(rebuilt)
       return rebuilt
     }
@@ -164,7 +164,7 @@ export class Ledger {
           `progress is behind round ${last.round}, but that round has no recoverable postState`,
         )
       }
-      const rebuilt = { ...last.postState, updatedAt: Date.now() }
+      const rebuilt = normalizeProgress({ ...last.postState, updatedAt: Date.now() })
       await this.writeProgress(rebuilt)
       return rebuilt
     }
@@ -178,19 +178,27 @@ export class Ledger {
 
   /** One derived truth for capsule/budget/meter steps. */
   async readView(lastK = 5): Promise<LedgerView> {
-    const [progress, lastRounds, findings, directionsFile] = await Promise.all([
+    const [progress, lastRounds] = await Promise.all([
       this.readProgress(),
       this.readJsonl<RoundEntry>(this.paths.roundsJsonl, lastK),
-      this.readJsonl<unknown>(this.paths.findingsJsonl, lastK),
-      readJsonFile<{ directions?: unknown[] }>(this.paths.directionsJson),
     ])
-    return {
-      progress,
-      lastRounds,
-      lastFindings: findings,
-      findingsCount: progress.totalFindings,
-      directions: directionsFile?.directions ?? [],
-    }
+    return { progress, lastRounds }
+  }
+}
+
+function normalizeProgress(value: unknown): ProgressView {
+  const raw = value && typeof value === 'object' ? value as Record<string, unknown> : {}
+  return {
+    schemaVersion: 4,
+    iteration: raw['iteration'] as number,
+    meters: raw['meters'] as Record<string, number>,
+    status: raw['status'] as ProgressView['status'],
+    ...(raw['nextRoundMode'] === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
+    objectiveBestValue: typeof raw['objectiveBestValue'] === 'number'
+      ? raw['objectiveBestValue']
+      : typeof raw['bestMetric'] === 'number' ? raw['bestMetric'] : null,
+    totalCostUsd: raw['totalCostUsd'] as number,
+    updatedAt: raw['updatedAt'] as number,
   }
 }
 
@@ -246,6 +254,10 @@ export function progressSchema(value: unknown): string[] {
   if (typeof p['status'] !== 'string') errs.push('status must be a string')
   if (typeof p['meters'] !== 'object' || p['meters'] === null) errs.push('meters must be an object')
   if (typeof p['totalCostUsd'] !== 'number') errs.push('totalCostUsd must be a number')
+  if (p['schemaVersion'] !== 4) errs.push('schemaVersion must be 4')
+  if (p['objectiveBestValue'] !== null && typeof p['objectiveBestValue'] !== 'number') {
+    errs.push('objectiveBestValue must be a number or null')
+  }
   if (typeof p['updatedAt'] !== 'number') errs.push('updatedAt must be a number')
   return errs
 }
@@ -297,7 +309,7 @@ export function roundSchema(value: unknown): string[] {
     else {
       if (p['iteration'] !== r['round']) errs.push('postState.iteration must equal round')
       if (typeof p['totalCostUsd'] !== 'number') errs.push('postState.totalCostUsd must be a number')
-      if (typeof p['totalFindings'] !== 'number') errs.push('postState.totalFindings must be a number')
+      if (p['schemaVersion'] !== 4) errs.push('postState.schemaVersion must be 4')
     }
   }
   return errs

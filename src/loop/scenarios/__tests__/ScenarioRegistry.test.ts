@@ -25,6 +25,7 @@ import {
 } from '../ScenarioRuntime.js'
 import { walkResearchCharter } from '../../__tests__/testCharter.js'
 import { materializeArtifactStreams } from '../../artifacts/ArtifactExecutor.js'
+import { commitRoundArtifacts } from '../../artifacts/ArtifactPipeline.js'
 
 function genericCharter(): Charter {
   return {
@@ -93,7 +94,9 @@ describe('Scenario registry and frozen GenericCharter bindings', () => {
     expect(upgraded.scenario).toBe(DEFAULT_SCENARIO_ID)
     expect(upgraded.artifacts.finding).toBeDefined()
     expect(upgraded.gateBindings.some(binding => binding.id === 'direction_diversity')).toBe(true)
-    expect(upgraded.projections).toEqual([])
+    expect(upgraded.projections.map(projection => projection.id).sort()).toEqual([
+      'artifact-direction', 'artifact-finding',
+    ])
   })
 
   it('rejects unknown Scenarios and incomplete or unsafe frozen bindings', () => {
@@ -180,13 +183,11 @@ describe('Scenario registry and frozen GenericCharter bindings', () => {
     const streams = materializeArtifactStreams(artifactEvents, instance.charter.artifacts)
     expect(streams.deliverables?.map(item => item.content)).toEqual([{ release: 'candidate-1' }])
     await writeFile(join(paths.draftsDir, 'deliverable.json'), JSON.stringify({ release: 'must-not-commit' }))
-    await scenarioRuntimeFor(instance.charter).commitArtifacts(instance, {
+    await commitRoundArtifacts(instance, {
       round: 1, producerOk: true, judgeRequired: false, judge: null,
     })
     expect(await instance.ledger.readJsonl(paths.artifactsJsonl)).toHaveLength(artifactEvents.length)
     await expect(readFile(join(paths.draftsDir, 'deliverable.json'), 'utf-8')).rejects.toThrow()
-    const progress = await instance.ledger.readProgress()
-    expect(progress.totalFindings).toBe(0)
     await expect(readFile(join(paths.draftsDir, 'deliverable.json'), 'utf-8')).rejects.toThrow()
     const report = await readFile(join(paths.reportsDir, 'final_report.md'), 'utf-8')
     expect(report).toContain(`scenario: ${GENERIC_SCENARIO_ID}`)
@@ -226,5 +227,37 @@ describe('Scenario registry and frozen GenericCharter bindings', () => {
       .toEqual({ valid: true })
     const rounds = await instance.ledger.readJsonl<{ correctiveRetries: number }>(paths.roundsJsonl)
     expect(rounds[0]?.correctiveRetries).toBe(1)
+  })
+
+  it('routes from a committed Artifact projection without a judge', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'loop-projection-observable-'))
+    const paths = instancePaths(dir, 'generic-work-v1')
+    const charter = genericCharter()
+    charter.artifacts = {
+      deliverable: {
+        id: 'deliverable', kind: 'json', draftPath: 'drafts/deliverable.json',
+        stream: 'deliverables', commitMode: 'append',
+        draft: { cardinality: 'one', requirement: 'each_round' },
+        requiredGates: ['producer', 'artifact_drafts'],
+      },
+    }
+    charter.observables = [{
+      name: 'artifact_count',
+      source: { from: 'projection', id: 'artifact-deliverable', pointer: '/count' },
+    }]
+    charter.tripwires = [{ when: 'artifact_count >= 1', then: { act: 'finalize' } }]
+    await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
+    await runUntilQuiescent({
+      projectDir: dir,
+      dispatcher: dispatcher(() => writeFile(
+        join(paths.draftsDir, 'deliverable.json'), JSON.stringify({ ok: true }),
+      )),
+    })
+    const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim())
+    expect(round.observables.artifact_count).toBe(1)
+    expect(round.observationResults.artifact_count).toMatchObject({
+      status: 'present', source: 'projection:artifact-deliverable/count',
+    })
+    expect(round.route.kind).toBe('finalize')
   })
 })

@@ -89,6 +89,33 @@ describe('HostSchedulerCoordinator', () => {
     await shared1!.release()
   })
 
+  it('does not starve an older exclusive waiter with later shared requests', async () => {
+    const state = await mkdtemp(join(tmpdir(), 'loop-host-writer-fair-'))
+    const coordinator = new HostSchedulerCoordinator({ rootDir: state, pollMs: 10 })
+    const signal = new AbortController().signal
+    const firstShared = await coordinator.acquireResources(scope('ws-a'), [
+      { id: 'dataset:one', mode: 'shared', maxConcurrent: 2 },
+    ], signal)
+    let exclusiveGranted = false
+    const exclusivePromise = coordinator.acquireResources(scope('ws-b'), [
+      { id: 'dataset:one', mode: 'exclusive' },
+    ], signal).then(handle => { exclusiveGranted = true; return handle })
+    await delay(20)
+    let laterSharedGranted = false
+    const laterSharedPromise = coordinator.acquireResources(scope('ws-c'), [
+      { id: 'dataset:one', mode: 'shared', maxConcurrent: 2 },
+    ], signal).then(handle => { laterSharedGranted = true; return handle })
+    await delay(30)
+    expect(laterSharedGranted).toBe(false)
+    await firstShared!.release()
+    const exclusive = await exclusivePromise
+    expect(exclusiveGranted).toBe(true)
+    expect(laterSharedGranted).toBe(false)
+    await exclusive!.release()
+    const laterShared = await laterSharedPromise
+    await laterShared!.release()
+  })
+
   it('admits actual scoped model calls and propagates the scope to descendants', async () => {
     const state = await mkdtemp(join(tmpdir(), 'loop-host-model-'))
     const sessionA = 'loop:ws-00000000-0000-4000-8000-00000000000a:loop-v1:seat:a'

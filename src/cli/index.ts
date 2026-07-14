@@ -35,7 +35,10 @@ import { createHash } from 'node:crypto'
 import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
-import { runLoopCli, runLoopScheduler, buildDistillerSystem, parseDistillOutput, validateCharter, type LoopEvent } from '../loop/index.js'
+import {
+  runLoopCli, runLoopScheduler, buildDistillerSystem, parseDistillOutput, validateCharter,
+  createBuiltinScenarioRegistry, loadScenarioPlugins, type LoopEvent,
+} from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
@@ -5024,14 +5027,18 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
  * and hand its SubAgentBridge to the loop runtime.
  */
 async function runLoopCommand(opts: CliOptions): Promise<void> {
-  const { name, args } = opts.loopCommand!
+  const { name, args: rawLoopArgs } = opts.loopCommand!
   const projectDir = resolve(opts.workspace ?? process.cwd())
+  const { args, plugins } = extractRepeatedOption(rawLoopArgs, '--scenario-plugin')
+  const scenarios = plugins.length > 0
+    ? await loadScenarioPlugins(plugins, { projectDir, base: createBuiltinScenarioRegistry() })
+    : createBuiltinScenarioRegistry()
   const sub = args[0]
   const needsBackend = name === 'loop-scheduler' || sub === 'tick' || sub === 'distill'
 
   if (!needsBackend) {
     // create / list / inspect / inbox / migrate — deterministic, no LLM.
-    console.log(await runLoopCli(args, { projectDir }))
+    console.log(await runLoopCli(args, { projectDir, scenarios }))
     return
   }
 
@@ -5040,7 +5047,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   if (sub === 'distill') {
     assertApiKeyConfigured(opts)
     await ensureMcpServerInstructions()
-    await runDistillDirect(opts, projectDir, args)
+    await runDistillDirect(opts, projectDir, args, scenarios)
     return
   }
 
@@ -5078,7 +5085,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     if (name === 'loop-scheduler') {
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler start (workspace ${projectDir})`)
       const result = await runLoopScheduler({
-        dispatcher, projectDir, signal: abort.signal, observer,
+        dispatcher, projectDir, signal: abort.signal, observer, scenarios,
         // Without onTick, per-wake errors from tickOnce (outcomes[].error) are
         // silently dropped in scheduler mode — `loop tick` prints them, so the
         // daemon must too, or spawn failures become invisible.
@@ -5091,11 +5098,29 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
         `${result.roundsRun} round(s) over ${result.ticks} tick(s).`)
     } else {
-      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal, observer }))
+      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal, observer, scenarios }))
     }
   } finally {
     await router.dispose().catch(() => undefined)
   }
+}
+
+function extractRepeatedOption(
+  args: readonly string[],
+  name: string,
+): { args: string[]; plugins: string[] } {
+  const kept: string[] = []
+  const plugins: string[] = []
+  for (let index = 0; index < args.length; index++) {
+    if (args[index] !== name) {
+      kept.push(args[index]!)
+      continue
+    }
+    const value = args[++index]
+    if (!value || value.startsWith('--')) throw new Error(`${name} requires a module specifier`)
+    plugins.push(value)
+  }
+  return { args: kept, plugins }
 }
 
 /** One-line render of a kernel LoopEvent for the CLI progress stream. */
@@ -5146,7 +5171,12 @@ function distillSessionId(projectDir: string, workspaceId: string, docFile: stri
  * full reasoning + workspace exploration across turns). Retries up to 3× per turn
  * feeding validation errors back, then writes the draft for review.
  */
-async function runDistillDirect(opts: CliOptions, projectDir: string, args: string[]): Promise<void> {
+async function runDistillDirect(
+  opts: CliOptions,
+  projectDir: string,
+  args: string[],
+  scenarios: import('../loop/index.js').ScenarioRegistry,
+): Promise<void> {
   const isResume = args.includes('--resume')
   const out = flagValue(args, '--out') ?? 'charter.draft.json'
   const sessionOverride = flagValue(args, '--session')
@@ -5214,7 +5244,7 @@ async function runDistillDirect(opts: CliOptions, projectDir: string, args: stri
       await streamPrompt(router, prompt, false, opts.showThinking)
       const parsed = parseDistillOutput(undefined, lastAssistantText(router.getMessages()))
       if (!parsed) { lastErrors = ['没有找到可解析的 ```json {charter, taskSpec} 代码块']; continue }
-      const errs = validateCharter(parsed.charter)
+      const errs = validateCharter(parsed.charter, scenarios)
       if (errs.length === 0) {
         writeFileSync(resolve(projectDir, out), JSON.stringify(parsed.charter, null, 2), 'utf-8')
         if (parsed.taskSpec) writeFileSync(resolve(projectDir, 'task_spec.draft.md'), parsed.taskSpec, 'utf-8')

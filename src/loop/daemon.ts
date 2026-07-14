@@ -15,7 +15,7 @@
  *     longer than `idleExitMs`, the daemon exits 0 (layer C self-heal or the
  *     next CLI invocation restarts it when needed).
  */
-import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'fs/promises'
+import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'fs/promises'
 import { join, resolve } from 'path'
 import { hostname } from 'os'
 import { randomUUID } from 'crypto'
@@ -36,6 +36,7 @@ import {
 } from './host/HostSchedulerCoordinator.js'
 import { ensureWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
 import { CLI_VERSION } from '../cli/version.js'
+import { instancePaths } from './types.js'
 
 export interface DaemonOptions extends TickDeps {
   pollMs?: number
@@ -53,6 +54,8 @@ export interface DaemonOptions extends TickDeps {
   maxConcurrentRounds?: number
   /** Host coordinator configuration; primarily deployment policy and test isolation. */
   hostCoordinatorOptions?: HostCoordinatorOptions
+  /** Retain consumed inbox/event files for this long. Default 30 days. */
+  archiveRetentionMs?: number
 }
 
 export interface DaemonResult {
@@ -63,6 +66,7 @@ export interface DaemonResult {
 
 const LOCK_FILE = 'daemon.lock'
 const WAKE_RETENTION_MS = 7 * 24 * 60 * 60_000
+const DEFAULT_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60_000
 const HOUSEKEEPING_INTERVAL_MS = 60 * 60_000
 
 export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResult> {
@@ -126,6 +130,7 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     observer: opts.observer,
     hostCoordinator,
     workspaceIdentity,
+    scenarios: opts.scenarios,
   }
   try {
     for (;;) {
@@ -152,6 +157,13 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
       const tickNow = now()
       if (tickNow >= nextHousekeepingAt) {
         await wakeStore.prune(WAKE_RETENTION_MS, tickNow).catch(() => 0)
+        await pruneInstanceArchives(
+          opts.projectDir,
+          Math.max(0, opts.archiveRetentionMs ?? DEFAULT_ARCHIVE_RETENTION_MS),
+          tickNow,
+        ).catch(error => {
+          console.error('[loop] archive housekeeping failed:', error)
+        })
         nextHousekeepingAt = tickNow + HOUSEKEEPING_INTERVAL_MS
       }
       const available = maxConcurrentRounds - inFlight.size
@@ -201,6 +213,33 @@ export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResul
     await workspaceLease.release().catch(() => undefined)
     await releaseDaemonLock(lockPath, lockToken)
   }
+}
+
+async function pruneInstanceArchives(
+  projectDir: string,
+  retentionMs: number,
+  now: number,
+): Promise<number> {
+  let removed = 0
+  for (const record of await listInstanceRecords(projectDir)) {
+    const paths = instancePaths(projectDir, record.instanceId)
+    for (const dir of [paths.processedDir, paths.eventsProcessedDir]) {
+      let files: string[]
+      try {
+        files = await readdir(dir)
+      } catch {
+        continue
+      }
+      for (const file of files) {
+        const path = join(dir, file)
+        const info = await stat(path).catch(() => null)
+        if (!info?.isFile() || now - info.mtimeMs < retentionMs) continue
+        await rm(path, { force: true })
+        removed++
+      }
+    }
+  }
+  return removed
 }
 
 /** A lock older than this (mtime) is presumed orphaned. The holder refreshes

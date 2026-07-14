@@ -2,6 +2,8 @@ import type { LoopInstance } from '../../instance/InstanceStore.js'
 import type { ArtifactSpec } from '../../charter/CharterTypes.js'
 import { renderRoute } from '../../types.js'
 import { resolve } from 'path'
+import { withFileLock } from '../../../infra/persist/index.js'
+import { refreshArtifactCheckpoint } from '../../projection/ArtifactCheckpoint.js'
 
 export function researchProducerOutputContract(
   draftsDir: string,
@@ -45,14 +47,20 @@ export async function renderResearchReport(
   narrative?: string,
 ): Promise<string> {
   const view = await instance.ledger.readView(50)
+  const { checkpoint } = await withFileLock(
+    instance.paths.artifactsJsonl,
+    () => refreshArtifactCheckpoint(instance),
+  )
+  const findings = checkpoint.views['artifact-finding']
+  const directions = checkpoint.views['artifact-direction']
   const lines = [
     `# Loop Report — ${instance.record.instanceId}`,
     '',
     `- reason: ${reason}`,
     `- rounds: ${view.progress.iteration}`,
     `- status: ${view.progress.status}`,
-    `- best_metric (${instance.charter.metric?.direction ?? 'max'}): ${view.progress.bestMetric ?? 'null'}`,
-    `- total findings: ${view.findingsCount}`,
+    `- objective_best (${instance.charter.metric?.direction ?? 'max'}): ${view.progress.objectiveBestValue ?? 'null'}`,
+    `- total findings: ${findings?.count ?? 0}`,
     `- total cost: $${view.progress.totalCostUsd.toFixed(2)}`,
     ...(narrative ? ['', '## Narrative (finalizer seat)', '', narrative] : []),
     '',
@@ -62,10 +70,10 @@ export async function renderResearchReport(
       `retries=${round.correctiveRetries} cost=$${round.costUsd.toFixed(2)}`),
     '',
     '## Directions tried',
-    ...view.directions.map(direction => `- ${JSON.stringify(direction)}`),
+    ...(directions?.items ?? []).map(item => `- ${JSON.stringify(item.content)}`),
     '',
     '## Findings',
-    ...view.lastFindings.map(finding => `- ${JSON.stringify(finding)}`),
+    ...(findings?.items ?? []).map(item => `- ${JSON.stringify(item.content)}`),
     '',
     `Generated at ${new Date().toISOString()} from the ledger (code template).`,
   ]

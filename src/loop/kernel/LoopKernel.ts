@@ -43,10 +43,9 @@ import { setInstanceStatus } from '../instance/InstanceStore.js'
 import { archiveInbox, buildCapsule, readInbox, type Capsule } from '../capsule/CapsuleBuilder.js'
 import { runFinalizerSeat, runJudgeSeat, runPivoterSeat, runWorkerSeat, type SeatResult, type SeatRunnerDeps } from './Seats.js'
 import { WakeStore, type WakeRecord } from '../wake/WakeStore.js'
-import { atomicWriteFile } from '../../infra/persist/index.js'
+import { atomicWriteFile, withFileLock } from '../../infra/persist/index.js'
 import { runConditionalCounterProjection } from '../projection/ConditionalCounterReducer.js'
 import { gateBinding } from '../charter/ExecutionPlan.js'
-import { scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 import {
   normalizeRoundMode,
   renderRoute,
@@ -72,6 +71,9 @@ import {
 } from '../effects/EffectAdapter.js'
 import { advanceEffect, submitEffect } from '../effects/EffectRuntime.js'
 import type { EffectRetryPolicy } from '../effects/EffectLedger.js'
+import { refreshArtifactCheckpoint, type ArtifactCheckpoint } from '../projection/ArtifactCheckpoint.js'
+import { commitRoundArtifacts } from '../artifacts/ArtifactPipeline.js'
+import { runScenarioHook } from '../scenarios/ScenarioHost.js'
 
 /** Observability events (T4.4) — consumed by CLI/daemon renderers. */
 export type LoopEvent =
@@ -86,6 +88,8 @@ export interface RunRoundDeps extends SeatRunnerDeps {
   wakeStore: WakeStore
   effectAdapters?: EffectAdapterRegistry
   observer?: (event: LoopEvent) => void
+  /** Internal fencing identity installed by runRound for authoritative writes. */
+  wakeFence?: { wakeId: string; claimToken: string }
 }
 
 export class RoundAbortedError extends Error {
@@ -185,6 +189,46 @@ function staleOutcome(round: number, mode: RoundMode, status: string): RoundOutc
   return { round, mode, route: 'stale-wake', status, costUsd: 0 }
 }
 
+async function buildInstanceCapsule(
+  instance: LoopInstance,
+  input: {
+    round: number
+    mode: RoundMode
+    inboxMessages: string[]
+    pivotDirective?: string
+  },
+): Promise<Capsule> {
+  const runtime = instance.scenarios.runtime(instance.charter.scenario)
+  const { checkpoint } = await withFileLock(
+    instance.paths.artifactsJsonl,
+    () => refreshArtifactCheckpoint(instance),
+  )
+  const view = runtime.buildCapsuleView
+    ? await runScenarioHook({
+        scenarioId: runtime.id,
+        hook: 'buildCapsuleView',
+        invoke: signal => runtime.buildCapsuleView!({ instance, checkpoint, signal }),
+        validate: value => (
+          typeof value === 'object' && value !== null &&
+          Number.isInteger(value.schemaVersion) && value.schemaVersion > 0 &&
+          Array.isArray(value.sections) && value.sections.every(section =>
+            typeof section?.title === 'string' &&
+            Array.isArray(section.items) && section.items.every(item => typeof item === 'string'))
+        ) ? [] : ['expected {schemaVersion, data, sections[]}'],
+      })
+    : { schemaVersion: 1, data: {}, sections: [] }
+  return buildCapsule({
+    paths: instance.paths,
+    ledger: instance.ledger,
+    goal: instance.charter.goal,
+    round: input.round,
+    mode: input.mode,
+    inboxMessages: input.inboxMessages,
+    ...(input.pivotDirective ? { pivotDirective: input.pivotDirective } : {}),
+    scenario: { id: instance.charter.scenario, view },
+  })
+}
+
 export async function runRound(
   instance: LoopInstance,
   wake: WakeRecord,
@@ -199,23 +243,53 @@ export async function runRound(
   // (The runner heartbeats the same wake around runClaimedWake; this interval
   // additionally covers direct runRound callers such as tests/CLI one-shots.)
   const heartbeat = setInterval(() => {
-    void deps.wakeStore.heartbeat(wake.wakeId).catch(() => undefined)
+    void deps.wakeStore.heartbeat(wake.wakeId, Date.now(), wake.claim?.token).catch(() => undefined)
   }, 60_000)
   heartbeat.unref?.()
   try {
+    if (wake.claim?.token) {
+      deps.wakeFence = { wakeId: wake.wakeId, claimToken: wake.claim.token }
+      await deps.wakeStore.assertClaim(wake.wakeId, wake.claim.token)
+    }
+    const scenario = instance.scenarios.runtime(instance.charter.scenario)
+    const pinnedScenario = instance.charter.frozen.scenarioPlugin
+    if (pinnedScenario) instance.scenarios.assertCompatible(pinnedScenario)
     if (deps.signal.aborted) throw new RoundAbortedError(0)
     // ── 2. RECONCILE ──────────────────────────────────────────────────────────
     await deps.wakeStore.reconcileOrphans()
     await ingestEvents(instance, waitDeps)
     await reconcileWaiting(instance, waitDeps)
-    await scenarioRuntimeFor(instance.charter).reconcileArtifacts(instance)
+    await withFileLock(instance.paths.artifactsJsonl, async () => {
+      await refreshArtifactCheckpoint(instance)
+    })
+    if (scenario.reconcileReadModel) {
+      await runScenarioHook({
+        scenarioId: scenario.id,
+        hook: 'reconcileReadModel',
+        signal: deps.signal,
+        invoke: signal => scenario.reconcileReadModel!(instance, signal),
+      })
+    }
 
     const pending = await readPendingRound(instance)
+    // A submit segment is authoritative once pending_round exists. If the
+    // process died before moving its inbox inputs, finish that tail action now
+    // so the harvest segment cannot consume the same feedback twice.
+    if (pending?.consumedInboxFiles?.length) {
+      await archiveInbox(instance.paths, pending.consumedInboxFiles)
+    }
+    const reconciledProgress = await instance.ledger.readProgress()
+    if (!pending && (
+      reconciledProgress.status === 'completed' ||
+      reconciledProgress.status === 'paused_attention'
+    )) {
+      return reconcileCommittedTerminal(instance, deps, reconciledProgress)
+    }
     if (
       (wake.kind === 'event' || wake.kind === 'effect_poll') &&
       (!pending || pending.kind !== 'effect' || pending.effectKey !== wake.effectKey)
     ) {
-      const progress = await instance.ledger.readProgress()
+      const progress = reconciledProgress
       return {
         round: pending?.round ?? progress.iteration,
         mode: pending ? normalizeRoundMode(pending.mode) : 'normal',
@@ -230,11 +304,12 @@ export async function runRound(
           instance, deps.wakeStore, pending.effectKey!, effectAdapters, 'inspect',
         )
         if (advanced?.status === 'failed') {
+          await assertWakeFence(deps)
           await setInstanceStatus(
             instance, 'failed',
             `effect ${pending.effectKey} failed: ${advanced.lastError ?? 'operator reconciliation required'}`,
           )
-          await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+          await cancelWakesFenced(instance, deps)
           return {
             round: pending.round, mode: normalizeRoundMode(pending.mode),
             route: 'effect-failed', status: 'failed', costUsd: 0,
@@ -389,7 +464,7 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
   const inboxMessages = inbox.messages
   let pivotDirective: string | undefined
   if (mode === 'pivot' && charter.seats.pivoter) {
-    const capsuleForPivot = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, inboxMessages })
+    const capsuleForPivot = await buildInstanceCapsule(instance, { round, mode, inboxMessages })
     const pivotLimit = remainingSeatUsd(charter, progress.totalCostUsd, costUsd)
     const pivot = pivotLimit !== undefined && pivotLimit <= 0
       ? budgetBlockedSeat('pivoter skipped: round/lifetime USD budget exhausted')
@@ -400,7 +475,7 @@ async function freshRound(instance: LoopInstance, deps: RunRoundDeps, carriedCos
     seatSummaries['pivoter'] = truncate(pivot.summary)
     pivotDirective = typeof pivot.data['directive'] === 'string' ? pivot.data['directive'] : undefined
   }
-  const capsule = await buildCapsule({ paths, ledger, goal: charter.goal, round, mode, pivotDirective, inboxMessages })
+  const capsule = await buildInstanceCapsule(instance, { round, mode, pivotDirective, inboxMessages })
 
   // ── 5b+6. SEAT + GATE ───────────────────────────────────────────────────────
   let seatLoop: SeatLoopOutcome
@@ -561,29 +636,39 @@ async function runSeatLoop(
       const effectKey = typeof worker.data['effectKey'] === 'string' && worker.data['effectKey']
         ? (worker.data['effectKey'] as string)
         : null
-      const prepareEventWait = scenarioRuntimeFor(instance.charter).prepareEventWait
+      const prepareEventWait = instance.scenarios.runtime(instance.charter.scenario).prepareEventWait
       if (effectKey || prepareEventWait) {
+        const workerData = worker.data
         let wait: {
           effectKey: string; payload?: Record<string, unknown>; maxWaitMs: number;
           adapterId?: string; effectBindingId?: string;
           authRequired?: boolean; retryPolicy?: EffectRetryPolicy
         }
         try {
-          wait = await prepareEventWait?.(instance, {
-            round: capsule.round,
-            ...(effectKey ? { effectKey } : {}),
-            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
-            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
-          }) ?? {
+          wait = prepareEventWait ? await runScenarioHook({
+            scenarioId: instance.charter.scenario,
+            hook: 'prepareEventWait',
+            signal: deps.signal,
+            invoke: signal => prepareEventWait(instance, {
+              round: capsule.round,
+              ...(effectKey ? { effectKey } : {}),
+              payload: isRecord(workerData['payload']) ? workerData['payload'] : undefined,
+              maxWaitMs: eventMaxWaitMs(workerData['maxWaitMs']),
+              signal,
+            }),
+            validate: value => typeof value?.effectKey === 'string' && value.effectKey.length > 0 &&
+              Number.isFinite(value.maxWaitMs) && value.maxWaitMs > 0
+              ? [] : ['expected a non-empty effectKey and positive maxWaitMs'],
+          }) : {
             effectKey: effectKey!,
-            payload: isRecord(worker.data['payload']) ? worker.data['payload'] : undefined,
-            maxWaitMs: eventMaxWaitMs(worker.data['maxWaitMs']),
-            adapterId: typeof worker.data['adapterId'] === 'string'
-              ? worker.data['adapterId'] as string : EVENT_EFFECT_ADAPTER_ID,
-            effectBindingId: typeof worker.data['effectBinding'] === 'string'
-              ? worker.data['effectBinding'] as string : undefined,
-            authRequired: worker.data['authRequired'] === true,
-            retryPolicy: effectRetryPolicy(worker.data['retryPolicy']),
+            payload: isRecord(workerData['payload']) ? workerData['payload'] : undefined,
+            maxWaitMs: eventMaxWaitMs(workerData['maxWaitMs']),
+            adapterId: typeof workerData['adapterId'] === 'string'
+              ? workerData['adapterId'] as string : EVENT_EFFECT_ADAPTER_ID,
+            effectBindingId: typeof workerData['effectBinding'] === 'string'
+              ? workerData['effectBinding'] as string : undefined,
+            authRequired: workerData['authRequired'] === true,
+            retryPolicy: effectRetryPolicy(workerData['retryPolicy']),
           }
         } catch (error) {
           const message = error instanceof Error ? error.message : String(error)
@@ -682,7 +767,18 @@ async function runSeatLoop(
     let producerGateFailed = false
     for (const binding of executionPlan.gates.filter(gate => gate.handler === 'scenario')) {
       const gateId = binding.id
-      const gate = await scenarioRuntimeFor(instance.charter).runProducerGate(instance, gateId)
+      const gateRuntime = instance.scenarios.runtime(instance.charter.scenario)
+      const gate = await runScenarioHook({
+        scenarioId: gateRuntime.id,
+        hook: `runProducerGate:${gateId}`,
+        signal: deps.signal,
+        invoke: signal => gateRuntime.runProducerGate(instance, gateId, signal),
+        validate: value => (
+          typeof value === 'object' && value !== null &&
+          ['pass', 'fail', 'error'].includes(value.verdict) &&
+          Array.isArray(value.messages) && value.messages.every(message => typeof message === 'string')
+        ) ? [] : ['expected {verdict: pass|fail|error, messages: string[]}'],
+      })
       if (gate.verdict !== 'pass' && !retriedProducerGates.has(gateId) && producerRetryEnabled(gateId)) {
         retriedProducerGates.add(gateId)
         corrective = `【纠偏重试】Artifact Gate '${gateId}' 未通过：${gate.messages.join('; ') || '请修正 proposal'}`
@@ -809,6 +905,7 @@ async function submitSegment(
     seatSummaries: input.seatSummaries,
     correctiveRetries: input.correctiveRetries,
     submitSummary: truncate(input.submitSummary, 2_000),
+    ...(input.inboxFiles?.length ? { consumedInboxFiles: [...input.inboxFiles] } : {}),
     createdAt: Date.now(),
   }
 
@@ -824,6 +921,7 @@ async function submitSegment(
     const waitDeadlineAt = input.priorSelfTimer?.waitDeadlineAt ??
       Date.now() + policy.maxRoundElapsedMs
     const fireAt = Math.min(Date.now() + input.waitRequest.afterMs, waitDeadlineAt)
+    await assertWakeFence(deps)
     await writePendingRound(instance, {
       ...base, kind: 'self_timer', reason: input.waitRequest.reason, fireAt,
       parkCount, waitDeadlineAt,
@@ -849,6 +947,7 @@ async function submitSegment(
   } satisfies PendingRound
   // Persist the resumable round before crossing the adapter boundary. A crash
   // after the remote side effect but before ack can then reconcile by effectKey.
+  await assertWakeFence(deps)
   await writePendingRound(instance, pending)
   if (input.inboxFiles?.length) await archiveInbox(instance.paths, input.inboxFiles)
   await submitEffect(instance, deps.wakeStore, {
@@ -863,6 +962,7 @@ async function submitSegment(
       ? instance.charter.effects[input.waitRequest.effectBindingId]?.admission
       : undefined,
   }, deps.effectAdapters ?? defaultEffectAdapterRegistry())
+  await assertWakeFence(deps)
   await setInstanceStatus(instance, 'waiting', `waiting on event ${input.waitRequest.effectKey}`)
   deps.observer?.({
     type: 'waiting_entered', round: input.round,
@@ -898,7 +998,7 @@ async function harvestSegment(
     await clearPendingRound(instance)
     if (effectKey) await effects.markHarvested(effectKey)
     if (progress.status === 'completed' || progress.status === 'paused_attention') {
-      await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+      await cancelWakesFenced(instance, deps)
       await setInstanceStatus(
         instance,
         progress.status === 'completed' ? 'done' : 'paused_attention',
@@ -931,15 +1031,14 @@ async function harvestSegment(
   // Transactional inbox read (see freshRound): archive only after this
   // segment durably commits (completeRound / the next submitSegment).
   const inbox = await readInbox(paths)
-  const capsule = await buildCapsule({
-    paths, ledger, goal: charter.goal, round: pending.round, mode,
-    inboxMessages: inbox.messages,
+  const capsule = await buildInstanceCapsule(instance, {
+    round: pending.round, mode, inboxMessages: inbox.messages,
   })
   // Lineage digest (D5): the harvest/continue worker knows WHAT it parked on and
   // WHY, via the submit summary — not via a shared transcript.
   let preface: string
   if (isSelfTimer) {
-    preface = scenarioRuntimeFor(instance.charter).harvestPreface({
+    preface = instance.scenarios.runtime(instance.charter.scenario).harvestPreface({
       selfTimer: true,
       reason: pending.reason,
       submitSummary: pending.submitSummary,
@@ -950,7 +1049,7 @@ async function harvestSegment(
     }
   } else {
     const effect = (await effects.get(effectKey!))!
-    preface = scenarioRuntimeFor(instance.charter).harvestPreface({
+    preface = instance.scenarios.runtime(instance.charter.scenario).harvestPreface({
       selfTimer: false,
       submitSummary: pending.submitSummary,
       effect: effect.outcome,
@@ -1087,12 +1186,27 @@ async function completeRound(
   const { baseProgress: progress } = input
   const judge = sanitizeJudge(input.judge)
 
-  // ── 7. METER ──────────────────────────────────────────────────────────────
+  await assertWakeFence(deps)
+
+  // ── 7. ARTIFACT + OBSERVE + METER ─────────────────────────────────────────
   const producerOk = input.worker?.ok === true
-  const { observables, observationResults, warnings } = collectObservables(
+  const artifactCommit = await commitRoundArtifacts(instance, {
+    round: input.round,
+    producerOk,
+    judgeRequired: !!charter.seats.judge,
+    judge,
+    assertAuthority: () => assertWakeFence(deps),
+  })
+  // A stale worker may finish a slow Scenario gate after its claim was
+  // recovered elsewhere. Artifacts are round-idempotent; the Round ledger
+  // commit below additionally runs INSIDE the wake-store critical section
+  // (withWakeFence), so claim recovery cannot interleave with the append.
+  await assertWakeFence(deps)
+  const { observables, observationResults, warnings } = await collectObservables(
     charter,
     judge,
     producerOk,
+    artifactCommit.checkpoint,
   )
   // Budget exhaustion is recomputed WITH this round accounted (iteration+cost),
   // so ROUTE terminates now instead of wasting a wake on an empty next round.
@@ -1107,31 +1221,29 @@ async function completeRound(
   const meters = counterProjection.meters
   warnings.push(...counterProjection.diagnostics)
 
-  // ── 8. LEDGER: commit gated Artifact proposals, then account the round ────
-  const artifactCommit = await scenarioRuntimeFor(instance.charter).commitArtifacts(instance, {
-    round: input.round,
-    producerOk,
-    judgeRequired: !!charter.seats.judge,
-    judge,
-  })
-  const legacyFindingDelta = artifactCommit.legacyFindingDelta
+  // ── 8. LEDGER: account the already-committed Artifact transaction + round ─
   const objective = evaluateMetricObjective(charter, judge, warnings)
   const metric = objective.value
   const metricImproved = metric !== null && (
-    progress.bestMetric === null ||
-    (charter.metric?.direction === 'min' ? metric < progress.bestMetric : metric > progress.bestMetric)
+    progress.objectiveBestValue === null ||
+    (charter.metric?.direction === 'min' ? metric < progress.objectiveBestValue : metric > progress.objectiveBestValue)
   )
-  const bestMetric = metricImproved
+  const objectiveBestValue = metricImproved
     ? metric
-    : progress.bestMetric
+    : progress.objectiveBestValue
 
   // ── 9. ROUTE — the SINGLE tripwire evaluation point of the round ──────────
   // Priority: built-in acceptance (judge goal_satisfied → the judgment is the
   // judge's, the decision is the kernel's) ▸ first matching charter tripwire ▸
   // built-in budget backstop ▸ continue.
   const postCtx = buildCtx(meters, observables, budgetExhausted)
-  const initialRoute: RouteDecision = objective.failStopReason
+  const candidateRoute: RouteDecision = objective.failStopReason
     ? { kind: 'escalate', cause: 'rule_error', reason: objective.failStopReason }
+    : artifactCommit.obligationErrors.length > 0
+      ? {
+          kind: 'escalate', cause: 'rule_error',
+          reason: `Artifact obligations failed: ${artifactCommit.obligationErrors.join('; ')}`,
+        }
     : decideRoute(
         charter,
         postCtx,
@@ -1140,6 +1252,13 @@ async function completeRound(
         judge,
         budgetExhausted,
       )
+  const initialRoute: RouteDecision = candidateRoute.kind === 'finalize' &&
+    artifactCommit.finalizationErrors.length > 0
+    ? {
+        kind: 'escalate', cause: 'rule_error',
+        reason: `Finalization obligations failed: ${artifactCommit.finalizationErrors.join('; ')}`,
+      }
+    : candidateRoute
   const { route, status } = applyHealthPolicy(
     initialRoute,
     charter,
@@ -1149,26 +1268,32 @@ async function completeRound(
     meters,
   )
   const postState = {
+    schemaVersion: 4 as const,
     iteration: input.round,
     meters,
     status,
     ...(route.kind === 'pivot' ? { nextRoundMode: 'pivot' as const } : {}),
-    bestMetric,
-    totalFindings: progress.totalFindings + legacyFindingDelta,
+    objectiveBestValue,
     totalCostUsd,
   }
 
-  await ledger.appendRound({
-    round: input.round, mode: input.mode, observables, observationResults, meters, route,
-    correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
-    seatSummaries: input.seatSummaries,
-    startedAt: input.startedAt, finishedAt: Date.now(),
-    postState,
-    ...(warnings.length > 0 ? { warnings } : {}),
-  } satisfies RoundEntry)
-  await ledger.writeProgress({
-    ...postState,
-    updatedAt: Date.now(),
+  // ATOMIC fence: the append + progress write run inside the wake-store
+  // critical section — reconcileOrphans/claimDue need the same lock, so the
+  // claim cannot be recovered and re-run between validation and commit.
+  await withWakeFence(deps, async () => {
+    await ledger.appendRound({
+      round: input.round, mode: input.mode, observables, observationResults, meters, route,
+      correctiveRetries: input.correctiveRetries, costUsd: input.costUsd,
+      seatSummaries: input.seatSummaries,
+      ...(input.inboxFiles?.length ? { consumedInboxFiles: [...input.inboxFiles] } : {}),
+      startedAt: input.startedAt, finishedAt: Date.now(),
+      postState,
+      ...(warnings.length > 0 ? { warnings } : {}),
+    } satisfies RoundEntry)
+    await ledger.writeProgress({
+      ...postState,
+      updatedAt: Date.now(),
+    })
   })
   // Round is durably accounted — NOW the consumed inbox files may be archived
   // (transactional consumption: a crash before this point replays the round
@@ -1184,6 +1309,7 @@ async function completeRound(
     })
   }
 
+  await assertWakeFence(deps)
   await deps.wakeStore.schedule({
     loopId: instance.record.instanceId,
     kind: 'timer',
@@ -1193,6 +1319,79 @@ async function completeRound(
   const routeText = renderRoute(route)
   deps.observer?.({ type: 'round_completed', round: input.round, route: routeText, status, costUsd: input.costUsd })
   return { round: input.round, mode: input.mode, route: routeText, status, costUsd: input.costUsd }
+}
+
+/**
+ * Repair the durable tail of a terminal round without running another seat.
+ * The RoundEntry/postState is authoritative; reports, wakes and instance.json
+ * are rebuildable side effects that may be missing after kill -9.
+ */
+async function reconcileCommittedTerminal(
+  instance: LoopInstance,
+  deps: RunRoundDeps,
+  progress: Awaited<ReturnType<LoopInstance['ledger']['readProgress']>>,
+): Promise<RoundOutcome> {
+  const last = (await instance.ledger.readJsonl<RoundEntry>(instance.paths.roundsJsonl, 1)).at(-1)
+  if (last?.consumedInboxFiles?.length) {
+    await archiveInbox(instance.paths, last.consumedInboxFiles)
+  }
+  const escalated = progress.status === 'paused_attention'
+  const route = last?.route ?? {
+    kind: escalated ? 'escalate' : 'finalize',
+    cause: 'rule_error',
+    reason: 'recovered terminal state',
+  } satisfies RouteDecision
+  const reason = typeof route === 'string'
+    ? route
+    : route.reason ?? route.cause ?? route.kind
+  const reportName = escalated ? 'attention_report.md' : 'final_report.md'
+  const reportPath = join(instance.paths.reportsDir, reportName)
+  try {
+    await readFile(reportPath, 'utf-8')
+  } catch {
+    let report: string
+    try {
+      const runtime = instance.scenarios.runtime(instance.charter.scenario)
+      report = await runScenarioHook({
+        scenarioId: runtime.id,
+        hook: 'renderReport',
+        signal: deps.signal,
+        invoke: signal => runtime.renderReport(instance, `recovered: ${reason}`, undefined, signal),
+        validate: value => typeof value === 'string' ? [] : ['expected a string'],
+      })
+    } catch (error) {
+      report = [
+        `# Loop Report — ${instance.record.instanceId}`,
+        '',
+        `- scenario: ${instance.charter.scenario}`,
+        `- reason: recovered terminal state (${reason})`,
+        `- rounds: ${progress.iteration}`,
+        `- status: ${progress.status}`,
+        `- report renderer error: ${error instanceof Error ? error.message : String(error)}`,
+        '',
+      ].join('\n')
+    }
+    await atomicWriteFile(reportPath, report)
+  }
+  await cancelWakesFenced(instance, deps)
+  const tripwireIndex = typeof route === 'object' && route.kind === 'escalate'
+    ? route.tripwireIndex
+    : undefined
+  await setInstanceStatus(
+    instance,
+    escalated ? 'paused_attention' : 'done',
+    `reconciled committed terminal round ${progress.iteration}: ${reason}`,
+    tripwireIndex === undefined ? undefined : {
+      lastEscalation: { tripwireIndex, reason, at: Date.now() },
+    },
+  )
+  return {
+    round: last?.round ?? progress.iteration,
+    mode: normalizeRoundMode(last?.mode),
+    route: 'already-accounted-terminal',
+    status: progress.status,
+    costUsd: 0,
+  }
 }
 
 /** ROUTE decision — total over the three tripwire actions + two built-ins. */
@@ -1324,15 +1523,16 @@ function firstTripwire(
   return null
 }
 
-function collectObservables(
+async function collectObservables(
   charter: FrozenCharter,
   judge: SeatResult | null,
   producerOk: boolean,
-): {
+  checkpoint: ArtifactCheckpoint,
+): Promise<{
   observables: Record<string, number | boolean | string>
   observationResults: Record<string, ObservationResult>
   warnings: string[]
-} {
+}> {
   const observedAt = Date.now()
   const out: Record<string, number | boolean | string> = {
     [PRODUCER_OK_OBSERVABLE]: producerOk,
@@ -1348,7 +1548,39 @@ function collectObservables(
   }
   const warnings: string[] = []
   for (const spec of charter.observables) {
-    if (spec.source.from !== 'judge') continue
+    if (spec.source.from === 'projection') {
+      const source = `projection:${spec.source.id}${spec.source.pointer}`
+      const projection = checkpoint.views[spec.source.id]
+      const resolved = projection === undefined
+        ? { found: false as const }
+        : resolveJsonPointer(projection, spec.source.pointer)
+      if (!resolved.found) {
+        observationResults[spec.name] = {
+          status: 'absent', source, observedAt, reason: 'not_produced',
+          provenance: [`artifact-checkpoint:${checkpoint.stateHash}`],
+        }
+      } else if (
+        resolved.value === null ||
+        typeof resolved.value === 'string' ||
+        typeof resolved.value === 'boolean' ||
+        (typeof resolved.value === 'number' && Number.isFinite(resolved.value))
+      ) {
+        observationResults[spec.name] = {
+          status: 'present', value: resolved.value, source, observedAt,
+          provenance: [`artifact-checkpoint:${checkpoint.stateHash}`],
+        }
+        if (resolved.value !== null) out[spec.name] = resolved.value
+      } else {
+        observationResults[spec.name] = {
+          status: 'error', source, observedAt,
+          errorCode: 'projection_value_invalid',
+          message: 'projection pointer did not resolve to a finite scalar or null',
+          provenance: [`artifact-checkpoint:${checkpoint.stateHash}`],
+        }
+        warnings.push(`observable '${spec.name}': projection value is not a supported scalar`)
+      }
+      continue
+    }
     const v = judge?.data[spec.source.key]
     const source = `judge:${spec.source.key}`
     if (judge === null) {
@@ -1409,6 +1641,26 @@ function collectObservables(
     }
   }
   return { observables: out, observationResults, warnings }
+}
+
+function resolveJsonPointer(
+  root: unknown,
+  pointer: string,
+): { found: true; value: unknown } | { found: false } {
+  if (pointer === '') return { found: true, value: root }
+  let current = root
+  for (const encoded of pointer.slice(1).split('/')) {
+    const key = encoded.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (Array.isArray(current)) {
+      const index = Number(key)
+      if (!Number.isSafeInteger(index) || index < 0 || index >= current.length) return { found: false }
+      current = current[index]
+      continue
+    }
+    if (!current || typeof current !== 'object' || !(key in current)) return { found: false }
+    current = (current as Record<string, unknown>)[key]
+  }
+  return { found: true, value: current }
 }
 
 type ObservationRuleResult =
@@ -1487,6 +1739,7 @@ function evaluateMetricObjective(
   judge: SeatResult | null,
   warnings: string[],
 ): { value: number | null; failStopReason?: string } {
+  if (!charter.metric) return { value: null }
   const raw = judge?.data['metric']
   if (typeof raw === 'number' && Number.isFinite(raw)) return { value: raw }
 
@@ -1668,6 +1921,8 @@ async function terminate(
   const terminalStatus: ProgressStatus = escalated ? 'paused_attention' : 'completed'
   const progressBeforeTerminal = await ledger.readProgress()
 
+  await assertWakeFence(deps)
+
   if (!input.alreadyAccounted) {
     const terminalPostState = {
       ...progressBeforeTerminal,
@@ -1677,7 +1932,7 @@ async function terminate(
       nextRoundMode: undefined,
       totalCostUsd: progressBeforeTerminal.totalCostUsd + input.costUsd,
     }
-    await ledger.appendRound({
+    await withWakeFence(deps, () => ledger.appendRound({
       round: input.round, mode: input.mode,
       observables: input.observables, meters: input.meters,
       route: input.route,
@@ -1685,7 +1940,7 @@ async function terminate(
       seatSummaries: input.seatSummaries,
       startedAt: input.startedAt, finishedAt: Date.now(),
       postState: terminalPostState,
-    })
+    }))
   }
 
   // Finalizer seat (graceful finalize only): one isolated, tool-less pass that
@@ -1709,7 +1964,7 @@ async function terminate(
   // budget guard) and folds in the finalizer cost, so progress.status can
   // never contradict the instance status again.
   const progress = input.alreadyAccounted ? await ledger.readProgress() : progressBeforeTerminal
-  await ledger.writeProgress({
+  await withWakeFence(deps, () => ledger.writeProgress({
     ...progress,
     // The not-yet-accounted path appended a terminal RoundEntry above — keep
     // iteration consistent with rounds.jsonl (the ledger is the authority).
@@ -1718,7 +1973,7 @@ async function terminate(
     nextRoundMode: undefined,
     totalCostUsd: progress.totalCostUsd + (input.alreadyAccounted ? 0 : input.costUsd) + finalizerCost,
     updatedAt: Date.now(),
-  })
+  }))
 
   // Escalation marker: re-arm (migrate) uses it to reset the offending meters.
   if (escalated && input.route.tripwireIndex !== undefined) {
@@ -1727,10 +1982,18 @@ async function terminate(
     }
   }
 
-  const report = await scenarioRuntimeFor(instance.charter).renderReport(instance, reason, narrative)
+  const reportRuntime = instance.scenarios.runtime(instance.charter.scenario)
+  const report = await runScenarioHook({
+    scenarioId: reportRuntime.id,
+    hook: 'renderReport',
+    signal: deps.signal,
+    invoke: signal => reportRuntime.renderReport(instance, reason, narrative, signal),
+    validate: value => typeof value === 'string' ? [] : ['expected a string'],
+  })
   const reportName = escalated ? 'attention_report.md' : 'final_report.md'
   await atomicWriteFile(join(paths.reportsDir, reportName), report)
-  await deps.wakeStore.cancelForLoop(instance.record.instanceId)
+  await assertWakeFence(deps)
+  await cancelWakesFenced(instance, deps)
   await setInstanceStatus(
     instance,
     escalated ? 'paused_attention' : 'done',
@@ -1742,6 +2005,27 @@ async function terminate(
     route: renderRoute(input.route),
     status: terminalStatus, costUsd: input.costUsd + finalizerCost,
   }
+}
+
+async function assertWakeFence(deps: RunRoundDeps): Promise<void> {
+  if (!deps.wakeFence) return
+  await deps.wakeStore.assertClaim(deps.wakeFence.wakeId, deps.wakeFence.claimToken)
+}
+
+/**
+ * Run `fn` atomically WITH the claim: inside the wake-store lock, after
+ * revalidating ownership. Claim recovery needs that same lock, so there is no
+ * check-then-write window around the authoritative ledger commits. `fn` must
+ * be fast and must not call back into the wake store. Legacy claims without a
+ * token degrade to a plain (unfenced) execution.
+ */
+async function withWakeFence<T>(deps: RunRoundDeps, fn: () => Promise<T>): Promise<T> {
+  if (!deps.wakeFence) return fn()
+  return deps.wakeStore.withClaim(deps.wakeFence.wakeId, deps.wakeFence.claimToken, fn)
+}
+
+async function cancelWakesFenced(instance: LoopInstance, deps: RunRoundDeps): Promise<void> {
+  await deps.wakeStore.cancelForLoop(instance.record.instanceId, deps.wakeFence)
 }
 
 function truncate(s: string, n = 300): string {

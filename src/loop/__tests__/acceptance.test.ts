@@ -21,6 +21,7 @@ import { WakeStore } from '../wake/WakeStore.js'
 import { runUntilQuiescent } from '../runner.js'
 import { instancePaths, type RoundEntry } from '../types.js'
 import { walkResearchCharter } from './testCharter.js'
+import { researchPaths } from '../scenarios/research/ResearchPaths.js'
 
 /** A seat impersonator: inspects the task text, performs file side-effects,
  * returns the structured data a real seat would submit via return_result. */
@@ -94,7 +95,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     })
     await runUntilQuiescent({ dispatcher, projectDir: dir })
     const progress = JSON.parse(await readFile(paths.progressJson, 'utf-8'))
-    expect(progress.bestMetric).toBe(8)
+    expect(progress.objectiveBestValue).toBe(8)
   })
 
   it('runs 3 rounds unattended, hits the finalize tripwire, leaves a full ledger', async () => {
@@ -135,10 +136,10 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     expect(rounds[0]!.meters).toEqual({ iteration: 1, stale_count: 0 })
     expect(rounds[1]!.meters).toEqual({ iteration: 2, stale_count: 1 }) // 0 findings → stale
     expect(rounds[2]!.meters).toEqual({ iteration: 3, stale_count: 0 }) // recovered
-    const findings = (await readFile(paths.findingsJsonl, 'utf-8')).trim().split('\n')
+    const findings = (await readFile(researchPaths(paths).findingsJsonl, 'utf-8')).trim().split('\n')
     expect(findings).toHaveLength(3)
     const progress = JSON.parse(await readFile(paths.progressJson, 'utf-8'))
-    expect(progress.bestMetric).toBe(0.55)
+    expect(progress.objectiveBestValue).toBe(0.55)
     expect(progress.totalCostUsd).toBeCloseTo(0.6) // 3 rounds × (worker+judge) × $0.1
 
     // Independence (D6): no judge task ever contains worker reasoning.
@@ -330,7 +331,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
 
     const round = JSON.parse((await readFile(paths.roundsJsonl, 'utf-8')).trim()) as RoundEntry
     expect(round.route).toMatchObject({ kind: 'escalate', cause: 'rule_error' })
-    expect(round.postState?.bestMetric).toBeNull()
+    expect(round.postState?.objectiveBestValue).toBeNull()
     expect(round.warnings).toContain("objective 'metric' null; applied fail_stop")
   })
 
@@ -407,7 +408,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
     })
     const inst = await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
     // Seed a tried direction so attempt 1 collides.
-    await inst.ledger.replaceJson(paths.directionsJson, { directions: [{ key: 'already-tried' }] })
+    await inst.ledger.replaceJson(researchPaths(paths).directionsJson, { directions: [{ key: 'already-tried' }] })
 
     await runUntilQuiescent({ dispatcher, projectDir: dir })
 
@@ -444,7 +445,7 @@ describe('M1 acceptance — walk-research loop, simulated seats', () => {
       tripwires: [{ when: 'iteration >= 1', then: { act: 'finalize' } }],
     })
     const instance = await createInstance({ projectDir: dir, charter, wakeStore: new WakeStore(dir) })
-    await instance.ledger.replaceJson(paths.directionsJson, {
+    await instance.ledger.replaceJson(researchPaths(paths).directionsJson, {
       directions: [{ key: 'already-tried' }],
     })
     await runUntilQuiescent({ dispatcher, projectDir: dir })

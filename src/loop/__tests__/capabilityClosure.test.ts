@@ -7,6 +7,7 @@ import { tmpdir } from 'os'
 import { createInstance } from '../instance/InstanceStore.js'
 import { makeVcsPublishTool } from '../kernel/VcsPublishTool.js'
 import { walkResearchCharter } from './testCharter.js'
+import { researchPaths } from '../scenarios/research/ResearchPaths.js'
 
 const execFileAsync = promisify(execFile)
 
@@ -78,8 +79,8 @@ describe('Loop capability closure', () => {
     await mkdir(join(projectDir, 'docs'), { recursive: true })
     await writeFile(join(projectDir, 'docs', 'research-history.md'), '# Dead Ends\n- repeated-direction\n')
     const instance = await createInstance({ projectDir, charter })
-    expect(await instance.ledger.readJsonl(instance.paths.findingsJsonl)).toEqual([])
-    expect((await instance.ledger.readProgress()).bestMetric).toBeNull()
+    expect(await instance.ledger.readJsonl(researchPaths(instance.paths).findingsJsonl)).toEqual([])
+    expect((await instance.ledger.readProgress()).objectiveBestValue).toBeNull()
   })
 })
 

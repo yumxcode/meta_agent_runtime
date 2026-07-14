@@ -23,6 +23,9 @@ import {
   type LoopInstanceStatus,
 } from '../types.js'
 import { ensureWorkspaceIdentity, withWorkspaceOperationLock } from '../workspace/WorkspaceIdentity.js'
+import { defaultScenarioRegistry } from '../scenarios/BuiltinScenarioPlugins.js'
+import type { ScenarioRegistry } from '../scenarios/ScenarioRegistry.js'
+import { completePendingMigration } from './MigrationRecovery.js'
 
 export interface CreateInstanceInput {
   projectDir: string
@@ -32,6 +35,8 @@ export interface CreateInstanceInput {
   /** First wake time. Default: now (run immediately). */
   firstFireAt?: number
   wakeStore?: WakeStore
+  /** Trusted Scenario plugins available to validation and future resumes. */
+  scenarios?: ScenarioRegistry
 }
 
 export interface LoopInstance {
@@ -39,6 +44,7 @@ export interface LoopInstance {
   charter: FrozenCharter
   paths: InstancePaths
   ledger: Ledger
+  scenarios: ScenarioRegistry
 }
 
 export async function createInstance(input: CreateInstanceInput): Promise<LoopInstance> {
@@ -46,14 +52,18 @@ export async function createInstance(input: CreateInstanceInput): Promise<LoopIn
 }
 
 async function createInstanceUnlocked(input: CreateInstanceInput): Promise<LoopInstance> {
+  const scenarios = input.scenarios ?? defaultScenarioRegistry
   const instanceId = input.instanceId ?? `${input.charter.id}-v${input.charter.version}`
   const paths = instancePaths(input.projectDir, instanceId)
   const workspace = await ensureWorkspaceIdentity(input.projectDir)
 
+  await completePendingMigration(paths)
   const existing = await readJsonFile<LoopInstanceRecord>(paths.instanceJson)
-  if (existing) return loadInstanceFrom(paths, await bindRecordToWorkspace(paths, existing, workspace.workspaceId))
+  if (existing) return loadInstanceFrom(
+    paths, await bindRecordToWorkspace(paths, existing, workspace.workspaceId), scenarios,
+  )
 
-  const frozen = freezeCharter(input.charter)   // throws on invalid charter
+  const frozen = freezeCharter(input.charter, scenarios)   // throws on invalid charter
   await preflightCharterCapabilities(frozen, input.projectDir)
   const charterHash = createHash('sha256').update(JSON.stringify(frozen)).digest('hex')
 
@@ -67,16 +77,14 @@ async function createInstanceUnlocked(input: CreateInstanceInput): Promise<LoopI
 
   const ledger = withBuiltinSchemas(new Ledger(paths), paths)
   await ledger.writeProgress({
+    schemaVersion: 4,
     iteration: 0,
     meters: Object.fromEntries(frozen.meters.map(m => [m.name, 0])),
     status: 'healthy',
-    bestMetric: null,
-    totalFindings: 0,
+    objectiveBestValue: null,
     totalCostUsd: 0,
     updatedAt: Date.now(),
   })
-  await ledger.replaceJson(paths.directionsJson, { directions: [] })
-
   const record: LoopInstanceRecord = {
     schemaVersion: '1.0',
     workspaceId: workspace.workspaceId,
@@ -99,18 +107,20 @@ async function createInstanceUnlocked(input: CreateInstanceInput): Promise<LoopI
     kind: 'timer',
     fireAt: input.firstFireAt ?? Date.now(),
   })
-  return { record, charter: frozen, paths, ledger }
+  return { record, charter: frozen, paths, ledger, scenarios }
 }
 
 export async function loadInstance(
   projectDir: string,
   instanceId: LoopInstanceId,
+  scenarios: ScenarioRegistry = defaultScenarioRegistry,
 ): Promise<LoopInstance | null> {
   const paths = instancePaths(projectDir, instanceId)
+  await completePendingMigration(paths)
   const record = await readJsonFile<LoopInstanceRecord>(paths.instanceJson)
   if (!record) return null
   const workspace = await ensureWorkspaceIdentity(projectDir)
-  return loadInstanceFrom(paths, await bindRecordToWorkspace(paths, record, workspace.workspaceId))
+  return loadInstanceFrom(paths, await bindRecordToWorkspace(paths, record, workspace.workspaceId), scenarios)
 }
 
 async function bindRecordToWorkspace(
@@ -136,16 +146,30 @@ async function bindRecordToWorkspace(
   })
 }
 
-async function loadInstanceFrom(paths: InstancePaths, record: LoopInstanceRecord): Promise<LoopInstance> {
+async function loadInstanceFrom(
+  paths: InstancePaths,
+  record: LoopInstanceRecord,
+  scenarios: ScenarioRegistry,
+): Promise<LoopInstance> {
   const charter = await readJsonFile<FrozenCharter>(paths.frozenCharter)
   if (!charter) throw new Error(`instance ${record.instanceId} is missing its frozen charter`)
+  const actualHash = createHash('sha256').update(JSON.stringify(charter)).digest('hex')
+  if (actualHash !== record.charterHash) {
+    throw new Error(
+      `instance ${record.instanceId} frozen charter hash mismatch: ` +
+      `record=${record.charterHash} actual=${actualHash}`,
+    )
+  }
+  const normalized = normalizeFrozenCharterForRuntime(charter, scenarios)
+  if (normalized.frozen.scenarioPlugin) scenarios.assertCompatible(normalized.frozen.scenarioPlugin)
   return {
     record,
     // Pre-v3 frozen snapshots carry legacy tripwire actions; normalize on every
     // load (deterministic, in-memory only — the on-disk snapshot/hash is untouched).
-    charter: normalizeFrozenCharterForRuntime(charter),
+    charter: normalized,
     paths,
     ledger: withBuiltinSchemas(new Ledger(paths), paths),
+    scenarios,
   }
 }
 

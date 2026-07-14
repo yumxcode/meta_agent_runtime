@@ -4,7 +4,7 @@
  * kernel observer events.
  */
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, mkdir, readFile, writeFile } from 'fs/promises'
+import { access, mkdtemp, mkdir, readFile, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
@@ -21,6 +21,9 @@ import { validateCharter } from '../charter/CharterValidate.js'
 import { instancePaths } from '../types.js'
 import { runLoopCli } from '../cli.js'
 import { walkResearchCharter } from './testCharter.js'
+import { researchPaths } from '../scenarios/research/ResearchPaths.js'
+import { atomicWriteJson } from '../../infra/persist/index.js'
+import { writeMigrationMarker } from '../instance/MigrationRecovery.js'
 
 function scriptedDispatcher(
   script: (task: string, config: Partial<SubAgentConfig>) => Promise<Record<string, unknown>>,
@@ -214,6 +217,44 @@ describe('migrateInstance', () => {
     const out = await runLoopCli(['migrate', inst.record.instanceId], { projectDir: dir })
     expect(out).toContain('v1 → v2')
   })
+
+  it('fails closed when the frozen charter no longer matches its pinned hash', async () => {
+    const { dir, inst } = await idleInstanceWithMeters()
+    await atomicWriteJson(inst.paths.frozenCharter, { ...inst.charter, goal: 'tampered' })
+    await expect(loadInstance(dir, inst.record.instanceId)).rejects.toThrow(/charter hash mismatch/)
+  })
+
+  it('finishes an interrupted migration intent idempotently during load', async () => {
+    const { dir, inst } = await idleInstanceWithMeters()
+    const progress = await inst.ledger.readProgress()
+    const migrationId = 'recovery-test-1'
+    const finalRecord = {
+      ...inst.record,
+      status: 'idle' as const,
+      statusReason: 'recovered migration',
+      updatedAt: Date.now(),
+    }
+    await setInstanceStatus(inst, 'migrating', 'test interrupted migration')
+    await writeMigrationMarker(inst.paths, {
+      schemaVersion: '1.0', migrationId,
+      frozenCharter: inst.charter,
+      record: finalRecord,
+      progress,
+      audit: { migrationId, at: Date.now(), fromVersion: 1, toVersion: 1 },
+      createdAt: Date.now(),
+    })
+
+    const recovered = await loadInstance(dir, inst.record.instanceId)
+    expect(recovered?.record.status).toBe('idle')
+    await expect(access(inst.paths.migrationPendingJson)).rejects.toThrow()
+    const audit = (await readFile(join(inst.paths.ledgerDir, 'migrations.jsonl'), 'utf-8'))
+      .trim().split('\n').map(line => JSON.parse(line) as { migrationId: string })
+    expect(audit.filter(entry => entry.migrationId === migrationId)).toHaveLength(1)
+    await loadInstance(dir, inst.record.instanceId)
+    const auditAgain = (await readFile(join(inst.paths.ledgerDir, 'migrations.jsonl'), 'utf-8'))
+      .trim().split('\n').map(line => JSON.parse(line) as { migrationId: string })
+    expect(auditAgain.filter(entry => entry.migrationId === migrationId)).toHaveLength(1)
+  })
 })
 
 // ── T4.1 lifetime budget escalation ───────────────────────────────────────────
@@ -277,9 +318,7 @@ describe('per-round USD budget', () => {
     expect(dispatcher.configs).toHaveLength(1)
     expect(dispatcher.configs[0]!.maxBudgetUsd).toBe(0.1)
     const instance = (await loadInstance(dir, 'walk-research-v1'))!
-    expect(await instance.ledger.readView()).toMatchObject({
-      findingsCount: 0,
-    })
+    expect(await instance.ledger.readJsonl(researchPaths(instance.paths).findingsJsonl)).toHaveLength(0)
   })
 })
 
@@ -312,7 +351,7 @@ describe('shape schema gates', () => {
     await runUntilQuiescent({ dispatcher, projectDir: dir })
     expect(dispatcher.configs).toHaveLength(2) // worker + one corrective retry; no judge
     const instance = (await loadInstance(dir, 'walk-research-v1'))!
-    expect((await instance.ledger.readView()).findingsCount).toBe(0)
+    expect(await instance.ledger.readJsonl(researchPaths(instance.paths).findingsJsonl)).toHaveLength(0)
   })
 })
 

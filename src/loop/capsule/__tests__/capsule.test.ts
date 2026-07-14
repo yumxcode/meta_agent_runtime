@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { mkdtemp, writeFile, readdir, mkdir } from 'fs/promises'
+import { access, mkdtemp, writeFile, readdir, mkdir } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { archiveInbox, buildCapsule, readInbox, renderCapsule } from '../CapsuleBuilder.js'
@@ -52,17 +52,24 @@ describe('createInstance', () => {
 describe('buildCapsule', () => {
   it('digests ledger state; inbox consumption is transactional (read stays, archive moves)', async () => {
     const { instance } = await freshInstance()
-    await instance.ledger.appendJsonl(instance.paths.findingsJsonl, { id: 'f1', claim: 'single_foot_contact 提升步态' })
-    await instance.ledger.replaceJson(instance.paths.directionsJson, { directions: [{ key: 'reward-shaping' }] })
     await mkdir(instance.paths.inboxDir, { recursive: true })
     await writeFile(join(instance.paths.inboxDir, '001.json'), JSON.stringify({ message: '别再调 sigma 了' }), 'utf-8')
 
     const capsule = await buildCapsule({
       paths: instance.paths, ledger: instance.ledger,
       goal: instance.charter.goal, round: 1, mode: 'normal',
+      scenario: {
+        id: instance.charter.scenario,
+        view: {
+          schemaVersion: 1, data: {}, sections: [
+            { title: '已试方向', items: ['reward-shaping'] },
+            { title: '近期 findings', items: ['single_foot_contact 提升步态'] },
+          ],
+        },
+      },
     })
-    expect(capsule.directionsTried).toEqual(['reward-shaping'])
-    expect(capsule.recentFindings).toHaveLength(1)
+    expect(capsule.scenario.view.sections[0]!.items).toEqual(['reward-shaping'])
+    expect(capsule.scenario.view.sections[1]!.items).toHaveLength(1)
     expect(capsule.inboxMessages).toEqual(['别再调 sigma 了'])
 
     // NON-destructive: buildCapsule never moves inbox files — an aborted or
@@ -100,11 +107,34 @@ describe('buildCapsule', () => {
 
   it('truncates oversized entries (size-bounded by construction)', async () => {
     const { instance } = await freshInstance()
-    await instance.ledger.appendJsonl(instance.paths.findingsJsonl, { id: 'f1', claim: 'x'.repeat(5000) })
     const capsule = await buildCapsule({
       paths: instance.paths, ledger: instance.ledger,
       goal: instance.charter.goal, round: 1, mode: 'normal',
+      scenario: {
+        id: instance.charter.scenario,
+        view: {
+          schemaVersion: 1, data: {},
+          sections: [{ title: 'large', items: ['x'.repeat(5000)] }],
+        },
+      },
     })
-    expect(capsule.recentFindings[0]!.length).toBeLessThanOrEqual(400)
+    const rendered = renderCapsule(capsule)
+    expect(rendered.split('\n').find(line => line.startsWith('- x'))!.length).toBeLessThanOrEqual(402)
+  })
+
+  it('limits one ingestion batch and quarantines oversized inbox files', async () => {
+    const { instance } = await freshInstance()
+    await mkdir(instance.paths.inboxDir, { recursive: true })
+    await Promise.all(Array.from({ length: 40 }, (_, i) => writeFile(
+      join(instance.paths.inboxDir, `${String(i).padStart(2, '0')}.txt`), `message-${i}`,
+    )))
+    const first = await readInbox(instance.paths)
+    expect(first.files).toHaveLength(32)
+
+    const huge = join(instance.paths.inboxDir, '00-huge.txt')
+    await writeFile(huge, 'x'.repeat(256 * 1024 + 1))
+    const bounded = await readInbox(instance.paths)
+    expect(bounded.files).not.toContain('00-huge.txt')
+    await expect(access(`${huge}.oversize`)).resolves.toBeUndefined()
   })
 })

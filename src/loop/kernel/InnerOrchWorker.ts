@@ -22,7 +22,6 @@ import { buildSkillManifestSection } from '../../core/dynamicPrompt.js'
 import type { AgentMode } from '../../core/dynamicPrompt.js'
 import type { Capsule } from '../capsule/CapsuleBuilder.js'
 import { renderCapsule } from '../capsule/CapsuleBuilder.js'
-import { DEFAULT_SCENARIO_ID, scenarioRuntimeFor } from '../scenarios/ScenarioRuntime.js'
 
 export type InnerWorkerVariant = 'lineage' | 'isolated'
 
@@ -33,7 +32,12 @@ export type InnerWorkerVariant = 'lineage' | 'isolated'
  * the latter, so the contract must point the worker at the exact absolute files.
  */
 export function buildOutputContract(draftsDir: string): string {
-  return scenarioRuntimeFor(DEFAULT_SCENARIO_ID).producerOutputContract(draftsDir, {})
+  return [
+    '【产出契约（硬性）】',
+    `仅在调用方声明的路径下写草稿（draft root: ${draftsDir}）。`,
+    '完成后必须调用 return_result，data 写 {"label":"ok"|"error","note":"一句话"}。',
+    '禁止直接修改 ledger/。',
+  ].join('\n')
 }
 
 const ROLE_HEADER = `\

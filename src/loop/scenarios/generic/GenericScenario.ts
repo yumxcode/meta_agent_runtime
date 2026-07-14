@@ -1,16 +1,14 @@
-import { readFile, rm } from 'fs/promises'
 import { resolve } from 'path'
 import { withFileLock } from '../../../infra/persist/index.js'
-import {
-  executeArtifactTransaction,
-} from '../../artifacts/ArtifactExecutor.js'
-import { makeArtifactProposal, type ArtifactGateResult } from '../../artifacts/ArtifactProtocol.js'
+import { type ArtifactGateResult } from '../../artifacts/ArtifactProtocol.js'
 import type { ArtifactSpec } from '../../charter/CharterTypes.js'
 import type { LoopInstance } from '../../instance/InstanceStore.js'
 import { refreshArtifactCheckpoint } from '../../projection/ArtifactCheckpoint.js'
-import { findCommittedArtifactTransaction } from '../../artifacts/ArtifactIndexes.js'
-import type { ScenarioRuntime } from '../ScenarioRuntime.js'
+import type { ScenarioRuntime } from '../ScenarioPlugin.js'
+import type { ScenarioCapsuleView, ScenarioJson } from '../ScenarioPlugin.js'
+import type { ArtifactCheckpoint } from '../../projection/ArtifactCheckpoint.js'
 import { GENERIC_SCENARIO_ID } from '../ScenarioDefinitions.js'
+import { readBoundedArtifactText } from '../../artifacts/ArtifactIo.js'
 
 export interface GenericScenarioConfig {
   id: string
@@ -25,19 +23,28 @@ export interface GenericScenarioConfig {
     contentHash: string
     spec: ArtifactSpec
   }): Promise<ArtifactGateResult | null>
+  buildCapsuleView?(instance: LoopInstance, checkpoint: ArtifactCheckpoint): Promise<ScenarioCapsuleView>
 }
 
 export function createGenericScenarioRuntime(config: GenericScenarioConfig): ScenarioRuntime {
   return {
   id: config.id,
+  buildCapsuleView: async ({ instance, checkpoint }) => config.buildCapsuleView?.(instance, checkpoint) ?? ({
+    schemaVersion: 1,
+    data: toScenarioJson({ projections: checkpoint.views, streams: checkpoint.streamStates }),
+    sections: Object.entries(checkpoint.views).map(([id, view]) => ({
+      title: id,
+      items: view.items.map(item => JSON.stringify(item.content)),
+    })),
+  }),
   producerOutputContract: (draftsDir, artifacts) => genericOutputContract(
     draftsDir, artifacts, config.outputInstructions,
   ),
   ...(config.prepareEventWait ? { prepareEventWait: config.prepareEventWait } : {}),
-  reconcileArtifacts: instance => withFileLock(
-    instance.paths.artifactsJsonl,
-    async () => { await refreshArtifactCheckpoint(instance) },
-  ),
+  artifactGate: async ({ instance, proposalId, contentHash, spec, gateId }) => {
+    if (!config.artifactGate || !spec.requiredGates.includes(gateId)) return null
+    return config.artifactGate({ instance, proposalId, contentHash, spec })
+  },
   runProducerGate: async (instance, gateId) => {
     if (gateId !== 'artifact_drafts') {
       return await config.runGate?.(instance, gateId) ?? {
@@ -48,59 +55,6 @@ export function createGenericScenarioRuntime(config: GenericScenarioConfig): Sce
     const messages = drafts.flatMap(draft => draft.error ? [`${draft.spec.id}: ${draft.error}`] : [])
     return { verdict: messages.length > 0 ? 'fail' : 'pass', messages }
   },
-  commitArtifacts: async (instance, input) => withFileLock(instance.paths.artifactsJsonl, async () => {
-    const before = await refreshArtifactCheckpoint(instance)
-    const transactionId = `round:${input.round}`
-    if (await findCommittedArtifactTransaction(instance, transactionId)) {
-      await cleanupGenericDrafts(instance)
-      return { legacyFindingDelta: 0 }
-    }
-    const drafts = await readGenericDrafts(instance)
-    const proposals = drafts.filter(draft => draft.present).map(draft => makeArtifactProposal({
-      proposalId: `round:${input.round}:${draft.spec.id}:0`,
-      transactionId,
-      artifactId: draft.spec.id,
-      content: draft.content,
-      draftPath: draft.spec.draftPath,
-    }))
-    const byArtifact = new Map(drafts.map(draft => [draft.spec.id, draft]))
-    const additional = new Map<string, ArtifactGateResult[]>()
-    if (config.artifactGate) {
-      for (const proposal of proposals) {
-        const spec = instance.charter.artifacts[proposal.artifactId]
-        if (!spec) continue
-        for (const gateId of spec.requiredGates) {
-          if (gateId === 'producer' || gateId === 'artifact_drafts') continue
-          const result = await config.artifactGate({
-            instance, proposalId: proposal.proposalId,
-            contentHash: proposal.contentHash, spec,
-          })
-          if (result) additional.set(proposal.proposalId, [
-            ...(additional.get(proposal.proposalId) ?? []), result,
-          ])
-        }
-      }
-    }
-    const result = await executeArtifactTransaction({
-      transactionId: `round:${input.round}`,
-      proposals,
-      specs: instance.charter.artifacts,
-      existingEvents: [],
-      gateResults: (proposal, spec) => genericGateResults(
-        proposal.proposalId,
-        proposal.contentHash,
-        spec,
-        input.producerOk,
-        byArtifact.get(spec.id)?.error,
-        additional.get(proposal.proposalId) ?? [],
-      ),
-      append: event => instance.ledger.appendJsonl(instance.paths.artifactsJsonl, event),
-    })
-    await refreshArtifactCheckpoint(instance)
-    await cleanupGenericDrafts(instance)
-    // totalFindings is a legacy Research projection, never a generic Artifact count.
-    return { legacyFindingDelta: 0 }
-  }),
   harvestPreface: input => input.selfTimer
     ? [
         `【继续】已到你设定的时间（原因：${input.reason ?? '?'}）。`,
@@ -134,14 +88,20 @@ export function createGenericScenarioRuntime(config: GenericScenarioConfig): Sce
     ].join('\n')
   },
 }
+
+function toScenarioJson(value: unknown): ScenarioJson {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return value
+  if (typeof value === 'number') return Number.isFinite(value) ? value : null
+  if (Array.isArray(value)) return value.map(toScenarioJson)
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value as Record<string, unknown>)
+      .map(([key, child]) => [key, toScenarioJson(child)]))
+  }
+  return String(value)
+}
 }
 
 export const genericScenarioRuntime = createGenericScenarioRuntime({ id: GENERIC_SCENARIO_ID })
-
-async function cleanupGenericDrafts(instance: LoopInstance): Promise<void> {
-  await Promise.all(Object.values(instance.charter.artifacts).map(spec =>
-    rm(resolve(instance.paths.root, spec.draftPath), { force: true })))
-}
 
 export interface GenericDraft {
   spec: ArtifactSpec
@@ -154,11 +114,16 @@ export async function readGenericDrafts(instance: LoopInstance): Promise<Generic
   return Promise.all(Object.values(instance.charter.artifacts).map(async spec => {
     let raw: string
     try {
-      raw = await readFile(resolve(instance.paths.root, spec.draftPath), 'utf-8')
+      raw = (await readBoundedArtifactText(resolve(instance.paths.root, spec.draftPath))).text
     } catch (error) {
       const code = (error as NodeJS.ErrnoException).code
       return code === 'ENOENT'
-        ? { spec, present: false, content: null }
+        ? {
+            spec, present: false, content: null,
+            ...(spec.draft?.requirement === 'each_round'
+              ? { error: 'required Artifact draft is missing' }
+              : {}),
+          }
         : { spec, present: true, content: null, error: (error as Error).message }
     }
     if (spec.kind === 'text' || spec.kind === 'workspace_diff') {
@@ -172,35 +137,14 @@ export async function readGenericDrafts(instance: LoopInstance): Promise<Generic
   }))
 }
 
-function genericGateResults(
-  proposalId: string,
-  contentHash: string,
-  spec: ArtifactSpec,
-  producerOk: boolean,
-  draftError?: string,
-  additional: ArtifactGateResult[] = [],
-): ArtifactGateResult[] {
-  const available: Record<string, ArtifactGateResult> = {
-    producer: {
-      proposalId, gateId: 'producer', verdict: producerOk ? 'pass' : 'fail',
-      messages: producerOk ? [] : ['producer did not complete successfully'], evidence: [contentHash],
-    },
-    artifact_drafts: {
-      proposalId, gateId: 'artifact_drafts', verdict: draftError ? 'error' : 'pass',
-      messages: draftError ? [draftError] : [], evidence: [contentHash],
-    },
-  }
-  for (const result of additional) available[result.gateId] = result
-  return spec.requiredGates.map(gateId => available[gateId]!).filter(Boolean)
-}
-
 function genericOutputContract(
   draftsDir: string,
   artifacts: Record<string, ArtifactSpec>,
   instructions: string[] = [],
 ): string {
   const entries = Object.values(artifacts).map(spec =>
-    `- ${spec.id} (${spec.kind}, ${spec.commitMode}) → ${resolve(draftsDir, '..', spec.draftPath)}`)
+    `- ${spec.id} (${spec.kind}, ${spec.commitMode}, ` +
+      `${spec.draft?.requirement ?? 'optional'}) → ${resolve(draftsDir, '..', spec.draftPath)}`)
   return [
     '【产出契约（硬性）】',
     ...(entries.length > 0 ? ['本轮需要产出时，只写以下 Artifact 草稿：', ...entries] : [

@@ -84,9 +84,9 @@ export function buildDistillerSystem(catalog: DistillerPromptCatalog = {}): stri
 - judge Gate 的 rubric 是判断语义的唯一权威来源，内核会把它原文注入 Judge。
 - judge Gate 的 evidence 同样是权威来源；有 judge Gate 时省略 seats.judge.inputs。旧 Charter 中该字段只作无 Gate 时的兼容回退。
 - seats.judge.prompt 只写角色、审查姿态和领域关注点；不得写“见 gates.xxx”，也不要复制 rubric。
-- 内核追加固定 JUDGE_CONTRACT：verdict、new_findings_count、metric_delta、metric、goal_satisfied、messages，以及 Charter 声明的额外 observable key。
-- Research Scenario 的 JUDGE_CONTRACT 还要求 accepted_finding_indexes（findings 数组的零基通过索引）；逐条 Gate 只提交这些 finding。new_findings_count 必须等于该数组长度。
-- rubric 必须定义：什么算有效证据、metric/metric_delta、goal_satisfied、pass/fail、fail 时 messages。
+- 内核固定 JUDGE_CONTRACT 仅包含 verdict、goal_satisfied、messages；Charter observable、可选 objective metric 和 Scenario 插件可以追加字段。
+- Research Scenario 追加 new_findings_count、metric_delta、metric、accepted_finding_indexes；这些不是通用 Kernel 语义。
+- rubric 必须定义场景扩展字段、有效证据、goal_satisfied、pass/fail，以及 fail 时 messages。
 - judge/pivoter/finalizer 永远 isolated 且无工具，只能看到 inputs/evidence 的有界内嵌内容。其 prompt 禁止要求调用工具、主动读文件或写 drafts；只能要求 return_result 契约中的语义结果。
 - 普通 evidence/input 相对实例根。经人工审阅或实际 workspace 检查确认的项目文件，可用 workspace:<项目相对路径> 只读引用；Loop 不预设任何目录名，也不自动发现“历史目录”。create 会校验文件真实存在且不能经 symlink 越界。它只提供上下文，不导入/改写 Ledger baseline。
 

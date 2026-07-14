@@ -61,11 +61,35 @@ export {
   type ScenarioRuntime,
 } from './scenarios/ScenarioRuntime.js'
 export {
+  ScenarioRegistry,
+  ScenarioPluginError,
+} from './scenarios/ScenarioRegistry.js'
+export {
+  SCENARIO_PLUGIN_API_VERSION,
+  type ScenarioPluginV1,
+  type ScenarioPluginManifest,
+  type FrozenScenarioPluginRef,
+  type ScenarioCapsuleView,
+  type ScenarioCapsuleSection,
+  type ScenarioJson,
+} from './scenarios/ScenarioPlugin.js'
+export {
+  builtinScenarioPlugins,
+  createBuiltinScenarioRegistry,
+  defaultScenarioRegistry,
+} from './scenarios/BuiltinScenarioPlugins.js'
+export { loadScenarioPlugins } from './scenarios/ScenarioLoader.js'
+export {
   executeArtifactTransaction,
   materializeArtifactStreams,
   type ArtifactLedgerEvent,
   type ArtifactTransactionResult,
 } from './artifacts/ArtifactExecutor.js'
+export {
+  commitRoundArtifacts,
+  readArtifactDrafts,
+  type ArtifactPipelineResult,
+} from './artifacts/ArtifactPipeline.js'
 export {
   readArtifactJournal,
   sealArtifactJournalIfNeeded,
