@@ -10,7 +10,7 @@ import { setModelCallAdmissionProvider } from '../../infra/modelCallAdmission.js
 
 export interface HostCoordinatorOptions {
   rootDir?: string
-  maxConcurrentRounds?: number
+  maxConcurrentGraphTicks?: number
   maxConcurrentModelCalls?: number
   leaseTtlMs?: number
   pollMs?: number
@@ -34,7 +34,7 @@ export interface HostAdmissionLease {
   schemaVersion: '1.0'
   leaseId: string
   ticketId: string
-  kind: 'round' | 'model_call' | 'resource' | 'adapter_call'
+  kind: 'graph_tick' | 'model_call' | 'resource' | 'adapter_call'
   scope: ExecutionScope
   token: string
   resourceIds?: string[]
@@ -83,7 +83,7 @@ export interface HostCoordinatorSnapshot {
   workspaces: WorkspaceSchedulerLease[]
   tickets: AdmissionTicket[]
   leases: HostAdmissionLease[]
-  maxConcurrentRounds: number
+  maxConcurrentGraphTicks: number
   maxConcurrentModelCalls: number
 }
 
@@ -100,7 +100,7 @@ export class WorkspaceIdentityConflictError extends Error {
 
 export class HostSchedulerCoordinator {
   readonly rootDir: string
-  readonly maxConcurrentRounds: number
+  readonly maxConcurrentGraphTicks: number
   readonly maxConcurrentModelCalls: number
   private readonly leaseTtlMs: number
   private readonly pollMs: number
@@ -109,7 +109,7 @@ export class HostSchedulerCoordinator {
 
   constructor(options: HostCoordinatorOptions = {}) {
     this.rootDir = resolve(options.rootDir ?? metaAgentPath('loop-scheduler'))
-    this.maxConcurrentRounds = boundedLimit(options.maxConcurrentRounds ?? envLimit('META_AGENT_LOOP_HOST_MAX_ROUNDS', 4))
+    this.maxConcurrentGraphTicks = boundedLimit(options.maxConcurrentGraphTicks ?? envLimit('META_AGENT_LOOP_HOST_MAX_GRAPH_TICKS', 4))
     this.maxConcurrentModelCalls = boundedLimit(options.maxConcurrentModelCalls ?? envLimit('META_AGENT_LOOP_HOST_MAX_MODEL_CALLS', 4))
     this.leaseTtlMs = Math.max(1_000, options.leaseTtlMs ?? DEFAULT_LEASE_TTL_MS)
     this.heartbeatIntervalMs = Math.max(250, Math.floor(this.leaseTtlMs / 3))
@@ -165,8 +165,8 @@ export class HostSchedulerCoordinator {
     return !!lease && lease.expiresAt > this.now()
   }
 
-  async acquireRound(scope: ExecutionScope, signal: AbortSignal): Promise<HostAdmissionHandle> {
-    return this.acquireTicket({ kind: 'round', scope }, signal)
+  async acquireGraphTick(scope: ExecutionScope, signal: AbortSignal): Promise<HostAdmissionHandle> {
+    return this.acquireTicket({ kind: 'graph_tick', scope }, signal)
   }
 
   async acquireModelCall(scope: ExecutionScope, signal: AbortSignal): Promise<HostAdmissionHandle> {
@@ -210,7 +210,7 @@ export class HostSchedulerCoordinator {
         workspaces: await this.readRecords<WorkspaceSchedulerLease>(this.workspaceDir()),
         tickets: await this.readRecords<AdmissionTicket>(this.ticketDir()),
         leases: await this.readRecords<HostAdmissionLease>(this.leaseDir()),
-        maxConcurrentRounds: this.maxConcurrentRounds,
+        maxConcurrentGraphTicks: this.maxConcurrentGraphTicks,
         maxConcurrentModelCalls: this.maxConcurrentModelCalls,
       }
     })
@@ -303,11 +303,11 @@ export class HostSchedulerCoordinator {
     now: number,
   ): boolean {
     const waitingTickets = tickets.filter(value => !value.grant)
-    if (ticket.kind === 'round') {
-      if (leases.filter(lease => lease.kind === 'round').length >= this.maxConcurrentRounds) return false
-      const roundTickets = waitingTickets.filter(value => value.kind === 'round')
+    if (ticket.kind === 'graph_tick') {
+      if (leases.filter(lease => lease.kind === 'graph_tick').length >= this.maxConcurrentGraphTicks) return false
+      const graphTickets = waitingTickets.filter(value => value.kind === 'graph_tick')
       const perWorkspace = new Map<string, AdmissionTicket>()
-      for (const candidate of roundTickets.sort(ticketOrder)) {
+      for (const candidate of graphTickets.sort(ticketOrder)) {
         if (!perWorkspace.has(candidate.scope.workspaceId)) perWorkspace.set(candidate.scope.workspaceId, candidate)
       }
       const winner = [...perWorkspace.values()].sort((a, b) =>
@@ -367,7 +367,7 @@ export class HostSchedulerCoordinator {
       leases.push(lease)
       await atomicWriteJson(this.leasePath(lease.leaseId), lease)
       await atomicWriteJson(this.ticketPath(winner.ticketId), winner)
-      if (winner.kind === 'round') {
+      if (winner.kind === 'graph_tick') {
         fairness.grants[winner.scope.workspaceId] = (fairness.grants[winner.scope.workspaceId] ?? 0) + 1
         normalizeGrantCounters(fairness.grants)
       }

@@ -2,14 +2,14 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.6.4` · Node.js `>= 18`
+> 当前版本:`0.7.0` · Node.js `>= 18`
 
 ---
 
 ## 特性概览
 
 - **五种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。模式只会显式选择，未指定时为 `agentic`。
-- **长周期 Loop 运行时**:`meta-agent loop ...` 提供章程、账本、round 调度与 daemon；它是会话之上的运行时，不是 `SessionMode`。
+- **长周期 Loop 运行时**:`meta-agent loop ...` 将自然语言需求自由编译为受约束图，再做保守静态校验与独立语义审阅；提供确定性路由、持久 Lane、自定义 Data Plane、Artifact/Evidence、timer/event、可恢复 paused 节点、Effect outbox、恢复与单机并发。安全边界由 Kernel 固定，领域节点和拓扑由 LLM 自由生成。
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
@@ -138,7 +138,7 @@ meta-agent --mode auto "把构建跑绿,修掉所有失败用例"      # 或 --y
 # 轻量无人值守(同款工作区监狱,但不启用 checkpoint/drift/verify,适合简单短任务)
 meta-agent --mode simple_auto "把 README 里的死链接都修掉"
 
-# 长周期多 Agent Loop（从需求文档生成 charter 草案）
+# 长周期多 Agent Loop（从需求文档生成可审核的执行图）
 meta-agent loop distill requirements.md
 
 # 其它模式
@@ -196,11 +196,29 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 ### 长周期 Loop 运行时
 
-跨阶段、多 Agent 的长周期任务使用 `meta-agent loop create|tick|list|inspect|pause|resume|inbox|distill`，而不是会话模式。Loop 把 charter、round ledger、预算和 daemon 调度放在会话之上；座位仍使用 `auto` / `simple_auto` / `agentic` 等会话档位执行。设计与命令详情见 [`docs/auto-orch-v2-spec.md`](docs/auto-orch-v2-spec.md)。
+跨阶段、多 Agent 的长周期任务使用 `meta-agent loop distill|create|tick|list|inspect|pause|resume|event`。Loop 只有一个执行模型：`durable-graph-v1`。自然语言由 Distill 编译为受约束 `LoopGraphSpec`，Freeze 校验并锁定能力版本，Kernel 只解释冻结图，不执行模型生成的代码。
 
-当前架构是**通用 Loop Kernel + 可插拔 Scenario**，内置 Research、Generic、Release、Compliance，并支持显式加载后续 Scenario 插件。机制、可靠性边界、并发模型、完整命令和排障方式见 [通用长周期 Loop 机制与使用指南](docs/loop-runtime-guide.md)；扩展 ABI 见 [Scenario 插件指南](docs/scenario-plugins.md)。
+`durable-graph-v1` 的核心是“Kernel 可靠执行 Distill 生成的任意受约束图节点和边”：Graph Node 只表达控制语义；强相关 Agent Node 共享持久 Execution Lane/session 和私有 worktree；`$state`、Reducer、Function、路由、timer/event、Artifact/Evidence、Activation journal 与恢复都由程序控制。Agent Node 统一通过专用 `graph_agent` SPI 执行；当前适配器复用 Meta-Agent KernelLoop 的工具循环、session resume 与上下文压缩，但不启用 Auto 的第二层编排。Graph Kernel 不再依赖具体 Agent 底座。
 
-Loop 下一代重构目标是“Kernel 可靠执行 Distill 生成的任意受约束图节点和边”。其中 Graph Node 只表达控制语义，多个强相关节点由同一个持久 Execution Lane/LLM session 执行，底层模式继续负责上下文压缩；完整方案见 [Durable Graph Loop Runtime 重构方案](docs/loop-durable-graph-runtime-plan.md)。
+Agent Node 可声明有序 Context Assembly Plan，通过版本化 Context Provider 精确选择 State、Input、命名 Evidence/Artifact View、Clock 和 continuation 数据，并选择 `activation_start`、`every_segment` 或 `continuation_only` 刷新策略。每个 prompt section 都携带来源、trust、provider integrity 和截断元数据；Lane/Node 可声明受限 systemInstructions，但不能覆盖 Kernel protected prompt。Runtime 不再向所有 Agent 隐式注入全局 Evidence。
+
+Distill 可声明任务专属的逻辑 `dataPlanes/dataViews`、Lane `dataAccess` 上限、Node 精确 Context View 与 publication。Freeze 把这些声明编译到固定的 State/Record/Journal/Workspace backend，校验 schema、trust、admission、retention 和 ACL，并锁定最终 Provider/Capability integrity；Kernel 不理解 Research/Release/Compliance 或 `semanticRole`，只执行冻结后的物理语义。真正新增存储执行语义必须由受信任、版本化 Capability Pack/Runtime 扩展，LLM 不能在图中临时生成代码。
+
+用户要求的任意目录/文件协议可由逻辑 `workspace` Data Plane 映射为 Input、State projection、Evidence、Artifact、Audit 或 Observability。Kernel 不预设 `progress.json`、`findings.jsonl` 等领域文件；未声明 Plane 的 Loop 行为不变。State/Record/Journal 物化文件可在 commit 后或恢复时幂等重建；Distill 节点使用 `builtin/data-plane-view@1` 选择逻辑 View，物理 workspace/evidence/artifact Provider 由 Freeze 生成。
+
+对训练、远端实验等紧密耦合的长生命周期，不应机械拆成 `submit/wait/inspect` 多个 Agent：用一个 persistent Lane 上的 Agent Activation 执行完整生命周期，Agent 可反复调用 timer hard park；恢复时 Activation ID 与 Lane lineage 不变，仅 `continuationVersion` 和执行段计数推进。GraphSpec 需同时声明单段 `budget`、完整 Activation 的 `lifetimeBudget` 以及 `timerPolicy.maxDelayMs/maxParks`。具体配置见下方运行指南。
+
+快速开始：
+
+```bash
+meta-agent -w /path/to/workspace loop distill requirements.md --out loop.graph.json
+# 审阅冻结前的图、权限、预算与边
+meta-agent -w /path/to/workspace loop create loop.graph.json
+meta-agent -w /path/to/workspace loop tick --until-quiescent
+meta-agent -w /path/to/workspace loop inspect <instanceId>
+```
+
+机制、GraphSpec 示例、Capability Pack 插件、可靠性边界和完整命令见 [通用长周期 Loop 机制与使用指南](docs/loop-runtime-guide.md)；Agent 执行边界见 [`graph_agent` 执行底座](docs/graph-agent-executor.md)；实现对应的架构决策见 [Durable Graph Loop Runtime 设计与实现](docs/loop-durable-graph-runtime-plan.md)。领域扩展统一通过 Capability Pack 提供 Function、Reducer、Effect、Context Provider 与 advisory Scenario guidance，不再存在独立 Scenario 执行器；Graph preset 属于后续 ABI。
 
 ---
 
@@ -451,4 +469,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.6.4`。
+当前包版本:`0.7.0`。

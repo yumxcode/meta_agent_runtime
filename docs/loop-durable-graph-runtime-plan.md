@@ -1,8 +1,18 @@
 # Durable Graph Loop Runtime 重构方案
 
-> 状态：目标架构设计，尚未替代当前 `legacy-round-v1` Runtime。
+> 状态：`durable-graph-v1` 已成为唯一 Loop 执行架构。此前的固定流程实现、Charter/Scenario ABI 与兼容执行路径已移除。本文既是架构决策记录，也是实现边界说明。
 >
 > 核心目标：**Kernel 可靠执行 Distill 生成的任意受约束图节点和边。**
+
+实现入口：
+
+- Graph ABI/冻结校验：`src/loop/graph/spec/`
+- Function/Reducer/Effect/Context Provider/Capability Pack：`src/loop/graph/registry/`
+- Journal、Activation、Lane、节点执行、提交与调度：`src/loop/graph/runtime/`
+- 自然语言编译与校验修复：`src/loop/graph/distill/`
+- CLI/Wake/Graph 调度：`src/loop/cli.ts`、`src/loop/runner.ts`、`src/loop/daemon.ts`
+
+当前已实现 Agent/Function/Effect/Wait/Join(all/any)/Terminal、确定性 `$state` 路由、Reducer、输入快照、声明式 Context Assembly、逻辑 Data Plane/View、Lane 数据 ACL、Freeze 物理编译、严格 executable ABI + 开放 annotations、保守 schema 数据流检查、闭合路径检查、版本化 Context Provider、Lane/Node system instructions、Artifact/Evidence provenance、workspace 幂等投影、timer/event/paused-terminal resume、Effect intent/receipt ledger、commit intent/replay、可选 serializable State replay、Lane session/worktree、独立 Distill 语义 reviewer、单机 Activation 并发和带 Scenario guidance 的本地 Capability Pack loader。Quorum Join、跨主机共享 lease backend 和断电级 fsync 不在当前保证内。
 
 ## 1. 为什么重构
 
@@ -57,7 +67,7 @@ Commit Coordinator  共享提交：State、Artifact、Evidence、主 workspace
 
 ### 2.2 Loop 层不重复实现上下文压缩
 
-`agentic`、`auto`、`simple_auto` 已经负责：
+专用 `graph_agent` 执行 SPI 的当前 Meta-Agent 适配器已经负责：
 
 - 会话历史压缩；
 - 工具结果裁剪；
@@ -65,7 +75,7 @@ Commit Coordinator  共享提交：State、Artifact、Evidence、主 workspace
 - tool call/result 结构修复；
 - session resume。
 
-Graph Loop 不再实现第二套 LLM context compactor。它只负责每次 Activation 的确定性上下文装配，并把稳定 session 交给底层执行模式管理。
+Graph Loop 不再实现第二套 LLM context compactor。它只负责每次 Activation 的确定性上下文装配，并把稳定 session 交给 `graph_agent` 管理。Graph Kernel 不直接依赖 SessionRouter、SubAgentDispatcher 或 Meta-Agent task record；具体底座通过 `GraphAgentExecutor` 注入。
 
 ### 2.3 LLM 只能编排注册能力，不能生成可执行代码
 
@@ -103,6 +113,10 @@ Durable Graph Kernel
   ├─ Timer/Event/Effect Continuations
   ├─ Commit Coordinator
   └─ Execution Journal/Reconcile
+        │
+        ▼
+GraphAgentExecutor SPI
+  └─ MetaAgentGraphAgentExecutor（当前，可替换）
 ```
 
 ## 4. LoopGraphSpec
@@ -122,9 +136,8 @@ interface LoopGraphSpec {
   transitions: TransitionSpec[]
   entrypoints: EntrypointSpec[]
 
-  artifacts?: Record<string, ArtifactChannelSpec>
-  evidenceViews?: Record<string, EvidenceViewSpec>
-  effects?: Record<string, EffectBinding>
+  dataPlanes?: Record<string, DataPlaneSpec>
+  dataViews?: Record<string, DataPlaneViewSpec>
 
   limits: LoopLimits
   concurrency?: LoopConcurrencyPolicy
@@ -132,6 +145,10 @@ interface LoopGraphSpec {
 ```
 
 Graph 在 create/freeze 后固定。运行期间变化的是 Activation、State、Artifact、Evidence、Event 和 workspace revision，不允许运行中由 Agent 静默改图。
+
+Distill 只作者化逻辑 `dataPlanes/dataViews`、Lane `dataAccess`、Node 精确 View 与 publication。Freeze 将它们编译到固定 `state | record | journal | workspace` 后端，同时生成内部 Artifact channel、Evidence/Artifact View、Workspace Binding、`compiledLaneDataAccess` 物理 ACL 和物理 Context Provider，并把最终能力加入 capability lock。物理字段是 Frozen Graph 实现细节，不属于 Distill 输出 ABI。
+
+逻辑 Plane 的 `semanticRole`、名称和 schema 可以随任务变化；Kernel 不解释领域含义。新的物理存储执行语义不能由 LLM 在 JSON 中创造，必须先由版本化、带 integrity 的 Capability Pack/Runtime 扩展 Freeze 与能力目录。
 
 ## 5. `$state`：全图控制状态
 
@@ -168,7 +185,7 @@ state:
 - approval status；
 - active candidate ID；
 - deadline；
--最新 Artifact/Evidence 引用。
+- 最新 Artifact/Evidence 引用。
 
 完整日志、Patch、报告、大量历史记录不进入 `$state`，而进入 Artifact/Evidence Plane。
 
@@ -338,7 +355,7 @@ Timer/Event 是图的一等节点。Agent 可以输出动态等待时间，Wait 
 
 ### 8.5 Join Node
 
-支持 `all`、`any` 和 `quorum`，并持久化 fork group 和分支结果。
+当前支持 `all` 和 `any`，并持久化 fork group 和分支结果。`quorum` 留作后续 ABI 扩展。
 
 ### 8.6 Terminal Node
 
@@ -385,14 +402,14 @@ nodes:
 
 一个 Lane 实例拥有：
 
--稳定 session/lineage ID；
--底层模式管理的对话上下文；
--私有 workspace overlay/worktree；
--单线程 mailbox；
+- 稳定 session/lineage ID；
+- 底层模式管理的对话上下文；
+- 私有 workspace overlay/worktree；
+- 单线程 mailbox；
 - state/artifact/evidence cursor；
 - workspace revision；
--资源租约；
--上下文 Anchor。
+- 资源租约；
+- 上下文 Anchor。
 
 ### 9.3 自动 Lane 分组
 
@@ -413,25 +430,28 @@ implement → test → fix
 5. fork 分支默认创建独立 Lane overlay；
 6. join 后返回原主 Lane或进入显式 merge Lane。
 
-### 9.4 Activation Context Envelope
+### 9.4 Context Assembly Plan
 
-Loop 不压缩聊天，但每次调用底层 session 都重新注入：
+Loop 不压缩聊天。每个 Agent 自动获得 Kernel 强制的最小 activation section；其他上下文由节点声明有序计划：
 
 ```ts
-interface ActivationContextEnvelope {
-  loop: { id: string; goal: string; graphHash: string }
-  lane: { id: string; workspaceRevision?: string }
-  activation: { id: string; nodeId: string; attempt: number }
-  stateRevision: number
-  state: JsonValue
-  input: JsonValue
-  artifactViews: ArtifactView[]
-  evidenceViews: EvidenceView[]
-  openObligations: string[]
+interface ContextSectionSpec {
+  name: string
+  provider: string                 // versioned id@version
+  refresh: 'activation_start' | 'every_segment' | 'continuation_only'
+  config?: JsonValue
+  required?: boolean
+  maxBytes?: number
 }
 ```
 
-底层 session 可以自行压缩旧历史；当前节点的权威输入不会因压缩消失。session 丢失时，也能从 Envelope、Journal 和 Artifact/Evidence 重建。
+Context Provider Catalog 的内置 provider 包括 activation、input、state、命名 evidence/artifact view、clock 和 continuation。Capability Pack 可以注册新 provider；Freeze 把实际引用写入 `capabilityLock.contextProviders`，resume 时 integrity 不匹配则拒绝执行。
+
+`activation_start` 的解析结果进入 Activation journal，跨 timer/retry/process restart 保持同一快照；`every_segment` 每个物理段刷新；`continuation_only` 只在恢复段注入。Runtime 不再把全局最多 100 条 Evidence/Artifact 注入所有节点。
+
+每个最终 prompt section 包含 provider/source/trust/refresh/resolvedAt/stateVersion/truncated/bytes/content 元数据并统一做字节上限与边界转义。Lane `agentProfile.systemInstructions` 和 Node `systemInstructions` 位于 graph-authored system 区域；数据 section 始终位于 user context，不能冒充系统指令。
+
+文件协议不是 Research Scenario 的固定结构。Distill 用逻辑 `workspace` Data Plane 将用户自行命名的相对路径映射为 Input、State projection、Evidence、Artifact、Audit 或 Observability；没有该 Plane 的图完全不启用文件机制。Node 用 `builtin/data-plane-view@1` 选择逻辑 View，Freeze 生成 `builtin/workspace-binding@1` 和物理 binding；`WorkspacePlaneMaterializer` 在 commit/recovery 后从 Kernel State、Record View 或 Journal 幂等重建投影。由此控制状态仍以 `$state` 为权威，Agent 不再双写 materialize 文件，且任何领域都能声明自己的目录协议。
 
 ## 10. 显式数据流
 
@@ -569,25 +589,31 @@ pivot:
 
 ```ts
 interface NodeActivation {
-  activationId: string
-  loopId: string
+  id: string
   nodeId: string
-  laneId: string
+  laneId?: string
   parentActivationId?: string
-  forkGroupId?: string
-  status: 'ready' | 'claimed' | 'running' | 'waiting' |
-    'completed' | 'failed' | 'cancelled'
-  inputSnapshot: JsonValue
-  stateRevisionAtEnqueue: number
-  evidenceSnapshots: EvidenceSnapshotRef[]
+  status: 'ready' | 'running' | 'waiting' | 'committing' |
+    'succeeded' | 'failed' | 'cancelled'
+  input: Record<string, JsonValue>
+  inputStateVersion: number
   attempt: number
-  claim?: { token: string; owner: string; expiresAt: number }
+  segmentCount: number
+  parkCount: number
+  usage: { turns: number; costUsd: number; durationMs: number }
+  firstStartedAt?: number
+  readyReason?: 'initial' | 'continuation' | 'retry'
+  continuationVersion: number
+  lease?: { token: string; owner: string; expiresAt: number }
   output?: JsonValue
-  continuation?: ContinuationSpec
+  outcome?: string
+  wakeAt?: number
 }
 ```
 
 Activation ID 由 loop、parent activation、transition、target node、branch index 等稳定信息派生，重复调度同一条已提交边不会制造重复 Activation。
+
+Activation 是逻辑业务执行，不等于一次 Agent 进程调用。一次 Agent 进程调用称为 segment；hard park 结束当前 segment，唤醒后仍以同一 Activation ID 在原 Lane 开始下一 segment。`attempt` 只统计初次执行和 lease 失效后的 retry，timer continuation 不增加 attempt；`segmentCount`、`parkCount` 和 `continuationVersion` 分别记录执行段、已提交 park 和恢复 fencing 版本。
 
 ## 13. Durable Graph Kernel
 
@@ -614,31 +640,23 @@ RECONCILE
 
 ## 14. Execution Journal
 
-新增权威日志：
+权威日志是按 sequence 编号的 append-only 文件：
 
 ```text
-ledger/execution.jsonl
+.loop/<instanceId>/graph/journal/000000000001.json
 ```
 
-事件包括：
+当前 ABI 的事件包括：
 
 ```text
-loop.created
-activation.enqueued
-activation.started
-activation.committed
-activation.waiting
-activation.resumed
-activation.retry_scheduled
-activation.cancelled
-transition.selected
-loop.paused
-loop.resumed
-loop.terminal
-graph.migrated
+graph_created
+activation_claimed
+activation_released
+activation_committed
+graph_status_changed
 ```
 
-每次 transition 记录当时 state revision、表达式结果、函数版本、选中边和子 Activation ID，确保可解释和 replay。
+`activation_released.reason` 区分 `parked`、`resumed`、`lease_expired` 和 Kernel failure；`activation_committed` 原子携带 state、instance、选中 transition、下游 Activation、取消项与 Artifact/Evidence。由此可以重建所有 projection，并保证 replay 可解释。
 
 ## 15. Time、Event、Effect 与 Resume
 
@@ -650,9 +668,256 @@ event → eventType + correlationKey + timeoutAt
 effect → effectKey + adapter + retry/deadline
 ```
 
-唤醒只将对应 Activation 从 waiting 变为 ready。Resume 恢复的是同一 Activation 和同一 input/evidence snapshot。
+唤醒只将对应 Activation 从 waiting 变为 ready。Resume 恢复的是同一 Activation 和同一 input/evidence snapshot，而不是从 entrypoint 重跑整张图。
 
-Agent 需要动态等待时，输出 `wait_ms` 或 correlation key，路由到 Wait Node，由 Kernel 注册 continuation。
+物理执行进程可以在等待后退出；Timer 是落盘的 durable Wake，不是进程内 `setTimeout`。时间到后可由新进程重新加载 Frozen Graph 并继续原来的图位置。
+
+### 15.1 显式 Wait Node
+
+适合等待前的工作已经完整提交，且下一步在 Distill 阶段已经确定的流程，例如发布后的固定冷却窗口：
+
+```text
+publish_release → wait_30_minutes → verify_rollout
+```
+
+```yaml
+nodes:
+  wait_rollout:
+    type: wait
+    wait:
+      kind: timer
+      delayMs: { literal: 1800000 }
+      maxDelayMs: 86400000
+
+transitions:
+  - id: verify_after_wait
+    from: wait_rollout
+    on: timer
+    to: { node: verify_rollout }
+
+  - id: escalate_wait_failure
+    from: wait_rollout
+    on: failure
+    to: { node: escalate }
+```
+
+不要用这一结构机械拆分同一个远端训练生命周期。如果提交任务、观察曲线、决定是否继续等待和最终收口需要同一个 Agent 的连续判断，应使用下一节的单一长生命周期 Agent Activation。
+
+执行过程：
+
+```text
+进入 Wait Node
+→ 持久化 waiting Activation/Continuation
+→ 注册 activation-scoped Wake
+→ 当前进程和 Lane 资源可以释放
+→ wakeAt 到期
+→ Scheduler claim Wake
+→ Wait Activation completed
+→ 按 timer outcome 的 Transition 创建下游 Activation
+```
+
+### 15.2 Agent 自调用 Timer（Hard Park）
+
+适合必须由 Agent 根据语义判断“是否还值得继续等待”的场景，例如观察训练曲线、等待实验收敛或检查远端任务中间状态。
+
+```yaml
+nodes:
+  inspect_training:
+    type: agent
+    lane: training
+    budget:
+      turns: 20
+      usd: 1
+      wallTimeMs: 900000
+    lifetimeBudget:
+      turns: 200
+      usd: 10
+      elapsedMs: 21600000
+    timerPolicy:
+      allowHardPark: true
+      maxDelayMs: 3600000
+      maxParks: 12
+```
+
+Agent 调用受控 timer tool：
+
+```json
+{
+  "afterMs": 1800000,
+  "reason": "训练指标仍在改善，30 分钟后重新检查",
+  "checkpoint": {
+    "jobId": "train-42",
+    "lastObservedStep": 18000,
+    "decision": "loss is still decreasing"
+  }
+}
+```
+
+timer 调用具有 hard-park 语义：
+
+1. 立即终止当前 Agent 执行段；
+2. 不允许在 timer tool result 后继续调用工具或提交 Node output；
+3. 当前 Activation 不标记 completed，而是进入 waiting；
+4. 已产生的费用、输入、Evidence snapshot 和 Lane lineage 全部落盘；
+5. 时间到后恢复同一个 Agent Activation，而不是创建一次全新业务执行。
+
+`checkpoint` 是 Agent 自主选择的、小型 JSON 恢复锚点。Kernel 把它物化为下一 segment 的 `__continuationCheckpoint` 输入。它不保存完整对话，也不替代底层 session 的上下文压缩。
+
+### 15.3 Timer Continuation 的持久投影
+
+```ts
+ActivationRecord {
+  id: string
+  nodeId: string
+  laneId?: string
+  status: 'waiting'
+  continuationVersion: number
+  wakeAt: number
+  input: {
+    __agentTimerReason?: string
+    __continuationCheckpoint?: JsonValue
+  }
+  usage: { turns: number; costUsd: number; durationMs: number }
+  parkCount: number
+}
+
+WakeRecord {
+  loopId: string
+  activationId: string
+  fireAt: number
+  status: 'pending' | 'claimed' | 'done' | 'cancelled'
+}
+```
+
+Journal 写入：
+
+```json
+{
+  "type": "activation_released",
+  "reason": "parked",
+  "activation": {
+    "id": "act-123",
+    "nodeId": "inspect_training",
+    "status": "waiting",
+    "continuationVersion": 2,
+    "wakeAt": 1893456000000,
+    "parkCount": 2
+  }
+}
+```
+
+### 15.4 时间到后的恢复协议
+
+```text
+Wake 到期
+→ Scheduler 原子 claim Wake
+→ 校验 Wake claim token
+→ 校验 Activation.status == waiting
+→ 校验 continuationVersion 仍是当前版本
+→ Activation waiting → ready
+→ 重新获取原 Execution Lane
+→ 恢复原 lineage session
+→ 注入 Timer Resume Envelope
+→ 继续同一个 Node/Activation
+```
+
+Resume Envelope 至少包含：
+
+```text
+activation/node/lane
+原始 timer reason
+scheduledAt/wakeAt/实际 wokeAt
+parkCount/累计等待时间
+原始 input snapshot
+当前 committed State
+固定 Evidence snapshot
+workspace revision 变化提示
+```
+
+`graph_agent` 继续负责 session resume 和上下文压缩；当前适配器复用 Meta-Agent KernelLoop 的实现。如果原 session 已丢失，Lane Manager 从 Activation Envelope、Journal、Artifact/Evidence 和 workspace revision 重建一个新 session。
+
+### 15.5 Scheduler/进程不需要常驻
+
+Timer Wake 必须存储在 durable store。以下情况都不能丢失执行位置：
+
+```text
+当前 tick 进程退出
+daemon 空闲退出
+机器重启
+scheduler 在 wakeAt 之后才恢复
+```
+
+Scheduler 启动时执行 RECONCILE：发现 waiting Activation 的 Wake 文件缺失时先从 `wakeAt` 重建 durable Wake；到期后 Kernel 将其恢复为 ready。即使晚了数小时，也只恢复一次，不按错过的时间间隔重复执行。这也关闭了“park journal 已提交、Wake 文件尚未写入时进程退出”的双存储崩溃窗口。
+
+### 15.6 幂等、Fencing 与重复 Wake
+
+Wake 交付可以是 at-least-once，但 resume commit 必须幂等。去重身份由以下信息共同确定：
+
+```text
+activationId
+continuationVersion
+wakeId
+claimToken
+```
+
+如果 Agent 在恢复后再次 park，`continuationVersion` 增加。旧版本 Wake 即使延迟到达，也只能写入 stale-wake 审计，不能恢复或修改当前 Activation。
+
+Activation waiting→ready 的 CAS、Wake token 校验和 journal append 必须处于同一个受 fencing 保护的恢复协议中。
+
+### 15.7 Pause/Resume
+
+人工 pause：
+
+- 保留 TimerContinuation 和原始 `wakeAt`；
+- 冻结或取消可触发的 Wake；
+- 不消费 timer、不恢复 Lane。
+
+人工 resume：
+
+- 若 `wakeAt` 尚未来到，按剩余时间重新注册 Wake；
+- 若 `wakeAt` 已经过期，立即把 Activation 恢复为 ready；
+- 仍使用相同 Activation、input snapshot 和 continuation identity。
+
+### 15.8 硬上限与超时路由
+
+Agent 自调用 timer 必须同时受以下限制：
+
+```text
+timerPolicy.maxDelayMs
+timerPolicy.maxParks
+lifetimeBudget.turns
+lifetimeBudget.usd
+lifetimeBudget.elapsedMs
+Loop deadline
+Loop activation/cost budget
+```
+
+达到上限后，Kernel 不提交新的 park，而是把当前执行段转换成确定性的失败结果：
+
+```text
+outcome = failure
+output.error = "Agent Activation ... exceeded"
+```
+
+并按 Graph 中预先冻结的边路由：
+
+```yaml
+- id: training_lifetime_exceeded
+  from: inspect_training
+  on: failure
+  to: { node: escalate }
+```
+
+不能让 Agent 通过无限 timer park 绕过 activation、费用或 lifetime 限制。
+
+### 15.9 Event 与 Effect 延续同一模型
+
+Event continuation 保存 `eventType + correlationKey + timeoutAt`；Effect continuation 保存 `effectKey + adapter + retry/deadline`。两者和 Timer 共用 Activation waiting/ready 状态机、continuation version、fencing 和 first-wins 恢复协议。
+
+Agent 需要动态等待但不需要保留未完成会话时，也可以结构化输出 `wait_ms` 或 correlation key，完成当前 Node 后路由到显式 Wait Node。选择原则：
+
+- 等待前 Node 工作已经完整提交：使用显式 Wait Node；
+- 需要时间到后继续同一 Agent 的未完成判断过程：使用 Agent self-timer hard park。
 
 ## 16. 并发与竞态写
 
@@ -704,17 +969,17 @@ external:k8s:production
 
 不相交资源可以并行提交。重叠写入处理方式：
 
--同一因果闭环：放入同一 Lane 串行；
--竞争方案：独立 overlay，选择 winner 后只提交一个；
--必须合并：进入 Merge Node；
+- 同一因果闭环：放入同一 Lane 串行；
+- 竞争方案：独立 overlay，选择 winner 后只提交一个；
+- 必须合并：进入 Merge Node；
 - commutative Reducer：按 manifest 合并；
--不可证明安全：静态拒绝或冲突后重跑。
+- 不可证明安全：静态拒绝或冲突后重跑。
 
 不同 Loop Instance 操作同一 workspace 时，也经过 workspace identity 级 Commit Coordinator。
 
 ## 17. Distill Compiler
 
-Distill 是编译器，而不是固定 Charter 填表器：
+Distill 是编译器，而不是固定流程填表器：
 
 ```text
 需求提取
@@ -734,16 +999,16 @@ Distill 是编译器，而不是固定 Charter 填表器：
 
 静态验证至少保证：
 
--所有节点从 entry 可达；
+- 所有节点从 entry 可达；
 - terminal/escalation 可达；
--每组 route 有唯一选择或显式 fork；
--每个 cycle 有 activation/budget/deadline 上限；
+- 每组 route 有唯一选择或显式 fork；
+- 每个 cycle 有 activation/budget/deadline 上限；
 - wait 有 timeout route；
 - join 不会静态死锁；
--所有 DataBinding 类型匹配；
+- 所有 DataBinding 类型匹配；
 - Reducer/Function/Effect ID 真实注册；
--副作用有 idempotency key；
--并行 write set 不冲突；
+- 副作用有 idempotency key；
+- 并行 write set 不冲突；
 - Lane context/workspace 策略闭合。
 
 产物：
@@ -757,44 +1022,24 @@ capability-lock.json
 
 ## 18. Capability Pack 取代具体 Scenario
 
-Capability Pack 只提供领域组件：
+Capability Pack 提供领域组件；当前 v1 loader 已正式支持 Function/Reducer、Effect、Context Provider 和 advisory Scenario Guidance：
 
 ```text
-Artifact Schema
 Function/Reducer
 Effect Protocol
-Agent Node Template
-Evidence View Template
-Report Renderer
-Distill Guidance
-Graph Preset
+Context Provider
+Scenario Guidance + bounded advisory Graph Fragment（已实现，非模板、可组合/可忽略）
+Capability input/output schema（已实现）
+Graph Preset / Report Renderer / 新物理 Backend（规划中）
 ```
 
-现有 Research direction/finding、Release manifest/note、Compliance bundle/approval 都应成为 preset，而不是 Kernel 或整个领域 Scenario 的固定语义。多个 Pack 可以同时参与同一 Graph。
+Research direction/finding、Release manifest/note、Compliance bundle/approval 等只能作为 guidance 或未来 preset 的例子，而不是 Kernel 或整个领域 Scenario 的固定语义。多个 Pack 可以同时参与同一 Graph；Distill reviewer 不得以某个 guidance 为固定拓扑判据。
 
-## 19. 兼容策略
+## 19. 唯一执行模型
 
-实例明确记录执行器：
+实例只记录并执行 `durable-graph-v1`。CLI、runner、daemon、Wake scheduler 和公开导出均不再探测或分派其他 Loop engine；`create` 只接受 `graph-1.0`。旧格式不会在 load 时静默转换，避免两套恢复语义、状态真相和插件 ABI 长期共存。
 
-```text
-legacy-round-v1
-durable-graph-v1
-```
-
-旧实例继续使用旧 Kernel；新 Distill 默认生成 GraphSpec。提供显式 `legacyCharterToGraphSpec` 和迁移模拟，但不在 load 时静默转换。
-
-旧概念映射：
-
-| 旧机制 | Graph Runtime |
-| --- | --- |
-| worker/judge/pivoter/finalizer | 任意 Agent Node |
-| meters | State + Reducer |
-| tripwires | Transition |
-| continue/pivot | 普通回边/策略节点 |
-| finalize/escalate | Terminal Node |
-| pending_round | Activation Continuation |
-| ScenarioRuntime | Capability Providers/Presets |
-| RoundEntry | 可选 iteration 投影 |
+领域复用统一落到 Capability Pack、Graph preset 和 Distill guidance。Kernel 不包含 Research、Release、Compliance 或其他领域分支。
 
 ## 20. 实施阶段
 
@@ -806,8 +1051,8 @@ durable-graph-v1
 6. **Effect/Event/Resume**：外部副作用和 continuation。
 7. **Fork/Join/Commit Coordinator**：Activation 级并发和冲突分析。
 8. **Distill Compiler**：自然语言生成、修复、解释和 Freeze。
-9. **Capability Packs/Legacy Adapter**：现有 Scenario 降级为 preset。
-10. **产品化**：CLI inspect/trace/simulate、迁移和完整 crash matrix。
+9. **Capability Packs**：领域 Function/Reducer/Effect/Schema/Guidance/preset 可组合加载。
+10. **产品化**：CLI inspect/trace/simulate 和完整 crash matrix。
 
 ## 21. 验收场景
 
@@ -817,7 +1062,7 @@ durable-graph-v1
 2. `state >= 2` 与 `state >= 8` 的确定性优先级路由；
 3. persistent development Lane 跨多个循环保持上下文和 overlay；
 4.底层 session 发生压缩后仍收到完整 Activation Envelope；
-5.三个 readonly reviewer 并行并 quorum join；
+5.三个 readonly reviewer 并行并 all/any join（quorum 留作后续 ABI 扩展）；
 6.两个竞争实现分支只提交 winner；
 7.并行分支写同一 state/workspace 时静态拒绝；
 8. Judge 基于固定 Evidence Snapshot，后到 Evidence 不污染本次判断；
@@ -825,7 +1070,7 @@ durable-graph-v1
 10.每个 commit 边界 kill -9 后不重复提交；
 11. stale claim 不能写 State/Artifact/workspace；
 12. reducer/plugin integrity 变化时拒绝 resume；
-13.无出口 cycle、缺失 fallback、无 timeout wait 在 create 前被拒绝；
+13.无出口 cycle、缺失 fallback、无界 Effect 与无界 Agent hard park 在 create 前被拒绝；
 14.不同 Loop 写同一 workspace 路径时由全局 Coordinator 协调。
 
 ## 22. 最终定位
@@ -842,7 +1087,7 @@ Kernel 如何可靠地执行 Distill 生成的任意受约束图节点和边
 Distill             设计图、State、Lane、数据流、Reducer 和路由
 Graph Kernel        执行 Activation、Transition、Wait、Commit 和 Recovery
 Execution Lane      让强相关节点共享 LLM context 和私有工作副本
-底层执行模式         管理 Agent 对话、工具循环和上下文压缩
+graph_agent SPI      管理 Agent segment、对话、工具循环和上下文压缩
 Artifact/Evidence   提供全图一致、可审计、可快照的公共知识
 Commit Coordinator  处理 State、Artifact 和 workspace 的共享提交
 ```
@@ -852,3 +1097,19 @@ Commit Coordinator  处理 State、Artifact 和 workspace 的共享提交
 > Graph Node 保留精确控制语义；多个强相关 Graph Node 由同一个持久 Execution Lane/LLM session 执行。
 
 这样同时保留图的泛化、审计和恢复能力，又避免“每节点一个 Agent”造成的上下文断裂与并发写退化。
+
+## 23. 可靠性加固（2026-07-14 复核）
+
+当前实现进一步固定以下不变量：
+
+- daemon abort 是 replay，不是业务 failure；确认取消前绝不重放同一 Lane，无法确认取消则 fail-stop；
+- Agent 常规失败受 `maxAttempts` 约束，runner 未分类故障最多退避五次；
+- Event 先落持久 inbox，按事件时间与 timeout first-wins；
+- fork group 标识一个 Join epoch，`Join(any)` 的迟到分支不能二次触发；
+- Journal 使用 sequence counter、周期 checkpoint 和 tail fold，heartbeat 不增长 Journal；
+- Artifact 容量是 publication gate，不是实例级异常；
+- Effect 的 `timeoutMs` 覆盖 submit 后的完整 poll 生命周期；
+- Lane merge 冲突 pause 图并保留 terminal replay，使用 `loop lane-repair` 显式恢复；
+- entrypoint Function 物化在 Graph transaction lock 外执行。
+
+完整逐项证据见 [Durable Graph Loop Runtime 代码评审与复核](loop-graph-runtime-review-2026-07-14.md)。

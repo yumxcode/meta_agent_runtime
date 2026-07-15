@@ -4,8 +4,8 @@
 
 - [Architecture overview](architecture/meta-agent-architecture.md)
 - [Generic long-running Loop mechanism and usage](loop-runtime-guide.md)
-- [Durable Graph Loop Runtime redesign plan](loop-durable-graph-runtime-plan.md)
-- [Loop Scenario plugin ABI](scenario-plugins.md)
+- [`graph_agent` execution substrate and replacement contract](graph-agent-executor.md)
+- [Durable Graph Loop Runtime design and implementation map](loop-durable-graph-runtime-plan.md)
 - [Permissions](permissions.md)
 - [Workflow system design](workflow-system-design.md)
 
@@ -19,6 +19,7 @@
 
 ## Reviews
 
+- [Durable Graph Loop Runtime review and remediation audit (2026-07-14)](loop-graph-runtime-review-2026-07-14.md)
 - [Latest code review](reviews/CODE_REVIEW_2026-05-31.md)
 - [Code review 2026-05-29](reviews/CODE_REVIEW_2026-05-29.md)
 - [Legacy code review](reviews/CODE_REVIEW.md)

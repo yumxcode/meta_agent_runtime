@@ -1,12 +1,12 @@
 /**
- * Expr — the restricted expression DSL for charter rules (loop v2, spec §3.2 / D3).
+ * Expr — the restricted deterministic expression DSL for graph edge conditions.
  *
- * Charter meters/tripwires are DATA, not code: strings like
+ * Graph conditions are data, not executable source: strings like
  * `"stale_count >= 2 && metric_delta < 0"` are parsed ONCE at instantiation
- * into a JSON AST (stored in the frozen charter snapshot) and evaluated by
+ * into a JSON AST (stored in the frozen graph snapshot) and evaluated by
  * this interpreter at fixed kernel steps (MODE/METER/ROUTE). There is no
  * codegen and no eval — the evaluator is a pure function over a closed value
- * domain, so a charter can be statically validated, diffed, and replayed.
+ * domain, so a graph can be statically validated, diffed, and replayed.
  *
  * Whitelist (everything else is a parse error):
  *   literals      number, 'string', "string", true, false
@@ -95,8 +95,8 @@ function tokenize(src: string): Token[] {
       continue
     }
     // Deliberate rejections with precise messages (spec: no calls/index/ternary).
-    if (ch === '[' || ch === ']') throw new ExprError('indexing is not allowed in charter expressions', src)
-    if (ch === '?' || ch === ':') throw new ExprError('ternary is not allowed in charter expressions', src)
+    if (ch === '[' || ch === ']') throw new ExprError('indexing is not allowed in graph expressions', src)
+    if (ch === '?' || ch === ':') throw new ExprError('ternary is not allowed in graph expressions', src)
     if (ch === '=') throw new ExprError("assignment is not allowed (use '==')", src)
     throw new ExprError(`unexpected character '${ch}'`, src)
   }
@@ -178,7 +178,7 @@ class Parser {
 
 /**
  * Parse an expression. When `declared` is given, every identifier must be in
- * it — this is the create-time static check (D3): a charter referencing an
+ * it — this is the create-time static check: a graph referencing an
  * undeclared observable/meter is rejected BEFORE the loop ever runs.
  */
 export function parse(src: string, declared?: ReadonlySet<string>): Ast {

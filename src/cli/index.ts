@@ -30,21 +30,19 @@ import * as readline from 'node:readline'
 import { createInterface } from 'node:readline'
 import { once } from 'node:events'
 import { Writable } from 'node:stream'
-import { isAbsolute, resolve, join, basename, relative } from 'node:path'
-import { createHash } from 'node:crypto'
-import { existsSync, mkdirSync, statSync, readFileSync, writeFileSync } from 'node:fs'
+import { isAbsolute, resolve, join, basename } from 'node:path'
+import { existsSync, mkdirSync, statSync } from 'node:fs'
 import { SessionRouter } from '../routing/SessionRouter.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import {
-  runLoopCli, runLoopScheduler, buildDistillerSystem, parseDistillOutput, validateCharter,
-  createBuiltinScenarioRegistry, loadScenarioPlugins, type LoopEvent,
+  runLoopCli, runLoopScheduler, createDefaultGraphRuntimeCatalog, loadGraphCapabilityPacks,
+  MetaAgentGraphAgentExecutor,
 } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
-import { listAllSkillNames } from '../tools/system/skill/index.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
@@ -94,7 +92,6 @@ import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { CLI_VERSION } from './version.js'
-import { ensureWorkspaceIdentity } from '../loop/workspace/WorkspaceIdentity.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -237,16 +234,17 @@ ${bold('OPTIONS')}
   -v, --version         Print version
   -h, --help            Show this help
 
-${bold('LOOP RUNTIME (charter-driven long-horizon loops)')}
-  meta-agent loop distill <需求.md>        Distill a requirement doc into a charter draft (visible agentic session)
-  meta-agent loop distill <需求.md> --resume --note "<意见>"  Co-create: resume the distill session and refine the draft
-  meta-agent loop create <charter.json>    Validate+freeze a charter, init the instance, schedule first wake
+${bold('LOOP RUNTIME (durable graph only)')}
+  meta-agent loop distill <需求.md>        Compile natural language into a validated LoopGraphSpec
+  meta-agent loop create <graph.json>     Freeze capabilities, create an instance, schedule its first wake
+  meta-agent loop event <id> <name>       Resume matching graph event waits
   meta-agent loop list                     List loop instances in this workspace
-  meta-agent loop inspect <instanceId>     Status + progress + recent rounds
-  meta-agent loop inbox <instanceId> <msg> Drop feedback for the next round
-  meta-agent loop tick [--until-quiescent] Claim due wakes and run rounds
-  meta-agent loop migrate <instanceId>     Migrate a live instance to a newer charter version
-  meta-agent loop-scheduler                Run the loop daemon until idle (unattended driver)
+  meta-agent loop inspect <instanceId>     State, activations, wakes and public artifacts/evidence
+  meta-agent loop tick [--until-quiescent] Claim due wakes and advance graphs
+  meta-agent loop pause|resume|stop <id>   Control an instance lifecycle
+  meta-agent loop capabilities             List frozen-capable Functions/Reducers/Effects/Packs
+  meta-agent loop-scheduler [options]      Run the loop daemon until idle (unattended driver)
+      --poll-ms <n> --idle-exit-ms <n> --max-concurrent-graphs <n>
   (put global flags like -w <dir> BEFORE the loop token: meta-agent -w <dir> loop tick)
 
 ${bold('INTERACTIVE COMMANDS')}
@@ -5020,34 +5018,31 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
 /**
  * Dispatch `meta-agent loop <cmd>` and `meta-agent loop-scheduler`.
  *
- * Pure-code loop subcommands (create/list/inspect/inbox/migrate) need no LLM
- * backend and run directly. `tick`, `distill`, and the `loop-scheduler` daemon
- * spawn seats, so they need a live dispatcher: we prewarm an `auto` backend
+ * Pure-code graph subcommands run directly. `tick`, `distill`, and the
+ * scheduler may spawn Agent nodes, so they prewarm an `auto` backend
  * (unattended base = autonomy jail + workspace confinement for spawned seats)
  * and hand its SubAgentBridge to the loop runtime.
  */
 async function runLoopCommand(opts: CliOptions): Promise<void> {
   const { name, args: rawLoopArgs } = opts.loopCommand!
   const projectDir = resolve(opts.workspace ?? process.cwd())
-  const { args, plugins } = extractRepeatedOption(rawLoopArgs, '--scenario-plugin')
-  const scenarios = plugins.length > 0
-    ? await loadScenarioPlugins(plugins, { projectDir, base: createBuiltinScenarioRegistry() })
-    : createBuiltinScenarioRegistry()
+  const graphOptions = extractRepeatedOption(rawLoopArgs, '--graph-pack')
+  const args = graphOptions.args
+  const graphCatalog = createDefaultGraphRuntimeCatalog()
+  if (graphOptions.plugins.length > 0) {
+    await loadGraphCapabilityPacks({
+      modulePaths: graphOptions.plugins.map(path => resolve(projectDir, path)),
+      target: graphCatalog,
+      registry: graphCatalog.packs,
+      allowedRoots: [projectDir],
+    })
+  }
   const sub = args[0]
-  const needsBackend = name === 'loop-scheduler' || sub === 'tick' || sub === 'distill'
+  const needsBackend = name === 'loop-scheduler' || sub === 'tick' || sub === 'distill' || sub === 'distill-graph'
 
   if (!needsBackend) {
-    // create / list / inspect / inbox / migrate — deterministic, no LLM.
-    console.log(await runLoopCli(args, { projectDir, scenarios }))
-    return
-  }
-
-  // Distill runs as a DIRECT streaming session (simple_auto), not a hidden
-  // sub-agent — so its work is visible in the CLI and easy to debug.
-  if (sub === 'distill') {
-    assertApiKeyConfigured(opts)
-    await ensureMcpServerInstructions()
-    await runDistillDirect(opts, projectDir, args, scenarios)
+    // create / list / inspect / lifecycle — deterministic, no LLM.
+    console.log(await runLoopCli(args, { projectDir, graphCatalog }))
     return
   }
 
@@ -5069,23 +5064,28 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   const abort = new AbortController()
   process.once('SIGINT', () => abort.abort())
   process.once('SIGTERM', () => abort.abort())
-  // Live progress: the kernel emits a LoopEvent per round/seat/wait transition;
-  // print each so the operator can watch the loop work (critical while testing).
   const stamp = (): string => new Date().toISOString().slice(11, 19)
-  const observer = (e: LoopEvent): void => {
-    const line = formatLoopEvent(e)
-    if (line) console.log(`${dim(`[loop ${stamp()}]`)} ${line}`)
-  }
   try {
     const warmed = await router.prewarmBackend()
     if (!warmed) throw new Error('could not create the loop backend (auto mode)')
     const dispatcher = SubAgentBridge.getBridge(router.getSessionId())
     if (!dispatcher) throw new Error('loop backend produced no sub-agent dispatcher')
+    const graphAgent = new MetaAgentGraphAgentExecutor(dispatcher)
 
     if (name === 'loop-scheduler') {
+      const schedulerNumber = (flag: string, fallback: number): number => {
+        const index = args.indexOf(flag)
+        if (index < 0) return fallback
+        const value = Number(args[index + 1])
+        if (!Number.isFinite(value) || value < 0) throw new Error(`${flag} requires a non-negative number`)
+        return value
+      }
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler start (workspace ${projectDir})`)
       const result = await runLoopScheduler({
-        dispatcher, projectDir, signal: abort.signal, observer, scenarios,
+        graphAgent, projectDir, signal: abort.signal, graphCatalog,
+        pollMs: schedulerNumber('--poll-ms', 2_000),
+        idleExitMs: schedulerNumber('--idle-exit-ms', 60_000),
+        maxConcurrentGraphs: schedulerNumber('--max-concurrent-graphs', 4),
         // Without onTick, per-wake errors from tickOnce (outcomes[].error) are
         // silently dropped in scheduler mode — `loop tick` prints them, so the
         // daemon must too, or spawn failures become invisible.
@@ -5096,9 +5096,9 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
         },
       })
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
-        `${result.roundsRun} round(s) over ${result.ticks} tick(s).`)
+        `${result.graphTicksRun} graph tick(s) over ${result.ticks} poll(s).`)
     } else {
-      console.log(await runLoopCli(args, { projectDir, dispatcher, signal: abort.signal, observer, scenarios }))
+      console.log(await runLoopCli(args, { projectDir, dispatcher, graphAgent, signal: abort.signal, graphCatalog }))
     }
   } finally {
     await router.dispose().catch(() => undefined)
@@ -5121,174 +5121,6 @@ function extractRepeatedOption(
     plugins.push(value)
   }
   return { args: kept, plugins }
-}
-
-/** One-line render of a kernel LoopEvent for the CLI progress stream. */
-function formatLoopEvent(e: LoopEvent): string {
-  switch (e.type) {
-    case 'round_started':   return `round ${e.round} [${e.mode}] started`
-    case 'seat_completed':  return `  ${e.seat} ${e.ok ? green('✓') : red('✗')} (cost $${e.costUsd.toFixed(3)})`
-    case 'waiting_entered': return `  ⏸ waiting (${e.waitName}) — ${e.effectKey}`
-    case 'harvest_started': return `  ▶ resume/harvest — ${e.effectKey}`
-    case 'round_completed': return `round ${e.round} done: route=${e.route} status=${e.status} cost=$${e.costUsd.toFixed(3)}`
-    case 'terminated':      return e.escalated
-      ? yellow(`⚠ terminated (${e.reason}) — needs human ack`)
-      : green(`■ finalized (${e.reason})`)
-    default:                return ''
-  }
-}
-
-/**
- * Distill a requirement doc into a charter draft as a DIRECT simple_auto session
- * (visible/streamed in the CLI), rather than a hidden sub-agent. Retries up to 3×,
- * feeding validation errors back, then writes the draft for human review.
- */
-/** value of a `--flag <value>` option, if present. */
-function flagValue(args: string[], name: string): string | undefined {
-  const i = args.indexOf(name)
-  return i >= 0 ? args[i + 1] : undefined
-}
-
-/** Prompt the human for a single line (co-creation feedback) on a TTY. */
-async function askLine(question: string): Promise<string> {
-  const rl = readline.createInterface({ input: process.stdin, output: process.stdout })
-  try { return (await new Promise<string>(res => rl.question(question, res))).trim() }
-  finally { rl.close() }
-}
-
-/** Stable distill session id derived from the requirement doc (or an explicit --session). */
-function distillSessionId(projectDir: string, workspaceId: string, docFile: string, override?: string): string {
-  const relativeDoc = relative(resolve(projectDir), resolve(projectDir, docFile)).replace(/\\/g, '/')
-  const key = override ? `override:${override}` : `doc:${relativeDoc}`
-  const digest = createHash('sha256').update(key).digest('hex').slice(0, 16)
-  return `loop-distill-${workspaceId}-${digest}`
-}
-
-/**
- * Distill a requirement doc into a charter draft as a DIRECT, VISIBLE agentic
- * session that PERSISTS — so the human can `--resume` it and co-create the draft
- * over several turns (each `--note` is one turn of feedback; the agent keeps its
- * full reasoning + workspace exploration across turns). Retries up to 3× per turn
- * feeding validation errors back, then writes the draft for review.
- */
-async function runDistillDirect(
-  opts: CliOptions,
-  projectDir: string,
-  args: string[],
-  scenarios: import('../loop/index.js').ScenarioRegistry,
-): Promise<void> {
-  const isResume = args.includes('--resume')
-  const out = flagValue(args, '--out') ?? 'charter.draft.json'
-  const sessionOverride = flagValue(args, '--session')
-  let note = flagValue(args, '--note')
-  // Positional doc path: skip flags and the values that follow value-flags.
-  const skip = new Set<string>()
-  for (const f of ['--out', '--note', '--session']) {
-    const i = args.indexOf(f)
-    if (i >= 0) { skip.add(args[i]!); if (args[i + 1]) skip.add(args[i + 1]!) }
-  }
-  const docFile = args.slice(1).find(a => !a.startsWith('--') && !skip.has(a))
-  if (!docFile) throw new Error('loop distill: requirement doc path required')
-  const doc = readFileSync(resolve(projectDir, docFile), 'utf-8')
-  const workspaceIdentity = await ensureWorkspaceIdentity(projectDir)
-  const sessionId = distillSessionId(projectDir, workspaceIdentity.workspaceId, docFile, sessionOverride)
-
-  assertApiKeyConfigured(opts)
-
-  // Resume: preload the prior distill transcript so the agent keeps context.
-  const priorMeta = isResume ? await SessionStore.getSession(sessionId) : null
-  if (priorMeta && priorMeta.workspaceId !== workspaceIdentity.workspaceId) {
-    throw new Error(`distill 会话 ${sessionId} 的 workspace identity 不匹配，拒绝恢复。`)
-  }
-  const priorMessages = isResume ? await SessionStore.loadHistory(sessionId) : []
-  if (isResume && priorMessages.length === 0) {
-    throw new Error(`没有可恢复的 distill 会话（${sessionId}）。请先不带 --resume 跑一次。`)
-  }
-  if (isResume) {
-    console.log(green(`✓ 已恢复 distill 会话 ${sessionId}（${priorMessages.length} 条历史）\n`))
-    if (!note) note = await askLine('修订意见 > ')
-    if (!note) throw new Error('loop distill --resume 需要修订意见（--note "…" 或交互输入）。')
-  }
-
-  const router = makeRouter(
-    { ...opts, mode: 'agentic', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
-    undefined, undefined, priorMessages.length > 0 ? priorMessages : undefined, undefined, undefined, undefined,
-  )
-  const tools = await createStandardTools({
-    system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
-    network: { webFetch: { maxResultSizeChars: 8_000 } },
-    mode: 'agentic',
-  })
-  for (const tool of tools) router.registerTool(tool)
-
-  const distillerSystem = buildDistillerSystem({
-    skillNames: await listAllSkillNames(projectDir, 'agentic'),
-  })
-  const freshPrompt =
-    `${distillerSystem}\n\n【loop 需求描述】\n${doc}\n\n` +
-    '你可以用 read_file/grep/glob 读工作区来理解项目。最后在一个 ```json 代码块里输出最终结果：' +
-    '{"charter": <Charter JSON>, "taskSpec": "<task_spec.md 内容>"}。'
-  const resumePrompt =
-    `【修订意见】\n${note}\n\n在现有草案基础上**最小改动**修订：保留已正确的部分，只改我指出的地方。` +
-    '最后在一个 ```json 代码块里重新输出完整 {"charter":..., "taskSpec":...}。'
-
-  try {
-    let lastErrors: string[] = []
-    let wrote = false
-    for (let attempt = 1; attempt <= 3; attempt++) {
-      const prompt = attempt > 1
-        ? `上一版章程未通过校验，必须修复：\n- ${lastErrors.join('\n- ')}\n` +
-          '请重新在一个 ```json 代码块里输出修正后的完整 {"charter":..., "taskSpec":...}。'
-        : (isResume ? resumePrompt : freshPrompt)
-      console.log(dim(`\n[distill] 第 ${attempt}/3 次尝试…\n`))
-      await streamPrompt(router, prompt, false, opts.showThinking)
-      const parsed = parseDistillOutput(undefined, lastAssistantText(router.getMessages()))
-      if (!parsed) { lastErrors = ['没有找到可解析的 ```json {charter, taskSpec} 代码块']; continue }
-      const errs = validateCharter(parsed.charter, scenarios)
-      if (errs.length === 0) {
-        writeFileSync(resolve(projectDir, out), JSON.stringify(parsed.charter, null, 2), 'utf-8')
-        if (parsed.taskSpec) writeFileSync(resolve(projectDir, 'task_spec.draft.md'), parsed.taskSpec, 'utf-8')
-        wrote = true
-        console.log(green(`\n✓ charter 草案已写入 ${out}（第 ${attempt} 次尝试，已通过校验）`))
-        if (parsed.taskSpec) console.log(dim('  task_spec.draft.md 仅供人工部署/审阅，不会被 loop create 执行'))
-        console.log(dim(`  审阅后运行:   meta-agent -w ${projectDir} loop create ${out}`))
-        console.log(dim(`  继续共创修订: meta-agent -w ${projectDir} loop distill ${docFile} --resume --note "你的意见"`))
-        break
-      }
-      lastErrors = errs
-      console.log(yellow(`\n[distill] 校验未过：\n- ${errs.join('\n- ')}`))
-    }
-    // Persist the transcript (success OR not) so the session is always resumable.
-    await SessionStore.replace(
-      sessionId,
-      { mode: 'agentic', startTime: Date.now(), lastActivity: Date.now(),
-        messageCount: router.getMessages().length, firstPrompt: `loop distill ${docFile}`,
-        workspace: projectDir, workspaceId: workspaceIdentity.workspaceId },
-      router.getMessages(),
-    ).catch(() => undefined)
-    if (!wrote) {
-      throw new Error(
-        `distill 未产出合格 charter（3 次尝试）:\n- ${lastErrors.join('\n- ')}\n` +
-        `会话已保存，可修订后继续: loop distill ${docFile} --resume --note "…"`,
-      )
-    }
-  } finally {
-    await router.dispose().catch(() => undefined)
-  }
-}
-
-/** Concatenate the text blocks of the last assistant message. */
-function lastAssistantText(msgs: readonly ConversationMessage[]): string {
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const m = msgs[i]!
-    if (m.role === 'assistant' && Array.isArray(m.content)) {
-      return m.content
-        .filter((b): b is { type: 'text'; text: string } => b.type === 'text')
-        .map(b => b.text)
-        .join('\n')
-    }
-  }
-  return ''
 }
 
 // ── Entry point ───────────────────────────────────────────────────────────────

@@ -1,6 +1,6 @@
 /**
  * Expr DSL — operator matrix, static checks, and every rejection path.
- * The evaluator is the ONLY thing standing between charter data and kernel
+ * The evaluator is the only thing standing between graph data and kernel
  * decisions, so its error paths are as load-bearing as its happy paths.
  */
 import { describe, expect, it } from 'vitest'
@@ -42,7 +42,7 @@ describe('parse + evaluate matrix', () => {
     expect(evalSrc('!flag || flag')).toBe(true)
   })
 
-  it('the real charter rules from the RL loop', () => {
+  it('evaluates compound graph routing rules', () => {
     expect(evalSrc('new_findings == 0 || metric_delta < 0')).toBe(true)
     expect(evalSrc('new_findings > 0 && metric_delta >= 0')).toBe(false)
     expect(evalSrc('budget.lifetime.exhausted')).toBe(false)

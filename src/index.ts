@@ -291,16 +291,45 @@ export { createResearchDispatchTool, RESEARCH_MAX_DURATION_MS } from './tools/re
 export { ResearchStore, buildResearchArtifactAnchors, researchRootDir } from './research/ResearchStore.js'
 export type { ResearchIndexEntry, SaveResearchResultOptions } from './research/ResearchStore.js'
 
-// ── Long-running Loop Scenario plugin ABI ────────────────────────────────────
-export { ScenarioRegistry, ScenarioPluginError } from './loop/scenarios/ScenarioRegistry.js'
-export { loadScenarioPlugins } from './loop/scenarios/ScenarioLoader.js'
+// ── Durable Graph Loop runtime ───────────────────────────────────────────────
 export {
-  SCENARIO_PLUGIN_API_VERSION,
-  type ScenarioPluginV1,
-  type ScenarioPluginManifest,
-  type ScenarioDefinition,
-  type ScenarioRuntime,
-  type ScenarioCapsuleView,
-  type ScenarioCapsuleSection,
-  type ScenarioJson,
-} from './loop/scenarios/ScenarioPlugin.js'
+  GraphKernel,
+  GraphStore,
+  ArtifactPlane,
+  freezeLoopGraph,
+  compileDataPlanes,
+  validateLoopGraph,
+  createDefaultGraphRuntimeCatalog,
+  loadGraphCapabilityPacks,
+  distillLoopGraph,
+  createBuiltinContextProviderRegistry,
+  ContextAssembler,
+  WorkspacePlaneMaterializer,
+  MetaAgentGraphAgentExecutor,
+  GRAPH_AGENT_PROFILE,
+  GRAPH_AGENT_SYSTEM_PROMPT,
+  runLoopCli,
+  runLoopScheduler,
+  type LoopGraphSpec,
+  type FrozenLoopGraphSpec,
+  type GraphRuntimeCatalog,
+  type GraphCapabilityPackV1,
+  type GraphInstanceRecord,
+  type GraphTickResult,
+  type GraphAgentExecutor,
+  type GraphAgentExecutionRequest,
+  type GraphAgentExecutionResult,
+  type ContextProvider,
+  type ContextAssemblyPlan,
+  type ContextSectionSpec,
+  type ContextRefreshPolicy,
+  type ContextSectionSnapshot,
+  type AgentProfileSpec,
+  type WorkspaceBindingSpec,
+  type WorkspaceProjectionSpec,
+  type WorkspacePlane,
+  type DataPlaneSpec,
+  type DataPlaneViewSpec,
+  type DataPlaneBackend,
+  type LaneDataAccessSpec,
+} from './loop/index.js'

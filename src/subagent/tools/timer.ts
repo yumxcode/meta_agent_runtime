@@ -1,33 +1,19 @@
-/**
- * timer — a loop worker's self-park channel.
- *
- * When a worker kicks off something slow (e.g. a remote training run) it decides
- * FOR ITSELF to check back later: it calls `timer` with a delay + reason. Calling
- * timer IMMEDIATELY ENDS this segment — the seat's runner parks the worker the
- * instant the tool returns (no separate return_result needed). The kernel
- * schedules a timer wake and RESUMES the same (lineage) worker after the delay
- * with a "continue" message, so the worker can look at the result itself and
- * decide to keep waiting (call `timer` again) or finish the round (write
- * findings/direction and return_result {"label":"ok"}).
- *
- * The park is enforced by the seat runner via a shared parkSignal (see Seats.ts /
- * SubAgentRunner): the sink flips it, the runner interrupts the session on the
- * timer tool_result. The worker therefore cannot "keep working after parking".
- *
- * Injected per-run by the loop seat; the `sink` closes over the seat's captured
- * park-intent slot (and, in Seats, also flips the parkSignal).
- */
+/** Generic hard-park tool for a durable Agent execution segment. */
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
 
 export interface TimerIntent {
   afterMs: number
   reason: string
+  checkpoint?: Record<string, unknown>
 }
 
-const MIN_MINUTES = 5        // shorter is churn — a remote task needs time to move
-const MAX_MINUTES = 3 * 60   // 3h cap — a longer single wait is a design smell
+const MAX_CHECKPOINT_BYTES = 16 * 1024
 
-export function makeTimerTool(sink: (intent: TimerIntent) => void): MetaAgentTool {
+export function makeTimerTool(
+  sink: (intent: TimerIntent) => void,
+  options: { maxDelayMs?: number } = {},
+): MetaAgentTool {
+  const maxDelayMs = options.maxDelayMs ?? Number.MAX_SAFE_INTEGER
   return {
     name: 'timer',
     isConcurrencySafe: false,
@@ -37,42 +23,73 @@ export function makeTimerTool(sink: (intent: TimerIntent) => void): MetaAgentToo
     // forced to inline-poll instead. timer returns instantly (records intent, the
     // runner then parks), so it is trivially abort-safe.
     abortSupport: 'cooperative',
-    description: `Park yourself and be woken later to continue THIS round.
+    description: `Durably park this Agent Activation and resume it later.
 
-Use when you've started something slow (e.g. a remote training run) and want to
-check back after a delay instead of finishing now. Calling timer ENDS this segment
-immediately — you do NOT need to return_result afterwards; the kernel resumes you
-(same session) after the delay with a message telling you to continue, where you
-re-check status and decide to wait again (call timer again) or harvest (write
-findings + return_result {"label":"ok"}).
-
-Choosing the delay — don't set it too short or too long:
-- minutes: 5..180 (i.e. 5 min .. 3 h). Below 5 min just churns; a single wait
-  longer than 3 h is a design smell — split it into repeated shorter waits.
-- Pick a delay proportional to how long the slow task actually needs to make
-  visible progress (e.g. ~30 min for a training run to move its reward curve).
-- reason:  short reason shown to you on resume (e.g. "check remote job progress").`,
+Calling timer immediately ends the current execution segment. Do not call more
+tools or submit node output afterwards. At the requested time, the Kernel resumes
+the same logical Activation on its persistent Lane. Use checkpoint for small JSON
+facts needed on resume, such as an external operation id or last observed state.`,
     inputSchema: {
       type: 'object',
-      required: ['minutes', 'reason'],
+      required: ['afterMs', 'reason'],
       properties: {
-        minutes: { type: 'number', description: 'Delay before resume, in minutes (5..180).' },
-        reason:  { type: 'string', description: 'Short reason, echoed back on resume.' },
+        afterMs: {
+          type: 'integer',
+          minimum: 1,
+          maximum: maxDelayMs,
+          description: 'Positive delay before resume, in milliseconds.',
+        },
+        reason: { type: 'string', description: 'Short domain-neutral reason, echoed on resume.' },
+        checkpoint: {
+          type: 'object',
+          description: 'Optional bounded JSON continuation data.',
+        },
       },
     },
     async call(input: Record<string, unknown>): Promise<ToolResult> {
-      const raw = Number(input['minutes'])
-      if (!Number.isFinite(raw) || raw < MIN_MINUTES || raw > MAX_MINUTES) {
-        return { content: `Error: timer "minutes" must be ${MIN_MINUTES}..${MAX_MINUTES} (5 min .. 3 h).`, isError: true }
+      const afterMs = Number(input['afterMs'])
+      if (!Number.isSafeInteger(afterMs) || afterMs < 1 || afterMs > maxDelayMs) {
+        return { content: `Error: timer "afterMs" must be an integer in 1..${maxDelayMs}.`, isError: true }
       }
       const reason = String(input['reason'] ?? '').trim()
       if (!reason) return { content: 'Error: timer requires a non-empty "reason".', isError: true }
-      sink({ afterMs: Math.round(raw) * 60_000, reason })
+      const checkpoint = input['checkpoint']
+      if (checkpoint !== undefined && (!isJsonObject(checkpoint) || jsonByteLength(checkpoint) > MAX_CHECKPOINT_BYTES)) {
+        return { content: `Error: timer checkpoint must be a JSON object no larger than ${MAX_CHECKPOINT_BYTES} bytes.`, isError: true }
+      }
+      sink({
+        afterMs,
+        reason,
+        ...(checkpoint !== undefined ? { checkpoint } : {}),
+      })
       return {
-        content: `Parked for ${Math.round(raw)} min ("${reason}"). This segment ends now; ` +
+        content: `Parked for ${afterMs} ms ("${reason}"). This segment ends now; ` +
           `you will be resumed after the delay to continue.`,
         isError: false,
       }
     },
   }
+}
+
+function isJsonObject(value: unknown, seen = new Set<object>()): value is Record<string, unknown> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return false
+  if (seen.has(value)) return false
+  seen.add(value)
+  return Object.entries(value as Record<string, unknown>).every(([key, child]) =>
+    key !== '__proto__' && key !== 'constructor' && key !== 'prototype' && isJsonValue(child, seen))
+}
+
+function isJsonValue(value: unknown, seen: Set<object>): boolean {
+  if (value === null || typeof value === 'string' || typeof value === 'boolean') return true
+  if (typeof value === 'number') return Number.isFinite(value)
+  if (Array.isArray(value)) {
+    if (seen.has(value)) return false
+    seen.add(value)
+    return value.every(child => isJsonValue(child, seen))
+  }
+  return isJsonObject(value, seen)
+}
+
+function jsonByteLength(value: Record<string, unknown>): number {
+  return Buffer.byteLength(JSON.stringify(value), 'utf8')
 }

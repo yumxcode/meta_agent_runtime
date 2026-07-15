@@ -14,7 +14,7 @@ export interface WorkspaceIdentity {
 export interface ExecutionScope {
   workspaceId: string
   instanceId: string
-  round?: number
+  activationId?: string
   wakeId?: string
 }
 
@@ -108,7 +108,7 @@ async function rebindInstanceRecords(root: string, from: string | undefined, to:
   const loopRoot = join(root, '.loop')
   const entries = await readdir(loopRoot, { withFileTypes: true }).catch(() => [])
   for (const entry of entries) {
-    if (!entry.isDirectory() || entry.name === 'wakes' || entry.name === 'charters') continue
+    if (!entry.isDirectory() || entry.name === 'wakes') continue
     const recordPath = join(loopRoot, entry.name, 'instance.json')
     const record = await readJsonFile<Record<string, unknown>>(recordPath)
     if (!record) continue

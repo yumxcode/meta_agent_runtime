@@ -1,13 +1,10 @@
 /**
  * WakeStore — durable wake records with atomic claims (spec C4, D11/D12).
  *
- * Generalised from AutoOrchScheduleStore: the same file-per-record store +
- * claim discipline, but wake KINDS are loop v2's three sources (timer / probe /
- * event) plus manual. M1 ships timer + manual; probe/event land in M2 on the
- * same record shape.
+ * File-per-record scheduling and claim fencing for graph activations.
  *
  * Guarantees the kernel relies on:
- *   • at-most-one in-flight round per loop — `claimDue` refuses to claim a
+ *   • at-most-one in-flight graph tick per loop — `claimDue` refuses to claim a
  *     wake for a loop that already has a live claim;
  *   • coalescing (D12) — scheduling a timer for a loop that already has a
  *     pending timer REPLACES it (missed/duplicate ticks merge, never queue);
@@ -27,9 +24,9 @@ import {
   readJsonFile,
   withFileLock,
 } from '../../infra/persist/index.js'
-import type { LoopInstanceId } from '../types.js'
+type LoopInstanceId = string
 
-export type WakeKind = 'timer' | 'event' | 'effect_poll' | 'manual'
+export type WakeKind = 'timer' | 'event' | 'manual'
 export type WakeStatus = 'pending' | 'claimed' | 'done' | 'cancelled'
 
 export interface WakeRecord {
@@ -40,15 +37,11 @@ export interface WakeRecord {
   projectDir: string
   kind: WakeKind
   fireAt: number
-  /** Effect this probe/event wake belongs to (M2). */
-  effectKey?: string
+  /** Activation being resumed, or `__graph__` for graph-level scheduling. */
+  activationId?: string
   status: WakeStatus
   claim?: { owner: string; token?: string; claimedAt: number; expiresAt: number }
   attempts: number
-  /** Cost observed on safely-cancelled attempts before this wake completed.
-   * It is carried into the eventual RoundEntry so abort/restart cannot reset
-   * the lifetime USD ledger. */
-  abortedCostUsd?: number
   createdAt: number
   updatedAt: number
 }
@@ -95,23 +88,23 @@ export class WakeStore {
   /**
    * Schedule a wake. Timer wakes COALESCE per loop (D12): an existing pending
    * timer for the same loop is replaced, so "missed three ticks" collapses to
-   * one. Manual/probe/event wakes never coalesce (each stands for a distinct
+   * one. Manual/event wakes never coalesce (each stands for a distinct
    * cause).
    */
   async schedule(input: {
     loopId: LoopInstanceId
     kind: WakeKind
     fireAt: number
-    effectKey?: string
+    activationId?: string
   }): Promise<WakeRecord> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
-      if (input.kind === 'timer' || input.kind === 'effect_poll') {
+      if (input.kind === 'timer') {
         for (const existing of await this.listUnlocked()) {
           if (
             existing.loopId === input.loopId &&
             existing.kind === input.kind &&
-            (input.kind !== 'effect_poll' || existing.effectKey === input.effectKey) &&
+            existing.activationId === input.activationId &&
             existing.status === 'pending'
           ) {
             const replaced: WakeRecord = {
@@ -131,7 +124,7 @@ export class WakeStore {
         projectDir: this.projectDir,
         kind: input.kind,
         fireAt: input.fireAt,
-        effectKey: input.effectKey,
+        activationId: input.activationId,
         status: 'pending',
         attempts: 0,
         createdAt: Date.now(),
@@ -235,20 +228,6 @@ export class WakeStore {
     })
   }
 
-  async addAbortedCost(wakeId: string, costUsd: number, claimToken?: string): Promise<boolean> {
-    if (!Number.isFinite(costUsd) || costUsd <= 0) return true
-    return withFileLock(this.lockPath(), async () => {
-      const record = await readJsonFile<WakeRecord>(this.pathFor(wakeId))
-      if (!record || (record.claim?.token !== undefined && record.claim.token !== claimToken)) return false
-      await atomicWriteJson(this.pathFor(wakeId), {
-        ...record,
-        abortedCostUsd: (record.abortedCostUsd ?? 0) + costUsd,
-        updatedAt: Date.now(),
-      })
-      return true
-    })
-  }
-
   /** Terminal release: 'done' on success; 'pending' re-queues (retry).
    * `opts.fireAt` (pending only) re-queues with a backoff instead of firing
    * immediately — the runner uses it so a deterministic error cannot hot-loop. */
@@ -265,29 +244,6 @@ export class WakeStore {
         status: outcome,
         claim: outcome === 'pending' ? undefined : record.claim,
         ...(outcome === 'pending' && opts?.fireAt !== undefined ? { fireAt: opts.fireAt } : {}),
-        updatedAt: Date.now(),
-      })
-      return true
-    })
-  }
-
-  /**
-   * Move aborted-attempt cost onto the loop's earliest live wake, so releasing
-   * a stale wake as done/cancelled cannot silently drop money from the
-   * lifetime USD ledger. Returns false when the loop has no live wake to
-   * carry the cost (caller should log — the invariant cannot be kept).
-   */
-  async transferAbortedCost(loopId: LoopInstanceId, costUsd: number): Promise<boolean> {
-    if (!Number.isFinite(costUsd) || costUsd <= 0) return true
-    return withFileLock(this.lockPath(), async () => {
-      const candidates = (await this.listUnlocked()).filter(
-        r => r.loopId === loopId && (r.status === 'pending' || r.status === 'claimed'),
-      )
-      const target = candidates[0]
-      if (!target) return false
-      await atomicWriteJson(this.pathFor(target.wakeId), {
-        ...target,
-        abortedCostUsd: (target.abortedCostUsd ?? 0) + costUsd,
         updatedAt: Date.now(),
       })
       return true

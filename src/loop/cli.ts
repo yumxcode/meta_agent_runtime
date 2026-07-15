@@ -1,374 +1,299 @@
-/**
- * loop CLI handlers (spec T1.7) — `meta-agent loop <cmd>`.
- *
- * Pure-code commands (create/list/inspect/inbox) need no LLM backend.
- * `tick` takes an injected dispatcher — the host CLI passes the same backend
- * dispatcher it builds for orch-scheduler; tests pass a scripted one.
- * Handlers return text (the host prints), never call process.exit.
- */
-import { readFile, readdir, writeFile, mkdir } from 'fs/promises'
-import { join, resolve } from 'path'
+/** CLI for the durable-graph-v1 Loop runtime. */
+import { readFile, writeFile } from 'node:fs/promises'
+import { join, resolve } from 'node:path'
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
-import type { Charter } from './charter/CharterTypes.js'
-import { CharterStore } from './charter/CharterStore.js'
-import { createInstance, loadInstance } from './instance/InstanceStore.js'
-import { migrateInstance } from './instance/Migrate.js'
-import { pauseInstance, resumeInstance, stopInstance } from './instance/Lifecycle.js'
-import { distillCharter } from './distill/Distiller.js'
-import { WakeStore } from './wake/WakeStore.js'
-import { tickOnce, runUntilQuiescent } from './runner.js'
-import { instancePaths, renderRoute, type LoopInstanceRecord } from './types.js'
-import type { EffectAdapterRegistry } from './effects/EffectAdapter.js'
 import {
-  ensureWorkspaceIdentity,
-  forkWorkspaceIdentity,
-  canonicalWorkspaceRoot,
-} from './workspace/WorkspaceIdentity.js'
-import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+  ArtifactPlane,
+  createDefaultGraphRuntimeCatalog,
+  distillLoopGraph,
+  freezeLoopGraph,
+  GraphKernel,
+  GraphStore,
+  LaneManager,
+  listGraphInstanceRecords,
+  MetaAgentGraphAgentExecutor,
+  type GraphAgentExecutor,
+  type GraphRuntimeCatalog,
+  type JsonValue,
+  type LoopGraphSpec,
+} from './graph/index.js'
 import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
-import type { ScenarioRegistry } from './scenarios/ScenarioRegistry.js'
-import { defaultScenarioRegistry } from './scenarios/BuiltinScenarioPlugins.js'
+import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+import { runUntilQuiescent, tickOnce } from './runner.js'
+import { WakeStore } from './wake/WakeStore.js'
+import { canonicalWorkspaceRoot, ensureWorkspaceIdentity, forkWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
 
 export interface LoopCliDeps {
   projectDir: string
-  /** Required only for `tick`. */
   dispatcher?: ISubAgentDispatcher
+  /** Replaceable graph_agent execution substrate. Defaults to the MetaAgent adapter. */
+  graphAgent?: GraphAgentExecutor
   signal?: AbortSignal
-  /** Host-owned adapters available to tick/lifecycle operations. */
-  effectAdapters?: EffectAdapterRegistry
-  /** Live per-round/seat progress for `tick` (CLI renders it). */
-  observer?: (event: import('./kernel/LoopKernel.js').LoopEvent) => void
-  scenarios?: ScenarioRegistry
+  graphCatalog?: GraphRuntimeCatalog
 }
 
 export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<string> {
-  const [cmd, ...rest] = argv
-  switch (cmd) {
-    case 'create': return cmdCreate(rest, deps)
-    case 'list': return cmdList(deps)
-    case 'inspect': return cmdInspect(rest, deps)
-    case 'inbox': return cmdInbox(rest, deps)
-    case 'tick': return cmdTick(rest, deps)
-    case 'distill': return cmdDistill(rest, deps)
-    case 'migrate': return cmdMigrate(rest, deps)
-    case 'pause': return cmdLifecycle('pause', rest, deps)
-    case 'resume': return cmdLifecycle('resume', rest, deps)
-    case 'stop': return cmdLifecycle('stop', rest, deps)
-    case 'workspace-info': return cmdWorkspaceInfo(deps)
-    case 'workspace-fork': return cmdWorkspaceFork(deps)
-    case 'schedulers': return cmdSchedulers()
-    case 'host-capacity': return cmdHostCapacity()
-    case 'scenarios': return cmdScenarios(deps)
-    default:
-      return [
-        'Usage: meta-agent loop <command>',
-        '  distill <需求.md> [--out charter.draft.json]  Distill a requirement doc into a charter draft (needs backend)',
-        '  create <charter.json> [--id <instanceId>]   Validate+freeze charter, init ledger, schedule first wake',
-        '  migrate <instanceId> [--version N]          Migrate a live instance to a newer charter version',
-        '  pause <instanceId> [--reason …]             Freeze an idle|waiting instance (wakes cancelled, events untouched)',
-        '  resume <instanceId> [--reason …]            Un-pause (rebuilds wakes) / light-ack a paused escalation (resets its meters)',
-        '  stop <instanceId> [--reason …]              Graceful terminate → final_report.md (finalizer seat runs when a backend is wired)',
-        '  workspace-info                              Show the stable workspace identity and canonical root',
-        '  workspace-fork                              Assign an intentionally copied workspace a new identity',
-        '  schedulers                                  Show live host schedulers and queued/active work',
-        '  host-capacity                               Show host-wide Loop admission usage',
-        '  scenarios                                   List loaded trusted Scenario plugins',
-        '  list                                        List loop instances in this workspace',
-        '  inspect <instanceId>                        Status + progress + recent rounds',
-        '  inbox <instanceId> <message…>               Drop feedback for the next round',
-        '  tick [--until-quiescent]                    Claim due wakes and run rounds (needs backend)',
-      ].join('\n')
+  const [command, ...args] = argv
+  switch (command) {
+    case 'distill':
+    case 'distill-graph': return distill(args, deps)
+    case 'create':
+    case 'create-graph': return create(args, deps)
+    case 'list': return list(deps)
+    case 'inspect': return inspect(args, deps)
+    case 'event': return event(args, deps)
+    case 'lane-repair': return laneRepair(args, deps)
+    case 'tick': return tick(args, deps)
+    case 'pause': return lifecycle('pause', args, deps)
+    case 'resume': return lifecycle('resume', args, deps)
+    case 'stop': return lifecycle('stop', args, deps)
+    case 'workspace-info': return workspaceInfo(deps)
+    case 'workspace-fork': return workspaceFork(deps)
+    case 'schedulers': return schedulers()
+    case 'host-capacity': return hostCapacity()
+    case 'capabilities': return capabilities(deps)
+    default: return usage()
   }
 }
 
-function cmdScenarios(deps: LoopCliDeps): string {
-  const registry = deps.scenarios ?? defaultScenarioRegistry
-  return registry.ids().map(id => {
-    const manifest = registry.require(id).manifest
-    return `${id}  api=${manifest.apiVersion} version=${manifest.version} integrity=${manifest.integrity}`
-  }).join('\n') || '(no Scenario plugins loaded)'
+function catalog(deps: LoopCliDeps): GraphRuntimeCatalog {
+  return deps.graphCatalog ?? createDefaultGraphRuntimeCatalog()
 }
 
-async function cmdWorkspaceInfo(deps: LoopCliDeps): Promise<string> {
-  const identity = await ensureWorkspaceIdentity(deps.projectDir)
-  return [
-    `workspaceId: ${identity.workspaceId}`,
-    `root: ${await canonicalWorkspaceRoot(deps.projectDir)}`,
-    `createdAt: ${new Date(identity.createdAt).toISOString()}`,
-    ...(identity.forkedFrom ? [`forkedFrom: ${identity.forkedFrom}`] : []),
-  ].join('\n')
-}
-
-async function cmdWorkspaceFork(deps: LoopCliDeps): Promise<string> {
-  const daemonLockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
-  const daemonToken = await acquireDaemonLock(daemonLockPath)
-  if (!daemonToken) throw new Error('loop workspace-fork requires the workspace scheduler to be stopped')
-  try {
-  const current = await ensureWorkspaceIdentity(deps.projectDir)
-  const coordinator = new HostSchedulerCoordinator()
-  if (await coordinator.hasLiveWorkspaceLease(current.workspaceId)) {
-    throw new Error('loop workspace-fork requires the workspace scheduler to be stopped')
-  }
-  const next = await forkWorkspaceIdentity(deps.projectDir)
-  return `workspace forked: ${current.workspaceId} -> ${next.workspaceId}`
-  } finally {
-    await releaseDaemonLock(daemonLockPath, daemonToken)
-  }
-}
-
-async function cmdSchedulers(): Promise<string> {
-  const snapshot = await new HostSchedulerCoordinator().snapshot()
-  if (snapshot.workspaces.length === 0) return '(no live loop schedulers)'
-  return snapshot.workspaces
-    .sort((a, b) => a.workspaceId.localeCompare(b.workspaceId))
-    .map(workspace => {
-      const active = snapshot.leases.filter(lease => lease.scope.workspaceId === workspace.workspaceId).length
-      const queued = snapshot.tickets.filter(ticket => ticket.scope.workspaceId === workspace.workspaceId).length
-      return `${workspace.workspaceId}  pid=${workspace.pid}  active=${active} queued=${queued}  ` +
-        `heartbeat=${new Date(workspace.heartbeatAt).toISOString()}  root=${workspace.workspaceRoot}`
-    }).join('\n')
-}
-
-async function cmdHostCapacity(): Promise<string> {
-  const snapshot = await new HostSchedulerCoordinator().snapshot()
-  const rounds = snapshot.leases.filter(lease => lease.kind === 'round').length
-  const models = snapshot.leases.filter(lease => lease.kind === 'model_call').length
-  const queuedRounds = snapshot.tickets.filter(ticket => ticket.kind === 'round').length
-  return [
-    `rounds: ${rounds}/${snapshot.maxConcurrentRounds} active, ${queuedRounds} queued`,
-    `modelCalls: ${models}/${snapshot.maxConcurrentModelCalls} active`,
-    `resourceLeases: ${snapshot.leases.filter(lease => lease.kind === 'resource').length}`,
-    `adapterCalls: ${snapshot.leases.filter(lease => lease.kind === 'adapter_call').length}`,
-  ].join('\n')
-}
-
-async function cmdDistill(rest: string[], deps: LoopCliDeps): Promise<string> {
+async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.dispatcher) throw new Error('loop distill needs a backend dispatcher')
-  const file = rest.find(a => !a.startsWith('--'))
-  if (!file) throw new Error('loop distill: requirement doc path required')
-  const out = flagValue(rest, '--out') ?? 'charter.draft.json'
-  const doc = await readFile(resolve(deps.projectDir, file), 'utf-8')
-  const result = await distillCharter(doc, {
+  const file = positional(args)
+  if (!file) throw new Error('loop distill: requirement document path required')
+  const out = flagValue(args, '--out') ?? 'loop.graph.draft.json'
+  const result = await distillLoopGraph(await readFile(resolve(deps.projectDir, file), 'utf8'), {
     dispatcher: deps.dispatcher,
+    catalog: catalog(deps),
     signal: deps.signal,
     projectDir: deps.projectDir,
-    scenarios: deps.scenarios,
-    promptCatalog: deps.effectAdapters ? { effectAdapterIds: deps.effectAdapters.ids() } : undefined,
   })
-  await writeFile(resolve(deps.projectDir, out), JSON.stringify(result.charter, null, 2), 'utf-8')
-  if (result.taskSpec) {
-    await writeFile(resolve(deps.projectDir, 'task_spec.draft.md'), result.taskSpec, 'utf-8')
+  await writeFile(resolve(deps.projectDir, out), JSON.stringify(result.graph, null, 2), 'utf8')
+  if (result.taskSpec) await writeFile(resolve(deps.projectDir, 'loop.graph.review.md'), result.taskSpec, 'utf8')
+  return `LoopGraphSpec written to ${out} (validated, ${result.attempts} attempt(s)); review then run: meta-agent loop create ${out}`
+}
+
+async function create(args: string[], deps: LoopCliDeps): Promise<string> {
+  const file = positional(args)
+  if (!file) throw new Error('loop create: graph JSON path required')
+  const graph = JSON.parse(await readFile(resolve(deps.projectDir, file), 'utf8')) as LoopGraphSpec
+  if (graph.schemaVersion !== 'graph-1.0') throw new Error("loop create only accepts schemaVersion 'graph-1.0'")
+  const runtime = catalog(deps)
+  const frozen = freezeLoopGraph(graph, runtime)
+  const instanceId = flagValue(args, '--id') ?? `${frozen.id}-v${frozen.version}`
+  const store = await GraphStore.create({ projectDir: deps.projectDir, instanceId, graph: frozen, functions: runtime.functions })
+  await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'timer', fireAt: Date.now() })
+  const snapshot = await store.snapshot()
+  return [
+    `durable-graph-v1 ${frozen.id}@v${frozen.version} frozen (${frozen.graphHash.slice(0, 12)})`,
+    `instance ${snapshot.instance.instanceId} created (status: ${snapshot.instance.status})`,
+    'first activation wake scheduled — run: meta-agent loop tick',
+  ].join('\n')
+}
+
+async function list(deps: LoopCliDeps): Promise<string> {
+  const records = await listGraphInstanceRecords(deps.projectDir)
+  return records.length
+    ? records.map(record => `${record.instanceId}  ${record.status}${record.statusReason ? `  (${record.statusReason})` : ''}  engine=${record.engine}  graph=${record.graphId}@v${record.graphVersion}`).join('\n')
+    : '(no loop instances)'
+}
+
+async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
+  const instanceId = positional(args)
+  if (!instanceId) throw new Error('loop inspect: instanceId required')
+  const store = new GraphStore(deps.projectDir, instanceId)
+  const snapshot = await store.snapshot().catch(() => null)
+  if (!snapshot) return `instance ${instanceId} not found`
+  const wakes = (await new WakeStore(deps.projectDir).list()).filter(wake =>
+    wake.loopId === instanceId && (wake.status === 'pending' || wake.status === 'claimed'),
+  )
+  const artifacts = await new ArtifactPlane(store).list({ maxItems: 10 })
+  const statuses = ['ready', 'running', 'waiting', 'succeeded', 'failed', 'cancelled'] as const
+  const counts = Object.fromEntries(statuses.map(status => [status, [...snapshot.activations.values()].filter(item => item.status === status).length]))
+  return [
+    `instance: ${instanceId}  status: ${snapshot.instance.status}${snapshot.instance.statusReason ? ` (${snapshot.instance.statusReason})` : ''}  engine: ${snapshot.instance.engine}`,
+    `graph: ${snapshot.instance.graphId}@v${snapshot.instance.graphVersion}  hash: ${snapshot.instance.graphHash.slice(0, 12)}`,
+    `state: version=${snapshot.state.version} values=${JSON.stringify(snapshot.state.values)}`,
+    `activations: ${JSON.stringify(counts)} total=${snapshot.instance.activationCount}`,
+    `cost: $${snapshot.instance.totalCostUsd.toFixed(4)}`,
+    `wakes: ${wakes.map(wake => `${wake.kind}:${wake.activationId ?? '-'}@${new Date(wake.fireAt).toISOString()}[${wake.status}]`).join(', ') || '(none)'}`,
+    `artifacts/evidence: ${artifacts.length}`,
+    ...artifacts.map(item => `  ${item.id} ${item.kind}/${item.channel} [${item.status}] from ${item.provenance.nodeId}`),
+  ].join('\n')
+}
+
+async function event(args: string[], deps: LoopCliDeps): Promise<string> {
+  const positionals = positionalValues(args)
+  const [instanceId, name] = positionals
+  if (!instanceId || !name) throw new Error('loop event: instanceId and event name required')
+  const store = new GraphStore(deps.projectDir, instanceId)
+  const graph = await store.loadSpec()
+  const runtime = catalog(deps)
+  const kernel = await GraphKernel.open({ store, graph, ...runtime })
+  const correlation = jsonFlag(args, '--correlation')
+  const payload = jsonFlag(args, '--payload')
+  const resumed = await kernel.signalEvent({ name, ...(correlation !== undefined ? { correlation } : {}), ...(payload !== undefined ? { payload } : {}) })
+  if (resumed) await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
+  return `${instanceId}: event '${name}' resumed ${resumed} activation(s)`
+}
+
+async function laneRepair(args: string[], deps: LoopCliDeps): Promise<string> {
+  const [instanceId, laneId] = positionalValues(args)
+  if (!instanceId || !laneId) throw new Error('loop lane-repair: instanceId and laneId required')
+  const store = new GraphStore(deps.projectDir, instanceId)
+  const snapshot = await store.snapshot()
+  const graph = await store.loadSpec()
+  const lane = await new LaneManager(store, graph, snapshot.instance).repair(laneId)
+  if (lane.status === 'conflicted') return `${instanceId}/${laneId}: still conflicted (${lane.error ?? 'unknown'})`
+  const pausedForThisLane = snapshot.instance.status === 'paused' &&
+    snapshot.instance.statusReason?.includes(`Lane '${laneId}' requires repair`)
+  if (pausedForThisLane) {
+    await store.setStatus('active', `Lane ${laneId} repaired`)
+    await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
   }
-  return [
-    `charter draft written to ${out} (validated, ${result.attempts} attempt(s))`,
-    ...(result.taskSpec ? ['task_spec.draft.md written as a human-only deployment/review checklist'] : []),
-    `review it, then approve by running: meta-agent loop create ${out}`,
-  ].join('\n')
+  return `${instanceId}/${laneId}: ${lane.status}`
 }
 
-async function cmdMigrate(rest: string[], deps: LoopCliDeps): Promise<string> {
-  const id = rest.find(a => !a.startsWith('--'))
-  if (!id) throw new Error('loop migrate: instanceId required')
-  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
-  if (!instance) return `instance ${id} not found`
-  const store = new CharterStore(deps.projectDir, { scenarios: deps.scenarios })
-  const versionFlag = flagValue(rest, '--version')
-  const version = versionFlag ? Number(versionFlag) : undefined
-  const charter = await store.load(instance.record.charterId, version)
-  if (!charter) return `charter ${instance.record.charterId}${version ? `@v${version}` : ''} not found in library`
-  const entry = await migrateInstance(instance, charter, {
-    wakeStore: new WakeStore(deps.projectDir),
-    projectDir: deps.projectDir,
-  })
-  return [
-    `migrated ${id}: v${entry.fromVersion} → v${entry.toVersion}`,
-    `meters carried: ${entry.carriedMeters.join(', ') || '(none)'}; new: ${entry.newMeters.join(', ') || '(none)'}; ` +
-      `dropped: ${Object.keys(entry.droppedMeters).join(', ') || '(none)'}`,
-    entry.reArmed ? 're-armed from paused_attention (human ack recorded); next round scheduled' : 'instance idle',
-  ].join('\n')
-}
-
-async function cmdLifecycle(
-  action: 'pause' | 'resume' | 'stop',
-  rest: string[],
-  deps: LoopCliDeps,
-): Promise<string> {
-  const id = rest.find(a => !a.startsWith('--'))
-  if (!id) throw new Error(`loop ${action}: instanceId required`)
-  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
-  if (!instance) return `instance ${id} not found`
-  const reason = flagValue(rest, '--reason')
-  const lifecycleDeps = {
-    wakeStore: new WakeStore(deps.projectDir), projectDir: deps.projectDir,
-    effectAdapters: deps.effectAdapters,
+async function lifecycle(action: 'pause' | 'resume' | 'stop', args: string[], deps: LoopCliDeps): Promise<string> {
+  const instanceId = positional(args)
+  if (!instanceId) throw new Error(`loop ${action}: instanceId required`)
+  const store = new GraphStore(deps.projectDir, instanceId)
+  const snapshot = await store.snapshot().catch(() => null)
+  if (!snapshot) return `instance ${instanceId} not found`
+  const reason = flagValue(args, '--reason')
+  const wakes = new WakeStore(deps.projectDir)
+  if (action === 'pause') {
+    const record = await store.setStatus('paused', reason ?? 'paused by operator')
+    await wakes.cancelForLoop(instanceId)
+    return `${instanceId}: paused  (status: ${record.status})`
   }
-  const result = action === 'pause'
-    ? await pauseInstance(instance, lifecycleDeps, reason)
-    : action === 'resume'
-      ? await resumeInstance(instance, lifecycleDeps, reason)
-      : await stopInstance(instance, {
-          ...lifecycleDeps,
-          ...(deps.observer ? { observer: deps.observer } : {}),
-          // With a backend wired (host CLI passes it), the finalizer seat can
-          // write the report narrative; without one, code-template report only.
-          ...(deps.dispatcher
-            ? {
-                seatDeps: {
-                  dispatcher: deps.dispatcher,
-                  projectDir: deps.projectDir,
-                  signal: deps.signal ?? new AbortController().signal,
-                  scenarios: deps.scenarios,
-                },
-              }
-            : {}),
-        }, reason)
-  return `${id}: ${result.message}  (status: ${result.status})`
+  if (action === 'resume') {
+    if (snapshot.instance.status !== 'paused') return `${instanceId}: not paused  (status: ${snapshot.instance.status})`
+    const graph = await store.loadSpec()
+    const runtime = catalog(deps)
+    const resumableTerminal = [...snapshot.activations.values()].some(activation => {
+      const node = graph.nodes[activation.nodeId]
+      return activation.status === 'succeeded' && !activation.resumedAt && node?.type === 'terminal' && node.status === 'paused'
+    })
+    const record = resumableTerminal
+      ? (await (await GraphKernel.open({ store, graph, ...runtime })).resumePausedTerminal()).instance
+      : await store.setStatus('active', reason ?? 'resumed by operator')
+    await wakes.schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
+    return `${instanceId}: resumed  (status: ${record.status})`
+  }
+  await store.setStatus('failed', reason ?? 'stopped by operator')
+  await wakes.cancelForLoop(instanceId)
+  return `${instanceId}: stopped  (status: failed)`
 }
 
-async function cmdCreate(rest: string[], deps: LoopCliDeps): Promise<string> {
-  const file = rest.find(a => !a.startsWith('--'))
-  if (!file) throw new Error('loop create: charter file path required')
-  const idFlag = flagValue(rest, '--id')
-  const raw = await readFile(resolve(deps.projectDir, file), 'utf-8')
-  const charter = JSON.parse(raw) as Charter
-
-  // Save into the charter library (versioned), then instantiate that version.
-  const store = new CharterStore(deps.projectDir, { scenarios: deps.scenarios })
-  const ref = await store.save(charter)
-  const saved = (await store.load(ref.charterId, ref.version))!
-  const instance = await createInstance({
-    projectDir: deps.projectDir,
-    charter: saved,
-    instanceId: idFlag,
-    scenarios: deps.scenarios,
-  })
-  return [
-    `charter ${ref.charterId}@v${ref.version} saved`,
-    `instance ${instance.record.instanceId} created (status: ${instance.record.status})`,
-    `first wake scheduled — run: meta-agent loop tick`,
-  ].join('\n')
-}
-
-async function cmdList(deps: LoopCliDeps): Promise<string> {
-  const loopRoot = join(resolve(deps.projectDir), '.loop')
-  let entries: string[]
+async function tick(args: string[], deps: LoopCliDeps): Promise<string> {
+  const graphAgent = deps.graphAgent ?? (deps.dispatcher ? new MetaAgentGraphAgentExecutor(deps.dispatcher) : undefined)
+  if (!graphAgent) throw new Error('loop tick needs a graph_agent executor')
+  const lockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
+  const token = await acquireDaemonLock(lockPath)
+  if (!token) throw new Error('loop tick refused: another scheduler owns this workspace')
+  const host = new HostSchedulerCoordinator()
+  let workspaceLease: Awaited<ReturnType<HostSchedulerCoordinator['acquireWorkspaceLease']>> | undefined
   try {
-    entries = await readdir(loopRoot)
-  } catch {
-    return '(no loop instances)'
-  }
-  const lines: string[] = []
-  for (const id of entries.sort()) {
-    if (id === 'charters' || id === 'wakes') continue
-    const record = await readInstanceRecord(deps.projectDir, id)
-    if (!record) continue
-    lines.push(
-      `${record.instanceId}  ${record.status}` +
-      (record.statusReason ? `  (${record.statusReason})` : '') +
-      `  charter=${record.charterId}@v${record.charterVersion}`,
-    )
-  }
-  return lines.length ? lines.join('\n') : '(no loop instances)'
-}
-
-async function cmdInspect(rest: string[], deps: LoopCliDeps): Promise<string> {
-  const id = rest[0]
-  if (!id) throw new Error('loop inspect: instanceId required')
-  const instance = await loadInstance(deps.projectDir, id, deps.scenarios)
-  if (!instance) return `instance ${id} not found`
-  const view = await instance.ledger.readView(10)
-  const wakes = (await new WakeStore(deps.projectDir).list())
-    .filter(w => w.loopId === id && (w.status === 'pending' || w.status === 'claimed'))
-  return [
-    `instance: ${id}  status: ${instance.record.status}` +
-      (instance.record.statusReason ? ` (${instance.record.statusReason})` : ''),
-    `charter: ${instance.record.charterId}@v${instance.record.charterVersion}  hash: ${instance.record.charterHash.slice(0, 12)}`,
-    `progress: iteration=${view.progress.iteration} status=${view.progress.status} ` +
-      `meters=${JSON.stringify(view.progress.meters)} objectiveBest=${view.progress.objectiveBestValue ?? 'null'} ` +
-      `cost=$${view.progress.totalCostUsd.toFixed(2)}`,
-    `wakes: ${wakes.map(w => `${w.kind}@${new Date(w.fireAt).toISOString()}[${w.status}]`).join(', ') || '(none)'}`,
-    '',
-    'recent rounds:',
-    ...view.lastRounds.map(r =>
-      `  #${r.round} [${r.mode}] route=${renderRoute(r.route)} retries=${r.correctiveRetries} cost=$${r.costUsd.toFixed(2)}`),
-  ].join('\n')
-}
-
-async function cmdInbox(rest: string[], deps: LoopCliDeps): Promise<string> {
-  const [id, ...messageParts] = rest
-  const message = messageParts.join(' ').trim()
-  if (!id || !message) throw new Error('loop inbox: instanceId and message required')
-  const record = await readInstanceRecord(deps.projectDir, id)
-  if (!record) return `instance ${id} not found`
-  const paths = instancePaths(deps.projectDir, id)
-  await mkdir(paths.inboxDir, { recursive: true })
-  const name = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}.json`
-  await writeFile(join(paths.inboxDir, name), JSON.stringify({ message, at: Date.now() }), 'utf-8')
-  return `inbox message queued for ${id} — it takes effect in the next round's capsule`
-}
-
-async function cmdTick(rest: string[], deps: LoopCliDeps): Promise<string> {
-  if (!deps.dispatcher) {
-    throw new Error('loop tick needs a backend dispatcher (host CLI wires this; see orch-scheduler bootstrap)')
-  }
-  const coordinator = new HostSchedulerCoordinator()
-  const workspaceIdentity = await ensureWorkspaceIdentity(deps.projectDir)
-  const daemonLockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
-  const daemonToken = await acquireDaemonLock(daemonLockPath)
-  if (!daemonToken) throw new Error('loop tick refused: another scheduler/tick owns this workspace')
-  let workspaceLease: Awaited<ReturnType<HostSchedulerCoordinator['acquireWorkspaceLease']>> | null = null
-  let workspaceHeartbeat: ReturnType<typeof setInterval> | null = null
-  const tickAbort = new AbortController()
-  const forwardAbort = (): void => tickAbort.abort(deps.signal?.reason)
-  if (deps.signal?.aborted) forwardAbort()
-  else deps.signal?.addEventListener('abort', forwardAbort, { once: true })
-  try {
-    workspaceLease = await coordinator.acquireWorkspaceLease(workspaceIdentity, deps.projectDir)
-    workspaceHeartbeat = setInterval(() => {
-      void workspaceLease?.heartbeat().then(ok => {
-        if (ok === false) tickAbort.abort(new Error('workspace scheduler lease lost'))
-      }).catch(() => tickAbort.abort(new Error('workspace scheduler heartbeat failed')))
-    }, coordinator.heartbeatIntervalMs)
-    workspaceHeartbeat.unref?.()
+    const identity = await ensureWorkspaceIdentity(deps.projectDir)
+    workspaceLease = await host.acquireWorkspaceLease(identity, deps.projectDir)
     const tickDeps = {
-      dispatcher: deps.dispatcher, projectDir: deps.projectDir, signal: tickAbort.signal,
-      observer: deps.observer, effectAdapters: deps.effectAdapters,
-      hostCoordinator: coordinator,
-      workspaceIdentity,
-      scenarios: deps.scenarios,
+      graphAgent,
+      projectDir: deps.projectDir,
+      signal: deps.signal,
+      graphCatalog: deps.graphCatalog,
+      hostCoordinator: host,
+      workspaceIdentity: identity,
     }
-    if (rest.includes('--until-quiescent')) {
+    if (args.includes('--until-quiescent')) {
       const results = await runUntilQuiescent(tickDeps)
-      const total = results.reduce((n, r) => n + r.claimed, 0)
-      return `ran ${total} round(s) across ${results.length} tick(s); now quiescent`
+      return `ran ${results.reduce((sum, result) => sum + result.claimed, 0)} graph tick(s); now quiescent`
     }
     const result = await tickOnce(tickDeps)
-    if (result.claimed === 0) return 'no wakes due'
-    return result.outcomes
-      .map(o => o.outcome
-        ? `${o.loopId}: round ${o.outcome.round} [${o.outcome.mode}] route=${o.outcome.route} status=${o.outcome.status}`
-        : `${o.loopId}: ERROR ${o.error}`)
-      .join('\n')
+    if (!result.claimed) return 'no wakes due'
+    return result.outcomes.map(outcome => outcome.graphOutcome
+      ? `${outcome.loopId}: claimed=${outcome.graphOutcome.claimed} committed=${outcome.graphOutcome.committed} parked=${outcome.graphOutcome.parked} status=${outcome.graphOutcome.instance.status}`
+      : `${outcome.loopId}: ERROR ${outcome.error}`).join('\n')
   } finally {
-    if (workspaceHeartbeat) clearInterval(workspaceHeartbeat)
-    deps.signal?.removeEventListener('abort', forwardAbort)
     await workspaceLease?.release().catch(() => undefined)
-    await releaseDaemonLock(daemonLockPath, daemonToken)
+    await releaseDaemonLock(lockPath, token)
   }
 }
 
-// ── helpers ───────────────────────────────────────────────────────────────────
+async function workspaceInfo(deps: LoopCliDeps): Promise<string> {
+  const identity = await ensureWorkspaceIdentity(deps.projectDir)
+  return `workspaceId: ${identity.workspaceId}\nroot: ${await canonicalWorkspaceRoot(deps.projectDir)}\ncreatedAt: ${new Date(identity.createdAt).toISOString()}`
+}
 
-async function readInstanceRecord(projectDir: string, id: string): Promise<LoopInstanceRecord | null> {
+async function workspaceFork(deps: LoopCliDeps): Promise<string> {
+  const lockPath = join(resolve(deps.projectDir), '.loop', 'daemon.lock')
+  const token = await acquireDaemonLock(lockPath)
+  if (!token) throw new Error('workspace-fork requires the scheduler to be stopped')
   try {
-    const raw = await readFile(instancePaths(projectDir, id).instanceJson, 'utf-8')
-    return JSON.parse(raw) as LoopInstanceRecord
-  } catch {
-    return null
+    const before = await ensureWorkspaceIdentity(deps.projectDir)
+    const after = await forkWorkspaceIdentity(deps.projectDir)
+    return `workspace forked: ${before.workspaceId} -> ${after.workspaceId}`
+  } finally { await releaseDaemonLock(lockPath, token) }
+}
+
+async function schedulers(): Promise<string> {
+  const snapshot = await new HostSchedulerCoordinator().snapshot()
+  return snapshot.workspaces.length
+    ? snapshot.workspaces.map(item => `${item.workspaceId} pid=${item.pid} heartbeat=${new Date(item.heartbeatAt).toISOString()} root=${item.workspaceRoot}`).join('\n')
+    : '(no live loop schedulers)'
+}
+
+async function hostCapacity(): Promise<string> {
+  const snapshot = await new HostSchedulerCoordinator().snapshot()
+  return `graph ticks: ${snapshot.leases.filter(item => item.kind === 'graph_tick').length}/${snapshot.maxConcurrentGraphTicks}\nmodel calls: ${snapshot.leases.filter(item => item.kind === 'model_call').length}/${snapshot.maxConcurrentModelCalls}`
+}
+
+function capabilities(deps: LoopCliDeps): string {
+  const runtime = catalog(deps)
+  return [
+    'Functions:', ...runtime.functions.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
+    'Reducers:', ...runtime.reducers.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
+    'Effects:', ...runtime.effects.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
+    'Context Providers:', ...runtime.contextProviders.manifests().map(item => `  ${item.id}@${item.version} trust=${item.trust} ${item.integrity}`),
+    'Capability Packs:', ...runtime.packs.list().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
+    'Scenario Guidance:', ...runtime.packs.scenarios().map(item => `  ${item.id} from ${item.pack.id}@${item.pack.version} — ${item.description}`),
+  ].join('\n')
+}
+
+function usage(): string {
+  return [
+    'Usage: meta-agent loop <command>',
+    '  distill <requirements.md> [--out loop.graph.json]',
+    '  create <loop.graph.json> [--id instanceId]',
+    '  tick [--until-quiescent]',
+    '  event <instanceId> <name> [--correlation JSON] [--payload JSON]',
+    '  lane-repair <instanceId> <laneId>',
+    '  list | inspect <instanceId> | pause/resume/stop <instanceId>',
+    '  capabilities | workspace-info | workspace-fork | schedulers | host-capacity',
+  ].join('\n')
+}
+
+function positional(args: string[]): string | undefined { return positionalValues(args)[0] }
+
+function positionalValues(args: string[]): string[] {
+  const values: string[] = []
+  for (let index = 0; index < args.length; index++) {
+    const value = args[index]!
+    if (value.startsWith('--')) { index++; continue }
+    values.push(value)
   }
+  return values
 }
 
 function flagValue(args: string[], flag: string): string | undefined {
-  const i = args.indexOf(flag)
-  return i >= 0 ? args[i + 1] : undefined
+  const index = args.indexOf(flag)
+  return index >= 0 ? args[index + 1] : undefined
+}
+
+function jsonFlag(args: string[], flag: string): JsonValue | undefined {
+  const value = flagValue(args, flag)
+  return value === undefined ? undefined : JSON.parse(value) as JsonValue
 }

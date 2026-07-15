@@ -1,9 +1,8 @@
 /**
  * seatSpawn — loop-owned sub-agent spawn/poll plumbing.
  *
- * Relocated from core/auto_orch/reviewer.ts per the v1 retirement plan
- * (spec §7 迁移清单): the loop runtime must not depend on the retired graph
- * engine. Semantics unchanged: spawn, poll until terminal, null on timeout.
+ * Shared plumbing for Agent nodes: spawn, observe terminal completion, and
+ * fence timeout/abort cancellation before the graph can retry the work.
  */
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import {

@@ -1,334 +1,182 @@
-/**
- * daemon — the loop-scheduler poll loop (spec C8/T2.4; SchedulerKeepAlive
- * layer B generalised).
- *
- * The daemon owns exactly two verbs: CLAIM (prepareAndClaim) and DISPATCH
- * (rounds — in-process, bounded by maxConcurrentRounds). There are no code
- * probes: waits are worker-driven (self-timer) or event-driven. It is
- * stateless: all truth lives in charter/ledger/effects/wakes, so killing the
- * daemon at any point loses nothing (D11).
- *
- * Lifecycle:
- *   • host lock — at most one daemon per workspace (stale locks from dead
- *     pids are reaped);
- *   • idle exit — when no pending wake exists and no instance is waiting for
- *     longer than `idleExitMs`, the daemon exits 0 (layer C self-heal or the
- *     next CLI invocation restarts it when needed).
- */
-import { mkdir, readFile, readdir, rename, rm, stat, utimes, writeFile } from 'fs/promises'
-import { join, resolve } from 'path'
-import { hostname } from 'os'
-import { randomUUID } from 'crypto'
-import {
-  prepareAndClaim,
-  runClaimedWake,
-  type TickDeps,
-  type TickOutcome,
-  type TickResult,
-} from './runner.js'
-import { listInstanceRecords } from './instance/InstanceStore.js'
-import { WakeStore } from './wake/WakeStore.js'
+/** Durable Graph scheduler: claim wakes and dispatch graph ticks concurrently. */
+import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { randomUUID } from 'node:crypto'
+import { hostname } from 'node:os'
+import { join, resolve } from 'node:path'
+import { CLI_VERSION } from '../cli/version.js'
 import {
   HostSchedulerCoordinator,
   WorkspaceIdentityConflictError,
-  type HostCoordinatorOptions,
   type HostAdmissionHandle,
+  type HostCoordinatorOptions,
 } from './host/HostSchedulerCoordinator.js'
+import { listGraphInstanceRecords } from './graph/index.js'
+import { prepareAndClaim, runClaimedWake, type TickDeps, type TickOutcome, type TickResult } from './runner.js'
+import { WakeStore } from './wake/WakeStore.js'
 import { ensureWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
-import { CLI_VERSION } from '../cli/version.js'
-import { instancePaths } from './types.js'
 
 export interface DaemonOptions extends TickDeps {
   pollMs?: number
-  /** Exit after this long with nothing pending. Default 60 s. */
   idleExitMs?: number
-  /** Observer for each non-empty tick (CLI renders progress). */
   onTick?: (result: TickResult) => void
-  /** Test hook: clock source. */
   now?: () => number
-  /** Cross-host lease freshness window. Default 5 min. Primarily a test hook. */
   lockFreshMs?: number
-  /** Independent lease heartbeat interval. Default 60 s. Primarily a test hook. */
   lockHeartbeatMs?: number
-  /** Maximum rounds executing concurrently in this daemon. Default 4. */
-  maxConcurrentRounds?: number
-  /** Host coordinator configuration; primarily deployment policy and test isolation. */
+  maxConcurrentGraphs?: number
   hostCoordinatorOptions?: HostCoordinatorOptions
-  /** Retain consumed inbox/event files for this long. Default 30 days. */
-  archiveRetentionMs?: number
+  hostCoordinator?: HostSchedulerCoordinator
 }
 
 export interface DaemonResult {
   ticks: number
-  roundsRun: number
+  graphTicksRun: number
   exitReason: 'idle' | 'aborted' | 'lock_held' | 'workspace_identity_conflict'
 }
 
-const LOCK_FILE = 'daemon.lock'
+const LOCK_FRESH_MS = 5 * 60_000
+const LOCK_HEARTBEAT_MS = 60_000
 const WAKE_RETENTION_MS = 7 * 24 * 60 * 60_000
-const DEFAULT_ARCHIVE_RETENTION_MS = 30 * 24 * 60 * 60_000
-const HOUSEKEEPING_INTERVAL_MS = 60 * 60_000
 
-export async function runLoopScheduler(opts: DaemonOptions): Promise<DaemonResult> {
-  const pollMs = Math.max(10, opts.pollMs ?? 2_000)
-  const idleExitMs = opts.idleExitMs ?? 60_000
-  const maxConcurrentRounds = Math.max(1, Math.floor(opts.maxConcurrentRounds ?? 4))
-  const now = opts.now ?? Date.now
-  const lockDir = join(resolve(opts.projectDir), '.loop')
-  const lockPath = join(lockDir, LOCK_FILE)
+export async function runLoopScheduler(options: DaemonOptions): Promise<DaemonResult> {
+  const now = options.now ?? Date.now
+  const pollMs = Math.max(10, options.pollMs ?? 2_000)
+  const idleExitMs = options.idleExitMs ?? 60_000
+  const maxConcurrent = Math.max(1, Math.floor(options.maxConcurrentGraphs ?? 4))
+  const lockPath = join(resolve(options.projectDir), '.loop', 'daemon.lock')
+  const lockFreshMs = Math.max(100, options.lockFreshMs ?? LOCK_FRESH_MS)
+  const lockHeartbeatMs = Math.max(10, Math.min(options.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS, Math.floor(lockFreshMs / 3)))
+  const token = await acquireDaemonLock(lockPath, lockFreshMs)
+  if (!token) return { ticks: 0, graphTicksRun: 0, exitReason: 'lock_held' }
 
-  const lockFreshMs = Math.max(100, opts.lockFreshMs ?? LOCK_FRESH_MS)
-  const lockHeartbeatMs = Math.max(10, Math.min(
-    opts.lockHeartbeatMs ?? LOCK_HEARTBEAT_MS,
-    Math.max(10, Math.floor(lockFreshMs / 3)),
-  ))
-  const lockToken = await acquireDaemonLock(lockPath, lockFreshMs)
-  if (!lockToken) {
-    return { ticks: 0, roundsRun: 0, exitReason: 'lock_held' }
-  }
-  const workspaceIdentity = await ensureWorkspaceIdentity(opts.projectDir)
-  const hostCoordinator = opts.hostCoordinator ?? new HostSchedulerCoordinator(opts.hostCoordinatorOptions)
+  const identity = await ensureWorkspaceIdentity(options.projectDir)
+  const host = options.hostCoordinator ?? new HostSchedulerCoordinator(options.hostCoordinatorOptions)
   let workspaceLease: HostAdmissionHandle
   try {
-    workspaceLease = await hostCoordinator.acquireWorkspaceLease(workspaceIdentity, opts.projectDir, CLI_VERSION)
+    workspaceLease = await host.acquireWorkspaceLease(identity, options.projectDir, CLI_VERSION)
   } catch (error) {
-    await releaseDaemonLock(lockPath, lockToken)
+    await releaseDaemonLock(lockPath, token)
     if (error instanceof WorkspaceIdentityConflictError) {
-      return { ticks: 0, roundsRun: 0, exitReason: 'workspace_identity_conflict' }
+      return { ticks: 0, graphTicksRun: 0, exitReason: 'workspace_identity_conflict' }
     }
     throw error
   }
-  const schedulerAbort = new AbortController()
-  const forwardAbort = (): void => schedulerAbort.abort(opts.signal?.reason)
-  if (opts.signal?.aborted) forwardAbort()
-  else opts.signal?.addEventListener('abort', forwardAbort, { once: true })
-  // This timer is independent of tickOnce(): a model seat can legally run for
-  // hours, so refreshing only between ticks lets a cross-host observer reap a
-  // live daemon's 5-minute lease mid-round.
-  const lockHeartbeat = setInterval(() => {
-    void refreshLock(lockPath, lockToken).catch(() => undefined)
-  }, lockHeartbeatMs)
-  lockHeartbeat.unref?.()
+
+  const abort = new AbortController()
+  const forwardAbort = (): void => abort.abort(options.signal?.reason)
+  if (options.signal?.aborted) forwardAbort()
+  else options.signal?.addEventListener('abort', forwardAbort, { once: true })
+  const lockHeartbeat = setInterval(() => void refreshLock(lockPath, token).catch(() => undefined), lockHeartbeatMs)
   const workspaceHeartbeat = setInterval(() => {
     void workspaceLease.heartbeat().then(ok => {
-      if (!ok) schedulerAbort.abort(new Error('workspace scheduler lease lost'))
-    }).catch(() => schedulerAbort.abort(new Error('workspace scheduler heartbeat failed')))
-  }, hostCoordinator.heartbeatIntervalMs)
+      if (!ok) abort.abort(new Error('workspace scheduler lease lost'))
+    }).catch(() => abort.abort(new Error('workspace scheduler heartbeat failed')))
+  }, host.heartbeatIntervalMs)
+  lockHeartbeat.unref?.()
   workspaceHeartbeat.unref?.()
-  const wakeStore = new WakeStore(opts.projectDir)
-  let ticks = 0
-  let roundsRun = 0
-  let idleSince: number | null = null
-  let nextHousekeepingAt = 0
+
+  const deps: TickDeps = {
+    graphAgent: options.graphAgent,
+    projectDir: options.projectDir,
+    signal: abort.signal,
+    graphCatalog: options.graphCatalog,
+    hostCoordinator: host,
+    workspaceIdentity: identity,
+  }
+  const wakeStore = new WakeStore(options.projectDir)
   const inFlight = new Map<string, Promise<void>>()
   const completed: TickOutcome[] = []
-  const tickDeps: TickDeps = {
-    dispatcher: opts.dispatcher,
-    projectDir: opts.projectDir,
-    signal: schedulerAbort.signal,
-    effectAdapters: opts.effectAdapters,
-    observer: opts.observer,
-    hostCoordinator,
-    workspaceIdentity,
-    scenarios: opts.scenarios,
-  }
+  let ticks = 0
+  let graphTicksRun = 0
+  let idleSince: number | null = null
+  let nextPruneAt = 0
   try {
     for (;;) {
-      if (completed.length > 0) {
+      if (completed.length) {
         const outcomes = completed.splice(0)
-        const result: TickResult = { claimed: outcomes.length, outcomes }
-        roundsRun += outcomes.filter(o => o.outcome).length
-        opts.onTick?.(result)
+        graphTicksRun += outcomes.filter(outcome => outcome.graphOutcome).length
+        options.onTick?.({ claimed: outcomes.length, outcomes })
       }
-      if (schedulerAbort.signal.aborted) {
-        // Keep the host lock until every task has observed cancellation and its
-        // wake disposition is durable. This prevents a replacement daemon from
-        // replaying work beside an old live worker.
-        await Promise.allSettled([...inFlight.values()])
-        if (completed.length > 0) {
-          const outcomes = completed.splice(0)
-          roundsRun += outcomes.filter(o => o.outcome).length
-          opts.onTick?.({ claimed: outcomes.length, outcomes })
-        }
-        return { ticks, roundsRun, exitReason: 'aborted' }
+      if (abort.signal.aborted) {
+        await Promise.allSettled(inFlight.values())
+        return { ticks, graphTicksRun, exitReason: 'aborted' }
       }
-
-      await refreshLock(lockPath, lockToken)
+      await refreshLock(lockPath, token)
       const tickNow = now()
-      if (tickNow >= nextHousekeepingAt) {
+      if (tickNow >= nextPruneAt) {
         await wakeStore.prune(WAKE_RETENTION_MS, tickNow).catch(() => 0)
-        await pruneInstanceArchives(
-          opts.projectDir,
-          Math.max(0, opts.archiveRetentionMs ?? DEFAULT_ARCHIVE_RETENTION_MS),
-          tickNow,
-        ).catch(error => {
-          console.error('[loop] archive housekeeping failed:', error)
-        })
-        nextHousekeepingAt = tickNow + HOUSEKEEPING_INTERVAL_MS
+        nextPruneAt = tickNow + 60 * 60_000
       }
-      const available = maxConcurrentRounds - inFlight.size
+      const available = maxConcurrent - inFlight.size
       const claimed = available > 0
-        ? await prepareAndClaim(tickDeps, tickNow, available)
+        ? await prepareAndClaim(deps, tickNow, available)
         : { wakeStore, wakes: [] }
       ticks++
-      if (claimed.wakes.length > 0) {
-        for (const wake of claimed.wakes) {
-          const task = runClaimedWake(tickDeps, claimed.wakeStore, wake)
-            .then(outcome => { completed.push(outcome) })
-            .catch(err => {
-              completed.push({
-                loopId: wake.loopId,
-                error: err instanceof Error ? err.message : String(err),
-              })
-            })
-            .finally(() => { inFlight.delete(wake.wakeId) })
-          inFlight.set(wake.wakeId, task)
-        }
-        idleSince = null
+      for (const wake of claimed.wakes) {
+        const task = runClaimedWake(deps, claimed.wakeStore, wake)
+          .then(outcome => { completed.push(outcome) })
+          .catch(error => { completed.push({ loopId: wake.loopId, error: error instanceof Error ? error.message : String(error) }) })
+          .finally(() => { inFlight.delete(wake.wakeId) })
+        inFlight.set(wake.wakeId, task)
       }
 
-      // Idle detection: pending OR claimed wakes (even future ones) keep us
-      // alive — and so does any WAITING instance: an event wait has no wake by
-      // design (its resume signal is an external events/ file), and only a
-      // live process can ingest that file when it arrives.
-      const live = (await wakeStore.list()).filter(
-        w => w.status === 'pending' || w.status === 'claimed',
-      )
-      const hasWaiting = live.length === 0 &&
-        (await listInstanceRecords(opts.projectDir)).some(r => r.status === 'waiting')
-      if (live.length === 0 && !hasWaiting && inFlight.size === 0) {
+      const liveWakes = (await wakeStore.list()).some(wake => wake.status === 'pending' || wake.status === 'claimed')
+      const waiting = (await listGraphInstanceRecords(options.projectDir)).some(record => record.status === 'waiting')
+      if (!liveWakes && !waiting && inFlight.size === 0) {
         idleSince ??= now()
-        if (now() - idleSince >= idleExitMs) {
-          return { ticks, roundsRun, exitReason: 'idle' }
-        }
-      } else {
-        idleSince = null
-      }
-      await sleep(pollMs, schedulerAbort.signal)
+        if (now() - idleSince >= idleExitMs) return { ticks, graphTicksRun, exitReason: 'idle' }
+      } else idleSince = null
+      await sleep(pollMs, abort.signal)
     }
   } finally {
     clearInterval(lockHeartbeat)
     clearInterval(workspaceHeartbeat)
-    opts.signal?.removeEventListener('abort', forwardAbort)
+    options.signal?.removeEventListener('abort', forwardAbort)
     await workspaceLease.release().catch(() => undefined)
-    await releaseDaemonLock(lockPath, lockToken)
+    await releaseDaemonLock(lockPath, token)
   }
 }
 
-async function pruneInstanceArchives(
-  projectDir: string,
-  retentionMs: number,
-  now: number,
-): Promise<number> {
-  let removed = 0
-  for (const record of await listInstanceRecords(projectDir)) {
-    const paths = instancePaths(projectDir, record.instanceId)
-    for (const dir of [paths.processedDir, paths.eventsProcessedDir]) {
-      let files: string[]
-      try {
-        files = await readdir(dir)
-      } catch {
-        continue
-      }
-      for (const file of files) {
-        const path = join(dir, file)
-        const info = await stat(path).catch(() => null)
-        if (!info?.isFile() || now - info.mtimeMs < retentionMs) continue
-        await rm(path, { force: true })
-        removed++
-      }
-    }
-  }
-  return removed
-}
-
-/** A lock older than this (mtime) is presumed orphaned. The holder refreshes
- * its lock every poll iteration, so a live daemon's lock stays far fresher. */
-const LOCK_FRESH_MS = 5 * 60_000
-const LOCK_HEARTBEAT_MS = 60_000
-
-interface DaemonLockRecord {
-  pid: number
-  host: string
-  token: string
-  at: number
-}
+interface DaemonLockRecord { pid: number; host: string; token: string; at: number }
 
 export async function acquireDaemonLock(lockPath: string, freshMs = LOCK_FRESH_MS): Promise<string | null> {
   await mkdir(join(lockPath, '..'), { recursive: true }).catch(() => undefined)
   try {
-    const raw = await readFile(lockPath, 'utf-8')
-    const held = JSON.parse(raw) as DaemonLockRecord
-    if (held.host === hostname()) {
-      // pid liveness alone is not enough: an OS-recycled pid would hold the
-      // lock forever. A live daemon refreshes mtime every heartbeat, so
-      // "alive AND fresh" is the real ownership test; alive-but-stale is a
-      // recycled pid (or a wedged daemon past its own lease) — reap it.
-      if (isAlive(held.pid)) {
-        const st = await stat(lockPath).catch(() => null)
-        if (!st || Date.now() - st.mtimeMs < freshMs) return null
-      }
-    } else {
-      // Cross-host (shared dir): pid liveness is unknowable here — judge by
-      // lock freshness instead of reaping unconditionally, which would let two
-      // hosts run duelling daemons over the same workspace.
-      const st = await stat(lockPath).catch(() => null)
-      if (st && Date.now() - st.mtimeMs < freshMs) return null
-    }
-    // Claim the stale inode with an atomic rename. Direct rm() has a race where
-    // two contenders can delete each other's freshly-created lock.
+    const held = JSON.parse(await readFile(lockPath, 'utf8')) as DaemonLockRecord
+    const info = await stat(lockPath).catch(() => null)
+    const fresh = !!info && Date.now() - info.mtimeMs < freshMs
+    if ((held.host !== hostname() && fresh) || (held.host === hostname() && isAlive(held.pid) && fresh)) return null
     const stalePath = `${lockPath}.${process.pid}.${randomUUID()}.stale`
     try {
       await rename(lockPath, stalePath)
       await rm(stalePath, { force: true })
-    } catch {
-      return null
-    }
-  } catch {
-    // no lock file — free to take it
-  }
+    } catch { return null }
+  } catch { /* free */ }
   const token = randomUUID()
   try {
-    await writeFile(lockPath, JSON.stringify({
-      pid: process.pid, host: hostname(), token, at: Date.now(),
-    } satisfies DaemonLockRecord), {
-      flag: 'wx', // exclusive create — loser of a race backs off
-    })
+    await writeFile(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), token, at: Date.now() } satisfies DaemonLockRecord), { flag: 'wx' })
     return token
-  } catch {
-    return null
-  }
+  } catch { return null }
 }
 
-/** Touch the lock's mtime so cross-host observers see the holder is alive. */
 async function refreshLock(lockPath: string, token: string): Promise<void> {
   try {
-    const held = JSON.parse(await readFile(lockPath, 'utf-8')) as DaemonLockRecord
+    const held = JSON.parse(await readFile(lockPath, 'utf8')) as DaemonLockRecord
     if (held.pid === process.pid && held.host === hostname() && held.token === token) {
-      const t = new Date()
-      await utimes(lockPath, t, t)
+      const time = new Date()
+      await utimes(lockPath, time, time)
     }
-  } catch {
-    // Lock vanished or is not ours — the next acquire/tick decides.
-  }
+  } catch { /* the next scheduler iteration observes loss */ }
 }
 
 export async function releaseDaemonLock(lockPath: string, token: string): Promise<void> {
   try {
-    const held = JSON.parse(await readFile(lockPath, 'utf-8')) as DaemonLockRecord
-    if (held.pid === process.pid && held.host === hostname() && held.token === token) {
-      await rm(lockPath, { force: true })
-    }
+    const held = JSON.parse(await readFile(lockPath, 'utf8')) as DaemonLockRecord
+    if (held.pid === process.pid && held.host === hostname() && held.token === token) await rm(lockPath, { force: true })
   } catch { /* already gone */ }
 }
 
 function isAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
+  try { process.kill(pid, 0); return true } catch { return false }
 }
 
 function sleep(ms: number, signal?: AbortSignal): Promise<void> {

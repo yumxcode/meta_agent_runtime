@@ -229,7 +229,7 @@ export class AutoWorktreeCoordinator {
     await this._updateRecord(record, { phase: 'finalizing', error: undefined })
     try {
       await this._assertNoGitOperation(record.worktreePath)
-      const sourcePaths = ['--', '.', ':(exclude).meta-agent/**']
+      const sourcePaths = ['--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**']
       const status = await this._gitIn(
         record.worktreePath,
         ['status', '--porcelain', ...sourcePaths],
@@ -316,7 +316,7 @@ export class AutoWorktreeCoordinator {
 
     let stashCommit: string | undefined
     try {
-      const transactionPaths = ['--', '.', ':(exclude).meta-agent/**']
+      const transactionPaths = ['--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**']
       const dirty = (
         await this._git(['status', '--porcelain', ...transactionPaths])
       ).length > 0
@@ -403,7 +403,7 @@ export class AutoWorktreeCoordinator {
         )
         const untracked = await this._gitIn(
           record.worktreePath,
-          ['ls-files', '--others', '--exclude-standard', '--', '.', ':(exclude).meta-agent/**'],
+          ['ls-files', '--others', '--exclude-standard', '--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**'],
         )
         return [stdout.trim(), untracked ? `Untracked:\n${untracked}` : '']
           .filter(Boolean)
@@ -596,7 +596,7 @@ export class AutoWorktreeCoordinator {
     try {
       await this._git(['merge', '--abort']).catch(() => undefined)
       await this._git(['reset', '--hard', preMergeHead])
-      await this._git(['clean', '-fd', '--', '.', ':(exclude).meta-agent/**'])
+      await this._git(['clean', '-fd', '--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**'])
       if (stashCommit) {
         await this._git(['stash', 'apply', '--index', stashCommit])
       }
@@ -648,7 +648,7 @@ export class AutoWorktreeCoordinator {
 
   private async _recordHasRecoverableChanges(record: AutoWorktreeRecord): Promise<boolean> {
     if (!existsSync(record.worktreePath)) return Boolean(record.finalizedCommit)
-    const sourcePaths = ['--', '.', ':(exclude).meta-agent/**']
+    const sourcePaths = ['--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**']
     const status = await this._gitIn(record.worktreePath, ['status', '--porcelain', ...sourcePaths])
     if (status.trim()) return true
     const commitCount = Number(await this._gitIn(

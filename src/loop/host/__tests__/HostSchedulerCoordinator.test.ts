@@ -29,13 +29,13 @@ describe('HostSchedulerCoordinator', () => {
     await first.release()
   })
 
-  it('enforces one host round slot across coordinator instances', async () => {
+  it('enforces one host graph-tick slot across coordinator instances', async () => {
     const state = await mkdtemp(join(tmpdir(), 'loop-host-capacity-'))
-    const a = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentRounds: 1, pollMs: 10 })
-    const b = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentRounds: 1, pollMs: 10 })
-    const first = await a.acquireRound(scope('ws-00000000-0000-4000-8000-000000000001'), new AbortController().signal)
+    const a = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentGraphTicks: 1, pollMs: 10 })
+    const b = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentGraphTicks: 1, pollMs: 10 })
+    const first = await a.acquireGraphTick(scope('ws-00000000-0000-4000-8000-000000000001'), new AbortController().signal)
     let secondGranted = false
-    const secondPromise = b.acquireRound(
+    const secondPromise = b.acquireGraphTick(
       scope('ws-00000000-0000-4000-8000-000000000002'), new AbortController().signal,
     ).then(handle => { secondGranted = true; return handle })
     await delay(40)
@@ -48,15 +48,15 @@ describe('HostSchedulerCoordinator', () => {
 
   it('gives a waiting workspace the next slot instead of letting a busy workspace reacquire', async () => {
     const state = await mkdtemp(join(tmpdir(), 'loop-host-fair-'))
-    const coordinator = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentRounds: 1, pollMs: 10 })
+    const coordinator = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentGraphTicks: 1, pollMs: 10 })
     const wsA = 'ws-00000000-0000-4000-8000-00000000000a'
     const wsB = 'ws-00000000-0000-4000-8000-00000000000b'
-    const first = await coordinator.acquireRound(scope(wsA, 'a1'), new AbortController().signal)
+    const first = await coordinator.acquireGraphTick(scope(wsA, 'a1'), new AbortController().signal)
     let aGranted = false
-    const nextA = coordinator.acquireRound(scope(wsA, 'a2'), new AbortController().signal)
+    const nextA = coordinator.acquireGraphTick(scope(wsA, 'a2'), new AbortController().signal)
       .then(handle => { aGranted = true; return handle })
     await delay(15)
-    const nextB = coordinator.acquireRound(scope(wsB, 'b1'), new AbortController().signal)
+    const nextB = coordinator.acquireGraphTick(scope(wsB, 'b1'), new AbortController().signal)
     await delay(25)
     await first.release()
     const b = await nextB
@@ -149,25 +149,25 @@ describe('HostSchedulerCoordinator', () => {
   it('recovers a crashed holder by TTL without letting its stale token delete the new lease', async () => {
     const state = await mkdtemp(join(tmpdir(), 'loop-host-stale-'))
     const coordinator = new HostSchedulerCoordinator({
-      rootDir: state, maxConcurrentRounds: 1, leaseTtlMs: 1_000, pollMs: 10,
+      rootDir: state, maxConcurrentGraphTicks: 1, leaseTtlMs: 1_000, pollMs: 10,
     })
-    const first = await coordinator.acquireRound(scope('ws-stale-a'), new AbortController().signal)
-    const second = await coordinator.acquireRound(scope('ws-stale-b'), new AbortController().signal)
+    const first = await coordinator.acquireGraphTick(scope('ws-stale-a'), new AbortController().signal)
+    const second = await coordinator.acquireGraphTick(scope('ws-stale-b'), new AbortController().signal)
     expect(second.lease.token).not.toBe(first.lease.token)
     await first.release() // stale release must be a no-op
     expect((await coordinator.snapshot()).leases.some(lease => lease.token === second.lease.token)).toBe(true)
     await second.release()
   }, 5_000)
 
-  it('bounds 200 round grants across 50 workspaces without starvation', async () => {
+  it('bounds 200 graph-tick grants across 50 workspaces without starvation', async () => {
     const state = await mkdtemp(join(tmpdir(), 'loop-host-stress-'))
-    const coordinator = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentRounds: 8, pollMs: 10 })
+    const coordinator = new HostSchedulerCoordinator({ rootDir: state, maxConcurrentGraphTicks: 8, pollMs: 10 })
     let active = 0
     let maxActive = 0
     const seen = new Set<string>()
     await Promise.all(Array.from({ length: 200 }, async (_, index) => {
       const workspaceId = `ws-${String(index % 50).padStart(8, '0')}-0000-4000-8000-000000000000`
-      const handle = await coordinator.acquireRound(scope(workspaceId, `loop-${index}`), new AbortController().signal)
+      const handle = await coordinator.acquireGraphTick(scope(workspaceId, `loop-${index}`), new AbortController().signal)
       active++
       maxActive = Math.max(maxActive, active)
       seen.add(workspaceId)
