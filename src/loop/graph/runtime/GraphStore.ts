@@ -91,6 +91,9 @@ export class GraphStore {
   readonly paths: GraphPaths
 
   constructor(readonly projectDir: string, readonly instanceId: string) {
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(instanceId)) {
+      throw new Error(`invalid graph instance id '${instanceId}'`)
+    }
     this.projectDir = resolve(projectDir)
     this.paths = graphPaths(this.projectDir, instanceId)
   }
@@ -329,6 +332,7 @@ export class GraphStore {
     leaseToken: string
     outcome: string
     output: JsonValue
+    summary?: string
     usage?: ActivationUsage
     now?: number
   }): Promise<ActivationCommitIntent> {
@@ -349,6 +353,7 @@ export class GraphStore {
         leaseToken: input.leaseToken,
         outcome: input.outcome,
         output: input.output,
+        summary: input.summary,
         usage: input.usage,
         createdAt: input.now ?? Date.now(),
         status: 'prepared',

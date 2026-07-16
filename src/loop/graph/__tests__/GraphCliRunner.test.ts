@@ -1,4 +1,4 @@
-import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { mkdtemp, readFile, rm, writeFile } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -8,7 +8,7 @@ import { HostSchedulerCoordinator } from '../../host/HostSchedulerCoordinator.js
 import { ensureWorkspaceIdentity } from '../../workspace/WorkspaceIdentity.js'
 import { WakeStore } from '../../wake/WakeStore.js'
 import { createDefaultGraphRuntimeCatalog, GraphStore } from '../index.js'
-import type { GraphAgentExecutor, LoopGraphSpec } from '../index.js'
+import type { GraphAgentExecutor, GraphDistillExecutor, GraphProgressEvent, LoopGraphSpec } from '../index.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
@@ -69,6 +69,39 @@ function pausedGraph(): LoopGraphSpec {
 }
 
 describe('durable graph CLI and shared scheduler', () => {
+  it('distills through the foreground executor without requiring a SubAgent dispatcher', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'graph-cli-distill-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Create a deterministic loop.', 'utf8')
+    const outputs: unknown[] = [
+      { graph: graph(), taskSpec: 'Foreground compiler output.' },
+      { accepted: true, issues: [] },
+    ]
+    const phases: string[] = []
+    const prompts: string[] = []
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        phases.push(request.phase)
+        prompts.push(request.taskDescription)
+        return { status: 'completed', output: outputs.shift() }
+      },
+    }
+
+    const result = await runLoopCli(['distill', 'requirements.md', '--out', 'compiled.json'], {
+      projectDir: root,
+      distillExecutor: executor,
+    })
+
+    expect(result).toContain('compiled.json')
+    expect(phases).toEqual(['compiler', 'semantic_review'])
+    expect(prompts[0]).toContain('用户的 Loop 需求是：requirements.md')
+    expect(prompts[0]).toContain(`项目地址是：${root}`)
+    expect(prompts[0]).not.toContain('Create a deterministic loop.')
+    expect(prompts[1]).not.toContain('Create a deterministic loop.')
+    expect(JSON.parse(await readFile(join(root, 'compiled.json'), 'utf8'))).toMatchObject({ id: 'cli-graph' })
+    expect(await readFile(join(root, 'loop.graph.review.md'), 'utf8')).toBe('Foreground compiler output.')
+  })
+
   it('resumes a graph-authored paused Terminal through its durable resume edge', async () => {
     const root = await mkdtemp(join(tmpdir(), 'graph-cli-paused-'))
     roots.push(root)
@@ -88,10 +121,14 @@ describe('durable graph CLI and shared scheduler', () => {
     const created = await runLoopCli(['create', 'loop.json', '--id', 'graph-one'], { projectDir: root })
     expect(created).toContain('durable-graph-v1')
 
-    const first = await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent })
+    const progress: GraphProgressEvent[] = []
+    const first = await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent, onGraphProgress: event => progress.push(event) })
     expect(first.outcomes[0]?.graphOutcome?.committed).toBe(1)
-    const second = await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent })
+    const second = await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent, onGraphProgress: event => progress.push(event) })
     expect(second.outcomes[0]?.graphOutcome?.instance.status).toBe('done')
+    expect(progress.map(event => event.type)).toEqual([
+      'phase_started', 'phase_completed', 'phase_started', 'phase_completed',
+    ])
 
     const listed = await runLoopCli(['list'], { projectDir: root })
     expect(listed).toContain('graph-one  done')
@@ -99,6 +136,31 @@ describe('durable graph CLI and shared scheduler', () => {
     const inspected = await runLoopCli(['inspect', 'graph-one'], { projectDir: root })
     expect(inspected).toContain('status: done')
     expect(inspected).toContain('durable-graph-v1')
+    expect(inspected).toContain('recent phase results: 2')
+    expect(inspected).toContain('Function builtin/identity@1 ended with outcome success')
+  })
+
+  it('derives operator views and archives only a quiescent terminal instance', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'graph-cli-operator-'))
+    roots.push(root)
+    await writeFile(join(root, 'loop.json'), JSON.stringify(graph()), 'utf8')
+    await runLoopCli(['create', 'loop.json', '--id', 'operator-one'], { projectDir: root })
+    await expect(runLoopCli(['archive', 'operator-one'], { projectDir: root })).rejects.toThrow(/non-terminal/)
+    await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent })
+    await tickOnce({ projectDir: root, graphAgent: unusedGraphAgent })
+
+    expect(await runLoopCli(['timeline', 'operator-one', '--limit', '10'], { projectDir: root }))
+      .toContain('activation_committed')
+    expect(await runLoopCli(['files', 'operator-one'], { projectDir: root }))
+      .toContain('graph declares no workspace files or records')
+    expect(await runLoopCli(['disk', 'operator-one'], { projectDir: root }))
+      .toContain('lane worktrees: 0B')
+
+    const archived = await runLoopCli(['archive', 'operator-one'], { projectDir: root })
+    expect(archived).toContain('archived to')
+    expect(await runLoopCli(['inspect', 'operator-one'], { projectDir: root })).toContain('not found')
+    expect(await runLoopCli(['gc', '--older-than-days', '1', '--include-archives'], { projectDir: root }))
+      .toContain('dry-run')
   })
 
   it('requeues a claimed wake when host admission is interrupted', async () => {

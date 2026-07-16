@@ -20,12 +20,15 @@ export function validateGraphAbiShape(value: unknown): string[] {
     keys(item, ['type', 'initial', 'description'], at, errors)
   })
   eachRecord(value.lanes, 'lanes', errors, (lane, at) => {
-    keys(lane, ['context', 'workspace', 'maxConcurrency', 'description', 'agentProfile', 'dataAccess', 'annotations'], at, errors)
+    keys(lane, ['context', 'workspace', 'maxConcurrency', 'description', 'agentProfile', 'dataAccess', 'workspaceAccess', 'annotations'], at, errors)
     annotation(lane.annotations, `${at}.annotations`, errors)
     child(lane.agentProfile, `${at}.agentProfile`, errors, profile => keys(profile, ['systemInstructions'], `${at}.agentProfile`, errors))
     child(lane.dataAccess, `${at}.dataAccess`, errors, access => {
       keys(access, ['read', 'publish', 'write'], `${at}.dataAccess`, errors)
       eachArray(access.read, `${at}.dataAccess.read`, errors, (grant, grantAt) => keys(grant, ['plane', 'views'], grantAt, errors))
+    })
+    child(lane.workspaceAccess, `${at}.workspaceAccess`, errors, access => {
+      keys(access, ['write', 'deny'], `${at}.workspaceAccess`, errors)
     })
   })
   eachRecord(value.nodes, 'nodes', errors, (node, at) => validateNode(node, at, errors))
@@ -60,7 +63,7 @@ export function validateGraphAbiShape(value: unknown): string[] {
 function validateNode(node: Record<string, unknown>, at: string, errors: string[]): void {
   const base = ['type', 'description', 'timeoutMs', 'publishes', 'annotations']
   const byType: Record<string, string[]> = {
-    agent: ['lane', 'prompt', 'systemInstructions', 'context', 'inputs', 'outputSchema', 'tools', 'skills', 'writes', 'maxAttempts', 'budget', 'lifetimeBudget', 'timerPolicy'],
+    agent: ['lane', 'prompt', 'systemInstructions', 'context', 'inputs', 'outputSchema', 'tools', 'skills', 'reads', 'writes', 'maxAttempts', 'budget', 'lifetimeBudget', 'timerPolicy'],
     function: ['function', 'inputs', 'outputSchema'],
     effect: ['effect', 'inputs', 'idempotencyKey'],
     wait: ['wait'],

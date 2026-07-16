@@ -32,11 +32,16 @@ import { once } from 'node:events'
 import { Writable } from 'node:stream'
 import { isAbsolute, resolve, join, basename } from 'node:path'
 import { existsSync, mkdirSync, statSync } from 'node:fs'
+import { readFile, writeFile } from 'node:fs/promises'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import {
   runLoopCli, runLoopScheduler, createDefaultGraphRuntimeCatalog, loadGraphCapabilityPacks,
-  MetaAgentGraphAgentExecutor,
+  ForegroundGraphDistillExecutor, MetaAgentGraphAgentExecutor, reviseLoopGraph,
+  freezeLoopGraph, validateLoopGraph,
+  type GraphDistillModelRequest, type GraphDistillProgressEvent,
+  type DistillGraphResult, type GraphRuntimeCatalog, type GraphProgressEvent,
 } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
@@ -84,7 +89,7 @@ import type { ProfileTemplate, ProfilePreset } from './hardwareTemplate.js'
 import type { MetaAgentConfig, BeforeToolCallResult } from '../core/config.js'
 import type { RouterOptions } from '../routing/types.js'
 import type { SessionMode } from '../core/modes.js'
-import type { MetaAgentEvent } from '../core/types.js'
+import type { MetaAgentEvent, MetaAgentResultEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
@@ -235,13 +240,18 @@ ${bold('OPTIONS')}
   -h, --help            Show this help
 
 ${bold('LOOP RUNTIME (durable graph only)')}
-  meta-agent loop distill <需求.md>        Compile natural language into a validated LoopGraphSpec
+  meta-agent loop distill <需求.md>        Compile, validate, and iteratively refine a LoopGraphSpec
   meta-agent loop create <graph.json>     Freeze capabilities, create an instance, schedule its first wake
   meta-agent loop event <id> <name>       Resume matching graph event waits
   meta-agent loop list                     List loop instances in this workspace
   meta-agent loop inspect <instanceId>     State, activations, wakes and public artifacts/evidence
+  meta-agent loop timeline <instanceId>    Human-readable causal timeline derived from the journal
+  meta-agent loop files <instanceId>       Declared inputs/projections and record counts
+  meta-agent loop disk <instanceId>        Metadata/worktree disk usage
   meta-agent loop tick [--until-quiescent] Claim due wakes and advance graphs
   meta-agent loop pause|resume|stop <id>   Control an instance lifecycle
+  meta-agent loop archive <id>             Move a quiescent terminal instance into .loop/archive
+  meta-agent loop gc [--apply]              Dry-run/apply terminal wake and optional archive cleanup
   meta-agent loop capabilities             List frozen-capable Functions/Reducers/Effects/Packs
   meta-agent loop-scheduler [options]      Run the loop daemon until idle (unattended driver)
       --poll-ms <n> --idle-exit-ms <n> --max-concurrent-graphs <n>
@@ -1689,13 +1699,25 @@ function canShowActiveThinkingMeter(): boolean {
   return !_suppressActiveThinkingMeter
 }
 
+interface StreamPromptSession {
+  submit(prompt: string): AsyncGenerator<MetaAgentEvent>
+  steer(text: string): boolean
+  getEstimatedCost(): number
+  readonly mode: SessionMode | null
+}
+
+interface StreamPromptResult {
+  text: string
+  result?: MetaAgentResultEvent
+}
+
 async function streamPrompt(
-  router: SessionRouter,
+  router: StreamPromptSession,
   prompt: string,
   jsonMode: boolean,
   showThinking = false,
   steerHooks?: SteerHooks,
-): Promise<void> {
+): Promise<StreamPromptResult> {
   const gen = router.submit(prompt)
   const steering = steerHooks ?? null
   let hasText = false
@@ -1705,6 +1727,8 @@ async function streamPrompt(
   // analysis when the run ends in a non-success terminal state. Accumulated in
   // BOTH json and text paths (see the event loop below).
   let recentAgentText = ''
+  let capturedText = ''
+  let terminalResult: MetaAgentResultEvent | undefined
   const recentToolTrail: string[] = []
   let visibleChars = 0
   let visibleTruncated = false
@@ -1826,6 +1850,7 @@ async function streamPrompt(
       // Accumulate recent agent activity for abnormal-termination diagnosis
       // (runs in BOTH json and text modes, before any mode-specific handling).
       if (event.type === 'text') {
+        capturedText += event.text
         recentAgentText += event.text
         if (recentAgentText.length > 8000) recentAgentText = recentAgentText.slice(-8000)
       } else if (event.type === 'tool_use') {
@@ -1842,10 +1867,10 @@ async function streamPrompt(
           event.type === 'result' && event.subtype !== 'success' &&
           isAutonomousMode(router.mode)
         ) {
-          const analysis = await analyzeAbnormalTermination(router, {
+          const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
             goal: prompt, subtype: event.subtype,
             recentText: recentAgentText, toolTrail: recentToolTrail,
-          })
+          }) : null
           if (analysis) {
             console.log(JSON.stringify({
               type: 'termination_analysis',
@@ -1940,6 +1965,7 @@ async function streamPrompt(
           break
         }
         case 'result': {
+          terminalResult = event
           meter.hide()
           await closeThinkingBlock()
           if (hasText) await safeStdoutWrite('\n')
@@ -1971,10 +1997,10 @@ async function streamPrompt(
           // Auto-series abnormal exit: replace the bare reason with an actual
           // LLM diagnosis (what happened / root cause / what's needed next).
           if (event.subtype !== 'success' && isAutonomousMode(router.mode)) {
-            const analysis = await analyzeAbnormalTermination(router, {
+            const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
               goal: prompt, subtype: event.subtype,
               recentText: recentAgentText, toolTrail: recentToolTrail,
-            })
+            }) : null
             if (analysis) {
               await safeStdoutWrite(
                 `\n${dim('─── 终态诊断 (LLM) ───────────────────────────────────────────')}\n` +
@@ -2006,7 +2032,7 @@ async function streamPrompt(
       }
     }
   } catch (err) {
-    if ((err as NodeJS.ErrnoException)?.code === 'ERR_STREAM_PREMATURE_CLOSE') return
+    if ((err as NodeJS.ErrnoException)?.code === 'ERR_STREAM_PREMATURE_CLOSE') return { text: capturedText, ...(terminalResult ? { result: terminalResult } : {}) }
     throw err
   } finally {
     // Always tear down the spinner timer and wipe any lingering status line —
@@ -2016,6 +2042,7 @@ async function streamPrompt(
     if (_activeThinkingMeter === meter) _activeThinkingMeter = null
     setActiveThinkingMeterSuppressed(false)
   }
+  return { text: capturedText, ...(terminalResult ? { result: terminalResult } : {}) }
 }
 
 // ── Session resume picker ─────────────────────────────────────────────────────
@@ -5038,22 +5065,84 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     })
   }
   const sub = args[0]
-  const needsBackend = name === 'loop-scheduler' || sub === 'tick' || sub === 'distill' || sub === 'distill-graph'
+  const isDistill = name === 'loop' && (sub === 'distill' || sub === 'distill-graph')
+  const needsGraphAgent = name === 'loop-scheduler' || sub === 'tick'
 
-  if (!needsBackend) {
+  if (!isDistill && !needsGraphAgent) {
     // create / list / inspect / lifecycle — deterministic, no LLM.
     console.log(await runLoopCli(args, { projectDir, graphCatalog }))
     return
   }
 
   assertApiKeyConfigured(opts)
+  const abort = new AbortController()
+  process.once('SIGINT', () => abort.abort())
+  process.once('SIGTERM', () => abort.abort())
+
+  if (isDistill) {
+    const interactiveDistill = Boolean(process.stdin.isTTY && isTTY && !opts.json && !args.includes('--non-interactive'))
+    const distillRl = interactiveDistill ? createInterface({ input: process.stdin, output: process.stdout }) : undefined
+    const standardTools = await createStandardTools({
+      system: { cwd: projectDir, mode: 'agentic', planModeRef: { active: false } },
+      network: { webFetch: { maxResultSizeChars: 8_000 } },
+      mode: 'agentic',
+    })
+    const toolsByName = new Map(standardTools.map(tool => [tool.name, tool]))
+    const reporter = createForegroundDistillReporter()
+    const distillExecutor = new ForegroundGraphDistillExecutor({
+      createSession: request => {
+        const session = new MetaAgentSession(foregroundDistillConfig(opts, projectDir, request, distillRl))
+        for (const toolName of request.allowedTools) {
+          const tool = toolsByName.get(toolName)
+          if (!tool) throw new Error(`foreground Distill tool '${toolName}' is unavailable`)
+          session.registerTool(tool)
+        }
+        return session
+      },
+      runSession: async (session, request) => {
+        const rendered = await streamPrompt({
+          submit: prompt => session.submit(prompt),
+          steer: text => session.steer(text),
+          getEstimatedCost: () => session.getEstimatedCost(),
+          mode: 'agentic',
+        }, request.taskDescription, opts.json, opts.showThinking)
+        if (request.signal.aborted) return { status: 'cancelled', output: rendered.text || undefined, error: 'Distill interrupted' }
+        const terminal = rendered.result
+        if (!terminal) return { status: 'failed', output: rendered.text || undefined, error: 'agentic Distill session ended without a terminal result' }
+        const output = rendered.text.trim() || terminal.result
+        return terminal.subtype === 'success' && !terminal.isError
+          ? { status: 'completed', output, summary: terminal.result }
+          : { status: 'failed', output: output || undefined, error: terminal.errors?.join('; ') || `agentic Distill session ended with ${terminal.subtype}` }
+      },
+    })
+    try {
+      console.log(await runLoopCli(args, {
+        projectDir,
+        distillExecutor,
+        signal: abort.signal,
+        graphCatalog,
+        onDistillProgress: reporter.onProgress,
+      }))
+      if (interactiveDistill && distillRl) {
+        await runDistillSession({
+          args, projectDir, executor: distillExecutor, graphCatalog,
+          signal: abort.signal, reporter, rl: distillRl,
+        })
+      }
+    } finally {
+      await distillExecutor.dispose()
+      distillRl?.close()
+    }
+    return
+  }
+
   await ensureMcpServerInstructions()
   const router = makeRouter(
     { ...opts, mode: 'auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
   )
-  // Register the standard tool set into the backend so spawned seats / the
-  // distiller sub-agent can resolve read_file/grep/glob/bash/etc. — without this
+  // Register the standard tool set into the backend so spawned Graph Agent
+  // seats can resolve read_file/grep/glob/bash/etc. — without this
   // the bridge's tool registry is empty and every seat fails "No tools resolved".
   const loopTools = await createStandardTools({
     system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
@@ -5061,9 +5150,6 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     mode: 'auto',
   })
   for (const tool of loopTools) router.registerTool(tool)
-  const abort = new AbortController()
-  process.once('SIGINT', () => abort.abort())
-  process.once('SIGTERM', () => abort.abort())
   const stamp = (): string => new Date().toISOString().slice(11, 19)
   try {
     const warmed = await router.prewarmBackend()
@@ -5071,6 +5157,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     const dispatcher = SubAgentBridge.getBridge(router.getSessionId())
     if (!dispatcher) throw new Error('loop backend produced no sub-agent dispatcher')
     const graphAgent = new MetaAgentGraphAgentExecutor(dispatcher)
+    const onGraphProgress = createGraphProgressReporter()
 
     if (name === 'loop-scheduler') {
       const schedulerNumber = (flag: string, fallback: number): number => {
@@ -5082,7 +5169,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       }
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler start (workspace ${projectDir})`)
       const result = await runLoopScheduler({
-        graphAgent, projectDir, signal: abort.signal, graphCatalog,
+        graphAgent, projectDir, signal: abort.signal, graphCatalog, onGraphProgress,
         pollMs: schedulerNumber('--poll-ms', 2_000),
         idleExitMs: schedulerNumber('--idle-exit-ms', 60_000),
         maxConcurrentGraphs: schedulerNumber('--max-concurrent-graphs', 4),
@@ -5098,10 +5185,239 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
         `${result.graphTicksRun} graph tick(s) over ${result.ticks} poll(s).`)
     } else {
-      console.log(await runLoopCli(args, { projectDir, dispatcher, graphAgent, signal: abort.signal, graphCatalog }))
+      console.log(await runLoopCli(args, { projectDir, dispatcher, graphAgent, signal: abort.signal, graphCatalog, onGraphProgress }))
     }
   } finally {
     await router.dispose().catch(() => undefined)
+  }
+}
+
+function createGraphProgressReporter(): (event: GraphProgressEvent) => void {
+  return event => {
+    const time = new Date(event.at).toISOString().slice(11, 19)
+    const loopId = event.instanceId.length > 18 ? `${event.instanceId.slice(0, 15)}…` : event.instanceId
+    const prefix = dim(`[${time}] [${loopId}/${event.nodeId} a${event.attempt}:s${event.segment}]`)
+    const detail = (value: string): string => terminalText(value.replace(/\s+/g, ' ').trim().slice(0, 300))
+    if (event.type === 'phase_started') {
+      const verb = event.resumed ? '恢复' : '开始'
+      const reason = event.resumeReason ? `；此前挂起原因：${detail(event.resumeReason)}` : ''
+      console.log(`${prefix} ${cyan('▶')} ${verb}：${detail(event.phase)}${reason}`)
+      return
+    }
+    if (event.type === 'phase_completed') {
+      const usage = event.usage
+        ? dim(`  turns=${event.usage.turns} cost=$${event.usage.costUsd.toFixed(4)}`)
+        : ''
+      const marker = event.outcome === 'failure' ? red('✗') : green('✓')
+      console.log(`${prefix} ${marker} 结束（${detail(event.outcome)}）：${detail(event.summary)}${usage}`)
+      return
+    }
+    if (event.type === 'phase_retrying') {
+      const timing = event.wakeAt ? `；${new Date(event.wakeAt).toISOString()} 后重试` : '；等待重新调度'
+      console.log(`${prefix} ${yellow('↻')} ${event.replay ? '重放' : '重试'}：${detail(event.reason)}${timing}`)
+      return
+    }
+    if (event.type === 'phase_parked') {
+      const target = event.wakeAt
+        ? `至 ${new Date(event.wakeAt).toISOString()}`
+        : event.eventName ? `等待事件 ${detail(event.eventName)}` : '等待恢复'
+      console.log(`${prefix} ${yellow('⏸')} 挂起${target}：${detail(event.reason)}`)
+      return
+    }
+    console.log(`${prefix} ${red('✗')} 终止：${detail(event.reason)}`)
+  }
+}
+
+async function runDistillSession(options: {
+  args: string[]
+  projectDir: string
+  executor: ForegroundGraphDistillExecutor
+  graphCatalog: GraphRuntimeCatalog
+  signal: AbortSignal
+  reporter: ReturnType<typeof createForegroundDistillReporter>
+  rl: readline.Interface
+}): Promise<void> {
+  const requirementArg = distillRequirementArg(options.args)
+  if (!requirementArg) throw new Error('interactive Distill lost the requirement document path')
+  const outArg = loopOptionValue(options.args, '--out') ?? 'loop.graph.draft.json'
+  const outPath = resolve(options.projectDir, outArg)
+  const reviewPath = resolve(options.projectDir, 'loop.graph.review.md')
+  const source = { requirement: requirementArg, projectDir: options.projectDir }
+  let current: DistillGraphResult = {
+    graph: JSON.parse(await readFile(outPath, 'utf8')),
+    taskSpec: await readFile(reviewPath, 'utf8').catch(() => ''),
+    attempts: 1,
+  }
+  const feedback: string[] = []
+  console.log(`\n${bold(green('Distill session'))}`)
+  printDistillDraft(current, outArg)
+  console.log(dim('检查已生成文件；有问题就直接输入补充或纠正，当前 turn 验证通过后会覆盖草图；/show 查看摘要；/reload 载入手工编辑；/validate 重新校验；/exit 结束。'))
+  while (!options.signal.aborted) {
+    const line = await questionLine(options.rl, `${bold(cyan('distill'))} › `)
+    if (line === null) break
+    const input = line.trim()
+    if (!input) continue
+    if (input === '/quit' || input === '/exit') {
+      console.log(`${dim(`Distill exited; current files remain on disk. Next: meta-agent loop create ${outArg}`)}`)
+      return
+    }
+    if (input === '/show') {
+      printDistillDraft(current, outArg)
+      continue
+    }
+    if (input === '/reload') {
+      try {
+        current = {
+          graph: JSON.parse(await readFile(outPath, 'utf8')),
+          taskSpec: await readFile(reviewPath, 'utf8').catch(() => current.taskSpec),
+          attempts: current.attempts,
+        }
+        console.log(`${green('✓')} Reloaded ${outArg} from disk.`)
+        printDistillDraft(current, outArg)
+      } catch (error) {
+        console.log(`${red('✗')} Could not reload the draft: ${sanitizeTerminalPreview(error instanceof Error ? error.message : String(error), 300)}`)
+      }
+      continue
+    }
+    if (input === '/validate') {
+      try {
+        const errors = validateLoopGraph(current.graph, options.graphCatalog)
+        if (errors.length) {
+          console.log(`${yellow('⚠')} ${errors.length} validation issue(s):`)
+          for (const error of errors) console.log(`  ${dim('·')} ${sanitizeTerminalPreview(error, 300)}`)
+        } else {
+          freezeLoopGraph(current.graph, options.graphCatalog, 0)
+          console.log(`${green('✓')} Structural and Freeze validation passed.`)
+        }
+      } catch (error) {
+        console.log(`${red('✗')} Freeze validation failed: ${sanitizeTerminalPreview(error instanceof Error ? error.message : String(error), 400)}`)
+      }
+      continue
+    }
+
+    console.log(`${dim('[distill]')} continuing the same compiler conversation…`)
+    try {
+      const nextFeedback = [...feedback, input]
+      const revised = await reviseLoopGraph(source, current, nextFeedback.map((item, index) => `${index + 1}. ${item}`).join('\n'), {
+        executor: options.executor,
+        catalog: options.graphCatalog,
+        signal: options.signal,
+        onProgress: options.reporter.onProgress,
+      })
+      feedback.push(input)
+      current = revised
+      await writeFile(outPath, JSON.stringify(revised.graph, null, 2), 'utf8')
+      await writeFile(reviewPath, revised.taskSpec, 'utf8')
+      console.log(`${green('✓')} Updated ${outArg} and loop.graph.review.md`)
+      printDistillDraft(current, outArg)
+    } catch (error) {
+      console.log(`${red('✗')} Revision was not applied; current draft is unchanged.`)
+      console.log(`  ${sanitizeTerminalPreview(error instanceof Error ? error.message : String(error), 500)}`)
+    }
+  }
+}
+
+function printDistillDraft(result: Pick<DistillGraphResult, 'graph' | 'taskSpec'>, out: string): void {
+  const graph = result.graph
+  console.log(`${bold('draft')} ${out}  graph=${graph.id}@v${graph.version}  nodes=${Object.keys(graph.nodes).length}  transitions=${graph.transitions.length}  lanes=${Object.keys(graph.lanes).length}  planes=${Object.keys(graph.dataPlanes ?? {}).length}`)
+  if (result.taskSpec.trim()) console.log(`${dim('compiler note:')}\n${result.taskSpec.trim()}`)
+}
+
+function distillRequirementArg(args: readonly string[]): string | undefined {
+  for (let index = 1; index < args.length; index++) {
+    const value = args[index]!
+    if (value === '--out') { index++; continue }
+    if (value === '--non-interactive') continue
+    if (!value.startsWith('--')) return value
+  }
+  return undefined
+}
+
+function loopOptionValue(args: readonly string[], name: string): string | undefined {
+  const index = args.indexOf(name)
+  return index >= 0 ? args[index + 1] : undefined
+}
+
+function questionLine(rl: readline.Interface, prompt: string): Promise<string | null> {
+  return new Promise(resolveLine => {
+    let settled = false
+    const finish = (value: string | null): void => {
+      if (settled) return
+      settled = true
+      rl.removeListener('close', onClose)
+      resolveLine(value)
+    }
+    const onClose = (): void => finish(null)
+    rl.once('close', onClose)
+    rl.question(prompt, answer => finish(answer))
+  })
+}
+
+function foregroundDistillConfig(
+  opts: CliOptions,
+  projectDir: string,
+  request: GraphDistillModelRequest,
+  rl?: readline.Interface,
+): MetaAgentConfig {
+  const allowed = new Set(request.allowedTools)
+  const config: MetaAgentConfig = {
+    projectDir,
+    promptMode: 'agentic',
+    externalPromptAssembly: true,
+    skipMemoryRecall: true,
+    systemPrompt: request.systemPrompt,
+    maxTurns: request.maxTurns,
+    maxBudgetUsd: request.phase === 'compiler' ? (opts.maxBudgetUsd ?? 10) : request.maxBudgetUsd,
+    debugMode: opts.debug,
+    beforeToolCall: async toolName => allowed.has(toolName)
+      ? { action: 'allow' }
+      : { action: 'deny', reason: `foreground Distill does not allow tool '${toolName}'` },
+  }
+  if (rl && !opts.json && isTTY) {
+    config.askUser = async (question: string, options?: string[]) => {
+      const choices = options ?? []
+      process.stdout.write(`\n${cyan('❓')}  ${bold('Distill 需要你的输入')}\n${terminalText(question)}\n`)
+      if (choices.length > 0) {
+        process.stdout.write(choices.map((choice, index) => `  ${green(String(index + 1))}. ${terminalText(choice)}`).join('\n') + '\n\n')
+        const answer = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `)
+        const selected = Number.parseInt(answer, 10)
+        if (Number.isInteger(selected) && selected >= 1 && selected <= choices.length) return choices[selected - 1]!
+        return answer
+      }
+      return askQuestion(rl, '你的回答 > ')
+    }
+  }
+  const apiKey = resolveExplicitApiKey(opts)
+  if (apiKey) config.apiKey = apiKey
+  if (opts.baseUrl) config.baseURL = opts.baseUrl
+  if (opts.model) config.model = opts.model
+  if (opts.fallbackModel) config.fallbackModel = opts.fallbackModel
+  return config
+}
+
+function createForegroundDistillReporter(): {
+  onProgress(event: GraphDistillProgressEvent): void
+} {
+  const phaseLabel = (phase: 'compiler' | 'semantic_review'): string => phase === 'compiler' ? 'compiler' : 'reviewer'
+  return {
+    onProgress(event): void {
+      if (event.type === 'phase_started') {
+        const attempt = event.phase === 'compiler' ? ` attempt ${event.attempt}/${event.maxAttempts}` : ''
+        console.log(`${dim('[distill]')} ${phaseLabel(event.phase)}${attempt} started on agentic session`)
+      } else if (event.type === 'phase_completed') {
+        console.log(`${dim('[distill]')} ${phaseLabel(event.phase)} response received`)
+      } else if (event.type === 'validation_passed') {
+        console.log(`${green('✓')} ${dim('[distill]')} structural and Freeze validation passed`)
+      } else if (event.type === 'validation_failed') {
+        console.log(`${yellow('⚠')} ${dim('[distill]')} compiler output rejected with ${event.issues.length} issue(s)`)
+        for (const issue of event.issues.slice(0, 8)) console.log(`  ${dim('·')} ${sanitizeTerminalPreview(issue, 240)}`)
+      } else if (event.type === 'semantic_review_accepted') {
+        console.log(`${green('✓')} ${dim('[distill]')} semantic review accepted`)
+      } else {
+        console.log(`${yellow('⚠')} ${dim('[distill]')} semantic review rejected`)
+        for (const issue of event.issues.slice(0, 8)) console.log(`  ${dim('·')} ${sanitizeTerminalPreview(issue, 240)}`)
+      }
+    },
   }
 }
 

@@ -74,11 +74,12 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
   for (const [laneId, lane] of Object.entries(spec.lanes ?? {})) {
     validateId(laneId, `lanes.${laneId}`, errors)
     if (!['persistent', 'fresh_per_activation'].includes(lane.context)) errors.push(`lanes.${laneId}.context is invalid`)
-    if (!['readonly', 'lane_overlay', 'effect_only'].includes(lane.workspace)) errors.push(`lanes.${laneId}.workspace is invalid`)
+    if (!['readonly', 'shared_controlled', 'lane_overlay', 'effect_only'].includes(lane.workspace)) errors.push(`lanes.${laneId}.workspace is invalid`)
     if (lane.maxConcurrency !== undefined && (!Number.isInteger(lane.maxConcurrency) || lane.maxConcurrency !== 1)) {
       errors.push(`lanes.${laneId}.maxConcurrency must be 1; a Lane is a single-writer continuity boundary`)
     }
     if (lane.agentProfile) validateInstructionText(lane.agentProfile.systemInstructions, `lanes.${laneId}.agentProfile.systemInstructions`, errors)
+    validateLaneWorkspaceAccess(laneId, lane, errors)
   }
 
   validateArtifactChannels(spec, errors)
@@ -89,6 +90,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
   const nodeIds = new Set(Object.keys(spec.nodes ?? {}))
   const transitionIds = new Set<string>()
   for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) validateNode(nodeId, node, spec, registries, errors)
+  validateWorkspaceDataflow(spec, errors)
 
   for (const [i, transition] of (spec.transitions ?? []).entries()) {
     const at = `transitions[${i}]`
@@ -301,11 +303,7 @@ function validateNode(nodeId: string, node: NodeSpec, spec: LoopGraphSpec, regis
         if (node.lifetimeBudget?.elapsedMs === undefined) errors.push(`${at}.lifetimeBudget.elapsedMs is required when hard park is enabled`)
       }
       validateBindings(node.inputs, `${at}.inputs`, registries, errors)
-      for (const [i, path] of (node.writes ?? []).entries()) {
-        if (typeof path !== 'string' || !path || path.startsWith('/') || path.startsWith('\\') || path.split(/[\\/]/).includes('..')) {
-          errors.push(`${at}.writes[${i}] must be a workspace-relative path without '..'`)
-        }
-      }
+      validateAgentWorkspacePaths(nodeId, node, spec, errors)
       break
     case 'function':
       if (!registries.functions.has(node.function)) errors.push(`${at}.function references unknown function '${node.function}'`)
@@ -562,7 +560,7 @@ function validateDataPlanes(spec: LoopGraphSpec, errors: string[]): void {
         else if (kind === 'publish' && plane.backend !== 'record') errors.push(`${at} Plane '${planeId}' is not a record backend`)
         else if (kind === 'write' && plane.backend !== 'workspace') errors.push(`${at} Plane '${planeId}' is not a workspace backend`)
         else if (kind === 'write' && plane.backend === 'workspace' && plane.binding.lane !== laneId) errors.push(`${at} workspace Plane '${planeId}' does not belong to Lane '${laneId}'`)
-        else if (kind === 'write' && spec.lanes[laneId]?.workspace !== 'lane_overlay') errors.push(`${at} requires Lane '${laneId}' to use lane_overlay`)
+        else if (kind === 'write' && !['lane_overlay', 'shared_controlled'].includes(spec.lanes[laneId]?.workspace ?? '')) errors.push(`${at} requires Lane '${laneId}' to use lane_overlay or shared_controlled`)
         else if (kind === 'write' && plane.backend === 'workspace' && plane.binding.plane !== 'observability' && plane.binding.direction !== 'bidirectional') {
           errors.push(`${at} workspace Plane '${planeId}' is Kernel/input-owned; direct Lane writes require observability or bidirectional ownership`)
         }
@@ -603,8 +601,8 @@ function validateWorkspaceBindings(spec: LoopGraphSpec, errors: string[]): void 
     if (binding.lane !== undefined) {
       const lane = spec.lanes?.[binding.lane]
       if (!lane) errors.push(`${at}.lane references unknown Lane '${binding.lane}'`)
-      else if (binding.direction !== 'ingest' && lane.workspace !== 'lane_overlay') {
-        errors.push(`${at}.lane '${binding.lane}' must use lane_overlay for materialization`)
+      else if (binding.direction !== 'ingest' && !['lane_overlay', 'shared_controlled'].includes(lane.workspace)) {
+        errors.push(`${at}.lane '${binding.lane}' must use lane_overlay or shared_controlled for materialization`)
       }
     }
     const destination = `${binding.lane ?? '$project'}:${binding.path}`
@@ -679,6 +677,124 @@ function isSafeWorkspacePath(path: string): boolean {
   const parts = path.split(/[\\/]/)
   if (parts.includes('..') || parts.includes('') || parts.includes('.')) return false
   return !['.loop', '.git', '.meta-agent'].includes(parts[0]!)
+}
+
+function validateLaneWorkspaceAccess(
+  laneId: string,
+  lane: LoopGraphSpec['lanes'][string],
+  errors: string[],
+): void {
+  const at = `lanes.${laneId}.workspaceAccess`
+  if (lane.workspaceAccess === undefined) {
+    if (lane.workspace === 'shared_controlled') errors.push(`${at} is required for shared_controlled`)
+    return
+  }
+  if (!isPlainRecord(lane.workspaceAccess)) { errors.push(`${at} must be an object`); return }
+  if (!['shared_controlled', 'lane_overlay'].includes(lane.workspace)) {
+    errors.push(`${at} is only valid for shared_controlled or lane_overlay`)
+  }
+  if (!Array.isArray(lane.workspaceAccess.write) || lane.workspaceAccess.write.length === 0) {
+    errors.push(`${at}.write must be a non-empty array`)
+  }
+  for (const [kind, paths] of [['write', lane.workspaceAccess.write], ['deny', lane.workspaceAccess.deny]] as const) {
+    if (paths !== undefined && !Array.isArray(paths)) { errors.push(`${at}.${kind} must be an array`); continue }
+    const list = Array.isArray(paths) ? paths : []
+    if (new Set(list).size !== list.length) errors.push(`${at}.${kind} must not contain duplicates`)
+    for (const [index, path] of list.entries()) if (!isSafeWorkspacePath(path)) {
+      errors.push(`${at}.${kind}[${index}] must be a safe workspace-relative path prefix`)
+    }
+  }
+}
+
+function validateAgentWorkspacePaths(
+  nodeId: string,
+  node: Extract<NodeSpec, { type: 'agent' }>,
+  spec: LoopGraphSpec,
+  errors: string[],
+): void {
+  const lane = spec.lanes[node.lane]
+  for (const kind of ['reads', 'writes'] as const) {
+    const paths = node[kind]
+    if (paths !== undefined && !Array.isArray(paths)) { errors.push(`nodes.${nodeId}.${kind} must be an array`); continue }
+    const list = Array.isArray(paths) ? paths : []
+    if (new Set(list).size !== list.length) errors.push(`nodes.${nodeId}.${kind} must not contain duplicates`)
+    for (const [index, path] of list.entries()) if (!isSafeWorkspacePath(path)) {
+      errors.push(`nodes.${nodeId}.${kind}[${index}] must be a safe workspace-relative path prefix`)
+    }
+  }
+  if (!node.writes?.length) return
+  if (!lane || lane.workspace === 'readonly' || lane.workspace === 'effect_only') {
+    errors.push(`nodes.${nodeId}.writes requires a writable Lane`)
+    return
+  }
+  const ceiling = lane.workspaceAccess?.write
+  if (lane.workspace === 'shared_controlled' && !ceiling?.length) {
+    errors.push(`nodes.${nodeId}.writes requires Lane '${node.lane}' workspaceAccess.write`)
+    return
+  }
+  for (const path of node.writes) {
+    if (ceiling?.length && !ceiling.some(root => pathCoveredBy(path, root))) {
+      errors.push(`nodes.${nodeId}.writes '${path}' exceeds Lane '${node.lane}' workspaceAccess.write`)
+    }
+    if (lane.workspaceAccess?.deny?.some(denied => pathsOverlap(path, denied))) {
+      errors.push(`nodes.${nodeId}.writes '${path}' overlaps Lane '${node.lane}' workspaceAccess.deny`)
+    }
+  }
+}
+
+/** Freeze-time visibility and ownership checks for raw workspace dataflow. */
+function validateWorkspaceDataflow(spec: LoopGraphSpec, errors: string[]): void {
+  const agents = Object.entries(spec.nodes ?? {})
+    .filter((entry): entry is [string, Extract<NodeSpec, { type: 'agent' }>] => entry[1].type === 'agent')
+  for (let leftIndex = 0; leftIndex < agents.length; leftIndex++) {
+    const [leftId, left] = agents[leftIndex]!
+    for (let rightIndex = leftIndex + 1; rightIndex < agents.length; rightIndex++) {
+      const [rightId, right] = agents[rightIndex]!
+      if (left.lane === right.lane) continue
+      for (const leftPath of left.writes ?? []) for (const rightPath of right.writes ?? []) {
+        if (pathsOverlap(leftPath, rightPath)) errors.push(
+          `nodes.${leftId}.writes '${leftPath}' conflicts across Lanes with nodes.${rightId}.writes '${rightPath}'; use one Lane or disjoint paths`,
+        )
+      }
+      for (const produced of left.writes ?? []) for (const consumed of right.reads ?? []) {
+        if (pathsOverlap(produced, consumed)) errors.push(
+          `nodes.${rightId}.reads '${consumed}' depends on workspace output '${produced}' from Lane '${left.lane}'; cross-Lane semantic data must use publication/Data View`,
+        )
+      }
+      for (const produced of right.writes ?? []) for (const consumed of left.reads ?? []) {
+        if (pathsOverlap(produced, consumed)) errors.push(
+          `nodes.${leftId}.reads '${consumed}' depends on workspace output '${produced}' from Lane '${right.lane}'; cross-Lane semantic data must use publication/Data View`,
+        )
+      }
+    }
+  }
+
+  for (const [bindingId, binding] of Object.entries(spec.workspaceBindings ?? {})) {
+    if (binding.direction !== 'materialize') continue
+    for (const [nodeId, node] of agents) {
+      const lane = spec.lanes[node.lane]
+      const samePhysicalWorkspace = binding.lane === node.lane ||
+        (binding.lane === undefined && lane?.workspace !== 'readonly' && lane?.workspace !== 'effect_only')
+      if (!samePhysicalWorkspace) continue
+      for (const path of node.writes ?? []) if (pathsOverlap(path, binding.path)) {
+        errors.push(`nodes.${nodeId}.writes '${path}' overlaps Kernel-owned Workspace projection '${bindingId}' at '${binding.path}'`)
+      }
+    }
+  }
+}
+
+function pathCoveredBy(path: string, root: string): boolean {
+  const child = normalizeWorkspacePrefix(path)
+  const parent = normalizeWorkspacePrefix(root)
+  return child === parent || child.startsWith(`${parent}/`)
+}
+
+function pathsOverlap(left: string, right: string): boolean {
+  return pathCoveredBy(left, right) || pathCoveredBy(right, left)
+}
+
+function normalizeWorkspacePrefix(path: string): string {
+  return path.replace(/\\/g, '/').replace(/\/+$/, '')
 }
 
 function validateInstructionText(value: string, at: string, errors: string[]): void {
@@ -785,7 +901,7 @@ function validateContractRef(
   let current = shape
   for (const segment of path) {
     if (current.type !== 'object') {
-      errors.push(`${at} references '$${ref}', but '${segment}' is below non-object schema type '${current.type}'`)
+      errors.push(`${at} references '$${ref}', but '${segment}' is below non-object schema type ${describeSchemaType(current.type)}`)
       return
     }
     const next = current.properties?.[segment]
@@ -880,7 +996,7 @@ function validateShapeSpec(value: unknown, at: string, depth = 0): string[] {
   const shape = value as Record<string, unknown>
   const type = shape.type
   if (!['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(String(type))) {
-    return [`${at}.type is invalid`]
+    return [`${at}.type must be one of object|array|string|number|integer|boolean|null; received ${describeSchemaType(type)}. ShapeSpec directly owns this string discriminator; do not wrap it in another type object`]
   }
   const errors: string[] = []
   const allowedByType: Record<string, Set<string>> = {
@@ -926,6 +1042,20 @@ function validateShapeSpec(value: unknown, at: string, depth = 0): string[] {
     if (typeof shape.minimum === 'number' && typeof shape.maximum === 'number' && shape.minimum > shape.maximum) errors.push(`${at}.minimum must be <= maximum`)
   }
   return errors
+}
+
+function describeSchemaType(value: unknown): string {
+  if (value === undefined) return 'undefined'
+  if (value === null) return 'null'
+  if (Array.isArray(value)) return `array ${boundedJson(value)}`
+  if (typeof value === 'object') return `object ${boundedJson(value)}`
+  return `${typeof value} ${boundedJson(value)}`
+}
+
+function boundedJson(value: unknown): string {
+  const rendered = JSON.stringify(value)
+  if (rendered === undefined) return String(value)
+  return rendered.length > 180 ? `${rendered.slice(0, 177)}...` : rendered
 }
 
 function isPlainRecord(value: unknown): value is Record<string, unknown> {

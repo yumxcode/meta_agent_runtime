@@ -24,7 +24,14 @@ export interface StateVariableSpec {
 }
 
 export type LaneContextMode = 'persistent' | 'fresh_per_activation'
-export type LaneWorkspaceMode = 'readonly' | 'lane_overlay' | 'effect_only'
+export type LaneWorkspaceMode = 'readonly' | 'shared_controlled' | 'lane_overlay' | 'effect_only'
+
+export interface LaneWorkspaceAccessSpec {
+  /** Upper bound for direct writes in a shared_controlled or lane_overlay workspace. */
+  write: string[]
+  /** Paths that remain immutable even when covered by write. Deny wins. */
+  deny?: string[]
+}
 
 export interface LaneDataReadGrant {
   plane: string
@@ -50,6 +57,8 @@ export interface ExecutionLaneSpec {
   agentProfile?: AgentProfileSpec
   /** Data-plane authorization ceiling inherited by Agent nodes on this Lane. */
   dataAccess?: LaneDataAccessSpec
+  /** Direct filesystem authorization ceiling. Semantic cross-Lane data still uses Data Planes. */
+  workspaceAccess?: LaneWorkspaceAccessSpec
   annotations?: GraphAnnotations
 }
 
@@ -96,6 +105,8 @@ export interface AgentNodeSpec extends NodeBase {
   outputSchema?: ShapeSpec
   tools?: string[]
   skills?: string[]
+  /** Declared raw workspace dependencies, used for Freeze visibility checks. */
+  reads?: string[]
   writes?: string[]
   maxAttempts?: number
   /** Per-process-segment limits. A timer continuation starts a new segment. */
@@ -453,6 +464,8 @@ export interface ActivationRecord {
   output?: JsonValue
   outcome?: string
   error?: string
+  /** Concise operator-facing reason why the latest execution segment stopped. */
+  summary?: string
   wakeAt?: number
   waitingReason?: 'continuation' | 'retry' | 'replay'
   event?: { name: string; correlation?: JsonValue }
@@ -587,6 +600,8 @@ export interface ActivationCommitIntent {
   leaseToken: string
   outcome: string
   output: JsonValue
+  /** Concise operator-facing completion summary, persisted with the commit. */
+  summary?: string
   usage?: ActivationUsage
   createdAt: number
   status: 'prepared' | 'committed'

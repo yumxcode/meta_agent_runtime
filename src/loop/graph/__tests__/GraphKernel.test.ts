@@ -1,4 +1,4 @@
-import { mkdtemp, rm } from 'node:fs/promises'
+import { lstat, mkdtemp, rm } from 'node:fs/promises'
 import { join } from 'node:path'
 import { tmpdir } from 'node:os'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -12,6 +12,8 @@ import {
   ArtifactPlane,
   CommitCoordinator,
   type EffectProvider,
+  type GraphAgentExecutionRequest,
+  type GraphProgressEvent,
   type LoopGraphSpec,
 } from '../index.js'
 
@@ -151,6 +153,50 @@ function lateAnyJoinGraph(): LoopGraphSpec {
 }
 
 describe('GraphKernel', () => {
+  it('runs shared_controlled on the project root without allocating a worktree', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'graph-shared-controlled-'))
+    roots.push(root)
+    const caps = capabilities()
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-1.0', id: 'shared-controlled', version: 1, goal: 'Edit one controlled path',
+      state: {},
+      lanes: {
+        work: {
+          context: 'persistent', workspace: 'shared_controlled', maxConcurrency: 1,
+          workspaceAccess: { write: ['src'], deny: ['src/generated'] },
+        },
+      },
+      nodes: {
+        work: { type: 'agent', lane: 'work', prompt: 'Edit the source.', reads: ['src'], writes: ['src/control'] },
+        done: { type: 'terminal', status: 'done' },
+        failed: { type: 'terminal', status: 'failed' },
+      },
+      transitions: [
+        { id: 'done', from: 'work', to: 'done' },
+        { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
+      ],
+      entrypoints: [{ id: 'start', node: 'work' }], limits: { maxActivations: 3 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir: root, instanceId: 'shared-controlled', graph, functions: caps.functions })
+    let request: GraphAgentExecutionRequest | undefined
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps,
+      graphAgent: {
+        id: 'test/shared-controlled@1',
+        async execute(input) {
+          request = input
+          return { kind: 'completed', taskId: 'task', success: true, output: {}, summary: 'edited controlled source', usage: { turns: 1, costUsd: 0, durationMs: 1 } }
+        },
+      },
+    })
+    await kernel.tick()
+    expect(request?.workspace.mode).toBe('shared_write')
+    expect(request?.workspace.projectDir).toBe(root)
+    expect(request?.workspace.writeAllowPaths).toEqual([join(root, 'src/control')])
+    expect(request?.workspace.writeDenyPaths).toContain(join(root, 'src/generated'))
+    expect(await lstat(join(store.paths.lanesDir, 'worktrees')).catch(() => null)).toBeNull()
+  })
   it('durably resumes a paused Terminal exactly once through its declared resume edge', async () => {
     const root = await mkdtemp(join(tmpdir(), 'graph-paused-resume-'))
     roots.push(root)
@@ -436,6 +482,7 @@ describe('GraphKernel', () => {
     roots.push(root)
     let now = 1_000
     let segment = 0
+    const progress: GraphProgressEvent[] = []
     const caps = capabilities()
     const graph = freezeLoopGraph(longAgentGraph(), caps, 1)
     const store = await GraphStore.create({ projectDir: root, instanceId: 'long-agent', graph, functions: caps.functions, now })
@@ -450,10 +497,19 @@ describe('GraphKernel', () => {
           inputPatch: { __continuationCheckpoint: { taskId: 'TASK-1', check: segment } },
           usage,
         }
-        return { kind: 'completed' as const, outcome: 'success', output: { complete: true }, usage }
+        return {
+          kind: 'completed' as const,
+          outcome: 'success',
+          output: { complete: true },
+          summary: 'Training lifecycle completed after convergence.',
+          usage,
+        }
       },
     }
-    const kernel = await GraphKernel.open({ store, graph, ...caps, executor, now: () => now, owner: 'test' })
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps, executor, now: () => now, owner: 'test',
+      onProgress: event => progress.push(event),
+    })
 
     expect((await kernel.tick()).parked).toBe(1)
     for (let check = 2; check <= 5; check++) {
@@ -480,7 +536,17 @@ describe('GraphKernel', () => {
     expect(completed.parkCount).toBe(5)
     expect(completed.continuationVersion).toBe(5)
     expect(completed.usage).toEqual({ turns: 12, costUsd: 0.6, durationMs: 6_000 })
+    expect(completed.summary).toBe('Training lifecycle completed after convergence.')
     expect(snapshot.instance.totalCostUsd).toBeCloseTo(0.6)
+    expect(progress.find(event => event.type === 'phase_parked')).toMatchObject({
+      type: 'phase_parked', reason: 'poll 1', wakeAt: 1_010,
+    })
+    expect(progress.find(event => event.type === 'phase_started' && event.resumed)).toMatchObject({
+      type: 'phase_started', resumeReason: 'poll 1', continuationVersion: 1,
+    })
+    expect(progress.find(event => event.type === 'phase_completed')).toMatchObject({
+      type: 'phase_completed', summary: 'Training lifecycle completed after convergence.', outcome: 'success',
+    })
     expect((await kernel.tick()).instance.status).toBe('done')
   })
 

@@ -20,7 +20,21 @@ meta-agent -w /path/to/workspace loop inspect my-loop
 
 `distill-graph` 和 `create-graph` 暂作为同义命令保留；文档统一使用 `distill` 和 `create`。`create` 只接受 `schemaVersion: "graph-1.0"`，执行逻辑与编译后双重校验，并冻结 Function、Reducer、Effect、Context Provider 和 Capability Pack 的版本与 integrity；运行和恢复时会重算 Frozen Graph 内容 hash，再核对 capability lock，任何图内容篡改或能力漂移都会 fail closed。
 
-Distill 使用的系统提示直接描述当前唯一的 `durable-graph-v1` ABI 和执行语义：Graph/Activation/Lane 边界、六种 Node、State/Reducer/Transition、Artifact/Evidence、timer/event/effect continuation、Join epoch、预算、retry/replay、journal 恢复和当前实际 Capability Catalog。候选图通过结构/Freeze 校验后，还由独立 LLM reviewer 对照原需求检查明确遗漏和矛盾；reviewer 被禁止规定节点数量、角色名或 Scenario 模板，因此可靠性检查不取代编译模型的领域创造性。若用户要求的确定性 Function/Effect 不在本次 Catalog 中，Distill 不得虚构能力，而应合并到受控 Agent 或在 `loop.graph.review.md` 中列为部署前缺口。
+Distill 使用的系统提示直接描述当前唯一的 `durable-graph-v1` ABI 和执行语义：Graph/Activation/Lane 边界、六种 Node、State/Reducer/Transition、逻辑 Data Plane/View、workspace ownership、timer/event/effect continuation、Join epoch、预算、retry/replay、journal 恢复和当前实际 Capability Catalog。Prompt 内嵌一张由同一套真实 Validator 与 Freeze 回归保护的、领域无关的最小完整 source Graph；它只示范两层 State ShapeSpec、直接 `outputSchema`、ValueExpression、outcome 覆盖和 condition/default 配对，不规定领域拓扑。校验失败后的下一次 Compiler attempt 同时收到原始诊断与按错误族生成的局部 ABI 修复提示，避免用含糊的 `type is invalid` 反复试错。
+
+候选图通过结构/Freeze 校验后，还由独立 LLM reviewer 对照原需求检查明确遗漏和矛盾。Reviewer 使用比 Compiler 更小的语义合同，但明确理解长生命周期 Activation、persistent Lane、确定性路由、逻辑 Plane/View 和 Kernel-owned materialization；它不重复 ABI lint，也被禁止规定节点数量、角色名或 Scenario 模板，因此可靠性检查不取代编译模型的领域创造性。若用户要求的确定性 Function/Effect 不在本次 Catalog 中，Distill 不得虚构能力，而应合并到受控 Agent 或在 `loop.graph.review.md` 中列为部署前缺口。
+
+Compiler 与 semantic reviewer 都直接复用现有 agentic 执行底座和同一套 `streamPrompt` 终端渲染，不注册 `subtask-*`，不经过 `SubAgentBridge`，也不会创建子 Agent sandbox。模型文本、工具调用、工具结果、API retry、thinking meter、token/费用终态与普通 agentic mode 一致地可见；`--show-thinking` 的行为也保持一致。两者保持独立上下文，以免 reviewer 继承 compiler 的自我辩护。宿主不会读取需求文件再把正文拼入 prompt，而只提供 `用户的 Loop 需求是：<命令中的文件参数>` 与 `项目地址是：<-w workspace>`。Compiler 必须使用 `read_file` 自行读取需求，再按 Loop 设计是否依赖项目现状，使用 `glob/grep/read_file` 最小化检查相关结构、已有状态、进展、工具和约束；不得仅凭文件名猜测，也不得无目的遍历 workspace。独立 semantic reviewer 同样自行读取原始需求和必要项目证据，不以 Compiler 的 `taskSpec` 转述代替原文。Compiler 还注册交互式 `ask_user`，缺少会实质改变拓扑、权限或运行边界的信息时可在当前 turn 请求用户选择或补充。结构解析、Validate、Freeze 和草图落盘仍由 Distill 控制层负责。Graph 运行阶段的 Agent Node 继续使用独立 `graph_agent` 接口，两者边界不变。
+
+在 TTY 中，首个 Distill turn 根据需求文档生成完整 `{graph, taskSpec}`，依次通过结构校验、Freeze 和独立 semantic review，落盘后本 turn 即结束并等待下一条用户输入。用户此时直接检查 `loop.graph.draft.json` 与 `loop.graph.review.md`；发现问题就输入补充或纠正，Compiler 基于当前完整草图在同一会话中生成完整新版本，再走同一验证链，成功后覆盖文件，失败则保留旧文件。没有额外的“协作审阅状态机”，也不使用 `action=answer|revise` 协议或 `/accept` 状态；用户满意后直接 `/exit`，再运行 `loop create`。`/show`、`/reload`、`/validate` 只是本地便利命令。非 TTY/管道调用自动保持一次性行为；TTY 自动化可显式添加 `--non-interactive`。
+
+```bash
+# 多轮前台 Distill（TTY 默认，完成后 /exit）
+meta-agent loop distill requirements.md --out loop.graph.json
+
+# CI 或脚本中的一次性编译
+meta-agent loop distill requirements.md --out loop.graph.json --non-interactive
+```
 
 以人形机器人远端训练研究为输入的过程说明见 [x1 Loop Distill 模拟](examples/x1-loop-distill-simulation.md)，完整结构化结果见 [x1 Loop Distill 输出](examples/x1-loop.distill-output.json)。其中 `graph` 是 CLI 写入 `loop.graph.draft.json` 的内容，`taskSpec` 是 CLI 写入 `loop.graph.review.md` 的审阅说明；该示例由默认 Catalog 的真实 Validator 与 Freeze 回归校验。
 
@@ -64,7 +78,7 @@ Distill 使用的系统提示直接描述当前唯一的 `durable-graph-v1` ABI 
 - `join`：以 `all` 或 `any` 收口并发分支；
 - `terminal`：`done/failed` 结束图；`paused` 是带唯一 `resume` 路由的持久恢复点。
 
-Lane 把“控制图节点”和“执行上下文”解耦。强相关节点放在同一 `persistent` Lane，复用稳定 lineage session；写 Lane 使用私有 `lane_overlay` 和单写者约束，不同 Lane 可以并发。只读审查节点可使用 `fresh_per_activation + readonly`，避免把生产节点与审查节点的上下文混在一起。
+Lane 把“控制图节点”“执行上下文”和“文件工作区”解耦。强相关节点放在同一 `persistent` Lane，复用稳定 lineage session；Lane 始终是单写者连续性边界，但不必创建 worktree。`readonly` 共享项目根且不可写，`shared_controlled` 共享项目根并按路径上限写，`lane_overlay` 才创建隔离 worktree，`effect_only` 不执行 Agent。只读审查节点可使用 `fresh_per_activation + readonly`。
 
 每个 Agent Activation 都接收 Kernel 强制的最小 `kernel_activation` section；其他信息由 Agent Node 的 Context Assembly Plan 显式声明。Runtime 不再隐式注入全局 Evidence/Artifact。每个 section 带来源、provider 版本、trust、刷新策略、解析时间、state version 和截断信息，即使底层 session 被压缩，关键快照仍可从冻结图和 journal 恢复。
 
@@ -73,8 +87,12 @@ Lane 把“控制图节点”和“执行上下文”解耦。强相关节点放
   "lanes": {
     "work": {
       "context": "persistent",
-      "workspace": "lane_overlay",
+      "workspace": "shared_controlled",
       "maxConcurrency": 1,
+      "workspaceAccess": {
+        "write": ["src", "experiments", "logs/work.jsonl"],
+        "deny": ["state/progress.json", "logs/orchestrator.jsonl"]
+      },
       "dataAccess": {
         "read": [
           { "plane": "control", "views": ["current_control"] },
@@ -89,6 +107,8 @@ Lane 把“控制图节点”和“执行上下文”解耦。强相关节点放
       "type": "agent",
       "lane": "work",
       "prompt": "完成当前工作并返回结构化结果。",
+      "reads": ["src", "requirements"],
+      "writes": ["src", "experiments", "logs/work.jsonl"],
       "context": {
         "sections": [
           { "name": "control", "provider": "builtin/data-plane-view@1", "refresh": "every_segment", "config": { "view": "current_control" }, "maxBytes": 4096 },
@@ -157,6 +177,8 @@ Lane 的 `dataAccess` 是访问上限，不是隐式注入。`read` 可收窄到
 Freeze 会把上例编译为内部 `dp_*` channel/binding、`dv_*` View、`compiledLaneDataAccess` 物理 ACL，以及 `builtin/state@1`、`builtin/evidence-view@1`、`builtin/workspace-binding@1` 等物理 Provider。Distill 草图不应直接输出 `artifacts`、`evidenceViews`、`artifactViews`、`workspaceBindings`、`compiled*`、物理 `channel` 或这些物理 Provider。Capability lock 只记录编译后的实际 Provider，不锁定编译期 marker `builtin/data-plane-view@1`。
 
 Workspace binding 的 `plane` 进一步说明文件所有权：`input`/`observability` 只 ingest；`state_projection`、`evidence`、`artifact`、`audit` 分别投影 State、Record View 或 Journal View。Kernel 在 commit 后和恢复时幂等重建 materialize 文件。除获得 `dataAccess.write` 的 Plane 外，Lane 内绑定路径会进入 Agent sandbox deny list，避免输入篡改或 Agent 与 Kernel 双写。路径拒绝绝对路径、`..`、`.loop/.git/.meta-agent` 与 symlink 逃逸。
+
+Agent 的 `reads` 是原始 workspace 依赖声明，`writes` 是实际写沙箱；两者使用文件或目录前缀而非 glob。`shared_controlled` 的 writes 还必须是 Lane `workspaceAccess.write` 的子集，且 deny 优先。Freeze 对每个 producer→consumer 做保守可见性检查：同 Lane 可使用声明的原始文件；跨 Lane 的语义结果必须 publication 到 Record Plane，再由 consumer 的精确 Data View 注入。不同 Lane writes 的相同/父子路径会被拒绝，Agent writes 覆盖 State/Evidence/Audit materialize 文件也会被拒绝。
 
 真正新增一种物理存储执行语义不属于 Distill 权限。当前 ABI 只接受四种固定 backend；扩展必须先以受信任、版本化、带 integrity 的 Capability Pack/Runtime 发布并加载，使其成为 Freeze 可验证的目录能力，再由 Distill 引用，不能在图 JSON 中临时生成执行代码。
 
@@ -316,7 +338,8 @@ meta-agent loop tick --until-quiescent
   "lanes": {
     "development": {
       "context": "persistent",
-      "workspace": "lane_overlay",
+      "workspace": "shared_controlled",
+      "workspaceAccess": { "write": ["src", "tests"] },
       "maxConcurrency": 1
     }
   },
@@ -424,7 +447,7 @@ meta-agent -w /path/to/workspace loop-scheduler \
 - workspace lease：检测复制 workspace 的 identity 冲突；
 - host graph-tick admission：限制同一台机器跨 workspace 的 Graph tick 数并保持公平；
 - Graph activation admission：限制全图及每个节点并发；
-- Lane admission：持久写 Lane 单写者；
+- Lane admission：持久 Lane 单写者；不同 shared workspace Lane 的路径集合在 Freeze 时必须不相交；
 - model-call/resource/effect admission：限制模型、共享资源与外部适配器并发。
 
 `concurrency.stateConsistency` 有两种通用策略：
@@ -432,9 +455,28 @@ meta-agent -w /path/to/workspace loop-scheduler \
 - `commit_latest`（默认）：并行计算，State/route/publication 串行按完成顺序提交；适合独立分支、交换/结合 Reducer 和需要最大吞吐的探索任务。
 - `serializable`：若某个执行段计算期间 State version 变化，Kernel 将其作为 replay 重新执行且不消耗业务 retry；只适合纯 Function、只读且可重放的 Agent。它不能回滚已发生的 bash/外部副作用或 workspace 写入，因此不是默认值。
 
-不同 `lane_overlay` 是隔离 worktree，只在最终 done/failed Terminal 合并。跨 Lane 的中间业务数据应通过 State/Record/Journal publication 或放回同一 Lane；下游 Lane 不会自动看到上游尚未 merge 的文件。
+`shared_controlled` 不创建 worktree，适合单机受控写和大仓库；文件修改发生在 Agent commit 前，因此不能获得文件事务或自动回滚，重试必须能识别已有部分修改。`lane_overlay` 提供隔离 worktree，只在最终 done/failed Terminal 合并，适用于并行方案、回滚和独立 merge。跨 Lane 的中间语义数据应通过 State/Record/Journal publication 或放回同一 Lane；不能把共享根目录或最终 merge 当成语义数据总线。
 
 主机默认上限可用 `META_AGENT_LOOP_HOST_MAX_GRAPH_TICKS` 和 `META_AGENT_LOOP_HOST_MAX_MODEL_CALLS` 配置。`loop host-capacity` 查看实时租约，`loop schedulers` 查看活跃 workspace scheduler。
+
+### 9.1 阶段级运行可观测性
+
+Scheduler 默认只输出低频 Graph 生命周期事件，不透传模型文本或工具调用：
+
+```text
+[09:21:40] [my-loop/train a1:s1] ▶ 开始：执行完整训练生命周期
+[09:31:41] [my-loop/train a1:s1] ⏸ 挂起至 2026-07-15T02:31:41.000Z：等待远端训练产生下一批指标
+[09:41:42] [my-loop/train a1:s2] ▶ 恢复：执行完整训练生命周期；此前挂起原因：等待远端训练产生下一批指标
+[10:02:18] [my-loop/train a1:s3] ✓ 结束（success）：训练达到收敛标准，已提取最终指标和模型路径
+```
+
+- 阶段名优先来自冻结 Node 的 `description`；未填写时 Runtime 才使用 Node 类型、能力名或 Agent prompt 首行作为后备。Distill 会被要求生成简短、稳定、面向操作者的 description。
+- Agent 正常结束或业务失败时，`graph_agent` 必须通过 `return_result.summary` 给出一句话原因。Kernel 将其与 commit 一起持久化；非 Agent 节点由 Kernel 生成通用摘要。
+- Agent 调用 timer hard park 时，timer 的 `reason` 必须说明正在等待的条件。Kernel 将 reason 持久化到同一 Activation，并在挂起及 continuation 恢复时展示。Wait/Effect 节点也使用同一通用 park reason 机制。
+- retry/replay、fatal 和 Lane merge pause 只在相应持久状态写入成功后输出。观察回调 fail-open，终端渲染异常不会改变 Graph 执行结果。
+- `meta-agent loop inspect <instanceId>` 显示 running/waiting 阶段、attempt/segment、运行或唤醒时间、等待原因，以及最近五个完成结果。旧版本已存在且没有 summary 的 Activation 会显示兼容性占位信息。
+
+这些事件是 Kernel 的通用执行生命周期，不引入 Research、训练、judge、pivot 等领域事件，也不是第二套 Observation Plane。需要完整因果审计时仍以 Activation journal 为准。
 
 ## 10. 持久化与崩溃恢复
 
@@ -456,21 +498,30 @@ meta-agent -w /path/to/workspace loop-scheduler \
       artifacts/*.json
       events/*.json
       lanes/*.json
+      lanes/worktrees/        # 仅 lane_overlay，执行工作区而非日志
 ```
 
-Journal 是权威 append-only spine；state、activation、artifact、event 和 instance 是可重建 projection。sequence 计数器避免每次 append 扫描全目录，周期 checkpoint 让恢复只 fold journal tail；heartbeat 只更新带 fencing 的 Activation lease projection，不制造 journal 事件。崩溃发生在 journal 写入后、projection 写入前时，下一次 snapshot/tick 会重放。`commitKey = activationId:continuationVersion` 保证提交幂等；lease token 阻止 stale worker 覆盖新 owner；Wake claim 过期后可被回收。
+Journal 是权威 append-only spine；state、activation、artifact、event 和 instance 是运行投影。commit-intent 覆盖 prepare→commit 崩溃窗口，effect-intent 记录外部 Effect 幂等状态，wake 驱动 timer/event 恢复，checkpoint/sequence 只用于加速恢复。Lane worktree 是未合并的执行工作区，不是日志。用户协议中的 `progress.json/findings.jsonl` 等并非 Kernel 必需文件，只有图声明对应 Workspace Plane 时才存在，并由 Kernel 从 State/Record/Journal 幂等重建。
 
-当前保证是单机进程崩溃恢复，基于本地原子 rename 和文件锁；不承诺断电级 `fsync`，也不提供跨主机共享 lease backend。`lane_overlay` 需要 git workspace，否则 fail closed。
+`.loop` 是机器持久化 ABI，不承担人类界面职责。优先使用 `loop inspect` 看当前状态，`loop timeline` 看 Journal 派生时间线，`loop files` 看业务输入/投影及 canonical owner，`loop disk` 区分元数据与 worktree 占用；不要手工编辑或删除内部 JSON。
+
+当前保证是单机进程崩溃恢复，基于本地原子 rename 和文件锁；不承诺断电级 `fsync`，也不提供跨主机共享 lease backend。`lane_overlay` 需要 git workspace，否则 fail closed；`shared_controlled` 无文件事务，适合可重复进入的受控修改，不适合相互冲突的并行方案。
 
 ## 11. 生命周期与运维命令
 
 ```bash
 meta-agent loop list
 meta-agent loop inspect my-loop
+meta-agent loop timeline my-loop --limit 50
+meta-agent loop files my-loop
+meta-agent loop disk my-loop
 meta-agent loop pause my-loop --reason "maintenance"
 meta-agent loop resume my-loop
 meta-agent loop lane-repair my-loop development
 meta-agent loop stop my-loop --reason "operator stop"
+meta-agent loop archive my-loop
+meta-agent loop gc --older-than-days 7
+meta-agent loop gc --older-than-days 30 --include-archives --apply
 meta-agent loop capabilities
 meta-agent loop workspace-info
 meta-agent loop workspace-fork
@@ -482,12 +533,14 @@ meta-agent loop host-capacity
 - `resume` 对运维 pause 恢复原有 ready/waiting Activation；若当前来自 graph-authored paused Terminal，则通过其唯一 `on=resume` 边原子生成后续 Activation，并保证同一暂停点只恢复一次；
 - `lane-repair` 重新 reconcile 并 merge 指定冲突 Lane；成功后会恢复因 Lane 冲突而 paused 的实例并安排 manual wake；
 - `stop` 以 failed 终止并取消 wake；
+- `archive` 只接受 done/failed 且无 pending/claimed wake 的实例，并要求 scheduler 停止；它原子移动完整实例，不裁剪恢复证据；
+- `gc` 默认 dry-run，只列出超过保留期的 done/cancelled wake；只有显式 `--include-archives` 才扫描归档，只有 `--apply` 才删除，绝不处理活动实例；
 - `workspace-fork` 用于复制 workspace 后显式生成新 identity，并重绑定实例记录；运行中的 scheduler 必须先停止。
 
-排障顺序：先看 `loop inspect`，再检查实例的 `instance.json`、journal、activation、commit intent 和 wake。不要手工改 frozen spec、state projection 或 journal；修订流程应创建新图版本和新实例。
+排障顺序：先看 `loop inspect/timeline/files/disk`，再按需检查实例的 `instance.json`、journal、activation、commit intent 和 wake。不要手工改 frozen spec、state projection 或 journal；修订流程应创建新图版本和新实例。
 
 ## 12. 可靠性边界
 
 Freeze/Validator 会拒绝未知 executable ABI 字段、schema 能证明不存在的数据引用、不可达节点、拓扑上无法到达 done/failed 的闭合路径、歧义路由、未锁定能力、非法 Lane ACL 和超出策略的 timer/effect。它不会尝试证明任意 LLM 语义条件必然终止，也不会假装静态理解 Agent bash 的文件依赖。运行时还受 activation、wall time、cost、fan-out 和 pending timer 限额约束。
 
-仍未提供的能力包括 quorum join、跨主机调度、断电级 durability，以及对不受信 Capability Pack 的进程隔离。Journal checkpoint 已限制恢复计算量，但 append-only 历史文件尚未做破坏性裁剪；Event 收件箱也尚未配置保留期。Effect 现在会在 submit 前持久化 intent、submit 后立即持久化 receipt，但外部服务与本地文件无法组成原子事务；极窄的 submit→receipt 崩溃窗口仍要求 Provider 真正按稳定 idempotency key 去重。需要更强保证时应先扩展 Kernel 的通用协议，而不是加入领域特例。
+仍未提供的能力包括 quorum join、跨主机调度、断电级 durability，以及对不受信 Capability Pack 的进程隔离。Archive/GC 不裁剪活动实例的 Journal；Event 收件箱尚未配置细粒度保留期。Effect 现在会在 submit 前持久化 intent、submit 后立即持久化 receipt，但外部服务与本地文件无法组成原子事务；`shared_controlled` 文件写同样不能与 Journal commit 组成原子事务。需要更强保证时应使用 lane_overlay/幂等 Effect 或先扩展 Kernel 的通用协议，而不是加入领域特例。

@@ -41,6 +41,8 @@ describe('graph_agent execution boundary', () => {
       outputSchema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } },
     })
     expect(GRAPH_AGENT_SYSTEM_PROMPT).toContain('Graph Kernel exclusively owns routing')
+    expect(GRAPH_AGENT_SYSTEM_PROMPT).toContain('operator-facing')
+    expect(GRAPH_AGENT_SYSTEM_PROMPT).toContain('being awaited')
     expect(buildGraphAgentSystemPrompt({ laneInstructions: 'Maintain continuity.' })).toContain('graph_authored_system_instructions')
     expect(user).toContain('"name": "activation_instruction"')
     expect(user).toContain('"role": "contract"')

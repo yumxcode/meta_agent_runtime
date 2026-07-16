@@ -147,7 +147,7 @@ describe('generic Workspace Plane bindings', () => {
         },
       },
       nodes: {
-        work: { type: 'agent', lane: 'work', prompt: 'Return success.', writes: ['state'] },
+        work: { type: 'agent', lane: 'work', prompt: 'Return success.', writes: ['scratch'] },
         done: { type: 'terminal', status: 'done' },
         failed: { type: 'terminal', status: 'failed' },
       },

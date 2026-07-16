@@ -1,16 +1,19 @@
 import { describe, expect, it } from 'vitest'
 import { readFile } from 'node:fs/promises'
 import {
+  CANONICAL_GRAPH_DISTILL_EXAMPLE,
+  buildGraphSemanticReviewerSystem,
   buildGraphDistillerSystem,
   createDefaultGraphRuntimeCatalog,
   distillLoopGraph,
   freezeLoopGraph,
+  formatGraphValidationFeedback,
   parseGraphDistillOutput,
+  reviseLoopGraph,
   validateLoopGraph,
+  type GraphDistillExecutor,
   type LoopGraphSpec,
 } from '../index.js'
-import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
-import type { SubAgentRecord } from '../../../subagent/types.js'
 
 const graph: LoopGraphSpec = {
   schemaVersion: 'graph-1.0', id: 'distilled', version: 1, goal: 'test', state: {}, lanes: {},
@@ -25,6 +28,8 @@ const graph: LoopGraphSpec = {
   entrypoints: [{ id: 'start', node: 'calculate' }],
   limits: { maxActivations: 3 },
 }
+
+const source = { requirement: 'requirements.md', projectDir: '/workspace/project' }
 
 describe('Graph Distill compiler contract', () => {
   it('describes the complete current Graph runtime and explicitly rejects legacy Loop IR', () => {
@@ -56,6 +61,57 @@ describe('Graph Distill compiler contract', () => {
     expect(prompt).toContain('threshold 使用更新前 State 正确换算')
     expect(prompt).toContain('builtin/increment@1')
     expect(prompt).toContain('Scenario guidance 是可组合的领域知识，不是固定模板')
+    expect(prompt).toContain('可调用 ask_user 当场询问')
+    expect(prompt).toContain('不会注入需求文件正文')
+    expect(prompt).toContain('【ShapeSpec 嵌套规则')
+    expect(prompt).toContain('"iteration":{"type":{"type":"integer","minimum":0}')
+    expect(prompt).toContain('"outputSchema":{"type":"object"')
+    expect(prompt).toContain('经当前 Validator 与 Freeze 真实校验的最小完整 source Graph')
+    expect(prompt).toContain(JSON.stringify(CANONICAL_GRAPH_DISTILL_EXAMPLE, null, 2))
+    expect(prompt).toContain('graph_created、activation_claimed')
+    expect(prompt).not.toContain('action=answer')
+    expect(prompt).not.toContain('action=revise')
+  })
+
+  it('keeps the embedded canonical source graph executable as the ABI evolves', () => {
+    const catalog = createDefaultGraphRuntimeCatalog()
+    expect(validateLoopGraph(CANONICAL_GRAPH_DISTILL_EXAMPLE, catalog)).toEqual([])
+    expect(() => freezeLoopGraph(CANONICAL_GRAPH_DISTILL_EXAMPLE, catalog, 1)).not.toThrow()
+  })
+
+  it('turns the two observed ShapeSpec mistakes into explicit repair instructions', () => {
+    const feedback = formatGraphValidationFeedback([
+      'state.iteration.minimum is not part of the executable Graph ABI; put non-executable domain metadata under annotations',
+      'state.iteration.type must be a ShapeSpec object',
+      'nodes.work.outputSchema.type must be one of object|array|string|number|integer|boolean|null; received object {"type":"object"}',
+      "transitions[0].to.inputs.result references '$output.is_stale', but 'is_stale' is below non-object schema type object {\"type\":\"object\"}",
+    ])
+    expect(feedback).toContain('state.x={"type":{"type":"integer","minimum":0},"initial":0}')
+    expect(feedback).toContain('outputSchema 本身直接就是 ShapeSpec')
+    expect(feedback).toContain('禁止写成 outputSchema.type=')
+  })
+
+  it('gives the independent reviewer enough runtime semantics without prescribing topology', () => {
+    const prompt = buildGraphSemanticReviewerSystem()
+    expect(prompt).toContain('长生命周期 Activation')
+    expect(prompt).toContain('persistent Lane')
+    expect(prompt).toContain('materialize workspace 文件的 canonical owner 是 Kernel')
+    expect(prompt).toContain('producer→consumer 可见性')
+    expect(prompt).toContain('publication→Data View→consumer context')
+    expect(prompt).toContain('不要规定节点数量')
+    expect(prompt).toContain('不要重做 ABI lint')
+  })
+
+  it('reports a double-wrapped output schema with the received shape instead of object coercion', () => {
+    const malformed = structuredClone(CANONICAL_GRAPH_DISTILL_EXAMPLE) as unknown as Record<string, unknown>
+    const nodes = malformed.nodes as Record<string, Record<string, unknown>>
+    nodes.work!.outputSchema = { type: { type: 'object', properties: { complete: { type: 'boolean' } } } }
+    const errors = validateLoopGraph(malformed as unknown as LoopGraphSpec, createDefaultGraphRuntimeCatalog())
+    expect(errors).toEqual(expect.arrayContaining([
+      expect.stringContaining('ShapeSpec directly owns this string discriminator'),
+    ]))
+    expect(errors.join('\n')).toContain('received object {"type":"object"')
+    expect(errors.join('\n')).not.toContain("schema type '[object Object]'")
   })
 
   it('parses the structured channel and yields a statically valid arbitrary graph', () => {
@@ -112,21 +168,92 @@ describe('Graph Distill compiler contract', () => {
       { accepted: true, issues: [] },
     ]
     let calls = 0
-    const dispatcher: ISubAgentDispatcher = {
-      async spawnSubAgent(options) {
-        const output = outputs[calls++]
-        return {
-          schemaVersion: '1.0', taskId: `subtask-${calls}`, parentSessionId: 'parent', status: 'completed',
-          config: options.config as SubAgentRecord['config'], createdAt: 1, completedAt: 2, pendingHumanApproval: false,
-          result: { success: true, summary: 'done', output, turnsUsed: 1, inputTokens: 1, outputTokens: 1, costUsd: 0, durationMs: 1 },
-        }
+    const requests: string[] = []
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        requests.push(request.taskDescription)
+        return { status: 'completed', output: outputs[calls++] }
       },
-      async getStatus() { return null }, async cancelTask() { return true },
     }
-    const result = await distillLoopGraph('Create any useful loop.', {
-      dispatcher, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    const result = await distillLoopGraph(source, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
     })
     expect(result.graph.nodes).toHaveProperty('calculate')
     expect(calls).toBe(2)
+    expect(requests[1]).toContain('机械提取的 producer→consumer 可见性清单')
+  })
+
+  it('injects ABI-aware repair guidance into the next compiler attempt', async () => {
+    const malformed = structuredClone(CANONICAL_GRAPH_DISTILL_EXAMPLE) as unknown as Record<string, unknown>
+    const state = malformed.state as Record<string, Record<string, unknown>>
+    state.iteration = { type: 'integer', minimum: 0, initial: 0 }
+    const requests: string[] = []
+    const outputs: unknown[] = [
+      { graph: malformed, taskSpec: 'first draft' },
+      { graph: CANONICAL_GRAPH_DISTILL_EXAMPLE, taskSpec: 'fixed nesting' },
+      { accepted: true, issues: [] },
+    ]
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        requests.push(request.taskDescription)
+        return { status: 'completed', output: outputs.shift() }
+      },
+    }
+    const result = await distillLoopGraph(source, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+    expect(result.attempts).toBe(2)
+    expect(requests[1]).toContain('【定向修复提示】')
+    expect(requests[1]).toContain('StateVariableSpec 与 ShapeSpec 是两层')
+  })
+
+  it('passes only the requirement entrypoint and project address, then lets agents read them', async () => {
+    const requests: Array<{ phase: string; taskDescription: string; allowedTools: readonly string[] }> = []
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        requests.push(request)
+        return request.phase === 'compiler'
+          ? { status: 'completed', output: { graph, taskSpec: 'Read from the workspace.' } }
+          : { status: 'completed', output: { accepted: true, issues: [] } }
+      },
+    }
+
+    await distillLoopGraph({ requirement: 'x1_loop.md', projectDir: '/workspace/agibot_x1_train_oma' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    expect(requests[0]?.taskDescription).toContain('用户的 Loop 需求是：x1_loop.md')
+    expect(requests[0]?.taskDescription).toContain('项目地址是：/workspace/agibot_x1_train_oma')
+    expect(requests[0]?.taskDescription).toContain('先使用 read_file 自行读取需求文件')
+    expect(requests[0]?.allowedTools).toEqual(expect.arrayContaining(['read_file', 'grep', 'glob']))
+    expect(requests[1]?.taskDescription).toContain('用户的 Loop 需求是：x1_loop.md')
+    expect(requests[1]?.allowedTools).toEqual(expect.arrayContaining(['read_file', 'grep', 'glob']))
+  })
+
+  it('revises the current draft from human feedback in the persistent compiler conversation', async () => {
+    const revisedGraph = { ...graph, goal: 'test with an explicit human review constraint' }
+    const requests: Array<{ phase: string; sessionKey?: string; taskDescription: string; allowedTools: readonly string[] }> = []
+    const outputs: unknown[] = [
+      { graph: revisedGraph, taskSpec: 'Applied the requested constraint.' },
+      { accepted: true, issues: [] },
+    ]
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        requests.push(request)
+        return { status: 'completed', output: outputs.shift() }
+      },
+    }
+
+    const result = await reviseLoopGraph(source, { graph, taskSpec: 'initial' }, 'Keep the route deterministic.', {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    expect(result.graph.goal).toContain('human review constraint')
+    expect(requests[0]).toMatchObject({ phase: 'compiler', sessionKey: 'distill-compiler' })
+    expect(requests[0]?.taskDescription).toContain('Keep the route deterministic.')
+    expect(requests[0]?.allowedTools).toContain('ask_user')
+    expect(requests[1]?.phase).toBe('semantic_review')
+    expect(requests[1]?.sessionKey).toBeUndefined()
+    expect(requests[1]?.taskDescription).toContain('用户在后续 Distill turn 中新增的约束与意见')
   })
 })

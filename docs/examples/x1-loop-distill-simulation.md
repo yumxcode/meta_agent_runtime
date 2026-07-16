@@ -21,7 +21,7 @@ LoopGraphSpec written to loop.graph.draft.json (validated, 1 attempt(s)); review
 
 ## 编译结果的关键变化
 
-原需求列出的 `load_state → choose_direction → research_design_train → extract_findings → semantic_eval → reduce_progress → state_writer` 没有逐项翻译成七个隔离 Agent。Distill 将强相关语义阶段合并为一个 `research_cycle` Agent Node，并放入单写 `persistent + lane_overlay` 的 `research` Lane：远端训练提交、每 30 分钟观察、平台期终止和 finding 提取属于同一个长生命周期 Activation，等待通过 timer hard park/resume 完成；确定性 State 更新、publication 与文件投影由 Kernel commit 负责。
+原需求列出的 `load_state → choose_direction → research_design_train → extract_findings → semantic_eval → reduce_progress → state_writer` 没有逐项翻译成七个隔离 Agent。Distill 将强相关语义阶段合并为一个 `research_cycle` Agent Node，并放入单写 `persistent + shared_controlled` 的 `research` Lane：远端训练提交、每 30 分钟观察、平台期终止和 finding 提取属于同一个长生命周期 Activation，等待通过 timer hard park/resume 完成；Lane 直接复用项目根且只开放明确的代码、实验和工作日志路径，不创建完整 worktree。确定性 State 更新、publication 与文件投影由 Kernel commit 负责。
 
 该 Lane 通过 `agentProfile.systemInstructions` 保持稳定研究身份，并用 `dataAccess` 声明对逻辑 Plane 的最大读/发布/写权限；每个 Agent Node 再用 Context Assembly Plan 的 `builtin/data-plane-view@1` 精确选择控制 View、`research_history` View、方向历史 View 和 continuation checkpoint。Evidence 快照不再由 Runtime 全局注入：研究周期与结构性调整使用 `activation_start` 固定本次判断证据，timer 恢复所需 checkpoint 使用 `continuation_only`，需要观察最新控制值的 State 使用 `every_segment`。
 

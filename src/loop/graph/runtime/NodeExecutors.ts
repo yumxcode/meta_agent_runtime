@@ -22,7 +22,7 @@ import type { LaneManager } from './LaneManager.js'
 import type { ContextAssembler } from './ContextAssembly.js'
 
 export type NodeExecutionResult =
-  | { kind: 'completed'; outcome: string; output: JsonValue; usage?: ActivationUsage }
+  | { kind: 'completed'; outcome: string; output: JsonValue; summary?: string; usage?: ActivationUsage }
   | { kind: 'retry'; reason: string; usage?: ActivationUsage; consumeAttempt: boolean; delayMs?: number }
   | { kind: 'fatal'; reason: string; usage?: ActivationUsage }
   | {
@@ -69,13 +69,13 @@ export class NodeExecutorRegistry {
     if (!this.deps.graphAgent || !this.deps.lanes || !this.deps.contextAssembler) {
       throw new Error('Agent node requires graph_agent, ContextAssembler, and LaneManager')
     }
-    if (activation.attempt > (node.maxAttempts ?? 3)) return { kind: 'completed', outcome: 'failure', output: { error: 'maxAttempts exceeded' } }
+    if (activation.attempt > (node.maxAttempts ?? 3)) return { kind: 'completed', outcome: 'failure', output: { error: 'maxAttempts exceeded' }, summary: 'Agent maxAttempts exceeded' }
     const binding = await this.deps.lanes.bind(node.lane, activation)
     const context = await this.deps.contextAssembler.assemble(node, activation, state, { laneRoot: binding.projectDir })
     const signal = this.deps.signal ?? new AbortController().signal
     const segmentLimits = remainingSegmentLimits(node, activation, this.now())
     if ('error' in segmentLimits) {
-      return { kind: 'completed', outcome: 'failure', output: { error: segmentLimits.error } }
+      return { kind: 'completed', outcome: 'failure', output: { error: segmentLimits.error }, summary: segmentLimits.error }
     }
     let result: Awaited<ReturnType<GraphAgentExecutor['execute']>>
     try {
@@ -98,12 +98,14 @@ export class NodeExecutorRegistry {
           projectDir: binding.projectDir,
           mode: binding.workspaceMode,
           writeAllowPaths: binding.workspaceMode === 'shared_write'
-            ? (node.writes?.length ? node.writes.map(path => resolve(binding.projectDir, path)) : [binding.projectDir])
+            ? (node.writes ?? []).map(path => resolve(binding.projectDir, path))
             : [],
           writeDenyPaths: [
             join(binding.projectDir, '.loop'),
             join(binding.projectDir, '.meta-agent'),
             join(binding.projectDir, '.git'),
+            ...(this.deps.graph.lanes[node.lane]?.workspaceAccess?.deny ?? [])
+              .map(path => resolve(binding.projectDir, path)),
             ...Object.entries(this.deps.graph.workspaceBindings ?? {})
               .filter(([bindingId, workspaceBinding]) =>
                 workspaceBinding.lane === node.lane && !laneMayWriteWorkspaceBinding(this.deps.graph, node.lane, bindingId, workspaceBinding.plane))
@@ -138,11 +140,11 @@ export class NodeExecutorRegistry {
     }
     if (result.park) {
       if (node.timerPolicy?.maxDelayMs !== undefined && result.park.afterMs > node.timerPolicy.maxDelayMs) {
-        return { kind: 'completed', outcome: 'failure', output: { error: `timer delay exceeds ${node.timerPolicy.maxDelayMs}`, requestedMs: result.park.afterMs }, usage }
+        return { kind: 'completed', outcome: 'failure', output: { error: `timer delay exceeds ${node.timerPolicy.maxDelayMs}`, requestedMs: result.park.afterMs }, summary: `Timer delay exceeds ${node.timerPolicy.maxDelayMs}ms`, usage }
       }
       const checkpoint = result.park.checkpoint
       if (checkpoint !== undefined && !isJsonValue(checkpoint)) {
-        return { kind: 'completed', outcome: 'failure', output: { error: 'timer checkpoint is not JSON' }, usage }
+        return { kind: 'completed', outcome: 'failure', output: { error: 'timer checkpoint is not JSON' }, summary: 'Timer checkpoint is not valid JSON', usage }
       }
       return {
         kind: 'parked',
@@ -180,16 +182,17 @@ export class NodeExecutorRegistry {
         kind: 'completed',
         outcome: 'failure',
         output: { error: result.error ?? 'agent execution failed', summary: result.summary },
+        summary: result.summary ?? result.error ?? 'Agent execution failed',
         usage,
       }
     }
     const raw = result.output ?? result.summary
-    if (!isJsonValue(raw)) return { kind: 'completed', outcome: 'failure', output: { error: 'agent output is not JSON' }, usage }
+    if (!isJsonValue(raw)) return { kind: 'completed', outcome: 'failure', output: { error: 'agent output is not JSON' }, summary: 'Agent output is not valid JSON', usage }
     if (node.outputSchema) {
       const errors = validateShape(raw, node.outputSchema, '$output')
-      if (errors.length) return { kind: 'completed', outcome: 'failure', output: { error: 'output schema mismatch', details: errors }, usage }
+      if (errors.length) return { kind: 'completed', outcome: 'failure', output: { error: 'output schema mismatch', details: errors }, summary: `Agent output schema mismatch: ${errors.join('; ')}`, usage }
     }
-    return { kind: 'completed', outcome: 'success', output: raw, usage }
+    return { kind: 'completed', outcome: 'success', output: raw, summary: result.summary, usage }
   }
 
   private async executeFunction(node: Extract<NodeSpec, { type: 'function' }>, activation: ActivationRecord, state: GraphStateSnapshot): Promise<NodeExecutionResult> {
@@ -355,7 +358,7 @@ function retryableAgentFailure(
   usage?: ActivationUsage,
 ): NodeExecutionResult {
   if (activation.attempt >= (node.maxAttempts ?? 3)) {
-    return { kind: 'completed', outcome: 'failure', output: { error: reason }, usage }
+    return { kind: 'completed', outcome: 'failure', output: { error: reason }, summary: reason, usage }
   }
   return { kind: 'retry', reason, usage, consumeAttempt: true, delayMs: retryDelayMs(activation.attempt) }
 }

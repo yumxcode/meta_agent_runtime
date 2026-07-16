@@ -37,7 +37,7 @@
     "lanes": {
       "research": {
         "context": "persistent",
-        "workspace": "lane_overlay",
+        "workspace": "shared_controlled",
         "maxConcurrency": 1,
         "description": "贯穿方向选择、设计实现、远端训练观察、finding 提取和 structural pivot 的长期研究上下文与单写工作副本；状态投影由 Kernel 维护。",
         "agentProfile": {
@@ -52,6 +52,10 @@
           ],
           "publish": ["research_history", "accepted_findings", "directions", "reports"],
           "write": ["work_log"]
+        },
+        "workspaceAccess": {
+          "write": ["humanoid", ".oma/experiments", "logs/work.jsonl", "state/attention_required.md", "state/error_report.md"],
+          "deny": ["state/progress.json", "state/findings.jsonl", "state/directions_tried.json", "state/iteration_log.jsonl", "logs/orchestrator.jsonl"]
         }
       }
     },
@@ -70,7 +74,8 @@
           ]
         },
         "tools": ["read_file", "edit_file", "write_file", "grep", "glob", "bash"],
-        "writes": ["."],
+        "reads": ["humanoid", ".oma"],
+        "writes": ["humanoid", ".oma/experiments", "logs/work.jsonl"],
         "maxAttempts": 3,
         "budget": {
           "turns": 40,
@@ -158,7 +163,8 @@
           ]
         },
         "tools": ["read_file", "edit_file", "write_file", "grep", "glob", "bash"],
-        "writes": ["state", "logs"],
+        "reads": ["humanoid", ".oma"],
+        "writes": ["logs/work.jsonl"],
         "maxAttempts": 3,
         "budget": {
           "turns": 30,
@@ -208,7 +214,7 @@
           ]
         },
         "tools": ["read_file", "edit_file", "write_file", "grep", "glob"],
-        "writes": ["state", "logs"],
+        "writes": ["state/attention_required.md"],
         "maxAttempts": 2,
         "budget": {
           "turns": 16,
@@ -246,7 +252,7 @@
           ]
         },
         "tools": ["read_file", "edit_file", "write_file", "grep", "glob", "bash"],
-        "writes": ["state", "logs"],
+        "writes": ["state/error_report.md"],
         "maxAttempts": 2,
         "budget": {
           "turns": 16,

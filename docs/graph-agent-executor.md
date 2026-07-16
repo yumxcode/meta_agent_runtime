@@ -103,6 +103,8 @@ Lane 历史不重复拼进 user prompt；persistent Lane 通过 `lineageSessionI
 
 Runtime 不再向所有 Agent 注入全局最多 100 条 Evidence/Artifact。Distill 节点必须选择逻辑 `dataView`，且该 View 必须位于 Lane `dataAccess.read` 上限内；Kernel 最终只看到 Freeze 生成的 `builtin/state@1`、`builtin/evidence-view@1`、`builtin/artifact-view@1`、`builtin/journal-view@1` 或 `builtin/workspace-binding@1`。
 
+Lane 不等于 worktree。`readonly` 与 `shared_controlled` 都把 `projectDir` 绑定到项目根，后者仅把 Node `writes`（已经 Freeze 验证为 Lane `workspaceAccess.write` 的子集）传给写沙箱；未声明 writes 就没有写权限。`lane_overlay` 才把 `projectDir` 绑定到持久 worktree。原始 workspace `reads` 只用于 Freeze 的 producer→consumer 可见性合同，跨 Lane 语义内容必须通过 publication/Data View 注入 prompt。
+
 ## 替换执行底座
 
 嵌入方可直接注入实现：

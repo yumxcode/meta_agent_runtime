@@ -147,6 +147,33 @@ describe('durable graph store and commit coordinator', () => {
     expect(retry.continuationVersion).toBe(0)
   })
 
+  it('clears a prior retry error after the Activation commits successfully', async () => {
+    const { store, coordinator } = await setup()
+    const first = (await store.claimReady({ owner: 'worker-1', now: 20 }))[0]!
+    await coordinator.retry({
+      activationId: first.id,
+      leaseToken: first.lease!.token,
+      reason: 'temporary turn limit',
+      consumeAttempt: true,
+      now: 21,
+    })
+    expect((await store.snapshot()).activations.get(first.id)?.error).toBe('temporary turn limit')
+    const second = (await store.claimReady({ owner: 'worker-2', now: 22 }))[0]!
+    const intent = await store.prepareCommit({
+      activationId: second.id,
+      leaseToken: second.lease!.token,
+      outcome: 'success',
+      output: { result: 'recovered' },
+      summary: 'completed after retry',
+      now: 23,
+    })
+    await coordinator.commit(intent, 24)
+    const committed = (await store.snapshot()).activations.get(first.id)!
+    expect(committed.status).toBe('succeeded')
+    expect(committed.error).toBeUndefined()
+    expect(committed.summary).toBe('completed after retry')
+  })
+
   it('rebuilds corrupted projections from the append-only journal', async () => {
     const { store } = await setup()
     await writeFile(store.paths.stateJson, JSON.stringify({ schemaVersion: 'graph-state-1.0', version: 99, values: { count: 999 }, updatedAt: 0 }))

@@ -29,8 +29,8 @@ export interface LaneExecutionBinding {
 
 /**
  * A Lane is the continuity and single-writer boundary. The GraphStore owns
- * scheduling exclusion; this class owns the durable session id and, for a
- * writer Lane, one persistent git worktree shared by all of that Lane's nodes.
+ * scheduling exclusion; this class owns the durable session id and selects a
+ * workspace backend. Only lane_overlay allocates a persistent git worktree.
  */
 export class LaneManager {
   private readonly worktrees: AutoWorktreeCoordinator
@@ -153,6 +153,8 @@ export class LaneManager {
       workspacePath = handle.worktreePath
       workspaceMode = 'shared_write'
       branchName = handle.branchName
+    } else if (spec.workspace === 'shared_controlled') {
+      workspaceMode = 'shared_write'
     } else if (spec.workspace === 'effect_only') {
       throw new Error(`Lane '${laneId}' is effect_only and cannot execute an Agent node`)
     }

@@ -7,6 +7,7 @@ import {
   listGraphInstanceRecords,
   type GraphRuntimeCatalog,
   type GraphTickResult,
+  type GraphProgressListener,
 } from './graph/index.js'
 import { WakeStore, type WakeRecord } from './wake/WakeStore.js'
 import type { HostAdmissionHandle, HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
@@ -20,6 +21,7 @@ export interface TickDeps {
   graphCatalog?: GraphRuntimeCatalog
   hostCoordinator?: HostSchedulerCoordinator
   workspaceIdentity?: WorkspaceIdentity
+  onGraphProgress?: GraphProgressListener
 }
 
 export interface TickResult {
@@ -119,6 +121,7 @@ export async function runClaimedWake(
       owner: wake.claim?.owner,
       hostCoordinatorRoot: deps.hostCoordinator?.rootDir,
       maxConcurrentModelCalls: deps.hostCoordinator?.maxConcurrentModelCalls,
+      onProgress: deps.onGraphProgress,
       signal: deps.signal,
     })
     const graphOutcome = await kernel.tick()

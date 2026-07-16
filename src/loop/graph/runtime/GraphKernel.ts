@@ -17,6 +17,12 @@ import { NodeExecutorRegistry, type NodeExecutionResult } from './NodeExecutors.
 import { ContextAssembler } from './ContextAssembly.js'
 import type { CapabilityPackRegistry } from '../registry/CapabilityPack.js'
 import { WorkspacePlaneMaterializer } from './WorkspacePlane.js'
+import {
+  graphProgressIdentity,
+  oneLine,
+  type GraphProgressEvent,
+  type GraphProgressListener,
+} from './GraphProgress.js'
 
 export interface GraphKernelOptions {
   store: GraphStore
@@ -35,6 +41,8 @@ export interface GraphKernelOptions {
   maxConcurrentModelCalls?: number
   activationLeaseTtlMs?: number
   activationHeartbeatMs?: number
+  /** Low-frequency phase lifecycle observer. Listener failures never affect execution. */
+  onProgress?: GraphProgressListener
   signal?: AbortSignal
 }
 
@@ -116,6 +124,18 @@ export class GraphKernel {
     }
 
     const recoveredResults = await this.coordinator.recoverPrepared(now)
+    for (const recovered of recoveredResults) {
+      if (recovered.duplicate) continue
+      this.emitProgress({
+        type: 'phase_completed',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, recovered.activation, now),
+        outcome: recovered.activation.status === 'failed'
+          ? 'failure'
+          : (recovered.activation.outcome ?? recovered.activation.status),
+        summary: this.activationSummary(recovered.activation),
+        usage: recovered.activation.usage,
+      })
+    }
     snapshot = await this.options.store.snapshot()
     if (isTerminal(snapshot.instance)) return { ...emptyResult(snapshot.instance), recovered: recoveredResults.length }
     await this.workspacePlanes.reconcile()
@@ -136,6 +156,15 @@ export class GraphKernel {
       limit: capacity,
       ttlMs: this.options.activationLeaseTtlMs ?? 10 * 60_000,
     })
+    for (const activation of claims) {
+      const resumed = activation.continuationVersion > 0
+      this.emitProgress({
+        type: 'phase_started',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, activation, now),
+        resumed,
+        ...(resumed && activation.summary ? { resumeReason: activation.summary } : {}),
+      })
+    }
     let committed = 0
     let parked = 0
     let retried = 0
@@ -157,7 +186,7 @@ export class GraphKernel {
             delayMs: retryDelayMs(activation.attempt),
           }
         } else {
-          result = { kind: 'completed', outcome: 'failure', output: { error: message(error) } }
+          result = { kind: 'completed', outcome: 'failure', output: { error: message(error) }, summary: message(error) }
         }
       }
       return this.finishActivation(activation, await this.enforceExecutionLimits(activation, result))
@@ -239,6 +268,13 @@ export class GraphKernel {
           kind: 'timer',
           fireAt: replay.wakeAt,
         })
+        this.emitProgress({
+          type: 'phase_retrying',
+          ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, replay, this.now()),
+          reason: replay.error ?? 'State changed; replaying under serializable policy',
+          replay: true,
+          ...(replay.wakeAt !== undefined ? { wakeAt: replay.wakeAt } : {}),
+        })
         return 'retried'
       }
     }
@@ -258,6 +294,13 @@ export class GraphKernel {
         kind: 'timer',
         fireAt: retry.wakeAt,
       })
+      this.emitProgress({
+        type: 'phase_retrying',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, retry, this.now()),
+        reason: result.reason,
+        replay: !result.consumeAttempt,
+        ...(retry.wakeAt !== undefined ? { wakeAt: retry.wakeAt } : {}),
+      })
       return 'retried'
     }
     if (result.kind === 'fatal') {
@@ -267,6 +310,12 @@ export class GraphKernel {
         reason: result.reason,
         usage: result.usage,
         now: this.now(),
+      })
+      this.emitProgress({
+        type: 'phase_failed',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, activation, this.now()),
+        reason: result.reason,
+        usage: result.usage,
       })
       return 'fatal'
     }
@@ -279,6 +328,7 @@ export class GraphKernel {
           wakeAt: result.wakeAt,
           event: result.event,
           inputPatch: result.inputPatch,
+          reason: result.reason,
           usage: result.usage,
           now: this.now(),
         })
@@ -288,6 +338,7 @@ export class GraphKernel {
           kind: 'completed',
           outcome: 'failure',
           output: { error: error.message },
+          summary: error.message,
           usage: result.usage,
         })
       }
@@ -299,6 +350,13 @@ export class GraphKernel {
           fireAt: parked.wakeAt,
         })
       }
+      this.emitProgress({
+        type: 'phase_parked',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, parked, this.now()),
+        reason: result.reason,
+        ...(parked.wakeAt !== undefined ? { wakeAt: parked.wakeAt } : {}),
+        ...(result.event ? { eventName: result.event.name } : {}),
+      })
       return 'parked'
     }
 
@@ -308,7 +366,7 @@ export class GraphKernel {
       const lanes = await this.lanes.mergeAll()
       const conflict = lanes.find(lane => lane.status === 'conflicted')
       if (conflict) {
-        await this.coordinator.retry({
+        const retry = await this.coordinator.retry({
           activationId: activation.id,
           leaseToken: activation.lease.token,
           reason: `Lane '${conflict.laneId}' merge conflict: ${conflict.error ?? 'unknown'}`,
@@ -316,6 +374,12 @@ export class GraphKernel {
           now: this.now(),
         })
         await this.options.store.setStatus('paused', `Lane '${conflict.laneId}' requires repair`, this.now())
+        this.emitProgress({
+          type: 'phase_retrying',
+          ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, retry, this.now()),
+          reason: retry.error ?? `Lane '${conflict.laneId}' requires repair`,
+          replay: true,
+        })
         return 'retried'
       }
     }
@@ -325,6 +389,7 @@ export class GraphKernel {
       outcome: result.outcome,
       output: result.output,
       usage: result.usage,
+      summary: this.completionSummary(activation, result),
       now: this.now(),
     })
     const committed = await this.coordinator.commit(intent, this.now())
@@ -333,6 +398,13 @@ export class GraphKernel {
         await this.coordinator.resumeDue(this.now(), { name: `join:${child.nodeId}` })
       }
     }
+    this.emitProgress({
+      type: 'phase_completed',
+      ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, committed.activation, this.now()),
+      outcome: committed.activation.status === 'failed' ? 'failure' : (committed.activation.outcome ?? result.outcome),
+      summary: this.activationSummary(committed.activation),
+      usage: result.usage,
+    })
     return 'committed'
   }
 
@@ -370,6 +442,7 @@ export class GraphKernel {
       kind: 'completed',
       outcome: 'failure',
       output: { error: errors.join('; ') },
+      summary: errors.join('; '),
       usage: result.usage,
     }
   }
@@ -409,6 +482,40 @@ export class GraphKernel {
     if (active) return this.options.store.setStatus('active', undefined, now)
     if (waiting) return this.options.store.setStatus('waiting', 'awaiting timer or event', now)
     return this.options.store.setStatus('failed', 'graph quiesced without reaching a terminal node', now)
+  }
+
+  private completionSummary(
+    activation: ActivationRecord,
+    result: Extract<NodeExecutionResult, { kind: 'completed' }>,
+  ): string {
+    const authored = oneLine(result.summary)
+    if (authored) return authored
+    if (result.output && typeof result.output === 'object' && !Array.isArray(result.output)) {
+      const error = result.output.error
+      if (typeof error === 'string' && oneLine(error)) return oneLine(error)
+    }
+    const node = this.options.graph.nodes[activation.nodeId]
+    if (!node) return `Phase ended with outcome ${result.outcome}`
+    switch (node.type) {
+      case 'agent': return `Agent phase ended with outcome ${result.outcome}`
+      case 'function': return `Function ${node.function} ended with outcome ${result.outcome}`
+      case 'effect': return `Effect ${node.effect} ended with outcome ${result.outcome}`
+      case 'wait': return `Wait ended with outcome ${result.outcome}`
+      case 'join': return `Join barrier ended with outcome ${result.outcome}`
+      case 'terminal': return `${node.status} terminal reached`
+    }
+  }
+
+  private activationSummary(activation: ActivationRecord): string {
+    return oneLine(activation.summary) || oneLine(activation.error) || `Phase ended with outcome ${activation.outcome ?? activation.status}`
+  }
+
+  private emitProgress(event: GraphProgressEvent): void {
+    try {
+      this.options.onProgress?.(event)
+    } catch {
+      // Observability is fail-open and must never perturb durable execution.
+    }
   }
 
   private now(): number { return this.options.now?.() ?? Date.now() }

@@ -81,6 +81,7 @@ export async function runLoopScheduler(options: DaemonOptions): Promise<DaemonRe
     graphCatalog: options.graphCatalog,
     hostCoordinator: host,
     workspaceIdentity: identity,
+    onGraphProgress: options.onGraphProgress,
   }
   const wakeStore = new WakeStore(options.projectDir)
   const inFlight = new Map<string, Promise<void>>()

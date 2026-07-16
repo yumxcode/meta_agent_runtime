@@ -73,6 +73,8 @@ export class CommitCoordinator {
           lease: undefined,
           output: intent.output,
           outcome: intent.outcome,
+          summary: intent.summary,
+          error: undefined,
           terminalResult: intent.output,
           updatedAt: now,
         }
@@ -110,18 +112,20 @@ export class CommitCoordinator {
           lease: undefined,
           output: intent.output,
           outcome: intent.outcome,
+          summary: intent.summary,
+          error: undefined,
           updatedAt: now,
         }
         if (instance.activationCount + spawned.length > this.graph.limits.maxActivations) {
           spawned = []
-          committedActivation = { ...committedActivation, status: 'failed', error: 'maxActivations exceeded' }
+          committedActivation = { ...committedActivation, status: 'failed', error: 'maxActivations exceeded', summary: 'maxActivations exceeded' }
           instance = { ...instance, status: 'failed', statusReason: 'maxActivations exceeded' }
         } else {
           instance = { ...instance, activationCount: instance.activationCount + spawned.length }
         }
         if (this.graph.limits.maxCostUsd !== undefined && instance.totalCostUsd > this.graph.limits.maxCostUsd) {
           spawned = []
-          committedActivation = { ...committedActivation, status: 'failed', error: 'maxCostUsd exceeded' }
+          committedActivation = { ...committedActivation, status: 'failed', error: 'maxCostUsd exceeded', summary: 'maxCostUsd exceeded' }
           instance = { ...instance, status: 'failed', statusReason: 'maxCostUsd exceeded' }
         }
         if (node.type === 'join') {
@@ -333,6 +337,7 @@ export class CommitCoordinator {
     wakeAt?: number
     event?: { name: string; correlation?: JsonValue }
     inputPatch?: Record<string, JsonValue>
+    reason: string
     usage?: ActivationUsage
     now?: number
   }): Promise<ActivationRecord> {
@@ -359,6 +364,7 @@ export class CommitCoordinator {
         waitingReason: 'continuation',
         event: input.event,
         input: { ...activation.input, ...(input.inputPatch ?? {}) },
+        summary: input.reason,
         updatedAt: now,
       }
       const instance: GraphInstanceRecord = {
@@ -409,6 +415,7 @@ export class CommitCoordinator {
         wakeAt: delayed ? now + input.delayMs! : undefined,
         waitingReason: delayed ? reason : undefined,
         error: input.reason,
+        summary: input.reason,
         updatedAt: now,
       }
       const instance: GraphInstanceRecord = {
@@ -450,6 +457,7 @@ export class CommitCoordinator {
         lease: undefined,
         usage: addUsage(activation.usage, input.usage),
         error: input.reason,
+        summary: input.reason,
         updatedAt: now,
       }
       await this.store.appendEventLocked({ type: 'activation_released', at: now, activation: failed, instance, reason: 'fatal' })

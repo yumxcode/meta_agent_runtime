@@ -149,4 +149,47 @@ describe('LoopGraphSpec', () => {
     expect(errors).toContain('nodes.work.inputs.count must be an integer')
     expect(errors.some(error => error.includes("'missing' is absent from the closed output/state schema"))).toBe(true)
   })
+
+  it('supports controlled root writes and rejects cross-Lane file dataflow or overlapping writers', () => {
+    const spec = graph()
+    spec.lanes.work = {
+      context: 'persistent', workspace: 'shared_controlled',
+      workspaceAccess: { write: ['src', 'logs/work.jsonl'], deny: ['src/generated'] },
+    }
+    const work = spec.nodes.work!
+    if (work.type !== 'agent') throw new Error('expected Agent')
+    work.reads = ['src/input']
+    work.writes = ['src/control']
+    expect(validateLoopGraph(spec, registries())).toEqual([])
+
+    work.writes = ['src/generated/output']
+    expect(validateLoopGraph(spec, registries()).join('\n')).toContain('workspaceAccess.deny')
+
+    work.writes = ['src/control']
+    spec.lanes.review = { context: 'fresh_per_activation', workspace: 'readonly' }
+    spec.nodes.review = { type: 'agent', lane: 'review', prompt: 'Review.', reads: ['src'] }
+    spec.transitions.push(
+      { id: 'review-done', from: 'review', to: 'fast' },
+      { id: 'review-failed', from: 'review', on: 'failure', to: 'slow' },
+    )
+    spec.transitions.find(edge => edge.id === 'to-fast')!.to = 'review'
+    const errors = validateLoopGraph(spec, registries()).join('\n')
+    expect(errors).toContain('cross-Lane semantic data must use publication/Data View')
+  })
+
+  it('keeps Kernel State projections single-owned instead of allowing Agent double writes', () => {
+    const spec = graph()
+    spec.workspaceBindings = {
+      progress: {
+        plane: 'state_projection', path: 'state/progress.json', format: 'json', direction: 'materialize',
+        lane: 'work', projection: { kind: 'state', keys: ['retry_count'] },
+      },
+    }
+    const work = spec.nodes.work!
+    if (work.type !== 'agent') throw new Error('expected Agent')
+    work.writes = ['state']
+    expect(validateLoopGraph(spec, registries()).join('\n')).toContain(
+      "overlaps Kernel-owned Workspace projection 'progress'",
+    )
+  })
 })
