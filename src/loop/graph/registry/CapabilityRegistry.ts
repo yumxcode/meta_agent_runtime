@@ -33,7 +33,7 @@ export interface EffectProvider {
 export class CapabilityRegistry<T extends { manifest: CapabilityManifest }> {
   private readonly providers = new Map<string, T>()
 
-  constructor(readonly kind: 'function' | 'reducer' | 'effect' | 'context_provider') {}
+  constructor(readonly kind: 'function' | 'reducer' | 'effect') {}
 
   register(provider: T): this {
     const { id, version, integrity } = provider.manifest
@@ -154,7 +154,7 @@ export function createBuiltinFunctionRegistry(): CapabilityRegistry<FunctionProv
   const add = (id: string, description: string, execute: FunctionProvider['execute']): void => {
     registry.register({ manifest: builtinManifest(id, '1', description), execute })
   }
-  add('builtin/identity', 'Return the input object.', input => cloneJson(input as Record<string, JsonValue>))
+  add('builtin/identity', 'Return the ENTIRE inputs record unchanged; downstream reads fields as $output.<key> (with inputs {value:...} use $output.value, not $output).', input => cloneJson(input as Record<string, JsonValue>))
   add('builtin/length', 'Return the length of input.value.', input => {
     const value = Array.isArray(input) ? input[0] : (input as Readonly<Record<string, JsonValue>>).value
     if (!Array.isArray(value) && typeof value !== 'string') throw new Error('input.value must be an array or string')

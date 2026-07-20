@@ -23,6 +23,8 @@ describe('built-in abort compliance', () => {
   it('unknown and non-cooperative tools are not auto-safe', () => {
     expect(resolveToolAbortSupport({ name: 'third_party_unknown' })).toBeUndefined()
     expect(resolveToolAbortSupport({ name: 'mcp_call' })).toBe('non_cooperative')
-    expect(resolveToolAbortSupport({ name: 'ask_user' })).toBe('non_cooperative')
+    // ask_user forwards ctx.abortSignal to the host prompt; a timeout cancels
+    // the pending readline question instead of leaving a zombie prompt.
+    expect(resolveToolAbortSupport({ name: 'ask_user' })).toBe('cooperative')
   })
 })

@@ -38,9 +38,11 @@ import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import {
   runLoopCli, runLoopScheduler, createDefaultGraphRuntimeCatalog, loadGraphCapabilityPacks,
+  createGraphDistillTools,
   ForegroundGraphDistillExecutor, MetaAgentGraphAgentExecutor, reviseLoopGraph,
-  freezeLoopGraph, validateLoopGraph,
-  type GraphDistillModelRequest, type GraphDistillProgressEvent,
+  readDistillArtifacts, writeDistillArtifacts,
+  freezeLoopGraph, validateLoopGraph, lintLoopGraph, formatGraphLintFindings,
+  type GraphDistillModelRequest, type GraphDistillPhase, type GraphDistillProgressEvent,
   type DistillGraphResult, type GraphRuntimeCatalog, type GraphProgressEvent,
 } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
@@ -242,7 +244,7 @@ ${bold('OPTIONS')}
 ${bold('LOOP RUNTIME (durable graph only)')}
   meta-agent loop distill <需求.md>        Compile, validate, and iteratively refine a LoopGraphSpec
   meta-agent loop create <graph.json>     Freeze capabilities, create an instance, schedule its first wake
-  meta-agent loop event <id> <name>       Resume matching graph event waits
+  meta-agent loop event <id> <name>       Deliver a durable graph event (--source/--delivery-id enables deduplication)
   meta-agent loop list                     List loop instances in this workspace
   meta-agent loop inspect <instanceId>     State, activations, wakes and public artifacts/evidence
   meta-agent loop timeline <instanceId>    Human-readable causal timeline derived from the journal
@@ -727,10 +729,32 @@ function isNativeQuestionActive(rl: readline.Interface): boolean {
   return nativeQuestionInterfaces.has(rl)
 }
 
-async function askQuestion(rl: readline.Interface, question: string): Promise<string> {
-  return new Promise(resolve => {
+async function askQuestion(rl: readline.Interface, question: string, signal?: AbortSignal): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new Error('interactive input cancelled before it was shown'))
+      return
+    }
     process.stdin.resume()
     nativeQuestionInterfaces.add(rl)
+    // With a signal, readline cancels the pending question on abort — the
+    // callback never fires and the interface is free for the next prompt.
+    // Without this, a timed-out ask_user leaves a zombie question that
+    // swallows the user's next input line (seen after Distill completion).
+    if (signal) {
+      const onAbort = (): void => {
+        nativeQuestionInterfaces.delete(rl)
+        process.stdout.write('\n')
+        reject(new Error('interactive input timed out or was cancelled; treat this question as unresolved'))
+      }
+      signal.addEventListener('abort', onAbort, { once: true })
+      rl.question(question, { signal }, answer => {
+        signal.removeEventListener('abort', onAbort)
+        queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
+        resolve(answer.trim())
+      })
+      return
+    }
     rl.question(question, answer => {
       queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
       resolve(answer.trim())
@@ -1250,21 +1274,26 @@ function makeRouter(
   // (never --json/pipe). Independent of --yes: an explicit question to the human
   // is not a "sensitive op" that auto-approve should silence.
   if (rl && !opts.json && isTTY) {
-    cfg.askUser = async (question: string, options?: string[]) => {
+    cfg.askUser = async (question: string, options?: string[], signal?: AbortSignal) => {
       const choices = options ?? []
       process.stdout.write(
         `\n${cyan('❓')}  ${bold('AI 需要你的输入')}\n${terminalText(question)}\n`,
       )
-      if (choices.length > 0) {
-        process.stdout.write(
-          choices.map((o, i) => `  ${green(String(i + 1))}. ${terminalText(o)}`).join('\n') + '\n\n',
-        )
-        const ans = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `)
-        const n = Number.parseInt(ans, 10)
-        if (Number.isInteger(n) && n >= 1 && n <= choices.length) return choices[n - 1]!
-        return ans
+      try {
+        if (choices.length > 0) {
+          process.stdout.write(
+            choices.map((o, i) => `  ${green(String(i + 1))}. ${terminalText(o)}`).join('\n') + '\n\n',
+          )
+          const ans = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `, signal)
+          const n = Number.parseInt(ans, 10)
+          if (Number.isInteger(n) && n >= 1 && n <= choices.length) return choices[n - 1]!
+          return ans
+        }
+        return await askQuestion(rl, `你的回答 > `, signal)
+      } catch (error) {
+        process.stdout.write(`${yellow('⚠')} 输入等待已取消（超时或中断），该问题按未回答处理。\n`)
+        throw error
       }
-      return askQuestion(rl, `你的回答 > `)
     }
   }
 
@@ -5064,6 +5093,27 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       allowedRoots: [projectDir],
     })
   }
+  // One concrete graph_agent capability set must govern the whole lifecycle.
+  // Distill used to validate against the interactive Agentic toolset while
+  // Create used DEFAULT_GRAPH_AGENT_TOOLS and Tick registered Auto tools. That
+  // allowed a graph to be reported as validated and then rejected by the very
+  // next `loop create` command. DEFAULT_GRAPH_AGENT_TOOLS is the single
+  // canonical graph_agent catalog (docs, library default, tests); here we only
+  // verify it against the tools the unattended runtime actually provides, so a
+  // graph frozen by this CLI validates identically from every other entrypoint.
+  // Session-only conveniences (sleep, todo_write, …) stay out of the catalog:
+  // durable waiting belongs to wait nodes and agent timer hard-park.
+  const graphAgentTools = await createStandardTools({
+    system: { cwd: projectDir, mode: 'agentic', planModeRef: { active: false } },
+    network: { webFetch: { maxResultSizeChars: 8_000 } },
+    mode: 'auto',
+  })
+  const runtimeToolNames = new Set(graphAgentTools.map(tool => tool.name))
+  const unavailableCatalogTools = [...graphCatalog.agentTools].filter(name => !runtimeToolNames.has(name))
+  if (unavailableCatalogTools.length) {
+    console.error(`warning: graph_agent catalog tools unavailable in this runtime were removed: ${unavailableCatalogTools.join(', ')}`)
+    graphCatalog.agentTools = new Set([...graphCatalog.agentTools].filter(name => runtimeToolNames.has(name)))
+  }
   const sub = args[0]
   const isDistill = name === 'loop' && (sub === 'distill' || sub === 'distill-graph')
   const needsGraphAgent = name === 'loop-scheduler' || sub === 'tick'
@@ -5076,8 +5126,8 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
 
   assertApiKeyConfigured(opts)
   const abort = new AbortController()
-  process.once('SIGINT', () => abort.abort())
-  process.once('SIGTERM', () => abort.abort())
+  process.once('SIGINT', () => abort.abort(new Error('process received SIGINT')))
+  process.once('SIGTERM', () => abort.abort(new Error('process received SIGTERM')))
 
   if (isDistill) {
     const interactiveDistill = Boolean(process.stdin.isTTY && isTTY && !opts.json && !args.includes('--non-interactive'))
@@ -5087,7 +5137,8 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       network: { webFetch: { maxResultSizeChars: 8_000 } },
       mode: 'agentic',
     })
-    const toolsByName = new Map(standardTools.map(tool => [tool.name, tool]))
+    const distillTools = createGraphDistillTools(graphCatalog)
+    const toolsByName = new Map([...standardTools, ...distillTools].map(tool => [tool.name, tool]))
     const reporter = createForegroundDistillReporter()
     const distillExecutor = new ForegroundGraphDistillExecutor({
       createSession: request => {
@@ -5144,12 +5195,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   // Register the standard tool set into the backend so spawned Graph Agent
   // seats can resolve read_file/grep/glob/bash/etc. — without this
   // the bridge's tool registry is empty and every seat fails "No tools resolved".
-  const loopTools = await createStandardTools({
-    system: { cwd: projectDir, mode: 'agentic', planModeRef: router.planModeRef },
-    network: { webFetch: { maxResultSizeChars: 8_000 } },
-    mode: 'auto',
-  })
-  for (const tool of loopTools) router.registerTool(tool)
+  for (const tool of graphAgentTools) router.registerTool(tool)
   const stamp = (): string => new Date().toISOString().slice(11, 19)
   try {
     const warmed = await router.prewarmBackend()
@@ -5239,15 +5285,9 @@ async function runDistillSession(options: {
 }): Promise<void> {
   const requirementArg = distillRequirementArg(options.args)
   if (!requirementArg) throw new Error('interactive Distill lost the requirement document path')
-  const outArg = loopOptionValue(options.args, '--out') ?? 'loop.graph.draft.json'
-  const outPath = resolve(options.projectDir, outArg)
-  const reviewPath = resolve(options.projectDir, 'loop.graph.review.md')
+  const outArg = loopOptionValue(options.args, '--out') ?? 'loop.graph.json'
   const source = { requirement: requirementArg, projectDir: options.projectDir }
-  let current: DistillGraphResult = {
-    graph: JSON.parse(await readFile(outPath, 'utf8')),
-    taskSpec: await readFile(reviewPath, 'utf8').catch(() => ''),
-    attempts: 1,
-  }
+  let current: DistillGraphResult = await readDistillArtifacts(options.projectDir, outArg)
   const feedback: string[] = []
   console.log(`\n${bold(green('Distill session'))}`)
   printDistillDraft(current, outArg)
@@ -5267,11 +5307,7 @@ async function runDistillSession(options: {
     }
     if (input === '/reload') {
       try {
-        current = {
-          graph: JSON.parse(await readFile(outPath, 'utf8')),
-          taskSpec: await readFile(reviewPath, 'utf8').catch(() => current.taskSpec),
-          attempts: current.attempts,
-        }
+        current = await readDistillArtifacts(options.projectDir, outArg)
         console.log(`${green('✓')} Reloaded ${outArg} from disk.`)
         printDistillDraft(current, outArg)
       } catch (error) {
@@ -5288,6 +5324,11 @@ async function runDistillSession(options: {
         } else {
           freezeLoopGraph(current.graph, options.graphCatalog, 0)
           console.log(`${green('✓')} Structural and Freeze validation passed.`)
+          const lint = formatGraphLintFindings(lintLoopGraph(current.graph))
+          if (lint.length) {
+            console.log(`${yellow('⚠')} ${lint.length} lint finding(s) — Distill 会阻断这些，请修复后再 create:`)
+            for (const finding of lint) console.log(`  ${dim('·')} ${sanitizeTerminalPreview(finding, 300)}`)
+          }
         }
       } catch (error) {
         console.log(`${red('✗')} Freeze validation failed: ${sanitizeTerminalPreview(error instanceof Error ? error.message : String(error), 400)}`)
@@ -5306,9 +5347,8 @@ async function runDistillSession(options: {
       })
       feedback.push(input)
       current = revised
-      await writeFile(outPath, JSON.stringify(revised.graph, null, 2), 'utf8')
-      await writeFile(reviewPath, revised.taskSpec, 'utf8')
-      console.log(`${green('✓')} Updated ${outArg} and loop.graph.review.md`)
+      await writeDistillArtifacts(options.projectDir, outArg, revised)
+      console.log(`${green('✓')} Updated ${outArg}, loop.design.md, and loop.semantic-review.md`)
       printDistillDraft(current, outArg)
     } catch (error) {
       console.log(`${red('✗')} Revision was not applied; current draft is unchanged.`)
@@ -5317,9 +5357,11 @@ async function runDistillSession(options: {
   }
 }
 
-function printDistillDraft(result: Pick<DistillGraphResult, 'graph' | 'taskSpec'>, out: string): void {
+function printDistillDraft(result: Pick<DistillGraphResult, 'graph' | 'taskSpec' | 'constraints' | 'semanticReview'>, out: string): void {
   const graph = result.graph
-  console.log(`${bold('draft')} ${out}  graph=${graph.id}@v${graph.version}  nodes=${Object.keys(graph.nodes).length}  transitions=${graph.transitions.length}  lanes=${Object.keys(graph.lanes).length}  planes=${Object.keys(graph.dataPlanes ?? {}).length}`)
+  const workspaceWrites = Object.values(graph.lanes).reduce((sum, lane) => sum + (lane.workspace.write?.length ?? 0), 0)
+  console.log(`${bold('draft')} ${out}  graph=${graph.id}@v${graph.version}  constraints=${result.constraints.constraints.length}  nodes=${Object.keys(graph.nodes).length}  transitions=${graph.transitions.length}  lanes=${Object.keys(graph.lanes).length}  workspace-writes=${workspaceWrites}  review=${result.semanticReview.accepted ? 'accepted' : 'rejected'}`)
+  for (const warning of result.semanticReview.warnings ?? []) console.log(`${yellow('warning:')} ${sanitizeTerminalPreview(warning, 300)}`)
   if (result.taskSpec.trim()) console.log(`${dim('compiler note:')}\n${result.taskSpec.trim()}`)
 }
 
@@ -5367,24 +5409,29 @@ function foregroundDistillConfig(
     skipMemoryRecall: true,
     systemPrompt: request.systemPrompt,
     maxTurns: request.maxTurns,
-    maxBudgetUsd: request.phase === 'compiler' ? (opts.maxBudgetUsd ?? 10) : request.maxBudgetUsd,
+    maxBudgetUsd: opts.maxBudgetUsd ?? request.maxBudgetUsd,
     debugMode: opts.debug,
     beforeToolCall: async toolName => allowed.has(toolName)
       ? { action: 'allow' }
       : { action: 'deny', reason: `foreground Distill does not allow tool '${toolName}'` },
   }
   if (rl && !opts.json && isTTY) {
-    config.askUser = async (question: string, options?: string[]) => {
+    config.askUser = async (question: string, options?: string[], signal?: AbortSignal) => {
       const choices = options ?? []
       process.stdout.write(`\n${cyan('❓')}  ${bold('Distill 需要你的输入')}\n${terminalText(question)}\n`)
-      if (choices.length > 0) {
-        process.stdout.write(choices.map((choice, index) => `  ${green(String(index + 1))}. ${terminalText(choice)}`).join('\n') + '\n\n')
-        const answer = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `)
-        const selected = Number.parseInt(answer, 10)
-        if (Number.isInteger(selected) && selected >= 1 && selected <= choices.length) return choices[selected - 1]!
-        return answer
+      try {
+        if (choices.length > 0) {
+          process.stdout.write(choices.map((choice, index) => `  ${green(String(index + 1))}. ${terminalText(choice)}`).join('\n') + '\n\n')
+          const answer = await askQuestion(rl, `请选择 [1-${choices.length}] 或直接输入回答: `, signal)
+          const selected = Number.parseInt(answer, 10)
+          if (Number.isInteger(selected) && selected >= 1 && selected <= choices.length) return choices[selected - 1]!
+          return answer
+        }
+        return await askQuestion(rl, '你的回答 > ', signal)
+      } catch (error) {
+        process.stdout.write(`${yellow('⚠')} 输入等待已取消（超时或中断），Distill 会把该问题记入 unresolved。\n`)
+        throw error
       }
-      return askQuestion(rl, '你的回答 > ')
     }
   }
   const apiKey = resolveExplicitApiKey(opts)
@@ -5398,18 +5445,21 @@ function foregroundDistillConfig(
 function createForegroundDistillReporter(): {
   onProgress(event: GraphDistillProgressEvent): void
 } {
-  const phaseLabel = (phase: 'compiler' | 'semantic_review'): string => phase === 'compiler' ? 'compiler' : 'reviewer'
+  const phaseLabel = (phase: GraphDistillPhase): string =>
+    phase === 'architect' ? 'architect' : phase === 'compiler' ? 'compiler' : 'reviewer'
   return {
     onProgress(event): void {
-      if (event.type === 'phase_started') {
-        const attempt = event.phase === 'compiler' ? ` attempt ${event.attempt}/${event.maxAttempts}` : ''
+      if (event.type === 'checkpoint_resumed') {
+        console.log(`${green('✓')} ${dim('[distill]')} resumed validated Architect checkpoint`)
+      } else if (event.type === 'phase_started') {
+        const attempt = event.phase !== 'semantic_review' ? ` attempt ${event.attempt}/${event.maxAttempts}` : ''
         console.log(`${dim('[distill]')} ${phaseLabel(event.phase)}${attempt} started on agentic session`)
       } else if (event.type === 'phase_completed') {
         console.log(`${dim('[distill]')} ${phaseLabel(event.phase)} response received`)
       } else if (event.type === 'validation_passed') {
         console.log(`${green('✓')} ${dim('[distill]')} structural and Freeze validation passed`)
       } else if (event.type === 'validation_failed') {
-        console.log(`${yellow('⚠')} ${dim('[distill]')} compiler output rejected with ${event.issues.length} issue(s)`)
+        console.log(`${yellow('⚠')} ${dim('[distill]')} ${phaseLabel(event.phase)} output rejected with ${event.issues.length} issue(s)`)
         for (const issue of event.issues.slice(0, 8)) console.log(`  ${dim('·')} ${sanitizeTerminalPreview(issue, 240)}`)
       } else if (event.type === 'semantic_review_accepted') {
         console.log(`${green('✓')} ${dim('[distill]')} semantic review accepted`)

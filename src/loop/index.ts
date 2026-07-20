@@ -1,4 +1,4 @@
-/** Public API for the durable-graph-v1 Loop runtime. */
+/** Public API for the durable-graph-v2 Loop runtime. */
 export * from './graph/index.js'
 export { WakeStore, WakeClaimLostError, wakeClaimOwner, type WakeRecord, type WakeKind } from './wake/WakeStore.js'
 export {

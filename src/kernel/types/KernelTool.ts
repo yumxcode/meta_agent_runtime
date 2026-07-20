@@ -36,7 +36,7 @@ export interface KernelToolContext {
   planMode?: boolean
   /** True for unattended auto-mode loops. */
   autonomousMode?: boolean
-  askUser?: (question: string, choices?: string[]) => Promise<string>
+  askUser?: (question: string, choices?: string[], signal?: AbortSignal) => Promise<string>
   /** Escape hatch for mode-specific context (Campaign, Robotics, etc.) */
   extensions?: Record<string, unknown>
 }

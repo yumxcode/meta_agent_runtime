@@ -60,6 +60,7 @@ const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   // are denied (requiresWorkspace), and plan mode still gates writes (planMode:
   // 'ask') so a planning turn does not silently modify files.
   write_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
+  append_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
   edit_file: { category: 'write', pathFields: ['file_path'], requiresWorkspace: true, sensitive: false, planMode: 'ask' },
   notebook_edit: { category: 'write', pathFields: ['notebook_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
   glob: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },

@@ -172,7 +172,7 @@ export interface KernelConfig {
   planModeRef?: { active: boolean }
 
   /** Optional user prompt function used by permission policies. */
-  askUser?: (question: string, choices?: string[]) => Promise<string>
+  askUser?: (question: string, choices?: string[], signal?: AbortSignal) => Promise<string>
 
   // ── Limits ────────────────────────────────────────────────────────────────
 

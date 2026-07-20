@@ -271,6 +271,7 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
     if (ctx.toolNames.has('read_file'))     hints.push('- Read files: use `read_file` tool (NOT cat/head/tail)')
     if (ctx.toolNames.has('edit_file'))     hints.push('- Edit files: use `edit_file` tool (NOT sed/awk)')
     if (ctx.toolNames.has('write_file'))    hints.push('- Write files: use `write_file` tool (NOT echo >/tee)')
+    if (ctx.toolNames.has('append_file'))   hints.push('- Append files: use `append_file` tool (NOT echo >>/tee -a)')
     if (ctx.toolNames.has('notebook_edit')) hints.push('- Edit Jupyter cells: use `notebook_edit` tool')
     return hints.length
       ? `${base}\n\nPrefer these tools over shell equivalents when available:\n${hints.join('\n')}`

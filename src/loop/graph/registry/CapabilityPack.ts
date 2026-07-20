@@ -5,7 +5,6 @@ import { pathToFileURL } from 'node:url'
 import type { FrozenCapabilityRef } from '../spec/GraphTypes.js'
 import type { JsonValue } from '../spec/GraphTypes.js'
 import type { CapabilityRegistry, EffectProvider, FunctionProvider, ReducerProvider } from './CapabilityRegistry.js'
-import type { ContextProvider } from './ContextProvider.js'
 
 export const GRAPH_CAPABILITY_PACK_API_VERSION = 'graph-pack-v1' as const
 
@@ -13,7 +12,6 @@ export interface CapabilityPackTarget {
   functions: CapabilityRegistry<FunctionProvider>
   reducers: CapabilityRegistry<ReducerProvider>
   effects: CapabilityRegistry<EffectProvider>
-  contextProviders: CapabilityRegistry<ContextProvider>
 }
 
 export interface GraphCapabilityPackV1 {

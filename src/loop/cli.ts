@@ -1,18 +1,22 @@
-/** CLI for the durable-graph-v1 Loop runtime. */
-import { lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
-import { join, resolve } from 'node:path'
+/** CLI for the durable-graph-v2 Loop runtime. */
+import { access, constants as fsConstants, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
+import { delimiter, join, resolve } from 'node:path'
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import {
-  ArtifactPlane,
+  createFileDistillCheckpointStore,
   createDefaultGraphRuntimeCatalog,
+  DISTILL_ARTIFACT_FILES,
   distillLoopGraph,
+  formatGraphLintFindings,
   freezeLoopGraph,
+  lintLoopGraph,
   GraphKernel,
   GraphStore,
   graphPhaseLabel,
-  LaneManager,
   listGraphInstanceRecords,
   MetaAgentGraphAgentExecutor,
+  validateLoopPreconditions,
+  writeDistillArtifacts,
   type GraphDistillExecutor,
   type GraphDistillProgressEvent,
   type GraphAgentExecutor,
@@ -20,6 +24,7 @@ import {
   type GraphProgressListener,
   type JsonValue,
   type LoopGraphSpec,
+  type LoopPreconditions,
 } from './graph/index.js'
 import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
 import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
@@ -55,7 +60,6 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'archive': return archive(args, deps)
     case 'gc': return gc(args, deps)
     case 'event': return event(args, deps)
-    case 'lane-repair': return laneRepair(args, deps)
     case 'tick': return tick(args, deps)
     case 'pause': return lifecycle('pause', args, deps)
     case 'resume': return lifecycle('resume', args, deps)
@@ -77,34 +81,138 @@ async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.distillExecutor) throw new Error('loop distill needs a foreground Distill executor')
   const file = positional(args)
   if (!file) throw new Error('loop distill: requirement document path required')
-  const out = flagValue(args, '--out') ?? 'loop.graph.draft.json'
+  const out = flagValue(args, '--out') ?? 'loop.graph.json'
   const result = await distillLoopGraph({ requirement: file, projectDir: deps.projectDir }, {
     executor: deps.distillExecutor,
     catalog: catalog(deps),
     signal: deps.signal,
     onProgress: deps.onDistillProgress,
+    checkpoint: createFileDistillCheckpointStore(deps.projectDir),
   })
-  await writeFile(resolve(deps.projectDir, out), JSON.stringify(result.graph, null, 2), 'utf8')
-  if (result.taskSpec) await writeFile(resolve(deps.projectDir, 'loop.graph.review.md'), result.taskSpec, 'utf8')
-  return `LoopGraphSpec written to ${out} (validated, ${result.attempts} attempt(s)); review then run: meta-agent loop create ${out}`
+  await writeDistillArtifacts(deps.projectDir, out, result)
+  const attempts = result.phaseAttempts
+    ? `architect=${result.phaseAttempts.architect}, compiler=${result.phaseAttempts.compiler}, reviewer=${result.phaseAttempts.reviewer}`
+    : `compiler=${result.attempts}`
+  return `Loop Blueprint and LoopGraphSpec written (${out}, loop.design.md, loop.semantic-review.md; validated; ${attempts}); review then run: meta-agent loop create ${out}`
 }
 
 async function create(args: string[], deps: LoopCliDeps): Promise<string> {
   const file = positional(args)
   if (!file) throw new Error('loop create: graph JSON path required')
   const graph = JSON.parse(await readFile(resolve(deps.projectDir, file), 'utf8')) as LoopGraphSpec
-  if (graph.schemaVersion !== 'graph-1.0') throw new Error("loop create only accepts schemaVersion 'graph-1.0'")
+  if (graph.schemaVersion !== 'graph-2.0') throw new Error("loop create only accepts schemaVersion 'graph-2.0'")
   const runtime = catalog(deps)
   const frozen = freezeLoopGraph(graph, runtime)
+  // Lint findings never block create — a human hand-authoring a graph may
+  // overrule a heuristic — but they are printed so nothing fails silently at
+  // the first activation instead.
+  const lintReport = formatGraphLintFindings(lintLoopGraph(graph)).map(finding => `warning: ${finding}`)
+  const preconditionReport = await checkLaunchPreconditions(deps.projectDir, graph, args.includes('--force'))
   const instanceId = flagValue(args, '--id') ?? `${frozen.id}-v${frozen.version}`
   const store = await GraphStore.create({ projectDir: deps.projectDir, instanceId, graph: frozen, functions: runtime.functions })
   await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'timer', fireAt: Date.now() })
   const snapshot = await store.snapshot()
+  const scmLanes = Object.entries(frozen.lanes).filter(([, lane]) => lane.scm === 'git').map(([laneId]) => laneId)
   return [
-    `durable-graph-v1 ${frozen.id}@v${frozen.version} frozen (${frozen.graphHash.slice(0, 12)})`,
+    `durable-graph-v2 ${frozen.id}@v${frozen.version} frozen (${frozen.graphHash.slice(0, 12)})`,
+    ...scmLanes.map(laneId => `notice: lane '${laneId}' has git commit access (.git writable; hooks/config remain protected)`),
+    ...lintReport,
+    ...preconditionReport,
     `instance ${snapshot.instance.instanceId} created (status: ${snapshot.instance.status})`,
     'first activation wake scheduled — run: meta-agent loop tick',
   ].join('\n')
+}
+
+/**
+ * Machine-checkable launch gate. Distill writes loop.preconditions.json next
+ * to the graph; here file/directory items are verified against the real
+ * project and blocking decision/command/credential items require explicit
+ * `--force` acknowledgement. Lane read paths that do not exist yet are
+ * surfaced as warnings only — loops legitimately bootstrap their own state.
+ */
+async function checkLaunchPreconditions(projectDir: string, graph: LoopGraphSpec, force: boolean): Promise<string[]> {
+  const lines: string[] = []
+  const blockers: string[] = []
+  const preconditions = await readJsonIfPresent<LoopPreconditions>(resolve(projectDir, DISTILL_ARTIFACT_FILES.preconditions))
+  if (preconditions) {
+    const shapeErrors = validateLoopPreconditions(preconditions)
+    if (shapeErrors.length) throw new Error(`loop create: invalid ${DISTILL_ARTIFACT_FILES.preconditions}:\n- ${shapeErrors.join('\n- ')}`)
+    for (const item of preconditions.items) {
+      const blocking = item.blocking !== false
+      if (item.kind === 'file' || item.kind === 'directory') {
+        const exists = await pathExists(resolve(projectDir, item.target), item.kind)
+        if (exists) continue
+        const message = `${item.kind} '${item.target}' is missing — ${item.reason}`
+        if (blocking) blockers.push(message)
+        else lines.push(`warning: ${message}`)
+      } else if (item.kind === 'command') {
+        // Commands are mechanically verifiable: resolve on PATH like `command -v`.
+        const found = await commandOnPath(item.target)
+        if (found) { lines.push(`precondition ok: command '${item.target}' → ${found}`); continue }
+        const message = `command '${item.target}' is not on PATH — ${item.reason}`
+        if (blocking) blockers.push(message)
+        else lines.push(`warning: ${message}`)
+      } else if (item.kind === 'credential') {
+        // A credential named like an environment variable and present with a
+        // non-empty value is verified; otherwise it may live in a config file
+        // and needs a human to vouch for it.
+        if (/^[A-Z][A-Z0-9_]*$/.test(item.target) && (process.env[item.target] ?? '').trim().length > 0) {
+          lines.push(`precondition ok: credential '${item.target}' present in environment`)
+          continue
+        }
+        const message = `credential '${item.target}' requires manual confirmation (not set in this environment; it may live in a config file) — ${item.reason}`
+        if (blocking) blockers.push(message)
+        else lines.push(`note: ${message}`)
+      } else {
+        const message = `${item.kind} '${item.target}' requires manual confirmation — ${item.reason}`
+        if (blocking) blockers.push(message)
+        else lines.push(`note: ${message}`)
+      }
+    }
+  }
+  for (const [laneId, lane] of Object.entries(graph.lanes ?? {})) {
+    for (const path of lane.workspace?.read ?? []) {
+      if (path === '**') continue
+      if (!(await pathExists(resolve(projectDir, path), 'any'))) {
+        lines.push(`warning: lane '${laneId}' reads '${path}' which does not exist yet — confirm the loop bootstraps it or create it before ticking`)
+      }
+    }
+  }
+  if (blockers.length && !force) {
+    throw new Error([
+      'loop create: launch preconditions are not satisfied:',
+      ...blockers.map(item => `- ${item}`),
+      'Fix missing files/commands first; for the confirmation items (credentials, decisions), verify them yourself and re-run with --force to acknowledge.',
+    ].join('\n'))
+  }
+  if (blockers.length) lines.push(...blockers.map(item => `forced past precondition: ${item}`))
+  return lines
+}
+
+async function readJsonIfPresent<T>(path: string): Promise<T | null> {
+  try { return JSON.parse(await readFile(path, 'utf8')) as T } catch { return null }
+}
+
+async function pathExists(path: string, kind: 'file' | 'directory' | 'any'): Promise<boolean> {
+  try {
+    const info = await stat(path)
+    if (kind === 'file') return info.isFile()
+    if (kind === 'directory') return info.isDirectory()
+    return true
+  } catch { return false }
+}
+
+/** Resolve a bare command name on PATH (the mechanical half of `command -v`). */
+async function commandOnPath(command: string): Promise<string | null> {
+  if (!command.trim() || command.includes('/') || command.includes('\\')) return null
+  for (const dir of (process.env.PATH ?? '').split(delimiter).filter(Boolean)) {
+    const candidate = join(dir, command)
+    try {
+      await access(candidate, fsConstants.X_OK)
+      return candidate
+    } catch { /* keep scanning */ }
+  }
+  return null
 }
 
 async function list(deps: LoopCliDeps): Promise<string> {
@@ -123,7 +231,6 @@ async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
   const wakes = (await new WakeStore(deps.projectDir).list()).filter(wake =>
     wake.loopId === instanceId && (wake.status === 'pending' || wake.status === 'claimed'),
   )
-  const artifacts = await new ArtifactPlane(store).list({ maxItems: 10 })
   const graph = await store.loadSpec()
   const statuses = ['ready', 'running', 'waiting', 'succeeded', 'failed', 'cancelled'] as const
   const counts = Object.fromEntries(statuses.map(status => [status, [...snapshot.activations.values()].filter(item => item.status === status).length]))
@@ -154,8 +261,6 @@ async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
     }),
     `recent phase results: ${recent.length || '(none)'}`,
     ...recent.map(item => `  ${item.nodeId} [${item.outcome ?? item.status}] ${item.summary ?? item.error ?? '(no summary recorded)'}`),
-    `artifacts/evidence: ${artifacts.length}`,
-    ...artifacts.map(item => `  ${item.id} ${item.kind}/${item.channel} [${item.status}] from ${item.provenance.nodeId}`),
   ].join('\n')
 }
 
@@ -178,12 +283,11 @@ async function timeline(args: string[], deps: LoopCliDeps): Promise<string> {
         case 'graph_created': return `${prefix} status=${event.instance.status} entries=${event.activations.map(a => a.nodeId).join(',')}`
         case 'activation_claimed': return `${prefix} node=${event.activation.nodeId} attempt=${event.activation.attempt} segment=${event.activation.segmentCount ?? 0}`
         case 'activation_released': return `${prefix} node=${event.activation.nodeId} status=${event.activation.status} reason=${event.reason}${event.activation.summary ? ` — ${event.activation.summary}` : ''}`
-        case 'activation_context_cached': return `${prefix} node=${event.activation.nodeId} section=${event.sectionName}`
         case 'activation_committed': return `${prefix} node=${event.activation.nodeId} outcome=${event.activation.outcome ?? event.activation.status} transition=${event.transitionId ?? '-'} spawned=${event.spawned.map(a => a.nodeId).join(',') || '-'}${event.activation.summary ? ` — ${event.activation.summary}` : ''}`
         case 'graph_status_changed': return `${prefix} status=${event.instance.status}${event.instance.statusReason ? ` — ${event.instance.statusReason}` : ''}`
         case 'paused_terminal_resumed': return `${prefix} node=${event.activation.nodeId} transition=${event.transitionId}`
-        case 'external_event_recorded': return `${prefix} name=${event.externalEvent.name} status=${event.externalEvent.status}`
-        case 'external_event_consumed': return `${prefix} name=${event.externalEvent.name} activations=${event.activations.length}`
+        case 'external_event_recorded': return `${prefix} name=${event.externalEvent.name} status=${event.externalEvent.status}${externalDeliveryLabel(event.externalEvent)}`
+        case 'external_event_consumed': return `${prefix} name=${event.externalEvent.name} activations=${event.activations.length}${externalDeliveryLabel(event.externalEvent)}`
       }
     }),
   ].join('\n')
@@ -195,28 +299,20 @@ async function files(args: string[], deps: LoopCliDeps): Promise<string> {
   const store = new GraphStore(deps.projectDir, instanceId)
   const graph = await store.loadSpec().catch(() => null)
   if (!graph) return `instance ${instanceId} not found`
-  const logicalByPhysical = new Map(Object.entries(graph.compiledDataPlanes ?? {})
-    .flatMap(([logical, ref]) => ref.physicalId ? [[ref.physicalId, logical] as const] : []))
-  const lines = [`files: ${instanceId}  canonical workspace projections and inputs`]
-  for (const [bindingId, binding] of Object.entries(graph.workspaceBindings ?? {})) {
-    const root = await bindingWorkspaceRoot(store, binding.lane, binding.lane ? graph.lanes[binding.lane]?.workspace : undefined)
-    const path = root ? resolve(root, binding.path) : undefined
-    const info = path ? await stat(path).catch(() => null) : null
-    const owner = binding.direction === 'ingest' ? 'workspace/input' : 'Kernel projection'
-    lines.push(
-      `  ${logicalByPhysical.get(bindingId) ?? bindingId}  ${binding.plane}/${binding.direction}  ${binding.lane ? `lane=${binding.lane}` : 'project'}:${binding.path}  ${info ? `${formatBytes(info.size)} ${owner}` : `(missing) ${owner}`}`,
-    )
-  }
-  const artifacts = await new ArtifactPlane(store).list({ maxItems: 10_000 })
-  const counts = new Map<string, number>()
-  for (const artifact of artifacts) counts.set(artifact.channel, (counts.get(artifact.channel) ?? 0) + 1)
-  if (counts.size) {
-    lines.push('records:')
-    for (const [channel, count] of [...counts].sort(([a], [b]) => a.localeCompare(b))) {
-      lines.push(`  ${logicalByPhysical.get(channel) ?? channel}  ${count} record(s)`)
+  const lines = [`files: ${instanceId}  direct Lane workspace contracts`]
+  for (const [laneId, lane] of Object.entries(graph.lanes)) {
+    lines.push(`  lane ${laneId}`)
+    for (const path of lane.workspace.read ?? []) {
+      const info = await stat(resolve(store.projectDir, path)).catch(() => null)
+      lines.push(`    read   ${path}  ${info ? formatBytes(info.size) : '(missing)'}`)
     }
+    for (const rule of lane.workspace.write ?? []) {
+      const info = await stat(resolve(store.projectDir, rule.path)).catch(() => null)
+      lines.push(`    write  ${rule.path}  mode=${rule.mode}  ${info ? formatBytes(info.size) : '(not created)'}`)
+    }
+    for (const path of lane.workspace.deny ?? []) lines.push(`    deny   ${path}`)
   }
-  if (lines.length === 1) lines.push('  (graph declares no workspace files or records)')
+  if (lines.length === 1) lines.push('  (graph declares no Lane workspace contract)')
   return lines.join('\n')
 }
 
@@ -310,17 +406,6 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(minutes / 60)}h${minutes % 60}m`
 }
 
-async function bindingWorkspaceRoot(
-  store: GraphStore,
-  laneId?: string,
-  workspace?: 'readonly' | 'shared_controlled' | 'lane_overlay' | 'effect_only',
-): Promise<string | undefined> {
-  if (!laneId) return store.projectDir
-  if (workspace === 'readonly' || workspace === 'shared_controlled') return store.projectDir
-  const lane = await readJsonObject(join(store.paths.lanesDir, `${laneId}.json`))
-  return typeof lane?.workspacePath === 'string' ? lane.workspacePath : undefined
-}
-
 async function filesystemSize(path: string): Promise<number> {
   const info = await lstat(path).catch(() => null)
   if (!info) return 0
@@ -335,6 +420,10 @@ function formatBytes(bytes: number): string {
   if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)}KiB`
   if (bytes < 1_073_741_824) return `${(bytes / 1_048_576).toFixed(1)}MiB`
   return `${(bytes / 1_073_741_824).toFixed(1)}GiB`
+}
+
+function externalDeliveryLabel(event: { source?: string; deliveryId?: string }): string {
+  return event.source === undefined ? '' : ` delivery=${event.source}:${event.deliveryId}`
 }
 
 async function readJsonObject(path: string): Promise<Record<string, unknown> | undefined> {
@@ -354,26 +443,22 @@ async function event(args: string[], deps: LoopCliDeps): Promise<string> {
   const kernel = await GraphKernel.open({ store, graph, ...runtime })
   const correlation = jsonFlag(args, '--correlation')
   const payload = jsonFlag(args, '--payload')
-  const resumed = await kernel.signalEvent({ name, ...(correlation !== undefined ? { correlation } : {}), ...(payload !== undefined ? { payload } : {}) })
-  if (resumed) await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
-  return `${instanceId}: event '${name}' resumed ${resumed} activation(s)`
-}
-
-async function laneRepair(args: string[], deps: LoopCliDeps): Promise<string> {
-  const [instanceId, laneId] = positionalValues(args)
-  if (!instanceId || !laneId) throw new Error('loop lane-repair: instanceId and laneId required')
-  const store = new GraphStore(deps.projectDir, instanceId)
-  const snapshot = await store.snapshot()
-  const graph = await store.loadSpec()
-  const lane = await new LaneManager(store, graph, snapshot.instance).repair(laneId)
-  if (lane.status === 'conflicted') return `${instanceId}/${laneId}: still conflicted (${lane.error ?? 'unknown'})`
-  const pausedForThisLane = snapshot.instance.status === 'paused' &&
-    snapshot.instance.statusReason?.includes(`Lane '${laneId}' requires repair`)
-  if (pausedForThisLane) {
-    await store.setStatus('active', `Lane ${laneId} repaired`)
-    await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
-  }
-  return `${instanceId}/${laneId}: ${lane.status}`
+  const source = flagValue(args, '--source')
+  const deliveryId = flagValue(args, '--delivery-id')
+  const result = await kernel.deliverEvent({
+    name,
+    ...(source !== undefined ? { source } : {}),
+    ...(deliveryId !== undefined ? { deliveryId } : {}),
+    ...(correlation !== undefined ? { correlation } : {}),
+    ...(payload !== undefined ? { payload } : {}),
+  })
+  if (result.resumed) await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
+  const delivery = result.event.source === undefined
+    ? ''
+    : ` delivery=${result.event.source}:${result.event.deliveryId}`
+  return result.duplicate
+    ? `${instanceId}: duplicate event '${name}' deduplicated; resumed ${result.resumed} activation(s)${delivery}`
+    : `${instanceId}: event '${name}' resumed ${result.resumed} activation(s)${delivery}`
 }
 
 async function lifecycle(action: 'pause' | 'resume' | 'stop', args: string[], deps: LoopCliDeps): Promise<string> {
@@ -477,7 +562,7 @@ function capabilities(deps: LoopCliDeps): string {
     'Functions:', ...runtime.functions.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
     'Reducers:', ...runtime.reducers.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
     'Effects:', ...runtime.effects.manifests().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
-    'Context Providers:', ...runtime.contextProviders.manifests().map(item => `  ${item.id}@${item.version} trust=${item.trust} ${item.integrity}`),
+    'Agent Tools:', ...[...runtime.agentTools].sort().map(item => `  ${item}`),
     'Capability Packs:', ...runtime.packs.list().map(item => `  ${item.id}@${item.version} ${item.integrity}`),
     'Scenario Guidance:', ...runtime.packs.scenarios().map(item => `  ${item.id} from ${item.pack.id}@${item.pack.version} — ${item.description}`),
   ].join('\n')
@@ -487,10 +572,9 @@ function usage(): string {
   return [
     'Usage: meta-agent loop <command>',
     '  distill <requirements.md> [--out loop.graph.json] [--non-interactive]',
-    '  create <loop.graph.json> [--id instanceId]',
+    '  create <loop.graph.json> [--id instanceId] [--force]  (verifies loop.preconditions.json)',
     '  tick [--until-quiescent]',
-    '  event <instanceId> <name> [--correlation JSON] [--payload JSON]',
-    '  lane-repair <instanceId> <laneId>',
+    '  event <instanceId> <name> [--source NAME --delivery-id ID] [--correlation JSON] [--payload JSON]',
     '  list | inspect/timeline/files/disk <instanceId>',
     '  pause/resume/stop/archive <instanceId>',
     '  gc [--older-than-days N] [--include-archives] [--apply]',
@@ -502,7 +586,7 @@ function positional(args: string[]): string | undefined { return positionalValue
 
 function positionalValues(args: string[]): string[] {
   const values: string[] = []
-  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives'])
+  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force'])
   for (let index = 0; index < args.length; index++) {
     const value = args[index]!
     if (value.startsWith('--')) {

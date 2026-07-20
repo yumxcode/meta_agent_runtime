@@ -5,7 +5,11 @@ export async function createAskUserTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
   return {
     name: 'ask_user',
-    abortSupport: 'non_cooperative',
+    // Abort-aware: the per-tool timeout / session interrupt aborts
+    // ctx.abortSignal, which we forward so the host cancels its pending
+    // terminal question. Without this the readline prompt outlives the tool
+    // call as a zombie and swallows the user's next input line.
+    abortSupport: 'cooperative',
     description,
     inputSchema: {
       type: 'object',
@@ -21,7 +25,7 @@ export async function createAskUserTool(): Promise<MetaAgentTool> {
       if (!question) return { content: 'Error: question is required', isError: true }
       if (ctx.askUser) {
         try {
-          const answer = await ctx.askUser(question, options)
+          const answer = await ctx.askUser(question, options, ctx.abortSignal)
           return { content: answer, isError: false }
         } catch (err) {
           return { content: `Error getting user input: ${err instanceof Error ? err.message : String(err)}`, isError: true }

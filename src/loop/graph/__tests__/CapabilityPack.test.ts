@@ -19,18 +19,14 @@ describe('GraphCapabilityPackV1 loader', () => {
         scenarios: [{
           id: 'optimization',
           description: 'Open-ended optimization loops.',
-          guidance: ['Keep measurements in a record plane.', 'Choose topology from the user goal.'],
+          guidance: ['Keep measurements in a Lane-owned workspace file.', 'Choose topology from the user goal.'],
           suggestedCapabilities: ['test/double@1'],
-          graphFragments: [{ id: 'measurement', description: 'One optional publication idea.', fragment: { publishes: [{ plane: 'measurements' }] } }]
+          graphFragments: [{ id: 'measurement', description: 'One optional workspace idea.', fragment: { workspace: { write: [{ path: 'measurements.jsonl', mode: 'append_only' }] } } }]
         }],
         register(target) {
           target.functions.register({
             manifest: { id: 'test/double', version: '1', integrity: 'test-double-v1', pure: true },
             execute(input) { return Number(input[0]) * 2 }
-          })
-          target.contextProviders.register({
-            manifest: { id: 'test/context', version: '1', integrity: 'test-context-v1', pure: false, trust: 'untrusted_data' },
-            async resolve() { return { source: 'test-pack', content: { ok: true } } }
           })
         }
       }
@@ -40,7 +36,6 @@ describe('GraphCapabilityPackV1 loader', () => {
     expect(loaded[0]?.manifest.integrity).toMatch(/^sha256:/)
     expect(catalog.packs.has(loaded[0]!.manifest)).toBe(true)
     expect(await catalog.functions.get('test/double@1').execute([4])).toBe(8)
-    expect(catalog.contextProviders.has('test/context@1')).toBe(true)
     expect(catalog.packs.scenarios()).toMatchObject([{
       id: 'optimization', pack: { id: 'test/math', version: '1' }, graphFragments: [{ id: 'measurement' }],
     }])

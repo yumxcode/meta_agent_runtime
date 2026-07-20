@@ -69,9 +69,15 @@ export async function decideTransition(input: {
   if (targets.length > maxFanOut) throw new Error(`transition '${selected.id}' fan-out ${targets.length} exceeds limit ${maxFanOut}`)
   const spawned: ActivationRecord[] = []
   const sourceNode = input.graph.nodes[input.activation.nodeId]
+  // forkGroupId is a stack of fork epochs ("outer|inner"): a fan-out pushes a
+  // new epoch, a Join pops one. This keeps nested fork/join groups matched --
+  // a flat id would strand outer-Join members in different groups (deadlock).
+  const enclosingForkGroup = sourceNode?.type === 'join'
+    ? popForkGroup(input.activation.forkGroupId)
+    : input.activation.forkGroupId
   const forkGroupId = targets.length > 1
-    ? `${input.activation.id}:${selected.id}`
-    : sourceNode?.type === 'join' ? undefined : input.activation.forkGroupId
+    ? appendForkGroup(enclosingForkGroup, `${input.activation.id}:${selected.id}`)
+    : enclosingForkGroup
   for (const target of targets) {
     const values = await evaluateBindings(target.inputs, { ...context, state: state.values }, input.functions)
     spawned.push(newActivation({
@@ -85,4 +91,16 @@ export async function decideTransition(input: {
     }))
   }
   return { transition: selected, state, spawned }
+}
+
+const FORK_GROUP_SEPARATOR = '|'
+
+function appendForkGroup(parent: string | undefined, epoch: string): string {
+  return parent === undefined ? epoch : `${parent}${FORK_GROUP_SEPARATOR}${epoch}`
+}
+
+function popForkGroup(group: string | undefined): string | undefined {
+  if (group === undefined) return undefined
+  const separator = group.lastIndexOf(FORK_GROUP_SEPARATOR)
+  return separator === -1 ? undefined : group.slice(0, separator)
 }

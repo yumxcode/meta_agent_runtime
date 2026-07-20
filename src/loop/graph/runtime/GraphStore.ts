@@ -18,16 +18,14 @@ import type {
   GraphJournalEvent,
   GraphStateSnapshot,
   JsonValue,
-  GraphArtifactRecord,
   SequencedGraphJournalEvent,
   ActivationUsage,
   GraphExternalEventRecord,
-  ContextSectionSnapshot,
   GraphEffectIntent,
 } from '../spec/GraphTypes.js'
 import { verifyFrozenGraphIntegrity } from '../spec/GraphValidate.js'
 import { evaluateBindings } from './GraphExpression.js'
-import { hydrateInitialStateFromWorkspace } from './WorkspaceFile.js'
+import { emptyUsage } from './UsageMath.js'
 
 export interface GraphPaths {
   root: string
@@ -40,7 +38,6 @@ export interface GraphPaths {
   intentsDir: string
   effectIntentsDir: string
   lanesDir: string
-  artifactsDir: string
   eventsDir: string
   journalSequenceJson: string
   checkpointJson: string
@@ -53,7 +50,6 @@ export interface GraphSnapshot {
   activations: Map<string, ActivationRecord>
   lastSequence: number
   commitKeys: Map<string, number>
-  artifacts: Map<string, GraphArtifactRecord>
   externalEvents: Map<string, GraphExternalEventRecord>
 }
 
@@ -71,7 +67,6 @@ export function graphPaths(projectDir: string, instanceId: string): GraphPaths {
     intentsDir: join(graphDir, 'commit-intents'),
     effectIntentsDir: join(graphDir, 'effect-intents'),
     lanesDir: join(graphDir, 'lanes'),
-    artifactsDir: join(graphDir, 'artifacts'),
     eventsDir: join(graphDir, 'events'),
     journalSequenceJson: join(graphDir, 'journal-sequence.json'),
     checkpointJson: join(graphDir, 'checkpoint.json'),
@@ -89,6 +84,13 @@ export interface CreateGraphInstanceInput {
 
 export class GraphStore {
   readonly paths: GraphPaths
+  /**
+   * Highest journal sequence whose projections this process has already
+   * repaired. Repair is idempotent, so doing it once per event per process
+   * keeps crash recovery while removing the O(journal-since-checkpoint)
+   * write amplification from every snapshot.
+   */
+  private repairedThrough = 0
 
   constructor(readonly projectDir: string, readonly instanceId: string) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(instanceId)) {
@@ -106,7 +108,7 @@ export class GraphStore {
     const initialize = await store.withTransaction(async () => {
       const existing = await readJsonFile<GraphInstanceRecord>(store.paths.instanceJson)
       if (existing) {
-        if (existing.engine !== 'durable-graph-v1') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
+        if (existing.engine !== 'durable-graph-v2') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return false
       }
@@ -123,10 +125,8 @@ export class GraphStore {
     // plugin code. Materialize entrypoint inputs outside the Graph transaction.
     const workspace = await ensureWorkspaceIdentity(input.projectDir)
     const now = input.now ?? Date.now()
-    const initialState = await hydrateInitialStateFromWorkspace(
-      input.projectDir,
-      input.graph,
-      Object.fromEntries(Object.entries(input.graph.state).map(([name, variable]) => [name, variable.initial])),
+    const initialState = Object.fromEntries(
+      Object.entries(input.graph.state).map(([name, variable]) => [name, variable.initial]),
     )
     const state: GraphStateSnapshot = {
       schemaVersion: 'graph-state-1.0',
@@ -156,7 +156,7 @@ export class GraphStore {
     }))
     const instance: GraphInstanceRecord = {
         schemaVersion: 'graph-instance-1.0',
-        engine: 'durable-graph-v1',
+        engine: 'durable-graph-v2',
         instanceId,
         graphId: input.graph.id,
         graphVersion: input.graph.version,
@@ -172,7 +172,7 @@ export class GraphStore {
     await store.withTransaction(async () => {
       const existing = await readJsonFile<GraphInstanceRecord>(store.paths.instanceJson)
       if (existing) {
-        if (existing.engine !== 'durable-graph-v1') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
+        if (existing.engine !== 'durable-graph-v2') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return
       }
@@ -190,7 +190,6 @@ export class GraphStore {
         activations: new Map(activations.map(a => [a.id, a])),
         lastSequence: 1,
         commitKeys: new Map(),
-        artifacts: new Map(),
         externalEvents: new Map(),
       })
     })
@@ -206,14 +205,13 @@ export class GraphStore {
       this.paths.intentsDir,
       this.paths.effectIntentsDir,
       this.paths.lanesDir,
-      this.paths.artifactsDir,
       this.paths.eventsDir,
     ].map(dir => mkdir(dir, { recursive: true })))
   }
 
   async loadSpec(): Promise<FrozenLoopGraphSpec> {
     const spec = await readJsonFile<FrozenLoopGraphSpec>(this.paths.specJson)
-    if (!spec || spec.schemaVersion !== 'graph-1.0' || !spec.graphHash) throw new Error(`graph spec is missing for '${this.instanceId}'`)
+    if (!spec || spec.schemaVersion !== 'graph-2.0' || !spec.graphHash) throw new Error(`graph spec is missing for '${this.instanceId}'`)
     verifyFrozenGraphIntegrity(spec)
     return spec
   }
@@ -296,37 +294,6 @@ export class GraphStore {
     })
   }
 
-  /** Durably memoize an activation_start context section under the live lease. */
-  async cacheActivationContext(input: {
-    activationId: string
-    leaseToken: string
-    section: ContextSectionSnapshot
-    now?: number
-  }): Promise<ContextSectionSnapshot> {
-    return this.withTransaction(async () => {
-      const snapshot = await this.reconcileLocked()
-      const activation = snapshot.activations.get(input.activationId)
-      if (!activation || activation.status !== 'running' || activation.lease?.token !== input.leaseToken) {
-        throw new Error(`activation lease lost while caching context for '${input.activationId}'`)
-      }
-      const existing = activation.contextCache?.[input.section.name]
-      if (existing) return existing
-      const next: ActivationRecord = {
-        ...activation,
-        contextCache: { ...(activation.contextCache ?? {}), [input.section.name]: input.section },
-        updatedAt: input.now ?? Date.now(),
-      }
-      await this.appendEventLocked({
-        type: 'activation_context_cached',
-        at: input.now ?? Date.now(),
-        activation: next,
-        sectionName: input.section.name,
-      })
-      await atomicWriteJson(this.activationPath(next.id), next)
-      return input.section
-    })
-  }
-
   async prepareCommit(input: {
     activationId: string
     leaseToken: string
@@ -398,7 +365,10 @@ export class GraphStore {
       const intent = await readJsonFile<GraphEffectIntent>(path)
       if (!intent) throw new Error(`Effect operation '${operationKey}' was not prepared`)
       if (intent.receipt !== undefined && JSON.stringify(intent.receipt) !== JSON.stringify(receipt)) {
-        throw new Error(`Effect operation '${operationKey}' returned a different receipt for the same idempotency key`)
+        // Providers may return receipts with nondeterministic fields (timestamps,
+        // request ids) on idempotent resubmission. The first durable receipt is
+        // authoritative; throwing here would poison every retry of the segment.
+        return intent
       }
       const next: GraphEffectIntent = { ...intent, status: 'submitted', receipt, updatedAt: now }
       await atomicWriteJson(path, next)
@@ -504,6 +474,11 @@ export class GraphStore {
     return this.readJournalLocked()
   }
 
+  /** Caller must hold withTransaction. Reads a single journal event by sequence. */
+  async readJournalEventLocked(sequence: number): Promise<SequencedGraphJournalEvent | null> {
+    return readJsonFile<SequencedGraphJournalEvent>(this.journalPath(sequence))
+  }
+
   /** Caller must hold withTransaction. */
   async authoritativeSnapshotLocked(): Promise<GraphSnapshot> {
     return this.reconcileLocked()
@@ -516,14 +491,6 @@ export class GraphStore {
     await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
     for (const activation of event.spawned) await atomicWriteJson(this.activationPath(activation.id), activation)
     for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
-    for (const artifact of event.artifacts ?? []) {
-      await atomicWriteJson(join(this.paths.artifactsDir, `${artifact.id}.json`), artifact)
-      if (artifact.supersedes) {
-        const previousPath = join(this.paths.artifactsDir, `${artifact.supersedes}.json`)
-        const previous = await readJsonFile<GraphArtifactRecord>(previousPath)
-        if (previous) await atomicWriteJson(previousPath, { ...previous, status: 'superseded', supersededBy: artifact.id })
-      }
-    }
     const intent = await readJsonFile<ActivationCommitIntent>(this.intentPath(event.commitKey))
     if (intent) await atomicWriteJson(this.intentPath(event.commitKey), { ...intent, status: 'committed', journalSequence: sequence })
   }
@@ -559,7 +526,7 @@ export class GraphStore {
   private async reconcileLocked(events?: SequencedGraphJournalEvent[]): Promise<GraphSnapshot> {
     const lastSequence = events?.at(-1)?.sequence ?? await this.readLastSequenceLocked()
     const checkpoint = events ? null : await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
-    const usableCheckpoint = checkpoint?.schemaVersion === 'graph-checkpoint-1.0' && checkpoint.lastSequence <= lastSequence
+    const usableCheckpoint = checkpoint?.schemaVersion === 'graph-checkpoint-2.0' && checkpoint.lastSequence <= lastSequence
       ? checkpoint
       : null
     const journal = events ?? await this.readJournalRangeLocked((usableCheckpoint?.lastSequence ?? 0) + 1, lastSequence)
@@ -568,7 +535,6 @@ export class GraphStore {
     let state: GraphStateSnapshot | undefined = usableCheckpoint?.state
     const activations = new Map<string, ActivationRecord>((usableCheckpoint?.activations ?? []).map(item => [item.id, item]))
     const commitKeys = new Map<string, number>(usableCheckpoint?.commitKeys ?? [])
-    const artifacts = new Map<string, GraphArtifactRecord>((usableCheckpoint?.artifacts ?? []).map(item => [item.id, item]))
     const externalEvents = new Map<string, GraphExternalEventRecord>()
     for (const item of usableCheckpoint?.externalEvents ?? []) externalEvents.set(item.id, item)
     for (const record of journal) {
@@ -582,7 +548,6 @@ export class GraphStore {
           break
         case 'activation_claimed':
         case 'activation_released':
-        case 'activation_context_cached':
           activations.set(event.activation.id, event.activation)
           if (event.type === 'activation_released' && event.instance) instance = event.instance
           break
@@ -590,13 +555,6 @@ export class GraphStore {
           activations.set(event.activation.id, event.activation)
           for (const activation of event.spawned) activations.set(activation.id, activation)
           for (const activation of event.cancelled ?? []) activations.set(activation.id, activation)
-          for (const artifact of event.artifacts ?? []) {
-            artifacts.set(artifact.id, artifact)
-            if (artifact.supersedes) {
-              const previous = artifacts.get(artifact.supersedes)
-              if (previous) artifacts.set(previous.id, { ...previous, status: 'superseded', supersededBy: artifact.id })
-            }
-          }
           state = event.state
           instance = event.instance
           commitKeys.set(event.commitKey, record.sequence)
@@ -629,8 +587,12 @@ export class GraphStore {
         activations.set(id, projected)
       }
     }
-    const snapshot = { instance, state, activations, lastSequence, commitKeys, artifacts, externalEvents }
-    for (const record of journal) await this.repairEventProjectionLocked(record)
+    const snapshot = { instance, state, activations, lastSequence, commitKeys, externalEvents }
+    const repairFrom = this.repairedThrough
+    for (const record of journal) {
+      if (record.sequence <= repairFrom) continue
+      await this.repairEventProjectionLocked(record)
+    }
     const [diskState, diskInstance] = await Promise.all([
       readJsonFile<GraphStateSnapshot>(this.paths.stateJson),
       readJsonFile<GraphInstanceRecord>(this.paths.instanceJson),
@@ -641,9 +603,11 @@ export class GraphStore {
       await this.writeCheckpointLocked(snapshot)
     }
     for (const [commitKey, sequence] of commitKeys) {
+      if (sequence <= repairFrom) continue
       const intent = await readJsonFile<ActivationCommitIntent>(this.intentPath(commitKey))
       if (intent?.status === 'prepared') await atomicWriteJson(this.intentPath(commitKey), { ...intent, status: 'committed', journalSequence: sequence })
     }
+    this.repairedThrough = Math.max(this.repairedThrough, lastSequence)
     return snapshot
   }
 
@@ -651,7 +615,6 @@ export class GraphStore {
     await atomicWriteJson(this.paths.instanceJson, snapshot.instance)
     await atomicWriteJson(this.paths.stateJson, snapshot.state)
     for (const activation of snapshot.activations.values()) await atomicWriteJson(this.activationPath(activation.id), activation)
-    for (const artifact of snapshot.artifacts.values()) await atomicWriteJson(join(this.paths.artifactsDir, `${artifact.id}.json`), artifact)
     for (const event of snapshot.externalEvents.values()) await this.writeExternalEventProjectionLocked(event)
   }
 
@@ -707,9 +670,6 @@ export class GraphStore {
         await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
         if (event.instance) await atomicWriteJson(this.paths.instanceJson, event.instance)
         return
-      case 'activation_context_cached':
-        await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
-        return
       case 'activation_committed':
         await this.writeCommitProjectionLocked(event, record.sequence)
         return
@@ -731,13 +691,12 @@ export class GraphStore {
 
   private async writeCheckpointLocked(snapshot: GraphSnapshot): Promise<void> {
     const checkpoint: GraphCheckpoint = {
-      schemaVersion: 'graph-checkpoint-1.0',
+      schemaVersion: 'graph-checkpoint-2.0',
       lastSequence: snapshot.lastSequence,
       instance: snapshot.instance,
       state: snapshot.state,
       activations: [...snapshot.activations.values()],
       commitKeys: [...snapshot.commitKeys.entries()],
-      artifacts: [...snapshot.artifacts.values()],
       externalEvents: [...snapshot.externalEvents.values()],
     }
     await atomicWriteJson(this.paths.checkpointJson, checkpoint)
@@ -747,13 +706,12 @@ export class GraphStore {
 const CHECKPOINT_INTERVAL = 50
 
 interface GraphCheckpoint {
-  schemaVersion: 'graph-checkpoint-1.0'
+  schemaVersion: 'graph-checkpoint-2.0'
   lastSequence: number
   instance: GraphInstanceRecord
   state: GraphStateSnapshot
   activations: ActivationRecord[]
   commitKeys: Array<[string, number]>
-  artifacts: GraphArtifactRecord[]
   externalEvents: GraphExternalEventRecord[]
 }
 
@@ -795,10 +753,6 @@ export function newActivation(input: {
   }
 }
 
-function emptyUsage(): ActivationUsage {
-  return { turns: 0, costUsd: 0, durationMs: 0 }
-}
-
 export async function listGraphInstanceRecords(projectDir: string): Promise<GraphInstanceRecord[]> {
   const root = join(resolve(projectDir), '.loop')
   const entries = await readdir(root, { withFileTypes: true }).catch(() => [])
@@ -806,7 +760,7 @@ export async function listGraphInstanceRecords(projectDir: string): Promise<Grap
   for (const entry of entries) {
     if (!entry.isDirectory()) continue
     const record = await readJsonFile<GraphInstanceRecord>(join(root, entry.name, 'instance.json'))
-    if (record?.engine === 'durable-graph-v1') records.push(record)
+    if (record?.engine === 'durable-graph-v2') records.push(record)
   }
   return records.sort((a, b) => a.instanceId.localeCompare(b.instanceId))
 }

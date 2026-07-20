@@ -324,7 +324,7 @@ export interface MetaAgentConfig {
   planModeRef?: { active: boolean }
 
   /** Optional user prompt function consumed by the kernel permission policy. */
-  askUser?: (question: string, choices?: string[]) => Promise<string>
+  askUser?: (question: string, choices?: string[], signal?: AbortSignal) => Promise<string>
 
   /**
    * Cleanup policy for auto-series isolated-write worktrees.

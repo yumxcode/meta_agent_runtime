@@ -1,6 +1,6 @@
 import type { MetaAgentEvent } from '../../../core/types.js'
 
-export type GraphDistillPhase = 'compiler' | 'semantic_review'
+export type GraphDistillPhase = 'architect' | 'compiler' | 'semantic_review'
 
 export interface GraphDistillModelRequest {
   phase: GraphDistillPhase

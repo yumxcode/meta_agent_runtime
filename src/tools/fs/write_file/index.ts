@@ -1,5 +1,6 @@
-import { mkdir, writeFile } from 'fs/promises'
-import { dirname } from 'path'
+import { randomUUID } from 'node:crypto'
+import { mkdir, rename, rm, writeFile } from 'fs/promises'
+import { dirname, join } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
 import { resolveInsideWorkspace } from '../workspaceGuard.js'
@@ -38,14 +39,19 @@ export async function createWriteFileTool(): Promise<MetaAgentTool> {
       // Auto mode: serialise concurrent writers to the same path (no-op when the
       // mutex is absent, i.e. non-auto sessions).
       const release = _ctx.writeMutex ? await _ctx.writeMutex.acquire(filePath) : null
+      let temporary: string | undefined
       try {
         await mkdir(dirname(filePath), { recursive: true })
-        await writeFile(filePath, content, 'utf-8')
+        temporary = join(dirname(filePath), `.${randomUUID()}.write`)
+        await writeFile(temporary, content, 'utf-8')
+        await rename(temporary, filePath)
+        temporary = undefined
         const lines = content.split('\n').length
         return { content: `Successfully wrote ${lines} lines to ${filePath}`, isError: false }
       } catch (err) {
         return { content: `Error writing file: ${err instanceof Error ? err.message : String(err)}`, isError: true }
       } finally {
+        if (temporary) await rm(temporary, { force: true }).catch(() => undefined)
         release?.()
       }
     },

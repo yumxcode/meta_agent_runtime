@@ -1,12 +1,109 @@
+import { mkdir, readFile, rename, writeFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
 import type { GraphRuntimeCatalog } from '../runtime/GraphCatalog.js'
 import type { LoopGraphSpec } from '../spec/GraphTypes.js'
 import { freezeLoopGraph, validateLoopGraph } from '../spec/GraphValidate.js'
+import { formatGraphLintFindings, lintLoopGraph } from '../spec/GraphLint.js'
 import type { GraphDistillExecutor, GraphDistillPhase } from './ForegroundGraphDistillExecutor.js'
+import type { DistillCheckpointStore } from './DistillCheckpoint.js'
+import {
+  GRAPH_TRACEABILITY_SCHEMA,
+  LOOP_CONSTRAINTS_SCHEMA,
+  LOOP_DESIGN_SCHEMA,
+  LOOP_PRECONDITIONS_SCHEMA,
+  SEMANTIC_REVIEW_LAYERS,
+  SEMANTIC_REVIEW_SCHEMA,
+  buildGraphImplementationManifest,
+  emptyLoopPreconditions,
+  renderLoopBlueprintMarkdown,
+  renderSemanticReviewMarkdown,
+  validateConstraintLedger,
+  validateGraphTraceability,
+  validateLoopBlueprint,
+  validateLoopPreconditions,
+  type GraphImplementationManifest,
+  type GraphTraceabilityMap,
+  type LayeredSemanticReview,
+  type LoopBlueprint,
+  type LoopConstraintLedger,
+  type LoopPreconditions,
+} from './DistillDesign.js'
 
 export interface DistillGraphResult {
+  constraints: LoopConstraintLedger
+  design: LoopBlueprint
   graph: LoopGraphSpec
+  traceability: GraphTraceabilityMap
+  manifest: GraphImplementationManifest
+  preconditions: LoopPreconditions
+  semanticReview: LayeredSemanticReview
+  designMarkdown: string
+  semanticReviewMarkdown: string
   taskSpec: string
   attempts: number
+  phaseAttempts?: { architect: number; compiler: number; reviewer: number }
+}
+
+export class DistillInterruptedError extends Error {
+  readonly name = 'DistillInterruptedError'
+  constructor(readonly phase: GraphDistillPhase, reason: string) {
+    super(`Distill interrupted during ${phase}: ${reason}`)
+  }
+}
+
+export const DISTILL_ARTIFACT_FILES = {
+  constraints: 'loop.constraints.json',
+  design: 'loop.design.json',
+  designMarkdown: 'loop.design.md',
+  traceability: 'loop.graph.traceability.json',
+  manifest: 'loop.graph.manifest.json',
+  preconditions: 'loop.preconditions.json',
+  semanticReview: 'loop.semantic-review.json',
+  semanticReviewMarkdown: 'loop.semantic-review.md',
+  taskSpec: 'loop.graph.review.md',
+} as const
+
+export async function writeDistillArtifacts(projectDir: string, graphFile: string, result: DistillGraphResult): Promise<void> {
+  const artifacts = new Map<string, string>([
+    [resolve(projectDir, graphFile), JSON.stringify(result.graph, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.constraints), JSON.stringify(result.constraints, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.design), JSON.stringify(result.design, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.designMarkdown), result.designMarkdown],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.traceability), JSON.stringify(result.traceability, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.manifest), JSON.stringify(result.manifest, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.preconditions), JSON.stringify(result.preconditions, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.semanticReview), JSON.stringify(result.semanticReview, null, 2)],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.semanticReviewMarkdown), result.semanticReviewMarkdown],
+    [resolve(projectDir, DISTILL_ARTIFACT_FILES.taskSpec), result.taskSpec],
+  ])
+  for (const [path, content] of artifacts) await atomicWrite(path, content)
+}
+
+export async function readDistillArtifacts(projectDir: string, graphFile: string): Promise<DistillGraphResult> {
+  const readJson = async <T>(path: string): Promise<T> => JSON.parse(await readFile(resolve(projectDir, path), 'utf8')) as T
+  const [graph, constraints, design, traceability, manifest, semanticReview] = await Promise.all([
+    readJson<LoopGraphSpec>(graphFile),
+    readJson<LoopConstraintLedger>(DISTILL_ARTIFACT_FILES.constraints),
+    readJson<LoopBlueprint>(DISTILL_ARTIFACT_FILES.design),
+    readJson<GraphTraceabilityMap>(DISTILL_ARTIFACT_FILES.traceability),
+    readJson<GraphImplementationManifest>(DISTILL_ARTIFACT_FILES.manifest),
+    readJson<LayeredSemanticReview>(DISTILL_ARTIFACT_FILES.semanticReview),
+  ])
+  // Older drafts predate the preconditions artifact; treat absence as empty.
+  const preconditions = await readJson<LoopPreconditions>(DISTILL_ARTIFACT_FILES.preconditions).catch(() => emptyLoopPreconditions())
+  const taskSpec = await readFile(resolve(projectDir, DISTILL_ARTIFACT_FILES.taskSpec), 'utf8').catch(() => '')
+  return {
+    graph, constraints, design, traceability, manifest, preconditions, semanticReview, taskSpec, attempts: 1,
+    designMarkdown: renderLoopBlueprintMarkdown(constraints, design),
+    semanticReviewMarkdown: renderSemanticReviewMarkdown(semanticReview),
+  }
+}
+
+async function atomicWrite(path: string, content: string): Promise<void> {
+  await mkdir(dirname(path), { recursive: true })
+  const temporary = `${path}.tmp-${process.pid}-${Math.random().toString(16).slice(2)}`
+  await writeFile(temporary, content, 'utf8')
+  await rename(temporary, path)
 }
 
 /** Filesystem entrypoint for a Distill session. The host supplies only the
@@ -21,7 +118,7 @@ export interface DistillSource {
  * Tests validate and Freeze this exact object so the example cannot drift from
  * the executable ABI. It demonstrates nesting/dataflow, not domain topology. */
 export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
-  schemaVersion: 'graph-1.0',
+  schemaVersion: 'graph-2.0',
   id: 'bounded_iterative_loop',
   version: 1,
   goal: 'Iterate until the semantic worker reports completion, otherwise fail cleanly.',
@@ -35,7 +132,7 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
   lanes: {
     work: {
       context: 'persistent',
-      workspace: 'readonly',
+      workspace: { read: ['requirements.md'], write: [], deny: ['.git'] },
       maxConcurrency: 1,
       description: 'One continuous semantic work context.',
     },
@@ -90,20 +187,23 @@ export interface DistillGraphDeps {
   maxAttempts?: number
   /** Independent intent-equivalence review; enabled by default. */
   semanticReview?: boolean
+  /** Optional durable Architect checkpoint. Compiler repair never rewrites it. */
+  checkpoint?: DistillCheckpointStore
   onProgress?: (event: GraphDistillProgressEvent) => void
 }
 
 export type GraphDistillProgressEvent =
+  | { type: 'checkpoint_resumed'; phase: 'architect' }
   | { type: 'phase_started'; phase: GraphDistillPhase; attempt: number; maxAttempts: number }
   | { type: 'phase_completed'; phase: GraphDistillPhase; attempt: number }
-  | { type: 'validation_passed'; attempt: number }
-  | { type: 'validation_failed'; attempt: number; issues: string[] }
+  | { type: 'validation_passed'; phase: 'compiler'; attempt: number }
+  | { type: 'validation_failed'; phase: 'architect' | 'compiler'; attempt: number; issues: string[] }
   | { type: 'semantic_review_accepted'; attempt: number }
   | { type: 'semantic_review_rejected'; attempt: number; issues: string[] }
 
 export async function distillLoopGraph(source: DistillSource, deps: DistillGraphDeps): Promise<DistillGraphResult> {
   return compileLoopGraph(source, deps, (attempt, lastErrors) => [
-    attempt > 1 ? `上一次 LoopGraphSpec 校验失败。逐项修复并返回完整图：\n${formatGraphValidationFeedback(lastErrors)}` : '',
+    attempt > 1 ? `上一次 Blueprint、Graph lowering、Freeze 或语义复核失败。重新核对来源并修订：\n${formatArchitectValidationFeedback(lastErrors)}` : '',
     formatDistillSource(source),
   ].filter(Boolean).join('\n\n'))
 }
@@ -113,7 +213,7 @@ export async function distillLoopGraph(source: DistillSource, deps: DistillGraph
  * caller restart cannot make the revision depend on hidden chat state. */
 export async function reviseLoopGraph(
   source: DistillSource,
-  current: Pick<DistillGraphResult, 'graph' | 'taskSpec'>,
+  current: Pick<DistillGraphResult, 'graph' | 'taskSpec'> & Partial<Pick<DistillGraphResult, 'constraints' | 'design' | 'traceability' | 'manifest'>>,
   reviewFeedback: string,
   deps: DistillGraphDeps,
 ): Promise<DistillGraphResult> {
@@ -122,11 +222,13 @@ export async function reviseLoopGraph(
     '【用户在后续 Distill turn 中新增的约束与意见】',
     reviewFeedback,
   ].join('\n\n')
-  return compileLoopGraph(source, deps, (attempt, lastErrors) => [
+  return compileLoopGraph(source, { ...deps, checkpoint: undefined }, (attempt, lastErrors) => [
     '【后续 Distill turn】',
-    '用户检查了已落盘的上一版 Graph，并给出了补充或纠正。基于当前草图继续修改，不要另起无关方案；返回完整的 {graph, taskSpec}。taskSpec 必须说明如何处理了本轮输入。',
-    attempt > 1 ? `上一次修订仍未通过校验。逐项修复：\n${formatGraphValidationFeedback(lastErrors)}` : '',
+    '用户检查了已落盘的上一版 Blueprint 与 Graph，并给出了补充或纠正。先更新约束台账和 Blueprint；不要直接给旧 Graph 打补丁。',
+    attempt > 1 ? `上一次修订仍未通过校验。先在 Blueprint 中逐项修复：\n${formatArchitectValidationFeedback(lastErrors)}` : '',
     formatDistillSource(source),
+    ...(current.constraints ? ['【当前约束台账】', JSON.stringify(current.constraints)] : []),
+    ...(current.design ? ['【当前 Loop Blueprint】', JSON.stringify(current.design)] : []),
     '【当前 Graph 草图】', JSON.stringify(current.graph),
     '【当前编译说明】', current.taskSpec,
     '【用户累计补充与纠正】', reviewFeedback,
@@ -138,153 +240,330 @@ async function compileLoopGraph(
   deps: DistillGraphDeps,
   buildTask: (attempt: number, lastErrors: string[]) => string,
   reviewSource = formatDistillSource(source),
+  semanticRevision = 0,
 ): Promise<DistillGraphResult> {
   const maxAttempts = deps.maxAttempts ?? 3
   const signal = deps.signal ?? new AbortController().signal
-  const systemPrompt = buildGraphDistillerSystem(deps.catalog)
-  let lastErrors: string[] = []
-  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
-    deps.onProgress?.({ type: 'phase_started', phase: 'compiler', attempt, maxAttempts })
-    const record = await deps.executor.execute({
-      phase: 'compiler',
-      sessionKey: 'distill-compiler',
-      taskDescription: buildTask(attempt, lastErrors),
-      systemPrompt,
+  const architectSystemPrompt = buildLoopArchitectSystem()
+  const compilerSystemPrompt = buildGraphDistillerSystem(deps.catalog)
+  let architecture: { constraints: LoopConstraintLedger; design: LoopBlueprint } | undefined
+  let architectErrors: string[] = []
+  let architectAttempts = 0
+
+  const checkpoint = await deps.checkpoint?.load(source)
+  if (checkpoint) {
+    const checkpointErrors = [
+      ...validateConstraintLedger(checkpoint.constraints),
+      ...validateLoopBlueprint(checkpoint.design, checkpoint.constraints),
+    ]
+    if (!checkpointErrors.length) {
+      architecture = { constraints: checkpoint.constraints, design: checkpoint.design }
+      deps.onProgress?.({ type: 'checkpoint_resumed', phase: 'architect' })
+    }
+  }
+
+  // Architect and Compiler have independent retry budgets. Once the semantic
+  // contract is valid, a Graph ABI/lowering failure must not regenerate it.
+  for (let attempt = 1; attempt <= maxAttempts && !architecture; attempt++) {
+    architectAttempts = attempt
+    throwIfDistillAborted(signal, 'architect')
+    deps.onProgress?.({ type: 'phase_started', phase: 'architect', attempt, maxAttempts })
+    const architectRecord = await deps.executor.execute({
+      phase: 'architect',
+      sessionKey: 'distill-architect',
+      taskDescription: [
+        buildTask(attempt, architectErrors),
+        '【本阶段任务：Architect】',
+        '读取来源并只输出 {constraints,design}。先把自然语言约束稳定为可审查的三面 Loop Blueprint，不要在本阶段输出 Graph。若缺少会改变权限、路由或安全边界的信息，使用 ask_user。',
+      ].join('\n\n'),
+      systemPrompt: architectSystemPrompt,
       allowedTools: ['read_file', 'grep', 'glob', 'ask_user'],
       maxTurns: 24,
       maxBudgetUsd: 2,
       signal,
     })
-    deps.onProgress?.({ type: 'phase_completed', phase: 'compiler', attempt })
+    if (architectRecord.status === 'cancelled' || signal.aborted) {
+      throw new DistillInterruptedError('architect', architectRecord.error ?? abortReason(signal))
+    }
+    if (architectRecord.status !== 'completed') {
+      architectErrors = [`foreground architect ${architectRecord.status}: ${architectRecord.error ?? 'no terminal error detail'}`]
+      deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
+      continue
+    }
+    deps.onProgress?.({ type: 'phase_completed', phase: 'architect', attempt })
+    const candidate = parseArchitectOutput(architectRecord.output, architectRecord.summary)
+    if (!candidate) {
+      architectErrors = ['no parseable {constraints, design} from foreground architect']
+      deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
+      continue
+    }
+    let architectureErrors: string[]
+    try {
+      architectureErrors = [
+        ...validateConstraintLedger(candidate.constraints),
+        ...validateLoopBlueprint(candidate.design, candidate.constraints),
+      ]
+    } catch (error) {
+      architectureErrors = [`layered design shape could not be validated: ${error instanceof Error ? error.message : String(error)}`]
+    }
+    if (architectureErrors.length) {
+      architectErrors = architectureErrors
+      deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
+      continue
+    }
+    architecture = candidate
+    await deps.checkpoint?.save(source, architecture)
+  }
+  if (!architecture) {
+    throw new Error(`graph architect failed after ${maxAttempts} attempts:\n- ${architectErrors.join('\n- ')}`)
+  }
+
+  let compilerErrors: string[] = []
+  let reviewerAttempts = 0
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    throwIfDistillAborted(signal, 'compiler')
+    deps.onProgress?.({ type: 'phase_started', phase: 'compiler', attempt, maxAttempts })
+    const record = await deps.executor.execute({
+      phase: 'compiler',
+      sessionKey: 'distill-compiler',
+      taskDescription: [
+        '【本阶段任务：Compiler / Lowering】',
+        '把已经确认的约束台账与轻量 Blueprint lower 为唯一现行 Graph ABI。Blueprint 不是第二套 Graph DSL；你可自由选择节点、Lane、Workspace 合同和路由 ID，但不得重新解释、删除或弱化 hard constraint。只输出 {graph,traceability,taskSpec}。',
+        formatDistillSourceIdentity(source),
+        ...(compilerErrors.length ? ['【上一轮 Compiler/Reviewer 诊断】', formatGraphValidationFeedback(compilerErrors)] : []),
+        '【约束台账】', JSON.stringify(architecture.constraints),
+        '【Loop Blueprint】', JSON.stringify(architecture.design),
+      ].join('\n\n'),
+      systemPrompt: compilerSystemPrompt,
+      allowedTools: ['ask_user', 'graph_reference', 'graph_validate'],
+      maxTurns: 24,
+      maxBudgetUsd: 2,
+      signal,
+    })
+    if (record.status === 'cancelled' || signal.aborted) {
+      throw new DistillInterruptedError('compiler', record.error ?? abortReason(signal))
+    }
     if (record.status !== 'completed') {
-      lastErrors = [`foreground compiler ${record.status}: ${record.error ?? 'no terminal error detail'}`]
-      deps.onProgress?.({ type: 'validation_failed', attempt, issues: lastErrors })
+      compilerErrors = [`foreground compiler ${record.status}: ${record.error ?? 'no terminal error detail'}`]
+      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
       continue
     }
-    const parsed = parseGraphDistillOutput(record.output, record.summary)
+    deps.onProgress?.({ type: 'phase_completed', phase: 'compiler', attempt })
+    const parsed = parseGraphCompilerOutput(record.output, record.summary)
     if (!parsed) {
-      lastErrors = [`no parseable {graph, taskSpec}; foreground compiler status=${record.status} error=${record.error ?? '(none)'}`]
-      deps.onProgress?.({ type: 'validation_failed', attempt, issues: lastErrors })
+      compilerErrors = [`no parseable {graph, traceability, taskSpec}; foreground compiler status=${record.status} error=${record.error ?? '(none)'}`]
+      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
       continue
     }
-    const errors = validateLoopGraph(parsed.graph, deps.catalog)
+    const preconditions = mergeUnresolvedIntoPreconditions(parsed.preconditions ?? emptyLoopPreconditions(), architecture.constraints)
+    let errors: string[]
+    let lintWarnings: string[] = []
+    try {
+      errors = [
+        ...validateLoopGraph(parsed.graph, deps.catalog),
+        ...validateGraphTraceability(parsed.traceability, architecture.constraints, parsed.graph),
+        ...validateLoopPreconditions(preconditions),
+      ]
+      // Write-surface lint: error-level findings (external write targets,
+      // git without any capability) are certain failures and block Distill.
+      // Warning-level findings (nested-repo reliance, precomputed booleans,
+      // dead routes) may be legitimate — they are handed to the semantic
+      // reviewer, which has the tools to actually verify them per case.
+      if (!errors.length) {
+        const lint = lintLoopGraph(parsed.graph)
+        errors = formatGraphLintFindings(lint.filter(finding => finding.level === 'error'))
+        lintWarnings = formatGraphLintFindings(lint.filter(finding => finding.level === 'warning'))
+      }
+    } catch (error) {
+      errors = [`Graph lowering shape could not be validated: ${error instanceof Error ? error.message : String(error)}`]
+    }
     if (!errors.length) {
       try {
         // Distill returns the logical source graph, but it must also survive the
         // exact logical-to-physical compilation Create will perform later.
         freezeLoopGraph(parsed.graph, deps.catalog, 0)
-        deps.onProgress?.({ type: 'validation_passed', attempt })
+        const manifest = buildGraphImplementationManifest(parsed.graph)
+        deps.onProgress?.({ type: 'validation_passed', phase: 'compiler', attempt })
+        let semanticReview = skippedSemanticReview()
         if (deps.semanticReview !== false) {
-          const review = await reviewGraphSemantics(reviewSource, parsed, deps, signal, attempt)
-          if (!review.accepted) {
-            lastErrors = review.issues.length ? review.issues.map(issue => `semantic review: ${issue}`) : ['semantic review rejected the graph without details']
-            deps.onProgress?.({ type: 'semantic_review_rejected', attempt, issues: review.issues })
+          const reviewed = await reviewGraphSemantics(reviewSource, {
+            ...architecture, ...parsed, manifest, preconditions, lintWarnings,
+          }, deps, signal, attempt)
+          semanticReview = reviewed.review
+          reviewerAttempts += reviewed.attempts
+          if (!semanticReview.accepted) {
+            compilerErrors = semanticReview.issues.length ? semanticReview.issues.map(issue => `semantic review: ${issue}`) : ['semantic review rejected the graph without details']
+            deps.onProgress?.({ type: 'semantic_review_rejected', attempt, issues: semanticReview.issues })
+            // ABI/lowering errors stay local to Compiler. A semantic rejection
+            // means the source contract, Blueprint and executable graph did not
+            // close as a whole, so give Architect one bounded chance to reread
+            // the source and repair the handoff before lowering again. This
+            // avoids repeatedly patching a Graph whose upstream contract is
+            // incomplete while keeping retries finite.
+            if (semanticRevision < 1) {
+              await deps.checkpoint?.clear()
+              const reviewErrors = [...compilerErrors]
+              return compileLoopGraph(source, { ...deps, checkpoint: undefined }, (nextAttempt, lastErrors) => [
+                buildTask(nextAttempt, [...reviewErrors, ...lastErrors]),
+                '【上一版 Semantic Reviewer 拒绝】',
+                formatArchitectValidationFeedback(reviewErrors),
+                '重新读取原始来源并修订 Constraint Ledger 与 Blueprint；随后必须从完整合同重新 lower，不要给旧 Graph 打补丁。',
+              ].join('\n\n'), reviewSource, semanticRevision + 1)
+            }
             continue
           }
           deps.onProgress?.({ type: 'semantic_review_accepted', attempt })
         }
-        return { ...parsed, attempts: attempt }
+        const result: DistillGraphResult = {
+          ...architecture,
+          graph: parsed.graph,
+          traceability: parsed.traceability,
+          taskSpec: parsed.taskSpec,
+          manifest,
+          preconditions,
+          semanticReview,
+          designMarkdown: renderLoopBlueprintMarkdown(architecture.constraints, architecture.design),
+          semanticReviewMarkdown: renderSemanticReviewMarkdown(semanticReview),
+          attempts: attempt,
+          phaseAttempts: { architect: architectAttempts, compiler: attempt, reviewer: reviewerAttempts },
+        }
+        await deps.checkpoint?.clear()
+        return result
       } catch (error) {
-        lastErrors = [error instanceof Error ? error.message : String(error)]
-        deps.onProgress?.({ type: 'validation_failed', attempt, issues: lastErrors })
+        if (error instanceof DistillInterruptedError) throw error
+        compilerErrors = [error instanceof Error ? error.message : String(error)]
+        deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
         continue
       }
     }
-    lastErrors = errors
-    deps.onProgress?.({ type: 'validation_failed', attempt, issues: lastErrors })
+    compilerErrors = errors
+    deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
   }
-  throw new Error(`graph distiller failed after ${maxAttempts} attempts:\n- ${lastErrors.join('\n- ')}`)
+  throw new Error(`graph compiler failed after ${maxAttempts} attempts:\n- ${compilerErrors.join('\n- ')}`)
 }
 
 async function reviewGraphSemantics(
   sourceDescription: string,
-  parsed: { graph: LoopGraphSpec; taskSpec: string },
+  parsed: {
+    constraints: LoopConstraintLedger
+    design: LoopBlueprint
+    graph: LoopGraphSpec
+    traceability: GraphTraceabilityMap
+    manifest: GraphImplementationManifest
+    preconditions: LoopPreconditions
+    lintWarnings?: string[]
+    taskSpec: string
+  },
   deps: DistillGraphDeps,
   signal: AbortSignal,
-  attempt: number,
-): Promise<{ accepted: boolean; issues: string[] }> {
-  deps.onProgress?.({ type: 'phase_started', phase: 'semantic_review', attempt, maxAttempts: deps.maxAttempts ?? 3 })
-  const record = await deps.executor.execute({
-    phase: 'semantic_review',
-    taskDescription: [
-      sourceDescription,
-      '【候选 Graph】', JSON.stringify(parsed.graph),
-      '【机械提取的 producer→consumer 可见性清单】', formatGraphVisibilityManifest(parsed.graph),
-      '【编译说明】', parsed.taskSpec,
-    ].join('\n\n'),
-    systemPrompt: buildGraphSemanticReviewerSystem(),
-    allowedTools: ['read_file', 'grep', 'glob'],
-    maxTurns: 12,
-    maxBudgetUsd: 0.75,
-    signal,
-  })
-  deps.onProgress?.({ type: 'phase_completed', phase: 'semantic_review', attempt })
-  if (record.status !== 'completed') {
-    return { accepted: false, issues: [`semantic reviewer ${record.status}: ${record.error ?? 'no terminal error detail'}`] }
+  compilerAttempt: number,
+): Promise<{ review: LayeredSemanticReview; attempts: number }> {
+  const maxReviewAttempts = 2
+  let lastError = 'semantic reviewer returned no valid verdict'
+  for (let attempt = 1; attempt <= maxReviewAttempts; attempt++) {
+    throwIfDistillAborted(signal, 'semantic_review')
+    deps.onProgress?.({ type: 'phase_started', phase: 'semantic_review', attempt, maxAttempts: maxReviewAttempts })
+    const record = await deps.executor.execute({
+      phase: 'semantic_review',
+      taskDescription: [
+        `【审阅候选】Compiler attempt ${compilerAttempt}`,
+        ...(attempt > 1 ? [`【格式重试】上一次 Reviewer 没有返回有效证据合同：${lastError}`] : []),
+        sourceDescription,
+        '【约束台账】', JSON.stringify(parsed.constraints),
+        '【Loop Blueprint】', JSON.stringify(parsed.design),
+        '【约束到 Graph 的 Traceability】', JSON.stringify(parsed.traceability),
+        '【Kernel 机械提取的实现清单】', JSON.stringify(parsed.manifest),
+        '【运行前置条件清单】', JSON.stringify(parsed.preconditions),
+        ...(parsed.lintWarnings?.length
+          ? ['【机械 Lint 提示（须逐条用工具核验，不得忽略）】', parsed.lintWarnings.map(item => `- ${item}`).join('\n')]
+          : []),
+        '【编译说明】', parsed.taskSpec,
+      ].join('\n\n'),
+      systemPrompt: buildGraphSemanticReviewerSystem(),
+      allowedTools: ['read_file', 'grep', 'glob'],
+      maxTurns: 18,
+      maxBudgetUsd: 1.25,
+      signal,
+    })
+    if (record.status === 'cancelled' || signal.aborted) {
+      throw new DistillInterruptedError('semantic_review', record.error ?? abortReason(signal))
+    }
+    if (record.status !== 'completed') {
+      lastError = `semantic reviewer ${record.status}: ${record.error ?? 'no terminal error detail'}`
+      continue
+    }
+    deps.onProgress?.({ type: 'phase_completed', phase: 'semantic_review', attempt })
+    const parsedReview = parseLayeredSemanticReview(record.output, record.summary)
+    if (parsedReview) return { review: parsedReview, attempts: attempt }
+    lastError = `status=${record.status} error=${record.error ?? '(none)'}`
   }
-  const candidates: unknown[] = [record.output]
-  if (typeof record.output === 'string') candidates.push(tryJson(record.output), ...extractJsonObjects(record.output))
-  if (record.summary) candidates.push(...extractJsonObjects(record.summary))
-  for (const candidate of candidates) {
-    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
-    const object = candidate as Record<string, unknown>
-    if (typeof object.accepted !== 'boolean') continue
-    const issues = Array.isArray(object.issues) ? object.issues.filter((item): item is string => typeof item === 'string' && Boolean(item.trim())) : []
-    return { accepted: object.accepted, issues }
-  }
-  return { accepted: false, issues: [`semantic reviewer returned no parseable verdict; status=${record.status} error=${record.error ?? '(none)'}`] }
+  return { review: rejectedSemanticReview(`semantic reviewer returned no valid layered verdict after ${maxReviewAttempts} attempts; ${lastError}`), attempts: maxReviewAttempts }
 }
 
 function formatGraphVisibilityManifest(graph: LoopGraphSpec): string {
-  const lines: string[] = []
+  const lines: string[] = [
+    `graph=${graph.id}@${graph.version} goal=${JSON.stringify(graph.goal)}`,
+    `state=${JSON.stringify(Object.fromEntries(Object.entries(graph.state).map(([name, spec]) => [name, { type: spec.type, initial: spec.initial }])) )}`,
+  ]
+  for (const [laneId, lane] of Object.entries(graph.lanes)) {
+    lines.push(`lane=${laneId} context=${lane.context} maxConcurrency=${lane.maxConcurrency ?? 1} workspace=${JSON.stringify(lane.workspace)}`)
+  }
   for (const [nodeId, node] of Object.entries(graph.nodes)) {
-    if (node.type !== 'agent') continue
-    const consumes = (node.context?.sections ?? []).flatMap(section => {
-      if (section.provider !== 'builtin/data-plane-view@1') return []
-      const config = section.config
-      const viewId = config && typeof config === 'object' && !Array.isArray(config) && typeof config['view'] === 'string'
-        ? config['view'] : '(invalid)'
-      const plane = viewId !== '(invalid)' ? graph.dataViews?.[viewId]?.plane : undefined
-      return [`${viewId}${plane ? `@${plane}` : ''}`]
-    })
-    const publishes = (node.publishes ?? []).map(item => item.plane ?? item.channel ?? '(invalid)')
+    if (node.type !== 'agent') {
+      lines.push(`node=${nodeId} type=${node.type} spec=${JSON.stringify(node)}`)
+      continue
+    }
     lines.push([
       `node=${nodeId}`,
+      'type=agent',
       `lane=${node.lane}`,
-      `workspace=${graph.lanes[node.lane]?.workspace ?? '(missing)'}`,
-      `reads=${JSON.stringify(node.reads ?? [])}`,
-      `writes=${JSON.stringify(node.writes ?? [])}`,
-      `consumes=${JSON.stringify(consumes)}`,
-      `publishes=${JSON.stringify(publishes)}`,
+      `workspace=${JSON.stringify(graph.lanes[node.lane]?.workspace ?? {})}`,
+      `inputs=${JSON.stringify(node.inputs ?? {})}`,
+      `outputSchema=${JSON.stringify(node.outputSchema ?? null)}`,
+      `tools=${JSON.stringify(node.tools ?? [])}`,
+      `skills=${JSON.stringify(node.skills ?? [])}`,
     ].join(' '))
   }
-  for (const [planeId, plane] of Object.entries(graph.dataPlanes ?? {})) if (plane.backend === 'workspace') {
-    lines.push(`workspace-plane=${planeId} lane=${plane.binding.lane ?? '$project'} path=${plane.binding.path} direction=${plane.binding.direction} owner=${plane.binding.direction === 'ingest' ? 'workspace/input' : 'Kernel projection'}`)
+  for (const transition of graph.transitions) {
+    lines.push(`transition=${transition.id} spec=${JSON.stringify(transition)}`)
   }
-  return lines.length ? lines.join('\n') : '(no Agent or logical workspace dataflow)'
+  for (const entrypoint of graph.entrypoints) {
+    lines.push(`entrypoint=${entrypoint.id} spec=${JSON.stringify(entrypoint)}`)
+  }
+  return lines.length ? lines.join('\n') : '(empty graph)'
 }
 
 /** The semantic reviewer intentionally receives a smaller contract than the
  * compiler. It must understand what a valid graph means, while leaving ABI
  * checking to Validate/Freeze and preserving topology freedom. */
 export function buildGraphSemanticReviewerSystem(): string {
-  return `你是 Loop Graph 的独立语义审阅器。候选图已通过严格结构校验与 Freeze；不要重做 ABI lint，只检查它是否遗漏或违背用户目标、成功标准、时间/审批/失败边界、数据协议，以及是否把未具备的外部能力假定为已可用。
+  return `你是 Loop Distill 的独立语义审阅器。候选 Graph 已通过 ABI Validate 与 Freeze。你不重做字段 lint；你读取原始需求和适用项目合同，并审阅 Constraint Ledger、简明 Loop Blueprint、Constraint→Graph Traceability、Kernel 机械提取的 Graph Manifest 与运行前置条件清单（preconditions）。
 
-宿主不会向你注入需求正文。必须先根据 user prompt 中的需求文件入口和项目地址，使用 read_file 自行读取原始需求；必要时使用 glob、grep、read_file 检查与候选图关键假设直接相关的项目状态。不得仅凭候选图的 taskSpec 代替原始需求。
+必须先根据 user prompt 的需求入口和项目地址使用 read_file 读取原始需求。只有设计实际依赖项目结构、文件、命令或 Skill 时，才用 glob/grep/read_file 做最小充分的治理、ownership 和能力检查。Constraint Ledger 与 taskSpec 都是待核验陈述，不能代替原始来源。
 
-审阅时按以下实际执行语义理解候选图：
-- Agent Node 可代表一个跨多次工具调用、上下文压缩和 timer continuation 的长生命周期 Activation，不是只执行一次 LLM 调用。因此用户列出的紧密阶段可合并在一个 Agent 中。
-- persistent Lane 是共享语义上下文的边界，同 Lane Activation 串行；Workspace backend 独立选择。readonly/shared_controlled 共享项目根，lane_overlay 才创建隔离 worktree。
-- State/Reducer/Transition/Wait 承载确定性计数、阈值、路由和时间；Agent outputSchema 中的命名标量可供程序路由，不需要另造 judge 角色。
-- 任务可自定义逻辑 Data Plane/View；Freeze 将其编译为固定 State/Record/Journal/Workspace 后端。Lane dataAccess 是上限，Node context/publication 是实际读写。
-- materialize workspace 文件的 canonical owner 是 Kernel，由 commit/recovery 幂等重建；不应再要求 Agent 双写。observability/bidirectional 且经 Lane ACL 授权的文件才能由 Agent 直接写。
-- 必须逐条检查 producer→consumer 可见性：同 Lane 可使用声明的原始 workspace reads/writes；跨 Lane 的语义结果必须由 publication→Data View→consumer context 流转。不能假设 lane_overlay 文件会在 Terminal merge 前被另一 Lane 或项目根看到。
-- 检查不同 Lane 的 writes 是否存在相同或父子路径重叠，以及 Agent writes 是否覆盖 Kernel-owned materialize projection；发现时要求合并 Lane、改用 Data Plane 或拆成不相交路径。
-- Function/Effect/Context Provider 已由 Validate/Freeze 按当次 Catalog 锁定。Agent 也可用用户配置的 tool/Skill 完成外部工作；若 taskSpec 已明确列为运行前能力缺口，不要误认为图已承诺它可用。
+约束优先级：用户显式 hard constraint 与协议 > 适用项目治理/ownership > 已冻结 Runtime/Capability > 派生设计 > Scenario guidance。不得用同 Lane、共享上下文、默认习惯或 taskSpec 解释来绕过更高优先级约束。
 
-不要规定节点数量、角色名称、Scenario 模板、研究/发布/合规固定字段，也不要因为有不同但合理的 Lane、Data Plane 或循环拓扑而拒绝。LLM 可以自由选择领域分解；只有明确矛盾、关键需求遗漏、不可执行能力、无界风险或数据所有权冲突才是 rejection。
+Blueprint 是自然语言语义交接，不是第二套 Graph DSL。它只描述 Workspace、Lane 与控制意图。Compiler 可自由选择具体拓扑；你审查的是来源语义是否被最终 Manifest 和 traceability 完整实现。
 
-只输出 JSON：{"accepted":true|false,"issues":["具体且可操作的问题"]}。`
+ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Freeze 机械保证，不需复查；你的职责是机器证明不了的部分。按六层逐层审阅：
+1. intent_constraints：目标、成功标准、hard/soft 强度和来源是否完整且未被改写。
+2. workspace_contract：对照 Blueprint workspace，检查 Agent 直接读写路径、write mode、deny、文件 owner 与用户协议是否一致；不要求 Kernel 代写用户文件。lane.scm='git' 是权限升级：只有来源确实要求提交/推送项目仓库时才允许，且 Agent prompt 中的 git 操作必须有对应能力（scm Lane 或 owned 前缀下的嵌套仓库）——prompt 要求 git commit/push 而两者皆无时必须 fail。
+3. lane_ownership：对照 Blueprint lanes，检查强相关生命周期是否保持连续会话；不同 Lane 的写路径不重叠，串行/并发和权限边界合理。
+4. control_flow：对照 Blueprint control，检查确定性路由、状态更新前后语义、success/failure/timeout/event/timer、恢复、预算和终态义务是否闭环且有界。
+5. capability_resolution：每个 hard constraint 的 graphRefs 都指向真实实现；Graph 使用的工具、Skill、Function、Reducer 与 Effect 确实可用，缺口没有被伪装成已实现。
+6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。项目外没有任何可写位置：prompt 把写/编辑/git 操作指向项目外路径（绝对路径、~、"outside this project"、"运行时再寻找"）必须 fail——把它列成 decision 或 precondition 都救不了 sandbox 拒写。
+
+user prompt 若附带【机械 Lint 提示】，每条都必须用 glob/read_file 实地核验并在对应层给出证据（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或将由前置条件保证 .git 目录），核验不成立即 fail——不得复述提示了事。
+
+逐个 Agent Manifest 审查 prompt 中声明的读写目标：每个写入文件或目录必须被该 Node 所属 Lane.workspace.write 覆盖，且 mode 与 append/replace 语义一致。Graph annotations 不会注入 Agent prompt，也不执行；hard constraint 不能仅靠 annotations、taskSpec 或 rationale 满足。若 Agent prompt 依赖 annotations 中的值，必须 fail。
+
+检查生产与提交时序：若来源要求“评估后只提交新增/批准结果”，生产 Agent 必须先输出候选数据，评估后再由有写权限的提交 Agent 落盘；不得为了保持 Reviewer 只读而提前污染最终文件。检查确定性分类是否保留来源语义，例如“变差”不能被简化成“没有改善”。
+
+保持拓扑自由：不要规定节点数量、角色名称、领域固定字段或 Scenario 模板。来源 hard constraint 未实现、不可执行、越权、写冲突、恢复不闭合或无界运行必须 fail。
+
+Reviewer 只做准入判断，不做设计建议：warnings 必须始终为 []。任何你认为值得记录的差异，要么确实不影响来源合同而省略，要么作为 issue 拒绝；禁止把已识别的协议冲突或错误指针降级为 warning。
+
+只输出 JSON，schemaVersion 必须是 ${SEMANTIC_REVIEW_SCHEMA}。layers 必须恰好覆盖 ${SEMANTIC_REVIEW_LAYERS.join(', ')}。每层结构为 {"status":"pass|fail|not_applicable","evidence":[{"sourceRefs":["需求或项目 path:locator"],"designRefs":["Blueprint section"],"graphRefs":["Graph JSON pointer"],"statement":"核验结论"}],"issues":["阻断问题"]}。任一层 fail 时 accepted=false；accepted=true 时根 issues 和所有层 issues 必须为空；始终输出 "warnings":[]。`
 }
 
 function formatDistillSource(source: DistillSource): string {
@@ -292,7 +571,44 @@ function formatDistillSource(source: DistillSource): string {
     '【Distill 输入入口】',
     `用户的 Loop 需求是：${source.requirement}`,
     `项目地址是：${source.projectDir}`,
-    '不要让宿主代读或假设需求正文。先使用 read_file 自行读取需求文件；再判断该 Loop 是否依赖项目当前结构、已有状态、进展、工具或约束，若依赖，使用 glob、grep、read_file 做最小充分检查后再生成 Graph。不得仅根据文件名猜测需求，也不要无目的遍历整个项目。',
+    '不要让宿主代读或假设需求正文。先使用 read_file 自行读取需求文件；再判断本阶段判断是否依赖项目当前结构、已有状态、进展、工具或约束，若依赖，使用 glob、grep、read_file 做最小充分检查后完成本阶段输出。不得仅根据文件名猜测需求，也不要无目的遍历整个项目。',
+  ].join('\n')
+}
+
+function formatDistillSourceIdentity(source: DistillSource): string {
+  return [
+    '【Distill 来源身份】',
+    `需求入口：${source.requirement}`,
+    `项目地址：${source.projectDir}`,
+    'Architect 已完成全部来源发现。Compiler 只消费 Constraint Ledger 与 Blueprint，不重新读取需求或扫描项目；若其中缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。',
+  ].join('\n')
+}
+
+/** Blueprint diagnostics must not send the Architect into the much larger
+ * Graph ABI repair vocabulary. */
+export function formatArchitectValidationFeedback(errors: readonly string[]): string {
+  const hints = new Set<string>()
+  const joined = errors.join('\n')
+  if (/must be a string array|must be an array/.test(joined)) {
+    hints.add('successCriteria、workspace、lanes、control、assumptions、capabilityGaps 必须是字符串数组；没有内容时使用 []。')
+  }
+  if (/semantic review:/.test(joined)) {
+    hints.add('这是 Reviewer 对来源、Blueprint 与最终 Graph 的语义差异。修改对应合同或 Graph，不得只在 taskSpec 中解释。')
+  }
+  if (/semantic review:.*(protocol|协议|append|canonical|workspace|文件)/is.test(joined)) {
+    hints.add('在 Blueprint workspace 中说清直接读写路径、唯一 owner、append/replace 约束和消费者。')
+  }
+  if (/semantic review:.*(owner|ownership|权限|治理|contract|冲突)/is.test(joined)) {
+    hints.add('重新读取适用的项目治理和 ownership 合同，并在 workspace/lanes 中明确不可违背的边界。')
+  }
+  if (/semantic review:.*(determin|路由|真值|阈值|boolean|语义)/is.test(joined)) {
+    hints.add('在 control 中保留会导致不同后果的语义类别，并明确状态更新前后与阈值语义。')
+  }
+  return [
+    '【Loop Blueprint 原始错误】',
+    ...errors.map(error => `- ${error}`),
+    ...(hints.size ? ['【Architect 定向修复提示】', ...[...hints].map(hint => `- ${hint}`)] : []),
+    '重新输出完整 {constraints,design}，不要输出 Graph 或 patch。',
   ].join('\n')
 }
 
@@ -317,300 +633,126 @@ export function formatGraphValidationFeedback(errors: readonly string[]): string
   if (/needs exactly one default transition|multiple default\/unconditional|must route outcome|conditional transitions sharing priority/.test(joined)) {
     hints.add('逐个 from+on 分组修路由：有条件边时恰好一个 default:true，条件边 priority 唯一；并覆盖该节点所有 success/failure/timer/event/timeout/resume outcome。')
   }
-  if (/Data Plane|dataPlanes|dataViews|read access|publish access|workspace Plane/.test(joined)) {
-    hints.add('检查逻辑数据链：Plane→View→Lane dataAccess→Node context/publication；Node 实际访问必须是 Lane ACL 的子集，workspace 直接写还必须满足 Lane ownership。')
-  }
-  if (/shared_controlled|workspaceAccess|conflicts across Lanes|cross-Lane semantic data|Kernel-owned Workspace projection/.test(joined)) {
-    hints.add('原始 workspace 依赖必须声明 reads/writes；shared_controlled 还要声明 Lane workspaceAccess.write/deny。跨 Lane 语义结果改用 publication→Data View，或把强相关节点放进同一 Lane；不要让 Agent 写 Kernel materialize 路径。')
-  }
-  if (/Context Provider|context\.sections|config\.view|refresh/.test(joined)) {
-    hints.add('Context section 只能引用目录中的 provider@version；逻辑 Plane 用 builtin/data-plane-view@1 + config.view，section name 唯一且不用 kernel_ 前缀。')
+  if (/workspace|write path|read path|deny|overlap|write rule/.test(joined)) {
+    hints.add('Lane.workspace 只有 read、write、deny；write 元素为 {path,mode}，mode 只能是 owned|atomic_replace|append_only。不同 Lane 写路径不得重叠。')
   }
   if (/hard park|timerPolicy|lifetimeBudget|budget\.(turns|usd|wallTimeMs)/.test(joined)) {
     hints.add('hard park Agent 必须位于 persistent Lane，并完整声明 segment budget、lifetimeBudget、timerPolicy.maxDelayMs/maxParks。')
+  }
+  if (/lint\((error|warning)\)/.test(joined)) {
+    hints.add('lint 指向写面或路由问题：项目外没有任何可写位置——需要编辑的外部仓库必须 clone 进项目内某个 owned 写前缀（或对项目根仓库声明 lane scm:\'git\'），并把该目录列为 blocking directory precondition；when 路由优先引用原始事实字段（计数/枚举）而非 Agent 预折叠布尔；永不可达的死路由直接删除。修复 prompt 与 lane 合同，不要只调措辞绕过规则。')
+  }
+  if (/semantic review:/.test(joined)) {
+    hints.add('这是独立 reviewer 对原始需求、项目合同与候选图的语义差异，不是 ABI 拼写错误。重新读取 reviewer 指向的来源并修改 Graph；不得只在 taskSpec 中解释或辩护。')
+  }
+  if (/semantic review:.*(protocol|协议|append|canonical|workspace|文件)/is.test(joined)) {
+    hints.add('显式文件协议必须逐项映射到 Lane.workspace 直接读写规则与唯一 owner。')
+  }
+  if (/semantic review:.*(owner|ownership|权限|治理|contract|冲突)/is.test(joined)) {
+    hints.add('针对 Lane.workspace 重新读取适用的项目治理和 ownership 合同，收窄路径授权；冲突时调整 Lane owner 或 ask_user。')
+  }
+  if (/semantic review:.*(determin|路由|真值|阈值|boolean|语义)/is.test(joined)) {
+    hints.add('为确定性规则重建真值表，保留会导致不同后果的语义类别，并消除没有可执行一致性保证的冗余路由字段。')
   }
   return [
     '【Validator 原始错误】',
     ...errors.map(error => `- ${error}`),
     ...(hints.size ? ['【定向修复提示】', ...[...hints].map(hint => `- ${hint}`)] : []),
-    '修复后仍必须返回完整 {graph,taskSpec}，不要只返回 patch。',
+    '修复后仍必须从完整 {constraints,design} 重新 lower，并返回完整 {graph,traceability,taskSpec}，不要只返回 patch。',
   ].join('\n')
 }
 
-export function buildGraphDistillerSystem(catalog: GraphRuntimeCatalog): string {
-  const functions = catalog.functions.manifests()
-    .map(manifest => formatCapability(manifest, 'registered Function'))
-  const reducers = catalog.reducers.manifests()
-    .map(manifest => formatCapability(manifest, 'registered Reducer'))
-  const effects = catalog.effects.manifests()
-    .map(manifest => formatCapability(manifest, 'registered Effect'))
-  const packs = catalog.packs.list()
-    .map(pack => `${pack.id}@${pack.version} integrity=${pack.integrity}`)
-  const contextProviders = catalog.contextProviders.manifests()
-    .map(manifest => [
-      `${manifest.id}@${manifest.version} trust=${manifest.trust} — ${manifest.description ?? 'registered Context Provider'}`,
-      ...(manifest.inputSchema ? [`config=${JSON.stringify(manifest.inputSchema)}`] : []),
-    ].join(' '))
-  const scenarioGuidance = catalog.packs.scenarios().map(scenario => [
-    `${scenario.id} — ${scenario.description}`,
-    `  Pack: ${scenario.pack.id}@${scenario.pack.version} integrity=${scenario.pack.integrity}`,
-    ...scenario.guidance.map(item => `  - ${item}`),
-    ...(scenario.suggestedCapabilities?.length ? [`  Suggested capabilities: ${scenario.suggestedCapabilities.join(', ')}`] : []),
-    ...(scenario.graphFragments?.map(fragment => `  Optional fragment ${fragment.id} (${fragment.description}): ${JSON.stringify(fragment.fragment)}`) ?? []),
-  ].join('\n'))
-  return `你是 Meta-Agent 唯一现行 Loop 架构 durable-graph-v1 的 Distill Compiler。你的任务是把用户的自然语言长期任务编译成当前 Kernel 可直接校验、冻结、恢复和执行的 LoopGraphSpec。
+/** Architect deliberately does not receive the executable Graph ABI. The
+ * Blueprint is a semantic handoff, not another executable schema. */
+export function buildLoopArchitectSystem(): string {
+  return `你是 Loop Distill 的前台 Architect。你只负责从原始来源抽取约束并建立简明、领域无关的 Loop Blueprint；不要输出 Graph，不要猜测 Graph ABI，也不要执行任务本身。
 
-【禁止使用旧 Loop 机制】
-- 不得输出或假设 Charter、Scenario executor、round ledger、capsule、worker/judge/pivoter 固定角色、continue/pivot/finalize 固定路由、code node、任意 JS 节点或 legacy auto_orch Plan。
-- 用户文档中的“每轮、worker、judge、pivot、code node、state_writer”等词只代表领域意图。必须翻译成下面的 Graph/Activation/Lane/State/Artifact/Function 语义，不能照抄为不存在的运行时类型。
-- Research、Release、Compliance 都只是可由 Capability Pack 帮助生成的图，不拥有独立 Kernel 或固定字段。不得自动加入 totalFindings、directionsTried 等领域字段，除非当前用户任务确实需要它们。
-- 只可引用下方实际注册的版本化能力。没有对应 Function/Effect 时不得虚构；可由 Agent 使用已授权工具完成的工作放入 Agent，否则在 taskSpec 明确列为部署前缺失能力。
+【工作方式】
+- user prompt 只给需求文件入口和项目地址。先用 read_file 读取原文；只有设计依赖项目结构、文件、命令、Skill 或 ownership 时，才用 glob/grep/read_file 做最小充分检查。
+- Workspace 事实必须核实，不得虚构：Blueprint 中每个写路径、以及需求或设计声明 Agent 要读取的每个具体文件，都必须用 glob/read_file 确认在项目中真实存在；不存在的要么在 workspace 中显式标注"由 loop 首轮自建"，要么写入 constraints.unresolved 或 capabilityGaps。禁止基于惯例发明项目中不存在的目录名（例如凭空假设 src/）。你是全流程唯一读取项目的阶段——Compiler 与 Runtime 都不会替你补查。
+- 项目外没有可写位置：Agent 沙箱对项目根以外的一切路径拒写。需求要求编辑的外部资源（例如另一个 git 仓库的工作树），Blueprint 必须以"clone/放置到项目内某个目录"的形式表达并作为启动前置条件；禁止设计"运行时再寻找项目外路径"的方案。
+- 约束优先级：用户显式目标/协议/边界 > 适用项目治理与 ownership > 已知部署能力 > 派生设计 > 默认习惯。来源冲突或歧义会改变路由、权限、所有权或安全边界时使用 ask_user。
+- ask_user 不可用、超时或未获回答时，禁止静默采用默认值：把问题原文、拟采用的默认与影响面写入 constraints.unresolved（{id,question,affects}）。unresolved 项会进入运行前置条件清单，由 loop create 强制人工确认。
+- 不预设领域角色、字段、目录或拓扑。任何 Scenario 词汇都只是来源内容，不是机制模板。
+- 用户明确列出的阶段可以合并到厚 Agent，但阶段的先后关系、文件 owner 和提交责任仍是 hard contract；不得在 Ledger 中因拓扑合并而丢失。例如“评估后由 writer 提交”必须保留为约束，而不是只保留文件存在性。
+- 只回答三类问题：Agent 直接读写哪些 Workspace 路径、哪些工作共享 Lane 会话与写权限、何时继续/等待/失败/结束。
+- 倾向“稀疏控制骨架 + 厚 Agent 节点”：只在确定性计算、持久化提交、并发/权限边界、等待/事件、失败隔离和终态处建议拆分节点；不要把自然语言步骤机械拆成许多节点。
 
-【输出与交互协议】
-只输出一个 JSON 对象，不要 Markdown fence、解释前缀或尾注。初次编译和校验修复使用：
-{"graph":<LoopGraphSpec>,"taskSpec":"供人审阅的编译决策、假设、能力缺口、运行前配置和风险边界"}
-后续 Distill turn 也返回同一结构的完整新草图，不能返回 patch。每个 turn 的草图都会经过结构校验、Freeze 和独立语义复核，全部通过后才覆盖输出文件。
-若编译过程中缺少会实质改变拓扑、权限或运行边界的用户信息，可调用 ask_user 当场询问；对于非关键细节应作出保守、明确记录的假设，不要制造无意义的确认。
-用户 prompt 只会提供需求文件入口和项目地址，不会注入需求文件正文。必须先用 read_file 自行读取需求；如果 Loop 设计依赖项目当前状态，再用 glob、grep、read_file 检查相关文件。只做与编译决策相关的最小充分发现，不要无边界扫描 workspace。
+【唯一输出】
+只输出一个 JSON 对象：{"constraints":<LoopConstraintLedger>,"design":<LoopBlueprint>}。不要 Markdown fence、解释前缀、Graph、taskSpec 或 patch。
 
-【当前执行模型】
-1. Graph Node 是控制语义，不是一次聊天或一个 workspace writer。Kernel 调度的是 durable Activation。
-2. Lane 是上下文、串行化和权限连续性边界，不等于 worktree。多个强相关 Agent Node 可共享一个 persistent Lane/session；readonly 共享根目录只读，shared_controlled 共享根目录并按 Lane/Node 路径上限写入，lane_overlay 才创建隔离 worktree，effect_only 不执行 Agent。不同 Lane 才可并行。Lane 可用 agentProfile.systemInstructions 声明稳定角色；Node 可用 systemInstructions 增加本 Activation 的系统约束。它们不能覆盖 Kernel protected system prompt。
-3. 一个逻辑 Agent Activation 可跨多个物理执行 segment。Agent 调用 timer hard park 后，当前进程退出；wake 到期后以同一 activation id、同一 Lane lineage、递增 continuationVersion 恢复。attempt 不因 continuation 增加。
-4. 紧密耦合的外部长任务——例如提交训练、周期观察、判断平台期、终止训练、提取结果——必须优先放进一个长生命周期 Agent Activation，不要机械拆成 submit/wait/inspect 多个 Agent。可以把后续结构性 pivot、独立审查、报告作为共享或独立 Lane 上的其他 Node。
-5. Agent Node 统一通过专用 graph_agent SPI 执行。当前 Meta-Agent 适配器负责会话 resume 和上下文压缩并复用 Agentic KernelLoop，但不启用 Auto 的 Verify/Drift/Checkpoint 第二层编排。GraphSpec 不选择 SessionMode，也不得输出 mode 字段。
-6. 每个 Agent 自动获得 Kernel 强制的最小 activation section；其他 State/Input/Evidence/Artifact/Clock/continuation 信息由 node.context.sections 显式选择。Runtime 不给每个节点注入全局最多 100 条 Evidence/Artifact。
-7. Context section 只能使用下方注册且版本锁定的 Provider。activation_start 在逻辑 Activation 首段解析并持久缓存，timer/retry/process restart 后复用；every_segment 每段刷新；continuation_only 只在 continuationVersion>0 时刷新并注入。
-8. Prompt section 由 Runtime 统一封装 name/provider/source/trust/refresh/resolvedAt/stateVersion/truncated/originalBytes/renderedBytes/content。Evidence、Artifact、Input 和 continuation 是 untrusted_data，不能冒充指令。
-9. Agent/Function 可以并发计算，但 State、路由、Artifact publication 和下游 Activation 创建由 CommitCoordinator 在短事务中串行提交。commitKey、lease token、journal 和 checkpoint 负责幂等、崩溃恢复与 stale writer fencing。
-10. daemon abort 是 replay，不是业务 failure；普通 Agent 故障受 maxAttempts 控制；无法确认取消时实例 fail-stop。因此图要提供业务 failure 路径，但不要设计“重启即失败”的补偿分支。
-11. 用户可声明任意名字的逻辑 dataPlanes/dataViews，并由 Freeze 编译到 state、record、journal、workspace 固定后端。Kernel 不理解 semanticRole，也不包含 Research/Release/Compliance 分支。用户没有公共数据协议时可省略 dataPlanes/dataViews。
-12. Lane dataAccess 是授权上限：read 针对 Plane/可选 View，publish 针对 record Plane，write 针对所属 Lane 的 workspace Plane。Node 仍必须用精确 Data View 和 publication 声明实际数据流。
-13. Scenario guidance 是可组合的领域知识，不是固定模板。可以组合、改写或不用；不得因为匹配某个 Scenario 就生成固定角色、字段或拓扑。使用某 Pack 的 guidance/capability 时必须把该 Pack 精确写入 capabilityPacks。
-14. Freeze 对 schema-backed 引用和 Capability input/output contract 做保守检查：能证明字段不存在时拒绝；没有 schema 的开放 Agent 输出仍可用。关键路由字段应提供闭合 outputSchema，探索性正文可以保持开放。
-15. concurrency.stateConsistency 默认 commit_latest，允许并行计算后按提交顺序应用最新 State，吞吐最高；serializable 会在 State 变化后重放计算，只用于可安全重放的纯计算/只读 Agent，不能用来掩盖外部副作用或不可回滚 workspace 写入。
-16. scheduler 的默认可观测性是低频阶段事件，不展示模型文本或工具调用。Node.description 是供人的稳定阶段名，应简短说明“当前处于什么阶段”；Agent 每个 segment 结束时由 graph_agent 的 return_result.summary 说明“为什么结束”，timer.reason 说明“在等待什么”，Kernel 会持久化并在恢复时展示。
+Constraint Ledger：
+- schemaVersion 必须是 "${LOOP_CONSTRAINTS_SCHEMA}"。
+- 每个 constraint 必须有 id、kind、statement、strength="hard|soft"、至少一个 {path,locator,excerpt?} 来源；可选 acceptance。
+- kind 只能是 goal|success_criteria|deterministic_rule|workspace_protocol|terminal_obligation|ownership|capability|timer|event|failure_boundary|recovery|budget|other。
 
-【LoopGraphSpec 精确 ABI】
-根对象只使用这些字段：
-{
-  "schemaVersion":"graph-1.0",
-  "id":"字母开头，只含字母数字下划线或短横线",
-  "version":正整数,
-  "goal":"非空目标",
-  "capabilityPacks":[{"id":"...","version":"...","integrity":"..."}],
-  "state":{"name":{"type":<ShapeSpec>,"initial":<JSON>,"description":"..."}},
-  "lanes":{"laneId":{"context":"persistent|fresh_per_activation","workspace":"readonly|shared_controlled|lane_overlay|effect_only","maxConcurrency":1,"description":"...","agentProfile":{"systemInstructions":"Lane 内稳定角色与行为约束"},"dataAccess":{"read":[{"plane":"逻辑Plane","views":["可选精确View"]}],"publish":["record Plane"],"write":["workspace Plane"]},"workspaceAccess":{"write":["允许直接写的相对路径前缀"],"deny":["始终禁止的相对路径前缀"]}}},
-  "nodes":{"nodeId":<NodeSpec>},
-  "transitions":[<TransitionSpec>],
-  "entrypoints":[{"id":"...","node":"...","inputs":{"name":<ValueExpression>}}],
-  "dataPlanes":{"planeId":<DataPlaneSpec>},
-  "dataViews":{"viewId":<DataPlaneViewSpec>},
-  "limits":{"maxActivations":正整数,"maxWallTimeMs":正数,"maxCostUsd":正数,"maxFanOut":正数,"maxPendingTimers":正数},
-  "concurrency":{"maxActivations":正整数,"maxPerNode":正整数,"stateConsistency":"commit_latest|serializable"},
-  "annotations":{"任意领域元数据":<JSON>}
-}
-capabilityPacks/dataPlanes/dataViews/concurrency 以及各可选字段可省略。Distill 不得输出物理 artifacts/artifactViews/evidenceViews/workspaceBindings、compiledDataPlanes、compiledLaneDataAccess、capabilityLock、graphHash、frozenAt、Activation、Wake、Journal 或 mode；这些由 Freeze/Kernel/部署配置决定。
-- executable ABI 严格拒绝未知字段，避免拼错后被静默忽略；不影响执行的领域分类、解释或 UI 信息统一放 annotations。annotations 不产生任何 Kernel 语义。
-- Graph id、State/Lane/Node/Transition/Entrypoint/Plane/View id 都必须匹配 ^[A-Za-z][A-Za-z0-9_-]{0,127}$；各自作用域内不得重复。不要把路径、空格或中文直接用作 id。
+Loop Blueprint：
+- schemaVersion 必须是 "${LOOP_DESIGN_SCHEMA}"，goal 必须与 constraints.goal 完全相同。
+- 固定字段是 intent、successCriteria、workspace、lanes、control、assumptions、capabilityGaps。
+- intent 是一段自然语言；其余字段都是字符串数组，没有内容时写 []。每个数组元素都是可独立审阅的一句话，不是结构化对象。
+- Blueprint 不声明 lane/node/route/terminal ID，不声明 JSON pointer 或跨层外键。严格 traceability 在 Compiler 生成最终 Graph 时建立。
+- Compiler 后续可自由选择具体拓扑、ID、State、Lane、路由和预算；不要提前伪造可执行字段。
 
-ShapeSpec 只支持：
-- object: {"type":"object","required":[...],"properties":{"x":<ShapeSpec>},"additionalProperties":boolean}
-- array: {"type":"array","minItems":整数,"items":<ShapeSpec>}
-- string: {"type":"string","minLength":整数,"enum":[...]}
-- number/integer: {"type":"number|integer","minimum":数,"maximum":数}
-- boolean: {"type":"boolean"}
-- null: {"type":"null"}
-- ShapeSpec 最深 20 层；数值必须有限。未列出的 schema keyword 一律不是“提示信息”，而是 ABI 错误。
+下面对象是完整形状示例；可以增删字符串数组元素，但不要增加第二套 Graph 结构：
+${JSON.stringify(loopBlueprintShapeExample(), null, 2)}
 
-【ShapeSpec 嵌套规则——最容易生成错误，必须逐字遵守】
-- ShapeSpec 是受限 schema，不是完整 JSON Schema。禁止 type 数组、oneOf/anyOf/allOf、$ref、definitions、const、default、nullable、format、pattern、maxLength、maxItems、uniqueItems 等未列字段；string enum 只能包含字符串。
-- StateVariableSpec 与 ShapeSpec 是两层。State 变量外层只允许 type、initial、description；外层 type 的值才是 ShapeSpec：
-  正确："iteration":{"type":{"type":"integer","minimum":0},"initial":0,"description":"..."}
-  错误："iteration":{"type":"integer","minimum":0,"initial":0}
-- Agent/Function 的 outputSchema 直接就是 ShapeSpec，不再套 StateVariableSpec 的 type 包装：
-  正确："outputSchema":{"type":"object","required":["is_stale"],"properties":{"is_stale":{"type":"boolean"}},"additionalProperties":false}
-  错误："outputSchema":{"type":{"type":"object","properties":{"is_stale":{"type":"boolean"}}}}
-- 任何会被 when、transition input、update 或 publication 通过 $output.field 引用的字段，都必须位于当前节点 outputSchema.properties；建议 required 并将 object 设 additionalProperties:false。开放探索正文可省略 outputSchema，但一旦声明闭合 schema 就不能引用未声明字段。
-
-所有 source Graph 可书写对象都只接受各自 ABI 字段。Graph、Lane、Node、Transition、Data Plane 可用 annotations 保存任意 JSON 领域元数据，但 annotations 不参与执行。Node 公共可选字段为 description、timeoutMs、publishes、annotations；不要把这些字段塞入 outputSchema。
-
-【六种 NodeSpec】
-1. Agent：
-{"type":"agent","lane":"laneId","prompt":"明确职责和完成条件","systemInstructions":"可选的当前节点系统约束","context":{"sections":[<ContextSectionSpec>]},"inputs":{"name":<ValueExpression>},"outputSchema":<ShapeSpec>,"tools":["read_file","edit_file","write_file","grep","glob","bash"],"skills":["用户已配置的Skill"],"reads":["直接读取的workspace相对路径前缀"],"writes":["workspace相对路径前缀"],"maxAttempts":正整数,"budget":{"turns":正整数,"usd":正数,"wallTimeMs":正数},"lifetimeBudget":{"turns":正整数,"usd":正数,"elapsedMs":正数},"timerPolicy":{"allowHardPark":true,"maxDelayMs":正数,"maxParks":正整数},"publishes":[<ArtifactPublishSpec>],"description":"可选","timeoutMs":正数,"annotations":{"可选元数据":<JSON>}}
-- 需要语义判断时由 Agent 输出有名字的标量字段，供确定性边判断。
-- 使用 hard park 时必须是 persistent Lane，并完整提供 budget 三项、lifetimeBudget 三项、maxDelayMs 和 maxParks。
-- reads/writes 是不带 glob 的 workspace 相对文件或目录前缀，不能含空段、.、.. 或运行时保留目录。reads 声明原始文件依赖以便 Freeze 做可见性检查；writes 是硬写沙箱。shared_controlled 的 Node writes 必须是 Lane workspaceAccess.write 的子集且不能碰 deny。
-- 跨 Lane 不能用 raw workspace writes→reads 传递语义结果；必须 publication 到 record Plane并由 consumer 的精确 Data View context 读取，或把强相关节点放进同一 persistent Lane。不同 Lane writes 不能重叠，Agent writes 不能覆盖 Kernel materialize 文件。
-- systemInstructions 和 Lane agentProfile 是 Distill 可控的 system 段，不得重复或对抗 Kernel 路由/权限规则；稳定角色优先放 Lane，单节点约束才放 Node。
-- description 应填写简短、稳定、面向操作者的阶段名，不要复制整段 prompt。prompt 应明确要求最终 return_result.summary 用一句话说明本段完成了什么或为何停止；允许 timer 时也要要求 reason 明确说明等待条件。
-
-ContextSectionSpec：
-{"name":"节点内唯一名称","provider":"已注册id@版本","refresh":"activation_start|every_segment|continuation_only","config":<Provider专用JSON>,"required":true|false,"maxBytes":256..262144}
-- 每个 Agent 最多 32 个 section；name 必须符合普通 id 规则、节点内唯一且不能以 kernel_ 开头。Kernel 已自动注入 builtin/activation@1，禁止再手工声明 activation section。
-- maxBytes 省略时默认 32768；required 省略时等同 true。Provider 解析失败时 required=true 会使 Activation 失败；只有显式 required=false 才会继续，并把带 available=false/error 的有界 section 注入上下文作为可观测诊断。
-- 逻辑数据必须先定义 dataPlane 和精确 dataView，再用 builtin/data-plane-view@1、config={"view":"Data View id"} 选择；Freeze 会将其编译为 state/record/journal/workspace 的物理 Provider。
-- Lane dataAccess.read 必须授权该 View 所属 Plane；若 read grant 带 views，Node 只能选择其中的 View。
-- 不得直接输出 builtin/state/evidence-view/artifact-view/workspace-binding/journal-view；它们是 Freeze 生成的物理实现细节。
-- Activation Input 可显式使用 builtin/input@1，config 可省略或为 {"keys":["精确输入字段"]}；Clock 使用 builtin/clock@1 且无需 config；timer resume 数据使用 builtin/continuation@1、无需 config，通常 refresh=continuation_only。
-- 同一 Activation 跨 segment 必须固定的材料用 activation_start；需要看到等待期间新 Evidence/State/Clock 的材料用 every_segment。
-- 对非 builtin Provider，config 必须遵守能力目录展示的 config schema 或对应 Pack guidance；若目录和 guidance 都没有公开配置合同，不得猜字段，应改用有明确合同的 Provider、询问用户或在 taskSpec 列为部署能力缺口。
-
-DataPlaneSpec 使用四种固定 backend；planeId 和 semanticRole 可由当前任务任意定义，Kernel 不解释 semanticRole：
-1. State：{"backend":"state","semanticRole":"自定义语义","trust":"trusted_runtime","stateKeys":["已声明State"]}
-2. Record：{"backend":"record","semanticRole":"自定义语义","trust":"untrusted_data","recordKind":"evidence|artifact","schema":<ShapeSpec>,"mutability":"append_only|superseding","admission":"automatic|judge","retention":{"maxItems":1..100000}}
-3. Journal：{"backend":"journal","semanticRole":"自定义语义","trust":"untrusted_data","eventTypes":["activation_committed"]}
-4. Workspace：{"backend":"workspace","semanticRole":"自定义语义","trust":"untrusted_data","binding":<WorkspaceBindingSpec>}
-- State 只放确定性控制事实；Record 保存带 provenance 的事实/产物；Journal 是 Kernel 因果审计；Workspace 是输入源或可重建文件投影。
-- recordKind 只是固定物理行为：evidence 表示判断依据，artifact 表示工作产物。业务可以命名 metrics、hypotheses、candidate_models、violations 等任意 Plane。
-- trust 不能由 Distill 提权：state 必须 trusted_runtime，其余 backend 必须 untrusted_data。
-- append_only Plane 的 publication 不能 supersedes；superseding Plane 可以显式替代旧 Record。
-- Journal eventTypes 只能取：graph_created、activation_claimed、activation_released、activation_context_cached、activation_committed、graph_status_changed、external_event_recorded、external_event_consumed、paused_terminal_resumed。
-- 新的物理存储语义不能写进 JSON；只有部署端已加载、版本锁定的 Capability Pack/Runtime 能扩展能力目录，Distill 只能引用当次目录实际存在的能力。
-
-DataPlaneViewSpec：
-{"plane":"逻辑Plane id","description":"...","stateKeys":[...],"statuses":["proposed|admitted|rejected|superseded"],"eventTypes":[...],"maxItems":1..10000}
-- state View 只能选 Plane stateKeys 的子集；record View 可选 statuses/maxItems；journal View 可选 eventTypes/maxItems；workspace View 不带 selector，代表绑定文件本身。
-- 上述是四种 backend 的字段并集，不得把所有 selector 同时写进一个 View：state={plane,stateKeys}；record={plane,statuses,maxItems}；journal={plane,eventTypes,maxItems}；workspace={plane,description}。
-- Node Context 必须选择 View，不能直接读取整个 Plane。
-
-WorkspaceBindingSpec（仅嵌套在 workspace Data Plane）：
-{"plane":"input|state_projection|evidence|artifact|audit|observability","path":"安全的workspace相对路径","format":"json|jsonl|text|markdown","direction":"ingest|materialize|bidirectional","lane":"可选Lane","required":true|false,"appendOnly":true|false,"projection":{"kind":"data_view","view":"逻辑Data View","record":"content|envelope","flattenArrays":boolean},"initializeState":"graph_defaults|workspace_if_present|workspace_required"}
-- 文件名和目录完全由用户协议决定；没有文件协议就不要定义 workspace Plane。
-- input/observability 必须 direction=ingest 且不能带 projection；state_projection 必须 direction=materialize、format=json，并投影 state View；evidence/artifact/audit materialize 分别只能投影对应 record/journal View。
-- materialize/bidirectional 必须有 projection；纯 ingest 禁止 projection；appendOnly 只用于 jsonl；bidirectional 只支持 jsonl 并结构去重；flattenArrays=true 还要求 record=content。
-- lane 指定后位于该 Lane 选择的 workspace backend；不指定时位于项目 workspace。State initializeState 只允许项目级 State projection，并只在实例首次创建时载入。
-- binding.path 必须是无空段、无 . 或 .. 的 workspace 相对路径，首段不能是 .loop、.git、.meta-agent；同一项目/Lane workspace 内两个 binding 不能指向同一路径。
-- Lane dataAccess.write 只能授权属于该 Lane 的 workspace Plane；Lane 必须 lane_overlay 或 shared_controlled，且该 binding 必须是 observability ingest，或 direction=bidirectional，不能直接改 Kernel/input-owned materialize 文件。
-- Kernel 在 commit/recovery 后幂等重建 materialize 文件；除获得 Lane dataAccess.write 的 workspace Plane 外，绑定路径进入 Agent sandbox deny list。
-
-2. Function：
-{"type":"function","function":"已注册id@version","inputs":{"name":<ValueExpression>},"outputSchema":<ShapeSpec>,"publishes":[...]}
-Function 是已注册的纯确定性能力，不是模型临时生成的代码。只有目录中存在的 Function 才能使用。
-- Function Node 把 inputs 解析成命名对象后调用 provider；ValueExpression.call 则把 args 解析成位置数组后调用同一 provider。必须遵守能力目录的 input/output contract，不要假设两种调用形态等价。
-
-3. Effect：
-{"type":"effect","effect":"已注册id@version","inputs":{"name":<ValueExpression>},"idempotencyKey":<ValueExpression>,"timeoutMs":正数}
-Effect 用于外部副作用。必须有覆盖所有 poll continuation 的 timeoutMs；idempotencyKey 应解析为稳定字符串。目录没有 Effect 时不得生成 Effect Node。
-- idempotencyKey 省略时 Kernel 使用 instanceId+activationId 的稳定默认值；只有业务系统需要自己的去重键时才显式声明，不能使用每次变化的 $clock.now。
-- Kernel 在调用 provider 前写 Effect intent，并在 submit 返回后立即持久化 receipt；仍无法跨越外部系统与本地文件的原子边界，所以 Provider 必须真正按 idempotencyKey 去重。
-
-4. Wait：
-- Timer: {"type":"wait","wait":{"kind":"timer","delayMs":<ValueExpression>,"maxDelayMs":正数}}
-- Event: {"type":"wait","wait":{"kind":"event","event":"事件名","correlation":<ValueExpression>,"timeoutMs":正数}}
-Wait 会 durable park，不占用 LLM 进程。外部 Event 先写持久 inbox，早到不丢；Event 与 timeout 按发生时间 first-wins。
-
-5. Join：
-{"type":"join","mode":"all|any","expects":["明确的前驱 transition id"]}
-fan-out 会产生 fork epoch；Join 只收拢同一 epoch，Join(any) 的迟到分支不会二次触发。当前不支持 quorum。
-
-6. Terminal：
-{"type":"terminal","status":"done|failed|paused","result":<ValueExpression>}
-done/failed Terminal 无出边。paused Terminal 必须且只能提供 on=resume 的恢复边；loop resume 会沿该边幂等创建后续 Activation，不能把 paused 当作无续点的结束状态。不要用撞 maxActivations 代替优雅 terminal。
-
-【值、State 与确定性路由】
-ValueExpression 只能是三型之一：
-{"literal":<JSON>}
-{"ref":"$state.x 或 $input.x 或 $output.x 或 $clock.now"}
-{"call":"已注册Function@版本","args":[<ValueExpression>]}
-- 每个 ValueExpression 对象必须恰好包含 literal/ref/call 之一；call 额外允许 args，不能写裸 JSON、"$state.x" 字符串或同时写 ref+literal。
-- Entry inputs 只能依赖 state；节点执行输入通常依赖 state/input/clock；transition inputs、updates 和 publication 可以依赖本次 output。
-- ABI 可识别的 ref root 完整集合是 $state、$input、$output、$event、$effect、$clock、$artifacts、$evidence，但某个执行位置只能使用当时真实可用的 root。普通 Transition 当前可靠上下文为 state/input/output/clock；不要仅因 root 语法合法就引用该阶段未物化的数据。
-- 不允许 JS、shell、模板表达式、数组索引或 $output.0。数组控制信息先由已注册 Function 归约，或让 Agent 输出命名标量。
-- $state 只保存小型、类型化控制事实，例如 iteration、stale_count、status、deadline、当前候选 id；完整 findings、日志、报告和模型产物进入 workspace 文件或 Artifact/Evidence Plane。
-- State 只能在 transition updates 中经 Reducer 原子更新，Agent 不得被要求心算并充当权威路由器。
-
-TransitionSpec：
-{"id":"唯一id","from":"nodeId","on":"outcome","when":"受限条件DSL","default":true,"priority":数字,"updates":[{"target":"stateName","reducer":"id@version","args":[<ValueExpression>]}],"to":"nodeId|{node,inputs}|数组"}
-- on 缺省等于 success。执行器 outcome：Agent/Function/Effect 为 success|failure；Timer Wait 为 timer|failure；Event Wait 为 event|timeout|failure；Join 为 success。
-- on=always 只在没有 exact outcome 边时作为 fallback，不会和 exact 边同时竞争；不要用 always 掩盖需要区分的失败或超时语义。
-- 每个非 Terminal 必须覆盖其全部 outcome，或提供 on=always。Event 即使没有 timeout 也必须覆盖 failure。
-- 同一 from+on 中：若有 when，必须恰好有一个 default；条件边 priority 必须唯一，数字大者先判断。不要在 default 上写 priority/when。
-- when DSL 只支持布尔/数字/字符串字面量、圆括号、!、-、*、/、+、-、<、<=、>、>=、==、!=、&&、|| 和点路径。严格类型，不做字符串/数字强转。
-- when 中可选字段缺失只代表该条件不匹配并继续 default；其他类型错误 fail closed。
-- updates 发生在选中路由的同一原子 commit 中；阈值判断看到的是更新前 State。若“本次 +1 后达到阈值 N”，条件必须比较旧值 >= N-1。
-- to 数组是显式 fan-out，长度不得超过 limits.maxFanOut。并行分支不得共享同一个写 Lane。
-- 条件边/默认边的正确配对示例：
-  条件：{"id":"finish","from":"work","on":"success","when":"$output.complete == true","priority":100,"to":{"node":"done","inputs":{"result":{"ref":"$output"}}}}
-  默认：{"id":"continue","from":"work","on":"success","default":true,"updates":[{"target":"iteration","reducer":"builtin/increment@1"}],"to":"work"}
-  失败：{"id":"failed","from":"work","on":"failure","to":"failed"}
-
-ArtifactPublishSpec：
-{"plane":"已声明record Data Plane","on":"success|failure|always","value":<ValueExpression>,"status":"proposed|admitted","supersedes":<ValueExpression>,"tags":["..."]}
-- on 缺省为 success，失败输出不访问只存在于成功 schema 的字段；确需发布失败诊断时显式使用 on=failure。
-- Agent 所在 Lane 必须在 dataAccess.publish 授权该 Plane。Freeze 将 plane 编译为物理 Record channel；Kernel 只提交 channel。
-- automatic Plane 默认 admitted；judge Plane 默认 proposed。retention.maxItems 超限只拒绝 publication，不应被用作流程控制。
-
-【经当前 Validator 与 Freeze 真实校验的最小完整 source Graph】
-下例是 ABI 参考，不是领域拓扑模板。只复用它的字段嵌套、ValueExpression、outcome 覆盖和条件/default 成对方式；必须按当前用户需求自由设计 Node、Lane、State、Data Plane 和路由：
-${JSON.stringify(CANONICAL_GRAPH_DISTILL_EXAMPLE, null, 2)}
-
-【Lane 与图划分规则】
-- 同一业务生命周期、需要连续上下文、操作同一工作副本的步骤优先合并为一个 Agent Node，或放进同一 persistent Lane；不要为了复刻用户列出的阶段而制造上下文断裂。
-- 同一 persistent Lane 的 Agent Activation 串行；通常使用 shared_controlled 受控写根工作区，只有并行分支隔离、回滚或独立合并确有需要时才使用 lane_overlay；readonly 用于独立审查。fresh_per_activation 不保留长期语义上下文。
-- Lane dataAccess 是权限上限而非隐式注入：read 授权 Plane/可选 Views，publish 授权 record Plane，write 仅授权属于该 Lane 的 workspace Plane。Node Context/publication 必须是其子集。
-- Function/Wait/Join/Terminal 不需要 Lane。effect_only Lane 不能绑定 Agent。
-- 并行只用于真正独立且 writes 不相交的分支；需要隔离合并时使用不同 Lane overlay，普通受控根目录写可用 shared_controlled，审查分支用 readonly Lane，随后显式 Join。
-- Kernel 不提供业务资源锁。账号池、Gradmotion 抢占、Git publish 等由用户给 Agent 配置工具/Skill，或由 Capability Pack 注册 Effect；Distill 不得伪造锁和 provider。
-
-【预算、恢复和退出】
-- limits.maxActivations 必填，所有 cycle 必须同时有基于 State/语义的优雅退出边；上限只是保险丝。
-- 长图建议设置 maxWallTimeMs、maxCostUsd、maxFanOut、maxPendingTimers；每个 Agent 设置 maxAttempts 和 segment budget。
-- hard-park Agent 还必须设置 lifetimeBudget 和 maxParks；等待不能重置费用、轮次或 elapsed budget。
-- Effect 必须有 timeoutMs；Event 若业务允许超时必须显式 timeoutMs 和 timeout 路由。
-- Lane terminal merge 冲突会 pause，运维通过 loop lane-repair 恢复。不要在图中虚构 merge conflict 处理 Node。
-
-【当前实际能力目录】
-Functions：
-${functions.map(item => `- ${item}`).join('\n') || '- (none)'}
-
-Reducers：
-${reducers.map(item => `- ${item}`).join('\n') || '- (none)'}
-
-Effects：
-${effects.map(item => `- ${item}`).join('\n') || '- (none；不得生成 effect 节点)'}
-
-Capability Packs：
-${packs.map(item => `- ${item}`).join('\n') || '- (none)'}
-
-Context Providers：
-${contextProviders.map(item => `- ${item}`).join('\n') || '- (none)'}
-
-Scenario Guidance（可选灵感与约束，不是模板）：
-${scenarioGuidance.map(item => `- ${item}`).join('\n') || '- (none；直接从用户场景自由编译)'}
-
-内置 Reducer 的参数个数/语义：set 恰好 1 个 newValue；add/subtract/min/max 各 1 个 number；increment/decrement 可 0 个（默认 1）或 1 个 number；toggle 0 个；bounded-append 2 个(value,nonNegativeIntegerLimit)；set-union/remove 各 1 个 value-or-array；ema 2 个(next,alphaIn0To1)；object-merge 1 个 object。必须使用目录中的完整 id@version。
-
-【编译决策顺序】
-1. 提取目标、成功标准、外部系统、人工事件、公共产物和硬边界。
-2. 识别业务生命周期：先决定哪些工作必须属于同一个长 Activation/Lane，再画控制节点；不要先按用户标题逐项建 Node。
-3. 把计数、阈值、状态机和时间边界下沉到 State/Reducer/Transition/Wait；把语义判断放到带 outputSchema 的 Agent；把已注册确定计算放到 Function。
-4. 为公共数据定义任务专属的逻辑 dataPlanes/dataViews，并给 Lane dataAccess 最小授权。State/Record/Journal 文件投影用 workspace Data Plane；需要自定义转换或外部副作用但目录没有对应 Function/Effect 时，不得冒充能力。
-5. 设计 success/failure/timeout、结构性 pivot、目标完成和不可恢复退出，确保所有节点可达、所有 cycle 有优雅出口。
-6. 为共享知识设计有界 record Plane 和精确 Data View；逐个 Agent 用 builtin/data-plane-view@1 声明实际 View、刷新生命周期和字节上限，不要把大文本塞进 State。
-7. 若用户声明文件协议，逐个文件决定 canonical plane 和方向：控制状态由 State 投影，证据/产物先 publication 再由 View 投影，审计由 Journal 投影，纯输入/工作日志只 ingest。不要让 Agent 与 Kernel 双写 materialize 文件。
-8. 为 Lane/Node 编写最小必要 systemInstructions；稳定身份放 Lane，当前任务仍放 prompt，数据只放 context section。
-9. 为每个 Node 编写简短 description 作为 scheduler 阶段名；确保 Agent 的结束摘要和 timer 等待原因能让操作者脱离工具调用日志理解进度。
-10. 为每个 Agent、整图、timer/effect/event 设置现实 bounds。
-
-【输出前必须自检】
-- 只含 graph-1.0 ABI 字段，没有旧机制字段或未注册能力；
-- 所有 id 合法且唯一，引用的 node/state/plane/view/transition/capability 存在且带版本；
-- state.initial 满足 ShapeSpec；所有 entry 和 Node 从至少一个 entrypoint 可达；
-- done/failed Terminal 无出边；paused Terminal 只有完备 resume 边；每个其他 Node 的所有 outcome 都有路由；条件组 default/priority 完备；
-- 所有循环既受 maxActivations 约束又有业务 terminal；threshold 使用更新前 State 正确换算；
-- 写 Agent 明确 reads/writes；默认按需使用 shared_controlled，只有强隔离需求使用 lane_overlay；独立审查 readonly，persistent Lane maxConcurrency=1；
-- 每个逻辑 Plane 可编译到固定 backend；schema/trust/admission/retention/mutability 合法；每个 View selector 与 backend 匹配；
-- 每个 Agent 的精确 Data View/publication 都在 Lane dataAccess 上限内；Context Provider 已注册且带版本；refresh 与任务生命周期一致；
-- workspace Data Plane 路径安全且 direction/projection 匹配；未臆造用户未要求的文件；materialize 文件没有同时要求 Agent 手工写；
-- 每条 producer→consumer 数据链都可见：同 Lane 原始文件依赖已声明 reads/writes；跨 Lane 语义数据通过 publication/Data View；不同 Lane writes 和 Kernel projection 不重叠；
-- systemInstructions 只承载角色/约束，未把 Evidence 等不可信数据拼成 system 指令；
-- 每个 Node 都有清晰简短的 description；Agent prompt 明确要求一句话结束摘要，timer 等待条件可被一句话说明；
-- hard-park Agent 的 segment/lifetime/timer bounds 齐全；Effect timeout 和 Event timeout 路由齐全；
-- 数组没有直接参与 when；大产物没有进入 State；fan-out 不产生并发写冲突；
-- taskSpec 明确列出：阶段合并/Lane 决策、阈值换算、workspace binding 的 canonical owner、默认能力无法保证的外部命令或自定义文件转换、所需用户工具/Skill/Pack、预算假设和运行前审阅点。`
+输出前只检查：goal 完全一致；intent 非空；六个列表字段都是字符串数组；没有 node/lane/route/terminal ID 或引用关系。`
 }
 
+/** @deprecated Use buildLoopArchitectSystem for Architect and
+ * buildGraphDistillerSystem for Compiler. */
+export function buildLayeredGraphDistillerSystem(_catalog: GraphRuntimeCatalog): string {
+  return buildLoopArchitectSystem()
+}
+
+export function buildGraphDistillerSystem(_catalog: GraphRuntimeCatalog): string {
+  return `你是 durable-graph-v2 的前台 Distill Compiler。你只负责把已确认的 Constraint Ledger 与简明 Loop Blueprint lower 为最终 LoopGraphSpec；不要执行用户任务，也不要创造第二套中间图 DSL。
+
+【输出】
+最终只输出一个 JSON 对象：
+{"graph":<完整 LoopGraphSpec>,"traceability":{"schemaVersion":"${GRAPH_TRACEABILITY_SCHEMA}","mappings":[{"constraintId":"C1","graphRefs":["/nodes/example"],"rationale":"如何满足约束"}]},"preconditions":{"schemaVersion":"${LOOP_PRECONDITIONS_SCHEMA}","items":[{"kind":"file|directory|command|credential|decision","target":"路径/命令/凭据/决策id","reason":"为何必须在启动前就绪","blocking":true}]},"taskSpec":"供人审阅的关键 lowering 决策、假设、能力缺口和运行前配置"}
+不要输出 Markdown fence、解释前缀、patch 或 Freeze-owned 字段。
+
+preconditions 是机器可校验的启动合同：列出 loop 自身不会创建、但首个 Activation 就依赖的文件与目录（例如需求方要先写好的 spec 文件）、必须已安装的外部 CLI、必须已配置的凭据，以及 Ledger 中所有 unresolved 或被默认代答的决策。loop create 会机械校验 file/directory 是否存在，并在 blocking 决策未确认时拒绝启动。由 loop 首轮自建的文件不要列入。没有前置条件时输出 {"schemaVersion":"${LOOP_PRECONDITIONS_SCHEMA}","items":[]}。
+
+【工作方式】
+1. Constraint Ledger 是权威来源合同；Blueprint 只描述 Workspace、Lane、Control 意图，不预设拓扑。你可以自由选择最小充分的 Node、Lane、State 和 Transition。
+2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
+3. 不要凭记忆猜 ABI。按需调用 graph_reference(section)：overview、nodes、workspace、lanes、control、capabilities、example。
+4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 两个终态”开始，只添加 Ledger 明确要求的边界。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。只有注册 Function 能完整执行的纯计算、独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
+5. 生成完整候选后必须调用 graph_validate，并同时传入 graph、constraints、traceability。根据返回的精确错误在当前 Compiler turn 内修复并再次验证；只有 valid=true 且 frozen=true 后才返回最终 JSON。graph_validate 直接验证最终 LoopGraphSpec，不是新的 IR。
+
+【稳定语义边界】
+- Agent 直接读写真实项目 Workspace。Lane.workspace 声明 read、write、deny；write mode 只有 owned、atomic_replace、append_only。Kernel 不复制、不投影、不保存第二份用户数据。
+- Lane 是连续会话、串行化和 Workspace 所有权边界，不是业务步骤，也不创建 worktree。Node 继承 Lane 的 Workspace 合同；不同 Lane 的写路径不能重叠。
+- 控制层使用 Agent、Function、Effect、Wait、Join、Terminal 和确定性 Transition。State 只存小型路由事实，并只通过注册 Reducer 在 commit 中更新。
+- $input 引用是严格的：节点 inputs、effect idempotencyKey、wait delayMs/correlation、terminal result 中的每个 $input.x，必须被指向该节点的所有 Transition target inputs 与所有 entrypoint 绑定，缺一条边运行时该 Activation 就地失败。只在部分路径存在的可选值，必须在其余每条入边与 entrypoint 上显式绑定 {"literal": null}。只有 when 条件对缺失引用宽松（视为不匹配）；ValueExpression ref 从不宽松。graph_validate 会机械拒绝任何供给缺口。
+- entrypoint inputs 只能引用 $state 或 literal——实例创建时 $input/$output 尚不存在。
+- builtin/identity@1 返回完整的 inputs 记录（不是解包后的单值）：identity 节点 inputs 为 {value:...} 时，下游必须用 $output.value 取值，用 $output 只会拿到嵌套对象。
+- 不要用 sleep、bash sleep 或轮询空转来模拟等待——它们烧掉段预算且不可恢复。Kernel 等待一律用 wait 节点（timer/event）或 Agent timer hard-park。
+- Kernel 默认拒绝项目根 .git 的一切写入：普通 Lane 的 Agent 无法在项目根执行 git commit/push。需求确实要求提交/推送项目仓库时，必须在恰好一个 Lane 上声明 scm:'git'（.git 可写但 hooks/config 仍受保护，该 Lane 需至少一条 write 规则），并在 taskSpec 里说明来源依据；或改用嵌套 clone 惯用法——在 owned 写前缀下维护独立仓库（其内部 .git 不受根保护影响）。不要给 Agent 写"git push"指令却不提供这两种能力之一。
+- 项目外没有任何可写位置：sandbox 对项目根以外的一切路径拒写，"运行时再寻找项目外工作树"的设计必然失败。需求要编辑的外部资源（含其他仓库的 work tree）必须 clone/放置到项目内某个 owned 写前缀，路径在图中固定，并作为 blocking directory precondition 声明。Agent prompt 中禁止出现绝对路径或 ~ 路径作为写目标。
+- when 路由优先引用原始事实字段（计数、三态枚举），把确定性规则留在图里；Agent 预折叠的布尔（is_*/should_* 等）只在无法用原始字段表达时使用，且原始字段仍须保留在 outputSchema 中供存档。
+- Function Node 不是“确定性”标签或占位符：只有 graph_reference(capabilities) 中某个注册 Function 的真实行为恰好完成该计算时才能创建；否则用 when + Reducer 表达小型确定性路由，复杂领域判断留在 Agent 输出中。
+- 确定性阈值、计数和时间规则不得让 Agent 心算；when 读取更新前 State。每个非终态 outcome 必须全覆盖，每个循环同时有业务终态和 limits.maxActivations 保险丝。
+- Agent 使用 graph_agent；Graph 不选择 agentic/auto mode。长 Activation 可以 timer hard park，但必须有 persistent Lane、segment/lifetime/timer bounds。
+- 只引用 graph_reference(capabilities) 返回的 Agent Tool、Function、Reducer、Effect 和 Pack。缺能力时在 taskSpec 明确列出，不能伪造。
+- outputSchema 只需闭合被路由、更新或传递引用的字段；开放探索正文不必过度 schema 化。
+- annotations 可保存非执行领域元数据；不得把领域偏好伪装成 Kernel 语义。
+- graph_reference(capabilities) 返回的是 Create 与 Runtime 共用的唯一 graph_agent Tool Catalog；不要加入当前 Compiler 会话有、运行时没有的工具。
+- Agent 运行时不会自动收到 Graph annotations。Agent 需要的值必须写入 node.prompt/systemInstructions/inputs，或位于 Lane 可读的项目文件中。hard constraint 的 traceability 至少指向一个可执行 Node/Lane/Transition/Limit，不能只指向 annotations。
+- 输出前逐个 Agent 对照 prompt 与 Lane.workspace：prompt 中每个声明写入的文件都必须被该 Lane 的 write rule 覆盖，append/replace 模式一致。
+- 保留来源的确定性语义类别，不要把“变差”压成“未改善”，也不要用布尔反转代替三态事实。需要区分时让评估 Agent 输出 worsened/unchanged/improved 或等价的无歧义字段。
+- 若最终文件只允许保存评估通过、真正新增或已批准的数据，生产 Agent 先输出候选数据，评估后由单一 writer 提交；不要在评估前写入最终 append-only 文件。
+
+【Traceability 与完成标准】
+- 每个 hard constraint 恰有一条 mapping，graphRefs 必须指向最终 Graph 中真实存在的 JSON pointer。
+- taskSpec 重点解释：Lane/节点合并选择、确定性真值与阈值、Workspace 路径与 owner、外部能力缺口、预算和人工审查点。
+- 验证标准是可执行、安全、可恢复和来源语义完整；不得因为节点数量、名称、Research/Release/Compliance 风格或未采用示例拓扑而自我否决。`
+}
+
+/** Kept temporarily as an internal reference while graph_reference provides
+ * the focused executable contract to the model on demand. */
 export function parseGraphDistillOutput(output: unknown, summary?: string): { graph: LoopGraphSpec; taskSpec: string } | null {
   const candidates: unknown[] = [output]
   if (typeof output === 'string') candidates.push(tryJson(output), ...extractJsonObjects(output))
@@ -624,6 +766,178 @@ export function parseGraphDistillOutput(output: unknown, summary?: string): { gr
     }
   }
   return null
+}
+
+export function parseArchitectOutput(output: unknown, summary?: string): { constraints: LoopConstraintLedger; design: LoopBlueprint } | null {
+  for (const candidate of structuredCandidates(output, summary)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const object = candidate as Record<string, unknown>
+    if (!object.constraints || typeof object.constraints !== 'object' || Array.isArray(object.constraints)) continue
+    if (!object.design || typeof object.design !== 'object' || Array.isArray(object.design)) continue
+    return {
+      constraints: object.constraints as LoopConstraintLedger,
+      design: object.design as LoopBlueprint,
+    }
+  }
+  return null
+}
+
+export function parseGraphCompilerOutput(output: unknown, summary?: string): {
+  graph: LoopGraphSpec
+  traceability: GraphTraceabilityMap
+  taskSpec: string
+  preconditions?: LoopPreconditions
+} | null {
+  for (const candidate of structuredCandidates(output, summary)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const object = candidate as Record<string, unknown>
+    if (!object.graph || typeof object.graph !== 'object' || Array.isArray(object.graph)) continue
+    if (!object.traceability || typeof object.traceability !== 'object' || Array.isArray(object.traceability)) continue
+    return {
+      graph: object.graph as LoopGraphSpec,
+      traceability: object.traceability as GraphTraceabilityMap,
+      taskSpec: typeof object.taskSpec === 'string' ? object.taskSpec : '',
+      ...(object.preconditions && typeof object.preconditions === 'object' && !Array.isArray(object.preconditions)
+        ? { preconditions: object.preconditions as LoopPreconditions }
+        : {}),
+    }
+  }
+  return null
+}
+
+/** Every Architect unresolved item is a launch decision by definition: it was
+ * a question that would have changed the design and never got answered. Merge
+ * them into the machine-checkable preconditions so `loop create` surfaces them
+ * instead of silently accepting whatever default the pipeline took. */
+export function mergeUnresolvedIntoPreconditions(preconditions: LoopPreconditions, ledger: LoopConstraintLedger): LoopPreconditions {
+  const items = [...(Array.isArray(preconditions.items) ? preconditions.items : [])]
+  const seen = new Set(items.filter(item => item?.kind === 'decision').map(item => item.target))
+  for (const unresolved of ledger.unresolved ?? []) {
+    if (!unresolved?.id || seen.has(unresolved.id)) continue
+    items.push({
+      kind: 'decision',
+      target: unresolved.id,
+      reason: `未决决策（需人工确认）：${unresolved.question}${unresolved.affects?.length ? `（影响：${unresolved.affects.join(', ')}）` : ''}`,
+      blocking: true,
+    })
+    seen.add(unresolved.id)
+  }
+  return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items }
+}
+
+export function parseLayeredSemanticReview(output: unknown, summary?: string): LayeredSemanticReview | null {
+  for (const candidate of structuredCandidates(output, summary)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const object = candidate as Record<string, unknown>
+    if (object.schemaVersion !== SEMANTIC_REVIEW_SCHEMA || typeof object.accepted !== 'boolean') continue
+    if (!object.layers || typeof object.layers !== 'object' || Array.isArray(object.layers)) continue
+    const layers = object.layers as Record<string, unknown>
+    if (Object.keys(layers).length !== SEMANTIC_REVIEW_LAYERS.length || Object.keys(layers).some(name => !SEMANTIC_REVIEW_LAYERS.includes(name as typeof SEMANTIC_REVIEW_LAYERS[number]))) continue
+    const rootIssues = stringArray(object.issues)
+    if (!rootIssues) continue
+    const warnings = object.warnings === undefined ? [] : stringArray(object.warnings)
+    if (!warnings) continue
+    let invalid = false
+    let failed = false
+    let layerIssueCount = 0
+    for (const name of SEMANTIC_REVIEW_LAYERS) {
+      const rawLayer = layers[name]
+      if (!rawLayer || typeof rawLayer !== 'object' || Array.isArray(rawLayer)) { invalid = true; break }
+      const layer = rawLayer as Record<string, unknown>
+      if (!['pass', 'fail', 'not_applicable'].includes(String(layer.status))) { invalid = true; break }
+      const issues = stringArray(layer.issues)
+      if (!issues || !Array.isArray(layer.evidence) || !layer.evidence.length) { invalid = true; break }
+      if (layer.status === 'fail' && !issues.length || layer.status !== 'fail' && issues.length) { invalid = true; break }
+      layerIssueCount += issues.length
+      failed ||= layer.status === 'fail'
+      for (const rawEvidence of layer.evidence) {
+        if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) { invalid = true; break }
+        const evidence = rawEvidence as Record<string, unknown>
+        const sourceRefs = stringArray(evidence.sourceRefs)
+        const designRefs = stringArray(evidence.designRefs)
+        const graphRefs = stringArray(evidence.graphRefs)
+        if (!sourceRefs || !designRefs || !graphRefs || typeof evidence.statement !== 'string' || !evidence.statement.trim()
+          || layer.status !== 'not_applicable' && (!sourceRefs.length || !designRefs.length && !graphRefs.length)) { invalid = true; break }
+      }
+      if (invalid) break
+    }
+    if (invalid) continue
+    // The semantic reviewer is an acceptance gate, not a design-advice stage.
+    // A previous reviewer reported concrete hard-contract discrepancies as
+    // "warnings" and still accepted the graph. Make that state unrepresentable:
+    // any discovered discrepancy must be repaired before Distill can finish.
+    if (warnings.length) continue
+    if (object.accepted && (failed || rootIssues.length || layerIssueCount)) continue
+    if (!object.accepted && (!failed || !rootIssues.length)) continue
+    return object as unknown as LayeredSemanticReview
+  }
+  return null
+}
+
+function structuredCandidates(output: unknown, summary?: string): unknown[] {
+  const candidates: unknown[] = [output]
+  if (typeof output === 'string') candidates.push(tryJson(output), ...extractJsonObjects(output))
+  if (summary) candidates.push(tryJson(summary), ...extractJsonObjects(summary))
+  return candidates
+}
+
+function skippedSemanticReview(): LayeredSemanticReview {
+  return {
+    schemaVersion: SEMANTIC_REVIEW_SCHEMA,
+    accepted: true,
+    layers: Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
+      status: 'not_applicable',
+      evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: 'Independent semantic review was explicitly disabled by the caller.' }],
+      issues: [],
+    }])) as unknown as LayeredSemanticReview['layers'],
+    issues: [],
+    warnings: [],
+  }
+}
+
+function rejectedSemanticReview(issue: string): LayeredSemanticReview {
+  const review = skippedSemanticReview()
+  review.accepted = false
+  review.layers.capability_resolution = {
+    status: 'fail', evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: issue }], issues: [issue],
+  }
+  review.issues = [issue]
+  review.warnings = []
+  return review
+}
+
+function stringArray(value: unknown): string[] | null {
+  return Array.isArray(value) && value.every(item => typeof item === 'string') ? value as string[] : null
+}
+
+function abortReason(signal: AbortSignal): string {
+  return signal.reason instanceof Error ? signal.reason.message : String(signal.reason ?? 'cancelled')
+}
+
+function throwIfDistillAborted(signal: AbortSignal, phase: GraphDistillPhase): void {
+  if (signal.aborted) throw new DistillInterruptedError(phase, abortReason(signal))
+}
+
+function loopBlueprintShapeExample(): unknown {
+  return {
+    constraints: {
+      schemaVersion: LOOP_CONSTRAINTS_SCHEMA,
+      goal: 'source-derived goal',
+      constraints: [{ id: 'C1', kind: 'goal', statement: 'source-derived hard constraint', strength: 'hard', sources: [{ path: 'requirement entry', locator: 'section or line' }], acceptance: ['observable acceptance condition'] }],
+      unresolved: [],
+    },
+    design: {
+      schemaVersion: LOOP_DESIGN_SCHEMA,
+      goal: 'source-derived goal',
+      intent: 'Describe the bounded loop without choosing executable topology.',
+      successCriteria: ['State the observable completion condition.'],
+      workspace: ['Describe direct workspace reads, writes, file modes, and ownership.'],
+      lanes: ['Describe which work needs one continuous conversation, serialization, or separate permissions.'],
+      control: ['Describe deterministic decisions, waits, failures, bounds, and terminal obligations.'],
+      assumptions: [],
+      capabilityGaps: [],
+    },
+  }
 }
 
 function extractJsonObjects(source: string): unknown[] {
@@ -652,15 +966,4 @@ function extractJsonObjects(source: string): unknown[] {
 
 function tryJson(value: string): unknown {
   try { return JSON.parse(value.trim()) } catch { return null }
-}
-
-function formatCapability(
-  manifest: { id: string; version: string; description?: string; inputSchema?: unknown; outputSchema?: unknown },
-  fallback: string,
-): string {
-  return [
-    `${manifest.id}@${manifest.version} — ${manifest.description ?? fallback}`,
-    ...(manifest.inputSchema ? [`input=${JSON.stringify(manifest.inputSchema)}`] : []),
-    ...(manifest.outputSchema ? [`output=${JSON.stringify(manifest.outputSchema)}`] : []),
-  ].join(' ')
 }

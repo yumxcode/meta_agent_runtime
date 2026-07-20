@@ -2,14 +2,14 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.7.1` · Node.js `>= 18`
+> 当前版本:`0.7.6` · Node.js `>= 18`
 
 ---
 
 ## 特性概览
 
 - **五种会话模式**:`agentic`(通用工具循环)、`auto`(无人值守自治 + 工作区监狱)、`simple_auto`(轻量无人值守:沿用 auto 监狱但去掉 checkpoint/drift/verify,面向简单短任务)、`campaign`(DOE/多目标优化)、`robotics`(机器人开发)。模式只会显式选择，未指定时为 `agentic`。
-- **长周期 Loop 运行时**:`meta-agent loop ...` 将自然语言需求自由编译为受约束图，再做保守静态校验与独立语义审阅；提供确定性路由、持久 Lane、自定义 Data Plane、Artifact/Evidence、timer/event、可恢复 paused 节点、Effect outbox、恢复与单机并发。安全边界由 Kernel 固定，领域节点和拓扑由 LLM 自由生成。
+- **长周期 Loop 运行时**:`meta-agent loop ...` 将自然语言需求编译为 `graph-2.0`，再做静态校验与独立语义审阅；提供确定性路由、持久 Lane、直接 Workspace、timer/event、可恢复 paused 节点、Effect outbox、崩溃恢复与单机并发。安全边界由 Kernel 固定，领域节点和拓扑由 LLM 自由生成。
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
@@ -196,23 +196,13 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 ### 长周期 Loop 运行时
 
-跨阶段、多 Agent 的长周期任务使用 `meta-agent loop distill|create|tick|list|inspect|timeline|files|disk|pause|resume|event|archive|gc`。Loop 只有一个执行模型：`durable-graph-v1`。自然语言由 Distill 编译为受约束 `LoopGraphSpec`，Freeze 校验并锁定能力版本，Kernel 只解释冻结图，不执行模型生成的代码。
+跨阶段长任务使用唯一执行模型 `durable-graph-v2`。它只有三类核心概念：Graph 控制流、Execution Lane、真实项目 Workspace。Agent 直接读写 Workspace；Kernel 只保存路由 State、Activation journal、timer/event 和能力锁，不维护用户数据的副本，也不创建 Lane worktree。
 
-`loop distill` 的 Compiler 与独立 semantic reviewer 直接复用 agentic 底座和同一套流式终端 UI：模型文本、thinking meter、工具调用/结果、重试与费用都可见，但不创建 `subtask-*` 或子 Agent sandbox。宿主只把“用户的 Loop 需求文件”和 `-w` 指定的项目地址交给 Compiler，不预读或注入需求正文；Compiler 必须自行用 `read_file` 读取需求，并按设计依赖用 `glob/grep/read_file` 最小化检查项目结构、已有状态和进展。TTY 下首次生成、验证并落盘后会保留 Compiler 会话；用户检查文件，有问题就直接输入补充或纠正，每个后续 turn 都生成完整新草图并通过同一验证链后才覆盖文件，完成时直接 `/exit`。Distill 没有 `answer/revise` 审阅协议或额外的接受状态；编译中缺少关键条件时，Compiler 可用 `ask_user` 当场请求选择或补充。脚本可加 `--non-interactive`。Graph 执行阶段仍由专用 `graph_agent` 负责。
+Lane 负责连续会话、串行化和写路径所有权。`workspace.read` 声明输入路径，`workspace.write` 的通用模式只有 `owned | atomic_replace | append_only`，`workspace.deny` 始终优先；Freeze 会拒绝不同 Lane 的重叠写路径。`write_file` 使用原子替换，`append_file` 提供串行追加。强相关的长生命周期工作放在一个 persistent Lane/Agent Activation 中，timer hard park 后仍以同一 Activation 和会话继续。
 
-`durable-graph-v1` 的核心是“Kernel 可靠执行 Distill 生成的任意受约束图节点和边”：Graph Node 只表达控制语义；强相关 Agent Node 共享持久 Execution Lane/session，Lane 与 Workspace backend 解耦；`$state`、Reducer、Function、路由、timer/event、Artifact/Evidence、Activation journal 与恢复都由程序控制。Agent Node 统一通过专用 `graph_agent` SPI 执行；当前适配器复用 Meta-Agent KernelLoop 的工具循环、session resume 与上下文压缩，但不启用 Auto 的第二层编排。Graph Kernel 不再依赖具体 Agent 底座。
+`loop distill` 是可见的前台 Agentic 编译会话：Architect 读取需求与必要项目文件，生成 Constraint Ledger 和简明 Blueprint（Workspace、Lanes、Control）；Compiler 通过 `graph_reference` 获取精确 `graph-2.0` ABI，生成完整图并调用 `graph_validate`；独立 Reviewer 再对原始需求、Agent prompt 中的直接读写、Workspace ownership、Lane、控制闭环和能力可用性做语义核验。Distill、Create 和 Runtime 使用同一个 `graph_agent` Tool Catalog，Freeze 锁定图实际引用的工具；Reviewer 发现任何合同差异都会拒绝，不允许以 warning 通过。Distill prompt、Validator、Freeze 和 Runtime 共用同一 ABI，不接受旧字段或隐式兼容。
 
-Agent Node 可声明有序 Context Assembly Plan，通过版本化 Context Provider 精确选择 State、Input、命名 Evidence/Artifact View、Clock 和 continuation 数据，并选择 `activation_start`、`every_segment` 或 `continuation_only` 刷新策略。每个 prompt section 都携带来源、trust、provider integrity 和截断元数据；Lane/Node 可声明受限 systemInstructions，但不能覆盖 Kernel protected prompt。Runtime 不再向所有 Agent 隐式注入全局 Evidence。
-
-Distill 可声明任务专属的逻辑 `dataPlanes/dataViews`、Lane `dataAccess` 上限、Node 精确 Context View 与 publication。Freeze 把这些声明编译到固定的 State/Record/Journal/Workspace backend，校验 schema、trust、admission、retention 和 ACL，并锁定最终 Provider/Capability integrity；Kernel 不理解 Research/Release/Compliance 或 `semanticRole`，只执行冻结后的物理语义。真正新增存储执行语义必须由受信任、版本化 Capability Pack/Runtime 扩展，LLM 不能在图中临时生成代码。
-
-Lane 的 workspace 可选 `readonly | shared_controlled | lane_overlay | effect_only`。`shared_controlled` 不创建 worktree，直接复用项目根，但 Node `writes` 必须落在 Lane `workspaceAccess.write` 上限内且避开 `deny`；未声明 writes 即无写权限。只有需要并行隔离、回滚或独立 merge 时才使用 `lane_overlay`。Freeze 拒绝不同 Lane 的重叠写路径、跨 Lane 原始文件 producer→consumer，以及 Agent 对 Kernel projection 的双写；跨 Lane 语义结果使用 publication/Data View，或把强相关节点放回同一 persistent Lane。
-
-用户要求的任意目录/文件协议可由逻辑 `workspace` Data Plane 映射为 Input、State projection、Evidence、Artifact、Audit 或 Observability。Kernel 不预设 `progress.json`、`findings.jsonl` 等领域文件；未声明 Plane 的 Loop 行为不变。State/Record/Journal 物化文件可在 commit 后或恢复时幂等重建；Distill 节点使用 `builtin/data-plane-view@1` 选择逻辑 View，物理 workspace/evidence/artifact Provider 由 Freeze 生成。
-
-对训练、远端实验等紧密耦合的长生命周期，不应机械拆成 `submit/wait/inspect` 多个 Agent：用一个 persistent Lane 上的 Agent Activation 执行完整生命周期，Agent 可反复调用 timer hard park；恢复时 Activation ID 与 Lane lineage 不变，仅 `continuationVersion` 和执行段计数推进。GraphSpec 需同时声明单段 `budget`、完整 Activation 的 `lifetimeBudget` 以及 `timerPolicy.maxDelayMs/maxParks`。具体配置见下方运行指南。
-
-`loop-scheduler` 默认输出低噪声的阶段级进度：Node 开始/恢复、执行段结束的一句话原因、retry/replay，以及 timer/event 挂起的等待原因和目标时间；不会打印 Agent 的具体工具调用。Agent 的 `return_result.summary` 与 timer `reason` 会写入 Activation，`loop inspect` 可随时查看当前阶段、等待原因和最近结果。
+Node 默认使用 `Agent | Wait | Terminal`；只有真实需要纯函数、幂等外部操作或并发汇合时才添加 `Function | Effect | Join`。`$state`、Reducer 和 `when` 提供确定性计数/阈值路由，开放领域判断仍交给 Agent。Kernel 支持 crash recovery、timer、早到 event inbox、event timeout 和 `source + deliveryId` 幂等去重。
 
 快速开始：
 
@@ -227,7 +217,7 @@ meta-agent -w /path/to/workspace loop files <instanceId>
 meta-agent -w /path/to/workspace loop disk <instanceId>
 ```
 
-机制、GraphSpec 示例、Capability Pack 插件、可靠性边界和完整命令见 [通用长周期 Loop 机制与使用指南](docs/loop-runtime-guide.md)；Agent 执行边界见 [`graph_agent` 执行底座](docs/graph-agent-executor.md)；实现对应的架构决策见 [Durable Graph Loop Runtime 设计与实现](docs/loop-durable-graph-runtime-plan.md)。领域扩展统一通过 Capability Pack 提供 Function、Reducer、Effect、Context Provider 与 advisory Scenario guidance，不再存在独立 Scenario 执行器；Graph preset 属于后续 ABI。
+完整命令和 GraphSpec 示例见 [Loop 使用指南](docs/loop-runtime-guide.md)；执行边界见 [`graph_agent` 执行底座](docs/graph-agent-executor.md)；架构与可靠性边界见 [Durable Graph v2 设计](docs/loop-durable-graph-runtime-plan.md)。领域扩展通过 Capability Pack 提供版本化 Function、Reducer、Effect 和 advisory Scenario guidance。
 
 ---
 
@@ -478,4 +468,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.7.1`。
+当前包版本:`0.7.6`。

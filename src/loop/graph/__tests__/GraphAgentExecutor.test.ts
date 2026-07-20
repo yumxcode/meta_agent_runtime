@@ -36,7 +36,7 @@ function completedRecord(config: SubAgentRecord['config']): SubAgentRecord {
 describe('graph_agent execution boundary', () => {
   it('owns a protected system prompt and a sectioned user prompt', () => {
     const user = buildGraphAgentUserPrompt({
-      contextSections: ['<prompt_section>{}</prompt_section>'],
+      workspace: { read: ['requirements.md'], write: [], deny: ['.git'] },
       instruction: 'Perform this activation.',
       outputSchema: { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } },
     })
@@ -45,6 +45,7 @@ describe('graph_agent execution boundary', () => {
     expect(GRAPH_AGENT_SYSTEM_PROMPT).toContain('being awaited')
     expect(buildGraphAgentSystemPrompt({ laneInstructions: 'Maintain continuity.' })).toContain('graph_authored_system_instructions')
     expect(user).toContain('"name": "activation_instruction"')
+    expect(user).toContain('"name": "lane_workspace_contract"')
     expect(user).toContain('"role": "contract"')
     expect(user).toContain('"role": "invariant"')
     expect(user).toContain('"trust": "trusted_graph"')

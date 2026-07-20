@@ -147,7 +147,14 @@ export interface ToolCallContext {
   jobManager?: import('../jobs/JobManager.js').JobManager
   vvChain?: import('../validation/VVHookChain.js').VVHookChain
   provenanceTracker?: import('../provenance/ProvenanceTracker.js').ProvenanceTracker
-  askUser?: (question: string, options: string[]) => Promise<string>
+  /**
+   * Interactive user prompt. Implementations MUST honor `signal`: when it
+   * aborts (per-tool timeout or session interrupt), cancel the pending
+   * terminal question and reject. A prompt left registered on a shared
+   * readline after timeout becomes a "zombie": it swallows the next line the
+   * user types and shadows later prompts (observed after Distill completion).
+   */
+  askUser?: (question: string, options: string[], signal?: AbortSignal) => Promise<string>
   onMessage?: (message: string, status: 'normal' | 'proactive') => void
   /**
    * When true, the session is in "plan mode": every tool call that is NOT

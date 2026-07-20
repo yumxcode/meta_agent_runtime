@@ -24,7 +24,7 @@ export type { FidelityLevel, RegistryEntry } from './registry/index.js'
 
 // ── File system tools ─────────────────────────────────────────────────────────
 export {
-  createReadFileTool, createWriteFileTool, createEditFileTool,
+  createReadFileTool, createWriteFileTool, createAppendFileTool, createEditFileTool,
   createGlobTool, createGrepTool, createNotebookEditTool,
   createFsTools,
 } from './fs/index.js'

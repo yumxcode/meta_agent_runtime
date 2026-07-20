@@ -19,7 +19,7 @@ import { evaluateBindings, evaluateValueExpression } from './GraphExpression.js'
 import { isJsonValue, validateShape } from './GraphJson.js'
 import type { GraphSnapshot, GraphStore } from './GraphStore.js'
 import type { LaneManager } from './LaneManager.js'
-import type { ContextAssembler } from './ContextAssembly.js'
+import { retryDelayMs } from './UsageMath.js'
 
 export type NodeExecutionResult =
   | { kind: 'completed'; outcome: string; output: JsonValue; summary?: string; usage?: ActivationUsage }
@@ -41,7 +41,6 @@ export interface NodeExecutorDeps {
   functions: CapabilityRegistry<FunctionProvider>
   effects?: CapabilityRegistry<EffectProvider>
   graphAgent?: GraphAgentExecutor
-  contextAssembler?: ContextAssembler
   lanes?: LaneManager
   signal?: AbortSignal
   now?: () => number
@@ -66,12 +65,17 @@ export class NodeExecutorRegistry {
   }
 
   private async executeAgent(node: Extract<NodeSpec, { type: 'agent' }>, activation: ActivationRecord, state: GraphStateSnapshot): Promise<NodeExecutionResult> {
-    if (!this.deps.graphAgent || !this.deps.lanes || !this.deps.contextAssembler) {
-      throw new Error('Agent node requires graph_agent, ContextAssembler, and LaneManager')
+    if (!this.deps.graphAgent || !this.deps.lanes) {
+      throw new Error('Agent node requires graph_agent and LaneManager')
     }
     if (activation.attempt > (node.maxAttempts ?? 3)) return { kind: 'completed', outcome: 'failure', output: { error: 'maxAttempts exceeded' }, summary: 'Agent maxAttempts exceeded' }
     const binding = await this.deps.lanes.bind(node.lane, activation)
-    const context = await this.deps.contextAssembler.assemble(node, activation, state, { laneRoot: binding.projectDir })
+    let nodeInputs: Record<string, JsonValue>
+    try {
+      nodeInputs = await evaluateBindings(node.inputs, this.context(activation, state), this.deps.functions)
+    } catch (error) {
+      return { kind: 'completed', outcome: 'failure', output: { error: `agent input evaluation failed: ${message(error)}` }, summary: 'Agent input evaluation failed' }
+    }
     const signal = this.deps.signal ?? new AbortController().signal
     const segmentLimits = remainingSegmentLimits(node, activation, this.now())
     if ('error' in segmentLimits) {
@@ -85,33 +89,29 @@ export class NodeExecutorRegistry {
           system: buildGraphAgentSystemPrompt({
             laneInstructions: this.deps.graph.lanes[node.lane]?.agentProfile?.systemInstructions,
             nodeInstructions: node.systemInstructions,
+            declaredSkills: node.skills,
           }),
           user: buildGraphAgentUserPrompt({
-            contextSections: context.rendered,
+            nodeInputs: {
+              ...nodeInputs,
+              __activation: {
+                id: activation.id,
+                attempt: activation.attempt,
+                continuationVersion: activation.continuationVersion,
+                stateVersion: state.version,
+              },
+            },
+            workspace: this.deps.graph.lanes[node.lane]!.workspace,
             instruction: node.prompt,
             outputSchema: node.outputSchema,
           }),
         },
-        allowedTools: node.tools ?? ['read_file', 'edit_file', 'write_file', 'grep', 'glob', 'bash'],
+        allowedTools: [...new Set([
+          ...(node.tools ?? ['read_file', 'edit_file', 'write_file', 'append_file', 'grep', 'glob', 'bash']),
+          ...(node.skills?.length ? ['skill'] : []),
+        ])],
         limits: segmentLimits,
-        workspace: {
-          projectDir: binding.projectDir,
-          mode: binding.workspaceMode,
-          writeAllowPaths: binding.workspaceMode === 'shared_write'
-            ? (node.writes ?? []).map(path => resolve(binding.projectDir, path))
-            : [],
-          writeDenyPaths: [
-            join(binding.projectDir, '.loop'),
-            join(binding.projectDir, '.meta-agent'),
-            join(binding.projectDir, '.git'),
-            ...(this.deps.graph.lanes[node.lane]?.workspaceAccess?.deny ?? [])
-              .map(path => resolve(binding.projectDir, path)),
-            ...Object.entries(this.deps.graph.workspaceBindings ?? {})
-              .filter(([bindingId, workspaceBinding]) =>
-                workspaceBinding.lane === node.lane && !laneMayWriteWorkspaceBinding(this.deps.graph, node.lane, bindingId, workspaceBinding.plane))
-              .map(([, workspaceBinding]) => resolve(binding.projectDir, workspaceBinding.path)),
-          ],
-        },
+        workspace: this.agentWorkspace(node.lane, binding),
         continuity: {
           ...(binding.lineageSessionId ? { lineageSessionId: binding.lineageSessionId } : {}),
           workspaceId: this.deps.instance.workspaceId,
@@ -232,8 +232,11 @@ export class NodeExecutorRegistry {
       if (intent.status === 'succeeded') return { kind: 'completed', outcome: 'success', output: intent.output ?? intent.receipt ?? null }
       if (intent.status === 'failed') return { kind: 'completed', outcome: 'failure', output: { error: intent.error ?? 'effect failed', receipt: intent.receipt ?? null } }
       const existing = activation.input.__effectReceipt ?? intent.receipt
-      const receipt = existing ?? await provider.submit(inputs, idempotencyKey)
-      await this.deps.store.recordEffectReceipt(operationKey, receipt, this.now())
+      const submitted = existing ?? await provider.submit(inputs, idempotencyKey)
+      // The first durably recorded receipt wins; a resubmission may return a
+      // receipt with nondeterministic fields.
+      const recorded = await this.deps.store.recordEffectReceipt(operationKey, submitted, this.now())
+      const receipt = recorded.receipt ?? submitted
       if (!provider.inspect) {
         await this.deps.store.completeEffectIntent(operationKey, { status: 'succeeded', output: receipt }, this.now())
         return { kind: 'completed', outcome: 'success', output: receipt }
@@ -268,19 +271,27 @@ export class NodeExecutorRegistry {
       const outcome = node.wait.kind === 'event' && resumeKind === 'timer' ? 'timeout' : node.wait.kind
       return { kind: 'completed', outcome, output: resumed }
     }
+    // A lease-expiry replay re-executes this segment. Reuse the absolute
+    // deadline fixed on first park so the timer does not drift longer.
+    const fixedDeadline = typeof activation.input.__timerDeadline === 'number' && Number.isFinite(activation.input.__timerDeadline)
+      ? activation.input.__timerDeadline
+      : undefined
     if (node.wait.kind === 'timer') {
+      if (fixedDeadline !== undefined) return { kind: 'parked', wakeAt: fixedDeadline, reason: `wait until ${fixedDeadline}` }
       const raw = await evaluateValueExpression(node.wait.delayMs, this.context(activation, state), this.deps.functions)
       if (typeof raw !== 'number' || !Number.isFinite(raw) || raw <= 0) return { kind: 'completed', outcome: 'failure', output: { error: 'timer delay must be positive milliseconds' } }
       if (node.wait.maxDelayMs !== undefined && raw > node.wait.maxDelayMs) return { kind: 'completed', outcome: 'failure', output: { error: `timer delay exceeds ${node.wait.maxDelayMs}` } }
-      return { kind: 'parked', wakeAt: this.now() + raw, reason: `wait ${raw}ms` }
+      const wakeAt = this.now() + raw
+      return { kind: 'parked', wakeAt, reason: `wait ${raw}ms`, inputPatch: { __timerDeadline: wakeAt } }
     }
     const correlation = node.wait.correlation
       ? await evaluateValueExpression(node.wait.correlation, this.context(activation, state), this.deps.functions)
       : undefined
+    const timeoutAt = fixedDeadline ?? (node.wait.timeoutMs !== undefined ? this.now() + node.wait.timeoutMs : undefined)
     return {
       kind: 'parked',
       event: { name: node.wait.event, correlation },
-      ...(node.wait.timeoutMs !== undefined ? { wakeAt: this.now() + node.wait.timeoutMs } : {}),
+      ...(timeoutAt !== undefined ? { wakeAt: timeoutAt, inputPatch: { __timerDeadline: timeoutAt } } : {}),
       reason: `wait event ${node.wait.event}`,
     }
   }
@@ -295,7 +306,13 @@ export class NodeExecutorRegistry {
     const complete = node.mode === 'any' ? arrived.size > 0 : node.expects.every(id => arrived.has(id))
     const leader = [...candidates].sort((a, b) => a.id.localeCompare(b.id))[0]
     if (!complete || leader?.id !== activation.id) {
-      return { kind: 'parked', event: { name: `join:${activation.nodeId}` }, reason: 'join barrier incomplete or coalesced' }
+      // Correlate on the fork group so one group's arrival does not wake every
+      // parked Join member of unrelated groups.
+      return {
+        kind: 'parked',
+        event: { name: `join:${activation.nodeId}`, correlation: activation.forkGroupId ?? null },
+        reason: 'join barrier incomplete or coalesced',
+      }
     }
     return {
       kind: 'completed',
@@ -309,6 +326,38 @@ export class NodeExecutorRegistry {
       ? await evaluateValueExpression(node.result, this.context(activation, state), this.deps.functions)
       : activation.input
     return { kind: 'completed', outcome: 'success', output }
+  }
+
+  /**
+   * Direct-workspace contract handed to graph_agent. `.loop`/`.meta-agent` are
+   * always Kernel-protected. `.git` at the project root is denied by default;
+   * a Lane with `scm: 'git'` opts in to commit/push mechanics — `.git` joins
+   * the write allow list while `.git/hooks` and `.git/config` (code-execution
+   * and credential surfaces) stay denied. Seatbelt/bwrap profiles apply denies
+   * after allows, so the nested denies win. Nested repos below an owned write
+   * prefix are unaffected either way: only the project-root `.git` is special.
+   */
+  private agentWorkspace(laneId: string, binding: { projectDir: string; workspaceMode: import('../../../subagent/types.js').SubAgentWorkspaceMode }) {
+    const lane = this.deps.graph.lanes[laneId]
+    const gitScm = lane?.scm === 'git'
+    return {
+      projectDir: binding.projectDir,
+      mode: binding.workspaceMode,
+      writeAllowPaths: binding.workspaceMode === 'shared_write'
+        ? [
+            ...(lane?.workspace.write ?? []).map(rule => resolve(binding.projectDir, rule.path)),
+            ...(gitScm ? [join(binding.projectDir, '.git')] : []),
+          ]
+        : [],
+      writeDenyPaths: [
+        join(binding.projectDir, '.loop'),
+        join(binding.projectDir, '.meta-agent'),
+        ...(gitScm
+          ? [join(binding.projectDir, '.git', 'hooks'), join(binding.projectDir, '.git', 'config')]
+          : [join(binding.projectDir, '.git')]),
+        ...(lane?.workspace.deny ?? []).map(path => resolve(binding.projectDir, path)),
+      ],
+    }
   }
 
   private context(activation: ActivationRecord, state: GraphStateSnapshot) {
@@ -361,22 +410,6 @@ function retryableAgentFailure(
     return { kind: 'completed', outcome: 'failure', output: { error: reason }, summary: reason, usage }
   }
   return { kind: 'retry', reason, usage, consumeAttempt: true, delayMs: retryDelayMs(activation.attempt) }
-}
-
-function retryDelayMs(attempt: number): number {
-  return Math.min(60_000, 1_000 * 2 ** Math.max(0, attempt - 1))
-}
-
-function laneMayWriteWorkspaceBinding(
-  graph: FrozenLoopGraphSpec,
-  laneId: string,
-  bindingId: string,
-  physicalRole: string,
-): boolean {
-  if (graph.compiledLaneDataAccess) {
-    return graph.compiledLaneDataAccess[laneId]?.writeBindings.includes(bindingId) ?? false
-  }
-  return physicalRole === 'observability'
 }
 
 function reserveUnknownCost(usage: ActivationUsage, segmentBudgetUsd: number): ActivationUsage {

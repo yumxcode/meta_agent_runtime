@@ -1,7 +1,6 @@
 import { hostname } from 'node:os'
 import { WakeStore } from '../../wake/WakeStore.js'
 import type { GraphAgentExecutor } from '../agent/GraphAgentExecutor.js'
-import { createBuiltinContextProviderRegistry, type ContextProvider } from '../registry/ContextProvider.js'
 import type {
   CapabilityRegistry,
   EffectProvider,
@@ -12,11 +11,10 @@ import type { ActivationRecord, ActivationUsage, FrozenCapabilityRef, FrozenLoop
 import { verifyFrozenGraphIntegrity } from '../spec/GraphValidate.js'
 import { CommitCoordinator, ParkLimitExceededError } from './CommitCoordinator.js'
 import { GraphStore } from './GraphStore.js'
+import { addUsage, retryDelayMs } from './UsageMath.js'
 import { LaneManager } from './LaneManager.js'
 import { NodeExecutorRegistry, type NodeExecutionResult } from './NodeExecutors.js'
-import { ContextAssembler } from './ContextAssembly.js'
 import type { CapabilityPackRegistry } from '../registry/CapabilityPack.js'
-import { WorkspacePlaneMaterializer } from './WorkspacePlane.js'
 import {
   graphProgressIdentity,
   oneLine,
@@ -31,7 +29,7 @@ export interface GraphKernelOptions {
   reducers: CapabilityRegistry<ReducerProvider>
   effects?: CapabilityRegistry<EffectProvider>
   packs?: CapabilityPackRegistry
-  contextProviders?: CapabilityRegistry<ContextProvider>
+  agentTools?: ReadonlySet<string>
   graphAgent?: GraphAgentExecutor
   wakeStore?: WakeStore
   owner?: string
@@ -61,7 +59,6 @@ export class GraphKernel {
   private readonly coordinator: CommitCoordinator
   private readonly lanes: LaneManager
   private readonly executor: Pick<NodeExecutorRegistry, 'execute'>
-  private readonly workspacePlanes: WorkspacePlaneMaterializer
   private readonly wakeStore: WakeStore
   private readonly owner: string
 
@@ -73,14 +70,14 @@ export class GraphKernel {
       if (!options.effects) throw new Error('graph requires Effect capabilities but no registry was supplied')
       verifyCapabilityLock(options.graph.capabilityLock.effects, options.effects, 'effect')
     }
-    const contextProviders = options.contextProviders ?? createBuiltinContextProviderRegistry()
-    verifyCapabilityLock(options.graph.capabilityLock.contextProviders ?? [], contextProviders, 'context provider')
     for (const pack of options.graph.capabilityLock.packs) {
       if (!options.packs?.has(pack)) throw new Error(`Capability Pack integrity mismatch or missing for '${pack.id}@${pack.version}'`)
     }
+    for (const tool of options.graph.capabilityLock.agentTools ?? []) {
+      if (!options.agentTools?.has(tool)) throw new Error(`graph_agent tool capability mismatch or missing for '${tool}'`)
+    }
     this.coordinator = new CommitCoordinator(options.store, options.graph, options.functions, options.reducers)
     this.lanes = new LaneManager(options.store, options.graph, instance)
-    this.workspacePlanes = new WorkspacePlaneMaterializer({ store: options.store, graph: options.graph, lanes: this.lanes })
     this.wakeStore = options.wakeStore ?? new WakeStore(options.store.projectDir)
     this.owner = options.owner ?? `${hostname()}#${process.pid}`
     this.executor = options.executor ?? new NodeExecutorRegistry({
@@ -90,13 +87,6 @@ export class GraphKernel {
       functions: options.functions,
       effects: options.effects,
       graphAgent: options.graphAgent,
-      contextAssembler: new ContextAssembler({
-        store: options.store,
-        graph: options.graph,
-        instance,
-        providers: contextProviders,
-        now: options.now,
-      }),
       lanes: this.lanes,
       now: options.now,
       hostCoordinatorRoot: options.hostCoordinatorRoot,
@@ -110,7 +100,6 @@ export class GraphKernel {
     if (snapshot.instance.graphHash !== options.graph.graphHash) throw new Error('loaded GraphSpec does not match instance graphHash')
     const kernel = new GraphKernel(options, snapshot.instance)
     await kernel.lanes.reconcile()
-    if (!isTerminal(snapshot.instance)) await kernel.workspacePlanes.reconcile()
     return kernel
   }
 
@@ -138,7 +127,6 @@ export class GraphKernel {
     }
     snapshot = await this.options.store.snapshot()
     if (isTerminal(snapshot.instance)) return { ...emptyResult(snapshot.instance), recovered: recoveredResults.length }
-    await this.workspacePlanes.reconcile()
 
     await this.options.store.releaseExpiredClaims(now)
     // An event created before a wait deadline wins even when this tick runs
@@ -176,21 +164,33 @@ export class GraphKernel {
         result = await this.executeWithHeartbeat(activation, () => this.executor.execute(activation, live))
       } catch (error) {
         const node = this.options.graph.nodes[activation.nodeId]
+        // The executor threw before reporting usage. For Agent nodes reserve
+        // the segment budget as unknown cost so maxCostUsd cannot be pierced
+        // by repeated crash-and-retry cycles.
+        const reservedUsage = node?.type === 'agent'
+          ? { turns: 0, costUsd: node.budget?.usd ?? 2, durationMs: 0 }
+          : undefined
         if (this.options.signal?.aborted) {
           result = { kind: 'retry', reason: `Graph execution interrupted: ${message(error)}`, consumeAttempt: false }
         } else if (node?.type === 'agent' && activation.attempt < (node.maxAttempts ?? 3)) {
           result = {
             kind: 'retry',
             reason: `Agent executor error: ${message(error)}`,
+            usage: reservedUsage,
             consumeAttempt: true,
             delayMs: retryDelayMs(activation.attempt),
           }
         } else {
-          result = { kind: 'completed', outcome: 'failure', output: { error: message(error) }, summary: message(error) }
+          result = { kind: 'completed', outcome: 'failure', output: { error: message(error) }, summary: message(error), usage: reservedUsage }
         }
       }
       return this.finishActivation(activation, await this.enforceExecutionLimits(activation, result))
     }))
+    // Kernel-level rejections (commit invariants, lost leases) must not abort
+    // the wave: finish bookkeeping, wake scheduling, and event consumption
+    // first, then surface them. The affected Activations recover through
+    // lease expiry.
+    const kernelFailures: unknown[] = []
     for (let i = 0; i < results.length; i++) {
       const result = results[i]!
       if (result.status === 'fulfilled') {
@@ -202,10 +202,10 @@ export class GraphKernel {
         const live = await this.options.store.snapshot()
         const activation = live.activations.get(claims[i]!.id)
         if (activation?.status === 'cancelled' || activation?.status === 'succeeded') continue
-        throw result.reason
+        kernelFailures.push(result.reason)
+        failed++
       }
     }
-    await this.workspacePlanes.reconcile()
     // A Wait Activation can park in this wave after its matching event was
     // already persisted. Consume that inbox entry now instead of sleeping
     // until the timeout wake.
@@ -219,13 +219,25 @@ export class GraphKernel {
       const runningExpiry = [...finalSnapshot.activations.values()]
         .filter(a => a.status === 'running' && a.lease)
         .map(a => a.lease!.expiresAt)
-      const fireAt = ready ? this.now() : runningExpiry.length ? Math.min(...runningExpiry) : this.now()
+      // Ready work normally warrants an immediate wake. If this tick made no
+      // progress the ready Activations are blocked (Lane exclusivity, per-node
+      // caps, another owner's leases): back off to the blocking lease expiry
+      // instead of hot-looping.
+      const progressed = claims.length > 0 || committed + parked + retried + recoveredResults.length > 0
+      const blockedWakeAt = runningExpiry.length ? Math.min(...runningExpiry) : this.now() + 1_000
+      const fireAt = ready
+        ? (progressed ? this.now() : blockedWakeAt)
+        : runningExpiry.length ? Math.min(...runningExpiry) : this.now()
       await this.wakeStore.schedule({
         loopId: this.options.store.instanceId,
         activationId: '__graph__',
         kind: 'timer',
         fireAt,
       })
+    }
+    if (kernelFailures.length === 1) throw kernelFailures[0]
+    if (kernelFailures.length) {
+      throw new AggregateError(kernelFailures, `graph tick finished with ${kernelFailures.length} kernel failures`)
     }
     return {
       instance,
@@ -239,10 +251,22 @@ export class GraphKernel {
     }
   }
 
-  async signalEvent(event: { name: string; correlation?: import('../spec/GraphTypes.js').JsonValue; payload?: import('../spec/GraphTypes.js').JsonValue }): Promise<number> {
+  async deliverEvent(event: import('../spec/GraphTypes.js').GraphExternalEventInput): Promise<import('../spec/GraphTypes.js').GraphExternalEventDeliveryResult> {
     const result = await this.coordinator.recordExternalEvent({ ...event, now: this.now() })
-    if (result.resumed.length) await this.options.store.setStatus('active', `event ${event.name}`, this.now())
-    return result.resumed.length
+    if (result.resumed.length) {
+      // A paused instance is gated on repair (e.g. Lane conflicts). Record the
+      // event and mark resumers ready, but do not bypass the pause gate.
+      const snapshot = await this.options.store.snapshot()
+      if (snapshot.instance.status !== 'paused') {
+        await this.options.store.setStatus('active', `event ${event.name}`, this.now())
+      }
+    }
+    return { event: result.event, resumed: result.resumed.length, duplicate: result.duplicate }
+  }
+
+  /** Backward-compatible shorthand for callers that only need the resume count. */
+  async signalEvent(event: import('../spec/GraphTypes.js').GraphExternalEventInput): Promise<number> {
+    return (await this.deliverEvent(event)).resumed
   }
 
   async resumePausedTerminal(): Promise<{ spawned: ActivationRecord[]; instance: GraphInstanceRecord }> {
@@ -253,13 +277,29 @@ export class GraphKernel {
     if (!activation.lease) throw new Error(`activation '${activation.id}' has no lease`)
     if (result.kind === 'completed' && this.options.graph.concurrency?.stateConsistency === 'serializable') {
       const latest = await this.options.store.snapshot()
-      if ((activation.executionStateVersion ?? activation.inputStateVersion) !== latest.state.version) {
+      const stateAdvanced = (activation.executionStateVersion ?? activation.inputStateVersion) !== latest.state.version
+      const replays = activation.replayCount ?? 0
+      if (stateAdvanced && replays >= MAX_SERIALIZABLE_REPLAYS) {
+        // Livelock guard: state kept advancing under this Activation for
+        // every replay. Fail it deterministically (fall through to commit)
+        // instead of spinning.
+        result = {
+          kind: 'completed',
+          outcome: 'failure',
+          output: { error: `serializable replay limit ${MAX_SERIALIZABLE_REPLAYS} exceeded` },
+          summary: `Serializable replay limit ${MAX_SERIALIZABLE_REPLAYS} exceeded`,
+          usage: result.usage,
+        }
+      } else if (stateAdvanced) {
         const replay = await this.coordinator.retry({
           activationId: activation.id,
           leaseToken: activation.lease.token,
           reason: `State advanced from v${activation.executionStateVersion ?? activation.inputStateVersion} to v${latest.state.version}; replaying under serializable policy`,
           usage: result.usage,
           consumeAttempt: false,
+          // First conflict replays immediately; repeated conflicts back off
+          // exponentially so a contended graph converges instead of spinning.
+          delayMs: replays === 0 ? 0 : Math.min(5_000, 50 * 2 ** Math.min(replays, 6)),
           now: this.now(),
         })
         if (replay.wakeAt !== undefined) await this.wakeStore.schedule({
@@ -360,29 +400,6 @@ export class GraphKernel {
       return 'parked'
     }
 
-    const node = this.options.graph.nodes[activation.nodeId]
-    if (node?.type === 'terminal' && node.status !== 'paused') {
-      await this.workspacePlanes.reconcile()
-      const lanes = await this.lanes.mergeAll()
-      const conflict = lanes.find(lane => lane.status === 'conflicted')
-      if (conflict) {
-        const retry = await this.coordinator.retry({
-          activationId: activation.id,
-          leaseToken: activation.lease.token,
-          reason: `Lane '${conflict.laneId}' merge conflict: ${conflict.error ?? 'unknown'}`,
-          consumeAttempt: false,
-          now: this.now(),
-        })
-        await this.options.store.setStatus('paused', `Lane '${conflict.laneId}' requires repair`, this.now())
-        this.emitProgress({
-          type: 'phase_retrying',
-          ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, retry, this.now()),
-          reason: retry.error ?? `Lane '${conflict.laneId}' requires repair`,
-          replay: true,
-        })
-        return 'retried'
-      }
-    }
     const intent = await this.options.store.prepareCommit({
       activationId: activation.id,
       leaseToken: activation.lease.token,
@@ -395,7 +412,7 @@ export class GraphKernel {
     const committed = await this.coordinator.commit(intent, this.now())
     for (const child of committed.spawned) {
       if (this.options.graph.nodes[child.nodeId]?.type === 'join') {
-        await this.coordinator.resumeDue(this.now(), { name: `join:${child.nodeId}` })
+        await this.coordinator.resumeDue(this.now(), { name: `join:${child.nodeId}`, correlation: child.forkGroupId ?? null })
       }
     }
     this.emitProgress({
@@ -451,26 +468,49 @@ export class GraphKernel {
     if (!activation.lease) throw new Error(`activation '${activation.id}' has no lease`)
     let lost = false
     let refreshing = false
+    let heartbeatInFlight: Promise<void> | undefined
+    let consecutiveFailures = 0
     const timer = setInterval(() => {
       if (refreshing || lost) return
       refreshing = true
-      void this.options.store.heartbeat(
+      const heartbeat = this.options.store.heartbeat(
         activation.id,
         activation.lease!.token,
         this.now(),
         this.options.activationLeaseTtlMs ?? 10 * 60_000,
       )
-        .then(owned => { if (!owned) lost = true })
-        .catch(() => { lost = true })
-        .finally(() => { refreshing = false })
+        .then(owned => {
+          // A definitive "not owned" answer is authoritative; discard the segment.
+          if (!owned) lost = true
+          else consecutiveFailures = 0
+        })
+        .catch(() => {
+          // Transient I/O or lock contention must not discard a whole finished
+          // segment. Only give up after repeated consecutive failures.
+          consecutiveFailures++
+          if (consecutiveFailures >= HEARTBEAT_FAILURE_TOLERANCE) lost = true
+        })
+        .finally(() => {
+          refreshing = false
+          if (heartbeatInFlight === heartbeat) heartbeatInFlight = undefined
+        })
+      heartbeatInFlight = heartbeat
     }, this.options.activationHeartbeatMs ?? 60_000)
     timer.unref?.()
     try {
       const result = await execute()
+      clearInterval(timer)
+      const pendingHeartbeat = heartbeatInFlight
+      if (pendingHeartbeat) await pendingHeartbeat
       if (lost) throw new Error(`activation lease lost for '${activation.id}' during execution`)
       return result
     } finally {
       clearInterval(timer)
+      // A heartbeat may already have entered GraphStore when the Agent segment
+      // finishes. Drain it before returning so no background projection write
+      // can race the next Activation, process shutdown, or workspace cleanup.
+      const pendingHeartbeat = heartbeatInFlight
+      if (pendingHeartbeat) await pendingHeartbeat
     }
   }
 
@@ -521,13 +561,8 @@ export class GraphKernel {
   private now(): number { return this.options.now?.() ?? Date.now() }
 }
 
-function addUsage(current: ActivationUsage | undefined, increment: ActivationUsage | undefined): ActivationUsage {
-  return {
-    turns: (current?.turns ?? 0) + (increment?.turns ?? 0),
-    costUsd: (current?.costUsd ?? 0) + (increment?.costUsd ?? 0),
-    durationMs: (current?.durationMs ?? 0) + (increment?.durationMs ?? 0),
-  }
-}
+const MAX_SERIALIZABLE_REPLAYS = 50
+const HEARTBEAT_FAILURE_TOLERANCE = 3
 
 function verifyCapabilityLock<T extends { manifest: { id: string; version: string; integrity: string } }>(
   refs: FrozenCapabilityRef[],
@@ -550,8 +585,4 @@ function emptyResult(instance: GraphInstanceRecord): GraphTickResult {
 
 function message(error: unknown): string {
   return error instanceof Error ? error.message : String(error)
-}
-
-function retryDelayMs(attempt: number): number {
-  return Math.min(60_000, 1_000 * 2 ** Math.max(0, attempt - 1))
 }

@@ -19,7 +19,6 @@
 
 ## Reviews
 
-- [Durable Graph Loop Runtime review and remediation audit (2026-07-14)](loop-graph-runtime-review-2026-07-14.md)
 - [Latest code review](reviews/CODE_REVIEW_2026-05-31.md)
 - [Code review 2026-05-29](reviews/CODE_REVIEW_2026-05-29.md)
 - [Legacy code review](reviews/CODE_REVIEW.md)

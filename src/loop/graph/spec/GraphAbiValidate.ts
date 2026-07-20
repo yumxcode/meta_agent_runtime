@@ -10,9 +10,8 @@ export function validateGraphAbiShape(value: unknown): string[] {
   if (!record(value)) return ['graph must be an object']
   keys(value, [
     'schemaVersion', 'id', 'version', 'goal', 'capabilityPacks', 'state', 'lanes', 'nodes',
-    'transitions', 'entrypoints', 'artifacts', 'artifactViews', 'evidenceViews',
-    'workspaceBindings', 'dataPlanes', 'dataViews', 'limits', 'concurrency', 'annotations',
-    'capabilityLock', 'graphHash', 'frozenAt', 'compiledDataPlanes', 'compiledLaneDataAccess',
+    'transitions', 'entrypoints', 'limits', 'concurrency', 'annotations',
+    'capabilityLock', 'graphHash', 'frozenAt',
   ], 'graph', errors)
   annotation(value.annotations, 'annotations', errors)
 
@@ -20,15 +19,14 @@ export function validateGraphAbiShape(value: unknown): string[] {
     keys(item, ['type', 'initial', 'description'], at, errors)
   })
   eachRecord(value.lanes, 'lanes', errors, (lane, at) => {
-    keys(lane, ['context', 'workspace', 'maxConcurrency', 'description', 'agentProfile', 'dataAccess', 'workspaceAccess', 'annotations'], at, errors)
+    keys(lane, ['context', 'workspace', 'maxConcurrency', 'description', 'agentProfile', 'scm', 'annotations'], at, errors)
     annotation(lane.annotations, `${at}.annotations`, errors)
     child(lane.agentProfile, `${at}.agentProfile`, errors, profile => keys(profile, ['systemInstructions'], `${at}.agentProfile`, errors))
-    child(lane.dataAccess, `${at}.dataAccess`, errors, access => {
-      keys(access, ['read', 'publish', 'write'], `${at}.dataAccess`, errors)
-      eachArray(access.read, `${at}.dataAccess.read`, errors, (grant, grantAt) => keys(grant, ['plane', 'views'], grantAt, errors))
-    })
-    child(lane.workspaceAccess, `${at}.workspaceAccess`, errors, access => {
-      keys(access, ['write', 'deny'], `${at}.workspaceAccess`, errors)
+    child(lane.workspace, `${at}.workspace`, errors, workspace => {
+      keys(workspace, ['read', 'write', 'deny'], `${at}.workspace`, errors)
+      eachArray(workspace.write, `${at}.workspace.write`, errors, (rule, ruleAt) => {
+        keys(rule, ['path', 'mode', 'schema', 'description'], ruleAt, errors)
+      })
     })
   })
   eachRecord(value.nodes, 'nodes', errors, (node, at) => validateNode(node, at, errors))
@@ -45,15 +43,6 @@ export function validateGraphAbiShape(value: unknown): string[] {
     keys(entry, ['id', 'node', 'inputs'], at, errors)
     expressions(entry.inputs, `${at}.inputs`, errors)
   })
-  eachRecord(value.artifacts, 'artifacts', errors, (channel, at) => keys(channel, ['kind', 'schema', 'admission', 'maxItems'], at, errors))
-  for (const field of ['artifactViews', 'evidenceViews'] as const) eachRecord(value[field], field, errors, (view, at) => {
-    keys(view, ['channels', 'statuses', 'maxItems'], at, errors)
-  })
-  eachRecord(value.workspaceBindings, 'workspaceBindings', errors, (binding, at) => workspaceBinding(binding, at, errors))
-  eachRecord(value.dataPlanes, 'dataPlanes', errors, (plane, at) => dataPlane(plane, at, errors))
-  eachRecord(value.dataViews, 'dataViews', errors, (view, at) => {
-    keys(view, ['plane', 'description', 'stateKeys', 'statuses', 'eventTypes', 'maxItems'], at, errors)
-  })
   child(value.limits, 'limits', errors, limits => keys(limits, ['maxActivations', 'maxWallTimeMs', 'maxCostUsd', 'maxFanOut', 'maxPendingTimers'], 'limits', errors))
   child(value.concurrency, 'concurrency', errors, concurrency => keys(concurrency, ['maxActivations', 'maxPerNode', 'stateConsistency'], 'concurrency', errors))
   eachArray(value.capabilityPacks, 'capabilityPacks', errors, (pack, at) => keys(pack, ['id', 'version', 'integrity'], at, errors))
@@ -61,9 +50,9 @@ export function validateGraphAbiShape(value: unknown): string[] {
 }
 
 function validateNode(node: Record<string, unknown>, at: string, errors: string[]): void {
-  const base = ['type', 'description', 'timeoutMs', 'publishes', 'annotations']
+  const base = ['type', 'description', 'timeoutMs', 'annotations']
   const byType: Record<string, string[]> = {
-    agent: ['lane', 'prompt', 'systemInstructions', 'context', 'inputs', 'outputSchema', 'tools', 'skills', 'reads', 'writes', 'maxAttempts', 'budget', 'lifetimeBudget', 'timerPolicy'],
+    agent: ['lane', 'prompt', 'systemInstructions', 'inputs', 'outputSchema', 'tools', 'skills', 'maxAttempts', 'budget', 'lifetimeBudget', 'timerPolicy'],
     function: ['function', 'inputs', 'outputSchema'],
     effect: ['effect', 'inputs', 'idempotencyKey'],
     wait: ['wait'],
@@ -73,18 +62,7 @@ function validateNode(node: Record<string, unknown>, at: string, errors: string[
   keys(node, [...base, ...(byType[String(node.type)] ?? [])], at, errors)
   annotation(node.annotations, `${at}.annotations`, errors)
   expressions(node.inputs, `${at}.inputs`, errors)
-  eachArray(node.publishes, `${at}.publishes`, errors, (publication, publicationAt) => {
-    keys(publication, ['plane', 'channel', 'on', 'value', 'status', 'supersedes', 'tags'], publicationAt, errors)
-    expression(publication.value, `${publicationAt}.value`, errors)
-    if (publication.supersedes !== undefined) expression(publication.supersedes, `${publicationAt}.supersedes`, errors)
-  })
   if (node.type === 'agent') {
-    child(node.context, `${at}.context`, errors, context => {
-      keys(context, ['sections'], `${at}.context`, errors)
-      eachArray(context.sections, `${at}.context.sections`, errors, (section, sectionAt) => {
-        keys(section, ['name', 'provider', 'refresh', 'config', 'required', 'maxBytes'], sectionAt, errors)
-      })
-    })
     child(node.budget, `${at}.budget`, errors, budget => keys(budget, ['turns', 'usd', 'wallTimeMs'], `${at}.budget`, errors))
     child(node.lifetimeBudget, `${at}.lifetimeBudget`, errors, budget => keys(budget, ['turns', 'usd', 'elapsedMs'], `${at}.lifetimeBudget`, errors))
     child(node.timerPolicy, `${at}.timerPolicy`, errors, policy => keys(policy, ['allowHardPark', 'maxDelayMs', 'maxParks'], `${at}.timerPolicy`, errors))
@@ -99,31 +77,6 @@ function validateNode(node: Record<string, unknown>, at: string, errors: string[
   } else if (node.type === 'terminal' && node.result !== undefined) {
     expression(node.result, `${at}.result`, errors)
   }
-}
-
-function dataPlane(plane: Record<string, unknown>, at: string, errors: string[]): void {
-  const base = ['backend', 'semanticRole', 'description', 'trust', 'annotations']
-  const variants: Record<string, string[]> = {
-    state: ['stateKeys'],
-    record: ['recordKind', 'schema', 'mutability', 'admission', 'retention'],
-    journal: ['eventTypes'],
-    workspace: ['binding'],
-  }
-  keys(plane, [...base, ...(variants[String(plane.backend)] ?? [])], at, errors)
-  annotation(plane.annotations, `${at}.annotations`, errors)
-  child(plane.retention, `${at}.retention`, errors, retention => keys(retention, ['maxItems'], `${at}.retention`, errors))
-  child(plane.binding, `${at}.binding`, errors, binding => workspaceBinding(binding, `${at}.binding`, errors))
-}
-
-function workspaceBinding(binding: Record<string, unknown>, at: string, errors: string[]): void {
-  keys(binding, ['plane', 'path', 'format', 'direction', 'lane', 'required', 'appendOnly', 'projection', 'initializeState'], at, errors)
-  child(binding.projection, `${at}.projection`, errors, projection => {
-    const variants: Record<string, string[]> = {
-      state: ['keys'], evidence_view: ['view', 'record', 'flattenArrays'], artifact_view: ['view', 'record', 'flattenArrays'],
-      journal: ['eventTypes', 'record'], data_view: ['view', 'record', 'flattenArrays'],
-    }
-    keys(projection, ['kind', ...(variants[String(projection.kind)] ?? [])], `${at}.projection`, errors)
-  })
 }
 
 function targets(value: unknown, at: string, errors: string[]): void {

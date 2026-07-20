@@ -1,5 +1,5 @@
 import type { CapabilityRegistry, FunctionProvider, ReducerProvider } from '../registry/CapabilityRegistry.js'
-import { randomUUID } from 'node:crypto'
+import { createHash, randomUUID } from 'node:crypto'
 import type {
   ActivationCommitIntent,
   ActivationRecord,
@@ -7,14 +7,13 @@ import type {
   GraphInstanceRecord,
   GraphJournalEvent,
   JsonValue,
-  GraphArtifactRecord,
   ActivationUsage,
   GraphExternalEventRecord,
+  GraphExternalEventInput,
 } from '../spec/GraphTypes.js'
 import { GraphStore } from './GraphStore.js'
+import { addUsage, emptyUsage } from './UsageMath.js'
 import { decideTransition } from './TransitionEngine.js'
-import { evaluateValueExpression } from './GraphExpression.js'
-import { validateShape } from './GraphJson.js'
 
 export interface CommitResult {
   activation: ActivationRecord
@@ -44,7 +43,7 @@ export class CommitCoordinator {
       const snapshot = await this.store.authoritativeSnapshotLocked()
       const committedSequence = snapshot.commitKeys.get(intent.commitKey)
       if (committedSequence !== undefined) {
-        const event = (await this.store.readJournalLockedView()).find(item => item.sequence === committedSequence)?.event
+        const event = (await this.store.readJournalEventLocked(committedSequence))?.event
         if (event?.type !== 'activation_committed') throw new Error(`commit index '${intent.commitKey}' is corrupt`)
         return resultFromEvent(event, true)
       }
@@ -59,45 +58,85 @@ export class CommitCoordinator {
       let spawned: ActivationRecord[] = []
       let transitionId: string | undefined
       let cancelled: ActivationRecord[] = []
-      let artifacts: GraphArtifactRecord[] = []
-      const publicationRejections: Array<{ channel: string; reason: string }> = []
       let instance: GraphInstanceRecord = { ...snapshot.instance, updatedAt: now }
       const segmentUsage = intent.usage ?? emptyUsage()
       instance.totalCostUsd = (instance.totalCostUsd ?? 0) + segmentUsage.costUsd
       let committedActivation: ActivationRecord
       if (node.type === 'terminal') {
+        // A Terminal that could not evaluate its result (outcome 'failure')
+        // must not report graph success -- respect the outcome over node.status.
+        const terminalFailed = node.status === 'failed' || intent.outcome === 'failure'
         committedActivation = {
           ...activation,
           usage: addUsage(activation.usage, segmentUsage),
-          status: node.status === 'failed' ? 'failed' : 'succeeded',
+          status: terminalFailed ? 'failed' : 'succeeded',
           lease: undefined,
           output: intent.output,
           outcome: intent.outcome,
           summary: intent.summary,
-          error: undefined,
+          error: intent.outcome === 'failure' ? (intent.summary ?? 'terminal execution failed') : undefined,
           terminalResult: intent.output,
           updatedAt: now,
         }
         instance = {
           ...instance,
-          status: node.status,
+          status: intent.outcome === 'failure' ? 'failed' : node.status,
           terminalResult: intent.output,
-          statusReason: node.description,
+          statusReason: intent.outcome === 'failure'
+            ? (intent.summary ?? 'terminal execution failed')
+            : node.description,
         }
         cancelled = [...snapshot.activations.values()]
           .filter(peer => peer.id !== activation.id && ['ready', 'running', 'waiting'].includes(peer.status))
           .map(peer => ({ ...peer, status: 'cancelled' as const, lease: undefined, updatedAt: now, error: `cancelled by terminal activation ${activation.id}` }))
       } else {
-        const decision = await decideTransition({
-          graph: this.graph,
-          activation,
-          outcome: intent.outcome,
-          output: intent.output,
-          state,
-          functions: this.functions,
-          reducers: this.reducers,
-          now,
-        })
+        // Transition evaluation runs reducer/function plugin code. A thrown
+        // error here must become a durable failed commit -- letting it escape
+        // leaves the prepared intent poisoned and recoverPrepared replays the
+        // same throw on every tick, wedging the instance forever.
+        let decision: Awaited<ReturnType<typeof decideTransition>> | undefined
+        let decisionError: string | undefined
+        try {
+          decision = await decideTransition({
+            graph: this.graph,
+            activation,
+            outcome: intent.outcome,
+            output: intent.output,
+            state,
+            functions: this.functions,
+            reducers: this.reducers,
+            now,
+          })
+        } catch (error) {
+          decisionError = message(error)
+        }
+        if (!decision) {
+          const reason = `transition evaluation failed for node '${activation.nodeId}' outcome '${intent.outcome}': ${decisionError}`
+          committedActivation = {
+            ...activation,
+            usage: addUsage(activation.usage, segmentUsage),
+            status: 'failed',
+            lease: undefined,
+            output: intent.output,
+            outcome: intent.outcome,
+            summary: reason,
+            error: reason,
+            updatedAt: now,
+          }
+          instance = { ...instance, status: 'failed', statusReason: reason }
+          const event: Extract<GraphJournalEvent, { type: 'activation_committed' }> = {
+            type: 'activation_committed',
+            at: now,
+            commitKey: intent.commitKey,
+            activation: committedActivation,
+            spawned: [],
+            state,
+            instance,
+          }
+          const journal = await this.store.appendEventLocked(event)
+          await this.store.writeCommitProjectionLocked(event, journal.sequence)
+          return resultFromEvent(event, false)
+        }
         state = decision.state
         spawned = decision.spawned.filter(child => {
           if (this.graph.nodes[child.nodeId]?.type !== 'join') return true
@@ -135,63 +174,6 @@ export class CommitCoordinator {
             .map(peer => ({ ...peer, status: 'cancelled' as const, lease: undefined, updatedAt: now, error: `coalesced by join activation ${activation.id}` }))
         }
       }
-      const activeArtifactIds = new Map<string, Set<string>>()
-      for (const [id, artifact] of snapshot.artifacts) {
-        if (artifact.status === 'superseded') continue
-        const ids = activeArtifactIds.get(artifact.channel) ?? new Set<string>()
-        ids.add(id)
-        activeArtifactIds.set(artifact.channel, ids)
-      }
-      for (const publication of node.publishes ?? []) {
-        if ((publication.on ?? 'success') !== intent.outcome && publication.on !== 'always') continue
-        const channelId = publication.channel
-        if (!channelId) throw new Error('logical publication reached Kernel without Freeze compilation')
-        const channel = this.graph.artifacts?.[channelId]
-        if (!channel) throw new Error(`publication references unknown channel '${channelId}'`)
-        const context = { state: state.values, input: activation.input, output: intent.output, clock: { now } }
-        const content = await evaluateValueExpression(publication.value, context, this.functions)
-        const shapeErrors = channel.schema ? validateShape(content, channel.schema, `$artifact.${channelId}`) : []
-        if (shapeErrors.length) throw new Error(`artifact schema mismatch: ${shapeErrors.join('; ')}`)
-        const supersedesValue = publication.supersedes
-          ? await evaluateValueExpression(publication.supersedes, context, this.functions)
-          : undefined
-        if (supersedesValue !== undefined && typeof supersedesValue !== 'string') throw new Error('artifact supersedes must resolve to an artifact id string')
-        const status = publication.status ?? (channel.admission === 'judge' ? 'proposed' : 'admitted')
-        if (channel.admission === 'judge' && status === 'admitted' && node.type !== 'agent') {
-          throw new Error(`channel '${channelId}' requires Agent judgment for admission`)
-        }
-        const artifact: GraphArtifactRecord = {
-          schemaVersion: 'graph-artifact-1.0',
-          id: `artifact-${randomUUID()}`,
-          channel: channelId,
-          kind: channel.kind ?? 'artifact',
-          status,
-          content,
-          tags: [...(publication.tags ?? [])],
-          provenance: {
-            activationId: activation.id,
-            nodeId: activation.nodeId,
-            laneId: activation.laneId,
-            stateVersion: state.version,
-            createdAt: now,
-          },
-          ...(supersedesValue ? { supersedes: supersedesValue } : {}),
-        }
-        const active = activeArtifactIds.get(channelId) ?? new Set<string>()
-        const superseded = supersedesValue && active.has(supersedesValue) ? supersedesValue : undefined
-        if (superseded) active.delete(superseded)
-        if (channel.maxItems !== undefined && active.size + 1 > channel.maxItems) {
-          if (superseded) active.add(superseded)
-          publicationRejections.push({
-            channel: channelId,
-            reason: `maxItems ${channel.maxItems} reached`,
-          })
-          continue
-        }
-        active.add(artifact.id)
-        activeArtifactIds.set(channelId, active)
-        artifacts.push(artifact)
-      }
       const event: Extract<GraphJournalEvent, { type: 'activation_committed' }> = {
         type: 'activation_committed',
         at: now,
@@ -199,8 +181,6 @@ export class CommitCoordinator {
         activation: committedActivation,
         spawned,
         ...(cancelled.length ? { cancelled } : {}),
-        ...(artifacts.length ? { artifacts } : {}),
-        ...(publicationRejections.length ? { publicationRejections } : {}),
         state,
         instance,
         transitionId,
@@ -266,29 +246,46 @@ export class CommitCoordinator {
     })
   }
 
-  async recordExternalEvent(input: {
-    name: string
-    correlation?: JsonValue
-    payload?: JsonValue
+  async recordExternalEvent(input: GraphExternalEventInput & {
     now?: number
-  }): Promise<{ event: GraphExternalEventRecord; resumed: ActivationRecord[] }> {
+  }): Promise<{ event: GraphExternalEventRecord; resumed: ActivationRecord[]; duplicate: boolean }> {
     const now = input.now ?? Date.now()
+    validateExternalEventInput(input)
     return this.store.withTransaction(async () => {
       const snapshot = await this.store.authoritativeSnapshotLocked()
-      const event: GraphExternalEventRecord = {
-        schemaVersion: 'graph-external-event-1.0',
-        id: `event-${randomUUID()}`,
-        name: input.name,
-        correlation: input.correlation,
-        payload: input.payload,
-        status: 'pending',
-        createdAt: now,
+      const id = input.source && input.deliveryId
+        ? externalDeliveryEventId(input.source, input.deliveryId)
+        : `event-${randomUUID()}`
+      const existing = snapshot.externalEvents.get(id)
+      let event: GraphExternalEventRecord
+      let duplicate = false
+      if (existing) {
+        if (!sameExternalDelivery(existing, input)) {
+          throw new Error(`external event delivery conflict for '${input.source}:${input.deliveryId}'`)
+        }
+        event = existing
+        duplicate = true
+      } else {
+        event = {
+          schemaVersion: 'graph-external-event-1.0',
+          id,
+          ...(input.source ? { source: input.source, deliveryId: input.deliveryId } : {}),
+          name: input.name,
+          correlation: input.correlation,
+          payload: input.payload,
+          status: 'pending',
+          createdAt: now,
+        }
+        await this.store.appendEventLocked({ type: 'external_event_recorded', at: now, externalEvent: event })
+        await this.store.writeExternalEventProjectionLocked(event)
       }
-      await this.store.appendEventLocked({ type: 'external_event_recorded', at: now, externalEvent: event })
-      await this.store.writeExternalEventProjectionLocked(event)
+      if (event.status === 'consumed') return { event, resumed: [], duplicate }
+      // A redelivery may be the call that repairs a crash between accepting a
+      // pending event and consuming it. Re-run matching without creating a
+      // second inbox record.
       const resumed = matchingEventActivations(snapshot.activations.values(), event).map(activation =>
         resumeForExternalEvent(activation, event, now))
-      if (!resumed.length) return { event, resumed }
+      if (!resumed.length) return { event, resumed, duplicate }
       const consumed: GraphExternalEventRecord = {
         ...event,
         status: 'consumed',
@@ -298,7 +295,7 @@ export class CommitCoordinator {
       await this.store.appendEventLocked({ type: 'external_event_consumed', at: now, externalEvent: consumed, activations: resumed })
       for (const activation of resumed) await this.store.writeActivationProjectionLocked(activation)
       await this.store.writeExternalEventProjectionLocked(consumed)
-      return { event: consumed, resumed }
+      return { event: consumed, resumed, duplicate }
     })
   }
 
@@ -410,6 +407,7 @@ export class CommitCoordinator {
         ...activation,
         status: delayed ? 'waiting' : 'ready',
         lease: undefined,
+        replayCount: input.consumeAttempt ? activation.replayCount : (activation.replayCount ?? 0) + 1,
         usage: addUsage(activation.usage, input.usage),
         readyReason: delayed ? undefined : reason,
         wakeAt: delayed ? now + input.delayMs! : undefined,
@@ -505,18 +503,8 @@ export class CommitCoordinator {
   }
 }
 
-function emptyUsage(): ActivationUsage {
-  return { turns: 0, costUsd: 0, durationMs: 0 }
-}
-
-function addUsage(current: ActivationUsage | undefined, increment: ActivationUsage | undefined): ActivationUsage {
-  const left = current ?? emptyUsage()
-  const right = increment ?? emptyUsage()
-  return {
-    turns: left.turns + right.turns,
-    costUsd: left.costUsd + right.costUsd,
-    durationMs: left.durationMs + right.durationMs,
-  }
+function message(error: unknown): string {
+  return error instanceof Error ? error.message : String(error)
 }
 
 function resultFromEvent(event: Extract<GraphJournalEvent, { type: 'activation_committed' }>, duplicate: boolean): CommitResult {
@@ -530,7 +518,41 @@ function resultFromEvent(event: Extract<GraphJournalEvent, { type: 'activation_c
 }
 
 function structurallyEqual(a: JsonValue | undefined, b: JsonValue | undefined): boolean {
-  return JSON.stringify(a) === JSON.stringify(b)
+  return canonicalJson(a) === canonicalJson(b)
+}
+
+function canonicalJson(value: JsonValue | undefined): string {
+  if (value === undefined) return 'undefined'
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(item => canonicalJson(item)).join(',')}]`
+  return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${canonicalJson(value[key])}`).join(',')}}`
+}
+
+function externalDeliveryEventId(source: string, deliveryId: string): string {
+  const digest = createHash('sha256').update(source).update('\0').update(deliveryId).digest('hex')
+  return `event-delivery-${digest}`
+}
+
+function validateExternalEventInput(input: GraphExternalEventInput): void {
+  if (!input.name.trim()) throw new Error('external event name must not be empty')
+  if (input.name.length > 256) throw new Error('external event name exceeds 256 characters')
+  if ((input.source === undefined) !== (input.deliveryId === undefined)) {
+    throw new Error('external event source and deliveryId must be provided together')
+  }
+  if (input.source !== undefined && (!input.source.trim() || input.source.length > 128)) {
+    throw new Error('external event source must be 1..128 characters')
+  }
+  if (input.deliveryId !== undefined && (!input.deliveryId.trim() || input.deliveryId.length > 512)) {
+    throw new Error('external event deliveryId must be 1..512 characters')
+  }
+}
+
+function sameExternalDelivery(existing: GraphExternalEventRecord, input: GraphExternalEventInput): boolean {
+  return existing.source === input.source &&
+    existing.deliveryId === input.deliveryId &&
+    existing.name === input.name &&
+    structurallyEqual(existing.correlation, input.correlation) &&
+    structurallyEqual(existing.payload, input.payload)
 }
 
 function matchingEventActivations(

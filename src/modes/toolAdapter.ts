@@ -16,6 +16,10 @@ import type {
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 
 const COOPERATIVE_ABORT_TOOLS = new Set([
+  // ask_user forwards ctx.abortSignal to the host prompt: the per-tool timeout
+  // cancels the pending readline question instead of leaving a zombie prompt
+  // that swallows the user's next input line.
+  'ask_user',
   'bash',
   'experiment_dispatch',
   'paper_search',
@@ -34,7 +38,6 @@ const NON_COOPERATIVE_ABORT_TOOLS = new Set([
   'mcp_call',
   'read_mcp_resource',
   'list_mcp_resources',
-  'ask_user',
 ])
 
 /**
@@ -71,7 +74,7 @@ const BUILTIN_BOUNDED_TOOLS = new Set([
   'physical_anchor_search', 'physical_anchor_write', 'principle_delete',
   'principle_load', 'principle_promote', 'principle_search', 'progress_note',
   'read_file', 'return_result', 'send_message', 'session_list', 'session_star',
-  'session_tag', 'skill', 'todo_write', 'write_file',
+  'session_tag', 'skill', 'todo_write', 'write_file', 'append_file',
 ])
 
 const DEFAULT_MAX_RESULT_SIZE_CHARS = 200 * 1024
