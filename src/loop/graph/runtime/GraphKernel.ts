@@ -13,7 +13,7 @@ import { CommitCoordinator, ParkLimitExceededError } from './CommitCoordinator.j
 import { GraphStore } from './GraphStore.js'
 import { addUsage, retryDelayMs } from './UsageMath.js'
 import { LaneManager } from './LaneManager.js'
-import { NodeExecutorRegistry, type NodeExecutionResult } from './NodeExecutors.js'
+import { DEFAULT_AGENT_SEGMENT_BUDGET_USD, NodeExecutorRegistry, type NodeExecutionResult } from './NodeExecutors.js'
 import type { CapabilityPackRegistry } from '../registry/CapabilityPack.js'
 import {
   graphProgressIdentity,
@@ -107,14 +107,19 @@ export class GraphKernel {
     const now = this.now()
     let snapshot = await this.options.store.snapshot()
     if (isTerminal(snapshot.instance)) return emptyResult(snapshot.instance)
-    if (this.options.graph.limits.maxWallTimeMs !== undefined && now - snapshot.instance.createdAt > this.options.graph.limits.maxWallTimeMs) {
+    if (this.options.graph.limits.maxWallTimeMs !== undefined && now - snapshot.instance.createdAt >= this.options.graph.limits.maxWallTimeMs) {
       const instance = await this.options.store.setStatus('failed', 'maxWallTimeMs exceeded', now)
       return { ...emptyResult(instance), failed: 1 }
     }
 
     const recoveredResults = await this.coordinator.recoverPrepared(now)
     for (const recovered of recoveredResults) {
-      if (recovered.duplicate) continue
+      if (recovered.duplicate || recovered.replayed) continue
+      for (const child of recovered.spawned) {
+        if (this.options.graph.nodes[child.nodeId]?.type === 'join') {
+          await this.coordinator.resumeDue(now, { name: `join:${child.nodeId}`, correlation: child.forkGroupId ?? null })
+        }
+      }
       this.emitProgress({
         type: 'phase_completed',
         ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, recovered.activation, now),
@@ -161,14 +166,18 @@ export class GraphKernel {
       const live = await this.options.store.snapshot()
       let result: NodeExecutionResult
       try {
-        result = await this.executeWithHeartbeat(activation, () => this.executor.execute(activation, live))
+        result = await this.executeWithHeartbeat(activation, signal => this.executor.execute(activation, live, signal))
       } catch (error) {
+        const afterError = await this.options.store.snapshot().catch(() => null)
+        if (afterError && afterError.instance.status !== 'active' && afterError.instance.status !== 'waiting') {
+          return 'superseded' as const
+        }
         const node = this.options.graph.nodes[activation.nodeId]
         // The executor threw before reporting usage. For Agent nodes reserve
         // the segment budget as unknown cost so maxCostUsd cannot be pierced
         // by repeated crash-and-retry cycles.
         const reservedUsage = node?.type === 'agent'
-          ? { turns: 0, costUsd: node.budget?.usd ?? 2, durationMs: 0 }
+          ? { turns: 0, costUsd: node.budget?.usd ?? DEFAULT_AGENT_SEGMENT_BUDGET_USD, durationMs: 0 }
           : undefined
         if (this.options.signal?.aborted) {
           result = { kind: 'retry', reason: `Graph execution interrupted: ${message(error)}`, consumeAttempt: false }
@@ -197,11 +206,13 @@ export class GraphKernel {
         if (result.value === 'committed') committed++
         else if (result.value === 'parked') parked++
         else if (result.value === 'retried') retried++
+        else if (result.value === 'superseded') continue
         else failed++
       } else {
         const live = await this.options.store.snapshot()
         const activation = live.activations.get(claims[i]!.id)
-        if (activation?.status === 'cancelled' || activation?.status === 'succeeded') continue
+        if (activation?.status === 'cancelled' || activation?.status === 'succeeded' ||
+            live.instance.status === 'paused' || isTerminal(live.instance)) continue
         kernelFailures.push(result.reason)
         failed++
       }
@@ -275,49 +286,6 @@ export class GraphKernel {
 
   private async finishActivation(activation: ActivationRecord, result: NodeExecutionResult): Promise<'committed' | 'parked' | 'retried' | 'fatal'> {
     if (!activation.lease) throw new Error(`activation '${activation.id}' has no lease`)
-    if (result.kind === 'completed' && this.options.graph.concurrency?.stateConsistency === 'serializable') {
-      const latest = await this.options.store.snapshot()
-      const stateAdvanced = (activation.executionStateVersion ?? activation.inputStateVersion) !== latest.state.version
-      const replays = activation.replayCount ?? 0
-      if (stateAdvanced && replays >= MAX_SERIALIZABLE_REPLAYS) {
-        // Livelock guard: state kept advancing under this Activation for
-        // every replay. Fail it deterministically (fall through to commit)
-        // instead of spinning.
-        result = {
-          kind: 'completed',
-          outcome: 'failure',
-          output: { error: `serializable replay limit ${MAX_SERIALIZABLE_REPLAYS} exceeded` },
-          summary: `Serializable replay limit ${MAX_SERIALIZABLE_REPLAYS} exceeded`,
-          usage: result.usage,
-        }
-      } else if (stateAdvanced) {
-        const replay = await this.coordinator.retry({
-          activationId: activation.id,
-          leaseToken: activation.lease.token,
-          reason: `State advanced from v${activation.executionStateVersion ?? activation.inputStateVersion} to v${latest.state.version}; replaying under serializable policy`,
-          usage: result.usage,
-          consumeAttempt: false,
-          // First conflict replays immediately; repeated conflicts back off
-          // exponentially so a contended graph converges instead of spinning.
-          delayMs: replays === 0 ? 0 : Math.min(5_000, 50 * 2 ** Math.min(replays, 6)),
-          now: this.now(),
-        })
-        if (replay.wakeAt !== undefined) await this.wakeStore.schedule({
-          loopId: this.options.store.instanceId,
-          activationId: replay.id,
-          kind: 'timer',
-          fireAt: replay.wakeAt,
-        })
-        this.emitProgress({
-          type: 'phase_retrying',
-          ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, replay, this.now()),
-          reason: replay.error ?? 'State changed; replaying under serializable policy',
-          replay: true,
-          ...(replay.wakeAt !== undefined ? { wakeAt: replay.wakeAt } : {}),
-        })
-        return 'retried'
-      }
-    }
     if (result.kind === 'retry') {
       const retry = await this.coordinator.retry({
         activationId: activation.id,
@@ -403,6 +371,9 @@ export class GraphKernel {
     const intent = await this.options.store.prepareCommit({
       activationId: activation.id,
       leaseToken: activation.lease.token,
+      ...(this.options.graph.concurrency?.stateConsistency === 'serializable'
+        ? { expectedStateVersion: activation.executionStateVersion ?? activation.inputStateVersion }
+        : {}),
       outcome: result.outcome,
       output: result.output,
       usage: result.usage,
@@ -410,6 +381,15 @@ export class GraphKernel {
       now: this.now(),
     })
     const committed = await this.coordinator.commit(intent, this.now())
+    if (committed.replayed) {
+      this.emitProgress({
+        type: 'phase_retrying',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, committed.activation, this.now()),
+        reason: committed.activation.error ?? 'State changed; replaying under serializable policy',
+        replay: true,
+      })
+      return 'retried'
+    }
     for (const child of committed.spawned) {
       if (this.options.graph.nodes[child.nodeId]?.type === 'join') {
         await this.coordinator.resumeDue(this.now(), { name: `join:${child.nodeId}`, correlation: child.forkGroupId ?? null })
@@ -464,8 +444,13 @@ export class GraphKernel {
     }
   }
 
-  private async executeWithHeartbeat<T>(activation: ActivationRecord, execute: () => Promise<T>): Promise<T> {
+  private async executeWithHeartbeat<T>(activation: ActivationRecord, execute: (signal: AbortSignal) => Promise<T>): Promise<T> {
     if (!activation.lease) throw new Error(`activation '${activation.id}' has no lease`)
+    const controller = new AbortController()
+    const upstream = this.options.signal
+    const abortFromUpstream = (): void => controller.abort(upstream?.reason)
+    if (upstream?.aborted) abortFromUpstream()
+    else upstream?.addEventListener('abort', abortFromUpstream, { once: true })
     let lost = false
     let refreshing = false
     let heartbeatInFlight: Promise<void> | undefined
@@ -481,24 +466,30 @@ export class GraphKernel {
       )
         .then(owned => {
           // A definitive "not owned" answer is authoritative; discard the segment.
-          if (!owned) lost = true
+          if (!owned) {
+            lost = true
+            controller.abort(new Error(`activation lease lost for '${activation.id}'`))
+          }
           else consecutiveFailures = 0
         })
         .catch(() => {
           // Transient I/O or lock contention must not discard a whole finished
           // segment. Only give up after repeated consecutive failures.
           consecutiveFailures++
-          if (consecutiveFailures >= HEARTBEAT_FAILURE_TOLERANCE) lost = true
+          if (consecutiveFailures >= HEARTBEAT_FAILURE_TOLERANCE) {
+            lost = true
+            controller.abort(new Error(`activation heartbeat failed for '${activation.id}'`))
+          }
         })
         .finally(() => {
           refreshing = false
           if (heartbeatInFlight === heartbeat) heartbeatInFlight = undefined
         })
       heartbeatInFlight = heartbeat
-    }, this.options.activationHeartbeatMs ?? 60_000)
+    }, this.options.activationHeartbeatMs ?? DEFAULT_ACTIVATION_HEARTBEAT_MS)
     timer.unref?.()
     try {
-      const result = await execute()
+      const result = await execute(controller.signal)
       clearInterval(timer)
       const pendingHeartbeat = heartbeatInFlight
       if (pendingHeartbeat) await pendingHeartbeat
@@ -506,6 +497,7 @@ export class GraphKernel {
       return result
     } finally {
       clearInterval(timer)
+      upstream?.removeEventListener('abort', abortFromUpstream)
       // A heartbeat may already have entered GraphStore when the Agent segment
       // finishes. Drain it before returning so no background projection write
       // can race the next Activation, process shutdown, or workspace cleanup.
@@ -561,8 +553,8 @@ export class GraphKernel {
   private now(): number { return this.options.now?.() ?? Date.now() }
 }
 
-const MAX_SERIALIZABLE_REPLAYS = 50
 const HEARTBEAT_FAILURE_TOLERANCE = 3
+const DEFAULT_ACTIVATION_HEARTBEAT_MS = 10_000
 
 function verifyCapabilityLock<T extends { manifest: { id: string; version: string; integrity: string } }>(
   refs: FrozenCapabilityRef[],

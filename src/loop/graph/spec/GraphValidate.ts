@@ -16,7 +16,7 @@ import type {
 import { validateGraphAbiShape } from './GraphAbiValidate.js'
 
 const ID_RE = /^[A-Za-z][A-Za-z0-9_-]{0,127}$/
-const ROOT_RE = /^\$(state|input|output|event|effect|clock)(\.|$)/
+const ROOT_RE = /^\$(state|input|output|clock)(\.|$)/
 
 export interface GraphCapabilityRegistries {
   functions: CapabilityRegistry<FunctionProvider>
@@ -31,7 +31,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
   if (!spec || typeof spec !== 'object') return ['graph must be an object']
   const abi = validateGraphAbiShape(spec)
   errors.push(...abi)
-  if (abi.some(error => /must be an? (object|array)$/.test(error))) return errors
+  if (abi.length) return errors
   if (spec.schemaVersion !== 'graph-2.0') errors.push("schemaVersion must be 'graph-2.0'")
   validateId(spec.id, 'id', errors)
   if (!Number.isInteger(spec.version) || spec.version < 1) errors.push('version must be a positive integer')
@@ -39,8 +39,8 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
   if (!Number.isInteger(spec.limits?.maxActivations) || spec.limits.maxActivations < 1) errors.push('limits.maxActivations must be a positive integer')
   positive(spec.limits?.maxWallTimeMs, 'limits.maxWallTimeMs', errors)
   positive(spec.limits?.maxCostUsd, 'limits.maxCostUsd', errors)
-  positive(spec.limits?.maxFanOut, 'limits.maxFanOut', errors)
-  positive(spec.limits?.maxPendingTimers, 'limits.maxPendingTimers', errors)
+  positiveInteger(spec.limits?.maxFanOut, 'limits.maxFanOut', errors)
+  positiveInteger(spec.limits?.maxPendingTimers, 'limits.maxPendingTimers', errors)
   positiveInteger(spec.concurrency?.maxActivations, 'concurrency.maxActivations', errors)
   positiveInteger(spec.concurrency?.maxPerNode, 'concurrency.maxPerNode', errors)
   if (spec.concurrency?.stateConsistency !== undefined && !['commit_latest', 'serializable'].includes(spec.concurrency.stateConsistency)) {
@@ -92,20 +92,27 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
     for (const target of transitionTargets(transition)) {
       if (!target || typeof target.node !== 'string' || !nodeIds.has(target.node)) errors.push(`${at}.to references unknown node '${String(target?.node)}'`)
       validateBindings(target?.inputs, `${at}.to.inputs`, registries, errors)
+      for (const [name, expression] of Object.entries(target?.inputs ?? {})) {
+        validateStrictOutputBinding(expression, spec.nodes?.[transition.from], transition.on ?? 'success', `${at}.to.inputs.${name}`, errors)
+      }
     }
     if (transition.default && transition.when) errors.push(`${at} cannot set both default and when`)
     if (transition.default && transition.priority !== undefined) errors.push(`${at}.default must not set priority`)
     if (transition.when !== undefined) {
       if (typeof transition.when !== 'string') errors.push(`${at}.when must be a string`)
       else try {
-        for (const ref of compileCondition(transition.when).refs) validateConditionRef(ref, spec, `${at}.when`, errors)
+        for (const ref of compileCondition(transition.when).refs) validateConditionRef(ref, spec, transition.from, `${at}.when`, errors)
       } catch (error) { errors.push(`${at}.when: ${message(error)}`) }
     }
     for (const [updateIndex, update] of (transition.updates ?? []).entries()) {
       const updateAt = `${at}.updates[${updateIndex}]`
       if (!(update.target in (spec.state ?? {}))) errors.push(`${updateAt} targets unknown state '${update.target}'`)
       if (!registries.reducers.has(update.reducer)) errors.push(`${updateAt} references unknown reducer '${update.reducer}'`)
-      for (const [argIndex, arg] of (update.args ?? []).entries()) validateValue(arg, `${updateAt}.args[${argIndex}]`, registries, errors)
+      for (const [argIndex, arg] of (update.args ?? []).entries()) {
+        const argAt = `${updateAt}.args[${argIndex}]`
+        validateValue(arg, argAt, registries, errors)
+        validateStrictOutputBinding(arg, spec.nodes?.[transition.from], transition.on ?? 'success', argAt, errors)
+      }
     }
   }
 
@@ -141,7 +148,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
     if (!nodeIds.has(entry.node)) errors.push(`entrypoints[${index}].node references unknown node '${entry.node}'`)
     validateBindings(entry.inputs, `entrypoints[${index}].inputs`, registries, errors)
     // Entrypoint bindings are evaluated at instance creation with only $state
-    // in scope; $input/$output/$event/$effect/$clock do not exist yet.
+    // in scope; $input/$output/$clock do not exist yet.
     const entryRoots = new Set<string>()
     for (const expression of Object.values(entry.inputs ?? {})) collectRefRoots(expression, entryRoots)
     for (const root of entryRoots) if (root !== 'state') {
@@ -149,8 +156,19 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
     }
   }
   for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) if (node.type === 'join') {
-    for (const expected of node.expects ?? []) if (!transitionIds.has(expected)) errors.push(`nodes.${nodeId}.expects references unknown transition '${expected}'`)
+    const incoming = new Set((spec.transitions ?? [])
+      .filter(transition => transitionTargets(transition).some(target => target?.node === nodeId))
+      .map(transition => transition.id))
+    const expected = new Set<string>()
+    for (const id of node.expects ?? []) {
+      if (expected.has(id)) errors.push(`nodes.${nodeId}.expects duplicates transition '${id}'`)
+      expected.add(id)
+      if (!transitionIds.has(id)) errors.push(`nodes.${nodeId}.expects references unknown transition '${id}'`)
+      else if (!incoming.has(id)) errors.push(`nodes.${nodeId}.expects transition '${id}' does not target this Join`)
+    }
+    for (const id of incoming) if (!expected.has(id)) errors.push(`nodes.${nodeId}.expects must include incoming transition '${id}'`)
   }
+  if ((spec.entrypoints?.length ?? 0) > spec.limits.maxActivations) errors.push('entrypoints exceed limits.maxActivations')
   validateReachability(spec, errors)
   validateTerminalReachability(spec, errors)
   validateInputSupply(spec, errors)
@@ -285,7 +303,10 @@ function validateNode(nodeId: string, node: NodeSpec, spec: LoopGraphSpec, regis
       positiveInteger(node.timerPolicy?.maxParks, `${at}.timerPolicy.maxParks`, errors)
       if (node.timerPolicy?.allowHardPark) {
         if (spec.lanes[node.lane]?.context !== 'persistent') errors.push(`${at}.timerPolicy.allowHardPark requires a persistent Lane`)
-        for (const [value, name] of [[node.budget?.turns, 'budget.turns'], [node.budget?.usd, 'budget.usd'], [node.budget?.wallTimeMs, 'budget.wallTimeMs'], [node.lifetimeBudget?.turns, 'lifetimeBudget.turns'], [node.lifetimeBudget?.usd, 'lifetimeBudget.usd'], [node.lifetimeBudget?.elapsedMs, 'lifetimeBudget.elapsedMs'], [node.timerPolicy.maxDelayMs, 'timerPolicy.maxDelayMs'], [node.timerPolicy.maxParks, 'timerPolicy.maxParks']] as const) {
+        // Segment execution already has conservative runtime defaults. Only
+        // the two durable-wait bounds are required; authored budget overrides
+        // remain optional so Distill need not manufacture eight numbers.
+        for (const [value, name] of [[node.timerPolicy.maxDelayMs, 'timerPolicy.maxDelayMs'], [node.timerPolicy.maxParks, 'timerPolicy.maxParks']] as const) {
           if (value === undefined) errors.push(`${at}.${name} is required when hard park is enabled`)
         }
       }
@@ -306,8 +327,11 @@ function validateNode(nodeId: string, node: NodeSpec, spec: LoopGraphSpec, regis
       if (node.wait.kind === 'timer') validateValue(node.wait.delayMs, `${at}.wait.delayMs`, registries, errors)
       else {
         if (typeof node.wait.event !== 'string' || !node.wait.event.trim()) errors.push(`${at}.wait.event must be non-empty`)
+        else if (node.wait.event.length > 256) errors.push(`${at}.wait.event exceeds 256 characters`)
+        positive(node.wait.timeoutMs, `${at}.wait.timeoutMs`, errors)
         if (node.wait.correlation) validateValue(node.wait.correlation, `${at}.wait.correlation`, registries, errors)
       }
+      if (node.wait.kind === 'timer') positive(node.wait.maxDelayMs, `${at}.wait.maxDelayMs`, errors)
       break
     case 'join':
       if (!['all', 'any'].includes(node.mode)) errors.push(`${at}.mode is invalid`)
@@ -353,7 +377,7 @@ function validateWorkspaceOwnership(spec: LoopGraphSpec, errors: string[]): void
 function requiredOutcomes(node: NodeSpec): string[] {
   if (node.type === 'terminal') return node.status === 'paused' ? ['resume'] : []
   if (node.type === 'wait') return node.wait.kind === 'timer' ? ['timer', 'failure'] : ['event', ...(node.wait.timeoutMs !== undefined ? ['timeout'] : []), 'failure']
-  if (node.type === 'join') return ['success']
+  if (node.type === 'join') return ['success', ...(node.timeoutMs !== undefined ? ['timeout'] : [])]
   return ['success', 'failure']
 }
 
@@ -401,13 +425,67 @@ function validateValue(value: ValueExpression | undefined, at: string, registrie
   }
 }
 
-function validateConditionRef(ref: string, spec: LoopGraphSpec, at: string, errors: string[]): void {
+/** Conditions deliberately treat a missing optional field as a non-match, but
+ * transition bindings are strict: resolveReference throws when a path is
+ * absent. Require every nested $output binding to be guaranteed by the source
+ * success schema so an ABI-valid graph cannot fail between routing and target
+ * activation. Failure/always payloads have no declared structured schema; only
+ * the whole $output value is safe there. */
+function validateStrictOutputBinding(
+  value: ValueExpression | undefined,
+  source: NodeSpec | undefined,
+  outcome: string,
+  at: string,
+  errors: string[],
+  depth = 0,
+): void {
+  if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 20) return
+  if ('ref' in value && typeof value.ref === 'string' && value.ref.startsWith('$output.')) {
+    if (outcome !== 'success') {
+      errors.push(`${at}.ref '${value.ref}' is not guaranteed for '${outcome}' output; bind the whole $output or a literal`)
+    } else {
+      const shape = source && (source.type === 'agent' || source.type === 'function') ? source.outputSchema : undefined
+      const path = value.ref.slice('$output.'.length).split('.')
+      if (!shape || !shapeRequiresPath(shape, path)) {
+        errors.push(`${at}.ref '${value.ref}' is strict but the source outputSchema does not require that path`)
+      }
+    }
+  }
+  if ('call' in value) for (const [index, argument] of (Array.isArray(value.args) ? value.args : []).entries()) {
+    validateStrictOutputBinding(argument, source, outcome, `${at}.args[${index}]`, errors, depth + 1)
+  }
+}
+
+function validateConditionRef(ref: string, spec: LoopGraphSpec, sourceNodeId: string, at: string, errors: string[]): void {
   const root = ref.split('.')[0]
-  if (!['state', 'input', 'output', 'event', 'effect', 'clock'].includes(root!)) errors.push(`${at} uses unsupported root '${root}'`)
+  if (!['state', 'input', 'output', 'clock'].includes(root!)) errors.push(`${at} uses unsupported root '${root}'`)
   if (root === 'state') {
     const name = ref.split('.')[1]
     if (!name || !(name in (spec.state ?? {}))) errors.push(`${at} references undeclared state '$${ref}'`)
   }
+  if (root === 'output') {
+    const node = spec.nodes?.[sourceNodeId]
+    const shape = node && (node.type === 'agent' || node.type === 'function') ? node.outputSchema : undefined
+    const path = ref.split('.').slice(1)
+    if (shape?.type === 'object' && shape.additionalProperties === false && path.length && !shapeContainsPath(shape, path)) {
+      errors.push(`${at} references undeclared closed output '$${ref}'`)
+    }
+  }
+}
+
+function shapeContainsPath(shape: ShapeSpec, path: string[]): boolean {
+  if (!path.length) return true
+  if (shape.type !== 'object') return false
+  const child = shape.properties?.[path[0]!]
+  return child !== undefined && shapeContainsPath(child, path.slice(1))
+}
+
+function shapeRequiresPath(shape: ShapeSpec, path: string[]): boolean {
+  if (!path.length) return true
+  if (shape.type !== 'object') return false
+  const name = path[0]!
+  const child = shape.properties?.[name]
+  return child !== undefined && (shape.required ?? []).includes(name) && shapeRequiresPath(child, path.slice(1))
 }
 
 function validateShapeSpec(value: unknown, at: string, depth = 0): string[] {
@@ -416,11 +494,37 @@ function validateShapeSpec(value: unknown, at: string, depth = 0): string[] {
   const type = value.type
   if (!['object', 'array', 'string', 'number', 'integer', 'boolean', 'null'].includes(String(type))) return [`${at}.type is invalid`]
   const errors: string[] = []
+  const allowed: Record<string, string[]> = {
+    object: ['type', 'required', 'properties', 'additionalProperties'],
+    array: ['type', 'minItems', 'items'],
+    string: ['type', 'minLength', 'enum'],
+    number: ['type', 'minimum', 'maximum'],
+    integer: ['type', 'minimum', 'maximum'],
+    boolean: ['type'], null: ['type'],
+  }
+  for (const key of Object.keys(value)) if (!allowed[String(type)]!.includes(key)) errors.push(`${at}.${key} is not part of ShapeSpec type '${String(type)}'`)
   if (type === 'object') {
     if (value.properties !== undefined && !plain(value.properties)) errors.push(`${at}.properties must be an object`)
+    if (value.required !== undefined && (!Array.isArray(value.required) || value.required.some(item => typeof item !== 'string'))) errors.push(`${at}.required must be a string array`)
+    if (value.additionalProperties !== undefined && typeof value.additionalProperties !== 'boolean') errors.push(`${at}.additionalProperties must be a boolean`)
+    const required = Array.isArray(value.required) ? value.required.filter(item => typeof item === 'string') : []
+    if (new Set(required).size !== required.length) errors.push(`${at}.required must not contain duplicates`)
+    for (const name of required) if (!plain(value.properties) || !(name in value.properties)) errors.push(`${at}.required references missing property '${name}'`)
     for (const [key, child] of Object.entries(plain(value.properties) ? value.properties : {})) errors.push(...validateShapeSpec(child, `${at}.properties.${key}`, depth + 1))
   }
-  if (type === 'array' && value.items !== undefined) errors.push(...validateShapeSpec(value.items, `${at}.items`, depth + 1))
+  if (type === 'array') {
+    nonNegativeInteger(value.minItems, `${at}.minItems`, errors)
+    if (value.items !== undefined) errors.push(...validateShapeSpec(value.items, `${at}.items`, depth + 1))
+  }
+  if (type === 'string') {
+    nonNegativeInteger(value.minLength, `${at}.minLength`, errors)
+    if (value.enum !== undefined && (!Array.isArray(value.enum) || value.enum.some(item => typeof item !== 'string'))) errors.push(`${at}.enum must be a string array`)
+  }
+  if (type === 'number' || type === 'integer') {
+    finite(value.minimum, `${at}.minimum`, errors)
+    finite(value.maximum, `${at}.maximum`, errors)
+    if (typeof value.minimum === 'number' && typeof value.maximum === 'number' && value.minimum > value.maximum) errors.push(`${at}.minimum must be <= maximum`)
+  }
   return errors
 }
 
@@ -432,6 +536,8 @@ function stable(value: unknown): string { if (Array.isArray(value)) return `[${v
 function validateId(value: unknown, at: string, errors: string[]): void { if (typeof value !== 'string' || !ID_RE.test(value)) errors.push(`${at} must match ${ID_RE}`) }
 function positive(value: unknown, at: string, errors: string[]): void { if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value) || value <= 0)) errors.push(`${at} must be positive`) }
 function positiveInteger(value: unknown, at: string, errors: string[]): void { if (value !== undefined && (!Number.isInteger(value) || Number(value) <= 0)) errors.push(`${at} must be a positive integer`) }
+function nonNegativeInteger(value: unknown, at: string, errors: string[]): void { if (value !== undefined && (!Number.isInteger(value) || Number(value) < 0)) errors.push(`${at} must be a non-negative integer`) }
+function finite(value: unknown, at: string, errors: string[]): void { if (value !== undefined && (typeof value !== 'number' || !Number.isFinite(value))) errors.push(`${at} must be a finite number`) }
 function instruction(value: unknown, at: string, errors: string[]): void { if (typeof value !== 'string' || !value.trim()) errors.push(`${at} must be non-empty`); else if (Buffer.byteLength(value, 'utf8') > 32768) errors.push(`${at} exceeds 32768 bytes`) }
 function safeRelativePath(path: unknown): path is string { return typeof path === 'string' && Boolean(path) && !path.startsWith('/') && !path.startsWith('\\') && !path.split(/[\\/]/).some(part => !part || part === '.' || part === '..') }
 function safePath(path: unknown): path is string { return safeRelativePath(path) && !['.loop', '.git', '.meta-agent'].includes(path.split(/[\\/]/)[0]!) }

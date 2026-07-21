@@ -1,4 +1,5 @@
 import type { MetaAgentEvent } from '../../../core/types.js'
+import type { LoopGraphSpec } from '../spec/GraphTypes.js'
 
 export type GraphDistillPhase = 'architect' | 'compiler' | 'semantic_review'
 
@@ -12,6 +13,14 @@ export interface GraphDistillModelRequest {
   allowedTools: readonly string[]
   maxTurns: number
   maxBudgetUsd: number
+  /** Distill is a bounded compiler, so reasoning is explicit per phase instead
+   * of inheriting the foreground Agent's unbounded/adaptive default. Zero
+   * disables provider-visible extended thinking. */
+  thinkingBudgetTokens?: number
+  /** Hard per-call output ceiling selected by the Distill phase policy. */
+  maxOutputTokens?: number
+  /** Hard wall-clock ceiling for one foreground phase call. */
+  maxWallTimeMs?: number
   signal: AbortSignal
 }
 
@@ -20,6 +29,9 @@ export interface GraphDistillModelResult {
   output?: unknown
   summary?: string
   error?: string
+  /** Last complete graph accepted by graph_validate during this call. This is
+   * executable evidence, not model prose, and may anchor a retry. */
+  validatedGraph?: LoopGraphSpec
 }
 
 /** Model boundary used by Distill. It is intentionally independent from the
@@ -54,15 +66,56 @@ export class ForegroundGraphDistillExecutor implements GraphDistillExecutor {
   constructor(private readonly options: ForegroundGraphDistillExecutorOptions) {}
 
   async execute(request: GraphDistillModelRequest): Promise<GraphDistillModelResult> {
+    const scoped = scopeRequestSignal(request)
+    try {
+      const result = await this.executeScoped(scoped.request)
+      // A phase-local wall deadline is a retryable compiler failure, not a
+      // user cancellation. Keeping it as `cancelled` made GraphDistiller abort
+      // all remaining attempts after the first slow response. The interrupted
+      // conversation is no longer a safe repair anchor, so replace it on retry.
+      const normalized = scoped.timedOut() && result.status === 'cancelled'
+        ? { ...result, status: 'failed' as const, error: abortReason(scoped.request.signal) }
+        : result
+      if (request.sessionKey && normalized.status !== 'completed') {
+        await this.discardSession(request.sessionKey)
+      }
+      return normalized
+    } finally {
+      scoped.dispose()
+    }
+  }
+
+  private async executeScoped(request: GraphDistillModelRequest): Promise<GraphDistillModelResult> {
     if (request.signal.aborted) return { status: 'cancelled', error: abortReason(request.signal) }
     const session = request.sessionKey
       ? await this.persistentSession(request.sessionKey, request)
       : await this.options.createSession(request)
+    // The caller may abort while an async session factory is resolving. An
+    // AbortSignal does not replay an already-fired event to a listener added
+    // later, so re-check before entering submit/runSession.
+    if (request.signal.aborted) {
+      session.interrupt()
+      if (!request.sessionKey) await session.dispose().catch(() => undefined)
+      return { status: 'cancelled', error: abortReason(request.signal) }
+    }
     const onAbort = (): void => session.interrupt()
     request.signal.addEventListener('abort', onAbort, { once: true })
     if (this.options.runSession) {
       try {
-        return await this.options.runSession(session, request)
+        const result = await this.options.runSession(session, request)
+        return request.signal.aborted
+          // A graph_validate callback may have produced a frozen candidate
+          // before the model spent too long formatting its final envelope.
+          // Preserve it across the timeout normalization so GraphDistiller can
+          // retry metadata only rather than rebuilding the graph.
+          ? {
+              status: 'cancelled',
+              output: result.output,
+              summary: result.summary,
+              error: abortReason(request.signal),
+              validatedGraph: result.validatedGraph,
+            }
+          : result
       } catch (error) {
         return {
           status: request.signal.aborted ? 'cancelled' : 'failed',
@@ -116,6 +169,41 @@ export class ForegroundGraphDistillExecutor implements GraphDistillExecutor {
     const created = await this.options.createSession(request)
     this.sessions.set(key, created)
     return created
+  }
+
+  private async discardSession(key: string): Promise<void> {
+    const session = this.sessions.get(key)
+    if (!session) return
+    this.sessions.delete(key)
+    await session.dispose().catch(() => undefined)
+  }
+}
+
+function scopeRequestSignal(request: GraphDistillModelRequest): {
+  request: GraphDistillModelRequest
+  timedOut(): boolean
+  dispose(): void
+} {
+  if (!request.maxWallTimeMs || request.maxWallTimeMs <= 0) {
+    return { request, timedOut: () => false, dispose() {} }
+  }
+  const controller = new AbortController()
+  let phaseTimedOut = false
+  const relayAbort = (): void => controller.abort(request.signal.reason)
+  request.signal.addEventListener('abort', relayAbort, { once: true })
+  if (request.signal.aborted) relayAbort()
+  const timer = setTimeout(() => {
+    phaseTimedOut = true
+    controller.abort(new Error(`foreground Distill ${request.phase} exceeded ${request.maxWallTimeMs}ms wall-time limit`))
+  }, request.maxWallTimeMs)
+  timer.unref?.()
+  return {
+    request: { ...request, signal: controller.signal },
+    timedOut: () => phaseTimedOut,
+    dispose() {
+      clearTimeout(timer)
+      request.signal.removeEventListener('abort', relayAbort)
+    },
   }
 }
 

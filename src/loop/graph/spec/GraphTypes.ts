@@ -411,13 +411,16 @@ export interface ActivationCommitIntent {
   activationId: string
   continuationVersion: number
   leaseToken: string
+  /** State version that must still be authoritative when this intent commits. */
+  expectedStateVersion?: number
   outcome: string
   output: JsonValue
   /** Concise operator-facing completion summary, persisted with the commit. */
   summary?: string
   usage?: ActivationUsage
   createdAt: number
-  status: 'prepared' | 'committed'
+  status: 'prepared' | 'committed' | 'discarded'
+  discardReason?: string
   journalSequence?: number
 }
 

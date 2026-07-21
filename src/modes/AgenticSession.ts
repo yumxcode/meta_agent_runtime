@@ -103,6 +103,7 @@ export class AgenticSession {
       onMainCostUsd: resolved.onMainCostUsd,
       getAdditionalBudgetUsd: resolved.getAdditionalBudgetUsd,
       maxOutputTokens: resolved.maxTokens,
+      recoverMaxOutputTokens: resolved.recoverMaxOutputTokens,
       maxRetries: resolved.maxRetries,
       compact: {
         enabled: true,

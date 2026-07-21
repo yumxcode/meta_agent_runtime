@@ -7,6 +7,7 @@
 import { describe, expect, it } from 'vitest'
 import { join } from 'path'
 import { tmpdir } from 'os'
+import { mkdir, mkdtemp, rm, symlink } from 'node:fs/promises'
 import { wrapWithSandboxWriteGuard } from '../SubAgentRunner.js'
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
 
@@ -88,6 +89,27 @@ describe('wrapWithSandboxWriteGuard', () => {
       writeAllowPaths: [join(ROOT, 'drafts')],
     })
     expect((await invoke(tool, join(ROOT, 'drafts2', 'x.json'))).isError).toBe(true)
+  })
+
+  it('blocks a symbolic link from an allowed root into a denied root', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'sandbox-guard-'))
+    try {
+      await mkdir(join(root, 'work'))
+      await mkdir(join(root, '.loop'))
+      await symlink(join(root, '.loop'), join(root, 'work', 'control'))
+      const calls: string[] = []
+      const tool = wrapWithSandboxWriteGuard(writeTool(calls), root, {
+        readonlyWorkspace: true,
+        writeAllowPaths: [join(root, 'work')],
+        writeDenyPaths: [join(root, '.loop')],
+      })
+      const result = await invoke(tool, join(root, 'work', 'control', 'corrupt.json'))
+      expect(result.isError).toBe(true)
+      expect(String(result.content)).toMatch(/writeDenyPaths/)
+      expect(calls).toEqual([])
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('leaves non-write tools untouched', () => {

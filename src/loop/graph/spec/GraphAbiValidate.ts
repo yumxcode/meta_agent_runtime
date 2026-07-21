@@ -13,25 +13,37 @@ export function validateGraphAbiShape(value: unknown): string[] {
     'transitions', 'entrypoints', 'limits', 'concurrency', 'annotations',
     'capabilityLock', 'graphHash', 'frozenAt',
   ], 'graph', errors)
+  required(value, {
+    schemaVersion: 'string', id: 'string', version: 'number', goal: 'string',
+    state: 'object', lanes: 'object', nodes: 'object', transitions: 'array',
+    entrypoints: 'array', limits: 'object',
+  }, 'graph', errors)
+  optional(value, { capabilityPacks: 'array', concurrency: 'object', annotations: 'object' }, 'graph', errors)
   annotation(value.annotations, 'annotations', errors)
 
   eachRecord(value.state, 'state', errors, (item, at) => {
     keys(item, ['type', 'initial', 'description'], at, errors)
+    required(item, { type: 'object', initial: 'present' }, at, errors)
   })
   eachRecord(value.lanes, 'lanes', errors, (lane, at) => {
     keys(lane, ['context', 'workspace', 'maxConcurrency', 'description', 'agentProfile', 'scm', 'annotations'], at, errors)
+    required(lane, { context: 'string', workspace: 'object' }, at, errors)
     annotation(lane.annotations, `${at}.annotations`, errors)
     child(lane.agentProfile, `${at}.agentProfile`, errors, profile => keys(profile, ['systemInstructions'], `${at}.agentProfile`, errors))
     child(lane.workspace, `${at}.workspace`, errors, workspace => {
       keys(workspace, ['read', 'write', 'deny'], `${at}.workspace`, errors)
+      optional(workspace, { read: 'array', write: 'array', deny: 'array' }, `${at}.workspace`, errors)
       eachArray(workspace.write, `${at}.workspace.write`, errors, (rule, ruleAt) => {
         keys(rule, ['path', 'mode', 'schema', 'description'], ruleAt, errors)
+        required(rule, { path: 'string', mode: 'string' }, ruleAt, errors)
       })
     })
   })
   eachRecord(value.nodes, 'nodes', errors, (node, at) => validateNode(node, at, errors))
   eachArray(value.transitions, 'transitions', errors, (transition, at) => {
     keys(transition, ['id', 'from', 'on', 'when', 'default', 'priority', 'updates', 'to', 'annotations'], at, errors)
+    required(transition, { id: 'string', from: 'string', to: 'present' }, at, errors)
+    optional(transition, { updates: 'array' }, at, errors)
     annotation(transition.annotations, `${at}.annotations`, errors)
     eachArray(transition.updates, `${at}.updates`, errors, (update, updateAt) => {
       keys(update, ['target', 'reducer', 'args'], updateAt, errors)
@@ -41,9 +53,13 @@ export function validateGraphAbiShape(value: unknown): string[] {
   })
   eachArray(value.entrypoints, 'entrypoints', errors, (entry, at) => {
     keys(entry, ['id', 'node', 'inputs'], at, errors)
+    required(entry, { id: 'string', node: 'string' }, at, errors)
     expressions(entry.inputs, `${at}.inputs`, errors)
   })
-  child(value.limits, 'limits', errors, limits => keys(limits, ['maxActivations', 'maxWallTimeMs', 'maxCostUsd', 'maxFanOut', 'maxPendingTimers'], 'limits', errors))
+  child(value.limits, 'limits', errors, limits => {
+    keys(limits, ['maxActivations', 'maxWallTimeMs', 'maxCostUsd', 'maxFanOut', 'maxPendingTimers'], 'limits', errors)
+    required(limits, { maxActivations: 'number' }, 'limits', errors)
+  })
   child(value.concurrency, 'concurrency', errors, concurrency => keys(concurrency, ['maxActivations', 'maxPerNode', 'stateConsistency'], 'concurrency', errors))
   eachArray(value.capabilityPacks, 'capabilityPacks', errors, (pack, at) => keys(pack, ['id', 'version', 'integrity'], at, errors))
   return errors
@@ -60,22 +76,40 @@ function validateNode(node: Record<string, unknown>, at: string, errors: string[
     terminal: ['status', 'result'],
   }
   keys(node, [...base, ...(byType[String(node.type)] ?? [])], at, errors)
+  required(node, { type: 'string' }, at, errors)
   annotation(node.annotations, `${at}.annotations`, errors)
   expressions(node.inputs, `${at}.inputs`, errors)
   if (node.type === 'agent') {
+    required(node, { lane: 'string', prompt: 'string' }, at, errors)
+    optional(node, { tools: 'array', skills: 'array' }, at, errors)
+    strings(node.tools, `${at}.tools`, errors)
+    strings(node.skills, `${at}.skills`, errors)
     child(node.budget, `${at}.budget`, errors, budget => keys(budget, ['turns', 'usd', 'wallTimeMs'], `${at}.budget`, errors))
     child(node.lifetimeBudget, `${at}.lifetimeBudget`, errors, budget => keys(budget, ['turns', 'usd', 'elapsedMs'], `${at}.lifetimeBudget`, errors))
     child(node.timerPolicy, `${at}.timerPolicy`, errors, policy => keys(policy, ['allowHardPark', 'maxDelayMs', 'maxParks'], `${at}.timerPolicy`, errors))
   } else if (node.type === 'effect' && node.idempotencyKey !== undefined) {
+    required(node, { effect: 'string' }, at, errors)
     expression(node.idempotencyKey, `${at}.idempotencyKey`, errors)
+  } else if (node.type === 'effect') {
+    required(node, { effect: 'string' }, at, errors)
+  } else if (node.type === 'function') {
+    required(node, { function: 'string' }, at, errors)
   } else if (node.type === 'wait') {
+    required(node, { wait: 'object' }, at, errors)
     child(node.wait, `${at}.wait`, errors, wait => {
+      required(wait, { kind: 'string' }, `${at}.wait`, errors)
       keys(wait, wait.kind === 'timer' ? ['kind', 'delayMs', 'maxDelayMs'] : ['kind', 'event', 'correlation', 'timeoutMs'], `${at}.wait`, errors)
       if (wait.delayMs !== undefined) expression(wait.delayMs, `${at}.wait.delayMs`, errors)
       if (wait.correlation !== undefined) expression(wait.correlation, `${at}.wait.correlation`, errors)
     })
   } else if (node.type === 'terminal' && node.result !== undefined) {
+    required(node, { status: 'string' }, at, errors)
     expression(node.result, `${at}.result`, errors)
+  } else if (node.type === 'terminal') {
+    required(node, { status: 'string' }, at, errors)
+  } else if (node.type === 'join') {
+    required(node, { mode: 'string', expects: 'array' }, at, errors)
+    strings(node.expects, `${at}.expects`, errors)
   }
 }
 
@@ -110,6 +144,38 @@ function annotation(value: unknown, at: string, errors: string[]): void {
 function keys(value: Record<string, unknown>, allowed: string[], at: string, errors: string[]): void {
   const set = new Set(allowed)
   for (const key of Object.keys(value)) if (!set.has(key)) errors.push(`${at}.${key} is not part of the executable Graph ABI; put non-executable domain metadata under annotations`)
+}
+
+type RuntimeKind = 'string' | 'number' | 'object' | 'array' | 'present'
+
+function required(value: Record<string, unknown>, fields: Record<string, RuntimeKind>, at: string, errors: string[]): void {
+  for (const [name, kind] of Object.entries(fields)) {
+    if (!Object.prototype.hasOwnProperty.call(value, name)) {
+      errors.push(`${at}.${name} is required`)
+      continue
+    }
+    if (kind !== 'present' && !kindMatches(value[name], kind)) errors.push(`${at}.${name} must be ${article(kind)}${kind}`)
+  }
+}
+
+function optional(value: Record<string, unknown>, fields: Record<string, RuntimeKind>, at: string, errors: string[]): void {
+  for (const [name, kind] of Object.entries(fields)) {
+    if (value[name] !== undefined && kind !== 'present' && !kindMatches(value[name], kind)) errors.push(`${at}.${name} must be ${article(kind)}${kind}`)
+  }
+}
+
+function kindMatches(value: unknown, kind: RuntimeKind): boolean {
+  if (kind === 'array') return Array.isArray(value)
+  if (kind === 'object') return record(value)
+  return typeof value === kind
+}
+
+function article(kind: RuntimeKind): string { return kind === 'object' || kind === 'array' ? 'an ' : 'a ' }
+
+function strings(value: unknown, at: string, errors: string[]): void {
+  if (value === undefined) return
+  if (!Array.isArray(value)) return
+  value.forEach((item, index) => { if (typeof item !== 'string') errors.push(`${at}[${index}] must be a string`) })
 }
 
 function eachRecord(value: unknown, at: string, errors: string[], fn: (item: Record<string, unknown>, itemAt: string) => void): void {

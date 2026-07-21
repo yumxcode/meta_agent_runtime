@@ -60,9 +60,11 @@ export async function decideTransition(input: {
   }
   const state: GraphStateSnapshot = {
     ...input.state,
-    version: input.state.version + 1,
+    // State version is a concurrency token, not a transition counter. A route
+    // with no updates must not force unrelated serializable work to replay.
+    version: selected.updates?.length ? input.state.version + 1 : input.state.version,
     values,
-    updatedAt: input.now,
+    updatedAt: selected.updates?.length ? input.now : input.state.updatedAt,
   }
   const targets = transitionTargets(selected)
   const maxFanOut = input.graph.limits.maxFanOut ?? Number.POSITIVE_INFINITY

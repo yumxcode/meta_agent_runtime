@@ -198,6 +198,22 @@ describe('KernelLoop — stream error recovery', () => {
     }
   })
 
+  it('honours a strict caller output ceiling without escalating or continuing', async () => {
+    let call = 0
+    mockStream.mockImplementation(async function* () {
+      call++
+      yield* maxOutputTokensStream()
+    })
+
+    const session = new KernelSession(makeConfig({ recoverMaxOutputTokens: false }))
+    const events = await collectEvents(session, 'Hello')
+
+    expect(call).toBe(1)
+    const result = events.find(e => e.type === 'result')
+    expect(result?.subtype).toBe('error_max_output_tokens')
+    expect(result?.resultText).toContain("caller's strict output-token limit")
+  })
+
   it('enforces the shared budget against concurrent child reservations on a natural completion', async () => {
     mockStream.mockImplementation(async function* () {
       yield* textStream('would otherwise complete')

@@ -1279,6 +1279,11 @@ export async function* runKernelLoop(
 
       // 14b: max_output_tokens recovery
       if (isMaxOutputTokensStopReason(stopReason)) {
+        if (config.recoverMaxOutputTokens === false) {
+          resultText =
+            `${assistantText}\n\n[Stopped: the response reached the caller's strict output-token limit.]`
+          return done('max_output_tokens')
+        }
         if (
           state.maxOutputTokensOverride === undefined &&
           !RuntimeEnv.maxOutputTokensPinned()

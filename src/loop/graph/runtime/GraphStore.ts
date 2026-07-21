@@ -242,7 +242,9 @@ export class GraphStore {
       let runningTotal = [...snapshot.activations.values()].filter(a => a.status === 'running').length
       const claimed: ActivationRecord[] = []
       const ready = [...snapshot.activations.values()].filter(a => a.status === 'ready').sort(compareActivation)
-      const terminal = ready.find(activation => spec.nodes[activation.nodeId]?.type === 'terminal')
+      const terminal = ready
+        .filter(activation => spec.nodes[activation.nodeId]?.type === 'terminal')
+        .sort((a, b) => compareTerminalActivation(a, b, spec))[0]
       // A Terminal is a graph-wide barrier: never start it beside live work,
       // and once one is ready do not launch additional branches ahead of it.
       const candidates = terminal ? (runningTotal === 0 ? [terminal] : []) : ready
@@ -284,6 +286,7 @@ export class GraphStore {
   async heartbeat(activationIdValue: string, leaseToken: string, now = Date.now(), ttlMs = 10 * 60_000): Promise<boolean> {
     return this.withTransaction(async () => {
       const snapshot = await this.reconcileLocked()
+      if (snapshot.instance.status !== 'active') return false
       const activation = snapshot.activations.get(activationIdValue)
       if (activation?.status !== 'running' || activation.lease?.token !== leaseToken) return false
       const next = { ...activation, updatedAt: now, lease: { ...activation.lease, expiresAt: now + ttlMs } }
@@ -297,6 +300,7 @@ export class GraphStore {
   async prepareCommit(input: {
     activationId: string
     leaseToken: string
+    expectedStateVersion?: number
     outcome: string
     output: JsonValue
     summary?: string
@@ -311,13 +315,14 @@ export class GraphStore {
       }
       const commitKey = `${activation.id}:${activation.continuationVersion}`
       const existing = await readJsonFile<ActivationCommitIntent>(this.intentPath(commitKey))
-      if (existing) return existing
+      if (existing && existing.status !== 'discarded') return existing
       const intent: ActivationCommitIntent = {
         schemaVersion: 'graph-commit-intent-1.0',
         commitKey,
         activationId: activation.id,
         continuationVersion: activation.continuationVersion,
         leaseToken: input.leaseToken,
+        expectedStateVersion: input.expectedStateVersion,
         outcome: input.outcome,
         output: input.output,
         summary: input.summary,
@@ -333,7 +338,9 @@ export class GraphStore {
   async listPreparedIntents(): Promise<ActivationCommitIntent[]> {
     const ids = await listJsonIds(this.paths.intentsDir)
     const intents = await Promise.all(ids.map(id => readJsonFile<ActivationCommitIntent>(join(this.paths.intentsDir, `${id}.json`))))
-    return intents.filter((intent): intent is ActivationCommitIntent => intent?.status === 'prepared')
+    return intents
+      .filter((intent): intent is ActivationCommitIntent => intent?.status === 'prepared')
+      .sort((a, b) => a.createdAt - b.createdAt || a.commitKey.localeCompare(b.commitKey))
   }
 
   /** Persist the Effect operation before contacting the external provider. */
@@ -424,6 +431,32 @@ export class GraphStore {
       const snapshot = await this.reconcileLocked()
       if (snapshot.instance.status === 'done' || snapshot.instance.status === 'failed') return snapshot.instance
       if (snapshot.instance.status === status && snapshot.instance.statusReason === reason) return snapshot.instance
+      if (status === 'paused' || status === 'done' || status === 'failed') {
+        for (const activation of snapshot.activations.values()) {
+          let next: ActivationRecord | undefined
+          if (status === 'paused' && activation.status === 'running') {
+            next = {
+              ...activation,
+              status: 'ready',
+              lease: undefined,
+              readyReason: 'replay',
+              error: reason ?? 'graph paused',
+              updatedAt: now,
+            }
+          } else if (status !== 'paused' && ['ready', 'running', 'waiting'].includes(activation.status)) {
+            next = {
+              ...activation,
+              status: 'cancelled',
+              lease: undefined,
+              error: reason ?? `graph ${status}`,
+              updatedAt: now,
+            }
+          }
+          if (!next) continue
+          await this.appendEventLocked({ type: 'activation_released', at: now, activation: next, reason: `graph_${status}` })
+          await atomicWriteJson(this.activationPath(next.id), next)
+        }
+      }
       const instance: GraphInstanceRecord = { ...snapshot.instance, status, statusReason: reason, updatedAt: now }
       await this.appendEventLocked({ type: 'graph_status_changed', at: now, instance })
       await atomicWriteJson(this.paths.instanceJson, instance)
@@ -493,6 +526,15 @@ export class GraphStore {
     for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
     const intent = await readJsonFile<ActivationCommitIntent>(this.intentPath(event.commitKey))
     if (intent) await atomicWriteJson(this.intentPath(event.commitKey), { ...intent, status: 'committed', journalSequence: sequence })
+  }
+
+  /** Caller must hold withTransaction. A discarded intent may be recreated by its replay. */
+  async discardCommitIntentLocked(intent: ActivationCommitIntent, reason: string): Promise<void> {
+    await atomicWriteJson(this.intentPath(intent.commitKey), {
+      ...intent,
+      status: 'discarded',
+      discardReason: reason,
+    } satisfies ActivationCommitIntent)
   }
 
   /** Caller must hold withTransaction. */
@@ -721,6 +763,27 @@ function activationId(): string {
 
 function compareActivation(a: ActivationRecord, b: ActivationRecord): number {
   return a.createdAt - b.createdAt || a.id.localeCompare(b.id)
+}
+
+/** Stable, conservative arbitration for simultaneously-ready Terminals. */
+function compareTerminalActivation(a: ActivationRecord, b: ActivationRecord, graph: FrozenLoopGraphSpec): number {
+  const rank = (activation: ActivationRecord): number => {
+    const node = graph.nodes[activation.nodeId]
+    if (node?.type !== 'terminal') return 3
+    return node.status === 'failed' ? 0 : node.status === 'paused' ? 1 : 2
+  }
+  return rank(a) - rank(b) ||
+    a.nodeId.localeCompare(b.nodeId) ||
+    (a.sourceTransitionId ?? '').localeCompare(b.sourceTransitionId ?? '') ||
+    stableJson(a.input).localeCompare(stableJson(b.input)) ||
+    a.createdAt - b.createdAt ||
+    a.id.localeCompare(b.id)
+}
+
+function stableJson(value: JsonValue): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  return `{${Object.keys(value).sort().map(key => `${JSON.stringify(key)}:${stableJson(value[key]!)}`).join(',')}}`
 }
 
 export function newActivation(input: {

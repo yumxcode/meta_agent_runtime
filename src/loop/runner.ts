@@ -54,7 +54,8 @@ export async function prepareAndClaim(
       if (liveForLoop().length) await wakeStore.cancelForLoop(record.instanceId)
       continue
     }
-    const snapshot = await new GraphStore(deps.projectDir, record.instanceId).snapshot().catch(() => null)
+    const store = new GraphStore(deps.projectDir, record.instanceId)
+    const snapshot = await store.snapshot().catch(() => null)
     if (snapshot) {
       for (const activation of snapshot.activations.values()) {
         if (activation.status !== 'waiting' || activation.wakeAt === undefined) continue
@@ -65,6 +66,19 @@ export async function prepareAndClaim(
           activationId: activation.id,
           kind: 'timer',
           fireAt: activation.wakeAt,
+        }))
+      }
+      const graph = await store.loadSpec().catch(() => null)
+      const wallDeadline = graph?.limits.maxWallTimeMs === undefined
+        ? undefined
+        : record.createdAt + graph.limits.maxWallTimeMs
+      const deadlineWakeExists = liveForLoop().some(wake => wake.activationId === '__graph_deadline__')
+      if (wallDeadline !== undefined && !deadlineWakeExists) {
+        allWakes.push(await wakeStore.schedule({
+          loopId: record.instanceId,
+          activationId: '__graph_deadline__',
+          kind: 'timer',
+          fireAt: wallDeadline,
         }))
       }
     }
@@ -87,18 +101,37 @@ export async function runClaimedWake(
   wake: WakeRecord,
 ): Promise<TickOutcome> {
   let graphAdmission: HostAdmissionHandle | undefined
-  const heartbeat = setInterval(() => {
+  let graphAdmissionHeartbeat: ReturnType<typeof setInterval> | undefined
+  let graphAdmissionHeartbeatInFlight: Promise<void> | undefined
+  let graphAdmissionLost = false
+  let graphAdmissionHeartbeatFailures = 0
+  const wakeHeartbeat = setInterval(() => {
     void wakeStore.heartbeat(wake.wakeId, Date.now(), wake.claim?.token).catch(() => undefined)
   }, 60_000)
-  heartbeat.unref?.()
+  wakeHeartbeat.unref?.()
   try {
     if (deps.hostCoordinator && deps.workspaceIdentity) {
       graphAdmission = await deps.hostCoordinator.acquireGraphTick({
         workspaceId: deps.workspaceIdentity.workspaceId,
         instanceId: wake.loopId,
-        ...(wake.activationId && wake.activationId !== '__graph__' ? { activationId: wake.activationId } : {}),
+        ...(wake.activationId && !isGraphLevelWake(wake.activationId) ? { activationId: wake.activationId } : {}),
         wakeId: wake.wakeId,
       }, deps.signal ?? new AbortController().signal)
+      graphAdmissionHeartbeat = setInterval(() => {
+        if (!graphAdmission || graphAdmissionHeartbeatInFlight) return
+        const pending = graphAdmission.heartbeat()
+          .then(owned => {
+            if (!owned) graphAdmissionLost = true
+            else graphAdmissionHeartbeatFailures = 0
+          })
+          .catch(() => {
+            graphAdmissionHeartbeatFailures++
+            if (graphAdmissionHeartbeatFailures >= 3) graphAdmissionLost = true
+          })
+          .finally(() => { if (graphAdmissionHeartbeatInFlight === pending) graphAdmissionHeartbeatInFlight = undefined })
+        graphAdmissionHeartbeatInFlight = pending
+      }, deps.hostCoordinator.heartbeatIntervalMs)
+      graphAdmissionHeartbeat.unref?.()
     }
     const store = new GraphStore(deps.projectDir, wake.loopId)
     const snapshot = await store.snapshot().catch(() => null)
@@ -125,6 +158,8 @@ export async function runClaimedWake(
       signal: deps.signal,
     })
     const graphOutcome = await kernel.tick()
+    if (graphAdmissionHeartbeatInFlight) await graphAdmissionHeartbeatInFlight
+    if (graphAdmissionLost) throw new Error('host graph-tick admission lease was lost during execution')
     await wakeStore.release(wake.wakeId, 'done', { claimToken: wake.claim?.token })
     if (graphOutcome.instance.status === 'done' || graphOutcome.instance.status === 'failed') {
       await wakeStore.cancelForLoop(wake.loopId)
@@ -153,9 +188,15 @@ export async function runClaimedWake(
     await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
     return { loopId: wake.loopId, error: message }
   } finally {
-    clearInterval(heartbeat)
+    clearInterval(wakeHeartbeat)
+    if (graphAdmissionHeartbeat) clearInterval(graphAdmissionHeartbeat)
+    if (graphAdmissionHeartbeatInFlight) await graphAdmissionHeartbeatInFlight
     await graphAdmission?.release().catch(() => undefined)
   }
+}
+
+function isGraphLevelWake(activationId: string): boolean {
+  return activationId === '__graph__' || activationId === '__graph_deadline__'
 }
 
 function isDeterministicGraphError(error: unknown): boolean {

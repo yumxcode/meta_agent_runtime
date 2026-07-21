@@ -21,6 +21,8 @@ import type { GraphSnapshot, GraphStore } from './GraphStore.js'
 import type { LaneManager } from './LaneManager.js'
 import { retryDelayMs } from './UsageMath.js'
 
+export const DEFAULT_AGENT_SEGMENT_BUDGET_USD = 10
+
 export type NodeExecutionResult =
   | { kind: 'completed'; outcome: string; output: JsonValue; summary?: string; usage?: ActivationUsage }
   | { kind: 'retry'; reason: string; usage?: ActivationUsage; consumeAttempt: boolean; delayMs?: number }
@@ -51,11 +53,11 @@ export interface NodeExecutorDeps {
 export class NodeExecutorRegistry {
   constructor(private readonly deps: NodeExecutorDeps) {}
 
-  async execute(activation: ActivationRecord, snapshot: GraphSnapshot): Promise<NodeExecutionResult> {
+  async execute(activation: ActivationRecord, snapshot: GraphSnapshot, executionSignal?: AbortSignal): Promise<NodeExecutionResult> {
     const node = this.deps.graph.nodes[activation.nodeId]
     if (!node) throw new Error(`unknown node '${activation.nodeId}'`)
     switch (node.type) {
-      case 'agent': return this.executeAgent(node, activation, snapshot.state)
+      case 'agent': return this.executeAgent(node, activation, snapshot.state, executionSignal)
       case 'function': return this.executeFunction(node, activation, snapshot.state)
       case 'effect': return this.executeEffect(node, activation, snapshot.state)
       case 'wait': return this.executeWait(node, activation, snapshot.state)
@@ -64,7 +66,7 @@ export class NodeExecutorRegistry {
     }
   }
 
-  private async executeAgent(node: Extract<NodeSpec, { type: 'agent' }>, activation: ActivationRecord, state: GraphStateSnapshot): Promise<NodeExecutionResult> {
+  private async executeAgent(node: Extract<NodeSpec, { type: 'agent' }>, activation: ActivationRecord, state: GraphStateSnapshot, executionSignal?: AbortSignal): Promise<NodeExecutionResult> {
     if (!this.deps.graphAgent || !this.deps.lanes) {
       throw new Error('Agent node requires graph_agent and LaneManager')
     }
@@ -76,7 +78,7 @@ export class NodeExecutorRegistry {
     } catch (error) {
       return { kind: 'completed', outcome: 'failure', output: { error: `agent input evaluation failed: ${message(error)}` }, summary: 'Agent input evaluation failed' }
     }
-    const signal = this.deps.signal ?? new AbortController().signal
+    const signal = executionSignal ?? this.deps.signal ?? new AbortController().signal
     const segmentLimits = remainingSegmentLimits(node, activation, this.now())
     if ('error' in segmentLimits) {
       return { kind: 'completed', outcome: 'failure', output: { error: segmentLimits.error }, summary: segmentLimits.error }
@@ -94,6 +96,13 @@ export class NodeExecutorRegistry {
           user: buildGraphAgentUserPrompt({
             nodeInputs: {
               ...nodeInputs,
+              ...(activation.continuationVersion > 0 ? {
+                __resume_context: {
+                  reason: activation.input.__agentTimerReason ?? activation.summary ?? 'durable continuation resumed',
+                  checkpoint: activation.input.__continuationCheckpoint ?? null,
+                  signal: activation.input.__resume ?? null,
+                },
+              } : {}),
               __activation: {
                 id: activation.id,
                 attempt: activation.attempt,
@@ -197,8 +206,10 @@ export class NodeExecutorRegistry {
 
   private async executeFunction(node: Extract<NodeSpec, { type: 'function' }>, activation: ActivationRecord, state: GraphStateSnapshot): Promise<NodeExecutionResult> {
     try {
-      const inputs = await evaluateBindings(node.inputs, this.context(activation, state), this.deps.functions)
-      const output = await this.deps.functions.get(node.function).execute(inputs)
+      const output = await withTimeout((async () => {
+        const inputs = await evaluateBindings(node.inputs, this.context(activation, state), this.deps.functions)
+        return this.deps.functions.get(node.function).execute(inputs)
+      })(), node.timeoutMs, `function ${node.function}`)
       if (!isJsonValue(output)) throw new Error('function returned a non-JSON value')
       const errors = node.outputSchema ? validateShape(output, node.outputSchema, '$output') : []
       if (errors.length) throw new Error(errors.join('; '))
@@ -297,6 +308,10 @@ export class NodeExecutorRegistry {
   }
 
   private async executeJoin(node: Extract<NodeSpec, { type: 'join' }>, activation: ActivationRecord, snapshot: GraphSnapshot): Promise<NodeExecutionResult> {
+    const resumed = activation.input.__resume
+    if (isJsonObject(resumed) && resumed.kind === 'timer') {
+      return { kind: 'completed', outcome: 'timeout', output: resumed }
+    }
     const candidates = [...snapshot.activations.values()].filter(item =>
       item.nodeId === activation.nodeId && item.sourceTransitionId && node.expects.includes(item.sourceTransitionId) &&
       item.forkGroupId === activation.forkGroupId &&
@@ -311,6 +326,16 @@ export class NodeExecutorRegistry {
       return {
         kind: 'parked',
         event: { name: `join:${activation.nodeId}`, correlation: activation.forkGroupId ?? null },
+        ...(node.timeoutMs !== undefined ? {
+          wakeAt: typeof activation.input.__joinDeadline === 'number'
+            ? activation.input.__joinDeadline
+            : (activation.firstStartedAt ?? this.now()) + node.timeoutMs,
+          inputPatch: {
+            __joinDeadline: typeof activation.input.__joinDeadline === 'number'
+              ? activation.input.__joinDeadline
+              : (activation.firstStartedAt ?? this.now()) + node.timeoutMs,
+          },
+        } : {}),
         reason: 'join barrier incomplete or coalesced',
       }
     }
@@ -375,6 +400,22 @@ function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, label: string): Promise<T> {
+  if (timeoutMs === undefined) return promise
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timeout ${timeoutMs}ms exceeded`)), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+  }
+}
+
 function remainingSegmentLimits(
   node: Extract<NodeSpec, { type: 'agent' }>,
   activation: ActivationRecord,
@@ -390,7 +431,7 @@ function remainingSegmentLimits(
   if (remainingUsd <= 0) return { error: 'Agent Activation lifetime USD budget exhausted' }
   if (remainingElapsed <= 0) return { error: 'Agent Activation lifetime elapsed budget exhausted' }
   const segmentTurns = node.budget?.turns ?? 30
-  const segmentUsd = node.budget?.usd ?? 2
+  const segmentUsd = node.budget?.usd ?? DEFAULT_AGENT_SEGMENT_BUDGET_USD
   const segmentWallTime = node.budget?.wallTimeMs ?? node.timeoutMs
   const wallTimeMs = Math.min(segmentWallTime ?? Number.POSITIVE_INFINITY, remainingElapsed)
   return {

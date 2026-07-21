@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'git-without-capability' | 'precomputed-routing' | 'dead-literal-route'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route'
   at: string
   message: string
 }
@@ -26,8 +26,48 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   const findings: GraphLintFinding[] = []
   lintAgentWorkspacePrompts(spec, findings)
   lintPrecomputedRouting(spec, findings)
+  lintDuplicateRouteConditions(spec, findings)
+  lintSameLaneAgentSplits(spec, findings)
   lintDeadLiteralRoutes(spec, findings)
   return findings
+}
+
+/** A persistent Lane is a continuous session boundary, not a phase bucket.
+ * Multiple Agents can be legitimate, so this is deliberately an advisory for
+ * semantic review rather than a mechanical rejection. */
+function lintSameLaneAgentSplits(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const [laneId, lane] of Object.entries(spec.lanes ?? {})) {
+    if (lane.context !== 'persistent') continue
+    const agents = Object.entries(spec.nodes ?? {})
+      .filter(([, node]) => node?.type === 'agent' && node.lane === laneId)
+      .map(([nodeId]) => nodeId)
+    if (agents.length < 2) continue
+    findings.push({
+      level: 'warning', rule: 'same-lane-agent-split', at: `lanes.${laneId}`,
+      message: `persistent lane contains ${agents.length} Agent nodes (${agents.join(', ')}); verify every split has an independent persistence, permission/concurrency, Kernel Wait/Event, failure-isolation, or terminal boundary — a different prompt, role name, first-run flag, or budget is not such a boundary; otherwise merge bootstrap/pivot/monitor phases into one autonomous Agent mode`,
+    })
+  }
+}
+
+/** Two transitions with the same source, outcome and predicate are not two
+ * branches: the higher-priority one permanently shadows the other. This is a
+ * mechanical routing error, not a semantic-review judgement. */
+function lintDuplicateRouteConditions(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const firstByCondition = new Map<string, string>()
+  for (const transition of spec.transitions ?? []) {
+    if (typeof transition.when !== 'string' || transition.default === true) continue
+    const condition = transition.when.trim().replace(/\s+/g, ' ')
+    const key = `${transition.from}\0${transition.on ?? 'success'}\0${condition}`
+    const first = firstByCondition.get(key)
+    if (!first) {
+      firstByCondition.set(key, transition.id)
+      continue
+    }
+    findings.push({
+      level: 'error', rule: 'duplicate-route-condition', at: `transitions '${transition.id}'.when`,
+      message: `has the same from/on/when predicate as transition '${first}'; one branch will always shadow the other — make the predicates mutually exclusive (including any state threshold)`,
+    })
+  }
 }
 
 const ABSOLUTE_PATH_RE = /(?:^|[\s"'`(=])(?:\/(?:Users|home|root|srv|Volumes)\/|~\/)/
@@ -35,6 +75,10 @@ const WRITE_VERB_RE = /\b(edit|write|modify|update|commit|push|clone|create|save
 const OUTSIDE_PROJECT_RE = /outside\s+(?:of\s+)?(?:this|the)\s+project|项目之?外/i
 const OUTSIDE_NEGATION_RE = /\b(?:never|not|don'?t|do\s+not|avoid|no)\b[^.\n]{0,40}outside|outside[^.\n]{0,40}\b(?:forbidden|prohibited|denied|read[- ]?only)\b|(?:禁止|不得|不要|勿)[^。\n]{0,20}项目之?外/i
 const GIT_MUTATION_RE = /\bgit\s+(?:add|commit|push)\b/i
+const EXPLICIT_WRITE_VERB_RE = /\b(?:write|edit|modify|update|create|save|append|replace)\b|(?:写入|编辑|修改|更新|创建|保存|追加|替换)/i
+const NEGATED_WRITE_RE = /\b(?:never|not|don'?t|do\s+not|mustn'?t|avoid)\b[^.。\n]{0,28}\b(?:write|edit|modify|update|create|save|append|replace)\b|(?:禁止|不得|不要|无需|不应|绝不)[^。\n]{0,18}(?:写入|编辑|修改|更新|创建|保存|追加|替换)/i
+const BACKTICK_PATH_RE = /`([^`\n]+)`/g
+const PLAIN_PATH_RE = /(?:^|[\s("'])((?:\.?[A-Za-z0-9_-]+\/)+(?:[A-Za-z0-9_.*<>{}-]+\.[A-Za-z0-9_-]+)?)(?=$|[.\s,;:)'])/g
 
 function lintAgentWorkspacePrompts(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
   for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
@@ -56,6 +100,14 @@ function lintAgentWorkspacePrompts(spec: LoopGraphSpec, findings: GraphLintFindi
         message: "prompt directs write/edit/git work at a location outside the project; there is NO writable location outside the project root — clone or move it inside the project under an owned write prefix and declare it as a directory precondition",
       })
     }
+    for (const target of explicitPromptWriteTargets(text)) {
+      const declared = (lane?.workspace?.write ?? []).some(rule => pathCoveredByWriteRule(target, rule.path))
+      if (declared) continue
+      findings.push({
+        level: 'error', rule: 'undeclared-workspace-write', at,
+        message: `prompt explicitly writes '${target}', but lane '${node.lane}' does not declare a covering workspace.write rule`,
+      })
+    }
     if (GIT_MUTATION_RE.test(text)) {
       const hasScm = lane?.scm === 'git'
       const ownedPrefixes = (lane?.workspace?.write ?? []).filter(rule => rule.mode === 'owned').map(rule => rule.path)
@@ -72,6 +124,48 @@ function lintAgentWorkspacePrompts(spec: LoopGraphSpec, findings: GraphLintFindi
       }
     }
   }
+}
+
+/** Extract only explicit backtick-delimited project paths from imperative
+ * write sentences. This intentionally avoids guessing paths from general prose:
+ * false negatives go to semantic review, while a hit is safe to block. */
+function explicitPromptWriteTargets(text: string): string[] {
+  const targets = new Set<string>()
+  for (const line of text.split('\n')) {
+    // Keep the verb and target in the same sentence. A common prompt shape is
+    // "create state/task.json. Use the baseline from .oma/history.md"; scanning
+    // the whole line incorrectly grants the write verb to the read-only source.
+    const clauses = line.split(/(?:[。！？；]|[.!?;](?=\s|$))\s*/)
+    for (const clause of clauses) {
+      if (!EXPLICIT_WRITE_VERB_RE.test(clause) || NEGATED_WRITE_RE.test(clause)) continue
+      for (const match of clause.matchAll(BACKTICK_PATH_RE)) {
+        const target = normalizePromptPath(match[1]!)
+        if (target) targets.add(target)
+      }
+      // Models often omit Markdown delimiters in imperative prose ("create
+      // state/ and logs/"). Restrict plain matches to directory-looking tokens
+      // or filenames with extensions to avoid treating branch names as paths.
+      for (const match of clause.matchAll(PLAIN_PATH_RE)) {
+        const target = normalizePromptPath(match[1]!)
+        if (target) targets.add(target)
+      }
+    }
+  }
+  return [...targets]
+}
+
+function normalizePromptPath(raw: string): string | null {
+  let path = raw.trim().replace(/^\.\//, '')
+  if (!path || path.startsWith('$') || /\s/.test(path) || !path.includes('/')) return null
+  // Templates such as exp-loop-iter<N>-<slug> remain beneath the stable prefix.
+  path = path.split(/[<*{]/, 1)[0]!.replace(/\/+$/, '')
+  if (!path || path === '..' || path.startsWith('../')) return null
+  return path
+}
+
+function pathCoveredByWriteRule(target: string, declared: string): boolean {
+  const prefix = declared.replace(/^\.\//, '').replace(/\/+$/, '')
+  return target === prefix || target.startsWith(`${prefix}/`)
 }
 
 const PRECOMPUTED_BOOLEAN_RE = /\$output\.((?:is|should|need|needs|has)_[A-Za-z0-9_]+)\s*[!=]=\s*(?:true|false)/

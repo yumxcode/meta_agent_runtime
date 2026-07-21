@@ -233,6 +233,13 @@ export interface MetaAgentConfig {
   /** Maximum output tokens per API call. Default: 8192 */
   maxTokens?: number
 
+  /**
+   * Recover a response that reaches maxTokens by escalating/continuing it.
+   * Defaults to true. Bounded structured compiler calls may disable this so a
+   * malformed or over-complex response fails at the declared ceiling.
+   */
+  recoverMaxOutputTokens?: boolean
+
   // ── Tools ──────────────────────────────────────────────────────────────────
   /** Tools available in this session. */
   tools?: MetaAgentTool[]
@@ -599,6 +606,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     onMainCostUsd: config.onMainCostUsd,
     getAdditionalBudgetUsd: config.getAdditionalBudgetUsd,
     maxTokens: config.maxTokens ?? 131_072,
+    recoverMaxOutputTokens: config.recoverMaxOutputTokens ?? true,
     tools: config.tools ?? [],
     includeStreamEvents: config.includeStreamEvents ?? false,
     maxRetries: config.maxRetries ?? 3,

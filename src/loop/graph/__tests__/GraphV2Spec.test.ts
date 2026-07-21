@@ -72,6 +72,73 @@ describe('durable-graph-v2 ABI', () => {
     expect(validateLoopGraph(spec, catalog()).join('\n')).toContain('is not part of the executable Graph ABI')
   })
 
+  it('rejects missing required ABI fields before Create can crash', () => {
+    const spec = graph() as unknown as Record<string, unknown>
+    delete spec.state
+    expect(validateLoopGraph(spec as unknown as LoopGraphSpec, catalog()))
+      .toContain('graph.state is required')
+  })
+
+  it('strictly validates ShapeSpec keys and value types', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected Agent')
+    work.outputSchema = {
+      type: 'object',
+      require: ['done'],
+      additionalProperties: 'no',
+    } as unknown as NonNullable<typeof work.outputSchema>
+    const errors = validateLoopGraph(spec, catalog()).join('\n')
+    expect(errors).toContain("outputSchema.require is not part of ShapeSpec type 'object'")
+    expect(errors).toContain('outputSchema.additionalProperties must be a boolean')
+  })
+
+  it('requires Join expects to exactly describe that Join incoming edges', () => {
+    const spec = graph()
+    spec.nodes.join = { type: 'join', mode: 'all', expects: ['failure'] }
+    spec.transitions.push({ id: 'to_join', from: 'work', on: 'joined', to: 'join' })
+    spec.transitions.push({ id: 'joined_done', from: 'join', to: 'done' })
+    const errors = validateLoopGraph(spec, catalog()).join('\n')
+    expect(errors).toContain("nodes.join.expects transition 'failure' does not target this Join")
+    expect(errors).toContain("nodes.join.expects must include incoming transition 'to_join'")
+  })
+
+  it('rejects expression roots that the runtime never populates', () => {
+    const spec = graph()
+    spec.transitions[0]!.when = '$event.approved == true'
+    expect(validateLoopGraph(spec, catalog()).join('\n')).toContain("uses unsupported root 'event'")
+  })
+
+  it('catches misspelled fields in a closed output schema', () => {
+    const spec = graph()
+    spec.transitions[0]!.when = '$output.dnoe == true'
+    expect(validateLoopGraph(spec, catalog()).join('\n'))
+      .toContain("references undeclared closed output '$output.dnoe'")
+  })
+
+  it('rejects strict transition bindings to optional output fields', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent' || work.outputSchema?.type !== 'object') throw new Error('expected Agent object output')
+    work.outputSchema.properties = {
+      ...work.outputSchema.properties,
+      note: { type: 'string' },
+    }
+    spec.transitions[0]!.to = { node: 'done', inputs: { result: { ref: '$output.note' } } }
+    const errors = validateLoopGraph(spec, catalog()).join('\n')
+    expect(errors).toContain("ref '$output.note' is strict but the source outputSchema does not require that path")
+
+    work.outputSchema.required = ['done', 'note']
+    expect(validateLoopGraph(spec, catalog())).toEqual([])
+  })
+
+  it('does not assume a structured output payload on failure transitions', () => {
+    const spec = graph()
+    spec.transitions[2]!.to = { node: 'failed', inputs: { error: { ref: '$output.message' } } }
+    expect(validateLoopGraph(spec, catalog()).join('\n'))
+      .toContain("ref '$output.message' is not guaranteed for 'failure' output")
+  })
+
   it('rejects overlapping writers across Lanes', () => {
     const spec = graph()
     spec.lanes.audit = { context: 'fresh_per_activation', workspace: { write: [{ path: 'state', mode: 'owned' }] } }
@@ -86,14 +153,14 @@ describe('durable-graph-v2 ABI', () => {
     expect(validateLoopGraph(spec, catalog())).toContain("nodes.work.tools[0] references unavailable Agent tool 'invented_platform_tool'")
   })
 
-  it('requires complete bounds for a hard-park Agent', () => {
+  it('requires only durable wait bounds for a hard-park Agent', () => {
     const spec = graph()
     const work = spec.nodes.work
     if (work.type !== 'agent') throw new Error('expected Agent')
     work.timerPolicy = { allowHardPark: true, maxDelayMs: 60_000 }
     const errors = validateLoopGraph(spec, catalog())
     expect(errors).toContain('nodes.work.timerPolicy.maxParks is required when hard park is enabled')
-    expect(errors).toContain('nodes.work.lifetimeBudget.elapsedMs is required when hard park is enabled')
+    expect(errors.join('\n')).not.toContain('lifetimeBudget')
   })
 
   it('rejects a $input reference that some incoming path does not bind', () => {

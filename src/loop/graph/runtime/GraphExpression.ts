@@ -7,11 +7,7 @@ export interface GraphEvaluationContext {
   state: Readonly<Record<string, JsonValue>>
   input?: Readonly<Record<string, JsonValue>>
   output?: JsonValue
-  event?: JsonValue
-  effect?: JsonValue
   clock?: Readonly<Record<string, JsonValue>>
-  artifacts?: Readonly<Record<string, JsonValue>>
-  evidence?: Readonly<Record<string, JsonValue>>
 }
 
 export interface CompiledCondition {
@@ -22,7 +18,9 @@ export interface CompiledCondition {
 }
 
 export function compileCondition(source: string): CompiledCondition {
-  const normalized = source.replace(/\$(state|input|output|event|effect|clock|artifacts|evidence)(?=\.|\b)/g, '$1')
+  // Strip the sigil for parsing every identifier root. GraphValidate then
+  // reports unsupported roots explicitly instead of leaking a lexer error.
+  const normalized = source.replace(/\$([A-Za-z][A-Za-z0-9_]*)(?=\.|\b)/g, '$1')
   const ast = parse(normalized)
   return { source, normalized, ast, refs: collectRefs(ast) }
 }
@@ -32,11 +30,7 @@ export function evaluateCondition(compiled: CompiledCondition, context: GraphEva
   flattenPrimitives('state', context.state, flat)
   if (context.input) flattenPrimitives('input', context.input, flat)
   if (context.output !== undefined) flattenPrimitives('output', context.output, flat)
-  if (context.event !== undefined) flattenPrimitives('event', context.event, flat)
-  if (context.effect !== undefined) flattenPrimitives('effect', context.effect, flat)
   if (context.clock) flattenPrimitives('clock', context.clock, flat)
-  if (context.artifacts) flattenPrimitives('artifacts', context.artifacts, flat)
-  if (context.evidence) flattenPrimitives('evidence', context.evidence, flat)
   // Optional output fields are legitimate routing inputs. A missing field means
   // this edge does not match; type/operator errors remain invariant failures.
   if (compiled.refs.some(ref => !Object.prototype.hasOwnProperty.call(flat, ref))) return false
@@ -88,5 +82,10 @@ function flattenPrimitives(prefix: string, value: unknown, output: Record<string
     return
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return
-  for (const [key, child] of Object.entries(value)) flattenPrimitives(`${prefix}.${key}`, child, output)
+  for (const [key, child] of Object.entries(value)) {
+    // Dot-bearing object keys are ambiguous with nested paths. They remain
+    // available to ValueExpression whole-object refs, but never enter `when`.
+    if (key.includes('.')) continue
+    flattenPrimitives(`${prefix}.${key}`, child, output)
+  }
 }

@@ -37,6 +37,8 @@ import { makeReturnResultTool, type ReturnedResult } from './tools/return_result
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
 import { isAbsolute, relative, resolve, sep } from 'path'
 import { tmpdir } from 'os'
+import { existsSync, realpathSync } from 'fs'
+import { dirname } from 'path'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -851,7 +853,8 @@ function pathIsUnderMetaAgent(raw: string, workspaceRoot: string): boolean {
  *   • a path under any writeDenyPaths is blocked (deny wins over allow);
  *   • the workspaceRoot is implicitly writable UNLESS readonlyWorkspace;
  *   • writeAllowPaths grant additional writable roots.
- * Lexical containment only — the OS layer remains the backstop for bash.
+ * Paths are canonicalised through the nearest existing ancestor, so an allow
+ * path cannot reach a denied control path through a symbolic link.
  */
 export function wrapWithSandboxWriteGuard(
   tool: MetaAgentTool,
@@ -876,15 +879,17 @@ export function wrapWithSandboxWriteGuard(
       for (const field of pathFields) {
         const raw = input[field]
         if (typeof raw !== 'string' || !raw) continue
-        const abs = isAbsolute(raw) ? resolve(raw) : resolve(workspaceRoot, raw)
-        if (denyRoots.some(root => pathIsUnder(abs, root))) {
+        const abs = canonicalGuardPath(raw, workspaceRoot)
+        const canonicalDenyRoots = denyRoots.map(root => canonicalGuardPath(root, workspaceRoot))
+        const canonicalAllowRoots = allowRoots.map(root => canonicalGuardPath(root, workspaceRoot))
+        if (canonicalDenyRoots.some(root => pathIsUnder(abs, root))) {
           return {
             content: `Error: '${raw}' is write-protected for this seat (sandbox writeDenyPaths). ` +
               `(blocked ${tool.name}.${field})`,
             isError: true,
           }
         }
-        if (!allowRoots.some(root => pathIsUnder(abs, root))) {
+        if (!canonicalAllowRoots.some(root => pathIsUnder(abs, root))) {
           const writable = allowRoots.length > 0 ? allowRoots.join(', ') : '(none)'
           return {
             content: `Error: '${raw}' is outside this seat's write scope (sandbox policy). ` +
@@ -896,6 +901,19 @@ export function wrapWithSandboxWriteGuard(
       return tool.call(input, ctx)
     },
   }
+}
+
+function canonicalGuardPath(path: string, base: string): string {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(base, path)
+  if (existsSync(absolute)) return realpathSync(absolute)
+  let ancestor = absolute
+  while (!existsSync(ancestor)) {
+    const parent = dirname(ancestor)
+    if (parent === ancestor) break
+    ancestor = parent
+  }
+  const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor)
+  return resolve(realAncestor, relative(ancestor, absolute))
 }
 
 function pathIsUnder(abs: string, root: string): boolean {

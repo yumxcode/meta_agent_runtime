@@ -14,6 +14,7 @@ import type {
 import { GraphStore } from './GraphStore.js'
 import { addUsage, emptyUsage } from './UsageMath.js'
 import { decideTransition } from './TransitionEngine.js'
+import { isJsonValue } from './GraphJson.js'
 
 export interface CommitResult {
   activation: ActivationRecord
@@ -21,6 +22,7 @@ export interface CommitResult {
   instance: GraphInstanceRecord
   transitionId?: string
   duplicate: boolean
+  replayed?: boolean
 }
 
 export class ParkLimitExceededError extends Error {
@@ -53,37 +55,87 @@ export class CommitCoordinator {
       if (!['running', 'ready'].includes(activation.status)) throw new Error(`activation '${intent.activationId}' cannot commit from ${activation.status}`)
       const node = this.graph.nodes[activation.nodeId]
       if (!node) throw new Error(`activation '${activation.id}' references missing node '${activation.nodeId}'`)
+      if (snapshot.instance.status === 'done' || snapshot.instance.status === 'failed' || snapshot.instance.status === 'paused') {
+        throw new Error(`graph '${snapshot.instance.instanceId}' is ${snapshot.instance.status}; stale activation '${activation.id}' cannot commit`)
+      }
+
+      let effectiveIntent = intent
+      const executionStateVersion = activation.executionStateVersion ?? activation.inputStateVersion
+      if (this.graph.concurrency?.stateConsistency === 'serializable' &&
+          intent.expectedStateVersion !== undefined && intent.expectedStateVersion !== executionStateVersion) {
+        throw new Error(`commit intent expected State v${intent.expectedStateVersion}, activation executed at v${executionStateVersion}`)
+      }
+      const expectedStateVersion = this.graph.concurrency?.stateConsistency === 'serializable'
+        ? executionStateVersion
+        : undefined
+      if (expectedStateVersion !== undefined && snapshot.state.version !== expectedStateVersion) {
+        const replayCount = activation.replayCount ?? 0
+        const replayLimit = node.type === 'agent' ? MAX_AGENT_SERIALIZABLE_REPLAYS : MAX_SERIALIZABLE_REPLAYS
+        if (replayCount < replayLimit) {
+          const reason = `State advanced from v${expectedStateVersion} to v${snapshot.state.version}; replaying under serializable policy`
+          const segmentUsage = intent.usage ?? emptyUsage()
+          const replay: ActivationRecord = {
+            ...activation,
+            status: 'ready',
+            lease: undefined,
+            replayCount: replayCount + 1,
+            usage: addUsage(activation.usage, segmentUsage),
+            readyReason: 'replay',
+            error: reason,
+            summary: reason,
+            updatedAt: now,
+          }
+          const instance: GraphInstanceRecord = {
+            ...snapshot.instance,
+            totalCostUsd: snapshot.instance.totalCostUsd + segmentUsage.costUsd,
+            updatedAt: now,
+          }
+          await this.store.appendEventLocked({ type: 'activation_released', at: now, activation: replay, instance, reason: 'replay' })
+          await this.store.writeActivationProjectionLocked(replay)
+          await this.store.writeInstanceProjectionLocked(instance)
+          await this.store.discardCommitIntentLocked(intent, reason)
+          return { activation: replay, spawned: [], instance, duplicate: false, replayed: true }
+        }
+        const reason = `serializable replay limit ${replayLimit} exceeded`
+        effectiveIntent = {
+          ...intent,
+          expectedStateVersion: undefined,
+          outcome: 'failure',
+          output: { error: reason },
+          summary: reason,
+        }
+      }
 
       let state = snapshot.state
       let spawned: ActivationRecord[] = []
       let transitionId: string | undefined
       let cancelled: ActivationRecord[] = []
       let instance: GraphInstanceRecord = { ...snapshot.instance, updatedAt: now }
-      const segmentUsage = intent.usage ?? emptyUsage()
+      const segmentUsage = effectiveIntent.usage ?? emptyUsage()
       instance.totalCostUsd = (instance.totalCostUsd ?? 0) + segmentUsage.costUsd
       let committedActivation: ActivationRecord
       if (node.type === 'terminal') {
         // A Terminal that could not evaluate its result (outcome 'failure')
         // must not report graph success -- respect the outcome over node.status.
-        const terminalFailed = node.status === 'failed' || intent.outcome === 'failure'
+        const terminalFailed = node.status === 'failed' || effectiveIntent.outcome === 'failure'
         committedActivation = {
           ...activation,
           usage: addUsage(activation.usage, segmentUsage),
           status: terminalFailed ? 'failed' : 'succeeded',
           lease: undefined,
-          output: intent.output,
-          outcome: intent.outcome,
-          summary: intent.summary,
-          error: intent.outcome === 'failure' ? (intent.summary ?? 'terminal execution failed') : undefined,
-          terminalResult: intent.output,
+          output: effectiveIntent.output,
+          outcome: effectiveIntent.outcome,
+          summary: effectiveIntent.summary,
+          error: effectiveIntent.outcome === 'failure' ? (effectiveIntent.summary ?? 'terminal execution failed') : undefined,
+          terminalResult: effectiveIntent.output,
           updatedAt: now,
         }
         instance = {
           ...instance,
-          status: intent.outcome === 'failure' ? 'failed' : node.status,
-          terminalResult: intent.output,
-          statusReason: intent.outcome === 'failure'
-            ? (intent.summary ?? 'terminal execution failed')
+          status: effectiveIntent.outcome === 'failure' ? 'failed' : node.status,
+          terminalResult: effectiveIntent.output,
+          statusReason: effectiveIntent.outcome === 'failure'
+            ? (effectiveIntent.summary ?? 'terminal execution failed')
             : node.description,
         }
         cancelled = [...snapshot.activations.values()]
@@ -97,28 +149,28 @@ export class CommitCoordinator {
         let decision: Awaited<ReturnType<typeof decideTransition>> | undefined
         let decisionError: string | undefined
         try {
-          decision = await decideTransition({
+          decision = await withTimeout(decideTransition({
             graph: this.graph,
             activation,
-            outcome: intent.outcome,
-            output: intent.output,
+            outcome: effectiveIntent.outcome,
+            output: effectiveIntent.output,
             state,
             functions: this.functions,
             reducers: this.reducers,
             now,
-          })
+          }), TRANSITION_EVALUATION_TIMEOUT_MS, 'transition evaluation')
         } catch (error) {
           decisionError = message(error)
         }
         if (!decision) {
-          const reason = `transition evaluation failed for node '${activation.nodeId}' outcome '${intent.outcome}': ${decisionError}`
+          const reason = `transition evaluation failed for node '${activation.nodeId}' outcome '${effectiveIntent.outcome}': ${decisionError}`
           committedActivation = {
             ...activation,
             usage: addUsage(activation.usage, segmentUsage),
             status: 'failed',
             lease: undefined,
-            output: intent.output,
-            outcome: intent.outcome,
+            output: effectiveIntent.output,
+            outcome: effectiveIntent.outcome,
             summary: reason,
             error: reason,
             updatedAt: now,
@@ -147,11 +199,11 @@ export class CommitCoordinator {
         committedActivation = {
           ...activation,
           usage: addUsage(activation.usage, segmentUsage),
-          status: intent.outcome === 'failure' ? 'failed' : 'succeeded',
+          status: effectiveIntent.outcome === 'failure' ? 'failed' : 'succeeded',
           lease: undefined,
-          output: intent.output,
-          outcome: intent.outcome,
-          summary: intent.summary,
+          output: effectiveIntent.output,
+          outcome: effectiveIntent.outcome,
+          summary: effectiveIntent.summary,
           error: undefined,
           updatedAt: now,
         }
@@ -209,7 +261,7 @@ export class CommitCoordinator {
         })
         .sort((a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id))[0]
       if (!activation) throw new Error('paused graph has no resumable paused Terminal')
-      const decision = await decideTransition({
+      const decision = await withTimeout(decideTransition({
         graph: this.graph,
         activation,
         outcome: 'resume',
@@ -218,7 +270,7 @@ export class CommitCoordinator {
         functions: this.functions,
         reducers: this.reducers,
         now,
-      })
+      }), TRANSITION_EVALUATION_TIMEOUT_MS, 'paused-terminal transition evaluation')
       if (snapshot.instance.activationCount + decision.spawned.length > this.graph.limits.maxActivations) {
         throw new Error('maxActivations exceeded while resuming paused Terminal')
       }
@@ -544,6 +596,30 @@ function validateExternalEventInput(input: GraphExternalEventInput): void {
   }
   if (input.deliveryId !== undefined && (!input.deliveryId.trim() || input.deliveryId.length > 512)) {
     throw new Error('external event deliveryId must be 1..512 characters')
+  }
+  if (input.correlation !== undefined && !isJsonValue(input.correlation)) throw new Error('external event correlation must be JSON')
+  if (input.payload !== undefined && !isJsonValue(input.payload)) throw new Error('external event payload must be JSON')
+  const bytes = Buffer.byteLength(JSON.stringify({ correlation: input.correlation, payload: input.payload }), 'utf8')
+  if (bytes > MAX_EXTERNAL_EVENT_BYTES) throw new Error(`external event data exceeds ${MAX_EXTERNAL_EVENT_BYTES} bytes`)
+}
+
+const MAX_AGENT_SERIALIZABLE_REPLAYS = 5
+const MAX_SERIALIZABLE_REPLAYS = 50
+const MAX_EXTERNAL_EVENT_BYTES = 1024 * 1024
+const TRANSITION_EVALUATION_TIMEOUT_MS = 30_000
+
+async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} exceeded ${timeoutMs}ms`)), timeoutMs)
+        timer.unref?.()
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 

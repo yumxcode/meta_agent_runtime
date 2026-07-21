@@ -194,6 +194,9 @@ export interface KernelConfig {
   /** Override max_tokens sent to the API */
   maxOutputTokens?: number
 
+  /** Whether max-output responses may escalate/continue. Defaults to true. */
+  recoverMaxOutputTokens?: boolean
+
   /** Maximum API retries for transient errors (default: 5) */
   maxRetries?: number
 

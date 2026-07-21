@@ -43,7 +43,7 @@ import {
   readDistillArtifacts, writeDistillArtifacts,
   freezeLoopGraph, validateLoopGraph, lintLoopGraph, formatGraphLintFindings,
   type GraphDistillModelRequest, type GraphDistillPhase, type GraphDistillProgressEvent,
-  type DistillGraphResult, type GraphRuntimeCatalog, type GraphProgressEvent,
+  type DistillGraphResult, type GraphRuntimeCatalog, type GraphProgressEvent, type LoopGraphSpec,
 } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
@@ -5137,7 +5137,10 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       network: { webFetch: { maxResultSizeChars: 8_000 } },
       mode: 'agentic',
     })
-    const distillTools = createGraphDistillTools(graphCatalog)
+    let validatedGraphThisCall: LoopGraphSpec | undefined
+    const distillTools = createGraphDistillTools(graphCatalog, {
+      onValidatedGraph: graph => { validatedGraphThisCall = graph },
+    })
     const toolsByName = new Map([...standardTools, ...distillTools].map(tool => [tool.name, tool]))
     const reporter = createForegroundDistillReporter()
     const distillExecutor = new ForegroundGraphDistillExecutor({
@@ -5151,19 +5154,30 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
         return session
       },
       runSession: async (session, request) => {
+        validatedGraphThisCall = undefined
         const rendered = await streamPrompt({
           submit: prompt => session.submit(prompt),
           steer: text => session.steer(text),
           getEstimatedCost: () => session.getEstimatedCost(),
           mode: 'agentic',
         }, request.taskDescription, opts.json, opts.showThinking)
-        if (request.signal.aborted) return { status: 'cancelled', output: rendered.text || undefined, error: 'Distill interrupted' }
+        if (request.signal.aborted) return {
+          status: 'cancelled', output: rendered.text || undefined, error: 'Distill interrupted',
+          validatedGraph: validatedGraphThisCall,
+        }
         const terminal = rendered.result
-        if (!terminal) return { status: 'failed', output: rendered.text || undefined, error: 'agentic Distill session ended without a terminal result' }
+        if (!terminal) return {
+          status: 'failed', output: rendered.text || undefined,
+          error: 'agentic Distill session ended without a terminal result', validatedGraph: validatedGraphThisCall,
+        }
         const output = rendered.text.trim() || terminal.result
         return terminal.subtype === 'success' && !terminal.isError
-          ? { status: 'completed', output, summary: terminal.result }
-          : { status: 'failed', output: output || undefined, error: terminal.errors?.join('; ') || `agentic Distill session ended with ${terminal.subtype}` }
+          ? { status: 'completed', output, summary: terminal.result, validatedGraph: validatedGraphThisCall }
+          : {
+              status: 'failed', output: output || undefined,
+              error: terminal.errors?.join('; ') || `agentic Distill session ended with ${terminal.subtype}`,
+              validatedGraph: validatedGraphThisCall,
+            }
       },
     })
     try {
@@ -5410,6 +5424,16 @@ function foregroundDistillConfig(
     systemPrompt: request.systemPrompt,
     maxTurns: request.maxTurns,
     maxBudgetUsd: opts.maxBudgetUsd ?? request.maxBudgetUsd,
+    ...(request.thinkingBudgetTokens === undefined
+      ? {}
+      : { thinkingConfig: request.thinkingBudgetTokens === 0
+          ? { type: 'disabled' as const }
+          : { type: 'enabled' as const, budgetTokens: request.thinkingBudgetTokens } }),
+    ...(request.maxOutputTokens === undefined ? {} : { maxTokens: request.maxOutputTokens }),
+    // A structured compiler response must fit in its phase budget. Kernel's
+    // normal 64k escalation/recovery would defeat that bound and can turn a
+    // simple lowering into a many-minute runaway generation.
+    recoverMaxOutputTokens: false,
     debugMode: opts.debug,
     beforeToolCall: async toolName => allowed.has(toolName)
       ? { action: 'allow' }

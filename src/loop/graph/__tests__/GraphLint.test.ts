@@ -65,6 +65,56 @@ describe('graph write-surface lint', () => {
     expect(finding?.level).toBe('error')
   })
 
+  it('blocks explicit prompt writes not covered by the Agent lane', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    spec.lanes.work.workspace.write = [{ path: 'humanoid', mode: 'owned' }]
+    work.prompt = 'Write initial `state/progress.json`, then create artifacts under `.oma/experiments/exp-<N>/`.'
+    const findings = lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')
+    expect(findings.map(f => f.message)).toEqual([
+      expect.stringContaining("'state/progress.json'"),
+      expect.stringContaining("'.oma/experiments/exp-'"),
+    ])
+
+    spec.lanes.work.workspace.write.push({ path: 'state', mode: 'owned' }, { path: '.oma/experiments', mode: 'owned' })
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
+  })
+
+  it('recognizes plain directory write targets without relying on Markdown backticks', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    spec.lanes.work.workspace.write = []
+    work.prompt = 'If this is the first run, create state/ and logs/ directories and write state/progress.json.'
+    const findings = lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')
+    expect(findings.map(f => f.message)).toEqual([
+      expect.stringContaining("'state'"),
+      expect.stringContaining("'logs'"),
+      expect.stringContaining("'state/progress.json'"),
+    ])
+  })
+
+  it('does not treat an explicit prohibition as a write instruction', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    spec.lanes.work.workspace.write = []
+    work.prompt = 'Do not write `state/progress.json`; return routing facts only.'
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
+    work.prompt = '绝不修改 `humanoid/**` 或 `.oma/experiments/` 下的文件。'
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
+  })
+
+  it('does not apply a write verb to a read-only path in the next sentence', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    spec.lanes.work.workspace.write = [{ path: 'state/task_spec.md', mode: 'atomic_replace' }]
+    work.prompt = 'First create state/task_spec.md if absent. Use the inherited baseline from .oma/loop-history.md.'
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
+  })
+
   it('flags routing on agent-precomputed booleans and dead literal routes', () => {
     const spec = graph()
     spec.transitions = [
@@ -76,5 +126,31 @@ describe('graph write-surface lint', () => {
     const rules = lintLoopGraph(spec).map(f => f.rule)
     expect(rules).toContain('precomputed-routing')
     expect(rules).toContain('dead-literal-route')
+  })
+
+  it('blocks duplicate deterministic predicates that shadow later routes', () => {
+    const spec = graph()
+    spec.transitions = [
+      { id: 'attention', from: 'work', on: 'success', when: "$output.count == 0 || $output.trend == 'worsened'", priority: 30, to: 'failed' },
+      { id: 'pivot', from: 'work', when: "  $output.count == 0   || $output.trend == 'worsened'  ", priority: 20, to: 'done' },
+      { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
+    ]
+    const finding = lintLoopGraph(spec).find(f => f.rule === 'duplicate-route-condition')
+    expect(finding?.level).toBe('error')
+    expect(finding?.message).toContain("transition 'attention'")
+
+    spec.transitions[1]!.when = "$state.status == 'stale' && ($output.count == 0 || $output.trend == 'worsened')"
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'duplicate-route-condition')).toEqual([])
+  })
+
+  it('asks semantic review to justify multiple Agents sharing one persistent session', () => {
+    const spec = graph()
+    spec.nodes.pivot = { type: 'agent', lane: 'work', prompt: 'Perform a pivot phase.', tools: ['read_file'] }
+    const finding = lintLoopGraph(spec).find(f => f.rule === 'same-lane-agent-split')
+    expect(finding?.level).toBe('warning')
+    expect(finding?.message).toContain('work, pivot')
+
+    spec.lanes.work!.context = 'fresh_per_activation'
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'same-lane-agent-split')).toEqual([])
   })
 })
