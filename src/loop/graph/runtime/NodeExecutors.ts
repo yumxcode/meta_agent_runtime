@@ -5,7 +5,12 @@ import type {
   FunctionProvider,
 } from '../registry/CapabilityRegistry.js'
 import { GRAPH_AGENT_PROFILE, type GraphAgentExecutor } from '../agent/GraphAgentExecutor.js'
-import { buildGraphAgentSystemPrompt, buildGraphAgentUserPrompt } from '../agent/GraphAgentPrompt.js'
+import {
+  buildGraphAgentRepairPrompt,
+  buildGraphAgentSystemPrompt,
+  buildGraphAgentUserPrompt,
+  GRAPH_AGENT_REPAIR_SYSTEM_PROMPT,
+} from '../agent/GraphAgentPrompt.js'
 import type {
   ActivationRecord,
   ActivationUsage,
@@ -19,7 +24,7 @@ import { evaluateBindings, evaluateValueExpression } from './GraphExpression.js'
 import { isJsonValue, validateShape } from './GraphJson.js'
 import type { GraphSnapshot, GraphStore } from './GraphStore.js'
 import type { LaneManager } from './LaneManager.js'
-import { retryDelayMs } from './UsageMath.js'
+import { addUsage, retryDelayMs } from './UsageMath.js'
 
 export const DEFAULT_AGENT_SEGMENT_BUDGET_USD = 10
 
@@ -84,6 +89,7 @@ export class NodeExecutorRegistry {
       return { kind: 'completed', outcome: 'exhausted', output: { error: segmentLimits.error, limit: 'activation_lifetime' }, summary: segmentLimits.error }
     }
     let result: Awaited<ReturnType<GraphAgentExecutor['execute']>>
+    const workspace = this.agentWorkspace(node.lane, binding)
     try {
       result = await this.deps.graphAgent.execute({
         profile: GRAPH_AGENT_PROFILE,
@@ -115,12 +121,13 @@ export class NodeExecutorRegistry {
             outputSchema: node.outputSchema,
           }),
         },
+        outputSchema: node.outputSchema,
         allowedTools: [...new Set([
           ...(node.tools ?? ['read_file', 'edit_file', 'write_file', 'append_file', 'grep', 'glob', 'bash']),
           ...(node.skills?.length ? ['skill'] : []),
         ])],
         limits: segmentLimits,
-        workspace: this.agentWorkspace(node.lane, binding),
+        workspace,
         continuity: {
           ...(binding.lineageSessionId ? { lineageSessionId: binding.lineageSessionId } : {}),
           workspaceId: this.deps.instance.workspaceId,
@@ -208,9 +215,156 @@ export class NodeExecutorRegistry {
     if (!isJsonValue(raw)) return { kind: 'completed', outcome: 'failure', output: { error: 'agent output is not JSON' }, summary: 'Agent output is not valid JSON', usage }
     if (node.outputSchema) {
       const errors = validateShape(raw, node.outputSchema, '$output')
-      if (errors.length) return { kind: 'completed', outcome: 'failure', output: { error: 'output schema mismatch', details: errors }, summary: `Agent output schema mismatch: ${errors.join('; ')}`, usage }
+      if (errors.length) {
+        const repair = await this.repairAgentOutput({
+          node,
+          activation,
+          candidate: raw,
+          candidateSummary: result.summary,
+          errors,
+          usage,
+          workspace,
+          signal,
+        })
+        const combinedUsage = addUsage(usage, repair.usage)
+        if (repair.kind === 'repaired') {
+          return {
+            kind: 'completed', outcome: 'success', output: repair.output,
+            summary: `${repair.summary || result.summary || 'Agent output repaired'} [contract repair ${repair.taskId} for ${result.taskId}]`,
+            usage: combinedUsage,
+          }
+        }
+        return {
+          kind: 'completed', outcome: 'failure',
+          output: {
+            error: 'output schema mismatch',
+            details: errors,
+            candidateOutput: raw,
+            candidateSummary: result.summary,
+            subtaskId: result.taskId,
+            contractRepair: repair.evidence,
+          },
+          summary: `Agent output schema mismatch after contract repair: ${errors.join('; ')}`,
+          usage: combinedUsage,
+        }
+      }
     }
     return { kind: 'completed', outcome: 'success', output: raw, summary: result.summary, usage }
+  }
+
+  private async repairAgentOutput(input: {
+    node: Extract<NodeSpec, { type: 'agent' }>
+    activation: ActivationRecord
+    candidate: JsonValue
+    candidateSummary: string
+    errors: string[]
+    usage: ActivationUsage
+    workspace: ReturnType<NodeExecutorRegistry['agentWorkspace']>
+    signal: AbortSignal
+  }): Promise<
+    | { kind: 'repaired'; output: JsonValue; summary: string; taskId: string; usage: ActivationUsage }
+    | { kind: 'failed'; evidence: JsonValue; usage?: ActivationUsage }
+  > {
+    const outputSchema = input.node.outputSchema!
+    const afterCandidate: ActivationRecord = {
+      ...input.activation,
+      usage: addUsage(input.activation.usage, input.usage),
+    }
+    const remaining = remainingSegmentLimits(input.node, afterCandidate, this.now())
+    if ('error' in remaining) {
+      return { kind: 'failed', evidence: { status: 'skipped', reason: remaining.error } }
+    }
+    const repairLimits = {
+      turns: Math.min(6, remaining.turns),
+      usd: Math.min(1, remaining.usd),
+      ...(remaining.wallTimeMs !== undefined ? { wallTimeMs: Math.min(120_000, remaining.wallTimeMs) } : { wallTimeMs: 120_000 }),
+    }
+    let repaired: Awaited<ReturnType<GraphAgentExecutor['execute']>>
+    try {
+      repaired = await this.deps.graphAgent!.execute({
+        profile: GRAPH_AGENT_PROFILE,
+        prompt: {
+          system: GRAPH_AGENT_REPAIR_SYSTEM_PROMPT,
+          user: buildGraphAgentRepairPrompt({
+            candidate: input.candidate,
+            summary: input.candidateSummary,
+            errors: input.errors,
+            outputSchema,
+          }),
+        },
+        outputSchema,
+        // The repair seat receives no domain/workspace tools. Its only injected
+        // tool is the schema-bound return_result channel owned by the substrate.
+        allowedTools: [],
+        limits: repairLimits,
+        workspace: {
+          ...input.workspace,
+          mode: 'shared_readonly',
+          writeAllowPaths: [],
+        },
+        // Deliberately omit lineageSessionId: this is a fresh, bounded schema
+        // repair seat, not another turn in the side-effecting research lane.
+        continuity: {
+          workspaceId: this.deps.instance.workspaceId,
+          loopInstanceId: this.deps.instance.instanceId,
+        },
+        ...(this.deps.hostCoordinatorRoot ? { hostCoordinatorRoot: this.deps.hostCoordinatorRoot } : {}),
+        ...(this.deps.maxConcurrentModelCalls !== undefined
+          ? { maxConcurrentModelCalls: this.deps.maxConcurrentModelCalls }
+          : {}),
+        signal: input.signal,
+      })
+    } catch (error) {
+      return {
+        kind: 'failed',
+        evidence: { status: 'failed', reason: `contract repair executor error: ${message(error)}` },
+      }
+    }
+    if (repaired.kind !== 'completed') {
+      return {
+        kind: 'failed',
+        evidence: {
+          status: 'failed',
+          reason: repaired.kind === 'exhausted' ? repaired.reason : `contract repair ${repaired.kind}`,
+          ...('taskId' in repaired ? { subtaskId: repaired.taskId } : {}),
+        },
+        usage: repaired.usage,
+      }
+    }
+    if (!repaired.success) {
+      return {
+        kind: 'failed',
+        evidence: {
+          status: 'failed', subtaskId: repaired.taskId,
+          reason: repaired.error ?? repaired.summary ?? 'contract repair failed',
+          ...(isJsonValue(repaired.output) ? { candidateOutput: repaired.output } : {}),
+        },
+        usage: repaired.usage,
+      }
+    }
+    const candidate = repaired.output ?? repaired.summary
+    if (!isJsonValue(candidate)) {
+      return {
+        kind: 'failed',
+        evidence: { status: 'failed', subtaskId: repaired.taskId, reason: 'contract repair output is not JSON' },
+        usage: repaired.usage,
+      }
+    }
+    const errors = validateShape(candidate, outputSchema, '$output')
+    if (errors.length) {
+      return {
+        kind: 'failed',
+        evidence: {
+          status: 'failed', subtaskId: repaired.taskId,
+          reason: 'contract repair output schema mismatch', details: errors, candidateOutput: candidate,
+        },
+        usage: repaired.usage,
+      }
+    }
+    return {
+      kind: 'repaired', output: candidate, summary: repaired.summary,
+      taskId: repaired.taskId, usage: repaired.usage,
+    }
   }
 
   private async executeFunction(node: Extract<NodeSpec, { type: 'function' }>, activation: ActivationRecord, state: GraphStateSnapshot): Promise<NodeExecutionResult> {

@@ -1,5 +1,7 @@
 /** Public API for the durable-graph-v2 Loop runtime. */
 export * from './graph/index.js'
+export * from './ingress/GraphEventDelivery.js'
+export * from './ingress/WebhookIngress.js'
 export { WakeStore, WakeClaimLostError, wakeClaimOwner, type WakeRecord, type WakeKind } from './wake/WakeStore.js'
 export {
   ensureWorkspaceIdentity,

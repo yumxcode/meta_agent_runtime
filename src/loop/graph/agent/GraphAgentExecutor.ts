@@ -1,4 +1,5 @@
 import type { ActivationUsage, JsonValue } from '../spec/GraphTypes.js'
+import type { ShapeSpec } from '../spec/ShapeSpec.js'
 
 /** Stable Graph Runtime execution profile. It is not a user-facing SessionMode. */
 export const GRAPH_AGENT_PROFILE = 'graph_agent' as const
@@ -37,6 +38,8 @@ export interface GraphAgentTimerCapability {
 export interface GraphAgentExecutionRequest {
   profile: typeof GRAPH_AGENT_PROFILE
   prompt: GraphAgentPrompt
+  /** Frozen Node output contract, enforced by the substrate's result channel. */
+  outputSchema?: ShapeSpec
   allowedTools: string[]
   workspace: GraphAgentWorkspace
   continuity: GraphAgentContinuity

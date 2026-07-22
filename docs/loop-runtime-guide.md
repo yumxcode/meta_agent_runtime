@@ -109,6 +109,14 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
 }
 ```
 
+## Agent 输出契约与局部修复
+
+声明 `outputSchema` 后，Runtime 会把该 schema 直接绑定到 Graph Agent 的 `return_result.data` 工具参数。缺少必填字段、类型/枚举不符或出现禁止的额外字段时，tool call 会在 Agent session 内报错，Agent 可以原地重新提交，而不会先结束 Activation。
+
+post-validation 仍保留为异构 executor 和旧 substrate 的防线。如果一个已完成 segment 仍返回 schema mismatch，Runtime 只启动一次结构化结果 repair segment：fresh context、`shared_readonly`、无业务工具、无 Lane lineage，最多 6 turns、1 USD、120 秒，并受 Node 单段预算上限与 Activation lifetime 剩余预算进一步约束。repair prompt 只能使用原 candidate、summary、校验错误和 schema，不得重做研究、访问 Workspace 或产生外部副作用。
+
+repair 仍失败时，Activation 走既有 `failure` transition，但 `$output` 会保留 `candidateOutput`、`candidateSummary`、原 `subtaskId` 以及 `contractRepair` 的 task ID、候选值和错误，便于 writer、Operator 或人工恢复有效成果。`maxAttempts` 不用于重跑这类已经产生外部副作用的完整 Agent 工作。
+
 ## Workspace 规则
 
 - `read`：Agent 需要读取的项目相对路径清单，供 Prompt、审阅和 Operator View 使用。
@@ -169,6 +177,8 @@ meta-agent loop inspect <instanceId>
 meta-agent loop timeline <instanceId> --limit 50
 meta-agent loop files <instanceId>
 meta-agent loop disk <instanceId>
+meta-agent loop events <instanceId> --status pending
+meta-agent loop inspect <instanceId> --json
 meta-agent loop pause <instanceId> --reason maintenance
 meta-agent loop resume <instanceId>
 meta-agent loop stop <instanceId> --reason cancelled
@@ -177,7 +187,7 @@ meta-agent loop gc --older-than-days 7
 meta-agent loop capabilities
 ```
 
-`files` 显示各 Lane 的直接 Workspace 合同和当前文件状态；`timeline` 显示控制 journal；`disk` 只统计 Runtime 自身实例记录。
+`files` 显示各 Lane 的直接 Workspace 合同和当前文件状态；`timeline` 显示控制 journal；`disk` 只统计 Runtime 自身实例记录。`list/inspect/timeline/disk` 支持版本化 `--json` 输出；`events` 是只读 inbox 视图，不消费或重放事件。`inspect --json` 同时返回静态 Reliability Profile 和从现有持久状态推导的诊断卡片。Evidence、Effect conformance 和 webhook ingress API 见 [Graph Loop Support Packs](graph-loop-support-packs.md)。
 
 ## 运行前审查
 

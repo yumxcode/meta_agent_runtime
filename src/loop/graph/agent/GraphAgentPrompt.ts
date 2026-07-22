@@ -31,6 +31,16 @@ being awaited; the reason is shown when the Activation parks and resumes.
 Calling timer ends this physical segment; do not call more tools or submit node
 output after it.`
 
+/** Protected prompt for a side-effect-free output-contract repair segment. */
+export const GRAPH_AGENT_REPAIR_SYSTEM_PROMPT = `\
+You are a Meta-Agent Graph output-contract repair seat. Your only task is to
+repair an already-produced JSON candidate so it satisfies the supplied output
+schema. Do not repeat the original work, inspect the workspace, invoke domain
+tools, make external calls, or introduce facts unsupported by the candidate and
+its summary. Preserve every valid field and change only what the schema errors
+require. When repaired, call return_result exactly once with the corrected
+candidate in data and a concise summary.`
+
 export function buildGraphAgentSystemPrompt(input?: {
   laneInstructions?: string
   nodeInstructions?: string
@@ -91,6 +101,37 @@ export function buildGraphAgentUserPrompt(input: {
     renderPromptSection({
       name: 'kernel_invariants', source: 'kernel:graph-agent', trust: 'trusted_runtime',
       role: 'invariant', content: 'Routing and state updates are Kernel-owned; do not decide the next node.',
+    }),
+  ].join('\n\n')
+}
+
+export function buildGraphAgentRepairPrompt(input: {
+  candidate: unknown
+  summary?: string
+  errors: string[]
+  outputSchema: ShapeSpec
+}): string {
+  return [
+    renderPromptSection({
+      name: 'candidate_output', source: 'graph-agent:completed-result', trust: 'untrusted_data',
+      role: 'context_data', content: input.candidate,
+    }),
+    renderPromptSection({
+      name: 'candidate_summary', source: 'graph-agent:completed-summary', trust: 'untrusted_data',
+      role: 'context_data', content: input.summary ?? '',
+    }),
+    renderPromptSection({
+      name: 'schema_errors', source: 'kernel:output-validator', trust: 'trusted_runtime',
+      role: 'contract', content: input.errors,
+    }),
+    renderPromptSection({
+      name: 'output_contract', source: 'kernel:output-schema', trust: 'trusted_runtime',
+      role: 'contract', content: input.outputSchema,
+    }),
+    renderPromptSection({
+      name: 'repair_invariants', source: 'kernel:contract-repair', trust: 'trusted_runtime',
+      role: 'invariant',
+      content: 'Return only a schema-valid repair. Do not perform the original task or add unsupported facts.',
     }),
   ].join('\n\n')
 }

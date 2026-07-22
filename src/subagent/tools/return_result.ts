@@ -18,6 +18,7 @@
  */
 
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
+import { validateJsonSchemaValue } from '../../core/jsonSchema.js'
 
 /**
  * Guidance appended to a sub-agent's task description so it knows to hand its
@@ -47,7 +48,10 @@ export interface ReturnedResult {
 
 export function makeReturnResultTool(
   sink: (result: ReturnedResult) => void,
+  dataSchema?: Record<string, unknown>,
 ): MetaAgentTool {
+  const dataDescription =
+    'Authoritative structured result, preserved verbatim and prioritized over narration.'
   return {
     name: 'return_result',
     isConcurrencySafe: false,
@@ -65,24 +69,30 @@ and untruncated-by-narration.
 After calling return_result you may stop — no further tool calls are needed.`,
     inputSchema: {
       type: 'object',
-      required: ['summary'],
+      required: dataSchema ? ['summary', 'data'] : ['summary'],
       properties: {
         summary: {
           type: 'string',
           description: 'Concise natural-language summary of the final outcome.',
         },
-        data: {
-          type: 'object',
-          description:
-            'Optional structured result object (e.g. {papers, synthesis, recommendation}). ' +
-            'Preserved verbatim and prioritized over narration when space is tight.',
-        },
+        data: dataSchema
+          ? { ...dataSchema, description: dataDescription }
+          : {
+              type: 'object',
+              description:
+                'Optional structured result object (e.g. {papers, synthesis, recommendation}). ' +
+                'Preserved verbatim and prioritized over narration when space is tight.',
+            },
       },
     },
     async call(input: Record<string, unknown>): Promise<ToolResult> {
       const summary = String(input['summary'] ?? '').trim()
       if (!summary) {
         return { content: 'Error: return_result requires a non-empty "summary".', isError: true }
+      }
+      if (dataSchema) {
+        const error = validateJsonSchemaValue(input['data'], dataSchema, 'return_result.data')
+        if (error) return { content: `Error: ${error}.`, isError: true }
       }
       const result: ReturnedResult = { summary }
       if (input['data'] !== undefined) result.data = input['data']

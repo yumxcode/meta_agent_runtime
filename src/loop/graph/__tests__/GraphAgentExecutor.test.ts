@@ -63,9 +63,11 @@ describe('graph_agent execution boundary', () => {
       async cancelTask() { return true },
     }
     const executor = new MetaAgentGraphAgentExecutor(dispatcher)
+    const outputSchema = { type: 'object', required: ['ok'], properties: { ok: { type: 'boolean' } } } as const
     const result = await executor.execute({
       profile: GRAPH_AGENT_PROFILE,
       prompt: { system: GRAPH_AGENT_SYSTEM_PROMPT, user: 'current activation' },
+      outputSchema,
       allowedTools: ['read_file'],
       workspace: {
         projectDir: '/workspace',
@@ -92,6 +94,7 @@ describe('graph_agent execution boundary', () => {
       loopInstanceId: 'loop-id',
       maxTurns: 5,
       maxBudgetUsd: 1,
+      resultSchema: outputSchema,
     })
     expect(result).toMatchObject({
       kind: 'completed',

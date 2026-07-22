@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest'
 import { extractLastJsonBlock, buildSummaryFromText } from '../SubAgentRunner.js'
 import { makeReturnResultTool, type ReturnedResult } from '../tools/return_result.js'
+import { toKernelTool } from '../../modes/toolAdapter.js'
 
 describe('extractLastJsonBlock', () => {
   it('returns null when no fenced json block exists', () => {
@@ -52,5 +53,39 @@ describe('makeReturnResultTool', () => {
     const res = await tool.call({ summary: '   ' }, {} as never)
     expect(res.isError).toBe(true)
     expect(captured).toBeUndefined()
+  })
+
+  it('binds return_result.data to a caller-supplied Graph output schema', () => {
+    const tool = toKernelTool(makeReturnResultTool(() => undefined, {
+      type: 'object',
+      required: ['count', 'trend'],
+      properties: {
+        count: { type: 'integer', minimum: 0 },
+        trend: { type: 'string', enum: ['improved', 'unchanged'] },
+      },
+      additionalProperties: false,
+    }))
+
+    expect(tool.inputSchema.safeParse({ summary: 'done' }).success).toBe(false)
+    expect(tool.inputSchema.safeParse({ summary: 'done', data: { count: 1 } }).success).toBe(false)
+    expect(tool.inputSchema.safeParse({ summary: 'done', data: { count: 1, trend: 'improved' } }).success).toBe(true)
+  })
+
+  it('revalidates resultSchema inside call when an executor bypasses toolAdapter', async () => {
+    let captured: ReturnedResult | undefined
+    const tool = makeReturnResultTool(r => { captured = r }, {
+      type: 'object', required: ['trend'],
+      properties: { trend: { type: 'string', enum: ['improved'] } },
+      additionalProperties: false,
+    })
+
+    const invalid = await tool.call({ summary: 'done', data: {} }, {} as never)
+    expect(invalid).toMatchObject({ isError: true })
+    expect(invalid.content).toContain('return_result.data.trend is required')
+    expect(captured).toBeUndefined()
+
+    const valid = await tool.call({ summary: 'done', data: { trend: 'improved' } }, {} as never)
+    expect(valid.isError).toBe(false)
+    expect(captured?.data).toEqual({ trend: 'improved' })
   })
 })

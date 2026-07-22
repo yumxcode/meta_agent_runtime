@@ -46,6 +46,7 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
       outcome = await spawnAndWaitDetailed(this.dispatcher, {
         taskDescription: request.prompt.user,
         systemPrompt: request.prompt.system,
+        resultSchema: request.outputSchema,
         externalPromptAssembly: true,
         skipMemoryRecall: true,
         allowedTools: request.allowedTools,

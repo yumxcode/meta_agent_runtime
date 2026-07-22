@@ -245,11 +245,12 @@ ${bold('LOOP RUNTIME (durable graph only)')}
   meta-agent loop distill <需求.md>        Compile, validate, and iteratively refine a LoopGraphSpec
   meta-agent loop create <graph.json>     Freeze capabilities, create an instance, schedule its first wake
   meta-agent loop event <id> <name>       Deliver a durable graph event (--source/--delivery-id enables deduplication)
-  meta-agent loop list                     List loop instances in this workspace
-  meta-agent loop inspect <instanceId>     State, activations, wakes and public artifacts/evidence
-  meta-agent loop timeline <instanceId>    Human-readable causal timeline derived from the journal
+  meta-agent loop list [--json]            List loop instances in this workspace
+  meta-agent loop inspect <id> [--json]    State, diagnostics and Reliability Profile
+  meta-agent loop timeline <id> [--json]   Causal timeline derived from the journal
+  meta-agent loop events <id> [--json]     Read-only external event inbox view
   meta-agent loop files <instanceId>       Declared inputs/projections and record counts
-  meta-agent loop disk <instanceId>        Metadata/worktree disk usage
+  meta-agent loop disk <instanceId> [--json] Metadata/worktree disk usage and growth metrics
   meta-agent loop tick [--until-quiescent] Claim due wakes and advance graphs
   meta-agent loop pause|resume|stop <id>   Control an instance lifecycle
   meta-agent loop archive <id>             Move a quiescent terminal instance into .loop/archive
@@ -5087,7 +5088,13 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   const { name, args: rawLoopArgs } = opts.loopCommand!
   const projectDir = resolve(opts.workspace ?? process.cwd())
   const graphOptions = extractRepeatedOption(rawLoopArgs, '--graph-pack')
-  const args = graphOptions.args
+  // `--json` is a global flag before the `loop` token, while the loop operator
+  // commands also accept it locally. Forward the global form so both
+  // `meta-agent --json loop inspect …` and `meta-agent loop inspect … --json`
+  // have the same machine-readable contract.
+  const args = opts.json && !graphOptions.args.includes('--json')
+    ? [...graphOptions.args, '--json']
+    : graphOptions.args
   const graphCatalog = createDefaultGraphRuntimeCatalog()
   if (graphOptions.plugins.length > 0) {
     await loadGraphCapabilityPacks({

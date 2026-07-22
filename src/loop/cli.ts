@@ -5,6 +5,8 @@ import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import {
   createFileDistillCheckpointStore,
   createDefaultGraphRuntimeCatalog,
+  buildLoopReliabilityProfile,
+  diagnoseLoop,
   DISTILL_ARTIFACT_FILES,
   distillLoopGraph,
   formatGraphLintFindings,
@@ -28,6 +30,7 @@ import {
 } from './graph/index.js'
 import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
 import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+import { deliverGraphEvent } from './ingress/GraphEventDelivery.js'
 import { runUntilQuiescent, tickOnce } from './runner.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { canonicalWorkspaceRoot, ensureWorkspaceIdentity, forkWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
@@ -52,11 +55,12 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'distill-graph': return distill(args, deps)
     case 'create':
     case 'create-graph': return create(args, deps)
-    case 'list': return list(deps)
+    case 'list': return list(args, deps)
     case 'inspect': return inspect(args, deps)
     case 'timeline': return timeline(args, deps)
     case 'files': return files(args, deps)
     case 'disk': return disk(args, deps)
+    case 'events': return events(args, deps)
     case 'archive': return archive(args, deps)
     case 'gc': return gc(args, deps)
     case 'event': return event(args, deps)
@@ -215,8 +219,12 @@ async function commandOnPath(command: string): Promise<string | null> {
   return null
 }
 
-async function list(deps: LoopCliDeps): Promise<string> {
+async function list(args: string[], deps: LoopCliDeps): Promise<string> {
   const records = await listGraphInstanceRecords(deps.projectDir)
+  if (args.includes('--json')) return prettyJson({
+    schemaVersion: 'loop-list-1.0',
+    instances: records,
+  })
   return records.length
     ? records.map(record => `${record.instanceId}  ${record.status}${record.statusReason ? `  (${record.statusReason})` : ''}  engine=${record.engine}  graph=${record.graphId}@v${record.graphVersion}`).join('\n')
     : '(no loop instances)'
@@ -227,7 +235,7 @@ async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!instanceId) throw new Error('loop inspect: instanceId required')
   const store = new GraphStore(deps.projectDir, instanceId)
   const snapshot = await store.snapshot().catch(() => null)
-  if (!snapshot) return `instance ${instanceId} not found`
+  if (!snapshot) return notFound(args, instanceId)
   const wakes = (await new WakeStore(deps.projectDir).list()).filter(wake =>
     wake.loopId === instanceId && (wake.status === 'pending' || wake.status === 'claimed'),
   )
@@ -242,6 +250,32 @@ async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
     .filter(item => item.status === 'succeeded' || item.status === 'failed')
     .sort((a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id))
     .slice(0, 5)
+  const reliability = buildLoopReliabilityProfile(graph, { generatedAt: now })
+  const diagnostics = diagnoseLoop(graph, {
+    instance: snapshot.instance,
+    state: snapshot.state,
+    activations: [...snapshot.activations.values()],
+    externalEvents: [...snapshot.externalEvents.values()],
+    wakes,
+  }, now)
+  if (args.includes('--json')) return prettyJson({
+    schemaVersion: 'loop-inspect-1.0',
+    generatedAt: now,
+    instance: snapshot.instance,
+    graph: { id: graph.id, version: graph.version, hash: graph.graphHash },
+    state: snapshot.state,
+    activationCounts: counts,
+    totalActivationCount: snapshot.instance.activationCount,
+    cost: { usedUsd: snapshot.instance.totalCostUsd, maxUsd: graph.limits.maxCostUsd ?? null },
+    wakes,
+    activePhases: active.map(item => ({
+      activation: item,
+      phase: graphPhaseLabel(graph.nodes[item.nodeId]!, item.nodeId),
+    })),
+    recentPhaseResults: recent,
+    reliability,
+    diagnostics,
+  })
   return [
     `instance: ${instanceId}  status: ${snapshot.instance.status}${snapshot.instance.statusReason ? ` (${snapshot.instance.statusReason})` : ''}  engine: ${snapshot.instance.engine}`,
     `graph: ${snapshot.instance.graphId}@v${snapshot.instance.graphVersion}  hash: ${snapshot.instance.graphHash.slice(0, 12)}`,
@@ -271,9 +305,16 @@ async function timeline(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!Number.isInteger(requested) || requested < 1 || requested > 1_000) throw new Error('loop timeline: --limit must be an integer in 1..1000')
   const store = new GraphStore(deps.projectDir, instanceId)
   const graph = await store.loadSpec().catch(() => null)
-  if (!graph) return `instance ${instanceId} not found`
+  if (!graph) return notFound(args, instanceId)
   const journal = await store.readJournal()
   const selected = journal.slice(-requested)
+  if (args.includes('--json')) return prettyJson({
+    schemaVersion: 'loop-timeline-1.0',
+    instanceId,
+    showing: selected.length,
+    total: journal.length,
+    events: selected,
+  })
   return [
     `timeline: ${instanceId}  showing=${selected.length}/${journal.length}`,
     ...selected.map(item => {
@@ -321,7 +362,7 @@ async function disk(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!instanceId) throw new Error('loop disk: instanceId required')
   const store = new GraphStore(deps.projectDir, instanceId)
   const rootInfo = await stat(store.paths.root).catch(() => null)
-  if (!rootInfo) return `instance ${instanceId} not found`
+  if (!rootInfo) return notFound(args, instanceId)
   const entries = await readdir(store.paths.root, { withFileTypes: true })
   const sizes = await Promise.all(entries.map(async entry => ({
     name: entry.name,
@@ -329,10 +370,57 @@ async function disk(args: string[], deps: LoopCliDeps): Promise<string> {
   })))
   const total = sizes.reduce((sum, item) => sum + item.bytes, 0)
   const laneWorktrees = await filesystemSize(join(store.paths.lanesDir, 'worktrees'))
+  const [journalFiles, activationFiles, commitIntentFiles, effectIntentFiles, eventFiles, checkpointInfo] = await Promise.all([
+    countJsonFiles(store.paths.journalDir),
+    countJsonFiles(store.paths.activationsDir),
+    countJsonFiles(store.paths.intentsDir),
+    countJsonFiles(store.paths.effectIntentsDir),
+    countJsonFiles(store.paths.eventsDir),
+    stat(store.paths.checkpointJson).catch(() => null),
+  ])
+  const journalBytes = await filesystemSize(store.paths.journalDir)
+  const metrics = {
+    checkpointBytes: checkpointInfo?.size ?? 0,
+    activationFiles,
+    looseJournalFiles: journalFiles,
+    looseJournalBytes: journalBytes,
+    averageLooseJournalBytes: journalFiles ? Math.round(journalBytes / journalFiles) : 0,
+    commitIntentFiles,
+    effectIntentFiles,
+    eventFiles,
+  }
+  if (args.includes('--json')) return prettyJson({
+    schemaVersion: 'loop-disk-1.0', instanceId, totalBytes: total,
+    partitions: sizes.sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name)),
+    laneWorktreeBytes: laneWorktrees,
+    metrics,
+  })
   return [
     `disk: ${instanceId}  total=${formatBytes(total)}`,
     ...sizes.sort((a, b) => b.bytes - a.bytes || a.name.localeCompare(b.name)).map(item => `  ${item.name}: ${formatBytes(item.bytes)}`),
     `  lane worktrees: ${formatBytes(laneWorktrees)}${laneWorktrees ? ' (execution workspaces, not logs)' : ''}`,
+  ].join('\n')
+}
+
+async function events(args: string[], deps: LoopCliDeps): Promise<string> {
+  const instanceId = positional(args)
+  if (!instanceId) throw new Error('loop events: instanceId required')
+  const requestedStatus = flagValue(args, '--status')
+  if (requestedStatus !== undefined && requestedStatus !== 'pending' && requestedStatus !== 'consumed') {
+    throw new Error('loop events: --status must be pending or consumed')
+  }
+  const store = new GraphStore(deps.projectDir, instanceId)
+  const snapshot = await store.snapshot().catch(() => null)
+  if (!snapshot) return notFound(args, instanceId)
+  const selected = [...snapshot.externalEvents.values()]
+    .filter(item => requestedStatus === undefined || item.status === requestedStatus)
+    .sort((a, b) => a.createdAt - b.createdAt || a.id.localeCompare(b.id))
+  if (args.includes('--json')) return prettyJson({
+    schemaVersion: 'loop-events-1.0', instanceId, status: requestedStatus ?? 'all', events: selected,
+  })
+  return [
+    `events: ${instanceId}  status=${requestedStatus ?? 'all'}  count=${selected.length}`,
+    ...selected.map(item => `${item.id}  ${item.status}  ${item.name}${externalDeliveryLabel(item)}  created=${new Date(item.createdAt).toISOString()}${item.consumedAt ? `  consumed=${new Date(item.consumedAt).toISOString()}` : ''}`),
   ].join('\n')
 }
 
@@ -415,6 +503,10 @@ async function filesystemSize(path: string): Promise<number> {
   return sizes.reduce((sum, size) => sum + size, 0)
 }
 
+async function countJsonFiles(path: string): Promise<number> {
+  return (await readdir(path).catch(() => [])).filter(name => name.endsWith('.json')).length
+}
+
 function formatBytes(bytes: number): string {
   if (bytes < 1_024) return `${bytes}B`
   if (bytes < 1_048_576) return `${(bytes / 1_024).toFixed(1)}KiB`
@@ -437,22 +529,22 @@ async function event(args: string[], deps: LoopCliDeps): Promise<string> {
   const positionals = positionalValues(args)
   const [instanceId, name] = positionals
   if (!instanceId || !name) throw new Error('loop event: instanceId and event name required')
-  const store = new GraphStore(deps.projectDir, instanceId)
-  const graph = await store.loadSpec()
   const runtime = catalog(deps)
-  const kernel = await GraphKernel.open({ store, graph, ...runtime })
   const correlation = jsonFlag(args, '--correlation')
   const payload = jsonFlag(args, '--payload')
   const source = flagValue(args, '--source')
   const deliveryId = flagValue(args, '--delivery-id')
-  const result = await kernel.deliverEvent({
+  const result = await deliverGraphEvent({
     name,
     ...(source !== undefined ? { source } : {}),
     ...(deliveryId !== undefined ? { deliveryId } : {}),
     ...(correlation !== undefined ? { correlation } : {}),
     ...(payload !== undefined ? { payload } : {}),
+  }, {
+    projectDir: deps.projectDir,
+    instanceId,
+    catalog: runtime,
   })
-  if (result.resumed) await new WakeStore(deps.projectDir).schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
   const delivery = result.event.source === undefined
     ? ''
     : ` delivery=${result.event.source}:${result.event.deliveryId}`
@@ -575,7 +667,8 @@ function usage(): string {
     '  create <loop.graph.json> [--id instanceId] [--force]  (verifies loop.preconditions.json)',
     '  tick [--until-quiescent]',
     '  event <instanceId> <name> [--source NAME --delivery-id ID] [--correlation JSON] [--payload JSON]',
-    '  list | inspect/timeline/files/disk <instanceId>',
+    '  list [--json] | inspect/timeline/disk <instanceId> [--json] | files <instanceId>',
+    '  events <instanceId> [--status pending|consumed] [--json]',
     '  pause/resume/stop/archive <instanceId>',
     '  gc [--older-than-days N] [--include-archives] [--apply]',
     '  capabilities | workspace-info | workspace-fork | schedulers | host-capacity',
@@ -586,7 +679,7 @@ function positional(args: string[]): string | undefined { return positionalValue
 
 function positionalValues(args: string[]): string[] {
   const values: string[] = []
-  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force'])
+  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force', '--json'])
   for (let index = 0; index < args.length; index++) {
     const value = args[index]!
     if (value.startsWith('--')) {
@@ -606,4 +699,14 @@ function flagValue(args: string[], flag: string): string | undefined {
 function jsonFlag(args: string[], flag: string): JsonValue | undefined {
   const value = flagValue(args, flag)
   return value === undefined ? undefined : JSON.parse(value) as JsonValue
+}
+
+function prettyJson(value: unknown): string {
+  return JSON.stringify(value, null, 2)
+}
+
+function notFound(args: string[], instanceId: string): string {
+  return args.includes('--json')
+    ? prettyJson({ schemaVersion: 'loop-error-1.0', error: 'instance_not_found', instanceId })
+    : `instance ${instanceId} not found`
 }

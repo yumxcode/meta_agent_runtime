@@ -327,7 +327,10 @@ export class SubAgentRunner {
     // here becomes the authoritative summary (see _summaryFor), independent of how
     // chatty the run was. Injected on top of the resolved tools so it never masks
     // the "no tools resolved" guard above.
-    const returnResultTool = makeReturnResultTool(r => { this._returnedResult = r })
+    const returnResultTool = makeReturnResultTool(
+      r => { this._returnedResult = r },
+      cfg.resultSchema,
+    )
     const sessionTools = [...tools, returnResultTool, ...(cfg.extraTools ?? [])]
 
     // Lineage seat (loop inner_orch_worker): resume the prior transcript under a

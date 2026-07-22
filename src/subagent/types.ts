@@ -93,6 +93,13 @@ export interface SubAgentConfig {
    */
   allowedTools?: string[]
   /**
+   * Optional JSON Schema for the authoritative `return_result.data` payload.
+   * Graph Agent seats set this to the frozen Node outputSchema so malformed
+   * results are rejected while the model session is still alive and can repair
+   * its tool call. Persisted as plain JSON with the task record.
+   */
+  resultSchema?: Record<string, unknown>
+  /**
    * Extra tool OBJECTS injected into this sub-agent's session (beyond the
    * name-resolved allowedTools). Used by the loop to give a worker seat
    * instance-scoped tools like timer whose handlers close over
@@ -242,6 +249,7 @@ export interface SubAgentConfig {
 export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> = {
   systemPrompt:            undefined,
   allowedTools:            undefined,
+  resultSchema:            undefined,
   maxTurns:                10,
   maxBudgetUsd:            0.5,
   maxDurationMs:           DEFAULT_SUB_AGENT_MAX_DURATION_MS,
