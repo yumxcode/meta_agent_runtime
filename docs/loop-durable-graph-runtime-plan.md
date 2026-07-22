@@ -1,6 +1,6 @@
 # Durable Graph Loop v2
 
-`durable-graph-v2` 是 Meta-Agent 唯一的长周期 Loop 执行模型。设计目标是让 Kernel 可靠执行 Distill 生成的受约束图，同时把开放领域工作保留给 Agent。
+`durable-graph-v2` 是 Meta-Agent 唯一的长周期 Loop 执行模型。它的目标定位是**强 Agent 的持久化治理与协调内核**：Kernel 可靠执行冻结的治理合同，开放规划、搜索、工具调用、子 Agent 并行与领域判断全部保留给 Agent。它不是通用 Workflow DSL，也不通过细粒度节点分解帮助弱模型完成任务。
 
 ## 1. 最小架构
 
@@ -15,13 +15,17 @@ Requirement
        |- timer / external event
        |- Lane session + write ownership
        `- graph_agent -> real project Workspace
+             `- autonomous inner loop / tools / sub-agents / verification
 ```
 
-Runtime 只有三个核心面：
+Runtime 有四个治理面：
 
-- Control：Node、Transition、`$state`、Reducer、timer/event、边界和终态。
-- Lane：连续会话、串行化、Agent profile 和 Workspace 所有权。
-- Workspace：用户真实文件。Agent 直接读写；它不是 Kernel State 的镜像。
+- Execution Contract：Node、Transition、`$state`、Reducer、timer/event、恢复和终态。
+- Trust & Ownership：Lane 连续会话、串行化、Agent profile、Workspace 所有权、预算与能力锁。
+- External I/O Contract：Effect intent/receipt、幂等键、外部 event delivery/correlation。
+- Evidence & Operations：journal、timeline、可靠性画像、诊断、归档和受控 handoff。
+
+Workspace 是用户真实文件。Agent 直接读写；它不是 Kernel State 的镜像。Graph State 只保存治理所需的小型事实，不同步模型内部计划、完整工作过程或逐工具调用。
 
 Kernel 不理解 Research、Release、Compliance，也不预设任何领域字段或目录。Scenario guidance 只能建议设计，不能改变 Kernel 语义。
 
@@ -55,7 +59,7 @@ interface LoopGraphSpec {
 
 - `agent`：开放领域工作，绑定一个 Lane。
 - `wait`：Kernel timer 或命名外部 event。
-- `terminal`：`done | failed | paused`。
+- `terminal`：`done | failed | exhausted | paused`。
 
 按需扩展：
 
@@ -64,6 +68,20 @@ interface LoopGraphSpec {
 - `join`：显式并发汇合。
 
 默认从“一条 Lane、一个厚 Agent、done/failed”开始。自然语言步骤不是拆节点的理由；确定性提交、权限/并发边界、Kernel 等待、失败隔离和终态才是节点边界。
+
+### 节点边界判据
+
+只有下列任一条件成立才拆节点：
+
+1. 需要跨进程持久等待或外部事件；
+2. 即将执行不可逆 Effect，并需要独立幂等收据；
+3. 需要人工或监督 Agent 审批；
+4. 发生 Lane、Workspace 或 capability 所有权切换；
+5. 需要独立预算、失败隔离或爆炸半径；
+6. 需要把一个确定性决策写入审计；
+7. 到达业务终态。
+
+不同 prompt、角色名、第一轮/后续轮、内部计划阶段或模型预算不同本身都不是节点边界。随着模型增强，允许多个 Agent 节点收缩为一个厚 Agent；Kernel 合同不因此扩张。
 
 ## 3. Lane 与直接 Workspace
 
@@ -108,7 +126,7 @@ Graph State 只保存小型控制事实，例如 iteration、retry count、statu
 {"call": "builtin/identity@1", "args": [{"ref": "$output.value"}]}
 ```
 
-Transition `when` 由程序计算，读取更新前 State；State 只通过注册 Reducer 在 commit 中修改。条件路由必须有唯一 priority 和恰好一条 default。所有非终态 outcome 必须覆盖，循环还必须有业务终态与 `limits.maxActivations` 保险丝。
+Transition `when` 由程序计算，读取更新前 State；State 只通过注册 Reducer 在 commit 中修改。条件路由必须有唯一 priority 和恰好一条 default。所有非终态 outcome 必须覆盖。有界循环使用 `maxTotalActivations`；持续/反应式循环可省略 total，但必须设置 `maxLiveActivations`，并由业务停止事件、预算或 wall limit 管理生命周期。旧 `maxActivations` 仅为兼容字段。
 
 ## 5. 长生命周期、timer 与 event
 
@@ -139,6 +157,8 @@ checkpoint.json
 
 Journal 是控制提交的权威记录；JSON 文件是可修复的 Runtime 索引。Prepared commit 可在 worker 崩溃后重放，commit key 保证同一 continuation 只提交一次。用户文件位于项目本身，由 Agent 按 Lane 合同维护，不写入实例目录。
 
+长期实例必须区分 hot/cold/external 三层：hot 只保留当前执行和恢复需要的有界集合；cold 保存压缩审计段；external archive 按 retention 外送。完整历史若永久保留，总审计字节仍随事件数线性增长，因此只承诺热执行成本有界，不承诺本地完整历史永久有界。
+
 ## 7. Distill 对齐
 
 Distill 三阶段共用 v2 术语：
@@ -167,4 +187,34 @@ Kernel 不保证：
 - 外部平台本身具备幂等、配额锁或高可用；
 - `workspace.read` 构成机密性隔离。
 
+补充边界：
+
+- Effect 的 Kernel 语义是 intent 先持久化、同幂等键至少一次 submit、首个持久 receipt 权威；业务 exactly-once 必须由 provider 通过 conformance 套件证明。
+- `atomic_replace/append_only` 当前对任意 bash 仍是语义合同；Reliability Profile 必须区分 cooperative 与 OS-enforced。
+- 默认 JSON 持久化是 write-then-rename，面向本地 POSIX 的进程崩溃恢复；掉电级 fsync、共享存储 HA 和分布式共识不在默认承诺内。
+- Kernel 保证执行协议、失败边界和可恢复性，不保证 Agent 的领域结论正确。
+
 这些边界保持 Kernel 通用且可部署，同时让 Distill 和用户通过 Tool、Skill、Capability Pack 与项目治理补充领域能力。
+
+## 9. Reliability Profile 与领域扩展
+
+每个冻结图和实例应能输出机器可读的 Reliability Profile，包含：bounded/continuous、wait 活性兜底、state consistency、Effect conformance、event delivery、workspace enforcement、durability、audit retention 和 soak/chaos evidence。它是事实清单，不是一个掩盖 unknown/degraded 项的总分。
+
+领域扩展采用 Domain Capability Pack，而不是新增 Kernel 节点。它是围绕现有 `GraphCapabilityPackV1` 的发布约定：只有 Function/Reducer/Effect 注册和 advisory scenario guidance 属于现有可执行 pack API，Ingress、模板和测试证据是同版本伴随资产，不要求扩大 Kernel pack ABI。一个领域发布包由以下内容组成：
+
+- Agent 原始事实 output schema；
+- 纯 Function/Reducer；
+- Effect provider 与 conformance 证据；
+- Ingress、deliveryId 和 correlation 规范；
+- Lane/Workspace 模板；
+- 领域场景、soak 和 chaos 夹具。
+
+动态高基数 fan-out、ETL、爬取、批量评测和高吞吐消息处理优先交给厚 Agent 内部并行、子 Agent 系统或外部批处理平台。Graph 只记录任务提交、等待、治理决策与结果收据。
+
+## 10. 强 Agent 时代的演进约束
+
+- Distill 从流程规划器收缩为治理合同起草器、静态检查器和可靠性画像生成器。
+- Graph 不记录模型完整计划或思维过程，只接收路由、预算、权限和审计必需的结构化事实。
+- 可续期运营 quota 使用可恢复的 budget pause；不可突破的安全上限才使用不可逆 `exhausted`。
+- 单实例 graphHash 与 capability lock 保持冻结。模型、prompt、Capability 或 Graph 升级采用 checkpoint/export → 显式 state migration → 新实例 → 审批 handoff，不允许运行中任意改图。
+- 默认拒绝新增节点类型、第二套 DSL 和领域控制语义；任何 ABI 扩展必须先证明无法放进厚 Agent、Effect、Capability Pack 或外部执行系统。

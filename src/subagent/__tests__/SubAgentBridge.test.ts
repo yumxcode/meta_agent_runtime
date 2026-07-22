@@ -263,6 +263,18 @@ describe('SubAgentBridge scheduler', () => {
     ).rejects.toThrow(/limit \$10\.0000/)
   })
 
+  it('keeps conservative auto scheduling without a default total cap when a durable caller owns budget', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      conservativeAutoDefaults: true,
+      budgetManagedExternally: true,
+      startDelayMs: 0,
+    })
+
+    await expect(
+      bridge.spawnSubAgent({ config: { taskDescription: 'graph segment', maxBudgetUsd: 15 } }),
+    ).resolves.toMatchObject({ config: { maxBudgetUsd: 15 } })
+  })
+
   it('internal safety-gate tasks bypass the shared budget cap', async () => {
     const bridge = new SubAgentBridge(crypto.randomUUID(), {
       maxConcurrentSubAgents: 1,

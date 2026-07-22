@@ -119,6 +119,8 @@ export class SessionRouter {
   private readonly _resumeSessionId?: string
   /** Confirmation callback for multi-agent escalation — forwarded to RoboticsSession. */
   private readonly _onEscalationRequest: ((reason: string) => Promise<boolean>) | undefined
+  /** Selects whether this session or a durable caller owns aggregate child spend. */
+  private readonly _subAgentBudgetOwner: 'session' | 'caller'
   /**
    * Lightweight Anthropic client used for side-calls.
    * Separate from the backend session client: 30 s timeout, 1 retry, always
@@ -157,7 +159,7 @@ export class SessionRouter {
   private _autoCostLedger: AutoCostLedger | null = null
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
-    const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, ...sessionConfig } = config
+    const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, subAgentBudgetOwner, ...sessionConfig } = config
     // Mode selection is explicit. Omitting mode means the normal agentic backend.
     this._hint = mode ?? 'agentic'
     this._debug = debugMode ?? false
@@ -165,6 +167,7 @@ export class SessionRouter {
     this._explicitResume = explicitResume ?? false
     this._resumeSessionId = resumeSessionId
     this._onEscalationRequest = onEscalationRequest
+    this._subAgentBudgetOwner = subAgentBudgetOwner ?? 'session'
     // Re-inject debugMode so resolveConfig() passes it down to MetaAgentSession.
     // Without this, destructuring above strips debugMode from sessionConfig,
     // making this.config.debugMode always undefined inside MetaAgentSession.
@@ -707,6 +710,7 @@ export class SessionRouter {
       resumeSessionId: this._resumeSessionId,
       explicitResume: this._explicitResume,
       overrides,
+      subAgentBudgetOwner: this._subAgentBudgetOwner,
       getGoal: () => this._autoGoal,
     })
     this._autoCheckpointCoordinator = checkpointCoordinator

@@ -1159,6 +1159,10 @@ function makeRouter(
   if (opts.model)      cfg.model        = opts.model
   if (opts.fallbackModel) cfg.fallbackModel = opts.fallbackModel
   cfg.mode = opts.mode
+  // Graph tick/scheduler already enforce node, Activation-lifetime and graph
+  // aggregate spend durably. Keep auto's jail, but do not reinterpret the
+  // entire daemon lifetime as one $10 auto-session child budget.
+  if (opts.loopCommand) cfg.subAgentBudgetOwner = 'caller'
 
   // Apply maxTurns: explicit flag wins; otherwise cap each user turn so a
   // single prompt cannot run for hours without a checkpoint. Auto-series modes
@@ -5203,7 +5207,10 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
 
   await ensureMcpServerInstructions()
   const router = makeRouter(
-    { ...opts, mode: 'auto', modeExplicit: true, workspace: projectDir, prompt: null, loopCommand: null },
+    // Preserve loopCommand: makeRouter uses it to mark the durable Graph Kernel
+    // as aggregate child-budget owner. Clearing it here silently reinstates the
+    // auto session's default $10 bridge cap.
+    { ...opts, mode: 'auto', modeExplicit: true, workspace: projectDir, prompt: null },
     undefined, undefined, undefined, undefined, undefined, undefined,
   )
   // Register the standard tool set into the backend so spawned Graph Agent

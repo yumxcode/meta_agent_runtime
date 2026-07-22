@@ -63,6 +63,8 @@ export interface AgenticBackendInput {
   explicitResume: boolean
   /** AGENTIC when undefined; AUTO when autonomy is present. */
   overrides?: { autonomy?: AutonomyProfile; promptMode?: AgentMode }
+  /** Durable callers can own aggregate child spend instead of the auto session. */
+  subAgentBudgetOwner?: 'session' | 'caller'
   /**
    * Live accessor for the session goal (AUTO). Read lazily by the gates and the
    * checkpoint snapshot, since the goal is captured on the first submit — after
@@ -88,6 +90,7 @@ export interface AgenticBackend {
 export async function createAgenticBackend(input: AgenticBackendInput): Promise<AgenticBackend> {
   const { baseConfig, projectDir, resumeSessionId, explicitResume, overrides, getGoal } = input
   const hasAutonomyJail = overrides?.autonomy !== undefined
+  const budgetManagedExternally = input.subAgentBudgetOwner === 'caller'
   // Only plain auto wires the heavyweight self-supervision machinery. simple_auto
   // deliberately runs on the lightweight execution base: no durable checkpoints,
   // no drift gate, no completion-verify gate, and no auto experience store. The
@@ -100,7 +103,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     ? readAutoCheckpoint(projectDir, resumeSessionId)
     : null
   const autoBudgetUsd = baseConfig.maxBudgetUsd
-  const costLedger = hasAutonomyJail && typeof autoBudgetUsd === 'number' && Number.isFinite(autoBudgetUsd)
+  const costLedger = !budgetManagedExternally && hasAutonomyJail && typeof autoBudgetUsd === 'number' && Number.isFinite(autoBudgetUsd)
     ? new AutoCostLedger(autoBudgetUsd)
     : null
 
@@ -210,12 +213,17 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   })
   sessionIdForRoles = session.getSessionId()
 
-  // Auto mode: conservative scheduler defaults (lower concurrency + a non-null
-  // total budget) as unattended safety/cost guards (env still overrides).
+  // Auto mode keeps conservative concurrency. Ordinary sessions also get the
+  // default aggregate budget; durable callers (Graph Kernel) own that budget
+  // themselves so a long-lived scheduler is not capped as one auto turn.
   const bridge = new SubAgentBridge(
     session.getSessionId(),
     hasAutonomyJail
-      ? { conservativeAutoDefaults: true, ...(costLedger ? { costLedger } : {}) }
+      ? {
+          conservativeAutoDefaults: true,
+          ...(budgetManagedExternally ? { budgetManagedExternally: true } : {}),
+          ...(costLedger ? { costLedger } : {}),
+        }
       : undefined,
   )
   bridgeRef = bridge

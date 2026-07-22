@@ -25,6 +25,7 @@ const mockState = vi.hoisted(() => ({
   // Constructor config captured from each MetaAgentSession instantiation.
   configs: [] as Array<Record<string, unknown>>,
   autonomyJailCalls: [] as Array<{ jail: unknown; opts: unknown }>,
+  bridgeOptions: [] as unknown[],
 }))
 
 vi.mock('../../core/MetaAgentSession.js', () => ({
@@ -42,7 +43,7 @@ vi.mock('../../core/MetaAgentSession.js', () => ({
 
 vi.mock('../../subagent/SubAgentBridge.js', () => ({
   SubAgentBridge: class {
-    constructor(_sessionId: string, _opts?: unknown) {}
+    constructor(_sessionId: string, opts?: unknown) { mockState.bridgeOptions.push(opts) }
     setToolRegistry(): void {}
     setAutonomyJail(jail: unknown, opts?: unknown): void {
       mockState.autonomyJailCalls.push({ jail, opts })
@@ -65,7 +66,7 @@ function tmpProjectDir(): string {
 
 async function buildBackend(
   promptModeKey: 'auto' | 'simple_auto',
-  opts: { projectDir?: string; explicitResume?: boolean; resumeSessionId?: string } = {},
+  opts: { projectDir?: string; explicitResume?: boolean; resumeSessionId?: string; subAgentBudgetOwner?: 'session' | 'caller' } = {},
 ) {
   const projectDir = opts.projectDir ?? tmpProjectDir()
   const baseConfig = resolveConfig({ projectDir })
@@ -75,6 +76,7 @@ async function buildBackend(
     explicitResume: opts.explicitResume ?? false,
     resumeSessionId: opts.resumeSessionId,
     overrides: MODE_PROFILES[promptModeKey].agenticOverrides,
+    subAgentBudgetOwner: opts.subAgentBudgetOwner,
     getGoal: () => null,
   })
   const config = mockState.configs.at(-1)!
@@ -85,6 +87,7 @@ describe('simple_auto backend wiring', () => {
   beforeEach(() => {
     mockState.configs.length = 0
     mockState.autonomyJailCalls.length = 0
+    mockState.bridgeOptions.length = 0
   })
 
   afterEach(() => {
@@ -98,6 +101,16 @@ describe('simple_auto backend wiring', () => {
       autoApproveInWorkspace: true,
       lockWorkspace: true,
     })
+  })
+
+  it('lets a durable caller own aggregate child budget without disabling the auto jail', async () => {
+    const { backend } = await buildBackend('auto', { subAgentBudgetOwner: 'caller' })
+    expect(backend.costLedger).toBeNull()
+    expect(mockState.bridgeOptions.at(-1)).toMatchObject({
+      conservativeAutoDefaults: true,
+      budgetManagedExternally: true,
+    })
+    expect(mockState.autonomyJailCalls).toHaveLength(1)
   })
 
   it('does NOT wire verify / drift / checkpoint / experience-recall', async () => {

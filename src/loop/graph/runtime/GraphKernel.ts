@@ -108,13 +108,22 @@ export class GraphKernel {
     let snapshot = await this.options.store.snapshot()
     if (isTerminal(snapshot.instance)) return emptyResult(snapshot.instance)
     if (this.options.graph.limits.maxWallTimeMs !== undefined && now - snapshot.instance.createdAt >= this.options.graph.limits.maxWallTimeMs) {
-      const instance = await this.options.store.setStatus('failed', 'maxWallTimeMs exceeded', now)
-      return { ...emptyResult(instance), failed: 1 }
+      const instance = await this.options.store.setStatus('exhausted', `maxWallTimeMs ${this.options.graph.limits.maxWallTimeMs} exhausted`, now)
+      return emptyResult(instance)
     }
 
     const recoveredResults = await this.coordinator.recoverPrepared(now)
     for (const recovered of recoveredResults) {
-      if (recovered.duplicate || recovered.replayed) continue
+      if (recovered.duplicate) continue
+      if (recovered.replayed) {
+        if (recovered.activation.wakeAt !== undefined) await this.wakeStore.schedule({
+          loopId: this.options.store.instanceId,
+          activationId: recovered.activation.id,
+          kind: 'timer',
+          fireAt: recovered.activation.wakeAt,
+        })
+        continue
+      }
       for (const child of recovered.spawned) {
         if (this.options.graph.nodes[child.nodeId]?.type === 'join') {
           await this.coordinator.resumeDue(now, { name: `join:${child.nodeId}`, correlation: child.forkGroupId ?? null })
@@ -138,6 +147,7 @@ export class GraphKernel {
     // after both timestamps. Event matching enforces createdAt < wakeAt.
     await this.coordinator.resumePendingExternalEvents(now)
     await this.coordinator.resumeDue(now)
+    await this.coordinator.reconcileWaitingJoins(now)
     await this.syncDerivedStatus(now)
     snapshot = await this.options.store.snapshot()
     if (isTerminal(snapshot.instance)) return { ...emptyResult(snapshot.instance), recovered: recoveredResults.length }
@@ -344,8 +354,8 @@ export class GraphKernel {
         if (!(error instanceof ParkLimitExceededError)) throw error
         return this.finishActivation(activation, {
           kind: 'completed',
-          outcome: 'failure',
-          output: { error: error.message },
+          outcome: 'exhausted',
+          output: { error: error.message, limit: 'maxPendingTimers' },
           summary: error.message,
           usage: result.usage,
         })
@@ -382,11 +392,18 @@ export class GraphKernel {
     })
     const committed = await this.coordinator.commit(intent, this.now())
     if (committed.replayed) {
+      if (committed.activation.wakeAt !== undefined) await this.wakeStore.schedule({
+        loopId: this.options.store.instanceId,
+        activationId: committed.activation.id,
+        kind: 'timer',
+        fireAt: committed.activation.wakeAt,
+      })
       this.emitProgress({
         type: 'phase_retrying',
         ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, committed.activation, this.now()),
         reason: committed.activation.error ?? 'State changed; replaying under serializable policy',
         replay: true,
+        ...(committed.activation.wakeAt !== undefined ? { wakeAt: committed.activation.wakeAt } : {}),
       })
       return 'retried'
     }
@@ -412,34 +429,42 @@ export class GraphKernel {
     const node = this.options.graph.nodes[activation.nodeId]
     if (node?.type !== 'agent') return result
     const usage = addUsage(activation.usage, result.usage)
-    const errors: string[] = []
+    const failures: string[] = []
+    const exhausted: string[] = []
     if (result.kind === 'parked') {
-      if (!node.timerPolicy?.allowHardPark) errors.push('Agent node is not allowed to hard-park')
+      if (!node.timerPolicy?.allowHardPark) failures.push('Agent node is not allowed to hard-park')
       if (node.timerPolicy?.maxParks !== undefined && (activation.parkCount ?? 0) + 1 > node.timerPolicy.maxParks) {
-        errors.push(`Agent Activation maxParks ${node.timerPolicy.maxParks} exceeded`)
+        exhausted.push(`Agent Activation maxParks ${node.timerPolicy.maxParks} exhausted`)
       }
     }
     if (node.lifetimeBudget?.turns !== undefined && usage.turns > node.lifetimeBudget.turns) {
-      errors.push(`Agent Activation lifetime turns ${node.lifetimeBudget.turns} exceeded`)
+      exhausted.push(`Agent Activation lifetime turns ${node.lifetimeBudget.turns} exhausted`)
     }
     if (node.lifetimeBudget?.usd !== undefined && usage.costUsd > node.lifetimeBudget.usd) {
-      errors.push(`Agent Activation lifetime USD ${node.lifetimeBudget.usd} exceeded`)
+      exhausted.push(`Agent Activation lifetime USD ${node.lifetimeBudget.usd} exhausted`)
     }
     if (node.lifetimeBudget?.elapsedMs !== undefined && activation.firstStartedAt !== undefined &&
         this.now() - activation.firstStartedAt > node.lifetimeBudget.elapsedMs) {
-      errors.push(`Agent Activation lifetime elapsedMs ${node.lifetimeBudget.elapsedMs} exceeded`)
+      exhausted.push(`Agent Activation lifetime elapsedMs ${node.lifetimeBudget.elapsedMs} exhausted`)
     }
     const snapshot = await this.options.store.snapshot()
     if (this.options.graph.limits.maxCostUsd !== undefined &&
         snapshot.instance.totalCostUsd + (result.usage?.costUsd ?? 0) > this.options.graph.limits.maxCostUsd) {
-      errors.push(`Graph maxCostUsd ${this.options.graph.limits.maxCostUsd} exceeded`)
+      exhausted.push(`Graph maxCostUsd ${this.options.graph.limits.maxCostUsd} exhausted`)
     }
-    if (!errors.length) return result
-    return {
+    if (failures.length) return {
       kind: 'completed',
       outcome: 'failure',
-      output: { error: errors.join('; ') },
-      summary: errors.join('; '),
+      output: { error: failures.join('; ') },
+      summary: failures.join('; '),
+      usage: result.usage,
+    }
+    if (!exhausted.length) return result
+    return {
+      kind: 'completed',
+      outcome: 'exhausted',
+      output: { error: exhausted.join('; '), limit: 'execution_budget' },
+      summary: exhausted.join('; '),
       usage: result.usage,
     }
   }
@@ -568,7 +593,7 @@ function verifyCapabilityLock<T extends { manifest: { id: string; version: strin
 }
 
 function isTerminal(instance: GraphInstanceRecord): boolean {
-  return instance.status === 'done' || instance.status === 'failed'
+  return instance.status === 'done' || instance.status === 'exhausted' || instance.status === 'failed'
 }
 
 function emptyResult(instance: GraphInstanceRecord): GraphTickResult {

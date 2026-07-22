@@ -237,4 +237,29 @@ describe('durable-graph-v2 ABI', () => {
     spec.lanes.audit = { context: 'fresh_per_activation', scm: 'git', workspace: { read: ['state'], write: [] } }
     expect(validateLoopGraph(spec, catalog()).join('\n')).toContain('scm requires at least one workspace write rule')
   })
+
+  it('supports continuous limits and an explicit exhausted Terminal', () => {
+    const spec = graph()
+    spec.limits = { maxLiveActivations: 2 }
+    const failed = spec.nodes.failed
+    if (failed.type !== 'terminal') throw new Error('expected Terminal')
+    failed.status = 'exhausted'
+    expect(validateLoopGraph(spec, catalog())).toEqual([])
+  })
+
+  it('requires one Activation safety bound and rejects ambiguous legacy/new totals', () => {
+    const spec = graph()
+    spec.limits = {}
+    expect(validateLoopGraph(spec, catalog()).join('\n')).toContain('limits must declare maxLiveActivations')
+    spec.limits = { maxActivations: 20, maxTotalActivations: 20 }
+    expect(validateLoopGraph(spec, catalog()).join('\n')).toContain('legacy alias of maxTotalActivations')
+  })
+
+  it('requires an explicit State consistency policy for concurrent execution', () => {
+    const spec = graph()
+    spec.concurrency = { maxActivations: 2 }
+    expect(validateLoopGraph(spec, catalog()).join('\n')).toContain('stateConsistency must be explicit')
+    spec.concurrency.stateConsistency = 'commit_latest'
+    expect(validateLoopGraph(spec, catalog())).toEqual([])
+  })
 })

@@ -11,6 +11,8 @@
 
 ## Design Notes
 
+- [Graph Loop positioning and evolution roadmap: durable governance kernel](graph-loop-positioning-and-roadmap-2026-07-21.md)
+- [Graph Loop P1 roadmap: multi-domain long-running loops](graph-loop-p1-roadmap-2026-07-21.md)
 - [Robotics mode design](robotics-mode-design.md)
 - [Robotics mode design v2](robotics-mode-design-v2.md)
 - [Prompt optimization plan](prompt-optimization-plan.md)

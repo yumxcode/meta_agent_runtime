@@ -175,7 +175,7 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
     },
   ],
   entrypoints: [{ id: 'start', node: 'work' }],
-  limits: { maxActivations: 100, maxWallTimeMs: 86_400_000, maxCostUsd: 20 },
+  limits: { maxTotalActivations: 100, maxLiveActivations: 4, maxWallTimeMs: 86_400_000, maxCostUsd: 20 },
   concurrency: { maxActivations: 1, maxPerNode: 1, stateConsistency: 'commit_latest' },
 }
 
@@ -841,7 +841,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 1. Constraint Ledger 是权威来源合同；Blueprint 只描述 Workspace、Lane、Control 意图，不预设拓扑。你可以自由选择最小充分的 Node、Lane、State 和 Transition。
 2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
 3. 不要凭记忆猜 ABI。先调用 graph_reference(example)，再只按实际缺口调用 overview、nodes、workspace、lanes、control、capabilities；不要一次加载全部 section，也不要用不完整 skeleton 试探 graph_validate。
-4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 两个终态”开始，只添加 Ledger 明确要求的边界。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。优先让同一个 persistent Agent 通过 mode/input 执行常规轮次、反思和 pivot；只有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
+4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 业务终态”开始，只添加 Ledger 明确要求的边界；需要作者处理节点预算耗尽时再增加 exhausted 终态/边。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。优先让同一个 persistent Agent 通过 mode/input 执行常规轮次、反思和 pivot；只有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
 5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
 
 【稳定语义边界】
@@ -862,7 +862,9 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - 单 writer 本身就是归约与路由之间的持久边界：工作 Agent 的多条出边用 when + updates 同时写入“下一计数”和“派生状态”，全部先进入 writer；writer 成功后的出边再按 $state 路由，包括 pivot_required→pivot。不得让 research→pivot 或 pivot→pivot 绕过 writer。bootstrap 只读取/发现并输出初始化 payload，不得亲自创建 writer 所拥有的文件；bootstrap、正常提交、pivot 提交、attention 报告和 error 记录都复用同一个 writer 的 mode/input，不为同一文件 owner 再拆 report/error Agent。
 - “唯一文件 writer”必须拥有独立 Lane，且工作 Agent 所在 Lane 不得包含 writer-owned 文件的 write rule；同一 Lane 内换一个 Node 名称或 prompt 不构成权限隔离。反过来，bootstrap/pivot/report 若只是同一研究会话中的首次模式、结构化策略或终止输出，也不得仅因角色名、独立 budget 或 first-run 标记拆 Agent，应作为厚 Agent 的 mode/input 处理。
 - when 读取更新前 State 不意味着需要 gate。若本轮触发后 next_count=current+1，阈值 next_count>=T 直接改写为 current>=T-1，并按阈值优先级枚举互斥 Transition；reset 分支直接同时 set 计数和状态。只有这个代数改写确实无法表达时才允许一个真实的 commit barrier，禁止串联 identity/reduce/status gate。
-- 确定性阈值、计数和时间规则不得让 Agent 心算；when 读取更新前 State。每个非终态 outcome 必须全覆盖，每个循环同时有业务终态和 limits.maxActivations 保险丝。
+- 确定性阈值、计数和时间规则不得让 Agent 心算；when 读取更新前 State。每个非终态 outcome 必须全覆盖。有界收敛 loop 使用 maxTotalActivations + maxLiveActivations；持续/反应式 loop 省略总量上限，只用 maxLiveActivations 限制同时存活的 ready/running/waiting Activation，并保留业务停止事件到 Terminal 的路由。不要再生成旧字段 maxActivations。
+- Graph 的墙钟、费用、Activation 总量/存活量和 Agent 生命周期预算耗尽会进入独立 exhausted 终态，不等同执行 failure；节点需要在耗尽前整理结果时可显式提供 on:'exhausted' 路由。quiesced without terminal 仍是控制流错误。
+- 并发数大于 1 时必须显式选择 stateConsistency。commit_latest 的 when 不得在需要同一快照语义时混用新鲜 $state 与基于旧 claim 快照生成的 $output；此类决策使用 serializable，或只路由与可变 State 无关的原始 output 事实。
 - Agent 使用 graph_agent；Graph 不选择 agentic/auto mode。研究、训练、监测、提取、评估等紧耦合语义步骤默认留在一个厚 Agent 内，由 Agent 自主规划；Graph 只接收路由所需的闭合事实。长 Activation 可以 timer hard park，自主选择下一次唤醒时间；只强制 persistent Lane 与 timerPolicy.maxDelayMs/maxParks。固定外部事件边界才使用 event Wait，固定图级时间边界才使用 timer Wait。每段已有保守默认预算，segment/lifetime budget 仅在来源确有需要时覆盖。
 - 只引用 graph_reference(capabilities) 返回的 Agent Tool、Function、Reducer、Effect 和 Pack。缺能力时在 taskSpec 明确列出，不能伪造。
 - outputSchema 只需闭合被路由、更新或传递引用的字段；开放探索正文不必过度 schema 化。

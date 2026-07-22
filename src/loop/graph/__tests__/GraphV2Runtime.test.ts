@@ -149,7 +149,7 @@ describe('durable-graph-v2 runtime', () => {
       state: {}, lanes: {},
       nodes: { done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' } },
       transitions: [], entrypoints: [{ id: 'done', node: 'done' }, { id: 'failed', node: 'failed' }],
-      limits: { maxActivations: 2 }, concurrency: { maxActivations: 2 },
+      limits: { maxActivations: 2 }, concurrency: { maxActivations: 2, stateConsistency: 'commit_latest' },
     }
     const graph = freezeLoopGraph(spec, caps, 1)
     const store = await GraphStore.create({ projectDir, instanceId: 'terminal-order', graph, functions: caps.functions, now: 1 })
@@ -226,6 +226,7 @@ describe('durable-graph-v2 runtime', () => {
     now = 110
     const due = await prepareAndClaim({ projectDir, graphAgent }, now)
     expect(due.wakes.map(wake => wake.activationId)).toContain('__graph_deadline__')
+    expect((await kernel.tick()).instance.status).toBe('exhausted')
   })
 
   it('applies NodeBase timeoutMs to Function nodes', async () => {
@@ -289,6 +290,48 @@ describe('durable-graph-v2 runtime', () => {
     expect(outcome.error).toBeUndefined()
     expect(heartbeats).toBeGreaterThan(0)
     expect(releases).toBe(1)
+  })
+
+  it('pauses instead of irreversibly failing after repeated unknown runner errors', async () => {
+    const projectDir = await root(); const catalog = createDefaultGraphRuntimeCatalog()
+    const graph = freezeLoopGraph(agentGraph(), catalog, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'runner-transient-pause', graph, functions: catalog.functions, now: 1 })
+    const graphAgent = { id: 'unused', async execute() { throw new Error('unused') } }
+    const hostCoordinator = {
+      rootDir: join(projectDir, '.host-test'), maxConcurrentModelCalls: 1, heartbeatIntervalMs: 5,
+      async acquireGraphTick() { throw new Error('temporary filesystem lock timeout') },
+    }
+    const deps = {
+      projectDir, graphAgent, graphCatalog: catalog,
+      hostCoordinator: hostCoordinator as never,
+      workspaceIdentity: { schemaVersion: '1.0' as const, workspaceId: (await store.snapshot()).instance.workspaceId, createdAt: 1 },
+    }
+    let finalError = ''
+    for (let attempt = 1; attempt <= 5; attempt++) {
+      const prepared = await prepareAndClaim(deps, Date.now() + 120_000)
+      expect(prepared.wakes).toHaveLength(1)
+      const outcome = await runClaimedWake(deps, prepared.wakeStore, prepared.wakes[0]!)
+      finalError = outcome.error ?? ''
+      expect((await store.snapshot()).instance.status).toBe(attempt < 5 ? 'active' : 'paused')
+    }
+    expect(finalError).toContain('run loop resume runner-transient-pause')
+    expect((await store.snapshot()).instance.statusReason).toContain('paused after 5 transient/unknown failures')
+  })
+
+  it('still marks a whitelisted deterministic runner error as failed', async () => {
+    const projectDir = await root(); const catalog = createDefaultGraphRuntimeCatalog()
+    const graph = freezeLoopGraph(agentGraph(), catalog, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'runner-deterministic-fail', graph, functions: catalog.functions, now: 1 })
+    const prepared = await prepareAndClaim({ projectDir, graphAgent: { id: 'unused', async execute() { throw new Error('unused') } } }, Date.now())
+    const incompatible = createDefaultGraphRuntimeCatalog()
+    incompatible.agentTools = new Set(['read_file'])
+    const outcome = await runClaimedWake({
+      projectDir,
+      graphAgent: { id: 'unused', async execute() { throw new Error('unused') } },
+      graphCatalog: incompatible,
+    }, prepared.wakeStore, prepared.wakes[0]!)
+    expect(outcome.error).toContain('capability mismatch')
+    expect((await store.snapshot()).instance.status).toBe('failed')
   })
 
   it('parks on a Kernel timer and resumes after its deadline', async () => {
@@ -434,7 +477,7 @@ describe('durable-graph-v2 runtime', () => {
         { id: 'joined', from: 'join', to: 'done' },
       ],
       entrypoints: [{ id: 'start', node: 'start' }], limits: { maxActivations: 10, maxFanOut: 2 },
-      concurrency: { maxActivations: 2, maxPerNode: 2 },
+      concurrency: { maxActivations: 2, maxPerNode: 2, stateConsistency: 'commit_latest' },
     }
     const graph = freezeLoopGraph(spec, caps, 1); const store = await GraphStore.create({ projectDir, instanceId: 'join', graph, functions: caps.functions })
     const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test' })
@@ -442,6 +485,92 @@ describe('durable-graph-v2 runtime', () => {
     const snapshot = await store.snapshot()
     expect(snapshot.instance.status).toBe('done')
     expect([...snapshot.activations.values()].filter(item => item.nodeId === 'join' && item.status === 'succeeded')).toHaveLength(1)
+  })
+
+  it('reconciles a complete waiting Join after the post-commit resume signal is lost', async () => {
+    const projectDir = await root(); const caps = capabilities(); let now = 0
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-2.0', id: 'join_reconcile', version: 1, goal: 'Repair a lost Join signal.', state: {}, lanes: {},
+      nodes: {
+        start: { type: 'function', function: 'builtin/identity@1' },
+        left: { type: 'function', function: 'builtin/identity@1' },
+        right: { type: 'wait', wait: { kind: 'timer', delayMs: { literal: 100 }, maxDelayMs: 100 } },
+        join: { type: 'join', mode: 'all', expects: ['left_join', 'right_join'] },
+        done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
+      },
+      transitions: [
+        { id: 'fanout', from: 'start', to: ['left', 'right'] },
+        { id: 'start_failed', from: 'start', on: 'failure', to: 'failed' },
+        { id: 'left_join', from: 'left', to: 'join' },
+        { id: 'left_failed', from: 'left', on: 'failure', to: 'failed' },
+        { id: 'right_join', from: 'right', on: 'timer', to: 'join' },
+        { id: 'right_failed', from: 'right', on: 'failure', to: 'failed' },
+        { id: 'joined', from: 'join', to: 'done' },
+      ],
+      entrypoints: [{ id: 'start', node: 'start' }],
+      limits: { maxTotalActivations: 10, maxLiveActivations: 4, maxFanOut: 2, maxPendingTimers: 2 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'join-reconcile', graph, functions: caps.functions, now })
+    const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test', now: () => now })
+    for (let step = 0; step < 8; step++) {
+      const snapshot = await store.snapshot()
+      const joinWaiting = [...snapshot.activations.values()].some(item => item.nodeId === 'join' && item.status === 'waiting')
+      const timerWaiting = [...snapshot.activations.values()].some(item => item.nodeId === 'right' && item.status === 'waiting')
+      if (joinWaiting && timerWaiting) break
+      await kernel.tick()
+    }
+    const beforeArrival = await store.snapshot()
+    const parkedJoin = [...beforeArrival.activations.values()].find(item => item.nodeId === 'join' && item.status === 'waiting')
+    expect(parkedJoin).toBeDefined()
+
+    const coordinator = (kernel as unknown as { coordinator: CommitCoordinator }).coordinator
+    const resumeDue = coordinator.resumeDue.bind(coordinator)
+    let dropped = false
+    coordinator.resumeDue = async (at, event) => {
+      if (!dropped && event?.name === 'join:join') {
+        dropped = true
+        throw new Error('simulated transaction lock timeout after Join arrival commit')
+      }
+      return resumeDue(at, event)
+    }
+    now = 100
+    // The arrival commit succeeds before the separate resume call throws. The
+    // wave treats the already-succeeded source Activation as committed, so the
+    // caller need not observe an exception for the notification to be lost.
+    await kernel.tick()
+    expect(dropped).toBe(true)
+    expect((await store.snapshot()).activations.size).toBeGreaterThan(beforeArrival.activations.size)
+
+    // Materialize the worst recoverable state explicitly: every complete
+    // barrier member is parked and no member has a timer. Reconciliation must
+    // choose the same UUID leader as executeJoin and wake only that member.
+    await store.withTransaction(async () => {
+      const snapshot = await store.authoritativeSnapshotLocked()
+      for (const activation of snapshot.activations.values()) {
+        if (activation.nodeId !== 'join' || activation.status !== 'ready') continue
+        const waiting = {
+          ...activation,
+          status: 'waiting' as const,
+          readyReason: undefined,
+          waitingReason: 'continuation' as const,
+          event: { name: 'join:join', correlation: activation.forkGroupId ?? null },
+          updatedAt: now,
+        }
+        await store.appendEventLocked({ type: 'activation_released', at: now, activation: waiting, reason: 'parked' })
+        await store.writeActivationProjectionLocked(waiting)
+      }
+    })
+    const allWaiting = [...(await store.snapshot()).activations.values()]
+      .filter(item => item.nodeId === 'join' && item.status === 'waiting')
+    expect(allWaiting).toHaveLength(2)
+    const leaderId = [...allWaiting].sort((a, b) => a.id.localeCompare(b.id))[0]!.id
+    await kernel.tick()
+    const journal = await store.readJournal()
+    expect(journal.some(record => record.event.type === 'activation_released' &&
+      record.event.reason === 'resumed' && record.event.activation.id === leaderId)).toBe(true)
+    for (let step = 0; step < 6 && (await store.snapshot()).instance.status !== 'done'; step++) await kernel.tick()
+    expect((await store.snapshot()).instance.status).toBe('done')
   })
 
   it('bounds a pending idempotent Effect by its Activation deadline', async () => {
@@ -464,5 +593,137 @@ describe('durable-graph-v2 runtime', () => {
     expect((await kernel.tick()).committed).toBe(1)
     expect(submits).toBe(1)
     expect((await kernel.tick()).instance.status).toBe('failed')
+  })
+
+  it('supports a continuous reactive loop with only a live-Activation cap', async () => {
+    const projectDir = await root(); const caps = capabilities()
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-2.0', id: 'continuous', version: 1, goal: 'Run beyond any lifetime Activation count.',
+      state: { count: { type: { type: 'integer', minimum: 0 }, initial: 0 } }, lanes: {},
+      nodes: {
+        step: { type: 'function', function: 'builtin/identity@1' },
+        done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
+      },
+      transitions: [
+        { id: 'again', from: 'step', when: '$state.count < 20', priority: 10, updates: [{ target: 'count', reducer: 'builtin/increment@1' }], to: 'step' },
+        { id: 'done', from: 'step', default: true, to: 'done' },
+        { id: 'failed', from: 'step', on: 'failure', to: 'failed' },
+      ],
+      entrypoints: [{ id: 'start', node: 'step' }],
+      limits: { maxLiveActivations: 1 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'continuous', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test' })
+    for (let index = 0; index < 30 && !['done', 'exhausted', 'failed'].includes((await store.snapshot()).instance.status); index++) await kernel.tick()
+    const snapshot = await store.snapshot()
+    expect(snapshot.instance.status).toBe('done')
+    expect(snapshot.instance.activationCount).toBe(22)
+    expect(snapshot.state.values.count).toBe(20)
+  })
+
+  it('ends as exhausted instead of failed when the total Activation budget is consumed', async () => {
+    const projectDir = await root(); const caps = capabilities()
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-2.0', id: 'total-exhaustion', version: 1, goal: 'Stop cleanly at the lifetime cap.',
+      state: {}, lanes: {},
+      nodes: { step: { type: 'function', function: 'builtin/identity@1' }, failed: { type: 'terminal', status: 'failed' } },
+      transitions: [{ id: 'again', from: 'step', to: 'step' }, { id: 'failed', from: 'step', on: 'failure', to: 'failed' }],
+      entrypoints: [{ id: 'start', node: 'step' }],
+      limits: { maxTotalActivations: 2, maxLiveActivations: 1 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'total-exhaustion', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test' })
+    await kernel.tick()
+    const result = await kernel.tick()
+    expect(result.instance).toMatchObject({ status: 'exhausted', activationCount: 2 })
+    expect(result.instance.statusReason).toContain('maxTotalActivations 2 exhausted')
+  })
+
+  it('bounds retained ready/waiting work independently from the lifetime count', async () => {
+    const projectDir = await root(); const caps = capabilities()
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-2.0', id: 'live-exhaustion', version: 1, goal: 'Reject an unsafe live fan-out.', state: {}, lanes: {},
+      nodes: {
+        start: { type: 'function', function: 'builtin/identity@1' },
+        left: { type: 'terminal', status: 'done' }, right: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
+      },
+      transitions: [{ id: 'fork', from: 'start', to: ['left', 'right'] }, { id: 'failed', from: 'start', on: 'failure', to: 'failed' }],
+      entrypoints: [{ id: 'start', node: 'start' }],
+      limits: { maxLiveActivations: 1, maxFanOut: 2 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'live-exhaustion', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test' })
+    const result = await kernel.tick()
+    expect(result.instance.status).toBe('exhausted')
+    expect(result.instance.statusReason).toContain('maxLiveActivations 1 exhausted')
+    expect((await store.snapshot()).activations.size).toBe(1)
+  })
+
+  it("lets an Agent route the 'exhausted' outcome to an explicit terminal", async () => {
+    const projectDir = await root(); const caps = capabilities()
+    const spec = agentGraph()
+    spec.nodes.work = { ...spec.nodes.work as Extract<LoopGraphSpec['nodes'][string], { type: 'agent' }>, lifetimeBudget: { turns: 1 } }
+    spec.nodes.exhausted = { type: 'terminal', status: 'exhausted' }
+    spec.transitions.push({ id: 'exhausted', from: 'work', on: 'exhausted', to: 'exhausted' })
+    spec.limits = { maxTotalActivations: 4, maxLiveActivations: 1 }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'agent-exhaustion', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps, owner: 'test',
+      graphAgent: { id: 'test', async execute() { return { kind: 'completed', taskId: 't', success: true, output: {}, usage: { turns: 2, costUsd: 0, durationMs: 1 } } } },
+    })
+    await kernel.tick()
+    expect((await kernel.tick()).instance.status).toBe('exhausted')
+  })
+
+  it('does not retry an executor budget admission exhaustion', async () => {
+    const projectDir = await root(); const caps = capabilities(); const spec = agentGraph(); let calls = 0
+    spec.nodes.work = {
+      ...spec.nodes.work as Extract<LoopGraphSpec['nodes'][string], { type: 'agent' }>,
+      maxAttempts: 3,
+      budget: { usd: 15 },
+    }
+    spec.nodes.exhausted = { type: 'terminal', status: 'exhausted' }
+    spec.transitions.push({ id: 'executor_exhausted', from: 'work', on: 'exhausted', to: 'exhausted' })
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'executor-budget-exhaustion', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps, owner: 'test',
+      graphAgent: {
+        id: 'test',
+        async execute() {
+          calls++
+          return {
+            kind: 'exhausted', reason: 'dispatcher aggregate budget exhausted',
+            usage: { turns: 0, costUsd: 0, durationMs: 0 },
+          }
+        },
+      },
+    })
+
+    expect((await kernel.tick()).committed).toBe(1)
+    expect(calls).toBe(1)
+    expect((await kernel.tick()).instance.status).toBe('exhausted')
+    expect(calls).toBe(1)
+    const work = [...(await store.snapshot()).activations.values()].find(item => item.nodeId === 'work')
+    expect(work).toMatchObject({ attempt: 1, outcome: 'exhausted', status: 'succeeded' })
+  })
+
+  it('classifies graph cost exhaustion separately from execution failure', async () => {
+    const projectDir = await root(); const caps = capabilities(); const spec = agentGraph()
+    spec.limits = { maxTotalActivations: 4, maxLiveActivations: 1, maxCostUsd: 0.5 }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'cost-exhaustion', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps, owner: 'test',
+      graphAgent: { id: 'test', async execute() { return { kind: 'completed', taskId: 't', success: true, output: {}, usage: { turns: 1, costUsd: 1, durationMs: 1 } } } },
+    })
+    const result = await kernel.tick()
+    expect(result.instance.status).toBe('exhausted')
+    expect(result.instance.statusReason).toContain('maxCostUsd 0.5 exhausted')
+    expect(result.instance.totalCostUsd).toBe(1)
   })
 })

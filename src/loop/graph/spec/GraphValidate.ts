@@ -36,13 +36,24 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
   validateId(spec.id, 'id', errors)
   if (!Number.isInteger(spec.version) || spec.version < 1) errors.push('version must be a positive integer')
   if (typeof spec.goal !== 'string' || !spec.goal.trim()) errors.push('goal must be non-empty')
-  if (!Number.isInteger(spec.limits?.maxActivations) || spec.limits.maxActivations < 1) errors.push('limits.maxActivations must be a positive integer')
+  positiveInteger(spec.limits?.maxActivations, 'limits.maxActivations', errors)
+  positiveInteger(spec.limits?.maxTotalActivations, 'limits.maxTotalActivations', errors)
+  positiveInteger(spec.limits?.maxLiveActivations, 'limits.maxLiveActivations', errors)
+  if (spec.limits?.maxActivations !== undefined && spec.limits.maxTotalActivations !== undefined) {
+    errors.push('limits.maxActivations is the legacy alias of maxTotalActivations; declare only maxTotalActivations')
+  }
+  if (spec.limits?.maxActivations === undefined && spec.limits?.maxTotalActivations === undefined && spec.limits?.maxLiveActivations === undefined) {
+    errors.push('limits must declare maxLiveActivations, maxTotalActivations, or legacy maxActivations')
+  }
   positive(spec.limits?.maxWallTimeMs, 'limits.maxWallTimeMs', errors)
   positive(spec.limits?.maxCostUsd, 'limits.maxCostUsd', errors)
   positiveInteger(spec.limits?.maxFanOut, 'limits.maxFanOut', errors)
   positiveInteger(spec.limits?.maxPendingTimers, 'limits.maxPendingTimers', errors)
   positiveInteger(spec.concurrency?.maxActivations, 'concurrency.maxActivations', errors)
   positiveInteger(spec.concurrency?.maxPerNode, 'concurrency.maxPerNode', errors)
+  if ((spec.concurrency?.maxActivations ?? 1) > 1 && spec.concurrency?.stateConsistency === undefined) {
+    errors.push('concurrency.stateConsistency must be explicit when concurrency.maxActivations > 1')
+  }
   if (spec.concurrency?.stateConsistency !== undefined && !['commit_latest', 'serializable'].includes(spec.concurrency.stateConsistency)) {
     errors.push('concurrency.stateConsistency must be commit_latest or serializable')
   }
@@ -168,7 +179,13 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
     }
     for (const id of incoming) if (!expected.has(id)) errors.push(`nodes.${nodeId}.expects must include incoming transition '${id}'`)
   }
-  if ((spec.entrypoints?.length ?? 0) > spec.limits.maxActivations) errors.push('entrypoints exceed limits.maxActivations')
+  const maxTotalActivations = spec.limits.maxTotalActivations ?? spec.limits.maxActivations
+  if (maxTotalActivations !== undefined && (spec.entrypoints?.length ?? 0) > maxTotalActivations) {
+    errors.push('entrypoints exceed the total Activation limit')
+  }
+  if (spec.limits.maxLiveActivations !== undefined && (spec.entrypoints?.length ?? 0) > spec.limits.maxLiveActivations) {
+    errors.push('entrypoints exceed limits.maxLiveActivations')
+  }
   validateReachability(spec, errors)
   validateTerminalReachability(spec, errors)
   validateInputSupply(spec, errors)
@@ -338,7 +355,7 @@ function validateNode(nodeId: string, node: NodeSpec, spec: LoopGraphSpec, regis
       if (!Array.isArray(node.expects) || !node.expects.length) errors.push(`${at}.expects must be non-empty`)
       break
     case 'terminal':
-      if (!['done', 'failed', 'paused'].includes(node.status)) errors.push(`${at}.status is invalid`)
+      if (!['done', 'failed', 'exhausted', 'paused'].includes(node.status)) errors.push(`${at}.status is invalid`)
       if (node.result) validateValue(node.result, `${at}.result`, registries, errors)
       break
     default: errors.push(`${at}.type '${String((node as NodeSpec).type)}' is unsupported`)
@@ -403,7 +420,7 @@ function validateTerminalReachability(spec: LoopGraphSpec, errors: string[]): vo
   const closed = new Set(Object.entries(spec.nodes ?? {}).filter(([, node]) => node.type === 'terminal' && node.status !== 'paused').map(([id]) => id))
   const queue = [...closed]
   while (queue.length) for (const parent of reverse.get(queue.shift()!) ?? []) if (!closed.has(parent)) { closed.add(parent); queue.push(parent) }
-  for (const nodeId of Object.keys(spec.nodes ?? {})) if (!closed.has(nodeId)) errors.push(`node '${nodeId}' is in a closed path that cannot reach a done/failed terminal`)
+  for (const nodeId of Object.keys(spec.nodes ?? {})) if (!closed.has(nodeId)) errors.push(`node '${nodeId}' is in a closed path that cannot reach a done/failed/exhausted terminal`)
 }
 
 function validateBindings(value: Record<string, ValueExpression> | undefined, at: string, registries: GraphCapabilityRegistries, errors: string[]): void {

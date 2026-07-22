@@ -81,7 +81,7 @@ export class NodeExecutorRegistry {
     const signal = executionSignal ?? this.deps.signal ?? new AbortController().signal
     const segmentLimits = remainingSegmentLimits(node, activation, this.now())
     if ('error' in segmentLimits) {
-      return { kind: 'completed', outcome: 'failure', output: { error: segmentLimits.error }, summary: segmentLimits.error }
+      return { kind: 'completed', outcome: 'exhausted', output: { error: segmentLimits.error, limit: 'activation_lifetime' }, summary: segmentLimits.error }
     }
     let result: Awaited<ReturnType<GraphAgentExecutor['execute']>>
     try {
@@ -140,6 +140,15 @@ export class NodeExecutorRegistry {
       return retryableAgentFailure(node, activation, `graph_agent executor error: ${message(error)}`)
     }
     const usage = result.usage
+    if (result.kind === 'exhausted') {
+      return {
+        kind: 'completed',
+        outcome: 'exhausted',
+        output: { error: result.reason, limit: 'executor_budget' },
+        summary: result.reason,
+        usage,
+      }
+    }
     if (result.kind === 'cancellation_unconfirmed') {
       return {
         kind: 'fatal',

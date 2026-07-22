@@ -124,7 +124,7 @@ export interface JoinNodeSpec extends NodeBase {
 
 export interface TerminalNodeSpec extends NodeBase {
   type: 'terminal'
-  status: 'done' | 'failed' | 'paused'
+  status: 'done' | 'failed' | 'exhausted' | 'paused'
   result?: ValueExpression
 }
 
@@ -173,7 +173,12 @@ export interface FrozenCapabilityRef {
 }
 
 export interface LoopLimits {
-  maxActivations: number
+  /** @deprecated Historical total-Activation cap. Prefer maxTotalActivations. */
+  maxActivations?: number
+  /** Optional lifetime cap. Omit it for a continuous/reactive loop. */
+  maxTotalActivations?: number
+  /** Maximum ready/running/waiting Activations retained at once. */
+  maxLiveActivations?: number
   maxWallTimeMs?: number
   maxCostUsd?: number
   maxFanOut?: number
@@ -275,7 +280,7 @@ export interface ActivationRecord {
   resumedAt?: number
 }
 
-export type GraphInstanceStatus = 'active' | 'waiting' | 'paused' | 'done' | 'failed'
+export type GraphInstanceStatus = 'active' | 'waiting' | 'paused' | 'done' | 'exhausted' | 'failed'
 
 export interface GraphInstanceRecord {
   schemaVersion: 'graph-instance-1.0'
@@ -382,6 +387,7 @@ export type GraphJournalEvent =
       at: number
       activation: ActivationRecord
       spawned: ActivationRecord[]
+      cancelled?: ActivationRecord[]
       state: GraphStateSnapshot
       instance: GraphInstanceRecord
       transitionId: string

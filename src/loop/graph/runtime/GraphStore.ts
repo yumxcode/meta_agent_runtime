@@ -429,9 +429,9 @@ export class GraphStore {
   async setStatus(status: GraphInstanceRecord['status'], reason?: string, now = Date.now()): Promise<GraphInstanceRecord> {
     return this.withTransaction(async () => {
       const snapshot = await this.reconcileLocked()
-      if (snapshot.instance.status === 'done' || snapshot.instance.status === 'failed') return snapshot.instance
+      if (isFinalStatus(snapshot.instance.status)) return snapshot.instance
       if (snapshot.instance.status === status && snapshot.instance.statusReason === reason) return snapshot.instance
-      if (status === 'paused' || status === 'done' || status === 'failed') {
+      if (status === 'paused' || isFinalStatus(status)) {
         for (const activation of snapshot.activations.values()) {
           let next: ActivationRecord | undefined
           if (status === 'paused' && activation.status === 'running') {
@@ -473,7 +473,7 @@ export class GraphStore {
         await this.appendEventLocked({ type: 'activation_released', at: now, activation: failed, reason: 'kernel_failure' })
         await atomicWriteJson(this.activationPath(failed.id), failed)
       }
-      if (snapshot.instance.status !== 'done' && snapshot.instance.status !== 'failed') {
+      if (!isFinalStatus(snapshot.instance.status)) {
         const instance: GraphInstanceRecord = { ...snapshot.instance, status: 'failed', statusReason: error, updatedAt: now }
         await this.appendEventLocked({ type: 'graph_status_changed', at: now, instance })
         await atomicWriteJson(this.paths.instanceJson, instance)
@@ -523,6 +523,7 @@ export class GraphStore {
     await atomicWriteJson(this.paths.instanceJson, event.instance)
     await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
     for (const activation of event.spawned) await atomicWriteJson(this.activationPath(activation.id), activation)
+    for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
     for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
     const intent = await readJsonFile<ActivationCommitIntent>(this.intentPath(event.commitKey))
     if (intent) await atomicWriteJson(this.intentPath(event.commitKey), { ...intent, status: 'committed', journalSequence: sequence })
@@ -607,6 +608,7 @@ export class GraphStore {
         case 'paused_terminal_resumed':
           activations.set(event.activation.id, event.activation)
           for (const activation of event.spawned) activations.set(activation.id, activation)
+          for (const activation of event.cancelled ?? []) activations.set(activation.id, activation)
           state = event.state
           instance = event.instance
           break
@@ -770,7 +772,7 @@ function compareTerminalActivation(a: ActivationRecord, b: ActivationRecord, gra
   const rank = (activation: ActivationRecord): number => {
     const node = graph.nodes[activation.nodeId]
     if (node?.type !== 'terminal') return 3
-    return node.status === 'failed' ? 0 : node.status === 'paused' ? 1 : 2
+    return node.status === 'failed' ? 0 : node.status === 'exhausted' ? 1 : node.status === 'paused' ? 2 : 3
   }
   return rank(a) - rank(b) ||
     a.nodeId.localeCompare(b.nodeId) ||
@@ -778,6 +780,10 @@ function compareTerminalActivation(a: ActivationRecord, b: ActivationRecord, gra
     stableJson(a.input).localeCompare(stableJson(b.input)) ||
     a.createdAt - b.createdAt ||
     a.id.localeCompare(b.id)
+}
+
+function isFinalStatus(status: GraphInstanceRecord['status']): boolean {
+  return status === 'done' || status === 'exhausted' || status === 'failed'
 }
 
 function stableJson(value: JsonValue): string {

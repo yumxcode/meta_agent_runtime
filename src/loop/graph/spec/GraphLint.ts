@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation'
   at: string
   message: string
 }
@@ -29,7 +29,96 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintDuplicateRouteConditions(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
   lintDeadLiteralRoutes(spec, findings)
+  lintUnboundedWaits(spec, findings)
+  lintMixedSnapshotRouting(spec, findings)
+  lintStaticEffectIdempotency(spec, findings)
+  lintTerminalFanOut(spec, findings)
   return findings
+}
+
+/** A lifetime Activation cap cannot release a bounded graph that is already
+ * parked. Continuous graphs intentionally omit the lifetime cap and may wait
+ * forever for their next external event. */
+function lintUnboundedWaits(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const bounded = spec.limits.maxTotalActivations !== undefined || spec.limits.maxActivations !== undefined
+  if (!bounded || spec.limits.maxWallTimeMs !== undefined) return
+  for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
+    const unboundedEvent = node.type === 'wait' && node.wait.kind === 'event' && node.wait.timeoutMs === undefined
+    const unboundedJoin = node.type === 'join' && node.timeoutMs === undefined
+    if (!unboundedEvent && !unboundedJoin) continue
+    findings.push({
+      level: 'warning', rule: 'unbounded-wait', at: `nodes.${nodeId}`,
+      message: `${unboundedEvent ? 'event Wait' : 'Join'} has no timeout while this is a lifetime-bounded graph with no maxWallTimeMs; it can remain waiting forever before the total Activation cap is reached — add a node timeout or graph wall limit, or make the graph continuous by using maxLiveActivations without maxTotalActivations`,
+    })
+  }
+}
+
+function lintMixedSnapshotRouting(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  if ((spec.concurrency?.maxActivations ?? 1) <= 1 || spec.concurrency?.stateConsistency === 'serializable') return
+  for (const transition of spec.transitions ?? []) {
+    if (!transition.when?.includes('$state') || !transition.when.includes('$output')) continue
+    findings.push({
+      level: 'warning', rule: 'mixed-snapshot-routing', at: `transitions '${transition.id}'.when`,
+      message: 'commit_latest evaluates fresh $state together with $output computed from the Activation claim snapshot; use serializable when this decision requires one coherent snapshot, or route only on raw output facts that are independent of mutable State',
+    })
+  }
+}
+
+function lintStaticEffectIdempotency(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
+    if (node.type !== 'effect' || !node.idempotencyKey || !('literal' in node.idempotencyKey) || !nodeInCycle(spec, nodeId)) continue
+    findings.push({
+      level: 'warning', rule: 'static-effect-idempotency', at: `nodes.${nodeId}.idempotencyKey`,
+      message: 'cyclic Effect uses a static idempotency key, so a provider may deduplicate later iterations; omit the key for the per-Activation default or include an iteration/correlation value',
+    })
+  }
+}
+
+function lintTerminalFanOut(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const transition of spec.transitions ?? []) {
+    const targets = targetNodeIds(transition.to)
+    if (targets.length < 2 || !targets.some(nodeId => reachesTerminalBeforeJoin(spec, nodeId))) continue
+    findings.push({
+      level: 'warning', rule: 'terminal-fanout-cancellation', at: `transitions '${transition.id}'.to`,
+      message: 'fan-out has a branch that can reach a Terminal before a Join; Terminal is a graph-wide barrier and cancels remaining ready/running/waiting siblings — add an explicit Join first unless race-to-terminal cancellation is intentional',
+    })
+  }
+}
+
+function nodeInCycle(spec: LoopGraphSpec, start: string): boolean {
+  const pending = [...outgoingNodeIds(spec, start)]
+  const seen = new Set<string>()
+  while (pending.length) {
+    const nodeId = pending.pop()!
+    if (nodeId === start) return true
+    if (seen.has(nodeId)) continue
+    seen.add(nodeId)
+    pending.push(...outgoingNodeIds(spec, nodeId))
+  }
+  return false
+}
+
+function reachesTerminalBeforeJoin(spec: LoopGraphSpec, start: string): boolean {
+  const pending = [start]
+  const seen = new Set<string>()
+  while (pending.length) {
+    const nodeId = pending.pop()!
+    if (seen.has(nodeId)) continue
+    seen.add(nodeId)
+    const node = spec.nodes[nodeId]
+    if (node?.type === 'terminal') return true
+    if (node?.type === 'join') continue
+    pending.push(...outgoingNodeIds(spec, nodeId))
+  }
+  return false
+}
+
+function outgoingNodeIds(spec: LoopGraphSpec, nodeId: string): string[] {
+  return (spec.transitions ?? []).filter(transition => transition.from === nodeId).flatMap(transition => targetNodeIds(transition.to))
+}
+
+function targetNodeIds(to: LoopGraphSpec['transitions'][number]['to']): string[] {
+  return (Array.isArray(to) ? to : [to]).map(target => typeof target === 'string' ? target : target.node)
 }
 
 /** A persistent Lane is a continuous session boundary, not a phase bucket.

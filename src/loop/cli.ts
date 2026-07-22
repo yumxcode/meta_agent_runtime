@@ -347,7 +347,7 @@ async function archive(args: string[], deps: LoopCliDeps): Promise<string> {
     const store = new GraphStore(deps.projectDir, instanceId)
     const snapshot = await store.snapshot().catch(() => null)
     if (!snapshot) return `instance ${instanceId} not found`
-    if (!['done', 'failed'].includes(snapshot.instance.status)) {
+    if (!['done', 'exhausted', 'failed'].includes(snapshot.instance.status)) {
       throw new Error(`loop archive refuses non-terminal instance '${instanceId}' (status: ${snapshot.instance.status})`)
     }
     const activeWakes = (await new WakeStore(deps.projectDir).list()).filter(wake =>

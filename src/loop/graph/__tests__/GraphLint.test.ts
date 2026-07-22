@@ -153,4 +153,42 @@ describe('graph write-surface lint', () => {
     spec.lanes.work!.context = 'fresh_per_activation'
     expect(lintLoopGraph(spec).filter(f => f.rule === 'same-lane-agent-split')).toEqual([])
   })
+
+  it('warns when a bounded graph can wait forever but permits intentional continuous waits', () => {
+    const spec = graph()
+    spec.nodes.work = { type: 'wait', wait: { kind: 'event', event: 'next' } }
+    spec.transitions = [
+      { id: 'next', from: 'work', on: 'event', to: 'done' },
+      { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
+    ]
+    expect(lintLoopGraph(spec).map(f => f.rule)).toContain('unbounded-wait')
+    spec.limits = { maxLiveActivations: 1 }
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'unbounded-wait')).toEqual([])
+  })
+
+  it('warns when commit_latest mixes fresh State with stale-snapshot Agent output', () => {
+    const spec = graph()
+    spec.concurrency = { maxActivations: 2, stateConsistency: 'commit_latest' }
+    spec.transitions[0]!.when = '$state.status == $output.observed_status'
+    expect(lintLoopGraph(spec).map(f => f.rule)).toContain('mixed-snapshot-routing')
+    spec.concurrency.stateConsistency = 'serializable'
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'mixed-snapshot-routing')).toEqual([])
+  })
+
+  it('warns about static Effect idempotency keys inside a cycle', () => {
+    const spec = graph()
+    spec.nodes.work = { type: 'effect', effect: 'test/effect@1', timeoutMs: 1000, idempotencyKey: { literal: 'same-key' } }
+    spec.transitions = [
+      { id: 'again', from: 'work', to: 'work' },
+      { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
+    ]
+    expect(lintLoopGraph(spec).map(f => f.rule)).toContain('static-effect-idempotency')
+  })
+
+  it('warns when fan-out can terminate globally before joining siblings', () => {
+    const spec = graph()
+    spec.nodes.other = { type: 'terminal', status: 'done' }
+    spec.transitions[0]!.to = ['done', 'other']
+    expect(lintLoopGraph(spec).map(f => f.rule)).toContain('terminal-fanout-cancellation')
+  })
 })

@@ -27,7 +27,7 @@ export interface CommitResult {
 
 export class ParkLimitExceededError extends Error {
   constructor(readonly limit: number) {
-    super(`maxPendingTimers ${limit} exceeded`)
+    super(`maxPendingTimers ${limit} exhausted`)
     this.name = 'ParkLimitExceededError'
   }
 }
@@ -55,7 +55,7 @@ export class CommitCoordinator {
       if (!['running', 'ready'].includes(activation.status)) throw new Error(`activation '${intent.activationId}' cannot commit from ${activation.status}`)
       const node = this.graph.nodes[activation.nodeId]
       if (!node) throw new Error(`activation '${activation.id}' references missing node '${activation.nodeId}'`)
-      if (snapshot.instance.status === 'done' || snapshot.instance.status === 'failed' || snapshot.instance.status === 'paused') {
+      if (snapshot.instance.status === 'done' || snapshot.instance.status === 'exhausted' || snapshot.instance.status === 'failed' || snapshot.instance.status === 'paused') {
         throw new Error(`graph '${snapshot.instance.instanceId}' is ${snapshot.instance.status}; stale activation '${activation.id}' cannot commit`)
       }
 
@@ -74,13 +74,29 @@ export class CommitCoordinator {
         if (replayCount < replayLimit) {
           const reason = `State advanced from v${expectedStateVersion} to v${snapshot.state.version}; replaying under serializable policy`
           const segmentUsage = intent.usage ?? emptyUsage()
+          const projectedCost = snapshot.instance.totalCostUsd + segmentUsage.costUsd
+          if (this.graph.limits.maxCostUsd !== undefined && projectedCost > this.graph.limits.maxCostUsd) {
+            const costReason = `maxCostUsd ${this.graph.limits.maxCostUsd} exhausted during serializable replay`
+            effectiveIntent = {
+              ...intent,
+              expectedStateVersion: undefined,
+              outcome: 'exhausted',
+              output: { error: costReason, limit: 'maxCostUsd' },
+              summary: costReason,
+            }
+          } else {
+          const requestedDelayMs = replayCount === 0 ? 0 : Math.min(5_000, 50 * 2 ** Math.min(replayCount, 6))
+          const pendingTimers = [...snapshot.activations.values()].filter(item => item.status === 'waiting' && item.wakeAt !== undefined).length
+          const delayed = requestedDelayMs > 0 && (this.graph.limits.maxPendingTimers === undefined || pendingTimers < this.graph.limits.maxPendingTimers)
           const replay: ActivationRecord = {
             ...activation,
-            status: 'ready',
+            status: delayed ? 'waiting' : 'ready',
             lease: undefined,
             replayCount: replayCount + 1,
             usage: addUsage(activation.usage, segmentUsage),
-            readyReason: 'replay',
+            readyReason: delayed ? undefined : 'replay',
+            waitingReason: delayed ? 'replay' : undefined,
+            wakeAt: delayed ? now + requestedDelayMs : undefined,
             error: reason,
             summary: reason,
             updatedAt: now,
@@ -95,14 +111,17 @@ export class CommitCoordinator {
           await this.store.writeInstanceProjectionLocked(instance)
           await this.store.discardCommitIntentLocked(intent, reason)
           return { activation: replay, spawned: [], instance, duplicate: false, replayed: true }
+          }
         }
-        const reason = `serializable replay limit ${replayLimit} exceeded`
-        effectiveIntent = {
-          ...intent,
-          expectedStateVersion: undefined,
-          outcome: 'failure',
-          output: { error: reason },
-          summary: reason,
+        if (effectiveIntent === intent) {
+          const reason = `serializable replay limit ${replayLimit} exhausted`
+          effectiveIntent = {
+            ...intent,
+            expectedStateVersion: undefined,
+            outcome: 'exhausted',
+            output: { error: reason, limit: 'serializable_replays', replayLimit },
+            summary: reason,
+          }
         }
       }
 
@@ -163,6 +182,31 @@ export class CommitCoordinator {
           decisionError = message(error)
         }
         if (!decision) {
+          if (effectiveIntent.outcome === 'exhausted') {
+            const reason = effectiveIntent.summary ?? decisionError ?? `node '${activation.nodeId}' exhausted its execution budget`
+            committedActivation = {
+              ...activation,
+              usage: addUsage(activation.usage, segmentUsage),
+              status: 'succeeded',
+              lease: undefined,
+              output: effectiveIntent.output,
+              outcome: 'exhausted',
+              summary: reason,
+              error: undefined,
+              updatedAt: now,
+            }
+            instance = { ...instance, status: 'exhausted', statusReason: reason }
+            cancelled = cancelLivePeers(snapshot.activations.values(), activation.id, reason, now)
+            const event: Extract<GraphJournalEvent, { type: 'activation_committed' }> = {
+              type: 'activation_committed', at: now, commitKey: intent.commitKey,
+              activation: committedActivation, spawned: [],
+              ...(cancelled.length ? { cancelled } : {}),
+              state, instance,
+            }
+            const journal = await this.store.appendEventLocked(event)
+            await this.store.writeCommitProjectionLocked(event, journal.sequence)
+            return resultFromEvent(event, false)
+          }
           const reason = `transition evaluation failed for node '${activation.nodeId}' outcome '${effectiveIntent.outcome}': ${decisionError}`
           committedActivation = {
             ...activation,
@@ -207,23 +251,33 @@ export class CommitCoordinator {
           error: undefined,
           updatedAt: now,
         }
-        if (instance.activationCount + spawned.length > this.graph.limits.maxActivations) {
-          spawned = []
-          committedActivation = { ...committedActivation, status: 'failed', error: 'maxActivations exceeded', summary: 'maxActivations exceeded' }
-          instance = { ...instance, status: 'failed', statusReason: 'maxActivations exceeded' }
-        } else {
-          instance = { ...instance, activationCount: instance.activationCount + spawned.length }
-        }
-        if (this.graph.limits.maxCostUsd !== undefined && instance.totalCostUsd > this.graph.limits.maxCostUsd) {
-          spawned = []
-          committedActivation = { ...committedActivation, status: 'failed', error: 'maxCostUsd exceeded', summary: 'maxCostUsd exceeded' }
-          instance = { ...instance, status: 'failed', statusReason: 'maxCostUsd exceeded' }
-        }
         if (node.type === 'join') {
           cancelled = [...snapshot.activations.values()]
             .filter(peer => peer.id !== activation.id && peer.nodeId === activation.nodeId &&
               peer.forkGroupId === activation.forkGroupId && ['ready', 'running', 'waiting'].includes(peer.status))
             .map(peer => ({ ...peer, status: 'cancelled' as const, lease: undefined, updatedAt: now, error: `coalesced by join activation ${activation.id}` }))
+        }
+        const totalLimit = this.graph.limits.maxTotalActivations ?? this.graph.limits.maxActivations
+        const projectedTotal = instance.activationCount + spawned.length
+        const projectedLive = countLiveActivations(snapshot.activations.values()) - 1 - cancelled.length + spawned.length
+        const exhaustionReason = totalLimit !== undefined && projectedTotal > totalLimit
+          ? `maxTotalActivations ${totalLimit} exhausted`
+          : this.graph.limits.maxLiveActivations !== undefined && projectedLive > this.graph.limits.maxLiveActivations
+            ? `maxLiveActivations ${this.graph.limits.maxLiveActivations} exhausted`
+            : this.graph.limits.maxCostUsd !== undefined && instance.totalCostUsd > this.graph.limits.maxCostUsd
+              ? `maxCostUsd ${this.graph.limits.maxCostUsd} exhausted`
+              : undefined
+        if (exhaustionReason) {
+          spawned = []
+          committedActivation = {
+            ...committedActivation,
+            status: 'succeeded', outcome: 'exhausted', error: undefined,
+            output: { error: exhaustionReason }, summary: exhaustionReason,
+          }
+          instance = { ...instance, status: 'exhausted', statusReason: exhaustionReason }
+          cancelled = cancelLivePeers(snapshot.activations.values(), activation.id, exhaustionReason, now)
+        } else {
+          instance = { ...instance, activationCount: projectedTotal }
         }
       }
       const event: Extract<GraphJournalEvent, { type: 'activation_committed' }> = {
@@ -271,30 +325,39 @@ export class CommitCoordinator {
         reducers: this.reducers,
         now,
       }), TRANSITION_EVALUATION_TIMEOUT_MS, 'paused-terminal transition evaluation')
-      if (snapshot.instance.activationCount + decision.spawned.length > this.graph.limits.maxActivations) {
-        throw new Error('maxActivations exceeded while resuming paused Terminal')
-      }
       const resumedActivation: ActivationRecord = { ...activation, resumedAt: now, updatedAt: now }
+      const totalLimit = this.graph.limits.maxTotalActivations ?? this.graph.limits.maxActivations
+      const projectedTotal = snapshot.instance.activationCount + decision.spawned.length
+      const projectedLive = countLiveActivations(snapshot.activations.values()) + decision.spawned.length
+      const exhaustionReason = totalLimit !== undefined && projectedTotal > totalLimit
+        ? `maxTotalActivations ${totalLimit} exhausted while resuming paused Terminal`
+        : this.graph.limits.maxLiveActivations !== undefined && projectedLive > this.graph.limits.maxLiveActivations
+          ? `maxLiveActivations ${this.graph.limits.maxLiveActivations} exhausted while resuming paused Terminal`
+          : undefined
+      const cancelled = exhaustionReason
+        ? cancelLivePeers(snapshot.activations.values(), activation.id, exhaustionReason, now)
+        : []
       const instance: GraphInstanceRecord = {
         ...snapshot.instance,
-        status: 'active',
-        statusReason: `resumed from paused Terminal '${activation.nodeId}'`,
+        status: exhaustionReason ? 'exhausted' : 'active',
+        statusReason: exhaustionReason ?? `resumed from paused Terminal '${activation.nodeId}'`,
         terminalResult: undefined,
-        activationCount: snapshot.instance.activationCount + decision.spawned.length,
+        activationCount: exhaustionReason ? snapshot.instance.activationCount : projectedTotal,
         updatedAt: now,
       }
       const event: Extract<GraphJournalEvent, { type: 'paused_terminal_resumed' }> = {
         type: 'paused_terminal_resumed',
         at: now,
         activation: resumedActivation,
-        spawned: decision.spawned,
-        state: decision.state,
+        spawned: exhaustionReason ? [] : decision.spawned,
+        ...(cancelled.length ? { cancelled } : {}),
+        state: exhaustionReason ? snapshot.state : decision.state,
         instance,
         transitionId: decision.transition.id,
       }
       await this.store.appendEventLocked(event)
       await this.store.writePausedResumeProjectionLocked(event)
-      return { spawned: decision.spawned, instance }
+      return { spawned: exhaustionReason ? [] : decision.spawned, instance }
     })
   }
 
@@ -553,6 +616,59 @@ export class CommitCoordinator {
       return resumed
     })
   }
+
+  /**
+   * Repair the post-commit Join notification window. Join arrivals are durable
+   * Activation records, while their immediate resume signal is only an
+   * optimization in a later transaction. Recompute complete barriers on every
+   * tick so a lost signal or lock timeout cannot leave every member parked.
+   */
+  async reconcileWaitingJoins(now = Date.now()): Promise<ActivationRecord[]> {
+    return this.store.withTransaction(async () => {
+      const snapshot = await this.store.authoritativeSnapshotLocked()
+      const resumed: ActivationRecord[] = []
+      const waiting = [...snapshot.activations.values()]
+        .filter(activation => activation.status === 'waiting' && this.graph.nodes[activation.nodeId]?.type === 'join')
+        .sort((a, b) => a.nodeId.localeCompare(b.nodeId) ||
+          (a.forkGroupId ?? '').localeCompare(b.forkGroupId ?? '') || a.id.localeCompare(b.id))
+      for (const activation of waiting) {
+        const node = this.graph.nodes[activation.nodeId]
+        if (node?.type !== 'join') continue
+        const candidates = [...snapshot.activations.values()].filter(candidate =>
+          candidate.nodeId === activation.nodeId &&
+          candidate.forkGroupId === activation.forkGroupId &&
+          candidate.sourceTransitionId !== undefined &&
+          node.expects.includes(candidate.sourceTransitionId) &&
+          ['ready', 'running', 'waiting'].includes(candidate.status))
+        const arrived = new Set(candidates.map(candidate => candidate.sourceTransitionId!))
+        const complete = node.mode === 'any' ? arrived.size > 0 : node.expects.every(id => arrived.has(id))
+        if (!complete) continue
+        const leader = [...candidates].sort((a, b) => a.id.localeCompare(b.id))[0]
+        if (leader?.id !== activation.id) continue
+        const eventName = `join:${activation.nodeId}`
+        if (activation.event?.name !== eventName ||
+          !structurallyEqual(activation.event.correlation, activation.forkGroupId ?? null)) continue
+        const next: ActivationRecord = {
+          ...activation,
+          status: 'ready',
+          wakeAt: undefined,
+          event: undefined,
+          continuationVersion: activation.continuationVersion + 1,
+          readyReason: 'continuation',
+          waitingReason: undefined,
+          input: {
+            ...activation.input,
+            __resume: { kind: 'event', name: eventName, payload: null, at: now },
+          },
+          updatedAt: now,
+        }
+        await this.store.appendEventLocked({ type: 'activation_released', at: now, activation: next, reason: 'resumed' })
+        await this.store.writeActivationProjectionLocked(next)
+        resumed.push(next)
+      }
+      return resumed
+    })
+  }
 }
 
 function message(error: unknown): string {
@@ -607,6 +723,27 @@ const MAX_AGENT_SERIALIZABLE_REPLAYS = 5
 const MAX_SERIALIZABLE_REPLAYS = 50
 const MAX_EXTERNAL_EVENT_BYTES = 1024 * 1024
 const TRANSITION_EVALUATION_TIMEOUT_MS = 30_000
+
+function countLiveActivations(activations: Iterable<ActivationRecord>): number {
+  return [...activations].filter(activation => ['ready', 'running', 'waiting', 'committing'].includes(activation.status)).length
+}
+
+function cancelLivePeers(
+  activations: Iterable<ActivationRecord>,
+  exceptId: string,
+  reason: string,
+  now: number,
+): ActivationRecord[] {
+  return [...activations]
+    .filter(activation => activation.id !== exceptId && ['ready', 'running', 'waiting', 'committing'].includes(activation.status))
+    .map(activation => ({
+      ...activation,
+      status: 'cancelled' as const,
+      lease: undefined,
+      updatedAt: now,
+      error: `cancelled because graph exhausted: ${reason}`,
+    }))
+}
 
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number, label: string): Promise<T> {
   let timer: ReturnType<typeof setTimeout> | undefined

@@ -61,6 +61,12 @@ export interface GraphAgentParkIntent {
  */
 export type GraphAgentExecutionResult =
   | {
+      /** Executor admission refused before a model segment started. */
+      kind: 'exhausted'
+      reason: string
+      usage: ActivationUsage
+    }
+  | {
       kind: 'completed'
       taskId: string
       success: boolean

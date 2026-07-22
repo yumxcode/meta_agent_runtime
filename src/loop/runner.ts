@@ -50,7 +50,7 @@ export async function prepareAndClaim(
     const liveForLoop = (): WakeRecord[] => allWakes.filter(wake =>
       wake.loopId === record.instanceId && (wake.status === 'pending' || wake.status === 'claimed'),
     )
-    if (record.status === 'done' || record.status === 'failed' || record.status === 'paused') {
+    if (record.status === 'done' || record.status === 'exhausted' || record.status === 'failed' || record.status === 'paused') {
       if (liveForLoop().length) await wakeStore.cancelForLoop(record.instanceId)
       continue
     }
@@ -139,7 +139,7 @@ export async function runClaimedWake(
       await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token })
       return { loopId: wake.loopId, error: 'graph instance not found' }
     }
-    if (snapshot.instance.status === 'done' || snapshot.instance.status === 'failed' || snapshot.instance.status === 'paused') {
+    if (snapshot.instance.status === 'done' || snapshot.instance.status === 'exhausted' || snapshot.instance.status === 'failed' || snapshot.instance.status === 'paused') {
       await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token })
       return { loopId: wake.loopId, error: `instance is ${snapshot.instance.status}` }
     }
@@ -161,7 +161,7 @@ export async function runClaimedWake(
     if (graphAdmissionHeartbeatInFlight) await graphAdmissionHeartbeatInFlight
     if (graphAdmissionLost) throw new Error('host graph-tick admission lease was lost during execution')
     await wakeStore.release(wake.wakeId, 'done', { claimToken: wake.claim?.token })
-    if (graphOutcome.instance.status === 'done' || graphOutcome.instance.status === 'failed') {
+    if (graphOutcome.instance.status === 'done' || graphOutcome.instance.status === 'exhausted' || graphOutcome.instance.status === 'failed') {
       await wakeStore.cancelForLoop(wake.loopId)
     }
     return { loopId: wake.loopId, graphOutcome }
@@ -174,7 +174,8 @@ export async function runClaimedWake(
       }).catch(() => undefined)
       return { loopId: wake.loopId, error: `graph tick interrupted: ${message}` }
     }
-    if (!isDeterministicGraphError(error) && wake.attempts < MAX_WAKE_ATTEMPTS) {
+    const deterministic = isDeterministicGraphError(error)
+    if (!deterministic && wake.attempts < MAX_WAKE_ATTEMPTS) {
       const backoffMs = Math.min(60_000, 1_000 * 2 ** Math.max(0, wake.attempts - 1))
       await wakeStore.release(wake.wakeId, 'pending', {
         claimToken: wake.claim?.token,
@@ -183,10 +184,17 @@ export async function runClaimedWake(
       return { loopId: wake.loopId, error: `graph tick retry ${wake.attempts}/${MAX_WAKE_ATTEMPTS}: ${message}` }
     }
     const store = new GraphStore(deps.projectDir, wake.loopId)
-    await store.setStatus('failed', `graph tick failed: ${message}`).catch(() => undefined)
+    const terminalStatus = deterministic ? 'failed' : 'paused'
+    const statusReason = deterministic
+      ? `graph tick failed: ${message}`
+      : `graph tick paused after ${MAX_WAKE_ATTEMPTS} transient/unknown failures: ${message}`
+    await store.setStatus(terminalStatus, statusReason).catch(() => undefined)
     await wakeStore.release(wake.wakeId, 'cancelled', { claimToken: wake.claim?.token }).catch(() => undefined)
     await wakeStore.cancelForLoop(wake.loopId).catch(() => 0)
-    return { loopId: wake.loopId, error: message }
+    return {
+      loopId: wake.loopId,
+      error: deterministic ? message : `${statusReason}; inspect infrastructure and run loop resume ${wake.loopId}`,
+    }
   } finally {
     clearInterval(wakeHeartbeat)
     if (graphAdmissionHeartbeat) clearInterval(graphAdmissionHeartbeat)

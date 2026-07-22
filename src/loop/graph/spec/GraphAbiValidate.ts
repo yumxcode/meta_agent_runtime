@@ -57,8 +57,7 @@ export function validateGraphAbiShape(value: unknown): string[] {
     expressions(entry.inputs, `${at}.inputs`, errors)
   })
   child(value.limits, 'limits', errors, limits => {
-    keys(limits, ['maxActivations', 'maxWallTimeMs', 'maxCostUsd', 'maxFanOut', 'maxPendingTimers'], 'limits', errors)
-    required(limits, { maxActivations: 'number' }, 'limits', errors)
+    keys(limits, ['maxActivations', 'maxTotalActivations', 'maxLiveActivations', 'maxWallTimeMs', 'maxCostUsd', 'maxFanOut', 'maxPendingTimers'], 'limits', errors)
   })
   child(value.concurrency, 'concurrency', errors, concurrency => keys(concurrency, ['maxActivations', 'maxPerNode', 'stateConsistency'], 'concurrency', errors))
   eachArray(value.capabilityPacks, 'capabilityPacks', errors, (pack, at) => keys(pack, ['id', 'version', 'integrity'], at, errors))

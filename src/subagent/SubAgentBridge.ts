@@ -57,6 +57,18 @@ const DEFAULT_AUTO_RETRY_LIMIT = 2
 const AUTO_MAX_CONCURRENT_SUB_AGENTS = 3
 const AUTO_DEFAULT_TOTAL_BUDGET_USD = 10
 
+export class SubAgentBudgetExceededError extends Error {
+  readonly code = 'SUB_AGENT_BUDGET_EXCEEDED'
+
+  constructor(
+    message: string,
+    readonly scope: 'bridge' | 'session',
+  ) {
+    super(message)
+    this.name = 'SubAgentBudgetExceededError'
+  }
+}
+
 const MERGED_NOTICE_RE = /^\[(\d+) 条更早的子代理通知已合并/
 const SHARED_READONLY_BLOCKED_WRITE_TOOLS = new Set([
   'write_file',
@@ -186,6 +198,12 @@ export interface SubAgentBridgeOptions {
    * for unattended safety. Explicit options and env vars still take precedence.
    */
   conservativeAutoDefaults?: boolean
+  /**
+   * Keep auto's conservative concurrency while leaving aggregate spend to an
+   * external durable owner (for example the Graph Kernel). Explicit operator
+   * caps from META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD still apply.
+   */
+  budgetManagedExternally?: boolean
 }
 
 interface QueuedSubAgent {
@@ -343,7 +361,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     )
     this.maxTotalSubAgentBudgetUsd = options.maxTotalSubAgentBudgetUsd ??
       this._envBudgetUsd('META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD') ??
-      (options.conservativeAutoDefaults ? AUTO_DEFAULT_TOTAL_BUDGET_USD : undefined)
+      (options.conservativeAutoDefaults && !options.budgetManagedExternally
+        ? AUTO_DEFAULT_TOTAL_BUDGET_USD
+        : undefined)
     this.startDelayMs = Math.max(
       0,
       options.startDelayMs ??
@@ -562,12 +582,13 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       this.maxTotalSubAgentBudgetUsd !== undefined &&
       this.settledCostUsd + this.reservedBudgetUsd + requestedBudget > this.maxTotalSubAgentBudgetUsd
     ) {
-      throw new Error(
+      throw new SubAgentBudgetExceededError(
         `[SubAgentBridge] Sub-agent budget exceeded. ` +
         `Requested $${requestedBudget.toFixed(4)}, ` +
         `reserved $${this.reservedBudgetUsd.toFixed(4)}, ` +
         `settled $${this.settledCostUsd.toFixed(4)}, ` +
         `limit $${this.maxTotalSubAgentBudgetUsd.toFixed(4)}.`,
+        'bridge',
       )
     }
 
@@ -575,9 +596,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     if (this.costLedger) {
       if (!this.costLedger.tryReserveTask(taskId, requestedBudget)) {
         const stats = this.costLedger.getBreakdown()
-        throw new Error(
+        throw new SubAgentBudgetExceededError(
           `[SubAgentBridge] Auto session budget exceeded. Requested $${requestedBudget.toFixed(4)}, ` +
           `committed $${stats.committedCostUsd.toFixed(4)}, limit $${stats.budgetUsd.toFixed(4)}.`,
+          'session',
         )
       }
       ledgerReserved = true

@@ -53,6 +53,14 @@ export interface RouterOptions {
   debugMode?: boolean
 
   /**
+   * Internal execution boundary: `caller` means a durable caller such as the
+   * Graph Kernel owns aggregate child spend. The auto workspace jail and
+   * conservative concurrency remain enabled, but the bridge does not add its
+   * own default whole-session budget. Explicit operator env caps still apply.
+   */
+  subAgentBudgetOwner?: 'session' | 'caller'
+
+  /**
    * Robot/platform name to bind for robotics mode sessions
    * (e.g. 'go2', 'franka_panda', 'f1').
    *
