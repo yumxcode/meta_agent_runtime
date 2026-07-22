@@ -49,6 +49,16 @@ describe('retry policy helpers', () => {
     expect(shouldRetrySubAgentConfig({}, 0, 2, true, 'transient provider overload')).toBe(true)
   })
 
+  it('never retries underneath a durable caller that owns attempts', () => {
+    expect(shouldRetrySubAgentConfig(
+      { retryOwner: 'caller' },
+      0,
+      2,
+      true,
+      'transient provider overload',
+    )).toBe(false)
+  })
+
   it('retryBackoffMs grows exponentially and caps at 30s', () => {
     expect(retryBackoffMs(0)).toBe(1000)
     expect(retryBackoffMs(1)).toBe(2000)

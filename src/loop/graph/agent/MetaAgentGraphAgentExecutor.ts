@@ -57,6 +57,10 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
         useEventDriven: false,
         pollIntervalMs: 500,
         checkpointEveryNTurns: 0,
+        // The durable Graph Kernel persists attempts and is the sole retry
+        // owner. A Bridge retry would create an untracked task id and could
+        // race the next Graph attempt on the same persistent Lane.
+        retryOwner: 'caller',
         projectDir: request.workspace.projectDir,
         workspaceMode: request.workspace.mode,
         sandbox: {
@@ -100,6 +104,23 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
       output: record?.result?.output,
       summary: record?.result?.summary ?? '',
       ...(record?.result?.error ? { error: record.result.error } : {}),
+      ...(record?.result?.diagnostics ? {
+        diagnostics: {
+          ...(record.result.diagnostics.timeoutPhase
+            ? { timeoutPhase: record.result.diagnostics.timeoutPhase }
+            : {}),
+          runtimeEventCount: record.result.diagnostics.runtimeEventCount,
+          ...(record.result.diagnostics.firstRuntimeEventAt !== undefined
+            ? { firstRuntimeEventAt: record.result.diagnostics.firstRuntimeEventAt }
+            : {}),
+          ...(record.result.diagnostics.lastRuntimeEventAt !== undefined
+            ? { lastRuntimeEventAt: record.result.diagnostics.lastRuntimeEventAt }
+            : {}),
+          ...(record.result.diagnostics.lastRuntimeEventType
+            ? { lastRuntimeEventType: record.result.diagnostics.lastRuntimeEventType }
+            : {}),
+        },
+      } : {}),
       usage,
       ...(park ? { park } : {}),
     }

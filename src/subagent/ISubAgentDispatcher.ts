@@ -36,6 +36,9 @@ export interface ISubAgentDispatcher {
    */
   cancelTask(taskId: SubAgentTaskId, reason?: string): Promise<boolean>
 
+  /** Cancel queued/running members and pending retries of one logical family. */
+  cancelTaskFamily?(logicalTaskId: SubAgentTaskId, reason?: string): Promise<number>
+
   /**
    * Wait until a task reaches a terminal state. Implementations should prefer
    * in-process completion events / runner promises and use polling only as a

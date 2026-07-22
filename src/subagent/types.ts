@@ -27,6 +27,22 @@ export type SubAgentWorkspaceMode =
   | 'isolated_write'
   | 'ephemeral_snapshot'
 
+/**
+ * Selects the single owner of retries for a logical task.
+ *
+ * `bridge` preserves the ordinary Auto behaviour: transient failures may be
+ * re-spawned by SubAgentBridge. `caller` is for durable orchestrators (for
+ * example the Graph Kernel) that already persist attempts and must never have
+ * an invisible second retry loop underneath them.
+ */
+export type SubAgentRetryOwner = 'bridge' | 'caller'
+
+export type SubAgentExecutionPhase =
+  | 'initializing'
+  | 'model_admission'
+  | 'provider_response'
+  | 'agent_execution'
+
 export function makeSubAgentTaskId(): SubAgentTaskId {
   const uuid8 = crypto.randomUUID().replace(/-/g, '').slice(0, 8)
   return `subtask-${uuid8}`
@@ -217,6 +233,13 @@ export interface SubAgentConfig {
    */
   retryCount?: number
 
+  /** Retry ownership. Durable callers set `caller`; default is `bridge`. */
+  retryOwner?: SubAgentRetryOwner
+  /** Stable id shared by every Bridge-owned retry in one logical task family. */
+  logicalTaskId?: SubAgentTaskId
+  /** Immediate predecessor when this record was created by Bridge auto-retry. */
+  retryOfTaskId?: SubAgentTaskId
+
   /**
    * Auto mode: when true AND the parent armed an AutoWorktreeCoordinator over a
    * git workspace, the sub-agent runs in its OWN git worktree+branch so its
@@ -325,6 +348,19 @@ export interface SubAgentResult {
    * Optional for backward compatibility with records written by older versions.
    */
   progressState?: SubAgentProgressState
+  /**
+   * Low-level execution diagnostics. Optional for backward compatibility.
+   * In particular, a wall-clock timeout can now distinguish model admission,
+   * first-provider-response wait, and an already-running agent turn.
+   */
+  diagnostics?: {
+    timedOut?: boolean
+    timeoutPhase?: SubAgentExecutionPhase
+    runtimeEventCount: number
+    firstRuntimeEventAt?: number
+    lastRuntimeEventAt?: number
+    lastRuntimeEventType?: string
+  }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

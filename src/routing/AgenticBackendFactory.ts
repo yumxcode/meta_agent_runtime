@@ -233,7 +233,12 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // (sandbox fail-closed + autonomy passthrough + projectDir bound to the jail
   // root). The jail is auto-specific safety; worktree isolation below is shared.
   if (hasAutonomyJail) {
-    bridge.setAutonomyJail({ workspaceRoot: projectDir, autonomy: overrides!.autonomy! })
+    bridge.setAutonomyJail(
+      { workspaceRoot: projectDir, autonomy: overrides!.autonomy! },
+      // Durable Graph callers own retry as well as aggregate budget. This is
+      // defense in depth on top of each Graph seat's retryOwner:'caller'.
+      budgetManagedExternally ? { retryLimit: 0 } : undefined,
+    )
   }
 
   // Git-worktree isolation for isolated_write sub-agents — armed for BOTH

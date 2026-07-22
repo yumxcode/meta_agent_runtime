@@ -136,6 +136,27 @@ function completeTask(taskId: string, costUsd = 0): void {
   mockState.runners.find(r => r.taskId === taskId)?.resolve()
 }
 
+function finishCancelledTask(taskId: string, costUsd = 0): void {
+  const record = mockState.tasks.get(taskId)
+  if (!record) throw new Error(`missing task ${taskId}`)
+  mockState.tasks.set(taskId, {
+    ...record,
+    status: 'cancelled',
+    completedAt: Date.now(),
+    result: {
+      success: false,
+      summary: 'cancelled',
+      error: 'cancelled',
+      turnsUsed: 0,
+      inputTokens: 1,
+      outputTokens: 0,
+      costUsd,
+      durationMs: 1,
+    },
+  })
+  mockState.runners.find(r => r.taskId === taskId)?.resolve()
+}
+
 function tool(name: string, category?: MetaAgentTool['permission']['category']): MetaAgentTool {
   return {
     name,
@@ -173,6 +194,59 @@ describe('SubAgentBridge scheduler', () => {
     completeTask(first.taskId)
     await waitFor(() => mockState.runners.length === 2)
     expect(mockState.runners[1]?.taskId).toBe(second.taskId)
+  })
+
+  it('serializes tasks that share a persistent lineage while using other slots', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 3,
+      maxQueuedSubAgents: 4,
+      startDelayMs: 0,
+    })
+
+    const first = await bridge.spawnSubAgent({
+      config: { taskDescription: 'lane first', lineageSessionId: 'lane-a' },
+    })
+    const second = await bridge.spawnSubAgent({
+      config: { taskDescription: 'lane second', lineageSessionId: 'lane-a' },
+    })
+    const independent = await bridge.spawnSubAgent({
+      config: { taskDescription: 'other lane', lineageSessionId: 'lane-b' },
+    })
+
+    await waitFor(() => mockState.runners.length === 2)
+    expect(mockState.runners.map(r => r.taskId)).toEqual([first.taskId, independent.taskId])
+    expect((await bridge.getStatus(second.taskId))?.status).toBe('queued')
+
+    completeTask(first.taskId)
+    await waitFor(() => mockState.runners.some(r => r.taskId === second.taskId))
+  })
+
+  it('assigns a stable logical task family id at spawn', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), { startDelayMs: 0 })
+    const task = await bridge.spawnSubAgent({ config: { taskDescription: 'family root' } })
+    expect(task.config.logicalTaskId).toBe(task.taskId)
+  })
+
+  it('keeps a cancelled running lineage fenced until the runner settles', async () => {
+    const bridge = new SubAgentBridge(crypto.randomUUID(), {
+      maxConcurrentSubAgents: 2,
+      maxQueuedSubAgents: 2,
+      startDelayMs: 0,
+    })
+    const first = await bridge.spawnSubAgent({
+      config: { taskDescription: 'first', lineageSessionId: 'lane-cancel' },
+    })
+    const second = await bridge.spawnSubAgent({
+      config: { taskDescription: 'second', lineageSessionId: 'lane-cancel' },
+    })
+    await waitFor(() => mockState.runners.length === 1)
+
+    await expect(bridge.cancelTask(first.taskId, 'replace')).resolves.toBe(true)
+    await new Promise(resolve => setTimeout(resolve, 20))
+    expect((await bridge.getStatus(second.taskId))?.status).toBe('queued')
+
+    finishCancelledTask(first.taskId, 0.01)
+    await waitFor(() => mockState.runners.some(r => r.taskId === second.taskId))
   })
 
   it('cancels queued tasks without starting them later', async () => {

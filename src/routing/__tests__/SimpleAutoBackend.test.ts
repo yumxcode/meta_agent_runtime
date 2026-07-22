@@ -111,6 +111,7 @@ describe('simple_auto backend wiring', () => {
       budgetManagedExternally: true,
     })
     expect(mockState.autonomyJailCalls).toHaveLength(1)
+    expect(mockState.autonomyJailCalls.at(-1)?.opts).toEqual({ retryLimit: 0 })
   })
 
   it('does NOT wire verify / drift / checkpoint / experience-recall', async () => {

@@ -29,6 +29,7 @@ import {
   type SubAgentResult,
   type SubAgentProgressState,
   type SubAgentTaskId,
+  type SubAgentExecutionPhase,
 } from './types.js'
 import { createSandboxExecutor } from '../sandbox/index.js'
 import type { SandboxHandle } from '../sandbox/types.js'
@@ -255,6 +256,18 @@ export class SubAgentRunner {
     let inputTokens = 0
     let outputTokens = 0
     let toolResultCount = 0   // counts completed tool-call rounds (turn proxy)
+    let executionPhase: SubAgentExecutionPhase = 'initializing'
+    let runtimeEventCount = 0
+    let firstRuntimeEventAt: number | undefined
+    let lastRuntimeEventAt: number | undefined
+    let lastRuntimeEventType: string | undefined
+    const diagnostics = (timedOut = false) => ({
+      ...(timedOut ? { timedOut: true, timeoutPhase: executionPhase } : {}),
+      runtimeEventCount,
+      ...(firstRuntimeEventAt !== undefined ? { firstRuntimeEventAt } : {}),
+      ...(lastRuntimeEventAt !== undefined ? { lastRuntimeEventAt } : {}),
+      ...(lastRuntimeEventType !== undefined ? { lastRuntimeEventType } : {}),
+    })
 
     // ── Sandbox initialisation ─────────────────────────────────────────────
     // When cfg.sandbox is set, create an OS-level sandbox handle and inject
@@ -362,6 +375,10 @@ export class SubAgentRunner {
         ...(cfg.hostMaxConcurrentModelCalls !== undefined
           ? { maxConcurrentModelCalls: cfg.hostMaxConcurrentModelCalls }
           : {}),
+        onAdmissionEvent: event => {
+          if (event.type === 'waiting') executionPhase = 'model_admission'
+          else if (event.type === 'acquired') executionPhase = 'provider_response'
+        },
       })
     }
     const sessionConfig: MetaAgentConfig = {
@@ -420,10 +437,17 @@ export class SubAgentRunner {
       this.abortSignal.addEventListener('abort', this._interruptSessionOnAbort, { once: true })
 
       // Run the agentic loop — consume the generator
+      executionPhase = 'provider_response'
       const gen = this.session.submit(cfg.taskDescription)
       this._emitRuntime({ type: 'session_submit_started', taskId: this.taskId })
 
       for await (const event of gen) {
+        const eventAt = Date.now()
+        runtimeEventCount++
+        firstRuntimeEventAt ??= eventAt
+        lastRuntimeEventAt = eventAt
+        lastRuntimeEventType = event.type
+        executionPhase = 'agent_execution'
         this._emitRuntime({ type: 'session_event', taskId: this.taskId, event })
         // Accumulate text
         if (event.type === 'text') {
@@ -498,6 +522,7 @@ export class SubAgentRunner {
               progressState: extractProgressState(
                 lastText, toolResultCount, this.record.latestCheckpoint,
               ),
+              diagnostics: diagnostics(this._timedOut),
             })
             return
           }
@@ -565,6 +590,7 @@ export class SubAgentRunner {
         progressState: extractProgressState(
           lastText, toolResultCount, this.record.latestCheckpoint,
         ),
+        diagnostics: diagnostics(this._timedOut),
       })
     } catch (err: unknown) {
       const errMsg = err instanceof Error ? err.message : String(err)
@@ -580,6 +606,9 @@ export class SubAgentRunner {
         progressState: extractProgressState(
           lastText, toolResultCount, this.record.latestCheckpoint,
         ),
+        ...((this._timedOut || runtimeEventCount > 0) ? {
+          diagnostics: diagnostics(this._timedOut),
+        } : {}),
       })
     }
     } finally {

@@ -134,12 +134,13 @@ export function isDeterministicSubAgentFailure(error: string): boolean {
 
 /** Bridge-level auto-retry gate for a spawned sub-agent config. */
 export function shouldRetrySubAgentConfig(
-  _config: SubAgentConfig | undefined,
+  config: SubAgentConfig | undefined,
   attempt: number,
   limit: number,
   armed: boolean,
   error = '',
 ): boolean {
+  if (config?.retryOwner === 'caller') return false
   if (isDeterministicSubAgentFailure(error)) return false
   return shouldRetrySubAgent(attempt, limit, armed)
 }
@@ -293,7 +294,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   /** Auto-mode failed-sub-agent retry limit (0 = no retry; set when jail armed). */
   private _autoRetryLimit = 0
   /** Pending retry backoff timers, cleared on dispose. */
-  private readonly _retryTimers = new Set<ReturnType<typeof setTimeout>>()
+  private readonly _retryTimers = new Map<SubAgentTaskId, ReturnType<typeof setTimeout>>()
+  /** Permanent per-bridge dedupe: one physical predecessor may spawn one retry. */
+  private readonly retryScheduledFor = new Set<SubAgentTaskId>()
 
   /**
    * Pending notifications keyed by parentSessionId.
@@ -309,6 +312,8 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private readonly queuedStarts = new Map<SubAgentTaskId, QueuedSubAgent>()
   private readonly startQueue: SubAgentTaskId[] = []
   private readonly activeTaskIds = new Set<SubAgentTaskId>()
+  /** A persistent lineage is a single conversation and therefore a single executor. */
+  private readonly activeLineages = new Map<string, SubAgentTaskId>()
   private readonly parentAbortCleanups = new Map<SubAgentTaskId, () => void>()
   private readonly maxConcurrentSubAgents: number
   private readonly maxQueuedSubAgents: number
@@ -494,8 +499,12 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this.destroyed = true
     CampaignEventBus.off('subagent:completed', this._onCompleted)
     CampaignEventBus.off('subagent:failed',    this._onFailed)
-    for (const timer of this._retryTimers) clearTimeout(timer)
+    for (const [taskId, timer] of this._retryTimers) {
+      this.retryScheduledFor.add(taskId)
+      clearTimeout(timer)
+    }
     this._retryTimers.clear()
+    this.retryScheduledFor.clear()
     for (const [taskId] of this.pollTimers) this._clearPollTimer(taskId)
     for (const [taskId, queued] of this.queuedStarts) {
       queued.abortController.abort()
@@ -523,6 +532,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this._finishedCount = 0
     this.pendingNotifications.length = 0
     this.internalTaskIds.clear()
+    this.activeLineages.clear()
     SubAgentBridge._bridgesBySessionId.delete(this.parentSessionId)
   }
 
@@ -576,6 +586,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
 
     const taskId = opts.taskId ?? makeSubAgentTaskId()
+    config = {
+      ...config,
+      logicalTaskId: config.logicalTaskId ?? taskId,
+    }
     const requestedBudget = Math.max(0, config.maxBudgetUsd)
     if (
       !isInternal &&
@@ -812,19 +826,16 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
     const runner = this.runners.get(taskId)
     if (runner) {
-      // Abort the runner's internal AbortController so the MetaAgentSession
-      // receives an interrupt signal.  We also write the cancelled record
-      // immediately (below) so the task appears cancelled right away rather
-      // than waiting for the runner to observe the abort signal.
-      // SubAgentRunner._writeTerminal() guards against overwriting a
-      // cancelled record, so there is no race condition.
-      runner.abort()
-      // Keep the runner in the map until it fully stops — the runner will
-      // reach its own terminal state (aborted → no further writes) and the
-      // map entry will be cleaned up at destroy() time.
+      // Let the runner write the terminal record after its session actually
+      // unwinds. Besides fencing the lineage, this preserves the real token /
+      // cost usage instead of replacing it with an eager zero-cost tombstone.
+      runner.abort(reason ?? 'cancelled')
+      this._clearPollTimer(taskId)
+      return true
     }
 
-    // Write cancelled status immediately.
+    // Queued tasks have no runner to report terminal usage, so cancel them
+    // immediately in the store.
     // L1-fix: go through mutateTask so the terminal-state check and the write
     // happen atomically on the per-task write chain — a runner finishing in
     // parallel can no longer interleave (whoever writes first wins; the loser
@@ -872,11 +883,39 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     return true
   }
 
+  /** Cancel a logical task and every queued/running Bridge-owned retry. */
+  async cancelTaskFamily(logicalTaskId: SubAgentTaskId, reason = 'task family cancelled'): Promise<number> {
+    const records = await listTasksForSession(this.parentSessionId)
+    const family = records.filter(record =>
+      (record.config.logicalTaskId ?? record.taskId) === logicalTaskId,
+    )
+    for (const record of family) {
+      this.retryScheduledFor.add(record.taskId)
+      const timer = this._retryTimers.get(record.taskId)
+      if (timer) {
+        clearTimeout(timer)
+        this._retryTimers.delete(record.taskId)
+      }
+    }
+    const results = await Promise.all(
+      family.map(record => this.cancelTask(record.taskId, reason).catch(() => false)),
+    )
+    return results.filter(Boolean).length
+  }
+
   /**
    * Cancel ALL running sub-agent tasks spawned by this bridge.
    * Called by RoboticsSession.dispose() on graceful shutdown.
    */
   async cancelAll(reason = 'Session disposed'): Promise<void> {
+    // A failed predecessor may currently have no queued/running task while its
+    // family is waiting in retry backoff. Cancel those timers as part of the
+    // same lifecycle boundary so cancelAll cannot spawn fresh work afterwards.
+    for (const [taskId, timer] of this._retryTimers) {
+      this.retryScheduledFor.add(taskId)
+      clearTimeout(timer)
+    }
+    this._retryTimers.clear()
     const ids = [...new Set([...this.startQueue, ...this.queuedStarts.keys(), ...this.runners.keys()])]
     await Promise.allSettled(ids.map(id => this.cancelTask(id, reason)))
   }
@@ -941,11 +980,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * Returns nothing; enqueues the appropriate notification.
    */
   private async _maybeRetryFailed(taskId: SubAgentTaskId, error: string): Promise<void> {
-    const surfaceFailure = () =>
-      this._enqueueNotification(`[${taskId}] ✗ 失败 | 原因: ${error.slice(0, 200)}`)
-
     if (this.destroyed) return
+    // Event and poll delivery are intentionally redundant; collapse duplicate
+    // failure observations so one physical task can schedule at most one retry.
+    if (this.retryScheduledFor.has(taskId)) return
     const rec = await readTask(taskId).catch(() => null)
+    const timeoutPhase = rec?.result?.diagnostics?.timeoutPhase
+    const diagnosticSuffix = timeoutPhase ? ` | timeoutPhase=${timeoutPhase}` : ''
+    const surfaceFailure = () =>
+      this._enqueueNotification(`[${taskId}] ✗ 失败 | 原因: ${error.slice(0, 200)}${diagnosticSuffix}`)
     const attempt = rec?.config.retryCount ?? 0
     if (!rec || !shouldRetrySubAgentConfig(rec.config, attempt, this._autoRetryLimit, this._autonomyJail !== null, error)) {
       surfaceFailure()
@@ -953,11 +996,13 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     }
 
     const delay = retryBackoffMs(attempt)
+    this.retryScheduledFor.add(taskId)
     this._enqueueNotification(
-      `[${taskId}] ↻ 失败，将在 ${Math.round(delay / 1000)}s 后第 ${attempt + 1}/${this._autoRetryLimit} 次重试 | 原因: ${error.slice(0, 120)}`,
+      `[${taskId}] ↻ 失败，将在 ${Math.round(delay / 1000)}s 后第 ${attempt + 1}/${this._autoRetryLimit} 次重试 | ` +
+      `原因: ${error.slice(0, 120)}${diagnosticSuffix}`,
     )
     const timer = setTimeout(() => {
-      this._retryTimers.delete(timer)
+      this._retryTimers.delete(taskId)
       if (this.destroyed) return
       void (async () => {
         // Abandon the failed attempt's isolated worktree BEFORE re-spawning.
@@ -968,13 +1013,24 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         if (rec.config.workspaceMode === 'isolated_write') {
           await this._worktreeCoordinator?.discard(taskId).catch(() => undefined)
         }
-        await this.spawnSubAgent({ config: { ...rec.config, retryCount: attempt + 1 } })
+        const retry = await this.spawnSubAgent({
+          config: {
+            ...rec.config,
+            retryCount: attempt + 1,
+            logicalTaskId: rec.config.logicalTaskId ?? rec.taskId,
+            retryOfTaskId: taskId,
+          },
+        })
+        this._enqueueNotification(
+          `[${taskId}] ↪ retry task ${retry.taskId} ` +
+          `(family ${retry.config.logicalTaskId}, attempt ${attempt + 1}/${this._autoRetryLimit})`,
+        )
       })().catch(() => {
         this._enqueueNotification(`[${taskId}] ✗ 重试派发失败；原始错误: ${error.slice(0, 120)}`)
       })
     }, delay)
     if (timer.unref) timer.unref()
-    this._retryTimers.add(timer)
+    this._retryTimers.set(taskId, timer)
   }
 
   private _enqueueNotification(text: string): void {
@@ -1203,7 +1259,17 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         this.activeTaskIds.size < this.maxConcurrentSubAgents &&
         this.startQueue.length > 0
       ) {
-        const taskId = this.startQueue.shift()!
+        const runnableIndex = this.startQueue.findIndex(candidateId => {
+          const candidate = this.queuedStarts.get(candidateId)
+          const lineage = candidate?.record.config.lineageSessionId
+          return !!candidate && (!lineage || !this.activeLineages.has(lineage))
+        })
+        // Capacity may be available while every queued task belongs to a
+        // lineage that is still unwinding. The completing runner schedules the
+        // next drain after it releases that lineage.
+        if (runnableIndex < 0) break
+        const [taskId] = this.startQueue.splice(runnableIndex, 1)
+        if (!taskId) continue
         const queued = this.queuedStarts.get(taskId)
         if (!queued) continue
 
@@ -1228,6 +1294,8 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         this.queuedStarts.delete(taskId)
         this.runners.set(taskId, runner)
         this.activeTaskIds.add(taskId)
+        const lineageId = queued.record.config.lineageSessionId
+        if (lineageId) this.activeLineages.set(lineageId, taskId)
         await this._worktreeCoordinator?.markRunning(taskId).catch(() => undefined)
 
         void runner.start()
@@ -1237,6 +1305,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
             this._settleBudget(taskId, finalRecord?.result?.costUsd)
             this.runners.delete(taskId)
             this.activeTaskIds.delete(taskId)
+            if (lineageId && this.activeLineages.get(lineageId) === taskId) {
+              this.activeLineages.delete(lineageId)
+            }
             this._clearParentAbortForwarder(taskId)
             this._finishedCount++
             this._scheduleDrain()
@@ -1248,10 +1319,15 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       }
     } finally {
       this.drainingStarts = false
+      const hasRunnable = this.startQueue.some(candidateId => {
+        const candidate = this.queuedStarts.get(candidateId)
+        const lineage = candidate?.record.config.lineageSessionId
+        return !!candidate && (!lineage || !this.activeLineages.has(lineage))
+      })
       if (
         !this.destroyed &&
         this.activeTaskIds.size < this.maxConcurrentSubAgents &&
-        this.startQueue.length > 0
+        hasRunnable
       ) {
         this._scheduleDrain()
       }

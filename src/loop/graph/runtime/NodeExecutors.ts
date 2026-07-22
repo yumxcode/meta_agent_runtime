@@ -194,10 +194,21 @@ export class NodeExecutorRegistry {
       return retryableAgentFailure(node, activation, `Agent execution ${result.kind} for task '${result.taskId}'`, usage)
     }
     if (!result.success) {
+      const diagnosticSuffix = result.diagnostics?.timeoutPhase
+        ? ` [timeoutPhase=${result.diagnostics.timeoutPhase}, runtimeEvents=${result.diagnostics.runtimeEventCount ?? 0}]`
+        : ''
+      const failureReason = `${result.error ?? 'Agent execution failed'}${diagnosticSuffix}`
+      const failureDiagnostics = result.diagnostics ? {
+        timeoutPhase: result.diagnostics.timeoutPhase ?? null,
+        runtimeEventCount: result.diagnostics.runtimeEventCount ?? 0,
+        firstRuntimeEventAt: result.diagnostics.firstRuntimeEventAt ?? null,
+        lastRuntimeEventAt: result.diagnostics.lastRuntimeEventAt ?? null,
+        lastRuntimeEventType: result.diagnostics.lastRuntimeEventType ?? null,
+      } : undefined
       if (activation.attempt < (node.maxAttempts ?? 3)) {
         return {
           kind: 'retry',
-          reason: result.error ?? 'Agent execution failed',
+          reason: failureReason,
           usage,
           consumeAttempt: true,
           delayMs: retryDelayMs(activation.attempt),
@@ -206,7 +217,11 @@ export class NodeExecutorRegistry {
       return {
         kind: 'completed',
         outcome: 'failure',
-        output: { error: result.error ?? 'agent execution failed', summary: result.summary },
+        output: {
+          error: result.error ?? 'agent execution failed',
+          summary: result.summary,
+          ...(failureDiagnostics ? { diagnostics: failureDiagnostics } : {}),
+        },
         summary: result.summary ?? result.error ?? 'Agent execution failed',
         usage,
       }

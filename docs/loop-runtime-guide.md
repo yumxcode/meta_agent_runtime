@@ -155,6 +155,10 @@ Hard park 只要求 persistent Lane 以及 `timerPolicy.maxDelayMs/maxParks` 两
 
 `loop tick` 和 `loop-scheduler` 的费用 owner 是持久 Graph Kernel：节点 `budget` 约束单个物理段，`lifetimeBudget` 约束逻辑 Activation，`limits.maxCostUsd` 约束整个图实例。Scheduler 仍复用 auto backend 的 workspace jail 和保守并发，但不会再叠加 auto 单次会话默认的 `$10` 子 Agent 累计上限；否则一个显式 `$15` 段会在模型启动前失败，长期 daemon 也会在累计 `$10` 后永久失活。操作员显式设置 `META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD` 时仍会增加宿主级硬上限；该上限拒绝被映射为 `exhausted`，不会消耗 `maxAttempts` 做确定性重试。
 
+Graph Kernel 同时是 Graph Agent attempt 的唯一 retry owner。Graph seat 以 `retryOwner:'caller'` 派发，loop backend 也把 SubAgentBridge 的 Auto retry 关闭；Bridge 不得为一个已由 Graph 持久化 attempt 的失败另起隐藏 task。普通 Auto 子 Agent 的 Bridge retry 会保留稳定的 `logicalTaskId`、记录 `retryOfTaskId`，并可按 task family 整体取消。同一 `lineageSessionId` 在 Bridge 内强制单执行者：即使还有全局并发槽，后续 task 也必须等前一 runner 完全退出并保存 history 后才能启动。
+
+SubAgent wall-clock 超时在 task record 的 `result.diagnostics` 中记录执行阶段：`model_admission` 表示等待宿主模型调用配额，`provider_response` 表示已获准但仍在等待模型事件，`agent_execution` 表示至少已有一个运行时事件。Graph retry reason 和最终 failure output 会保留该诊断，避免把 0-turn admission/provider 等待误判成文件工具失败。
+
 timer 会结束当前物理执行段，但不结束逻辑 Activation。到期后同一 Lane 会话恢复。`loop inspect` 显示当前阶段、等待原因、累计时间和最近 summary。
 
 ## Webhook / event

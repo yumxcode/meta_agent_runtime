@@ -3,7 +3,14 @@ export interface ModelCallScope {
   instanceId: string
   coordinatorRoot?: string
   maxConcurrentModelCalls?: number
+  /** In-process diagnostics hook; never persisted or sent to the coordinator. */
+  onAdmissionEvent?: (event: ModelCallAdmissionEvent) => void
 }
+
+export type ModelCallAdmissionEvent =
+  | { type: 'waiting'; at: number }
+  | { type: 'acquired'; at: number }
+  | { type: 'released'; at: number }
 
 export interface ModelCallLease {
   heartbeatIntervalMs: number
@@ -41,7 +48,9 @@ export async function acquireRegisteredModelCall(
   const forwardAbort = (): void => controller.abort(parentSignal.reason)
   if (parentSignal.aborted) forwardAbort()
   else parentSignal.addEventListener('abort', forwardAbort, { once: true })
+  scope.onAdmissionEvent?.({ type: 'waiting', at: Date.now() })
   const lease = await provider(scope, controller.signal)
+  scope.onAdmissionEvent?.({ type: 'acquired', at: Date.now() })
   const heartbeat = setInterval(() => {
     void lease.heartbeat().then(ok => {
       if (!ok) controller.abort(new Error('host model-call lease lost'))
@@ -57,6 +66,7 @@ export async function acquireRegisteredModelCall(
       clearInterval(heartbeat)
       parentSignal.removeEventListener('abort', forwardAbort)
       await lease.release()
+      scope.onAdmissionEvent?.({ type: 'released', at: Date.now() })
     },
   }
 }

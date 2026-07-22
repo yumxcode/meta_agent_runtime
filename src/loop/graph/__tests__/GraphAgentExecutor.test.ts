@@ -94,6 +94,7 @@ describe('graph_agent execution boundary', () => {
       loopInstanceId: 'loop-id',
       maxTurns: 5,
       maxBudgetUsd: 1,
+      retryOwner: 'caller',
       resultSchema: outputSchema,
     })
     expect(result).toMatchObject({
@@ -128,6 +129,47 @@ describe('graph_agent execution boundary', () => {
       kind: 'exhausted',
       reason: 'graph segment exceeds operator cap',
       usage: { turns: 0, costUsd: 0, durationMs: 0 },
+    })
+  })
+
+  it('propagates timeout phase diagnostics without exposing dispatcher records', async () => {
+    const dispatcher: ISubAgentDispatcher = {
+      async spawnSubAgent(options) {
+        const record = completedRecord(options.config as SubAgentRecord['config'])
+        return {
+          ...record,
+          status: 'failed',
+          result: {
+            ...record.result!,
+            success: false,
+            error: 'Sub-agent exceeded 120000ms wall-clock limit',
+            diagnostics: {
+              timedOut: true,
+              timeoutPhase: 'model_admission',
+              runtimeEventCount: 0,
+            },
+          },
+        }
+      },
+      async getStatus() { return null },
+      async cancelTask() { return true },
+    }
+    const result = await new MetaAgentGraphAgentExecutor(dispatcher).execute({
+      profile: GRAPH_AGENT_PROFILE,
+      prompt: { system: GRAPH_AGENT_SYSTEM_PROMPT, user: 'current activation' },
+      allowedTools: [],
+      workspace: {
+        projectDir: '/workspace', mode: 'shared_readonly', writeAllowPaths: [], writeDenyPaths: [],
+      },
+      continuity: { workspaceId: 'workspace-id', loopInstanceId: 'loop-id' },
+      limits: { turns: 5, usd: 1, wallTimeMs: 120_000 },
+      signal: new AbortController().signal,
+    })
+
+    expect(result).toMatchObject({
+      kind: 'completed',
+      success: false,
+      diagnostics: { timeoutPhase: 'model_admission', runtimeEventCount: 0 },
     })
   })
 

@@ -56,6 +56,14 @@ export interface GraphAgentParkIntent {
   checkpoint?: JsonValue
 }
 
+export interface GraphAgentExecutionDiagnostics {
+  timeoutPhase?: 'initializing' | 'model_admission' | 'provider_response' | 'agent_execution'
+  runtimeEventCount?: number
+  firstRuntimeEventAt?: number
+  lastRuntimeEventAt?: number
+  lastRuntimeEventType?: string
+}
+
 /**
  * Substrate-neutral result of one physical Graph Agent segment.
  *
@@ -76,6 +84,7 @@ export type GraphAgentExecutionResult =
       output?: unknown
       summary: string
       error?: string
+      diagnostics?: GraphAgentExecutionDiagnostics
       usage: ActivationUsage
       park?: GraphAgentParkIntent
     }
