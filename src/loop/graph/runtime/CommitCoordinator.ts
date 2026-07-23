@@ -715,13 +715,27 @@ function validateExternalEventInput(input: GraphExternalEventInput): void {
   }
   if (input.correlation !== undefined && !isJsonValue(input.correlation)) throw new Error('external event correlation must be JSON')
   if (input.payload !== undefined && !isJsonValue(input.payload)) throw new Error('external event payload must be JSON')
+  // Correlation/payload flow into recursive canonicalization (structural
+  // equality) on every match attempt. Reject pathological nesting at ingress
+  // so it cannot stack-overflow the kernel later.
+  if (exceedsJsonDepth(input.correlation, MAX_EXTERNAL_EVENT_DEPTH)) throw new Error(`external event correlation exceeds depth ${MAX_EXTERNAL_EVENT_DEPTH}`)
+  if (exceedsJsonDepth(input.payload, MAX_EXTERNAL_EVENT_DEPTH)) throw new Error(`external event payload exceeds depth ${MAX_EXTERNAL_EVENT_DEPTH}`)
   const bytes = Buffer.byteLength(JSON.stringify({ correlation: input.correlation, payload: input.payload }), 'utf8')
   if (bytes > MAX_EXTERNAL_EVENT_BYTES) throw new Error(`external event data exceeds ${MAX_EXTERNAL_EVENT_BYTES} bytes`)
+}
+
+/** Depth check whose recursion is bounded by `limit` itself (safe on any input). */
+function exceedsJsonDepth(value: unknown, limit: number): boolean {
+  if (value === null || typeof value !== 'object') return false
+  if (limit <= 1) return true
+  const children = Array.isArray(value) ? value : Object.values(value)
+  return children.some(child => exceedsJsonDepth(child, limit - 1))
 }
 
 const MAX_AGENT_SERIALIZABLE_REPLAYS = 5
 const MAX_SERIALIZABLE_REPLAYS = 50
 const MAX_EXTERNAL_EVENT_BYTES = 1024 * 1024
+const MAX_EXTERNAL_EVENT_DEPTH = 64
 const TRANSITION_EVALUATION_TIMEOUT_MS = 30_000
 
 function countLiveActivations(activations: Iterable<ActivationRecord>): number {

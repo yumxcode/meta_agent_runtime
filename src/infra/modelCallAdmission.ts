@@ -49,7 +49,16 @@ export async function acquireRegisteredModelCall(
   if (parentSignal.aborted) forwardAbort()
   else parentSignal.addEventListener('abort', forwardAbort, { once: true })
   scope.onAdmissionEvent?.({ type: 'waiting', at: Date.now() })
-  const lease = await provider(scope, controller.signal)
+  let lease: ModelCallLease
+  try {
+    lease = await provider(scope, controller.signal)
+  } catch (error) {
+    // The parent signal is typically a long-lived daemon signal. Leaving the
+    // forwarder attached after a failed admission (lock timeout, vanished
+    // ticket, abort) leaks one closure per failure for the signal's lifetime.
+    parentSignal.removeEventListener('abort', forwardAbort)
+    throw error
+  }
   scope.onAdmissionEvent?.({ type: 'acquired', at: Date.now() })
   const heartbeat = setInterval(() => {
     void lease.heartbeat().then(ok => {

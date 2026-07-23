@@ -3,6 +3,7 @@ import { mkdir, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import {
   atomicWriteJson,
+  deleteJsonFile,
   ensureDir,
   listJsonIds,
   readJsonFile,
@@ -41,6 +42,7 @@ export interface GraphPaths {
   eventsDir: string
   journalSequenceJson: string
   checkpointJson: string
+  checkpointPrevJson: string
   transactionLock: string
 }
 
@@ -70,6 +72,7 @@ export function graphPaths(projectDir: string, instanceId: string): GraphPaths {
     eventsDir: join(graphDir, 'events'),
     journalSequenceJson: join(graphDir, 'journal-sequence.json'),
     checkpointJson: join(graphDir, 'checkpoint.json'),
+    checkpointPrevJson: join(graphDir, 'checkpoint.prev.json'),
     transactionLock: join(graphDir, '.transaction'),
   }
 }
@@ -91,6 +94,10 @@ export class GraphStore {
    * write amplification from every snapshot.
    */
   private repairedThrough = 0
+  /** Highest journal sequence this process has already pruned (memo only). */
+  private journalPrunedThrough = 0
+  /** Next time settled commit-intent files are swept (throttle). */
+  private nextIntentPruneAt = 0
 
   constructor(readonly projectDir: string, readonly instanceId: string) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(instanceId)) {
@@ -112,9 +119,8 @@ export class GraphStore {
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return false
       }
-      const events = await store.readJournalLocked()
-      if (events.length) {
-        await store.reconcileLocked(events)
+      if (await store.hasDurableHistoryLocked()) {
+        await store.reconcileLocked()
         return false
       }
       return true
@@ -176,9 +182,8 @@ export class GraphStore {
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return
       }
-      const racedEvents = await store.readJournalLocked()
-      if (racedEvents.length) {
-        await store.reconcileLocked(racedEvents)
+      if (await store.hasDurableHistoryLocked()) {
+        await store.reconcileLocked()
         return
       }
       await atomicWriteJson(store.paths.specJson, input.graph)
@@ -524,7 +529,6 @@ export class GraphStore {
     await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
     for (const activation of event.spawned) await atomicWriteJson(this.activationPath(activation.id), activation)
     for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
-    for (const activation of event.cancelled ?? []) await atomicWriteJson(this.activationPath(activation.id), activation)
     const intent = await readJsonFile<ActivationCommitIntent>(this.intentPath(event.commitKey))
     if (intent) await atomicWriteJson(this.intentPath(event.commitKey), { ...intent, status: 'committed', journalSequence: sequence })
   }
@@ -568,10 +572,16 @@ export class GraphStore {
 
   private async reconcileLocked(events?: SequencedGraphJournalEvent[]): Promise<GraphSnapshot> {
     const lastSequence = events?.at(-1)?.sequence ?? await this.readLastSequenceLocked()
-    const checkpoint = events ? null : await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
-    const usableCheckpoint = checkpoint?.schemaVersion === 'graph-checkpoint-2.0' && checkpoint.lastSequence <= lastSequence
-      ? checkpoint
-      : null
+    // Prefer the current checkpoint; fall back to the previous generation if
+    // the current one is missing/corrupt (readJsonFile quarantines corrupt
+    // files as .corrupt). Journal pruning keeps every sequence AFTER the
+    // previous generation, so the fallback always has a contiguous tail.
+    const usable = (candidate: GraphCheckpoint | null): GraphCheckpoint | null =>
+      candidate?.schemaVersion === 'graph-checkpoint-2.0' && candidate.lastSequence <= lastSequence ? candidate : null
+    const usableCheckpoint = events
+      ? null
+      : usable(await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson))
+        ?? usable(await readJsonFile<GraphCheckpoint>(this.paths.checkpointPrevJson))
     const journal = events ?? await this.readJournalRangeLocked((usableCheckpoint?.lastSequence ?? 0) + 1, lastSequence)
     if (!usableCheckpoint && journal.length === 0) throw new Error(`graph instance '${this.instanceId}' has no journal`)
     let instance: GraphInstanceRecord | undefined = usableCheckpoint?.instance
@@ -678,7 +688,15 @@ export class GraphStore {
       return lastSequence
     }
     const ids = (await listJsonIds(this.paths.journalDir)).filter(id => /^\d{12}$/.test(id)).sort()
-    const lastSequence = ids.length ? Number(ids.at(-1)) : 0
+    // The journal prefix may have been pruned behind a checkpoint, so a bare
+    // directory scan can undercount after losing the counter file. Take the
+    // max of the directory tail and both checkpoint generations.
+    const checkpoint = await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
+      ?? await readJsonFile<GraphCheckpoint>(this.paths.checkpointPrevJson)
+    const lastSequence = Math.max(
+      ids.length ? Number(ids.at(-1)) : 0,
+      checkpoint?.schemaVersion === 'graph-checkpoint-2.0' ? checkpoint.lastSequence : 0,
+    )
     await atomicWriteJson(this.paths.journalSequenceJson, { schemaVersion: '1.0', lastSequence })
     return lastSequence
   }
@@ -734,20 +752,117 @@ export class GraphStore {
   }
 
   private async writeCheckpointLocked(snapshot: GraphSnapshot): Promise<void> {
+    const now = Date.now()
+    // Compaction: without it, the checkpoint (and therefore the in-memory
+    // snapshot rebuilt on EVERY snapshot() call) grows linearly with the total
+    // number of Activations ever created — unbounded for a long-lived loop.
+    // Retention is deliberately conservative; see retainActivationInCheckpoint.
+    const spec = await readJsonFile<FrozenLoopGraphSpec>(this.paths.specJson)
+    const activations = [...snapshot.activations.values()]
+      .filter(activation => retainActivationInCheckpoint(activation, spec, now))
+    const externalEvents = [...snapshot.externalEvents.values()]
+      .filter(event => event.status === 'pending' ||
+        now - (event.consumedAt ?? event.createdAt) < EXTERNAL_EVENT_RETENTION_MS)
+    // Two-generation rotation: keep the outgoing checkpoint as .prev so a
+    // corrupt current checkpoint still recovers without the full journal.
+    const previous = await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
+    // Journal sequences at or below BOTH generations' lastSequence are covered
+    // twice over and can be deleted. commitKey entries pointing into that
+    // pruned prefix are dropped with them: their duplicate-commit lookup would
+    // dereference a deleted journal file anyway, and a same-commitKey replay
+    // that old is impossible while the Activation itself is compacted.
+    const pruneThrough = Math.min(previous?.lastSequence ?? 0, snapshot.lastSequence)
     const checkpoint: GraphCheckpoint = {
       schemaVersion: 'graph-checkpoint-2.0',
       lastSequence: snapshot.lastSequence,
       instance: snapshot.instance,
       state: snapshot.state,
-      activations: [...snapshot.activations.values()],
-      commitKeys: [...snapshot.commitKeys.entries()],
-      externalEvents: [...snapshot.externalEvents.values()],
+      activations,
+      commitKeys: [...snapshot.commitKeys.entries()].filter(([, sequence]) => sequence > pruneThrough),
+      externalEvents,
+    }
+    if (previous && previous.lastSequence < checkpoint.lastSequence) {
+      await atomicWriteJson(this.paths.checkpointPrevJson, previous)
     }
     await atomicWriteJson(this.paths.checkpointJson, checkpoint)
+    // Bounded batch per checkpoint keeps the transaction short; the backlog
+    // drains across successive checkpoints.
+    if (pruneThrough > this.journalPrunedThrough) {
+      let deleted = 0
+      for (let sequence = this.journalPrunedThrough + 1; sequence <= pruneThrough && deleted < HOUSEKEEPING_BATCH; sequence++) {
+        await deleteJsonFile(this.journalPath(sequence)).catch(() => undefined)
+        this.journalPrunedThrough = sequence
+        deleted++
+      }
+    }
+    await this.pruneSettledIntentsLocked(now)
+  }
+
+  /**
+   * Remove committed/discarded commit-intent files older than the retention
+   * window. recoverPrepared() lists EVERY intent file on every tick, so
+   * settled intents left forever degrade each tick linearly. Replay dedup is
+   * unaffected: commit() dedups via the journal-backed commitKeys index, not
+   * via these files.
+   */
+  private async pruneSettledIntentsLocked(now: number): Promise<void> {
+    if (now < this.nextIntentPruneAt) return
+    this.nextIntentPruneAt = now + HOUSEKEEPING_INTERVAL_MS
+    const ids = await listJsonIds(this.paths.intentsDir)
+    let deleted = 0
+    for (const id of ids) {
+      if (deleted >= HOUSEKEEPING_BATCH) break
+      const path = join(this.paths.intentsDir, `${id}.json`)
+      const intent = await readJsonFile<ActivationCommitIntent>(path)
+      if (!intent || intent.status === 'prepared') continue
+      if (now - intent.createdAt < INTENT_RETENTION_MS) continue
+      await deleteJsonFile(path).catch(() => undefined)
+      deleted++
+    }
+  }
+
+  /** True when this instance has any durable history (journal tail or checkpoint). */
+  private async hasDurableHistoryLocked(): Promise<boolean> {
+    if (await this.readLastSequenceLocked() > 0) return true
+    const checkpoint = await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
+      ?? await readJsonFile<GraphCheckpoint>(this.paths.checkpointPrevJson)
+    return checkpoint !== null
   }
 }
 
 const CHECKPOINT_INTERVAL = 50
+/** Terminal (succeeded/failed/cancelled) Activations older than this are folded out of checkpoints. */
+const ACTIVATION_RETENTION_MS = 24 * 60 * 60_000
+/** Consumed external events stay deduplicable for this window (webhook redelivery horizon). */
+const EXTERNAL_EVENT_RETENTION_MS = 7 * 24 * 60 * 60_000
+/** Committed/discarded commit-intent files older than this are deleted. */
+const INTENT_RETENTION_MS = 7 * 24 * 60 * 60_000
+const HOUSEKEEPING_BATCH = 500
+const HOUSEKEEPING_INTERVAL_MS = 10 * 60_000
+
+/**
+ * Conservative checkpoint retention. An Activation is dropped ONLY when every
+ * reader is provably done with it:
+ *   • live statuses (ready/running/waiting/committing) are always kept;
+ *   • join-node Activations are kept — spawned-join dedup inspects succeeded
+ *     join members per fork group (CommitCoordinator.commit);
+ *   • terminal-node Activations are kept — resumePausedTerminal looks up
+ *     succeeded paused Terminals without resumedAt;
+ *   • anything else is kept for ACTIVATION_RETENTION_MS after its last update
+ *     (grace for observers/CLI), then folded out.
+ * When the spec cannot be read, nothing is dropped.
+ */
+function retainActivationInCheckpoint(
+  activation: ActivationRecord,
+  spec: FrozenLoopGraphSpec | null,
+  now: number,
+): boolean {
+  if (['ready', 'running', 'waiting', 'committing'].includes(activation.status)) return true
+  if (!spec || spec.schemaVersion !== 'graph-2.0') return true
+  const nodeType = spec.nodes[activation.nodeId]?.type
+  if (nodeType === 'join' || nodeType === 'terminal' || nodeType === undefined) return true
+  return now - activation.updatedAt < ACTIVATION_RETENTION_MS
+}
 
 interface GraphCheckpoint {
   schemaVersion: 'graph-checkpoint-2.0'
@@ -774,10 +889,18 @@ function compareTerminalActivation(a: ActivationRecord, b: ActivationRecord, gra
     if (node?.type !== 'terminal') return 3
     return node.status === 'failed' ? 0 : node.status === 'exhausted' ? 1 : node.status === 'paused' ? 2 : 3
   }
+  let inputOrder = 0
+  try {
+    inputOrder = stableJson(a.input).localeCompare(stableJson(b.input))
+  } catch {
+    // Pathologically deep agent-produced input must not crash claimReady with
+    // a stack overflow; fall through to the remaining stable tie-breakers.
+    inputOrder = 0
+  }
   return rank(a) - rank(b) ||
     a.nodeId.localeCompare(b.nodeId) ||
     (a.sourceTransitionId ?? '').localeCompare(b.sourceTransitionId ?? '') ||
-    stableJson(a.input).localeCompare(stableJson(b.input)) ||
+    inputOrder ||
     a.createdAt - b.createdAt ||
     a.id.localeCompare(b.id)
 }

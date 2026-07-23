@@ -1,5 +1,5 @@
 /** Durable Graph scheduler: claim wakes and dispatch graph ticks concurrently. */
-import { mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
+import { link, mkdir, readFile, rename, rm, stat, utimes, writeFile } from 'node:fs/promises'
 import { randomUUID } from 'node:crypto'
 import { hostname } from 'node:os'
 import { join, resolve } from 'node:path'
@@ -141,22 +141,41 @@ interface DaemonLockRecord { pid: number; host: string; token: string; at: numbe
 
 export async function acquireDaemonLock(lockPath: string, freshMs = LOCK_FRESH_MS): Promise<string | null> {
   await mkdir(join(lockPath, '..'), { recursive: true }).catch(() => undefined)
-  try {
-    const held = JSON.parse(await readFile(lockPath, 'utf8')) as DaemonLockRecord
+  const raw = await readFile(lockPath, 'utf8').catch(() => null)
+  if (raw !== null) {
+    // A lock whose content cannot be parsed was left by a crashed/interrupted
+    // writer. It must never be treated as held forever: once its mtime goes
+    // stale it is reclaimed exactly like an orphaned healthy lock. While it is
+    // still fresh we conservatively back off (a writer may be mid-crash).
+    let held: DaemonLockRecord | null = null
+    try { held = JSON.parse(raw) as DaemonLockRecord } catch { held = null }
     const info = await stat(lockPath).catch(() => null)
     const fresh = !!info && Date.now() - info.mtimeMs < freshMs
-    if ((held.host !== hostname() && fresh) || (held.host === hostname() && isAlive(held.pid) && fresh)) return null
+    const heldByLive = !!held &&
+      ((held.host !== hostname() && fresh) || (held.host === hostname() && isAlive(held.pid) && fresh))
+    if (heldByLive || (!held && fresh)) return null
     const stalePath = `${lockPath}.${process.pid}.${randomUUID()}.stale`
     try {
       await rename(lockPath, stalePath)
       await rm(stalePath, { force: true })
     } catch { return null }
-  } catch { /* free */ }
+  }
   const token = randomUUID()
+  // Atomic create-if-absent WITH atomic content: write the record to a private
+  // temp file first, then link() it into place. link() fails with EEXIST when
+  // the lock exists (exclusivity) and never exposes a half-written lock file
+  // (a crash mid-writeFile('wx') previously could — and a corrupt lock used to
+  // wedge this function permanently).
+  const tmpPath = `${lockPath}.${process.pid}.${randomUUID().slice(0, 8)}.tmp`
   try {
-    await writeFile(lockPath, JSON.stringify({ pid: process.pid, host: hostname(), token, at: Date.now() } satisfies DaemonLockRecord), { flag: 'wx' })
+    await writeFile(tmpPath, JSON.stringify({ pid: process.pid, host: hostname(), token, at: Date.now() } satisfies DaemonLockRecord))
+    await link(tmpPath, lockPath)
     return token
-  } catch { return null }
+  } catch {
+    return null
+  } finally {
+    await rm(tmpPath, { force: true }).catch(() => undefined)
+  }
 }
 
 async function refreshLock(lockPath: string, token: string): Promise<void> {

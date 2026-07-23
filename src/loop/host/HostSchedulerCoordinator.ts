@@ -89,6 +89,8 @@ export interface HostCoordinatorSnapshot {
 
 const DEFAULT_LEASE_TTL_MS = 5 * 60_000
 const DEFAULT_POLL_MS = 50
+/** adapterLastStartedAt entries older than this are inert (minIntervalMs ≤ 60s) and dropped. */
+const ADAPTER_INTERVAL_RETENTION_MS = 10 * 60_000
 const SAFE_RESOURCE_ID = /^[A-Za-z0-9][A-Za-z0-9._:/@#=+-]{0,511}$/
 
 export class WorkspaceIdentityConflictError extends Error {
@@ -380,7 +382,15 @@ export class HostSchedulerCoordinator {
       }
       changed = true
     }
-    if (changed) await atomicWriteJson(this.fairnessPath(), fairness)
+    if (changed) {
+      // adapter min-interval entries are only meaningful for up to 60s
+      // (minIntervalMs cap); drop stale ones so the map cannot grow with
+      // every adapter/credential pair ever seen.
+      for (const [resourceId, startedAt] of Object.entries(fairness.adapterLastStartedAt)) {
+        if (now - startedAt > ADAPTER_INTERVAL_RETENTION_MS) delete fairness.adapterLastStartedAt[resourceId]
+      }
+      await atomicWriteJson(this.fairnessPath(), fairness)
+    }
   }
 
   private makeLease(ticket: AdmissionTicket, now: number): HostAdmissionLease {
@@ -557,7 +567,14 @@ function normalizeGrantCounters(grants: Record<string, number>): void {
   if (values.length === 0) return
   const min = Math.min(...values)
   if (min < 10_000) return
-  for (const key of Object.keys(grants)) grants[key] = grants[key]! - min
+  for (const key of Object.keys(grants)) {
+    const next = grants[key]! - min
+    // A zero counter is indistinguishable from an absent key (both read back
+    // as 0), so drop it — otherwise the map keeps one entry per workspace
+    // ever seen, forever.
+    if (next === 0) delete grants[key]
+    else grants[key] = next
+  }
 }
 
 function boundedLimit(value: number): number {

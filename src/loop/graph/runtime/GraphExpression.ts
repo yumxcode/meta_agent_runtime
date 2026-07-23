@@ -76,16 +76,22 @@ export function resolveReference(reference: string, context: GraphEvaluationCont
   return path ? readPath(roots[rootName], path) : cloneJson(roots[rootName] as JsonValue)
 }
 
-function flattenPrimitives(prefix: string, value: unknown, output: Record<string, Value>): void {
+/** Deeper values never enter `when` conditions; a missing ref makes the edge
+ * not match instead of crashing evaluation with a stack overflow on
+ * pathologically deep agent-produced JSON. */
+const MAX_CONDITION_FLATTEN_DEPTH = 32
+
+function flattenPrimitives(prefix: string, value: unknown, output: Record<string, Value>, depth = 0): void {
   if (typeof value === 'string' || typeof value === 'boolean' || (typeof value === 'number' && Number.isFinite(value))) {
     output[prefix] = value
     return
   }
   if (value === null || typeof value !== 'object' || Array.isArray(value)) return
+  if (depth >= MAX_CONDITION_FLATTEN_DEPTH) return
   for (const [key, child] of Object.entries(value)) {
     // Dot-bearing object keys are ambiguous with nested paths. They remain
     // available to ValueExpression whole-object refs, but never enter `when`.
     if (key.includes('.')) continue
-    flattenPrimitives(`${prefix}.${key}`, child, output)
+    flattenPrimitives(`${prefix}.${key}`, child, output, depth + 1)
   }
 }

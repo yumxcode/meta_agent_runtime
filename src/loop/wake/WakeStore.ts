@@ -54,6 +54,10 @@ export interface WakeStoreOptions {
 }
 
 const DEFAULT_CLAIM_TTL_MS = 10 * 60_000
+/** Terminal (done/cancelled) wakes older than this are removed opportunistically. */
+const DEFAULT_WAKE_RETENTION_MS = 7 * 24 * 60 * 60_000
+/** Minimum spacing between opportunistic terminal-wake sweeps per store instance. */
+const OPPORTUNISTIC_PRUNE_INTERVAL_MS = 10 * 60_000
 
 export function wakeClaimOwner(): string {
   return `${hostname()}#${process.pid}`
@@ -70,6 +74,8 @@ export class WakeStore {
   private readonly dir: string
   private readonly claimTtlMs: number
   private readonly projectDir: string
+  /** Next time an opportunistic terminal-wake sweep may run (throttle). */
+  private nextOpportunisticPruneAt = 0
 
   constructor(projectDir: string, opts?: WakeStoreOptions) {
     this.projectDir = resolve(projectDir)
@@ -99,6 +105,11 @@ export class WakeStore {
   }): Promise<WakeRecord> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
+      // Self-cleaning: hourly prune previously ran only inside the daemon
+      // loop. Deployments that only schedule (webhook ingress) or only run
+      // tickOnce would otherwise accumulate terminal wake files forever and
+      // pay an ever-growing directory scan on every schedule/claim.
+      await this.opportunisticPruneUnlocked(Date.now())
       if (input.kind === 'timer') {
         for (const existing of await this.listUnlocked()) {
           if (
@@ -160,6 +171,7 @@ export class WakeStore {
   ): Promise<WakeRecord[]> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
+      await this.opportunisticPruneUnlocked(now)
       const all = await this.listUnlocked()
       const liveClaimedLoops = new Set(
         all
@@ -297,15 +309,25 @@ export class WakeStore {
 
   /** Remove terminal records older than `olderThanMs` (housekeeping). */
   async prune(olderThanMs: number, now = Date.now()): Promise<number> {
-    return withFileLock(this.lockPath(), async () => {
-      let n = 0
-      for (const record of await this.listUnlocked()) {
-        if (record.status !== 'done' && record.status !== 'cancelled') continue
-        if (now - record.updatedAt < olderThanMs) continue
-        await deleteJsonFile(this.pathFor(record.wakeId))
-        n++
-      }
-      return n
-    })
+    return withFileLock(this.lockPath(), async () => this.pruneUnlocked(olderThanMs, now))
+  }
+
+  /** Caller must hold the store lock. */
+  private async pruneUnlocked(olderThanMs: number, now: number): Promise<number> {
+    let n = 0
+    for (const record of await this.listUnlocked()) {
+      if (record.status !== 'done' && record.status !== 'cancelled') continue
+      if (now - record.updatedAt < olderThanMs) continue
+      await deleteJsonFile(this.pathFor(record.wakeId)).catch(() => undefined)
+      n++
+    }
+    return n
+  }
+
+  /** Caller must hold the store lock. Throttled terminal-wake sweep. */
+  private async opportunisticPruneUnlocked(now: number): Promise<void> {
+    if (now < this.nextOpportunisticPruneAt) return
+    this.nextOpportunisticPruneAt = now + OPPORTUNISTIC_PRUNE_INTERVAL_MS
+    await this.pruneUnlocked(DEFAULT_WAKE_RETENTION_MS, now)
   }
 }

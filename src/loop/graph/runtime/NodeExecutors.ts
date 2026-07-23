@@ -578,6 +578,13 @@ function isJsonObject(value: JsonValue): value is { [key: string]: JsonValue } {
   return value !== null && typeof value === 'object' && !Array.isArray(value)
 }
 
+/**
+ * NOTE: a timeout rejects this wrapper but does NOT cancel the underlying
+ * promise — the capability Function keeps running in the background and may
+ * overlap the retried execution. Function providers are declared pure; any
+ * provider that holds real resources (connections, child processes) must
+ * implement its own internal deadline.
+ */
 async function withTimeout<T>(promise: Promise<T>, timeoutMs: number | undefined, label: string): Promise<T> {
   if (timeoutMs === undefined) return promise
   let timer: ReturnType<typeof setTimeout> | undefined
