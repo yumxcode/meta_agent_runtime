@@ -31,6 +31,65 @@ function agentGraph(): LoopGraphSpec {
 }
 
 describe('durable-graph-v2 runtime', () => {
+  it('pauses provider/runtime failures and replays without consuming a business attempt', async () => {
+    const projectDir = await root(); const caps = capabilities()
+    const spec = agentGraph()
+    const work = spec.nodes.work
+    if (work?.type === 'agent') work.maxAttempts = 1
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'blocked-replay', graph, functions: caps.functions, now: 1 })
+    let calls = 0
+    const kernel = await GraphKernel.open({
+      store, graph, ...caps, owner: 'test',
+      graphAgent: {
+        id: 'test',
+        async execute() {
+          calls++
+          if (calls === 1) return {
+            kind: 'completed' as const,
+            taskId: 'blocked',
+            success: false,
+            summary: '',
+            error: 'subscription expired',
+            failure: {
+              category: 'provider_blocked' as const,
+              message: 'subscription expired',
+              retryable: false,
+              providerId: 'zhipu' as const,
+            },
+            usage: { turns: 0, costUsd: 0, durationMs: 1 },
+          }
+          return {
+            kind: 'completed' as const,
+            taskId: 'ok',
+            success: true,
+            output: {},
+            summary: 'recovered',
+            usage: { turns: 1, costUsd: 0.1, durationMs: 1 },
+          }
+        },
+      },
+    })
+    const blocked = await kernel.tick()
+    expect(blocked).toMatchObject({ blocked: 1, instance: { status: 'paused' } })
+    const paused = await store.snapshot()
+    const activation = [...paused.activations.values()].find(item => item.nodeId === 'work')!
+    expect(activation).toMatchObject({
+      status: 'ready',
+      attempt: 1,
+      readyReason: 'replay',
+      replayCount: 1,
+      blockedFailure: { category: 'provider_blocked' },
+    })
+    expect((await store.readJournal()).some(item => item.event.type === 'activation_blocked')).toBe(true)
+
+    await store.setStatus('active', 'provider restored', 2)
+    expect((await kernel.tick()).committed).toBe(1)
+    const recovered = (await store.snapshot()).activations.get(activation.id)!
+    expect(recovered.attempt).toBe(1)
+    expect(await kernel.tick()).toMatchObject({ instance: { status: 'done' } })
+  })
+
   it('runs every Lane on the project root and passes its direct write scope to graph_agent', async () => {
     const projectDir = await root(); const caps = capabilities(); const graph = freezeLoopGraph(agentGraph(), caps, 1)
     const store = await GraphStore.create({ projectDir, instanceId: 'direct', graph, functions: caps.functions, now: 1 })
@@ -593,6 +652,47 @@ describe('durable-graph-v2 runtime', () => {
     expect((await kernel.tick()).committed).toBe(1)
     expect(submits).toBe(1)
     expect((await kernel.tick()).instance.status).toBe('failed')
+  })
+
+  it('enforces an Effect manifest outputSchema before committing success', async () => {
+    const projectDir = await root(); const caps = capabilities()
+    caps.effects.register({
+      manifest: {
+        id: 'test/typed-effect',
+        version: '1',
+        integrity: 'test:typed-effect-v1',
+        pure: false,
+        outputSchema: {
+          type: 'object',
+          required: ['ok'],
+          properties: { ok: { type: 'boolean' } },
+          additionalProperties: false,
+        },
+      },
+      async submit() { return { wrong: true } },
+    })
+    const spec: LoopGraphSpec = {
+      schemaVersion: 'graph-2.0', id: 'typed_effect', version: 1, goal: 'Reject invalid Effect output.',
+      state: {}, lanes: {},
+      nodes: {
+        effect: { type: 'effect', effect: 'test/typed-effect@1', timeoutMs: 60_000 },
+        done: { type: 'terminal', status: 'done' },
+        failed: { type: 'terminal', status: 'failed' },
+      },
+      transitions: [
+        { id: 'done', from: 'effect', to: 'done' },
+        { id: 'failed', from: 'effect', on: 'failure', to: 'failed' },
+      ],
+      entrypoints: [{ id: 'start', node: 'effect' }],
+      limits: { maxTotalActivations: 3, maxLiveActivations: 1 },
+    }
+    const graph = freezeLoopGraph(spec, caps, 1)
+    const store = await GraphStore.create({ projectDir, instanceId: 'typed-effect', graph, functions: caps.functions })
+    const kernel = await GraphKernel.open({ store, graph, ...caps, owner: 'test' })
+    await kernel.tick()
+    expect((await kernel.tick()).instance.status).toBe('failed')
+    const failed = [...(await store.snapshot()).activations.values()].find(item => item.nodeId === 'effect')
+    expect(failed?.output).toMatchObject({ error: expect.stringContaining('$output.ok is required') })
   })
 
   it('supports a continuous reactive loop with only a live-Activation cap', async () => {

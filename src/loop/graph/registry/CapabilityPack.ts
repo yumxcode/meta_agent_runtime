@@ -44,7 +44,15 @@ export class CapabilityPackRegistry {
     const key = `${manifest.id}@${manifest.version}`
     const existing = this.manifestsByKey.get(key)
     if (existing && existing.integrity !== manifest.integrity) throw new Error(`Capability Pack '${key}' integrity conflict`)
-    this.manifestsByKey.set(key, { ...manifest })
+    // Pack authoring metadata (for example description) is advisory and is not
+    // part of the executable FrozenCapabilityRef ABI. Strip it at registration
+    // so catalog listings can be copied into a Graph without leaking unknown
+    // executable fields.
+    this.manifestsByKey.set(key, {
+      id: manifest.id,
+      version: manifest.version,
+      integrity: manifest.integrity,
+    })
   }
 
   has(reference: Pick<FrozenCapabilityRef, 'id' | 'version' | 'integrity'>): boolean {

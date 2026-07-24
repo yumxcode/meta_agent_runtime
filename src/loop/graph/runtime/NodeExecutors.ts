@@ -25,6 +25,12 @@ import { isJsonValue, validateShape } from './GraphJson.js'
 import type { GraphSnapshot, GraphStore } from './GraphStore.js'
 import type { LaneManager } from './LaneManager.js'
 import { addUsage, retryDelayMs } from './UsageMath.js'
+import {
+  classifyExecutionFailure,
+  isInfrastructureFailure,
+  serializeExecutionError,
+  type ExecutionFailure,
+} from '../../../infra/failures/ExecutionFailure.js'
 
 export const DEFAULT_AGENT_SEGMENT_BUDGET_USD = 10
 
@@ -32,6 +38,7 @@ export type NodeExecutionResult =
   | { kind: 'completed'; outcome: string; output: JsonValue; summary?: string; usage?: ActivationUsage }
   | { kind: 'retry'; reason: string; usage?: ActivationUsage; consumeAttempt: boolean; delayMs?: number }
   | { kind: 'fatal'; reason: string; usage?: ActivationUsage }
+  | { kind: 'blocked'; reason: string; failure: ExecutionFailure; usage?: ActivationUsage }
   | {
       kind: 'parked'
       wakeAt?: number
@@ -144,9 +151,16 @@ export class NodeExecutorRegistry {
       })
     } catch (error) {
       if (signal.aborted) return { kind: 'retry', reason: `Agent execution aborted: ${message(error)}`, consumeAttempt: false }
-      return retryableAgentFailure(node, activation, `graph_agent executor error: ${message(error)}`)
+      const failure = classifyExecutionFailure({
+        subtype: 'error_during_execution',
+        errors: serializeExecutionError(error),
+      })
+      return { kind: 'blocked', reason: failure.message, failure }
     }
     const usage = result.usage
+    if (result.kind === 'blocked') {
+      return { kind: 'blocked', reason: result.reason, failure: result.failure, usage }
+    }
     if (result.kind === 'exhausted') {
       return {
         kind: 'completed',
@@ -198,6 +212,14 @@ export class NodeExecutorRegistry {
         ? ` [timeoutPhase=${result.diagnostics.timeoutPhase}, runtimeEvents=${result.diagnostics.runtimeEventCount ?? 0}]`
         : ''
       const failureReason = `${result.error ?? 'Agent execution failed'}${diagnosticSuffix}`
+      if (isInfrastructureFailure(result.failure)) {
+        return {
+          kind: 'blocked',
+          reason: failureReason,
+          failure: result.failure!,
+          usage,
+        }
+      }
       const failureDiagnostics = result.diagnostics ? {
         timeoutPhase: result.diagnostics.timeoutPhase ?? null,
         runtimeEventCount: result.diagnostics.runtimeEventCount ?? 0,
@@ -418,7 +440,12 @@ export class NodeExecutorRegistry {
         idempotencyKey,
         input: inputs,
       }, this.now())
-      if (intent.status === 'succeeded') return { kind: 'completed', outcome: 'success', output: intent.output ?? intent.receipt ?? null }
+      if (intent.status === 'succeeded') {
+        const output = intent.output ?? intent.receipt ?? null
+        const errors = provider.manifest.outputSchema ? validateShape(output, provider.manifest.outputSchema, '$output') : []
+        if (errors.length) return { kind: 'completed', outcome: 'failure', output: { error: errors.join('; ') } }
+        return { kind: 'completed', outcome: 'success', output }
+      }
       if (intent.status === 'failed') return { kind: 'completed', outcome: 'failure', output: { error: intent.error ?? 'effect failed', receipt: intent.receipt ?? null } }
       const existing = activation.input.__effectReceipt ?? intent.receipt
       const submitted = existing ?? await provider.submit(inputs, idempotencyKey)
@@ -427,12 +454,22 @@ export class NodeExecutorRegistry {
       const recorded = await this.deps.store.recordEffectReceipt(operationKey, submitted, this.now())
       const receipt = recorded.receipt ?? submitted
       if (!provider.inspect) {
+        const errors = provider.manifest.outputSchema ? validateShape(receipt, provider.manifest.outputSchema, '$output') : []
+        if (errors.length) {
+          await this.deps.store.completeEffectIntent(operationKey, { status: 'failed', error: errors.join('; ') }, this.now())
+          return { kind: 'completed', outcome: 'failure', output: { error: errors.join('; '), receipt } }
+        }
         await this.deps.store.completeEffectIntent(operationKey, { status: 'succeeded', output: receipt }, this.now())
         return { kind: 'completed', outcome: 'success', output: receipt }
       }
       const inspection = await provider.inspect(receipt)
       if (inspection.status === 'succeeded') {
         const output = inspection.output ?? receipt
+        const errors = provider.manifest.outputSchema ? validateShape(output, provider.manifest.outputSchema, '$output') : []
+        if (errors.length) {
+          await this.deps.store.completeEffectIntent(operationKey, { status: 'failed', error: errors.join('; ') }, this.now())
+          return { kind: 'completed', outcome: 'failure', output: { error: errors.join('; '), receipt } }
+        }
         await this.deps.store.completeEffectIntent(operationKey, { status: 'succeeded', output }, this.now())
         return { kind: 'completed', outcome: 'success', output }
       }

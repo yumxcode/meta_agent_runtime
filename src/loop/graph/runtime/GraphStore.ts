@@ -83,6 +83,25 @@ export interface CreateGraphInstanceInput {
   graph: FrozenLoopGraphSpec
   functions: CapabilityRegistry<FunctionProvider>
   now?: number
+  mustCreate?: boolean
+  recoverySeed?: {
+    state: GraphStateSnapshot
+    activation: Pick<ActivationRecord, 'nodeId' | 'input'>
+    sourceInstanceId: string
+    sourceActivationId: string
+    reason?: string
+  }
+}
+
+export interface CreateGraphRecoveryForkInput {
+  projectDir: string
+  sourceInstanceId: string
+  targetInstanceId: string
+  functions: CapabilityRegistry<FunctionProvider>
+  activationId?: string
+  reason?: string
+  allowUnsafe?: boolean
+  now?: number
 }
 
 export class GraphStore {
@@ -115,11 +134,13 @@ export class GraphStore {
     const initialize = await store.withTransaction(async () => {
       const existing = await readJsonFile<GraphInstanceRecord>(store.paths.instanceJson)
       if (existing) {
+        if (input.mustCreate) throw new Error(`instance '${instanceId}' already exists`)
         if (existing.engine !== 'durable-graph-v2') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return false
       }
       if (await store.hasDurableHistoryLocked()) {
+        if (input.mustCreate) throw new Error(`instance '${instanceId}' already has durable history`)
         await store.reconcileLocked()
         return false
       }
@@ -131,19 +152,29 @@ export class GraphStore {
     // plugin code. Materialize entrypoint inputs outside the Graph transaction.
     const workspace = await ensureWorkspaceIdentity(input.projectDir)
     const now = input.now ?? Date.now()
-    const initialState = Object.fromEntries(
-      Object.entries(input.graph.state).map(([name, variable]) => [name, variable.initial]),
-    )
-    const state: GraphStateSnapshot = {
-      schemaVersion: 'graph-state-1.0',
-      version: 0,
-      values: initialState,
-      updatedAt: now,
-    }
-    const materializedEntries = await Promise.all(input.graph.entrypoints.map(async entry => ({
-      entry,
-      values: await evaluateBindings(entry.inputs, { state: state.values }, input.functions),
-    })))
+    const state: GraphStateSnapshot = input.recoverySeed
+      ? {
+          ...input.recoverySeed.state,
+          values: structuredClone(input.recoverySeed.state.values),
+          updatedAt: now,
+        }
+      : {
+          schemaVersion: 'graph-state-1.0',
+          version: 0,
+          values: Object.fromEntries(
+            Object.entries(input.graph.state).map(([name, variable]) => [name, variable.initial]),
+          ),
+          updatedAt: now,
+        }
+    const materializedEntries = input.recoverySeed
+      ? [{
+          entry: { id: 'recovery', node: input.recoverySeed.activation.nodeId },
+          values: structuredClone(input.recoverySeed.activation.input),
+        }]
+      : await Promise.all(input.graph.entrypoints.map(async entry => ({
+          entry,
+          values: await evaluateBindings(entry.inputs, { state: state.values }, input.functions),
+        })))
     const activations: ActivationRecord[] = materializedEntries.map(({ entry, values }) => ({
           schemaVersion: 'graph-activation-1.0',
           id: activationId(),
@@ -157,7 +188,7 @@ export class GraphStore {
           createdAt: now,
           updatedAt: now,
           input: values,
-          inputStateVersion: 0,
+          inputStateVersion: state.version,
           continuationVersion: 0,
     }))
     const instance: GraphInstanceRecord = {
@@ -174,15 +205,25 @@ export class GraphStore {
         updatedAt: now,
         activationCount: activations.length,
         totalCostUsd: 0,
+        ...(input.recoverySeed ? {
+          recovery: {
+            sourceInstanceId: input.recoverySeed.sourceInstanceId,
+            sourceActivationId: input.recoverySeed.sourceActivationId,
+            recoveredAt: now,
+            ...(input.recoverySeed.reason ? { reason: input.recoverySeed.reason } : {}),
+          },
+        } : {}),
     }
     await store.withTransaction(async () => {
       const existing = await readJsonFile<GraphInstanceRecord>(store.paths.instanceJson)
       if (existing) {
+        if (input.mustCreate) throw new Error(`instance '${instanceId}' already exists`)
         if (existing.engine !== 'durable-graph-v2') throw new Error(`instance '${instanceId}' belongs to a different loop engine`)
         if (existing.graphHash !== input.graph.graphHash) throw new Error(`instance '${instanceId}' already exists with a different graph`)
         return
       }
       if (await store.hasDurableHistoryLocked()) {
+        if (input.mustCreate) throw new Error(`instance '${instanceId}' already has durable history`)
         await store.reconcileLocked()
         return
       }
@@ -199,6 +240,54 @@ export class GraphStore {
       })
     })
     return store
+  }
+
+  static async createRecoveryFork(input: CreateGraphRecoveryForkInput): Promise<GraphStore> {
+    if (input.sourceInstanceId === input.targetInstanceId) {
+      throw new Error('recovery fork must use a new instance id')
+    }
+    const source = new GraphStore(input.projectDir, input.sourceInstanceId)
+    const [snapshot, graph] = await Promise.all([source.snapshot(), source.loadSpec()])
+    if (!['failed', 'exhausted', 'done'].includes(snapshot.instance.status)) {
+      throw new Error(`loop recover requires a terminal source; '${input.sourceInstanceId}' is ${snapshot.instance.status}`)
+    }
+    if (snapshot.instance.status === 'done' && !input.allowUnsafe) {
+      throw new Error('recovering a done instance requires --force')
+    }
+    const candidates = [...snapshot.activations.values()]
+      .filter(activation => {
+        const node = graph.nodes[activation.nodeId]
+        return node?.type !== 'terminal' &&
+          (activation.status === 'failed' || activation.outcome === 'failure' || activation.outcome === 'exhausted')
+      })
+      .sort((a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id))
+    const activation = input.activationId
+      ? snapshot.activations.get(input.activationId)
+      : candidates[0]
+    if (!activation) throw new Error(`no recoverable activation found in '${input.sourceInstanceId}'`)
+    const node = graph.nodes[activation.nodeId]
+    if (!node || node.type === 'terminal') throw new Error(`activation '${activation.id}' is not a recoverable work node`)
+    if (!input.allowUnsafe && node.type === 'effect') {
+      throw new Error(`recovering Effect activation '${activation.id}' may duplicate side effects; re-run with --force after verifying idempotency`)
+    }
+    if (!input.allowUnsafe && !candidates.some(candidate => candidate.id === activation.id)) {
+      throw new Error(`activation '${activation.id}' did not fail or exhaust; re-run with --force to recover it`)
+    }
+    return GraphStore.create({
+      projectDir: input.projectDir,
+      instanceId: input.targetInstanceId,
+      graph,
+      functions: input.functions,
+      now: input.now,
+      mustCreate: true,
+      recoverySeed: {
+        state: snapshot.state,
+        activation: { nodeId: activation.nodeId, input: activation.input },
+        sourceInstanceId: input.sourceInstanceId,
+        sourceActivationId: activation.id,
+        reason: input.reason,
+      },
+    })
   }
 
   async ensureLayout(): Promise<void> {
@@ -270,6 +359,7 @@ export class GraphStore {
             : activation.attempt + 1,
           segmentCount: (activation.segmentCount ?? 0) + 1,
           executionStateVersion: snapshot.state.version,
+          blockedFailure: undefined,
           firstStartedAt: activation.firstStartedAt ?? now,
           readyReason: undefined,
           updatedAt: now,
@@ -462,7 +552,13 @@ export class GraphStore {
           await atomicWriteJson(this.activationPath(next.id), next)
         }
       }
-      const instance: GraphInstanceRecord = { ...snapshot.instance, status, statusReason: reason, updatedAt: now }
+      const instance: GraphInstanceRecord = {
+        ...snapshot.instance,
+        status,
+        statusReason: reason,
+        ...(status === 'active' ? { blockedFailure: undefined } : {}),
+        updatedAt: now,
+      }
       await this.appendEventLocked({ type: 'graph_status_changed', at: now, instance })
       await atomicWriteJson(this.paths.instanceJson, instance)
       return instance
@@ -551,6 +647,12 @@ export class GraphStore {
   }
 
   /** Caller must hold withTransaction. */
+  async writeBlockedProjectionLocked(event: Extract<GraphJournalEvent, { type: 'activation_blocked' }>): Promise<void> {
+    await atomicWriteJson(this.paths.instanceJson, event.instance)
+    await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
+  }
+
+  /** Caller must hold withTransaction. */
   async writeActivationProjectionLocked(activation: ActivationRecord): Promise<void> {
     await atomicWriteJson(this.activationPath(activation.id), activation)
   }
@@ -603,6 +705,10 @@ export class GraphStore {
         case 'activation_released':
           activations.set(event.activation.id, event.activation)
           if (event.type === 'activation_released' && event.instance) instance = event.instance
+          break
+        case 'activation_blocked':
+          activations.set(event.activation.id, event.activation)
+          instance = event.instance
           break
         case 'activation_committed':
           activations.set(event.activation.id, event.activation)
@@ -731,6 +837,9 @@ export class GraphStore {
       case 'activation_released':
         await atomicWriteJson(this.activationPath(event.activation.id), event.activation)
         if (event.instance) await atomicWriteJson(this.paths.instanceJson, event.instance)
+        return
+      case 'activation_blocked':
+        await this.writeBlockedProjectionLocked(event)
         return
       case 'activation_committed':
         await this.writeCommitProjectionLocked(event, record.sequence)

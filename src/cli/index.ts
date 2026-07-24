@@ -47,7 +47,7 @@ import {
 } from '../loop/index.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoordinator.js'
-import { getModelProtocol } from '../providers/registry.js'
+import { getModelProtocol, resolveProvider } from '../providers/registry.js'
 import { RuntimeEnv, ENV_REGISTRY } from '../infra/env/RuntimeEnv.js'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
@@ -252,7 +252,8 @@ ${bold('LOOP RUNTIME (durable graph only)')}
   meta-agent loop files <instanceId>       Declared inputs/projections and record counts
   meta-agent loop disk <instanceId> [--json] Metadata/worktree disk usage and growth metrics
   meta-agent loop tick [--until-quiescent] Claim due wakes and advance graphs
-  meta-agent loop pause|resume|stop <id>   Control an instance lifecycle
+  meta-agent loop pause|resume|stop <id>   Control lifecycle (resume --run advances immediately)
+  meta-agent loop recover <id>             Fork a terminal instance from a failed activation
   meta-agent loop archive <id>             Move a quiescent terminal instance into .loop/archive
   meta-agent loop gc [--apply]              Dry-run/apply terminal wake and optional archive cleanup
   meta-agent loop capabilities             List frozen-capable Functions/Reducers/Effects/Packs
@@ -5127,11 +5128,18 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   }
   const sub = args[0]
   const isDistill = name === 'loop' && (sub === 'distill' || sub === 'distill-graph')
-  const needsGraphAgent = name === 'loop-scheduler' || sub === 'tick'
+  const runLifecycle = (sub === 'resume' || sub === 'recover') && args.includes('--run')
+  const needsGraphAgent = name === 'loop-scheduler' || sub === 'tick' || runLifecycle
+  const modelConfig = loadModelConfig({ projectDir })
+  const configuredProviderId = resolveProvider({
+    apiKey: modelConfig.apiKey ?? opts.apiKey,
+    baseURL: modelConfig.baseURL ?? opts.baseUrl,
+    model: modelConfig.mainModel ?? opts.model,
+  }).provider
 
   if (!isDistill && !needsGraphAgent) {
     // create / list / inspect / lifecycle — deterministic, no LLM.
-    console.log(await runLoopCli(args, { projectDir, graphCatalog }))
+    console.log(await runLoopCli(args, { projectDir, graphCatalog, providerId: configuredProviderId }))
     return
   }
 
@@ -5230,7 +5238,9 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     if (!warmed) throw new Error('could not create the loop backend (auto mode)')
     const dispatcher = SubAgentBridge.getBridge(router.getSessionId())
     if (!dispatcher) throw new Error('loop backend produced no sub-agent dispatcher')
-    const graphAgent = new MetaAgentGraphAgentExecutor(dispatcher)
+    const providerConfig = router.getProviderConfig()
+    const providerId = resolveProvider(providerConfig).provider
+    const graphAgent = new MetaAgentGraphAgentExecutor(dispatcher, undefined, { providerId })
     const onGraphProgress = createGraphProgressReporter()
 
     if (name === 'loop-scheduler') {
@@ -5259,7 +5269,15 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
       console.log(`${dim(`[loop ${stamp()}]`)} scheduler exit (${result.exitReason}); ` +
         `${result.graphTicksRun} graph tick(s) over ${result.ticks} poll(s).`)
     } else {
-      console.log(await runLoopCli(args, { projectDir, dispatcher, graphAgent, signal: abort.signal, graphCatalog, onGraphProgress }))
+      console.log(await runLoopCli(args, {
+        projectDir,
+        dispatcher,
+        graphAgent,
+        signal: abort.signal,
+        graphCatalog,
+        onGraphProgress,
+        providerId,
+      }))
     }
   } finally {
     await router.dispose().catch(() => undefined)
@@ -5296,6 +5314,13 @@ function createGraphProgressReporter(): (event: GraphProgressEvent) => void {
         ? `至 ${new Date(event.wakeAt).toISOString()}`
         : event.eventName ? `等待事件 ${detail(event.eventName)}` : '等待恢复'
       console.log(`${prefix} ${yellow('⏸')} 挂起${target}：${detail(event.reason)}`)
+      return
+    }
+    if (event.type === 'phase_blocked') {
+      const usage = event.usage
+        ? dim(`  turns=${event.usage.turns} cost=$${event.usage.costUsd.toFixed(4)}`)
+        : ''
+      console.log(`${prefix} ${yellow('⏸')} 基础设施阻塞，实例已暂停并保留重放点：${detail(event.reason)}${usage}`)
       return
     }
     console.log(`${prefix} ${red('✗')} 终止：${detail(event.reason)}`)

@@ -1,4 +1,5 @@
 import type { ShapeSpec } from './ShapeSpec.js'
+import type { ExecutionFailure } from '../../../infra/failures/ExecutionFailure.js'
 export type { ShapeSpec } from './ShapeSpec.js'
 
 export type JsonPrimitive = string | number | boolean | null
@@ -270,6 +271,8 @@ export interface ActivationRecord {
   output?: JsonValue
   outcome?: string
   error?: string
+  /** Infrastructure failure that paused this activation for replay. */
+  blockedFailure?: ExecutionFailure
   /** Concise operator-facing reason why the latest execution segment stopped. */
   summary?: string
   wakeAt?: number
@@ -298,6 +301,13 @@ export interface GraphInstanceRecord {
   totalCostUsd: number
   terminalResult?: JsonValue
   statusReason?: string
+  blockedFailure?: ExecutionFailure
+  recovery?: {
+    sourceInstanceId: string
+    sourceActivationId: string
+    recoveredAt: number
+    reason?: string
+  }
 }
 
 export interface GraphStateSnapshot {
@@ -365,6 +375,13 @@ export type GraphJournalEvent =
       reason: string
       /** Present when release changes instance-level accounting, such as park cost. */
       instance?: GraphInstanceRecord
+    }
+  | {
+      type: 'activation_blocked'
+      at: number
+      activation: ActivationRecord
+      instance: GraphInstanceRecord
+      failure: ExecutionFailure
     }
   | {
       type: 'activation_committed'

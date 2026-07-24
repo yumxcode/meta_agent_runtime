@@ -1,3 +1,5 @@
+import type { ExecutionFailure } from '../infra/failures/ExecutionFailure.js'
+
 /**
  * Core type definitions for Meta-Agent Runtime
  *
@@ -57,6 +59,8 @@ export interface MetaAgentResultEvent {
   usage: TokenUsage
   /** Populated on error_during_execution — contains the underlying error message(s) */
   errors?: string[]
+  /** Structured failure classification retained across orchestration layers. */
+  failure?: ExecutionFailure
 }
 
 /** API-level stream events (pass-through for advanced consumers) */

@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.7.8",
+  "version": "0.7.9",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",

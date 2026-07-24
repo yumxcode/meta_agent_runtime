@@ -11,10 +11,14 @@ import type { ActivationRecord, ActivationUsage, FrozenCapabilityRef, FrozenLoop
 import { verifyFrozenGraphIntegrity } from '../spec/GraphValidate.js'
 import { CommitCoordinator, ParkLimitExceededError } from './CommitCoordinator.js'
 import { GraphStore } from './GraphStore.js'
-import { addUsage, retryDelayMs } from './UsageMath.js'
+import { addUsage } from './UsageMath.js'
 import { LaneManager } from './LaneManager.js'
 import { DEFAULT_AGENT_SEGMENT_BUDGET_USD, NodeExecutorRegistry, type NodeExecutionResult } from './NodeExecutors.js'
 import type { CapabilityPackRegistry } from '../registry/CapabilityPack.js'
+import {
+  classifyExecutionFailure,
+  serializeExecutionError,
+} from '../../../infra/failures/ExecutionFailure.js'
 import {
   graphProgressIdentity,
   oneLine,
@@ -50,6 +54,7 @@ export interface GraphTickResult {
   committed: number
   parked: number
   retried: number
+  blocked: number
   recovered: number
   failed: number
   nextWakeAt?: number
@@ -171,6 +176,7 @@ export class GraphKernel {
     let committed = 0
     let parked = 0
     let retried = 0
+    let blocked = 0
     let failed = 0
     const results = await Promise.allSettled(claims.map(async activation => {
       const live = await this.options.store.snapshot()
@@ -191,14 +197,12 @@ export class GraphKernel {
           : undefined
         if (this.options.signal?.aborted) {
           result = { kind: 'retry', reason: `Graph execution interrupted: ${message(error)}`, consumeAttempt: false }
-        } else if (node?.type === 'agent' && activation.attempt < (node.maxAttempts ?? 3)) {
-          result = {
-            kind: 'retry',
-            reason: `Agent executor error: ${message(error)}`,
-            usage: reservedUsage,
-            consumeAttempt: true,
-            delayMs: retryDelayMs(activation.attempt),
-          }
+        } else if (node?.type === 'agent') {
+          const failure = classifyExecutionFailure({
+            subtype: 'error_during_execution',
+            errors: serializeExecutionError(error),
+          })
+          result = { kind: 'blocked', reason: failure.message, failure, usage: reservedUsage }
         } else {
           result = { kind: 'completed', outcome: 'failure', output: { error: message(error) }, summary: message(error), usage: reservedUsage }
         }
@@ -216,6 +220,7 @@ export class GraphKernel {
         if (result.value === 'committed') committed++
         else if (result.value === 'parked') parked++
         else if (result.value === 'retried') retried++
+        else if (result.value === 'blocked') blocked++
         else if (result.value === 'superseded') continue
         else failed++
       } else {
@@ -266,6 +271,7 @@ export class GraphKernel {
       committed,
       parked,
       retried,
+      blocked,
       recovered: recoveredResults.length,
       failed,
       nextWakeAt,
@@ -294,7 +300,7 @@ export class GraphKernel {
     return this.coordinator.resumePausedTerminal(this.now())
   }
 
-  private async finishActivation(activation: ActivationRecord, result: NodeExecutionResult): Promise<'committed' | 'parked' | 'retried' | 'fatal'> {
+  private async finishActivation(activation: ActivationRecord, result: NodeExecutionResult): Promise<'committed' | 'parked' | 'retried' | 'blocked' | 'fatal'> {
     if (!activation.lease) throw new Error(`activation '${activation.id}' has no lease`)
     if (result.kind === 'retry') {
       const retry = await this.coordinator.retry({
@@ -320,6 +326,23 @@ export class GraphKernel {
         ...(retry.wakeAt !== undefined ? { wakeAt: retry.wakeAt } : {}),
       })
       return 'retried'
+    }
+    if (result.kind === 'blocked') {
+      const blocked = await this.coordinator.block({
+        activationId: activation.id,
+        leaseToken: activation.lease.token,
+        reason: result.reason,
+        failure: result.failure,
+        usage: result.usage,
+        now: this.now(),
+      })
+      this.emitProgress({
+        type: 'phase_blocked',
+        ...graphProgressIdentity(this.options.graph, this.options.store.instanceId, blocked.activation, this.now()),
+        reason: result.reason,
+        usage: result.usage,
+      })
+      return 'blocked'
     }
     if (result.kind === 'fatal') {
       await this.coordinator.failStop({
@@ -597,7 +620,7 @@ function isTerminal(instance: GraphInstanceRecord): boolean {
 }
 
 function emptyResult(instance: GraphInstanceRecord): GraphTickResult {
-  return { instance, claimed: 0, committed: 0, parked: 0, retried: 0, recovered: 0, failed: 0 }
+  return { instance, claimed: 0, committed: 0, parked: 0, retried: 0, blocked: 0, recovered: 0, failed: 0 }
 }
 
 function message(error: unknown): string {

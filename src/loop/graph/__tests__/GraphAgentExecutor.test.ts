@@ -132,6 +132,53 @@ describe('graph_agent execution boundary', () => {
     })
   })
 
+  it('preserves structured provider failures from dispatcher records', async () => {
+    const dispatcher: ISubAgentDispatcher = {
+      async spawnSubAgent(options) {
+        const record = completedRecord(options.config as SubAgentRecord['config'])
+        return {
+          ...record,
+          status: 'failed',
+          result: {
+            ...record.result!,
+            success: false,
+            error: 'status=402 subscription expired',
+            failure: {
+              category: 'provider_blocked' as const,
+              message: 'status=402 subscription expired',
+              retryable: false,
+              providerId: 'zhipu' as const,
+              status: 402,
+            },
+          },
+        }
+      },
+      async getStatus() { return null },
+      async cancelTask() { return true },
+    }
+    const result = await new MetaAgentGraphAgentExecutor(dispatcher).execute({
+      profile: GRAPH_AGENT_PROFILE,
+      prompt: { system: GRAPH_AGENT_SYSTEM_PROMPT, user: 'current activation' },
+      allowedTools: [],
+      workspace: {
+        projectDir: '/workspace', mode: 'shared_readonly', writeAllowPaths: [], writeDenyPaths: [],
+      },
+      continuity: { workspaceId: 'workspace-id', loopInstanceId: 'loop-id' },
+      limits: { turns: 5, usd: 1 },
+      signal: new AbortController().signal,
+    })
+    expect(result).toMatchObject({
+      kind: 'completed',
+      success: false,
+      error: 'status=402 subscription expired',
+      failure: {
+        category: 'provider_blocked',
+        providerId: 'zhipu',
+        status: 402,
+      },
+    })
+  })
+
   it('propagates timeout phase diagnostics without exposing dispatcher records', async () => {
     const dispatcher: ISubAgentDispatcher = {
       async spawnSubAgent(options) {

@@ -104,7 +104,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
       if (!target || typeof target.node !== 'string' || !nodeIds.has(target.node)) errors.push(`${at}.to references unknown node '${String(target?.node)}'`)
       validateBindings(target?.inputs, `${at}.to.inputs`, registries, errors)
       for (const [name, expression] of Object.entries(target?.inputs ?? {})) {
-        validateStrictOutputBinding(expression, spec.nodes?.[transition.from], transition.on ?? 'success', `${at}.to.inputs.${name}`, errors)
+        validateStrictOutputBinding(expression, spec.nodes?.[transition.from], transition.on ?? 'success', `${at}.to.inputs.${name}`, registries, errors)
       }
     }
     if (transition.default && transition.when) errors.push(`${at} cannot set both default and when`)
@@ -112,7 +112,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
     if (transition.when !== undefined) {
       if (typeof transition.when !== 'string') errors.push(`${at}.when must be a string`)
       else try {
-        for (const ref of compileCondition(transition.when).refs) validateConditionRef(ref, spec, transition.from, `${at}.when`, errors)
+        for (const ref of compileCondition(transition.when).refs) validateConditionRef(ref, spec, transition.from, `${at}.when`, registries, errors)
       } catch (error) { errors.push(`${at}.when: ${message(error)}`) }
     }
     for (const [updateIndex, update] of (transition.updates ?? []).entries()) {
@@ -122,7 +122,7 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
       for (const [argIndex, arg] of (update.args ?? []).entries()) {
         const argAt = `${updateAt}.args[${argIndex}]`
         validateValue(arg, argAt, registries, errors)
-        validateStrictOutputBinding(arg, spec.nodes?.[transition.from], transition.on ?? 'success', argAt, errors)
+        validateStrictOutputBinding(arg, spec.nodes?.[transition.from], transition.on ?? 'success', argAt, registries, errors)
       }
     }
   }
@@ -453,6 +453,7 @@ function validateStrictOutputBinding(
   source: NodeSpec | undefined,
   outcome: string,
   at: string,
+  registries: GraphCapabilityRegistries,
   errors: string[],
   depth = 0,
 ): void {
@@ -461,7 +462,7 @@ function validateStrictOutputBinding(
     if (outcome !== 'success') {
       errors.push(`${at}.ref '${value.ref}' is not guaranteed for '${outcome}' output; bind the whole $output or a literal`)
     } else {
-      const shape = source && (source.type === 'agent' || source.type === 'function') ? source.outputSchema : undefined
+      const shape = declaredOutputShape(source, registries)
       const path = value.ref.slice('$output.'.length).split('.')
       if (!shape || !shapeRequiresPath(shape, path)) {
         errors.push(`${at}.ref '${value.ref}' is strict but the source outputSchema does not require that path`)
@@ -469,11 +470,18 @@ function validateStrictOutputBinding(
     }
   }
   if ('call' in value) for (const [index, argument] of (Array.isArray(value.args) ? value.args : []).entries()) {
-    validateStrictOutputBinding(argument, source, outcome, `${at}.args[${index}]`, errors, depth + 1)
+    validateStrictOutputBinding(argument, source, outcome, `${at}.args[${index}]`, registries, errors, depth + 1)
   }
 }
 
-function validateConditionRef(ref: string, spec: LoopGraphSpec, sourceNodeId: string, at: string, errors: string[]): void {
+function validateConditionRef(
+  ref: string,
+  spec: LoopGraphSpec,
+  sourceNodeId: string,
+  at: string,
+  registries: GraphCapabilityRegistries,
+  errors: string[],
+): void {
   const root = ref.split('.')[0]
   if (!['state', 'input', 'output', 'clock'].includes(root!)) errors.push(`${at} uses unsupported root '${root}'`)
   if (root === 'state') {
@@ -482,12 +490,24 @@ function validateConditionRef(ref: string, spec: LoopGraphSpec, sourceNodeId: st
   }
   if (root === 'output') {
     const node = spec.nodes?.[sourceNodeId]
-    const shape = node && (node.type === 'agent' || node.type === 'function') ? node.outputSchema : undefined
+    const shape = declaredOutputShape(node, registries)
     const path = ref.split('.').slice(1)
     if (shape?.type === 'object' && shape.additionalProperties === false && path.length && !shapeContainsPath(shape, path)) {
       errors.push(`${at} references undeclared closed output '$${ref}'`)
     }
   }
+}
+
+function declaredOutputShape(
+  node: NodeSpec | undefined,
+  registries: GraphCapabilityRegistries,
+): ShapeSpec | undefined {
+  if (!node) return undefined
+  if (node.type === 'agent' || node.type === 'function') return node.outputSchema
+  if (node.type === 'effect' && registries.effects?.has(node.effect)) {
+    return registries.effects.get(node.effect).manifest.outputSchema
+  }
+  return undefined
 }
 
 function shapeContainsPath(shape: ShapeSpec, path: string[]): boolean {

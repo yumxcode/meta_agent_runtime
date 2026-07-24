@@ -46,4 +46,27 @@ describe('Effect Provider conformance', () => {
     expect(report.checks.find(check => check.id === 'same-key-idempotency')?.passed).toBe(false)
     expect(() => assertEffectProviderConformance(report)).toThrow(/same-key-idempotency/)
   })
+
+  it('supports observation Effects whose submit phase creates no external operation', async () => {
+    let ready = false
+    const provider: EffectProvider = {
+      manifest: { id: 'test/observer', version: '1', integrity: 'test:observer-v1', pure: false },
+      async submit(_input, key) { return { key } },
+      async inspect() {
+        return ready
+          ? { status: 'succeeded', output: { observed: true } }
+          : { status: 'pending' }
+      },
+    }
+    const report = await runEffectProviderConformance(provider, {
+      input: { target: 'remote-job' },
+      idempotencyKey: 'observe-1',
+      readSideEffectCount: () => 0,
+      expectedSideEffectsPerKey: 0,
+      settle: () => { ready = true },
+    })
+    expect(report.passed).toBe(true)
+    expect(report.checks.find(check => check.id === 'same-key-idempotency')?.detail)
+      .toContain('preserved 0 externally-visible operation')
+  })
 })

@@ -24,6 +24,13 @@ export {
   type HostResourceRequirement,
   type WorkspaceSchedulerLease,
 } from './host/HostSchedulerCoordinator.js'
+export {
+  ProviderCircuitBreaker,
+  ProviderCircuitOpenError,
+  type ProviderCircuitBreakerOptions,
+  type ProviderCircuitPermit,
+  type ProviderCircuitRecord,
+} from './host/ProviderCircuitBreaker.js'
 export { spawnAndWait, spawnAndWaitDetailed, type SpawnWaitOptions } from './seatSpawn.js'
 export { tickOnce, runUntilQuiescent, prepareAndClaim, runClaimedWake, type TickDeps, type TickResult, type TickOutcome } from './runner.js'
 export { runLoopCli, type LoopCliDeps } from './cli.js'

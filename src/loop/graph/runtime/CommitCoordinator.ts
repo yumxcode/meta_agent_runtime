@@ -15,6 +15,7 @@ import { GraphStore } from './GraphStore.js'
 import { addUsage, emptyUsage } from './UsageMath.js'
 import { decideTransition } from './TransitionEngine.js'
 import { isJsonValue } from './GraphJson.js'
+import type { ExecutionFailure } from '../../../infra/failures/ExecutionFailure.js'
 
 export interface CommitResult {
   activation: ActivationRecord
@@ -540,6 +541,56 @@ export class CommitCoordinator {
       await this.store.writeActivationProjectionLocked(next)
       await this.store.writeInstanceProjectionLocked(instance)
       return next
+    })
+  }
+
+  async block(input: {
+    activationId: string
+    leaseToken: string
+    reason: string
+    failure: ExecutionFailure
+    usage?: ActivationUsage
+    now?: number
+  }): Promise<{ activation: ActivationRecord; instance: GraphInstanceRecord }> {
+    const now = input.now ?? Date.now()
+    return this.store.withTransaction(async () => {
+      const snapshot = await this.store.authoritativeSnapshotLocked()
+      const activation = snapshot.activations.get(input.activationId)
+      if (activation?.status !== 'running' || activation.lease?.token !== input.leaseToken) {
+        throw new Error(`activation lease lost for '${input.activationId}'`)
+      }
+      const next: ActivationRecord = {
+        ...activation,
+        status: 'ready',
+        lease: undefined,
+        replayCount: (activation.replayCount ?? 0) + 1,
+        usage: addUsage(activation.usage, input.usage),
+        readyReason: 'replay',
+        wakeAt: undefined,
+        waitingReason: undefined,
+        error: input.reason,
+        summary: input.reason,
+        blockedFailure: input.failure,
+        updatedAt: now,
+      }
+      const instance: GraphInstanceRecord = {
+        ...snapshot.instance,
+        status: 'paused',
+        statusReason: input.reason,
+        blockedFailure: input.failure,
+        totalCostUsd: snapshot.instance.totalCostUsd + (input.usage?.costUsd ?? 0),
+        updatedAt: now,
+      }
+      const event: Extract<GraphJournalEvent, { type: 'activation_blocked' }> = {
+        type: 'activation_blocked',
+        at: now,
+        activation: next,
+        instance,
+        failure: input.failure,
+      }
+      await this.store.appendEventLocked(event)
+      await this.store.writeBlockedProjectionLocked(event)
+      return { activation: next, instance }
     })
   }
 

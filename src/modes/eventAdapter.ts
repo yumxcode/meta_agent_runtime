@@ -89,6 +89,7 @@ export function translateKernelEvent(
         totalCostUsd: event.costUsd,
         usage: kernelUsageToMetaAgentUsage(event.usage),
         ...(event.errors?.length ? { errors: event.errors } : {}),
+        ...(event.failure ? { failure: event.failure } : {}),
       }]
     }
 

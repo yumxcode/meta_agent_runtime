@@ -13,6 +13,7 @@
  *   4. Human-approval gate is implemented at the tool-handler layer.
  */
 import type { MetaAgentTool } from '../core/types.js'
+import type { ExecutionFailure } from '../infra/failures/ExecutionFailure.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task ID
@@ -338,6 +339,10 @@ export interface SubAgentResult {
   output?: unknown
   /** Error message when success=false. */
   error?: string
+  /** Structured provider/runtime/task failure; contains no credentials. */
+  failure?: ExecutionFailure
+  /** Sanitized low-level errors retained from the Kernel result event. */
+  errors?: string[]
   turnsUsed: number
   inputTokens: number
   outputTokens: number

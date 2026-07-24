@@ -4,6 +4,7 @@
  * Corresponds to CC's SDKMessage but stripped of CLI-only subtypes.
  */
 import type { TokenUsage } from './TokenUsage.js'
+import type { ExecutionFailure } from '../../infra/failures/ExecutionFailure.js'
 
 // ── Individual event types ────────────────────────────────────────────────────
 
@@ -105,6 +106,7 @@ export interface ResultEvent {
   stopReason: string | null
   resultText: string
   errors?: string[]
+  failure?: ExecutionFailure
   permissionDenials?: PermissionDenial[]
 }
 

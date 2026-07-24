@@ -27,6 +27,11 @@ import { getMessagesAfterCompactBoundary } from './messages/MessageNormalizer.js
 import { applyToolResultBudget } from './tools/ToolResultBudget.js'
 import { tokenCountWithEstimation } from './api/TokenCount.js'
 import { assembleSystemPrompt } from './utils/AssembleSystemPrompt.js'
+import {
+  classifyExecutionFailure,
+  serializeExecutionError,
+} from '../infra/failures/ExecutionFailure.js'
+import { resolveProvider } from '../providers/registry.js'
 
 import { stripVolatileContextPrefix } from './utils/VolatileContext.js'
 
@@ -571,6 +576,11 @@ export class KernelSession {
     loopResult: LoopResult | undefined,
     loopError: unknown,
   ): ResultEvent {
+    const providerId = resolveProvider({
+      apiKey: this._config.apiKey,
+      baseURL: this._config.baseURL,
+      model: this._config.model,
+    }).provider
     if (loopResult) {
       type Subtype = ResultEvent['subtype']
         const subtypeMap: Record<LoopTerminationReason, Subtype> = {
@@ -597,9 +607,18 @@ export class KernelSession {
         error:             'error_during_execution',
       }
 
+      const subtype = subtypeMap[loopResult.reason]
+      const failure = subtype === 'success'
+        ? undefined
+        : classifyExecutionFailure({
+            subtype,
+            stopReason: loopResult.reason,
+            resultText: loopResult.resultText,
+            providerId,
+          })
       return {
         type: 'result',
-        subtype: subtypeMap[loopResult.reason],
+        subtype,
         sessionId: this._sessionId,
         // M3: report CUMULATIVE usage so it matches costUsd, which the loop
         // already returns cumulatively (seeded with cumulativeCostUsd). The
@@ -611,9 +630,16 @@ export class KernelSession {
         stopReason: loopResult.reason === 'success' ? null : loopResult.reason,
         resultText: loopResult.resultText,
         permissionDenials: loopResult.permissionDenials,
+        ...(failure ? { failure } : {}),
       }
     }
 
+    const errors = serializeExecutionError(loopError)
+    const failure = classifyExecutionFailure({
+      subtype: 'error_during_execution',
+      errors,
+      providerId,
+    })
     return {
       type: 'result',
       subtype: 'error_during_execution',
@@ -623,7 +649,8 @@ export class KernelSession {
       numTurns: 0,
       stopReason: null,
       resultText: '',
-      errors: [String(loopError ?? 'Unknown error')],
+      errors,
+      failure,
     }
   }
 }

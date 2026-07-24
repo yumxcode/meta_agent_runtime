@@ -2,6 +2,7 @@
 import { access, constants as fsConstants, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { delimiter, join, resolve } from 'node:path'
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
+import type { ProviderId } from '../providers/registry.js'
 import {
   createFileDistillCheckpointStore,
   createDefaultGraphRuntimeCatalog,
@@ -30,6 +31,7 @@ import {
 } from './graph/index.js'
 import { acquireDaemonLock, releaseDaemonLock } from './daemon.js'
 import { HostSchedulerCoordinator } from './host/HostSchedulerCoordinator.js'
+import { ProviderCircuitBreaker } from './host/ProviderCircuitBreaker.js'
 import { deliverGraphEvent } from './ingress/GraphEventDelivery.js'
 import { runUntilQuiescent, tickOnce } from './runner.js'
 import { WakeStore } from './wake/WakeStore.js'
@@ -46,6 +48,8 @@ export interface LoopCliDeps {
   signal?: AbortSignal
   graphCatalog?: GraphRuntimeCatalog
   onGraphProgress?: GraphProgressListener
+  /** Provider used by this CLI backend; lets operator resume reset its host-wide circuit. */
+  providerId?: ProviderId
 }
 
 export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<string> {
@@ -67,6 +71,7 @@ export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<str
     case 'tick': return tick(args, deps)
     case 'pause': return lifecycle('pause', args, deps)
     case 'resume': return lifecycle('resume', args, deps)
+    case 'recover': return recover(args, deps)
     case 'stop': return lifecycle('stop', args, deps)
     case 'workspace-info': return workspaceInfo(deps)
     case 'workspace-fork': return workspaceFork(deps)
@@ -324,6 +329,7 @@ async function timeline(args: string[], deps: LoopCliDeps): Promise<string> {
         case 'graph_created': return `${prefix} status=${event.instance.status} entries=${event.activations.map(a => a.nodeId).join(',')}`
         case 'activation_claimed': return `${prefix} node=${event.activation.nodeId} attempt=${event.activation.attempt} segment=${event.activation.segmentCount ?? 0}`
         case 'activation_released': return `${prefix} node=${event.activation.nodeId} status=${event.activation.status} reason=${event.reason}${event.activation.summary ? ` — ${event.activation.summary}` : ''}`
+        case 'activation_blocked': return `${prefix} node=${event.activation.nodeId} category=${event.failure.category} — ${event.failure.message}`
         case 'activation_committed': return `${prefix} node=${event.activation.nodeId} outcome=${event.activation.outcome ?? event.activation.status} transition=${event.transitionId ?? '-'} spawned=${event.spawned.map(a => a.nodeId).join(',') || '-'}${event.activation.summary ? ` — ${event.activation.summary}` : ''}`
         case 'graph_status_changed': return `${prefix} status=${event.instance.status}${event.instance.statusReason ? ` — ${event.instance.statusReason}` : ''}`
         case 'paused_terminal_resumed': return `${prefix} node=${event.activation.nodeId} transition=${event.transitionId}`
@@ -578,11 +584,57 @@ async function lifecycle(action: 'pause' | 'resume' | 'stop', args: string[], de
       ? (await (await GraphKernel.open({ store, graph, ...runtime })).resumePausedTerminal()).instance
       : await store.setStatus('active', reason ?? 'resumed by operator')
     await wakes.schedule({ loopId: instanceId, activationId: '__graph__', kind: 'manual', fireAt: Date.now() })
-    return `${instanceId}: resumed  (status: ${record.status})`
+    if (deps.providerId) {
+      const host = new HostSchedulerCoordinator()
+      await new ProviderCircuitBreaker({ rootDir: host.rootDir }).reset(deps.providerId)
+    }
+    const resumed = `${instanceId}: resumed  (status: ${record.status})`
+    return args.includes('--run')
+      ? `${resumed}\n${await tick(['--until-quiescent'], deps)}`
+      : resumed
   }
   await store.setStatus('failed', reason ?? 'stopped by operator')
   await wakes.cancelForLoop(instanceId)
   return `${instanceId}: stopped  (status: failed)`
+}
+
+async function recover(args: string[], deps: LoopCliDeps): Promise<string> {
+  const sourceInstanceId = positional(args)
+  if (!sourceInstanceId) throw new Error('loop recover: source instanceId required')
+  const runtime = catalog(deps)
+  const records = await listGraphInstanceRecords(deps.projectDir)
+  let targetInstanceId = flagValue(args, '--id')
+  if (!targetInstanceId) {
+    const existing = new Set(records.map(record => record.instanceId))
+    for (let index = 1; index <= 10_000; index++) {
+      const suffix = `-r${index}`
+      const candidate = `${sourceInstanceId.slice(0, 128 - suffix.length)}${suffix}`
+      if (!existing.has(candidate)) { targetInstanceId = candidate; break }
+    }
+  }
+  if (!targetInstanceId) throw new Error(`loop recover: could not allocate a recovery id for '${sourceInstanceId}'`)
+  const reason = flagValue(args, '--reason') ?? 'operator recovery fork'
+  const store = await GraphStore.createRecoveryFork({
+    projectDir: deps.projectDir,
+    sourceInstanceId,
+    targetInstanceId,
+    functions: runtime.functions,
+    activationId: flagValue(args, '--from'),
+    reason,
+    allowUnsafe: args.includes('--force'),
+  })
+  await new WakeStore(deps.projectDir).schedule({
+    loopId: targetInstanceId,
+    activationId: '__graph__',
+    kind: 'manual',
+    fireAt: Date.now(),
+  })
+  const snapshot = await store.snapshot()
+  const source = snapshot.instance.recovery!
+  const created = `${targetInstanceId}: recovery fork created from ${source.sourceInstanceId}/${source.sourceActivationId}  (status: ${snapshot.instance.status})`
+  return args.includes('--run')
+    ? `${created}\n${await tick(['--until-quiescent'], deps)}`
+    : created
 }
 
 async function tick(args: string[], deps: LoopCliDeps): Promise<string> {
@@ -612,7 +664,7 @@ async function tick(args: string[], deps: LoopCliDeps): Promise<string> {
     const result = await tickOnce(tickDeps)
     if (!result.claimed) return 'no wakes due'
     return result.outcomes.map(outcome => outcome.graphOutcome
-      ? `${outcome.loopId}: claimed=${outcome.graphOutcome.claimed} committed=${outcome.graphOutcome.committed} parked=${outcome.graphOutcome.parked} status=${outcome.graphOutcome.instance.status}`
+      ? `${outcome.loopId}: claimed=${outcome.graphOutcome.claimed} committed=${outcome.graphOutcome.committed} parked=${outcome.graphOutcome.parked} blocked=${outcome.graphOutcome.blocked} status=${outcome.graphOutcome.instance.status}`
       : `${outcome.loopId}: ERROR ${outcome.error}`).join('\n')
   } finally {
     await workspaceLease?.release().catch(() => undefined)
@@ -644,8 +696,18 @@ async function schedulers(): Promise<string> {
 }
 
 async function hostCapacity(): Promise<string> {
-  const snapshot = await new HostSchedulerCoordinator().snapshot()
-  return `graph ticks: ${snapshot.leases.filter(item => item.kind === 'graph_tick').length}/${snapshot.maxConcurrentGraphTicks}\nmodel calls: ${snapshot.leases.filter(item => item.kind === 'model_call').length}/${snapshot.maxConcurrentModelCalls}`
+  const host = new HostSchedulerCoordinator()
+  const [snapshot, circuits] = await Promise.all([
+    host.snapshot(),
+    new ProviderCircuitBreaker({ rootDir: host.rootDir }).snapshot(),
+  ])
+  return [
+    `graph ticks: ${snapshot.leases.filter(item => item.kind === 'graph_tick').length}/${snapshot.maxConcurrentGraphTicks}`,
+    `model calls: ${snapshot.leases.filter(item => item.kind === 'model_call').length}/${snapshot.maxConcurrentModelCalls}`,
+    `provider circuits: ${circuits.length
+      ? circuits.map(item => `${item.providerId}:${item.state}@${new Date(item.retryAt).toISOString()}`).join(', ')
+      : '(closed)'}`,
+  ].join('\n')
 }
 
 function capabilities(deps: LoopCliDeps): string {
@@ -669,7 +731,8 @@ function usage(): string {
     '  event <instanceId> <name> [--source NAME --delivery-id ID] [--correlation JSON] [--payload JSON]',
     '  list [--json] | inspect/timeline/disk <instanceId> [--json] | files <instanceId>',
     '  events <instanceId> [--status pending|consumed] [--json]',
-    '  pause/resume/stop/archive <instanceId>',
+    '  pause/resume [--run]/stop/archive <instanceId>',
+    '  recover <terminalInstanceId> [--from activationId] [--id newId] [--run] [--force]',
     '  gc [--older-than-days N] [--include-archives] [--apply]',
     '  capabilities | workspace-info | workspace-fork | schedulers | host-capacity',
   ].join('\n')
@@ -679,7 +742,7 @@ function positional(args: string[]): string | undefined { return positionalValue
 
 function positionalValues(args: string[]): string[] {
   const values: string[] = []
-  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force', '--json'])
+  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force', '--json', '--run'])
   for (let index = 0; index < args.length; index++) {
     const value = args[index]!
     if (value.startsWith('--')) {

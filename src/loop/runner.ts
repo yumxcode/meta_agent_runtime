@@ -161,7 +161,8 @@ export async function runClaimedWake(
     if (graphAdmissionHeartbeatInFlight) await graphAdmissionHeartbeatInFlight
     if (graphAdmissionLost) throw new Error('host graph-tick admission lease was lost during execution')
     await wakeStore.release(wake.wakeId, 'done', { claimToken: wake.claim?.token })
-    if (graphOutcome.instance.status === 'done' || graphOutcome.instance.status === 'exhausted' || graphOutcome.instance.status === 'failed') {
+    if (graphOutcome.instance.status === 'done' || graphOutcome.instance.status === 'exhausted' ||
+        graphOutcome.instance.status === 'failed' || graphOutcome.instance.status === 'paused') {
       await wakeStore.cancelForLoop(wake.loopId)
     }
     return { loopId: wake.loopId, graphOutcome }

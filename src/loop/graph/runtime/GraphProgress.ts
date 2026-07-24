@@ -54,6 +54,11 @@ export type GraphProgressEvent =
       reason: string
       usage?: ActivationUsage
     })
+  | (GraphProgressIdentity & {
+      type: 'phase_blocked'
+      reason: string
+      usage?: ActivationUsage
+    })
 
 export type GraphProgressListener = (event: GraphProgressEvent) => void
 

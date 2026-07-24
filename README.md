@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.7.8` · Node.js `>= 18`
+> 当前版本:`0.7.9` · Node.js `>= 18`
 
 ---
 
@@ -218,6 +218,8 @@ meta-agent -w /path/to/workspace loop disk <instanceId>
 ```
 
 完整命令和 GraphSpec 示例见 [Loop 使用指南](docs/loop-runtime-guide.md)；执行边界见 [`graph_agent` 执行底座](docs/graph-agent-executor.md)；架构与可靠性边界见 [Durable Graph v2 设计](docs/loop-durable-graph-runtime-plan.md)。领域扩展通过 Capability Pack 提供版本化 Function、Reducer、Effect 和 advisory Scenario guidance。
+
+可选的通用 GitHub Actions Pack 保持默认 Effect Registry 为空，只在显式加载时提供“按 workflow + head SHA 精确解析 Run”和“按 run ID 等待完成”两个观察能力；它不包含项目发布、Artifact 解释或领域指标语义。配置与边界见 [Graph Loop Support Packs](docs/graph-loop-support-packs.md#optional-github-actions-pack)。
 
 ---
 
@@ -468,4 +470,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.7.8`。
+当前包版本:`0.7.9`。

@@ -10,8 +10,23 @@ import type {
   GraphAgentParkIntent,
 } from './GraphAgentExecutor.js'
 import { GRAPH_AGENT_PROFILE } from './GraphAgentExecutor.js'
+import {
+  classifyExecutionFailure,
+  isInfrastructureFailure,
+  serializeExecutionError,
+} from '../../../infra/failures/ExecutionFailure.js'
+import { resolveProvider, type ProviderId } from '../../../providers/registry.js'
+import {
+  ProviderCircuitBreaker,
+  ProviderCircuitOpenError,
+  type ProviderCircuitPermit,
+} from '../../host/ProviderCircuitBreaker.js'
 
 export const META_AGENT_GRAPH_AGENT_EXECUTOR_ID = 'meta-agent/graph-agent-kernel@1'
+
+export interface MetaAgentGraphAgentExecutorOptions {
+  providerId?: ProviderId
+}
 
 /**
  * Current graph_agent substrate: MetaAgentSession -> AgenticSession -> KernelLoop.
@@ -26,11 +41,32 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
   constructor(
     private readonly dispatcher: ISubAgentDispatcher,
     private readonly spawnOptions?: SpawnWaitOptions,
+    private readonly options: MetaAgentGraphAgentExecutorOptions = {},
   ) {}
 
   async execute(request: GraphAgentExecutionRequest): Promise<GraphAgentExecutionResult> {
     if (request.profile !== GRAPH_AGENT_PROFILE) {
       throw new Error(`unsupported Graph Agent profile '${String(request.profile)}'`)
+    }
+    const providerId = this.options.providerId ?? resolveProvider({}).provider
+    const breaker = request.hostCoordinatorRoot
+      ? new ProviderCircuitBreaker({ rootDir: request.hostCoordinatorRoot })
+      : undefined
+    let permit: ProviderCircuitPermit | undefined
+    if (breaker) {
+      try {
+        permit = await breaker.beforeCall(providerId)
+      } catch (error) {
+        if (error instanceof ProviderCircuitOpenError) {
+          return {
+            kind: 'blocked',
+            reason: error.message,
+            failure: error.failure,
+            usage: { turns: 0, costUsd: 0, durationMs: 0 },
+          }
+        }
+        throw error
+      }
     }
     let timerIntent: TimerIntent | undefined
     const parkSignal = { requested: false }
@@ -83,12 +119,33 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
           usage: { turns: 0, costUsd: 0, durationMs: 0 },
         }
       }
-      throw error
+      const failure = classifyExecutionFailure({
+        subtype: 'error_during_execution',
+        errors: serializeExecutionError(error),
+        providerId,
+      })
+      if (permit) await breaker?.recordFailure(permit, failure)
+      return {
+        kind: 'blocked',
+        reason: failure.message,
+        failure,
+        usage: { turns: 0, costUsd: 0, durationMs: 0 },
+      }
     }
 
     const usage = usageFromRecord(outcome.record)
     const park = toParkIntent(timerIntent)
     if (outcome.kind !== 'terminal') {
+      if (outcome.kind === 'timed_out' || outcome.kind === 'lost') {
+        const failure = classifyExecutionFailure({
+          subtype: 'error_during_execution',
+          errors: [`Graph Agent task '${outcome.taskId}' ${outcome.kind}`],
+          providerId,
+        })
+        if (permit) await breaker?.recordFailure(permit, failure)
+        return { kind: 'blocked', reason: failure.message, failure, usage }
+      }
+      if (permit) await breaker?.abandon(permit)
       return {
         kind: outcome.kind,
         taskId: outcome.taskId,
@@ -97,6 +154,18 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
       }
     }
     const record = outcome.record
+    const failure = record?.result?.success === false
+      ? record.result.failure ?? classifyExecutionFailure({
+          subtype: 'error_during_execution',
+          resultText: record.result.summary,
+          errors: record.result.error ? [record.result.error] : [],
+          providerId,
+        })
+      : undefined
+    if (permit) {
+      if (isInfrastructureFailure(failure)) await breaker?.recordFailure(permit, failure!)
+      else await breaker?.recordSuccess(permit)
+    }
     return {
       kind: 'completed',
       taskId: outcome.taskId,
@@ -104,6 +173,8 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
       output: record?.result?.output,
       summary: record?.result?.summary ?? '',
       ...(record?.result?.error ? { error: record.result.error } : {}),
+      ...(failure ? { failure } : {}),
+      ...(record?.result?.errors?.length ? { errors: record.result.errors } : {}),
       ...(record?.result?.diagnostics ? {
         diagnostics: {
           ...(record.result.diagnostics.timeoutPhase

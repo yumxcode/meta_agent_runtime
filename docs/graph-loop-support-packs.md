@@ -99,3 +99,52 @@ Schemas are `loop-list-1.0`, `loop-inspect-1.0`, `loop-timeline-1.0`, `loop-disk
 `diagnoseLoop` derives operator cards from instance/state/activation/event/wake snapshots. It does not pause, resume, consume events, schedule wakes, or write journal records.
 
 `loop disk --json` reports current checkpoint bytes, projection/intent/event file counts, loose journal bytes, and average bytes per loose journal record. These are point-in-time capacity facts; growth rate requires collecting multiple samples externally.
+
+## Optional GitHub Actions Pack
+
+`createGitHubActionsCapabilityPack()` is a domain-neutral, explicitly loaded Pack. The default Graph Effect registry remains empty. The Pack adds only:
+
+- `github/actions-resolve-run@1`: resolve one workflow run from an exact repository, workflow identifier, and `head_sha`; optional branch/event/created filters further narrow identity. The safe default rejects multiple matches.
+- `github/actions-watch-run@1`: observe one exact numeric run ID until GitHub reports `status=completed`.
+
+The Pack deliberately does **not** push code, dispatch workflows, download artifacts, or interpret conclusions/metrics. Publication policy and domain evaluation remain in the project. A completed run with `conclusion=failure` is therefore a successful observation whose raw conclusion is returned to the Graph.
+
+The REST client uses GitHub's documented workflow-run endpoints and `head_sha` filter. It disables redirects while carrying a token, treats rate limits and transient HTTP failures as pending observations, and treats authentication/schema failures as terminal provider failures. See the [GitHub workflow-runs REST API](https://docs.github.com/en/rest/actions/workflow-runs).
+
+Create a trusted project-local loader module:
+
+```js
+// meta-agent-packs/github-actions.mjs
+import {
+  createGitHubActionsCapabilityPack,
+  createGitHubRestActionsClient,
+} from '@meta-agent/runtime'
+
+const token = process.env.GH_TOKEN ?? process.env.GITHUB_TOKEN
+if (!token) throw new Error('GH_TOKEN or GITHUB_TOKEN is required')
+
+export default createGitHubActionsCapabilityPack({
+  client: createGitHubRestActionsClient({ token }),
+})
+```
+
+Load the same module for every lifecycle command that validates or executes the frozen graph:
+
+```bash
+meta-agent -w /path/to/project loop distill requirements.md \
+  --graph-pack meta-agent-packs/github-actions.mjs
+meta-agent -w /path/to/project loop create loop.graph.json \
+  --graph-pack meta-agent-packs/github-actions.mjs
+meta-agent -w /path/to/project loop tick --until-quiescent \
+  --graph-pack meta-agent-packs/github-actions.mjs
+meta-agent -w /path/to/project loop-scheduler \
+  --graph-pack meta-agent-packs/github-actions.mjs
+```
+
+Use two Effects rather than repeatedly resolving a moving query:
+
+1. Resolve with exact `repository + workflow + headSha` and default `selection=unique`.
+2. Bind the resolver's required `id` and `headSha` output fields into the watch Effect.
+3. Route on the watch output's raw `status`/`conclusion` or hand it to a project-owned evaluator.
+
+Capability manifest `outputSchema` participates in Freeze-time strict `$output.*` validation and Runtime output validation, so the resolver-to-watcher binding is checked as an executable contract rather than prompt convention.

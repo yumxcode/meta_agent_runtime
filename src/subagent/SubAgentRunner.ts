@@ -19,6 +19,8 @@ import type { MetaAgentConfig } from '../core/config.js'
 import type { MetaAgentTool } from '../core/types.js'
 import { SessionStore } from '../core/SessionStore.js'
 import { registerModelCallScope } from '../infra/modelCallAdmission.js'
+import { classifyExecutionFailure } from '../infra/failures/ExecutionFailure.js'
+import { resolveProvider } from '../providers/registry.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
 import { writeTask, readTask, mutateTask, releaseWriteChain } from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
@@ -528,6 +530,19 @@ export class SubAgentRunner {
           }
 
           const isError = event.subtype !== 'success'
+          const failure = isError
+            ? event.failure ?? classifyExecutionFailure({
+                subtype: event.subtype,
+                stopReason: event.stopReason,
+                resultText: event.result,
+                errors: event.errors,
+                providerId: resolveProvider({
+                  apiKey: cfg.apiKey,
+                  baseURL: cfg.baseURL,
+                  model: cfg.model,
+                }).provider,
+              })
+            : undefined
           const result: SubAgentResult = {
             success:      !isError,
             summary:      this._summaryFor(lastText, event.result),
@@ -536,9 +551,11 @@ export class SubAgentRunner {
             // large deliverables (e.g. research report markdown) must survive
             // intact for the dispatching tool to persist them to disk.
             output:       this._returnedData(),
-            error:        isError
-              ? truncate(this._stopReasonToError(event.subtype), ERROR_MAX_CHARS)
+            error:        failure
+              ? truncate(failure.message, ERROR_MAX_CHARS)
               : undefined,
+            ...(failure ? { failure } : {}),
+            ...(event.errors?.length ? { errors: event.errors } : {}),
             turnsUsed,
             inputTokens,
             outputTokens,

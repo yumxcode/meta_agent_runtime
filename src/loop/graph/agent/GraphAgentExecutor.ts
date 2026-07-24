@@ -1,5 +1,6 @@
 import type { ActivationUsage, JsonValue } from '../spec/GraphTypes.js'
 import type { ShapeSpec } from '../spec/ShapeSpec.js'
+import type { ExecutionFailure } from '../../../infra/failures/ExecutionFailure.js'
 
 /** Stable Graph Runtime execution profile. It is not a user-facing SessionMode. */
 export const GRAPH_AGENT_PROFILE = 'graph_agent' as const
@@ -84,9 +85,17 @@ export type GraphAgentExecutionResult =
       output?: unknown
       summary: string
       error?: string
+      failure?: ExecutionFailure
+      errors?: string[]
       diagnostics?: GraphAgentExecutionDiagnostics
       usage: ActivationUsage
       park?: GraphAgentParkIntent
+    }
+  | {
+      kind: 'blocked'
+      reason: string
+      failure: ExecutionFailure
+      usage: ActivationUsage
     }
   | {
       kind: 'aborted' | 'timed_out' | 'lost'

@@ -11,6 +11,11 @@ export interface EffectProviderConformanceFixture {
   settle?(receipt: JsonValue): void | Promise<void>
   maxInspectAttempts?: number
   verifyDistinctKey?: boolean
+  /**
+   * Observation Effects may create no external operation during submit.
+   * Defaults to one for mutating Effects.
+   */
+  expectedSideEffectsPerKey?: number
 }
 
 export interface EffectProviderConformanceCheck {
@@ -38,6 +43,14 @@ export async function runEffectProviderConformance(
 ): Promise<EffectProviderConformanceReport> {
   const checks: EffectProviderConformanceCheck[] = []
   const providerName = `${provider.manifest.id}@${provider.manifest.version}`
+  const expectedPerKey = fixture.expectedSideEffectsPerKey ?? 1
+  if (!Number.isInteger(expectedPerKey) || expectedPerKey < 0) {
+    throw new Error('expectedSideEffectsPerKey must be a non-negative integer')
+  }
+  if (expectedPerKey === 0 && fixture.verifyDistinctKey === true) {
+    throw new Error('verifyDistinctKey cannot prove independence when expectedSideEffectsPerKey is zero')
+  }
+  const verifyDistinctKey = fixture.verifyDistinctKey ?? expectedPerKey > 0
   checks.push({
     id: 'manifest',
     passed: provider.manifest.pure === false && !!provider.manifest.integrity,
@@ -59,27 +72,27 @@ export async function runEffectProviderConformance(
     try {
       const replayReceipt = await provider.submit(fixture.input, fixture.idempotencyKey)
       const afterReplay = await fixture.readSideEffectCount()
-      const passed = isJsonValue(replayReceipt) && afterReplay - before === 1
+      const passed = isJsonValue(replayReceipt) && afterReplay - before === expectedPerKey
       checks.push({
         id: 'same-key-idempotency', passed,
         detail: passed
-          ? 'repeated submit with the same key produced exactly one externally-visible operation'
-          : `expected one side effect after same-key replay, observed ${afterReplay - before}`,
+          ? `repeated submit with the same key preserved ${expectedPerKey} externally-visible operation(s)`
+          : `expected ${expectedPerKey} side effect(s) after same-key replay, observed ${afterReplay - before}`,
       })
     } catch (error) {
       checks.push({ id: 'same-key-idempotency', passed: false, detail: `same-key replay failed: ${message(error)}` })
     }
 
-    if (fixture.verifyDistinctKey !== false) {
+    if (verifyDistinctKey) {
       try {
         await provider.submit(fixture.input, `${fixture.idempotencyKey}:distinct`)
         const afterDistinct = await fixture.readSideEffectCount()
-        const passed = afterDistinct - before === 2
+        const passed = afterDistinct - before === expectedPerKey * 2
         checks.push({
           id: 'distinct-key-independence', passed,
           detail: passed
-            ? 'a distinct idempotency key produced an independent operation'
-            : `expected two total side effects after a distinct key, observed ${afterDistinct - before}`,
+            ? `a distinct idempotency key produced an independent operation set (${expectedPerKey * 2} total)`
+            : `expected ${expectedPerKey * 2} total side effects after a distinct key, observed ${afterDistinct - before}`,
         })
       } catch (error) {
         checks.push({ id: 'distinct-key-independence', passed: false, detail: `distinct-key submit failed: ${message(error)}` })
