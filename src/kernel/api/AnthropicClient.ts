@@ -23,6 +23,8 @@ import {
   FallbackTriggeredError,
   AvailabilityFallbackTriggeredError,
 } from './Errors.js'
+import { withStreamWatchdog } from './StreamWatchdog.js'
+import { timeout } from '../../core/timeouts.js'
 
 export type StreamEvent =
   | { type: 'message_start'; usage: { input_tokens: number; cache_read_input_tokens?: number; cache_creation_input_tokens?: number } }
@@ -226,12 +228,28 @@ export async function* streamMessages(
   let yieldedAny = false
   try {
     while (true) {
+      // Per-ATTEMPT controller so the watchdog can abort THIS request without
+      // tearing down the caller's signal (which must stay usable for retries).
+      const attemptCtrl = new AbortController()
+      const forwardAbort = (): void => attemptCtrl.abort(activeAbortSignal.reason)
+      if (activeAbortSignal.aborted) forwardAbort()
+      else activeAbortSignal.addEventListener('abort', forwardAbort, { once: true })
+
       try {
         const stream = await client.messages.create(requestParams, {
-          signal: activeAbortSignal,
+          signal: attemptCtrl.signal,
         })
 
-        for await (const event of stream) {
+        // The SDK's own `timeout` stops covering the request the moment
+        // response headers arrive, so a streaming call is otherwise unbounded.
+        // See StreamWatchdog for the two-budget rationale.
+        const guarded = withStreamWatchdog(stream, {
+          firstTokenMs: timeout('llmFirstTokenMs'),
+          idleMs:       timeout('llmIdleMs'),
+          onTimeout:    () => attemptCtrl.abort(new Error('stream watchdog')),
+        })
+
+        for await (const event of guarded) {
           yieldedAny = true
           // Accumulate response content for the markdown debug twin (no-op
           // when debug is off — writer is null).
@@ -281,6 +299,10 @@ export async function* streamMessages(
           // surface the interruption rather than silently retrying.
           throw error
         }
+      } finally {
+        // activeAbortSignal is long-lived (a session / daemon signal); leaving
+        // one forwarder attached per retry attempt would leak for its lifetime.
+        activeAbortSignal.removeEventListener('abort', forwardAbort)
       }
     }
   } finally {

@@ -2,6 +2,7 @@
  * Errors — error classification for the streaming API.
  * Mirrors CC's errors.ts / errorUtils.ts.
  */
+import { isStreamTimeoutError } from './StreamWatchdog.js'
 
 /** Thrown when the API returns a prompt-too-long (context overflow) error */
 export class PromptTooLongError extends Error {
@@ -76,6 +77,11 @@ export function isRateLimitError(error: unknown): boolean {
 }
 
 export function isRetryableError(error: unknown): boolean {
+  // A first-token / idle stream timeout is a transport-level stall, not a
+  // semantic failure — re-issuing the request is the correct response. Callers
+  // still gate on `yieldedAny`, so only a first-token timeout actually replays;
+  // a mid-stream stall goes to KernelLoop's stream-error recovery instead.
+  if (isStreamTimeoutError(error)) return true
   return isRateLimitError(error) || isOverloadedError(error) || isServerError(error)
 }
 

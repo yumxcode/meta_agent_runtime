@@ -149,9 +149,9 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
             '只输出这一句话，不要解释、不要列表。',
           user: `最近修改的文件（去重）:\n${paths.slice(0, 40).join('\n')}`,
           maxTokens: 120,
-          // Fire-and-forget (never blocks the kernel), so a generous timeout just
-          // raises the digest's success rate on a slow provider.
-          timeoutMs: 30_000,
+          // Fire-and-forget (never blocks the kernel), so the derived budget
+          // (flashTtftMs + 120 tokens worth of generation) is exactly right —
+          // generous enough for a slow provider, no hand-tuned literal.
         })
     : undefined
 

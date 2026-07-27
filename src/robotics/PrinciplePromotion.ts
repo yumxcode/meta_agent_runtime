@@ -103,7 +103,6 @@ export async function proposePrincipleFromExperience(opts: {
     system: PRINCIPLE_PROMOTION_SYSTEM,
     user: formatPromotionInput(experience, related, anchors, opts.reason),
     maxTokens: 1_000,
-    timeoutMs: 30_000,
     cacheKey: `principle-promotion:${opts.reason}:${experience.id}:${score}`,
   })
   if (!raw) return { promoted: false, reason: 'flash_failed', score }
@@ -166,7 +165,6 @@ export async function proposePrincipleFromCluster(opts: {
     system: PRINCIPLE_PROMOTION_SYSTEM,
     user: formatClusterPromotionInput(opts.cluster, anchors),
     maxTokens: 1_000,
-    timeoutMs: 30_000,
     cacheKey: `principle-cluster:${domain}:${clusterIds}`,
   })
   if (!raw) return { promoted: false, reason: 'flash_failed' }

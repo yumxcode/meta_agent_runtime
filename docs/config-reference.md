@@ -13,7 +13,9 @@
 合并优先级:`session > project > global`,**逐字段**覆盖。
 在 `resolveConfig()` 里,合并后的文件值再与调用方/CLI 参数比较,最终顺序为:**配置文件 > CLI/调用方 > Provider 内置默认**。
 
-`config.json` **只**管模型/Provider/搜索三类键(下表)。其余运行参数(thinking、maxTurns、maxTokens 等)不在文件里,通过 CLI flag 或代码传入。文件中**未知键会被运行时忽略**,因此可顺带存放自己的 per-project 偏好(如 `ui.theme`)。
+`config.json` 管四类键:模型 / Provider / 搜索 / **超时(`timeouts`)**。其余运行参数(thinking、maxTurns、maxTokens 等)不在文件里,通过 CLI flag 或代码传入。文件中**未知顶层键会被运行时忽略**(可顺带存放自己的 per-project 偏好,如 `ui.theme`);但 `timeouts` 段内的未知键**会告警**,以免拼错后静默失效。
+
+> ⚠️ 优先级例外:`timeouts.*` 是**配置文件 > 环境变量 > 内置默认**(与模型键一致)。而 `TAVILY_API_KEY` 相反,是 env 优先于文件——见文末环境变量一节。
 
 ---
 
@@ -65,6 +67,42 @@
     // Tavily 搜索 key(首选搜索 Provider)。等价于环境变量 TAVILY_API_KEY。
     // 默认:未设置 —— 回退到 Anthropic 原生搜索。
     "tavilyApiKey": "tvly-<your-key>"
+  },
+
+  // ── timeouts:各阶段超时(全部可选,单位 ms,除 flashTokensPerSec)────────
+  // 优先级:本段 > 对应环境变量 > 内置默认。逐字段生效,不必写全。
+  // 超出合法区间或类型不对的值会**告警并忽略**(不会被静默钳位)。
+  "timeouts": {
+    // 流式主对话:到「第一个流事件」的预算。默认 90000(90s)。
+    // 按首字 30s 估算并留 3 倍余量 —— 压缩阈值附近的长上下文 prefill 会显著拉长首字。
+    "llmFirstTokenMs": 90000,
+
+    // 流式主对话:相邻两个流事件之间的最大静默。默认 60000(60s)。
+    // 刻意**没有**总时长上限:maxTokens 默认 131072,按 20 tok/s 打满约 109 分钟,
+    // 任何总超时都会误杀合法长生成;卡死只能靠「静默多久」判定。
+    "llmIdleMs": 60000,
+
+    // 压缩副调用(非流式,因此这个值约束整次调用)。默认 720000(12 分钟)。
+    "compactMs": 720000,
+
+    // flash 副调用的预算 = flashTtftMs + maxTokens / flashTokensPerSec,
+    // 结果钳在 [30s, 180s]。默认 30000 / 20。
+    "flashTtftMs": 30000,
+    "flashTokensPerSec": 20,
+
+    // 单工具全局超时。默认 180000(3 分钟),`0` 禁用。
+    // 阻塞等待子代理的工具(run_agent 等)自己声明 timeoutMs:0,不受此值影响。
+    "toolMs": 180000,
+
+    // MCP 单次 RPC。默认均为 60000。
+    "mcpMs": 60000,
+    "mcpStdioMs": 60000,
+
+    // LocalExecutor 单个 job 的看门狗。默认 1800000(30 分钟),`0` 禁用。
+    "jobMs": 1800000,
+
+    // 单个 auto verify 审核子代理的墙钟上限。默认 1800000(30 分钟)。
+    "verifyMaxDurationMs": 1800000
   }
 
   // ── 任意自定义键(运行时忽略,仅供你自己的 workflow 读取)─────────────────
@@ -94,6 +132,18 @@
   },
   "web_search": {
     "tavilyApiKey": "tvly-<your-key>"
+  },
+  "timeouts": {
+    "llmFirstTokenMs": 90000,
+    "llmIdleMs": 60000,
+    "compactMs": 720000,
+    "flashTtftMs": 30000,
+    "flashTokensPerSec": 20,
+    "toolMs": 180000,
+    "mcpMs": 60000,
+    "mcpStdioMs": 60000,
+    "jobMs": 1800000,
+    "verifyMaxDurationMs": 1800000
   }
 }
 ```
@@ -131,7 +181,31 @@
 - `TAVILY_API_KEY` ↔ `web_search.tavilyApiKey`:解析顺序为 `调用方 > 环境变量 > 配置文件`(env 优先于文件)。
 - Provider 凭证(`ZHIPU_API_KEY`/`DEEPSEEK_API_KEY`/`QWEN_API_KEY`/`ANTHROPIC_API_KEY`):由 Provider Registry 解析,参与 Provider 自动探测,属于凭证而非普通配置,不在下表。
 
-当前默认值:
+
+### 超时类(10 个,**均可被 `config.json` 的 `timeouts` 段覆盖**)
+
+这一组的优先级与其它环境变量相反:**配置文件 > 环境变量 > 内置默认**。它们由
+`src/core/timeouts.ts` 解析(不走 RuntimeEnv 的访问器),`ENV_REGISTRY` 只负责登记文档。
+
+| 环境变量 | 配置键 | 默认 | 区间 | 说明 |
+| --- | --- | --- | --- | --- |
+| `META_AGENT_LLM_FIRST_TOKEN_TIMEOUT_MS` | `timeouts.llmFirstTokenMs` | `90000` | [1e3, 3.6e6] | 流式调用到第一个流事件的预算 |
+| `META_AGENT_LLM_IDLE_TIMEOUT_MS` | `timeouts.llmIdleMs` | `60000` | [1e3, 3.6e6] | 流式调用相邻事件间的最大静默;**无总时长上限** |
+| `META_AGENT_COMPACT_TIMEOUT_MS` | `timeouts.compactMs` | `720000`(12 分钟) | [1e4, 3.6e6] | 压缩副调用(非流式,约束整次调用) |
+| `META_AGENT_FLASH_TTFT_MS` | `timeouts.flashTtftMs` | `30000` | [1e3, 6e5] | flash 推导预算的首字部分 |
+| `META_AGENT_FLASH_TOKENS_PER_SEC` | `timeouts.flashTokensPerSec` | `20` | [1, 1e4] | flash 推导预算的吐字速率假设 |
+| `META_AGENT_TOOL_TIMEOUT_MS` | `timeouts.toolMs` | `180000`(3 分钟) | [0, 3.6e6] | 单工具全局超时,`0` 禁用 |
+| `META_AGENT_MCP_TIMEOUT_MS` | `timeouts.mcpMs` | `60000` | [1e3, 6e5] | 单次 HTTP MCP RPC |
+| `META_AGENT_MCP_STDIO_TIMEOUT_MS` | `timeouts.mcpStdioMs` | `60000` | [100, 6e5] | 单次 stdio MCP RPC(也可在 mcp 配置文件里 per-server 覆盖) |
+| `META_AGENT_JOB_TIMEOUT_MS` | `timeouts.jobMs` | `1800000`(30 分钟) | [0, 8.64e7] | LocalExecutor 单 job 看门狗,`0` 禁用 |
+| `META_AGENT_VERIFY_MAX_DURATION_MS` | `timeouts.verifyMaxDurationMs` | `1800000`(30 分钟) | [1e4, 3.6e6] | 单个 auto verify 审核子代理的墙钟上限 |
+
+**flash 副调用的实际预算是推导出来的**,不是固定值:
+`flashTtftMs + maxTokens / flashTokensPerSec × 1000`,再钳到 `[30s, 180s]`。
+按默认值,1200 token 的知识抽取拿到 90s,1000 token 的原则晋升拿到 80s,120 token 的小调用拿到 36s。
+显式传入 `timeoutMs` 的调用点(如 QueryAnalyzer 的 8s)不受推导影响。
+
+### 其它环境变量
 
 | 环境变量 | 类型 | 默认 | 说明 |
 | --- | --- | --- | --- |
@@ -141,10 +215,8 @@
 | `META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD` | int | 关闭(未设) | 提前压缩的硬 token 上限 |
 | `DISABLE_COMPACT` / `DISABLE_AUTO_COMPACT` | flag | 关闭 | 关闭自动压缩 |
 | `META_AGENT_MAX_OUTPUT_TOKENS` | flag | 未设 | 设置后固定 max output tokens 并禁用自动升档 |
-| `META_AGENT_TOOL_TIMEOUT_MS` | int | `180000`(3 分钟) | 单工具全局超时(ms),`0` 禁用 |
 | `META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS` | int | `3` | auto 模式超时仍运行工具的熔断上限 |
 | `META_AGENT_MAX_TOOL_USE_CONCURRENCY` | int | `10` | 工具并发上限,范围 [1,64] |
-| `META_AGENT_JOB_TIMEOUT_MS` | int | `1800000`(30 分钟) | LocalExecutor 看门狗预算(ms),`0` 禁用 |
 | `META_AGENT_KEEP_TERMINAL_JOBS` | int | `200` | 内存中保留的终态 job 数(LRU) |
 | `META_AGENT_IGNORE_USER_PERMISSIONS` | flag | 关闭 | 忽略磁盘权限配置(hermetic 模式) |
 | `META_AGENT_MAX_TOOL_OUTPUT_CHARS` | int | `102400`(100 KiB) | bash 工具输出上限,范围 [1KiB,1MiB] |

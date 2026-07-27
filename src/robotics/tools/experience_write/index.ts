@@ -200,7 +200,6 @@ export function createExperienceWriteTool(
             system: PRINCIPLE_SYSTEM,
             user: userContext,
             maxTokens: 120,
-            timeoutMs: 30_000,
             cacheKey: `principle:${hashForCache(userContext)}`,
           })
           if (raw?.trim()) abstractPrinciple = raw.trim().slice(0, 400)

@@ -40,6 +40,7 @@ import { HttpMcpClient } from './HttpMcpClient.js'
 import { registerMcpClient, mcpClients } from './registry.js'
 import type { McpClient } from './registry.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
+import { timeout } from '../../core/timeouts.js'
 
 // ── Config path ───────────────────────────────────────────────────────────────
 
@@ -168,7 +169,7 @@ export class StdioMcpClient implements McpClient {
       let settled = false
       const timeoutMs = Number.isFinite(cfg.timeoutMs) && (cfg.timeoutMs ?? 0) > 0
         ? cfg.timeoutMs!
-        : RuntimeEnv.mcpStdioTimeoutMs(DEFAULT_STDIO_TIMEOUT_MS)
+        : timeout('mcpStdioMs')
       const maxBytes = Number.isFinite(cfg.maxResponseBytes) && (cfg.maxResponseBytes ?? 0) > 0
         ? cfg.maxResponseBytes!
         : RuntimeEnv.mcpStdioMaxResponseBytes(DEFAULT_STDIO_MAX_RESPONSE_BYTES)

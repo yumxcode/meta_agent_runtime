@@ -20,6 +20,7 @@ import { stripImagesFromMessages, normalizeMessagesForAPI } from '../messages/Me
 import { normalizeMessagesForDeepSeek } from '../messages/DeepSeekMessageNormalizer.js'
 import { buildAnthropicAuth } from '../api/AnthropicClient.js'
 import { getModelProtocol } from '../../providers/registry.js'
+import { timeout } from '../../core/timeouts.js'
 import {
   buildCompactPrompt,
   formatCompactSummary,
@@ -376,7 +377,16 @@ async function callCompactModel(
   const client = new Anthropic({
     ...buildAnthropicAuth(options.apiKey, options.baseURL),
     baseURL: options.baseURL,
-    maxRetries: options.maxRetries ?? 2,
+    maxRetries: options.maxRetries ?? 1,
+    // Compaction is the ONLY non-streaming model call in the hot path, so the
+    // SDK timeout bounds it end-to-end (unlike a stream, where it stops at the
+    // response headers). The vendor default of 600 s is not enough:
+    // COMPACT_MAX_TOKENS is 12,000, which at ~20 tok/s is 600 s of generation
+    // BEFORE the prefill of a nearly-full context window. 12 min gives real
+    // headroom. maxRetries drops 2→1 for the same reason — three 12-minute
+    // attempts would stall an unattended run for 36 minutes before reaching the
+    // deterministic structural fallback.
+    timeout: timeout('compactMs'),
   })
 
   const apiMessages = normalizeMessagesForAPI(withFinalInstruction(messages))
@@ -436,7 +446,16 @@ async function callCompactModelDeepSeek(
   const client = new OpenAI({
     apiKey,
     baseURL: options.baseURL ?? 'https://api.deepseek.com',
-    maxRetries: options.maxRetries ?? 2,
+    maxRetries: options.maxRetries ?? 1,
+    // Compaction is the ONLY non-streaming model call in the hot path, so the
+    // SDK timeout bounds it end-to-end (unlike a stream, where it stops at the
+    // response headers). The vendor default of 600 s is not enough:
+    // COMPACT_MAX_TOKENS is 12,000, which at ~20 tok/s is 600 s of generation
+    // BEFORE the prefill of a nearly-full context window. 12 min gives real
+    // headroom. maxRetries drops 2→1 for the same reason — three 12-minute
+    // attempts would stall an unattended run for 36 minutes before reaching the
+    // deterministic structural fallback.
+    timeout: timeout('compactMs'),
   })
 
   // Compact is text-only — include systemPrompt and convert to OpenAI format

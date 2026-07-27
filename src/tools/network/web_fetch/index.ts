@@ -109,9 +109,12 @@ const TRUST_FAKE_IP = RuntimeEnv.trustFakeIp()
 
 /** Returns null if the IP is allowed, otherwise a human-readable rejection. */
 function classifyIp(ip: string): string | null {
+  // WHATWG URL.hostname keeps brackets around IPv6 literals in Node. DNS
+  // results do not, so normalize both representations before classification.
+  const normalized = ip.startsWith('[') && ip.endsWith(']') ? ip.slice(1, -1) : ip
   // IPv4 private ranges (RFC 1918) + loopback + link-local + CG-NAT + IMDS
   // + this-network + benchmark + documentation + multicast + broadcast.
-  const v4 = ip.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
+  const v4 = normalized.match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/)
   if (v4) {
     const a = Number(v4[1]); const b = Number(v4[2])
     if (a === 10) return 'private 10/8'
@@ -128,7 +131,7 @@ function classifyIp(ip: string): string | null {
     return null
   }
   // IPv6 — best-effort.  Treat anything that isn't clearly global as private.
-  const lower = ip.toLowerCase()
+  const lower = normalized.toLowerCase()
   if (lower === '::1' || lower === '::') return 'loopback ::1'
   if (lower.startsWith('fe80:') || lower.startsWith('fe80::')) return 'IPv6 link-local fe80::/10'
   if (/^f[cd][0-9a-f]{2}:/.test(lower)) return 'IPv6 ULA fc00::/7'
@@ -164,6 +167,25 @@ async function validateUrl(rawUrl: string): Promise<{ ok: true; value: Validated
   // mapping localhost → public IP can't bypass us.
   if (host.toLowerCase() === 'localhost') {
     return { ok: false, reason: 'localhost is not allowed' }
+  }
+  // Classify IP literals directly. Besides avoiding needless DNS, this is
+  // essential for bracketed IPv6: request() connects literals without calling
+  // the custom lookup hook, so they must be rejected before the request.
+  const literalHost = host.startsWith('[') && host.endsWith(']') ? host.slice(1, -1) : host
+  const literalFamily = isIP(literalHost)
+  if (literalFamily !== 0) {
+    const reason = classifyIp(literalHost)
+    if (reason !== null) {
+      return { ok: false, reason: `host ${host} is not allowed (${reason})` }
+    }
+    return {
+      ok: true,
+      value: {
+        url: parsed,
+        resolvedHost: host,
+        addresses: [{ address: literalHost, family: literalFamily }],
+      },
+    }
   }
   // DNS-resolve and inspect every returned address. `all: true` returns the
   // full set so we don't accidentally allow a host that round-robins between

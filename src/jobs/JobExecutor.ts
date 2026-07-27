@@ -48,7 +48,7 @@ import type {
   ProgressReporter,
   DimensionalRecord,
 } from './types.js'
-import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
+import { timeout } from '../core/timeouts.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Executor interface (for future swap-in of subprocess / remote backends)
@@ -87,8 +87,9 @@ interface PendingJob {
   callbacks: ExecutorCallbacks
 }
 
-/** Default wall-clock watchdog applied to every job that doesn't override it. */
-const DEFAULT_JOB_TIMEOUT_MS = 30 * 60_000   // 30 minutes
+// The default job watchdog now lives in core/timeouts.ts (`timeouts.jobMs`,
+// 30 min) so it is settable from the config file as well as
+// META_AGENT_JOB_TIMEOUT_MS.
 
 export class LocalExecutor implements Executor {
   private readonly maxConcurrent: number
@@ -111,7 +112,7 @@ export class LocalExecutor implements Executor {
     this.defaultTimeoutMs =
       defaultTimeoutMs !== undefined && Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs >= 0
         ? defaultTimeoutMs
-        : RuntimeEnv.jobTimeoutMs(DEFAULT_JOB_TIMEOUT_MS)
+        : timeout('jobMs')
   }
 
   submit(

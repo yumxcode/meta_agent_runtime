@@ -35,6 +35,7 @@
 import { readFileSync } from 'fs'
 import { META_AGENT_HOME } from './metaAgentHome.js'
 import { join } from 'path'
+import { parseTimeoutSection, type TimeoutConfig } from './timeouts.js'
 
 export interface ModelConfigFile {
   /** Primary interaction model. Maps to MetaAgentConfig.model. */
@@ -55,6 +56,15 @@ export interface ModelConfigFile {
    * when both are present.
    */
   tavilyApiKey?: string
+  /**
+   * Tunable timeouts. Unlike the string fields above (env var wins), the
+   * `timeouts` section takes precedence OVER its environment variables —
+   * see core/timeouts.ts for the full precedence rule and key list.
+   *
+   * Kept as a nested section rather than flat fields so it cannot collide with
+   * the model/credential namespace as more knobs are added.
+   */
+  timeouts?: Partial<TimeoutConfig>
 }
 
 let _pathsOverride: string[] | null = null
@@ -113,6 +123,13 @@ export function normalizeModelConfig(raw: unknown, sourceLabel = 'config.json'):
     }
     out[field] = v.trim()
   }
+
+  // `timeouts` is read from the RAW object, not `merged`: it is a nested
+  // section in its own right, so flattening LLM/web_search over it would let an
+  // unrelated group shadow it.
+  const timeouts = parseTimeoutSection(raw, sourceLabel)
+  if (Object.keys(timeouts).length > 0) out.timeouts = timeouts
+
   return out
 }
 

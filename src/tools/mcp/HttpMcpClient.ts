@@ -17,6 +17,7 @@
  */
 
 import type { McpClient } from './registry.js'
+import { timeout } from '../../core/timeouts.js'
 
 type JsonRpcResponse<T = unknown> = {
   jsonrpc: '2.0'
@@ -44,8 +45,14 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
   return Math.min(max, Math.max(min, parsed))
 }
 
+/**
+ * Per-request wall-clock limit. Routed through the shared resolver so it is
+ * settable from the config file (`timeouts.mcpMs`) and appears in
+ * ENV_REGISTRY — previously this read META_AGENT_MCP_TIMEOUT_MS with a private
+ * helper, so the variable existed but was documented nowhere.
+ */
 function requestTimeoutMs(): number {
-  return envInt('META_AGENT_MCP_TIMEOUT_MS', DEFAULT_REQUEST_TIMEOUT_MS, 1_000, 600_000)
+  return timeout('mcpMs')
 }
 
 function maxResponseBytes(): number {

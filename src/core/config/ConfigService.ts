@@ -34,6 +34,7 @@ import {
   resetModelConfigFileCache,
   type ModelConfigFile,
 } from '../modelConfigFile.js'
+import { invalidateTimeoutCache, type TimeoutConfig } from '../timeouts.js'
 
 export type ConfigScope = 'global' | 'project' | 'session'
 const CONFIG_FILENAME = 'config.json'
@@ -151,7 +152,24 @@ export function loadModelConfig(opts: { projectDir?: string } = {}): ModelConfig
     ? normalizeModelConfig(readRawFile(projectConfigPath(opts.projectDir)), 'project config.json')
     : {}
   const session = normalizeModelConfig(_session, 'session config')
-  return { ...global, ...project, ...session }
+  const merged: ModelConfigFile = { ...global, ...project, ...session }
+  // `timeouts` must merge PER FIELD, not per section: a project file that sets
+  // only `toolMs` should not erase a global `llmIdleMs`. The spread above would
+  // have replaced the whole object.
+  const timeouts = { ...global.timeouts, ...project.timeouts, ...session.timeouts }
+  if (Object.keys(timeouts).length > 0) merged.timeouts = timeouts
+  else delete merged.timeouts
+  return merged
+}
+
+/**
+ * The merged `timeouts` section across all layers — the loader handed to
+ * `configureTimeouts()` at bootstrap so deep call sites (API clients,
+ * ToolExecution, MCP) resolve config-file timeouts without threading config
+ * through their signatures.
+ */
+export function loadTimeoutConfig(opts: { projectDir?: string } = {}): Partial<TimeoutConfig> {
+  return loadModelConfig(opts).timeouts ?? {}
 }
 
 // ── Tool-facing operations ───────────────────────────────────────────────────
@@ -176,6 +194,7 @@ export function setValue(
   const scope = opts.scope ?? 'project'
   if (scope === 'session') {
     setNested(_session, key, value)
+    invalidateTimeoutCache()
     return
   }
   const path = scopePath(scope, opts.projectDir)
@@ -183,6 +202,9 @@ export function setValue(
   setNested(raw, key, value)
   writeRawFile(path, raw)
   if (scope === 'global') resetModelConfigFileCache() // next loadModelConfigFile() re-reads
+  // Any layer can carry `timeouts.*`, so the resolved table is stale after any
+  // write. Cheap to drop — the next read re-merges.
+  invalidateTimeoutCache()
 }
 
 /** Delete a key from a scope (default: project). Returns whether it existed. */
@@ -191,13 +213,18 @@ export function deleteValue(
   opts: { projectDir?: string; scope?: ConfigScope } = {},
 ): boolean {
   const scope = opts.scope ?? 'project'
-  if (scope === 'session') return deleteNested(_session, key)
+  if (scope === 'session') {
+    const removed = deleteNested(_session, key)
+    if (removed) invalidateTimeoutCache()
+    return removed
+  }
   const path = scopePath(scope, opts.projectDir)
   const raw = readRawFile(path)
   const found = deleteNested(raw, key)
   if (found) {
     writeRawFile(path, raw)
     if (scope === 'global') resetModelConfigFileCache()
+    invalidateTimeoutCache()
   }
   return found
 }
@@ -214,4 +241,5 @@ export function listValues(
 /** Clear the in-memory session overlay (use in tests / between sessions). */
 export function clearSessionConfig(): void {
   _session = {}
+  invalidateTimeoutCache()
 }

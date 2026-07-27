@@ -22,6 +22,7 @@ import { resolveConfig } from '../config.js'
 import { getModelProtocol } from '../../providers/registry.js'
 import { buildAnthropicAuth } from '../../kernel/api/AnthropicClient.js'
 import { withAbortableTimeout } from '../utils/withTimeout.js'
+import { flashTimeoutMs } from '../timeouts.js'
 import type { MetaAgentConfig } from '../config.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -32,7 +33,16 @@ export interface FlashQueryOpts {
   system: string
   user: string
   maxTokens: number
-  /** Hard timeout in ms. Default: 30000 */
+  /**
+   * Hard timeout in ms. Default: DERIVED from maxTokens via
+   * `flashTimeoutMs()` — `flashTtftMs + maxTokens / flashTokensPerSec`,
+   * clamped to [30 s, 180 s].
+   *
+   * Pass an explicit value only when the call has a latency budget of its own
+   * (QueryAnalyzer deliberately uses 8 s because it must not block the turn).
+   * A flat default is what left the 1,000–1,200-token side-calls able to
+   * succeed only on a fast provider.
+   */
   timeoutMs?: number
   /**
    * When set, the result is cached in memory under this key.
@@ -76,6 +86,8 @@ export class FlashClient {
    *   - The model returned no text content
    *
    * Callers MUST handle null with a keyword-based or safe-default fallback.
+   * Failures are logged (previously they were entirely silent, so a knowledge
+   * pipeline that had stopped working produced no signal at all).
    */
   async query(opts: FlashQueryOpts): Promise<string | null> {
     // Cache hit
@@ -85,6 +97,8 @@ export class FlashClient {
       this.cache.set(opts.cacheKey, cached)
       return cached
     }
+
+    const effectiveTimeoutMs = opts.timeoutMs ?? flashTimeoutMs(opts.maxTokens)
 
     try {
       let text: string | null = null
@@ -99,7 +113,7 @@ export class FlashClient {
               { role: 'user', content: opts.user },
             ],
           }, { signal }),
-          opts.timeoutMs ?? FlashClient.DEFAULT_TIMEOUT_MS,
+          effectiveTimeoutMs,
         )
         text = msg.choices[0]?.message?.content?.trim() || null
       } else if (this.anthropicClient) {
@@ -110,7 +124,7 @@ export class FlashClient {
             system: opts.system,
             messages: [{ role: 'user', content: opts.user }],
           }, { signal }),
-          opts.timeoutMs ?? FlashClient.DEFAULT_TIMEOUT_MS,
+          effectiveTimeoutMs,
         )
 
         const block = msg.content[0]
@@ -120,8 +134,16 @@ export class FlashClient {
 
       if (opts.cacheKey) this.setCached(opts.cacheKey, text)
       return text
-    } catch {
-      // Timeout, network error, or API failure — caller handles fallback
+    } catch (err) {
+      // Timeout, network error, or API failure — caller handles fallback.
+      // Warn rather than swallow: a persistently failing flash call degrades a
+      // whole feature (memory recall, knowledge extraction, principle
+      // promotion) into its fallback with no other symptom.
+      console.warn(
+        `[meta-agent] flash call failed (model=${this.model}, maxTokens=${opts.maxTokens}, ` +
+        `timeout=${effectiveTimeoutMs}ms) — using caller fallback:`,
+        err instanceof Error ? err.message : String(err),
+      )
       return null
     }
   }

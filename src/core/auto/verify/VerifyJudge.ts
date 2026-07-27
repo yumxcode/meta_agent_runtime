@@ -20,6 +20,7 @@ import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES } from '../../../subagent/types.js'
 import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGate.js'
 import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../../subagent/verdictChannel.js'
+import { timeout } from '../../timeouts.js'
 import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
 
 export interface AutoVerifyGateDeps {
@@ -94,7 +95,9 @@ export function resolveJudgeLimits(): { maxTurns: number; maxBudgetUsd: number; 
   return {
     maxTurns:      verifyEnvInt('META_AGENT_VERIFY_MAX_TURNS', VERIFY_JUDGE_DEFAULTS.maxTurns, 1, 10_000),
     maxBudgetUsd:  verifyEnvFloat('META_AGENT_VERIFY_MAX_BUDGET_USD', VERIFY_JUDGE_DEFAULTS.maxBudgetUsd, 0.01, 1_000_000),
-    maxDurationMs: verifyEnvInt('META_AGENT_VERIFY_MAX_DURATION_MS', VERIFY_JUDGE_DEFAULTS.maxDurationMs, 10_000, 3_600_000),
+    // Routed through the shared resolver so `timeouts.verifyMaxDurationMs` in
+    // the config file also works, not just the env var.
+    maxDurationMs: timeout('verifyMaxDurationMs'),
   }
 }
 

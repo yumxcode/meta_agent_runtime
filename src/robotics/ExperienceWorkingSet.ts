@@ -251,7 +251,6 @@ export class ExperienceWorkingSetManager {
         `Candidate experiences:\n${candidates.map(formatExperienceCandidate).join('\n\n')}`,
       ].join('\n\n'),
       maxTokens: 220,
-      timeoutMs: 30_000,
       cacheKey: `experience-working-set:${createHash('sha256')
         .update([
           prompt.slice(0, 800),

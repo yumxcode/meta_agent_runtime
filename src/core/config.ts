@@ -21,6 +21,7 @@ import type { CompactProfile } from '../kernel/compact/CompactPrompt.js'
 import type { AgentMode, OutputStyle } from './dynamicPrompt.js'
 import type { AutoWorktreeCleanupStrategy } from './auto/AutoWorktreeCoordinator.js'
 import { loadModelConfig } from './config/ConfigService.js'
+import { bootstrapTimeoutsFor } from './timeouts.js'
 import { resolveProvider, inferProviderFromURL as registryInferFromURL } from '../providers/registry.js'
 import type { Capabilities, Protocol } from '../providers/registry.js'
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
@@ -558,6 +559,13 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
   // built-in provider defaults:  config-file > CLI > default. The project layer
   // is read from <projectDir>/.meta-agent/config.json when projectDir is set.
   const file = loadModelConfig({ projectDir: config.projectDir })
+
+  // Register the config-file layer for the timeout resolver. Done here because
+  // resolveConfig() is the one function every entry point (CLI, SessionRouter,
+  // every Session class, embedders) already calls with a projectDir — so deep
+  // call sites (API clients, ToolExecution, MCP) get config-file timeouts
+  // without threading config through their signatures. Idempotent per scope.
+  bootstrapTimeoutsFor(config.projectDir, dir => loadModelConfig({ projectDir: dir }).timeouts ?? {})
 
   // apiKey / baseURL / model fed into provider detection (file wins).
   const detectInput = {

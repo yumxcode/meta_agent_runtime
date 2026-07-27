@@ -292,9 +292,13 @@ export interface MetaAgentTool {
   /** Maximum characters to keep from this tool's result. Undefined uses runtime default. */
   maxResultSizeChars?: number
   /**
-   * Per-tool execution timeout in ms. Undefined → kernel default (3 min).
-   * Set to 0 to opt out (e.g. tools that await a sub-agent, which is bounded
-   * by the sub-agent's own 5-min wall-clock cap instead).
+   * Per-tool execution timeout in ms. Undefined → kernel default (3 min,
+   * `timeouts.toolMs`).
+   *
+   * Set to 0 to opt out. Required for any tool that BLOCKS on a sub-agent:
+   * those are bounded by the sub-agent's own wall-clock cap
+   * (DEFAULT_SUB_AGENT_MAX_DURATION_MS, 30 min) plus a minute of polling slack,
+   * which is an order of magnitude beyond the kernel default.
    */
   timeoutMs?: number
 }

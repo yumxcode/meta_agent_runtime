@@ -1343,7 +1343,6 @@ Required output:
 META-WORKFLOW content:
 ${input.content.slice(0, 12000)}`,
       maxTokens: 3000,
-      timeoutMs: 30_000,
       cacheKey: `workflow-repair:${input.mode}:${contentHash}`,
     })
   }
@@ -1418,7 +1417,6 @@ Reply with a JSON object: {"mode":"single"|"multi","reason":"<one sentence why>"
         system: systemPrompt,
         user: userContent,
         maxTokens: 60,
-        timeoutMs: 30_000,
         cacheKey: `robotics-agent-mode:${this.sessionId}:${firstPrompt.slice(0, 120)}`,
       }) ?? ''
 

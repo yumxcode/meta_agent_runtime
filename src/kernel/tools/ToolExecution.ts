@@ -8,6 +8,7 @@ import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
 import { makeToolResultMessage } from '../messages/MessageFactory.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
+import { timeout } from '../../core/timeouts.js'
 
 const TRUNCATION_NOTICE =
   '\n\n[Content truncated: result exceeded maximum allowed size. ' +
@@ -47,16 +48,16 @@ export function clearTimedOutRunningTools(sessionId: string): void {
 }
 
 /**
- * Read META_AGENT_TOOL_TIMEOUT_MS lazily (mirrors getConcurrencyLimit pattern)
- * so tests / startup overrides both work. Returns the default 3 min when unset
- * or invalid. 0 disables the global timeout.
+ * Resolve the per-tool timeout lazily so config-file / env / startup overrides
+ * all take effect. Precedence is config file (`timeouts.toolMs`) > env
+ * (META_AGENT_TOOL_TIMEOUT_MS) > 3 min. `0` disables the global timeout.
  *
- * This default lives in the kernel, so it applies to every KernelLoop —
- * including the ones sub-agents run — which is how the timeout mechanism
- * propagates into sub-agent tool calls.
+ * This lives in the kernel, so it applies to every KernelLoop — including the
+ * ones sub-agents run — which is how the mechanism propagates into sub-agent
+ * tool calls.
  */
 function getToolTimeoutMs(): number {
-  return RuntimeEnv.toolTimeoutMs(DEFAULT_TOOL_TIMEOUT_MS)
+  return timeout('toolMs')
 }
 
 function truncateString(value: string, maxChars: number | undefined): string {

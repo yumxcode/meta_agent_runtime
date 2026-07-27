@@ -127,7 +127,13 @@ export const RuntimeEnv = {
   },
 
   // ── Jobs / executor ───────────────────────────────────────────────────────
-  /** LocalExecutor default watchdog budget (ms). `0` disables. */
+  /**
+   * LocalExecutor default watchdog budget (ms). `0` disables.
+   *
+   * @deprecated Superseded by `timeout('jobMs')` (core/timeouts.ts), which
+   * layers the config file's `timeouts.jobMs` over this env var. Kept for
+   * embedders that call RuntimeEnv directly; the runtime no longer uses it.
+   */
   jobTimeoutMs(fallback: number): number {
     return readIntEnvOr('META_AGENT_JOB_TIMEOUT_MS', fallback, 0)
   },
@@ -138,7 +144,11 @@ export const RuntimeEnv = {
   },
 
   // ── MCP ─────────────────────────────────────────────────────────────────
-  /** Stdio MCP per-RPC wall-clock limit (ms). */
+  /**
+   * Stdio MCP per-RPC wall-clock limit (ms).
+   *
+   * @deprecated Superseded by `timeout('mcpStdioMs')` (core/timeouts.ts).
+   */
   mcpStdioTimeoutMs(fallback: number): number {
     return readIntEnvOr('META_AGENT_MCP_STDIO_TIMEOUT_MS', fallback, 100, 600_000)
   },
@@ -180,7 +190,11 @@ export const RuntimeEnv = {
   },
 
   // ── Tool execution ────────────────────────────────────────────────────────
-  /** Global per-tool timeout (ms). `0` disables. Clamped >= 0. */
+  /**
+   * Global per-tool timeout (ms). `0` disables. Clamped >= 0.
+   *
+   * @deprecated Superseded by `timeout('toolMs')` (core/timeouts.ts).
+   */
   toolTimeoutMs(fallback: number): number {
     return readIntEnvOr('META_AGENT_TOOL_TIMEOUT_MS', fallback, 0)
   },
@@ -254,6 +268,12 @@ export interface EnvVarDoc {
  * Authoritative list of the config env vars this runtime reads. Keep in sync
  * with the accessors above. (Provider credential keys are intentionally omitted
  * — see the module header.)
+ *
+ * Timeout vars are resolved by core/timeouts.ts, NOT by the accessors in this
+ * file: each is overridable by the config file's `timeouts` section, which
+ * takes PRECEDENCE over the env var. They are registered here so `--help` and
+ * docs/config-reference.md stay complete — META_AGENT_MCP_TIMEOUT_MS in
+ * particular used to be read by a private helper and appeared in neither.
  */
 export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_AUTO_COMPACT_WINDOW', type: 'int', default: 'model window', description: 'Override the context window size (tokens) used for compaction math.' },
@@ -261,9 +281,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_LONG_CONTEXT_AUTOCOMPACT_THRESHOLD', type: 'int', default: 'off', description: 'Hard token cap to compact earlier than the percentage rule.' },
   { name: 'DISABLE_COMPACT', type: 'flag', default: 'off', description: 'Disable auto-compaction entirely.' },
   { name: 'DISABLE_AUTO_COMPACT', type: 'flag', default: 'off', description: 'Alias of DISABLE_COMPACT.' },
-  { name: 'META_AGENT_JOB_TIMEOUT_MS', type: 'int', default: '1800000', description: 'LocalExecutor watchdog budget per job (ms). 0 disables.' },
   { name: 'META_AGENT_KEEP_TERMINAL_JOBS', type: 'int', default: '200', description: 'Max terminal jobs retained in memory (LRU).' },
-  { name: 'META_AGENT_MCP_STDIO_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one stdio MCP RPC. Range [100,600000].' },
   { name: 'META_AGENT_MCP_STDIO_MAX_RESPONSE_BYTES', type: 'int', default: '10485760', description: 'Maximum stdout bytes retained from one stdio MCP RPC.' },
   { name: 'META_AGENT_IGNORE_USER_PERMISSIONS', type: 'flag', default: 'off', description: 'Ignore on-disk permission configs (hermetic mode).' },
   { name: 'META_AGENT_WEB_FETCH_UA', type: 'string', default: 'built-in UA', description: 'User-Agent header for web_fetch.' },
@@ -278,10 +296,20 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_AUTO_MAX_BUDGET_USD', type: 'float', default: '20', description: 'Whole-session USD ceiling for auto/simple_auto, including sub-agents and gates.' },
   { name: 'META_AGENT_VERIFY_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto verify judge.' },
   { name: 'META_AGENT_VERIFY_MAX_BUDGET_USD', type: 'float', default: '1', description: 'Maximum USD spend for one auto verify judge.' },
-  { name: 'META_AGENT_VERIFY_MAX_DURATION_MS', type: 'int', default: '1800000', description: 'Wall-clock limit for one auto verify judge.' },
   { name: 'META_AGENT_DRIFT_MAX_BUDGET_USD', type: 'float', default: '0.5', description: 'Maximum USD spend for one auto drift judge.' },
+  // ── Timeouts (all overridable by config.json → "timeouts") ────────────────
+  { name: 'META_AGENT_LLM_FIRST_TOKEN_TIMEOUT_MS', type: 'int', default: '90000', description: 'Streaming LLM call: budget to the FIRST stream event. Range [1000,3600000]. Config key: timeouts.llmFirstTokenMs.' },
+  { name: 'META_AGENT_LLM_IDLE_TIMEOUT_MS', type: 'int', default: '60000', description: 'Streaming LLM call: max silence BETWEEN stream events. There is deliberately no total cap. Range [1000,3600000]. Config key: timeouts.llmIdleMs.' },
+  { name: 'META_AGENT_COMPACT_TIMEOUT_MS', type: 'int', default: '720000', description: 'Compaction side-call (non-streaming, bounds the whole call). Range [10000,3600000]. Config key: timeouts.compactMs.' },
+  { name: 'META_AGENT_FLASH_TTFT_MS', type: 'int', default: '30000', description: 'Flash side-calls: first-token half of the derived budget. Range [1000,600000]. Config key: timeouts.flashTtftMs.' },
+  { name: 'META_AGENT_FLASH_TOKENS_PER_SEC', type: 'int', default: '20', description: 'Flash side-calls: assumed output rate used to size the generation half. Range [1,10000]. Config key: timeouts.flashTokensPerSec.' },
+  { name: 'META_AGENT_TOOL_TIMEOUT_MS', type: 'int', default: '180000', description: 'Global per-tool timeout (ms). 0 disables. Config key: timeouts.toolMs.' },
+  { name: 'META_AGENT_MCP_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one HTTP MCP RPC. Range [1000,600000]. Config key: timeouts.mcpMs.' },
+  { name: 'META_AGENT_MCP_STDIO_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one stdio MCP RPC. Range [100,600000]. Config key: timeouts.mcpStdioMs.' },
+  { name: 'META_AGENT_JOB_TIMEOUT_MS', type: 'int', default: '1800000', description: 'LocalExecutor watchdog budget per job (ms). 0 disables. Config key: timeouts.jobMs.' },
+  { name: 'META_AGENT_VERIFY_MAX_DURATION_MS', type: 'int', default: '1800000', description: 'Wall-clock limit for one auto verify judge. Range [10000,3600000]. Config key: timeouts.verifyMaxDurationMs.' },
+  // ── /Timeouts ─────────────────────────────────────────────────────────────
   { name: 'META_AGENT_HOME', type: 'string', default: '~/.meta-agent', description: 'Root directory for all persisted meta-agent state.' },
-  { name: 'META_AGENT_TOOL_TIMEOUT_MS', type: 'int', default: '180000', description: 'Global per-tool timeout (ms). 0 disables.' },
   { name: 'META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS', type: 'int', default: '3', description: 'Auto-mode circuit cap on timed-out-but-running tools.' },
   { name: 'META_AGENT_MAX_TOOL_USE_CONCURRENCY', type: 'int', default: '10', description: 'Max concurrent tool_use executions. Range [1,64].' },
   { name: 'META_AGENT_MAX_TOOL_OUTPUT_CHARS', type: 'int', default: '102400', description: 'Max chars of a bash tool output. Range [1KiB,1MiB].' },

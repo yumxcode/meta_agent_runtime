@@ -124,7 +124,6 @@ export async function extractKnowledgePostSession(deps: ExtractDeps): Promise<{ 
       user: `Session transcript (recent assistant turns):\n\n${transcript}\n\n` +
         'Extract durable experiences and physical anchors per the rules. Return {} fields empty if nothing qualifies.',
       maxTokens: 1_200,
-      timeoutMs: 30_000,
     })
   } catch {
     return zero

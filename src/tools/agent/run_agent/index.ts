@@ -12,6 +12,15 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
     abortSupport: 'cooperative',
     description,
     permission: { category: 'state', checkpointBoundary: 'both' },
+    // Opt out of the kernel's 3-minute per-tool timeout: this tool BLOCKS until
+    // the sub-agent reaches a terminal state, which its own wall-clock cap puts
+    // at up to 31 minutes (DEFAULT_SUB_AGENT_MAX_DURATION_MS + 60 s). Without
+    // this the kernel killed the tool call at 180 s while the sub-agent kept
+    // running detached — the parent never saw the result, and each occurrence
+    // counted toward the auto-mode timed-out-running-tools circuit.
+    // The sibling blocking dispatchers (research_dispatch, paper_search,
+    // experiment_dispatch) already do this; run_agent was the one that did not.
+    timeoutMs: 0,
     inputSchema: {
       type: 'object',
       properties: {
