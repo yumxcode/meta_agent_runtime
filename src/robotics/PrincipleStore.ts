@@ -2,7 +2,7 @@ import { rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile } from '../core/persist/index.js'
+import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile, withFileLock } from '../core/persist/index.js'
 import type {
   KnowledgeConfidenceTier,
   PrincipleEntry,
@@ -67,7 +67,7 @@ export class PrincipleStore {
       updatedAt: now,
     }
     await atomicWriteJson(join(this.dir, `${id}.json`), full)
-    await this._upsertManifest(full).catch(() => undefined)
+    await this._upsertManifest(full).catch(err => warnManifestFailure('upsert', err))
     return id
   }
 
@@ -98,7 +98,7 @@ export class PrincipleStore {
       updatedAt: Date.now(),
     }
     await atomicWriteJson(join(this.dir, `${id}.json`), updated)
-    await this._upsertManifest(updated).catch(() => undefined)
+    await this._upsertManifest(updated).catch(err => warnManifestFailure('upsert', err))
     return updated
   }
 
@@ -121,7 +121,7 @@ export class PrincipleStore {
     } catch {
       return false
     }
-    await this._rebuildManifestFromFiles().catch(() => undefined)
+    await this._rebuildManifestFromFiles().catch(err => warnManifestFailure('rebuild', err))
     return true
   }
 
@@ -170,36 +170,75 @@ export class PrincipleStore {
     return loadWithConcurrency(ids, id => this.load(id))
   }
 
+  /**
+   * Read the manifest, self-healing when it has silently fallen behind the
+   * per-entry files. See PhysicalAnchorStore._loadManifestEntries for the full
+   * rationale — a "valid but stale" manifest hides a principle from search()
+   * forever, which is worse than one extra readdir per call.
+   */
   private async _loadManifestEntries(): Promise<PrincipleEntry[]> {
     const manifest = await readJsonFile<PrincipleManifest>(this.manifestPath)
-    if (isPrincipleManifest(manifest)) return manifest.entries
+    if (!isPrincipleManifest(manifest)) return this._rebuildManifestFromFiles()
+
+    const fileIds = await this.listIds()
+    const manifestIds = new Set(manifest.entries.map(e => e.id))
+    const drifted = fileIds.length !== manifestIds.size || fileIds.some(id => !manifestIds.has(id))
+    if (!drifted) return manifest.entries
+
+    console.warn(
+      `[meta-agent] principle manifest is out of sync ` +
+      `(${manifestIds.size} indexed vs ${fileIds.length} on disk) — rebuilding from files.`,
+    )
     return this._rebuildManifestFromFiles()
   }
 
   private async _rebuildManifestFromFiles(): Promise<PrincipleEntry[]> {
     const entries = await this._loadAllFromFiles()
-    await this._writeManifest(entries).catch(() => undefined)
+    await this._lockManifest(() => this._writeManifestUnlocked(entries))
+      .catch(err => warnManifestFailure('rebuild', err))
     return entries
   }
 
+  /**
+   * Read-modify-write the manifest under an exclusive cross-process lock, so
+   * two concurrent write()/recordOutcomeSignal() calls cannot interleave and
+   * drop an entry. Mirrors ExperienceStore's guard on its shared summary.
+   */
   private async _upsertManifest(entry: PrincipleEntry): Promise<void> {
-    const manifest = await readJsonFile<PrincipleManifest>(this.manifestPath)
-    if (!isPrincipleManifest(manifest)) {
-      await this._rebuildManifestFromFiles()
-      return
-    }
-    const entries = manifest.entries.filter(existing => existing.id !== entry.id)
-    entries.push(entry)
-    await this._writeManifest(entries)
+    const outcome = await this._lockManifest(async () => {
+      const manifest = await readJsonFile<PrincipleManifest>(this.manifestPath)
+      if (!isPrincipleManifest(manifest)) return 'rebuild' as const
+      const entries = manifest.entries.filter(existing => existing.id !== entry.id)
+      entries.push(entry)
+      await this._writeManifestUnlocked(entries)
+      return null
+    })
+    // Rebuild AFTER releasing the lock — _rebuildManifestFromFiles reacquires it.
+    if (outcome === 'rebuild') await this._rebuildManifestFromFiles()
   }
 
-  private async _writeManifest(entries: PrincipleEntry[]): Promise<void> {
+  private _lockManifest<T>(fn: () => Promise<T>): Promise<T> {
+    return withFileLock(this.manifestPath, fn)
+  }
+
+  private async _writeManifestUnlocked(entries: PrincipleEntry[]): Promise<void> {
     await atomicWriteJson(this.manifestPath, {
       schemaVersion: '1.0',
       updatedAt: Date.now(),
       entries,
     } satisfies PrincipleManifest)
   }
+}
+
+/**
+ * A failed manifest write means a principle has gone missing from search.
+ * It used to be swallowed by `.catch(() => undefined)`; make it visible.
+ */
+function warnManifestFailure(op: string, err: unknown): void {
+  console.warn(
+    `[meta-agent] principle manifest ${op} failed — the entry may be invisible to search:`,
+    err instanceof Error ? err.message : String(err),
+  )
 }
 
 function isPrincipleManifest(value: unknown): value is PrincipleManifest {

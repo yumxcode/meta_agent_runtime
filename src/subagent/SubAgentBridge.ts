@@ -1129,12 +1129,68 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     // Generous slack over the runner's own wall-clock cap so a legitimately
     // slow task is never cut off early.
     const maxAgeMs = Math.max((maxDurationMs ?? DEFAULT_SUB_AGENT_MAX_DURATION_MS) * 4, intervalMs * 4)
+    // Re-entrancy guard — same rationale as CampaignMonitor's `tickInFlight`:
+    // setInterval fires on schedule regardless of whether the previous async
+    // tick finished, so a slow disk could otherwise overlap two ticks and
+    // double-fire the terminal notification / finalize().
+    let tickInFlight = false
+    // A transient read failure must not permanently kill the timer. readTask()
+    // collapses "file missing" and "file unreadable right now" into the same
+    // null, and unconditionally clearing on null meant one blip silenced this
+    // sub-agent's completion notification forever.
+    let consecutiveMissing = 0
+    const MAX_CONSECUTIVE_MISSING = 3
     const timer = setInterval(async () => {
+      if (tickInFlight) return
+      tickInFlight = true
+      try {
+        await this._pollTick(taskId, startedAt, maxAgeMs, () => {
+          consecutiveMissing++
+          return consecutiveMissing >= MAX_CONSECUTIVE_MISSING
+        }, () => { consecutiveMissing = 0 })
+      } catch (err) {
+        // The CLI treats unhandledRejection as fatal (process.once →
+        // disposeAndExit(1)). An advisory poll tick must never be able to take
+        // the host down, so nothing escapes this callback.
+        console.warn(
+          `[SubAgentBridge:${taskId}] poll tick failed:`,
+          err instanceof Error ? err.message : String(err),
+        )
+      } finally {
+        tickInFlight = false
+      }
+    }, intervalMs)
+    if (timer.unref) timer.unref()
+    this.pollTimers.set(taskId, timer)
+  }
+
+  /**
+   * One poll tick. Extracted from the interval callback so the re-entrancy
+   * guard, the error boundary and the missing-record tolerance stay readable.
+   *
+   * @param onMissing  called when the record could not be read; returns true
+   *                   once the failure has repeated enough to give up.
+   * @param onPresent  called when the record was read successfully.
+   */
+  private async _pollTick(
+    taskId: SubAgentTaskId,
+    startedAt: number,
+    maxAgeMs: number,
+    onMissing: () => boolean,
+    onPresent: () => void,
+  ): Promise<void> {
+    {
       const record = await readTask(taskId)
       if (!record) {
-        this._clearPollTimer(taskId)
+        if (onMissing()) {
+          this._enqueueNotification(
+            `[${taskId}] ⚠ 任务记录连续多次读取失败，已停止轮询。`,
+          )
+          this._clearPollTimer(taskId)
+        }
         return
       }
+      onPresent()
       if (TERMINAL_STATUSES.has(record.status)) {
         let resultLine: string
         if (record.result?.success) {
@@ -1167,9 +1223,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         )
         this._clearPollTimer(taskId)
       }
-    }, intervalMs)
-    if (timer.unref) timer.unref()
-    this.pollTimers.set(taskId, timer)
+    }
   }
 
   private _clearPollTimer(taskId: SubAgentTaskId): void {

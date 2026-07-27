@@ -2,7 +2,7 @@ import { rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile } from '../core/persist/index.js'
+import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile, withFileLock } from '../core/persist/index.js'
 import type {
   KnowledgeConfidenceTier,
   PhysicalAnchorEntry,
@@ -67,7 +67,7 @@ export class PhysicalAnchorStore {
       updatedAt: now,
     }
     await atomicWriteJson(join(this.dir, `${id}.json`), full)
-    await this._upsertManifest(full).catch(() => undefined)
+    await this._upsertManifest(full).catch(err => warnManifestFailure('upsert', err))
     return id
   }
 
@@ -97,7 +97,7 @@ export class PhysicalAnchorStore {
       updatedAt: Date.now(),
     }
     await atomicWriteJson(join(this.dir, `${id}.json`), updated)
-    await this._upsertManifest(updated).catch(() => undefined)
+    await this._upsertManifest(updated).catch(err => warnManifestFailure('upsert', err))
     return updated
   }
 
@@ -125,7 +125,7 @@ export class PhysicalAnchorStore {
       updatedAt: Date.now(),
     }
     await atomicWriteJson(join(this.dir, `${anchorId}.json`), updated)
-    await this._upsertManifest(updated).catch(() => undefined)
+    await this._upsertManifest(updated).catch(err => warnManifestFailure('upsert', err))
     return true
   }
 
@@ -140,7 +140,7 @@ export class PhysicalAnchorStore {
     } catch {
       return false
     }
-    await this._rebuildManifestFromFiles().catch(() => undefined)
+    await this._rebuildManifestFromFiles().catch(err => warnManifestFailure('rebuild', err))
     return true
   }
 
@@ -217,36 +217,84 @@ export class PhysicalAnchorStore {
     return loadWithConcurrency(ids, id => this.load(id))
   }
 
+  /**
+   * Read the manifest, self-healing when it has silently fallen behind the
+   * per-entry files.
+   *
+   * A "valid but stale" manifest used to be accepted as-is, so an anchor whose
+   * manifest upsert lost a race stayed on disk yet was permanently invisible to
+   * search()/formatForPrompt() — i.e. a physical fact the model was supposed to
+   * be anchored on quietly stopped being injected. The id-set comparison below
+   * costs one readdir and closes that hole even if a write is lost some other
+   * way (crash between the entry write and the manifest write, external edit).
+   */
   private async _loadManifestEntries(): Promise<PhysicalAnchorEntry[]> {
     const manifest = await readJsonFile<PhysicalAnchorManifest>(this.manifestPath)
-    if (isPhysicalAnchorManifest(manifest)) return manifest.entries
+    if (!isPhysicalAnchorManifest(manifest)) return this._rebuildManifestFromFiles()
+
+    const fileIds = await this.listIds()
+    const manifestIds = new Set(manifest.entries.map(e => e.id))
+    const drifted = fileIds.length !== manifestIds.size || fileIds.some(id => !manifestIds.has(id))
+    if (!drifted) return manifest.entries
+
+    console.warn(
+      `[meta-agent] physical anchor manifest is out of sync ` +
+      `(${manifestIds.size} indexed vs ${fileIds.length} on disk) — rebuilding from files.`,
+    )
     return this._rebuildManifestFromFiles()
   }
 
   private async _rebuildManifestFromFiles(): Promise<PhysicalAnchorEntry[]> {
     const entries = await this._loadAllFromFiles()
-    await this._writeManifest(entries).catch(() => undefined)
+    await this._lockManifest(() => this._writeManifestUnlocked(entries))
+      .catch(err => warnManifestFailure('rebuild', err))
     return entries
   }
 
+  /**
+   * Read-modify-write the manifest under an exclusive cross-process lock.
+   *
+   * Without the lock two concurrent write()/recordOutcomeSignal() calls — very
+   * reachable in robotics mode, where experiment_dispatch fans out async
+   * sub-agents alongside the main agent — interleave read→merge→write and one
+   * entry is dropped. ExperienceStore already guards its shared summary this
+   * way; these two stores were the outliers.
+   */
   private async _upsertManifest(entry: PhysicalAnchorEntry): Promise<void> {
-    const manifest = await readJsonFile<PhysicalAnchorManifest>(this.manifestPath)
-    if (!isPhysicalAnchorManifest(manifest)) {
-      await this._rebuildManifestFromFiles()
-      return
-    }
-    const entries = manifest.entries.filter(existing => existing.id !== entry.id)
-    entries.push(entry)
-    await this._writeManifest(entries)
+    const rebuildEntries = await this._lockManifest(async () => {
+      const manifest = await readJsonFile<PhysicalAnchorManifest>(this.manifestPath)
+      if (!isPhysicalAnchorManifest(manifest)) return 'rebuild' as const
+      const entries = manifest.entries.filter(existing => existing.id !== entry.id)
+      entries.push(entry)
+      await this._writeManifestUnlocked(entries)
+      return null
+    })
+    // Rebuild AFTER releasing the lock — _rebuildManifestFromFiles reacquires it.
+    if (rebuildEntries === 'rebuild') await this._rebuildManifestFromFiles()
   }
 
-  private async _writeManifest(entries: PhysicalAnchorEntry[]): Promise<void> {
+  private _lockManifest<T>(fn: () => Promise<T>): Promise<T> {
+    return withFileLock(this.manifestPath, fn)
+  }
+
+  private async _writeManifestUnlocked(entries: PhysicalAnchorEntry[]): Promise<void> {
     await atomicWriteJson(this.manifestPath, {
       schemaVersion: '1.0',
       updatedAt: Date.now(),
       entries,
     } satisfies PhysicalAnchorManifest)
   }
+}
+
+/**
+ * A failed manifest write means a knowledge entry has gone missing from search.
+ * It used to be swallowed by `.catch(() => undefined)`; make it visible.
+ */
+function warnManifestFailure(op: string, err: unknown): void {
+  console.warn(
+    `[meta-agent] physical anchor manifest ${op} failed — the entry may be invisible to search:`,
+    err instanceof Error ? err.message : String(err),
+  )
 }
 
 function isPhysicalAnchorManifest(value: unknown): value is PhysicalAnchorManifest {

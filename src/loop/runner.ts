@@ -210,7 +210,14 @@ function isGraphLevelWake(activationId: string): boolean {
 
 function isDeterministicGraphError(error: unknown): boolean {
   if (error instanceof ExprError) return true
+  // A stack overflow while parsing/evaluating a graph is a property of the
+  // GRAPH, not of the host: retrying it with backoff burns MAX_WAKE_ATTEMPTS
+  // and then mislabels the instance `paused` + "inspect infrastructure".
+  // Expr now caps depth/length so this should be unreachable, but keep the net:
+  // any other deeply-recursive graph structure would hit the same misfiling.
+  if (error instanceof RangeError) return true
   const value = error instanceof Error ? error.message : String(error)
+  if (/maximum call stack size exceeded/i.test(value)) return true
   return [
     /capability .*mismatch/i,
     /graph spec is missing/i,

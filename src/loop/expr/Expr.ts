@@ -114,8 +114,27 @@ const BIN_PRECEDENCE: Record<string, number> = {
   '*': 6, '/': 6,
 }
 
+/**
+ * Hard caps on parser input. The parser is recursive descent, so nesting depth
+ * maps 1:1 onto JS stack frames: without a cap, `'('.repeat(5000)` or
+ * `'!'.repeat(20000)` throws `RangeError: Maximum call stack size exceeded`
+ * instead of an `ExprError`. That matters beyond tidiness — `runner.ts`'s
+ * `isDeterministicGraphError()` only recognises `ExprError` and a fixed set of
+ * message patterns, so a RangeError is misfiled as a TRANSIENT failure: the
+ * wake is retried with backoff MAX_WAKE_ATTEMPTS times and the graph finally
+ * lands in `paused` with "inspect infrastructure", when the truth is a
+ * permanently malformed condition that should be `failed` immediately.
+ *
+ * Graph conditions are hand-or-LLM-authored routing predicates; real ones are
+ * tens of characters. These limits are orders of magnitude above any legitimate
+ * expression while staying far below the ~4k-frame stack budget.
+ */
+const MAX_SOURCE_LENGTH = 4096
+const MAX_PARSE_DEPTH = 64
+
 class Parser {
   private pos = 0
+  private depth = 0
   constructor(private readonly tokens: Token[], private readonly src: string) {}
 
   parse(): Ast {
@@ -127,7 +146,28 @@ class Parser {
   private peek(): Token { return this.tokens[this.pos]! }
   private next(): Token { return this.tokens[this.pos++]! }
 
+  /**
+   * Enter one level of recursion, failing as a normal ExprError (not a stack
+   * overflow) once the cap is hit. Callers MUST pair this with `this.depth--`
+   * in a finally block.
+   */
+  private enter(): void {
+    if (++this.depth > MAX_PARSE_DEPTH) {
+      this.depth--
+      throw new ExprError(`expression nests deeper than ${MAX_PARSE_DEPTH} levels`, this.src)
+    }
+  }
+
   private expression(minPrec: number): Ast {
+    this.enter()
+    try {
+      return this.expressionInner(minPrec)
+    } finally {
+      this.depth--
+    }
+  }
+
+  private expressionInner(minPrec: number): Ast {
     let left = this.unary()
     for (;;) {
       const tok = this.peek()
@@ -145,7 +185,14 @@ class Parser {
     const tok = this.peek()
     if (tok.t === 'op' && (tok.v === '!' || tok.v === '-')) {
       this.next()
-      return { kind: 'unary', op: tok.v, operand: this.unary() }
+      // `!!!!…x` self-recurses once per operator, so it needs the same depth
+      // guard as the parenthesised path.
+      this.enter()
+      try {
+        return { kind: 'unary', op: tok.v, operand: this.unary() }
+      } finally {
+        this.depth--
+      }
     }
     return this.primary()
   }
@@ -183,6 +230,12 @@ class Parser {
  */
 export function parse(src: string, declared?: ReadonlySet<string>): Ast {
   if (typeof src !== 'string' || !src.trim()) throw new ExprError('expression is empty')
+  // Length cap before tokenizing: bounds both the token array and (with
+  // MAX_PARSE_DEPTH) the recursion, so a pathological condition string fails
+  // as a deterministic ExprError rather than a RangeError. See the constants.
+  if (src.length > MAX_SOURCE_LENGTH) {
+    throw new ExprError(`expression exceeds ${MAX_SOURCE_LENGTH} characters (got ${src.length})`)
+  }
   const ast = new Parser(tokenize(src), src).parse()
   if (declared) {
     const missing = collectRefs(ast).filter(name => !declared.has(name))

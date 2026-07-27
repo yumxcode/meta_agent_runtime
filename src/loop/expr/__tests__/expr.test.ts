@@ -114,6 +114,59 @@ describe('strict runtime typing (no coercion)', () => {
   })
 })
 
+describe('parser resource limits (deterministic failure, never a stack overflow)', () => {
+  /**
+   * The parser is recursive descent, so nesting depth maps onto JS stack
+   * frames. Unbounded, `'('.repeat(5000)` threw RangeError — which
+   * `runner.isDeterministicGraphError()` does not recognise, so a permanently
+   * malformed condition was retried with backoff and the graph instance ended
+   * up `paused` with "inspect infrastructure" instead of `failed`.
+   */
+  const deepParens = (n: number) => '('.repeat(n) + 'x' + ')'.repeat(n)
+
+  it('rejects deeply nested parentheses as an ExprError, not a RangeError', () => {
+    for (const n of [100, 5_000]) {
+      try {
+        parse(deepParens(n))
+        expect.unreachable(`depth ${n} should be rejected`)
+      } catch (err) {
+        expect(err, `depth ${n}`).toBeInstanceOf(ExprError)
+        expect(err).not.toBeInstanceOf(RangeError)
+      }
+    }
+  })
+
+  it('rejects deeply nested unary operators as an ExprError', () => {
+    for (const n of [100, 20_000]) {
+      try {
+        parse('!'.repeat(n) + 'x')
+        expect.unreachable(`depth ${n} should be rejected`)
+      } catch (err) {
+        expect(err, `depth ${n}`).toBeInstanceOf(ExprError)
+        expect(err).not.toBeInstanceOf(RangeError)
+      }
+    }
+  })
+
+  it('rejects an over-long source before tokenizing', () => {
+    try {
+      parse('a' + ' + a'.repeat(5_000))
+      expect.unreachable()
+    } catch (err) {
+      expect(err).toBeInstanceOf(ExprError)
+      expect((err as ExprError).message).toMatch(/exceeds \d+ characters/)
+    }
+  })
+
+  it('still accepts realistically nested conditions', () => {
+    // Real graph conditions are shallow; make sure the cap is nowhere near them.
+    const ast = parse('((stale_count >= 2) && (iteration < 10)) || !budget.lifetime.exhausted')
+    expect(evaluate(ast, ctx)).toBe(true)
+    // And a comfortably deep — but legitimate — expression still parses.
+    expect(() => parse(deepParens(30))).not.toThrow()
+  })
+})
+
 describe('AST is plain JSON (frozen-snapshot requirement)', () => {
   it('round-trips through JSON.stringify/parse and still evaluates', () => {
     const ast = parse('stale_count >= 2 && !budget.lifetime.exhausted')

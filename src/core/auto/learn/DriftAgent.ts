@@ -24,6 +24,7 @@
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { TERMINAL_STATUSES } from '../../../subagent/types.js'
 import type { DriftGateFn, DriftVerdict } from '../../../kernel/loop/DriftGate.js'
+import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../../subagent/verdictChannel.js'
 import { readAutoCheckpoint } from '../AutoCheckpointStore.js'
 import { createAutoExperienceStore, renderRecentExperiences } from './AutoExperienceStore.js'
 
@@ -68,16 +69,13 @@ B. 沉淀经验（严格）
 - 调用时**必须在 error_source 注明来源**：严重偏离目标的具体表现、verify 拒绝项、或明确的执行失败/退出码。
 - 没有确凿来源就**不要写**——宁可不写，也不要凭猜测污染经验库。优先沉淀"失败教训"。
 
-输出（关键）：在最后一条消息里只输出一个 JSON 代码块：
-\`\`\`json
-{
+${buildVerdictOutputProtocol(`{
   "drifted": true 或 false,
   "severity": "minor" 或 "major",
   "corrective": ["若偏离，给出具体纠偏步骤", "..."],
   "note": "简述判断依据"
-}
-\`\`\`
-drifted=false 时 corrective 必须为空数组。experience 通过工具写入，不要放进这个 JSON。`
+}`)}
+drifted=false 时 corrective 必须为空数组。experience 通过 \`experience_write\` 工具写入，不要放进这个 JSON。`
 
 function buildDriftTask(goal: string, checkpointJson: string, experienceBlock: string | null): string {
   return [
@@ -121,12 +119,18 @@ export function parseDriftVerdict(text: string): DriftVerdict | null {
   return null
 }
 
-/** Spawn the drift agent and block until terminal; return its summary text. */
+/**
+ * Spawn the drift agent and block until terminal; return its parsed verdict.
+ *
+ * `undefined` = no usable terminal result (timeout / failure / cancel).
+ * `null`      = completed, but neither the `return_result` data payload nor the
+ *               chat-text channel carried a parsable verdict.
+ */
 async function runDriftAgent(
   dispatcher: ISubAgentDispatcher,
   taskDescription: string,
   signal: AbortSignal,
-): Promise<string | null> {
+): Promise<DriftVerdict | null | undefined> {
   const rec = await dispatcher.spawnSubAgent({
     config: {
       taskDescription,
@@ -157,8 +161,8 @@ async function runDriftAgent(
     if (!polled) break
     latest = polled
   }
-  if (latest.status !== 'completed') return null
-  return latest.result?.summary ?? null
+  if (latest.status !== 'completed') return undefined
+  return parseFromVerdictChannels(latest, parseDriftVerdict)
 }
 
 /** Build the drift gate for an auto session. Skips are handled by KernelLoop policy. */
@@ -208,9 +212,10 @@ export function makeAutoDriftGate(deps: AutoDriftGateDeps): DriftGateFn {
 
       const experienceBlock = await renderRecentExperiences(store)
       const task = buildDriftTask(goal, checkpointJson, experienceBlock)
-      const summary = await runDriftAgent(deps.dispatcher, task, signal)
-      if (!summary) return skip('drift agent returned no summary')
-      return parseDriftVerdict(summary) ?? skip('drift agent returned an unparsable verdict')
+      const verdict = await runDriftAgent(deps.dispatcher, task, signal)
+      if (verdict === undefined) return skip('drift agent returned no usable result')
+      if (verdict === null) return skip('drift agent returned an unparsable verdict')
+      return verdict
     } catch (err) {
       return skip(err instanceof Error ? err.message : String(err))
     }

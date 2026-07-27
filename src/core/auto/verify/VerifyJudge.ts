@@ -19,6 +19,7 @@
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES } from '../../../subagent/types.js'
 import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGate.js'
+import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../../subagent/verdictChannel.js'
 import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
 
 export interface AutoVerifyGateDeps {
@@ -119,17 +120,14 @@ ${toolLine}
 2. 必须亲自到工作区取证来对照目标——不要凭空判断，也不要轻信任何"已完成"的说法。
 3. verify 不运行 typecheck/test/lint；你必须仅基于原始目标和亲自读取到的代码/产物作出 LLM 审核判断。
 4. 对每一条判断都要给出具体证据（文件:行号，或只读命令输出）。给不出证据的"完成"不成立。
-5. 预算有限：一旦接近轮次/预算上限，立即输出 JSON 裁决（哪怕 done:false，并在 unfinished/note 里写明还没核到的部分），切勿在没有裁决的情况下耗尽预算。
+5. 预算有限：一旦接近轮次/预算上限，立即给出 JSON 裁决（哪怕 done:false，并在 unfinished/note 里写明还没核到的部分），切勿在没有裁决的情况下耗尽预算。
 
-输出（关键）：在你最后一条消息里，只输出一个 JSON 代码块，schema 如下，不要有多余文字：
-\`\`\`json
-{
+${buildVerdictOutputProtocol(`{
   "done": true 或 false,
   "unfinished": ["未完成项1（具体、可执行）", "..."],
   "evidence": ["证据1（file:line 或 命令+退出码）", "..."],
   "note": "可选：无法判断时的说明"
-}
-\`\`\`
+}`)}
 done=true 时 unfinished 必须为空数组。`
 }
 
@@ -201,13 +199,23 @@ export function parseVerdict(text: string): VerifyVerdict | null {
   return null
 }
 
-/** Spawn the judge and block until terminal, returning its summary text. */
+/**
+ * Spawn the judge and block until terminal, returning its parsed verdict.
+ *
+ * The verdict may arrive through either channel the rubric blesses — the
+ * `return_result` data payload (preferred) or a trailing JSON block in the
+ * chat text — so parsing goes through `parseFromVerdictChannels`.
+ *
+ * Returns `undefined` when the judge produced no usable terminal result at all
+ * (timeout / failure / cancellation) and `null` when it completed but no
+ * channel carried a parsable verdict. The gate maps those to different notes.
+ */
 async function runJudge(
   deps: AutoVerifyGateDeps,
   taskDescription: string,
   signal: AbortSignal,
   snapshotPath: string | null,
-): Promise<string | null> {
+): Promise<VerifyVerdict | null | undefined> {
   const allowedTools = snapshotPath ? JUDGE_TOOLS : JUDGE_TOOLS_READONLY
   const limits = resolveJudgeLimits()
   const rec = await deps.dispatcher.spawnSubAgent({
@@ -254,8 +262,8 @@ async function runJudge(
     latest = polled
     status = polled.status
   }
-  if (latest.status !== 'completed') return null
-  return latest.result?.summary ?? null
+  if (latest.status !== 'completed') return undefined
+  return parseFromVerdictChannels(latest, parseVerdict)
 }
 
 /**
@@ -272,14 +280,15 @@ export function makeAutoVerifyGate(deps: AutoVerifyGateDeps): VerifyGateFn {
 
     try {
       // Isolated read-only snapshot + LLM judge. No typecheck/test/lint are run.
-      const summary = await withReadonlySnapshot(deps.projectDir, async (snapshotPath, diff) => {
+      const verdict = await withReadonlySnapshot(deps.projectDir, async (snapshotPath, diff) => {
         const task = buildJudgeTask(goal, snapshotPath, diff)
         return runJudge(deps, task, signal, snapshotPath)
       })
 
-      if (!summary) return passOpen('verify skipped: judge 未返回可用结果（超时/失败/取消）')
-      const verdict = parseVerdict(summary)
-      if (!verdict) return passOpen('verify skipped: 无法解析 judge 裁决 JSON')
+      // undefined = judge never reached a usable terminal state;
+      // null = it completed but neither output channel carried a parsable verdict.
+      if (verdict === undefined) return passOpen('verify skipped: judge 未返回可用结果（超时/失败/取消）')
+      if (verdict === null) return passOpen('verify skipped: 无法解析 judge 裁决 JSON（return_result.data 与文本通道均未命中 schema）')
       return verdict
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err)

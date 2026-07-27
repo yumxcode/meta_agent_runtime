@@ -75,6 +75,38 @@ export const AUTO_DENIED_TOOL_NAMES = [
   'powershell',
 ] as const
 
+// ── Shared autonomous-mode prompt text ────────────────────────────────────────
+//
+// `auto` and `simple_auto` had byte-identical identity lines and 5 of 7
+// identical currentModeText bullets, maintained as two copies. That is exactly
+// how prompt text goes stale on one branch only (the delegation guidance's
+// "notifications live in the system prompt" line survived a refactor the same
+// way). Both profiles now compose from these constants and supply ONLY their
+// own differing bullet.
+
+/** Identity shared by every unattended mode — goal-oriented, not "Agentic". */
+const AUTONOMOUS_IDENTITY =
+  '你是 Meta-Agent，一个自主运行的工程 Agent，专注于目标的达成与任务的解决。' +
+  '你会在工作区边界内持续自主推进，直到目标达成或遇到真正的阻塞才停下，' +
+  '并在结束时清晰交代已完成与未完成的部分。'
+
+/** currentModeText bullets that are identical across all unattended modes. */
+const AUTONOMOUS_COMMON_BULLETS = [
+  '- **授权范围**：对**项目工作路径内**的写入、编辑、删除、替换等操作（含不可逆操作）你已获明确授权，无需逐次请求确认，直接执行即可。',
+  '- **边界约束**：文件系统的读、写、编辑、删除限定在工作区边界内；对**工作区之外文件**的读/写/删/编辑会被系统直接拒绝。联网（web 搜索/抓取、拉取、下载）与 git 操作（`git pull` 拉取、`git push` 推送，HTTP 与 SSH 两种方式均受支持）已在授权范围内，可直接执行，无需逐次请求确认。',
+  '- **训练与验证策略**：深度学习 / 强化学习等算法训练**不在本地进行**，应尝试调用外部训练环境；本地仅核验语法与单元测试（test），不在本地跑真实训练。',
+  '- **持续推进**：可自行判定的小决策直接做，不要为此停下等待；持续推进直到目标达成或遇到真正的阻塞。',
+]
+
+/** Closing bullet shared by every unattended mode. */
+const AUTONOMOUS_CLOSING_BULLET =
+  '- **终止与总结**：完成或受阻时，给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。'
+
+/** Compose a full currentModeText from the shared bullets + this mode's own. */
+function autonomousModeText(header: string, ...ownBullets: string[]): string {
+  return [header, ...AUTONOMOUS_COMMON_BULLETS, ...ownBullets, AUTONOMOUS_CLOSING_BULLET].join('\n')
+}
+
 export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
   agentic: {
     weight: 1,
@@ -87,18 +119,11 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
   // raise-to-agentic (1 > 1 === false) never clobbers an explicit auto.
   auto: {
     weight: 1,
-    identityLine:
-      '你是 Meta-Agent，一个自主运行的工程 Agent，专注于目标的达成与任务的解决。' +
-      '你会在工作区边界内持续自主推进，直到目标达成或遇到真正的阻塞才停下，' +
-      '并在结束时清晰交代已完成与未完成的部分。',
-    currentModeText:
-      'AUTO — 无人值守自主执行模式：多轮工具调用已启用。\n' +
-      '- **授权范围**：对**项目工作路径内**的写入、编辑、删除、替换等操作（含不可逆操作）你已获明确授权，无需逐次请求确认，直接执行即可。\n' +
-      '- **边界约束**：文件系统的读、写、编辑、删除限定在工作区边界内；对**工作区之外文件**的读/写/删/编辑会被系统直接拒绝。联网（web 搜索/抓取、拉取、下载）与 git 操作（`git pull` 拉取、`git push` 推送，HTTP 与 SSH 两种方式均受支持）已在授权范围内，可直接执行，无需逐次请求确认。\n' +
-      '- **训练与验证策略**：深度学习 / 强化学习等算法训练**不在本地进行**，应尝试调用外部训练环境；本地仅核验语法与单元测试（test），不在本地跑真实训练。\n' +
-      '- **持续推进**：可自行判定的小决策直接做，不要为此停下等待；持续推进直到目标达成或遇到真正的阻塞。\n' +
-      '- **进展留痕**：及时使用 `todo_write` 记录任务分解和完成情况，使用 `progress_note` 更新进度摘要，使用 `artifacts_register` 标记关键产出文件——这些信息用于航向检查和会话恢复。\n' +
-      '- **终止与总结**：完成或受阻时，给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
+    identityLine: AUTONOMOUS_IDENTITY,
+    currentModeText: autonomousModeText(
+      'AUTO — 无人值守自主执行模式：多轮工具调用已启用。',
+      '- **进展留痕**：及时使用 `todo_write` 记录任务分解和完成情况，使用 `progress_note` 更新进度摘要，使用 `artifacts_register` 标记关键产出文件——这些信息用于航向检查和会话恢复。',
+    ),
     compactProfile: 'auto',
     agenticOverrides: {
       promptMode: 'auto',
@@ -120,18 +145,11 @@ export const MODE_PROFILES: Record<SessionMode, ModeProfile> = {
   // weight to agentic/auto so an explicit selection is never clobbered.
   simple_auto: {
     weight: 1,
-    identityLine:
-      '你是 Meta-Agent，一个自主运行的工程 Agent，专注于目标的达成与任务的解决。' +
-      '你会在工作区边界内持续自主推进，直到目标达成或遇到真正的阻塞才停下，' +
-      '并在结束时清晰交代已完成与未完成的部分。',
-    currentModeText:
-      'SIMPLE-AUTO — 轻量无人值守自主执行模式：面向简单、短链路任务，多轮工具调用已启用。\n' +
-      '- **授权范围**：对**项目工作路径内**的写入、编辑、删除、替换等操作（含不可逆操作）你已获明确授权，无需逐次请求确认，直接执行即可。\n' +
-      '- **边界约束**：文件系统的读、写、编辑、删除限定在工作区边界内；对**工作区之外文件**的读/写/删/编辑会被系统直接拒绝。联网（web 搜索/抓取、拉取、下载）与 git 操作（`git pull` 拉取、`git push` 推送，HTTP 与 SSH 两种方式均受支持）已在授权范围内，可直接执行，无需逐次请求确认。\n' +
-      '- **训练与验证策略**：深度学习 / 强化学习等算法训练**不在本地进行**，应尝试调用外部训练环境；本地仅核验语法与单元测试（test），不在本地跑真实训练。\n' +
-      '- **持续推进**：可自行判定的小决策直接做，不要为此停下等待；持续推进直到目标达成或遇到真正的阻塞。\n' +
-      '- **轻量模式**：本模式不启用检查点、航向校正与独立完成度审核——请专注于直接、高效地完成简单任务；若任务变复杂或高风险，建议改用 AUTO 模式。\n' +
-      '- **终止与总结**：完成或受阻时，给出简洁总结——已完成、未完成、阻塞原因与建议的下一步。',
+    identityLine: AUTONOMOUS_IDENTITY,
+    currentModeText: autonomousModeText(
+      'SIMPLE-AUTO — 轻量无人值守自主执行模式：面向简单、短链路任务，多轮工具调用已启用。',
+      '- **轻量模式**：本模式不启用检查点、航向校正与独立完成度审核——请专注于直接、高效地完成简单任务；若任务变复杂或高风险，建议改用 AUTO 模式。',
+    ),
     compactProfile: 'simple_auto',
     agenticOverrides: {
       promptMode: 'simple_auto',

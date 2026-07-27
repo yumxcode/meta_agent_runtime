@@ -94,16 +94,37 @@ const AUTO_CONTINUATION_MARKERS = [
 ]
 
 /**
+ * Trailing punctuation / filler a bare continuation prompt may carry
+ * ("继续。", "继续吧", "continue!", "resume ..."). Anything beyond this is
+ * treated as CONTENT, which makes the prompt a new requirement.
+ */
+const CONTINUATION_TRAILER_RE = /^[\s，。,.!！?？~、…]*(?:吧|啊|呢|一下|下)?[\s，。,.!！?？~、…]*$/
+
+/**
  * Whether an auto-mode prompt is a "continue the current run" signal rather than
- * a NEW goal. Empty input, or a short prompt that is exactly / starts with a
- * continuation marker, counts as continuation. Anything longer is treated as a
- * real new requirement so it becomes the goal.
+ * a NEW goal. Empty input, or a prompt that is EXACTLY a continuation marker
+ * (modulo trailing punctuation / filler), counts as continuation. Anything that
+ * carries additional content is treated as a real new requirement so it becomes
+ * the goal.
+ *
+ * Deliberately NOT a prefix match. The previous rule was
+ * `p.length <= 24 && markers.some(m => p.startsWith(m))`, which swallowed short
+ * REAL requirements — "继续开发登录模块", "接着做支付回调",
+ * "proceed with step 3", "resume the migration" all matched. On the
+ * `--resume` first turn that path keeps the PRIOR checkpoint's goal as the
+ * anchor (SessionRouter.submit), so verify and drift then judge the new work
+ * against the old goal — a failure whose root cause is invisible from the
+ * symptoms (verify never passes, drift always reports "off course").
  */
 export function isAutoContinuationPrompt(prompt: string): boolean {
   const p = prompt.trim().toLowerCase()
   if (p === '') return true
+  // Cheap reject before the per-marker scan; the longest marker is 10 chars and
+  // the trailer allows a few more.
   if (p.length > 24) return false
-  return AUTO_CONTINUATION_MARKERS.some(m => p === m || p.startsWith(m))
+  return AUTO_CONTINUATION_MARKERS.some(m =>
+    p.startsWith(m) && CONTINUATION_TRAILER_RE.test(p.slice(m.length)),
+  )
 }
 
 export class SessionRouter {

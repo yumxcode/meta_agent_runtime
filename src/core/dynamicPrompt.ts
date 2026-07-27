@@ -57,6 +57,8 @@ import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import { buildSubAgentNotificationSection } from '../subagent/notificationSection.js'
 import type { TaskContract } from './contract/types.js'
 import { listAllSkillNames, readSkill, extractSkillDescription } from '../tools/system/skill/index.js'
+import { VOLATILE_SECTION_TAGS } from './volatileSectionTags.js'
+export { VOLATILE_SECTION_TAGS } from './volatileSectionTags.js'
 
 // ── AgentMode ─────────────────────────────────────────────────────────────────
 
@@ -296,7 +298,9 @@ export function buildSkillManifestSection(mode: AgentMode, projectDir: string): 
       }),
     )
 
-    const overflow = names.length > 12 ? `\n  *(${names.length - 12} more — use \`skill list\`)*` : ''
+    const overflow = names.length > 12
+      ? `\n  *(${names.length - 12} more — use \`skill(action="list")\`)*`
+      : ''
 
     return (
       `## Available Skills\n\n` +
@@ -315,13 +319,29 @@ export function buildSkillManifestSection(mode: AgentMode, projectDir: string): 
 // 保留当前日期（时序判断）和知识截止日期（防止模型对截止日后的事件过度自信）。
 // ─────────────────────────────────────────────────────────────────────────────
 
+/**
+ * D2 — env info.
+ *
+ * The date is read LIVE (`new Date()`), not derived from sessionStartMs, and
+ * the section is volatile-with-a-stable-body: it recomputes each turn but its
+ * text only changes when the calendar day rolls over, so the prompt cache is
+ * broken at most once per day rather than never being correct.
+ *
+ * Why this matters: `sessionStartMs` is fixed at construction and the section
+ * used to be memoized, so a `meta-agent loop` daemon or a multi-day unattended
+ * auto run told the model "today is <the day the process booted>" forever —
+ * directly under a bullet insisting that time-sensitive facts must come from
+ * tools rather than memory.
+ *
+ * `sessionStartMs` is still accepted (and used as a fallback when a caller
+ * passes a fixed clock in tests) but no longer drives the displayed date.
+ */
 export function buildEnvInfoSection(
-  sessionId: string,
   sessionStartMs: number,
+  now: () => Date = () => new Date(),
 ): SystemPromptSection {
-  return systemPromptSection('env_info', () => {
-    // 从 sessionStartMs 推导当前日期（YYYY-MM-DD），供模型时序判断使用
-    const currentDate = new Date(sessionStartMs).toISOString().slice(0, 10)
+  return DANGEROUS_uncachedSystemPromptSection('env_info', () => {
+    const currentDate = (now() ?? new Date(sessionStartMs)).toISOString().slice(0, 10)
 
     const envItems = [
       `当前日期：${currentDate}`,
@@ -334,7 +354,11 @@ export function buildEnvInfoSection(
       '当前运行环境信息：',
       ...envItems.map(item => ` - ${item}`),
     ].join('\n')
-  })
+  },
+  'The current date must not freeze at process-boot time in long-running loop / ' +
+  'unattended auto runs. The rendered text is identical within a calendar day, ' +
+  'so the prompt cache is invalidated at most once per day.',
+  )
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -469,31 +493,30 @@ export function buildOutputStyleSection(style?: OutputStyle): SystemPromptSectio
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// D4a — Engineering Calculation Standards  [memoized per mode]
+// D4a — Engineering Calculation Standards  [REMOVED — kept as a no-op section]
 //
-// Injected only for agentic and campaign modes.
-//   direct:   single-turn Q&A — sig-fig rules are noise.
-//   robotics: hardware/controls work — not needed at current stage.
-//   agentic:  multi-step computation — units + precision matter.
-//   campaign: DOE / simulation — full fidelity requirements.
+// This section used to be injected for agentic mode only (`if (mode !==
+// 'agentic') return null`), which is precisely the mode it did not belong to:
+//
+//   • "Match precision to fidelity level (L0: 2-3 sig figs, L1: 3-4, L2: 4-5)"
+//     refers to campaign's multi-fidelity ladder. Agentic has no L0/L1/L2.
+//   • "Mismatched units are a common source of PRE-CALL ABORT" refers to the
+//     V&V pipeline's return state. Agentic runs no V&V pipeline, so the model
+//     was warned about a failure mode that cannot occur.
+//   • "Include units with every numerical value without exception. Never report
+//     a bare number." is actively wrong for a mode whose own identity line is
+//     "专注于代码开发与软件工程任务".
+//
+// It was also the only English section among otherwise-Chinese D1-D7, which
+// fights the D3 language preference. ~320 tokens of dead weight per turn.
+//
+// The builder is retained (returning null) so the section name stays reserved
+// and existing callers/tests keep compiling; genuinely campaign-scoped
+// numerical standards belong in the campaign prompt assembly, not here.
 // ─────────────────────────────────────────────────────────────────────────────
 
-export function buildEngineeringStandardsSection(mode: AgentMode): SystemPromptSection {
-  return systemPromptSection('engineering_standards', () => {
-    // agentic only (campaign assembles its own prompt and never reaches here).
-    if (mode !== 'agentic') return null
-    return `\
-## Engineering Calculation Standards
-
-- **Units**: Include units with every numerical value without exception. Never report a bare number.
-- **Significant figures**: Match precision to fidelity level (L0: 2–3 sig figs, L1: 3–4, L2: 4–5).
-- **Scientific notation**: Use for values > 1e6 or < 1e-3 (e.g. \`1.23e-4 m\` or \`1.23E-4 m\`).
-- **Dimensional consistency**: Verify that input units match tool expectations before calling. \
-Mismatched units are a common source of PRE-CALL ABORT.
-- **Uncertainty**: When a result has known uncertainty, state it explicitly (e.g. \`± 5 %\`).
-- **Assumptions**: List all simplifying assumptions before any analysis. \
-Quantify the impact of key assumptions where possible.`
-  })
+export function buildEngineeringStandardsSection(_mode: AgentMode): SystemPromptSection {
+  return systemPromptSection('engineering_standards', () => null)
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -575,7 +598,8 @@ export function buildDelegationGuidanceSection(mode: AgentMode): SystemPromptSec
       `2. **多个子任务之间有依赖吗？** 无依赖 → 用异步 \`${asyncTool}\` 并发扇出：` +
         '在同一轮发出多个调用，它们会并行执行；每次立即返回 task_id，你不被阻塞。',
       '',
-      '异步完成后，你会在后续某轮系统提示顶部看到「Sub-Agent Notifications」段；' +
+      '异步完成后，你会在后续某轮**用户消息开头 `<context>` 块内的 `<notifications>` 标签**里' +
+        '看到子代理完成通知（不在系统提示里）；' +
         '用 `get_sub_agent_status(task_id)` 取完整结果，必要时 `get_sub_agent_intermediate` 看中途进度、' +
         '`cancel_sub_agent` 取消跑偏的任务、`list_sub_agents` 查总览。',
       '',
@@ -830,11 +854,11 @@ export interface DynamicSectionOptions {
  *   D5  mcp_instructions [memoized]
  *   D6  output_style     [memoized]
  *   D7  summarize_tool_results [memoized]
- *   D11 subagent_notifications [uncached] — when subAgentBridge provided
- *   ── Campaign Assembly (campaign mode only) ──
- *   D8  campaign_context  [uncached]
- *   D9  session_provenance [memoized, invalidated on new records]
- *   D10 phase_guidance    [uncached]
+ *
+ * NOT in this list (all moved to buildVolatileContextSections() → user-message
+ * `<context>` prefix, so the system message stays byte-stable for KV cache):
+ *   D1b memory_content, D11 subagent_notifications,
+ *   D8 campaign_context, D9 session_provenance, D10 phase_guidance
  */
 // ─────────────────────────────────────────────────────────────────────────────
 // Volatile context sections — injected as a user message prefix, NOT into
@@ -949,19 +973,35 @@ export function buildVolatileContextSections(opts: VolatileContextOptions): Syst
   return sections
 }
 
-/** Maps internal section names to the XML tag used in the user message prefix. */
-const VOLATILE_SECTION_TAGS: Record<string, string> = {
-  memory_content:         'memory',
-  experience_index:       'experience_index',
-  physical_anchors:       'physical_anchors',
-  robotics_subagents:     'subagent_status',
-  robotics_progress:      'progress',
-  robotics_team_mode:     'team_status',
-  team_context_boundary:  'context_boundary',
-  subagent_notifications: 'notifications',
-  campaign_context:       'campaign_context',
-  session_provenance:     'session_provenance',
-  phase_guidance:         'phase_guidance',
+/**
+ * Neutralise structural markers inside a volatile section's body so untrusted
+ * content cannot break out of its block and impersonate the user.
+ *
+ * Threat: `<notifications>` embeds a sub-agent's own `summary` text
+ * (SubAgentBridge._enqueueNotification → record.result.summary), and that
+ * sub-agent has just read arbitrary workspace files / fetched arbitrary pages.
+ * A summary containing `\n</context>\n\n---\n\n<instruction>` lands verbatim in
+ * the user message, where S2 tells the model that everything after the first
+ * `---` following `</context>` IS the user's real message.
+ *
+ * Defence in depth (the S2 "不可信数据" hard rule is the other half):
+ *   - `<` in a closing-tag position is escaped, so no `</context>` /
+ *     `</notifications>` inside a body can terminate its block;
+ *   - a line that is exactly `---` is defanged to `- - -`, so no body can forge
+ *     the context/user-message separator.
+ *
+ * Deliberately minimal — this must not mangle ordinary markdown. Horizontal
+ * rules written as `***` or `___` are left alone (they are not the sentinel),
+ * and `---` inside a line (e.g. `a---b`) is untouched.
+ *
+ * This mirrors what the graph path already does via
+ * `GraphAgentPrompt.safeJson()`; the two paths now agree that untrusted content
+ * gets neutralised before it reaches the model.
+ */
+export function sanitizeVolatileSectionBody(content: string): string {
+  return content
+    .replace(/<\//g, '&lt;/')
+    .replace(/^[ \t]*-{3,}[ \t]*$/gm, '- - -')
 }
 
 /**
@@ -989,7 +1029,7 @@ export function formatVolatileContext(
     const content = resolved[i]
     if (!content) continue
     const tag = VOLATILE_SECTION_TAGS[sections[i].name] ?? sections[i].name
-    blocks.push(`<${tag}>\n${content.trim()}\n</${tag}>`)
+    blocks.push(`<${tag}>\n${sanitizeVolatileSectionBody(content.trim())}\n</${tag}>`)
   }
   if (blocks.length === 0) return null
   return `<context>\n${blocks.join('\n\n')}\n</context>`
@@ -1019,7 +1059,7 @@ export function buildDynamicSections(opts: DynamicSectionOptions): SystemPromptS
     // NOTE: D1b (memory_content) has been moved to buildVolatileContextSections().
     // It must NOT be in the system message — DeepSeek KV cache requires the
     // system message to be byte-identical across turns to get prefix cache hits.
-    buildEnvInfoSection(opts.sessionId, opts.sessionStartMs),
+    buildEnvInfoSection(opts.sessionStartMs),
     buildLanguageSection(opts.language),
     buildCurrentModeSection(opts.mode),
     buildEngineeringStandardsSection(opts.mode),

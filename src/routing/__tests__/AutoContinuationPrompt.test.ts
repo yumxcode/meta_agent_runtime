@@ -31,4 +31,29 @@ describe('isAutoContinuationPrompt', () => {
     const longStartsWithMarker = 'continue ' + 'x'.repeat(40)
     expect(isAutoContinuationPrompt(longStartsWithMarker)).toBe(false)
   })
+
+  it('tolerates trailing punctuation and filler on a bare marker', () => {
+    for (const p of ['继续。', '继续吧', '继续 ', '继续，', 'continue!', 'proceed.', 'resume...', 'go on~']) {
+      expect(isAutoContinuationPrompt(p), p).toBe(true)
+    }
+  })
+
+  it('treats a SHORT prompt that merely starts with a marker as a NEW goal', () => {
+    // Regression: the old rule was `length <= 24 && startsWith(marker)`, so all
+    // of these were swallowed as "continue". On the --resume first turn that
+    // keeps the PRIOR checkpoint goal as the anchor, and verify/drift then judge
+    // the new work against the old goal — a failure that is invisible from the
+    // symptoms (verify never passes, drift always reports "off course").
+    for (const p of [
+      '继续开发登录模块',
+      '接着做支付回调',
+      '继续修 bug 然后跑测试',
+      'proceed with step 3',
+      'resume the migration',
+      'continue the refactor',
+      'go on to phase 2',
+    ]) {
+      expect(isAutoContinuationPrompt(p), p).toBe(false)
+    }
+  })
 })

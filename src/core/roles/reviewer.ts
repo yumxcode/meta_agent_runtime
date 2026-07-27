@@ -9,6 +9,7 @@
  */
 import type { ISubAgentDispatcher } from '../../subagent/ISubAgentDispatcher.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES, type SubAgentRecord, type SubAgentConfig } from '../../subagent/types.js'
+import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../subagent/verdictChannel.js'
 import type { OrchVerdict } from './Verdict.js'
 
 /** Read-only toolset for reviewing role nodes (no write vector). */
@@ -24,10 +25,9 @@ export function roleSystemPrompt(role: string, criteria: string): string {
     '【审查标准】',
     criteria,
     '',
-    '输出（关键）：只在最后一条消息里输出一个 JSON 代码块：',
-    '```json',
-    '{ "label": "pass" 或 "fail", "messages": ["若 fail，给出具体未达成项/纠偏步骤"], "note": "判断依据" }',
-    '```',
+    buildVerdictOutputProtocol(
+      '{ "label": "pass" 或 "fail", "messages": ["若 fail，给出具体未达成项/纠偏步骤"], "note": "判断依据" }',
+    ),
     'pass 时 messages 为空数组。',
   ].join('\n')
 }
@@ -131,10 +131,13 @@ export async function runReviewer(
     input.spawnOptions,
   )
   const cost = rec?.result?.costUsd ?? 0
-  if (rec?.status !== 'completed' || !rec.result?.summary) {
+  // A reviewer that used `return_result` may carry its verdict ONLY in the
+  // structured `output` payload, so an empty summary is not by itself "no
+  // result" — readVerdictChannels() decides that.
+  if (rec?.status !== 'completed' || (!rec.result?.summary && rec.result?.output === undefined)) {
     return { action: 'done', label: 'pass', skipped: true, note: `${input.role} unavailable`, data: { costUsd: cost, gateKind: input.role } }
   }
-  const verdict = parseRoleVerdict(rec.result.summary)
+  const verdict = parseFromVerdictChannels(rec, parseRoleVerdict)
   if (!verdict) {
     return { action: 'done', label: 'pass', skipped: true, note: `${input.role} returned an unparsable verdict`, data: { costUsd: cost, gateKind: input.role } }
   }
