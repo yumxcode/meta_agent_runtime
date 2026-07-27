@@ -242,7 +242,7 @@ export type ToolDescription =
 // that enforces them) and re-exported here for backward compatibility. This
 // removes the former kernel→core type inversion: the kernel imports these from
 // its own kernel/types/Permissions.ts instead of reaching up into core.
-// See architecture-review-2026-06-18.md §1.3.
+// See docs/reviews/architecture-review-2026-06-18.md §1.3.
 // Imported (not just re-exported) so they are also usable locally below
 // (e.g. MetaAgentTool.permission).
 import type {

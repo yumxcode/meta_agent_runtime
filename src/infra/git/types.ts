@@ -5,7 +5,7 @@
  * multi-agent orchestration and auto-mode isolated writes), so it lives under
  * `infra/` and depends on these mode-agnostic types instead of robotics ones.
  * `robotics/types.ts` re-exports `GitWorkspaceState` as `RoboticsGitState` for
- * backward compatibility. See architecture-review-2026-06-18.md §1.2.
+ * backward compatibility. See docs/reviews/architecture-review-2026-06-18.md §1.2.
  */
 
 /**

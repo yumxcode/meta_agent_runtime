@@ -1,11 +1,20 @@
 # Dependencies
 node_modules/
+.npm-cache/
 
 # Build output (produced by `npm run build`; published via npm, not git)
 dist/
 
 # Packaged tarballs
 *.tgz
+
+# Local review / transfer staging
+_pack_src_stage*
+_review_src_snapshot*
+_stage_parts/
+_to_delete/
+__wtest__
+_show_worker_prompt.mts
 
 # Logs / debug
 *.log

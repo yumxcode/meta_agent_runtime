@@ -2,7 +2,7 @@
  * Knowledge-store types — the experience-entry schema persisted by
  * ExperienceStore. These live in neutral infra (not robotics) so the store and
  * its auto-mode reuse don't force a mode→mode dependency
- * (architecture-review-2026-06-18.md §1.2 / §5.1 #2b).
+ * (docs/reviews/architecture-review-2026-06-18.md §1.2 / §5.1 #2b).
  *
  * `robotics/types.ts` re-exports these under its historical names
  * (`KnowledgeDomain` → `RoboticsDomain`, `KNOWLEDGE_DOMAINS` → `ROBOTICS_DOMAINS`)

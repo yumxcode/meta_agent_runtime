@@ -1202,7 +1202,7 @@ export class RoboticsSession implements RoboticsCapabilities {
    * The team-collaboration controller for this unit. SessionRouter exposes it to
    * the CLI; the agent-facing team tools use it as their host. The ~20 team
    * operations live on the coordinator now, not this session (cohesion — see
-   * architecture-review-2026-06-18.md §3.1).
+   * docs/reviews/architecture-review-2026-06-18.md §3.1).
    */
   getTeamController(): RoboticsTeamController {
     return this.teamController

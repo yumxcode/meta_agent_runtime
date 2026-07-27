@@ -1,7 +1,7 @@
 /**
  * RoboticsTeamCoordinator — the team-collaboration half of a robotics unit,
  * extracted out of RoboticsSession (which was a god-object — see
- * architecture-review-2026-06-18.md §3.1).
+ * docs/reviews/architecture-review-2026-06-18.md §3.1).
  *
  * It owns the thin "mutate TeamStore → invalidate the prompt section → refresh
  * the watcher" choreography that every team operation shares, plus the Plan-B

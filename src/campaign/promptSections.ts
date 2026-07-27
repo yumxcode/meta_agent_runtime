@@ -3,7 +3,7 @@
  *
  * These live in the campaign package (not core/dynamicPrompt) so the shared
  * prompt builder no longer imports campaign internals — the "fake-shared"
- * coupling called out in architecture-review-2026-06-18.md §1.1. CampaignSession
+ * coupling called out in docs/reviews/architecture-review-2026-06-18.md §1.1. CampaignSession
  * owns its prompt assembly (it injects an enriched `<context>` user-message
  * prefix), so these builders are campaign's to use/inject, exactly like robotics
  * owns R1–R6.

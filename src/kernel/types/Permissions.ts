@@ -6,7 +6,7 @@
  * `core`. `core/types.ts` re-exports them for backward compatibility, so every
  * existing `import { ToolPermissionDeclaration } from '../core/types.js'` keeps
  * working while the kernel no longer has to reach UP into core (which inverted
- * the layering — see architecture-review-2026-06-18.md §1.3).
+ * the layering — see docs/reviews/architecture-review-2026-06-18.md §1.3).
  */
 
 /** Broad capability class used by the kernel permission policy. */

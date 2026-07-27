@@ -7,7 +7,7 @@
  *   - `RoboticsSession implements` them → the compiler verifies the session
  *     actually provides every advertised capability (renaming/removing a method
  *     now fails the build instead of silently returning `undefined` at runtime
- *     via the old `as any` casts — see architecture-review-2026-06-18.md §2.1);
+ *     via the old `as any` casts — see docs/reviews/architecture-review-2026-06-18.md §2.1);
  *   - the router imports them type-only and narrows `_impl` through ONE typed
  *     cast guarded by `mode === 'robotics'`, never per-accessor `as any`.
  */

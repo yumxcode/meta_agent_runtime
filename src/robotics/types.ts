@@ -175,7 +175,7 @@ export interface HardwareProfileData {
 
 // ── Git state (used in ProjectStore) ─────────────────────────────────────────
 // Git worktree state now lives in neutral infra (GitWorkspaceManager moved out
-// of robotics/ — see architecture-review-2026-06-18.md §1.2). Imported for local
+// of robotics/ — see docs/reviews/architecture-review-2026-06-18.md §1.2). Imported for local
 // use below (RoboticsProjectState.git) and re-exported under the original name
 // so existing robotics references keep working unchanged.
 import type { GitWorkspaceState } from '../infra/git/types.js'

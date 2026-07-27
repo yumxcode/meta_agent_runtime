@@ -1,7 +1,7 @@
 /**
  * ExperienceWorkingSetManager — the "recall the right past experiences for this
  * turn" engine, extracted out of RoboticsSession (god-object — see
- * architecture-review-2026-06-18.md §3.1).
+ * docs/reviews/architecture-review-2026-06-18.md §3.1).
  *
  * Responsibility: given the user prompt + analyzed intent, pick a small set of
  * stored experiences that materially apply (local heuristic ranking + an

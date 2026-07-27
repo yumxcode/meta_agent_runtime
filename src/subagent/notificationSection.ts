@@ -4,7 +4,7 @@
  * Builds the D-SubAgent dynamic system-prompt block from a SubAgentBridge's
  * public state. This is a PROMPT concern, deliberately kept out of the
  * SubAgentBridge scheduler class (which owns lifecycle/scheduling/budget), so
- * the scheduler file stays focused. See architecture-review-2026-06-18.md §3.2.
+ * the scheduler file stays focused. See docs/reviews/architecture-review-2026-06-18.md §3.2.
  */
 import type { SubAgentBridge } from './SubAgentBridge.js'
 
