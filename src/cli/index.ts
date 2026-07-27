@@ -99,6 +99,7 @@ import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { CLI_VERSION } from './version.js'
+import { formatLocalClock, formatLocalTimestamp } from '../loop/localTime.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -5232,7 +5233,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
   // seats can resolve read_file/grep/glob/bash/etc. — without this
   // the bridge's tool registry is empty and every seat fails "No tools resolved".
   for (const tool of graphAgentTools) router.registerTool(tool)
-  const stamp = (): string => new Date().toISOString().slice(11, 19)
+  const stamp = (): string => formatLocalClock(Date.now())
   try {
     const warmed = await router.prewarmBackend()
     if (!warmed) throw new Error('could not create the loop backend (auto mode)')
@@ -5286,7 +5287,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
 
 function createGraphProgressReporter(): (event: GraphProgressEvent) => void {
   return event => {
-    const time = new Date(event.at).toISOString().slice(11, 19)
+    const time = formatLocalClock(event.at)
     const loopId = event.instanceId.length > 18 ? `${event.instanceId.slice(0, 15)}…` : event.instanceId
     const prefix = dim(`[${time}] [${loopId}/${event.nodeId} a${event.attempt}:s${event.segment}]`)
     const detail = (value: string): string => terminalText(value.replace(/\s+/g, ' ').trim().slice(0, 300))
@@ -5305,13 +5306,13 @@ function createGraphProgressReporter(): (event: GraphProgressEvent) => void {
       return
     }
     if (event.type === 'phase_retrying') {
-      const timing = event.wakeAt ? `；${new Date(event.wakeAt).toISOString()} 后重试` : '；等待重新调度'
+      const timing = event.wakeAt ? `；${formatLocalTimestamp(event.wakeAt)} 后重试` : '；等待重新调度'
       console.log(`${prefix} ${yellow('↻')} ${event.replay ? '重放' : '重试'}：${detail(event.reason)}${timing}`)
       return
     }
     if (event.type === 'phase_parked') {
       const target = event.wakeAt
-        ? `至 ${new Date(event.wakeAt).toISOString()}`
+        ? `至 ${formatLocalTimestamp(event.wakeAt)}`
         : event.eventName ? `等待事件 ${detail(event.eventName)}` : '等待恢复'
       console.log(`${prefix} ${yellow('⏸')} 挂起${target}：${detail(event.reason)}`)
       return

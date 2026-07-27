@@ -36,6 +36,7 @@ import { deliverGraphEvent } from './ingress/GraphEventDelivery.js'
 import { runUntilQuiescent, tickOnce } from './runner.js'
 import { WakeStore } from './wake/WakeStore.js'
 import { canonicalWorkspaceRoot, ensureWorkspaceIdentity, forkWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
+import { formatLocalTimestamp } from './localTime.js'
 
 export interface LoopCliDeps {
   projectDir: string
@@ -287,14 +288,14 @@ async function inspect(args: string[], deps: LoopCliDeps): Promise<string> {
     `state: version=${snapshot.state.version} values=${JSON.stringify(snapshot.state.values)}`,
     `activations: ${JSON.stringify(counts)} total=${snapshot.instance.activationCount}`,
     `cost: $${snapshot.instance.totalCostUsd.toFixed(4)}`,
-    `wakes: ${wakes.map(wake => `${wake.kind}:${wake.activationId ?? '-'}@${new Date(wake.fireAt).toISOString()}[${wake.status}]`).join(', ') || '(none)'}`,
+    `wakes: ${wakes.map(wake => `${wake.kind}:${wake.activationId ?? '-'}@${formatLocalTimestamp(wake.fireAt)}[${wake.status}]`).join(', ') || '(none)'}`,
     `active phases: ${active.length || '(none)'}`,
     ...active.map(item => {
       const node = graph.nodes[item.nodeId]!
       const phase = graphPhaseLabel(node, item.nodeId)
       const timing = item.status === 'running'
         ? `running for ${formatElapsed(now - (item.firstStartedAt ?? item.updatedAt))}`
-        : item.wakeAt ? `waiting until ${new Date(item.wakeAt).toISOString()}` : 'waiting for event'
+        : item.wakeAt ? `waiting until ${formatLocalTimestamp(item.wakeAt)}` : 'waiting for event'
       const reason = item.summary ? ` — ${item.summary}` : ''
       return `  ${item.nodeId} [${item.status}] a${item.attempt}:s${item.segmentCount ?? 0} ${timing}: ${phase}${reason}`
     }),
@@ -324,7 +325,7 @@ async function timeline(args: string[], deps: LoopCliDeps): Promise<string> {
     `timeline: ${instanceId}  showing=${selected.length}/${journal.length}`,
     ...selected.map(item => {
       const event = item.event
-      const prefix = `#${item.sequence} ${new Date(event.at).toISOString()} ${event.type}`
+      const prefix = `#${item.sequence} ${formatLocalTimestamp(event.at)} ${event.type}`
       switch (event.type) {
         case 'graph_created': return `${prefix} status=${event.instance.status} entries=${event.activations.map(a => a.nodeId).join(',')}`
         case 'activation_claimed': return `${prefix} node=${event.activation.nodeId} attempt=${event.activation.attempt} segment=${event.activation.segmentCount ?? 0}`
@@ -426,7 +427,7 @@ async function events(args: string[], deps: LoopCliDeps): Promise<string> {
   })
   return [
     `events: ${instanceId}  status=${requestedStatus ?? 'all'}  count=${selected.length}`,
-    ...selected.map(item => `${item.id}  ${item.status}  ${item.name}${externalDeliveryLabel(item)}  created=${new Date(item.createdAt).toISOString()}${item.consumedAt ? `  consumed=${new Date(item.consumedAt).toISOString()}` : ''}`),
+    ...selected.map(item => `${item.id}  ${item.status}  ${item.name}${externalDeliveryLabel(item)}  created=${formatLocalTimestamp(item.createdAt)}${item.consumedAt ? `  consumed=${formatLocalTimestamp(item.consumedAt)}` : ''}`),
   ].join('\n')
 }
 
@@ -674,7 +675,7 @@ async function tick(args: string[], deps: LoopCliDeps): Promise<string> {
 
 async function workspaceInfo(deps: LoopCliDeps): Promise<string> {
   const identity = await ensureWorkspaceIdentity(deps.projectDir)
-  return `workspaceId: ${identity.workspaceId}\nroot: ${await canonicalWorkspaceRoot(deps.projectDir)}\ncreatedAt: ${new Date(identity.createdAt).toISOString()}`
+  return `workspaceId: ${identity.workspaceId}\nroot: ${await canonicalWorkspaceRoot(deps.projectDir)}\ncreatedAt: ${formatLocalTimestamp(identity.createdAt)}`
 }
 
 async function workspaceFork(deps: LoopCliDeps): Promise<string> {
@@ -691,7 +692,7 @@ async function workspaceFork(deps: LoopCliDeps): Promise<string> {
 async function schedulers(): Promise<string> {
   const snapshot = await new HostSchedulerCoordinator().snapshot()
   return snapshot.workspaces.length
-    ? snapshot.workspaces.map(item => `${item.workspaceId} pid=${item.pid} heartbeat=${new Date(item.heartbeatAt).toISOString()} root=${item.workspaceRoot}`).join('\n')
+    ? snapshot.workspaces.map(item => `${item.workspaceId} pid=${item.pid} heartbeat=${formatLocalTimestamp(item.heartbeatAt)} root=${item.workspaceRoot}`).join('\n')
     : '(no live loop schedulers)'
 }
 
@@ -705,7 +706,7 @@ async function hostCapacity(): Promise<string> {
     `graph ticks: ${snapshot.leases.filter(item => item.kind === 'graph_tick').length}/${snapshot.maxConcurrentGraphTicks}`,
     `model calls: ${snapshot.leases.filter(item => item.kind === 'model_call').length}/${snapshot.maxConcurrentModelCalls}`,
     `provider circuits: ${circuits.length
-      ? circuits.map(item => `${item.providerId}:${item.state}@${new Date(item.retryAt).toISOString()}`).join(', ')
+      ? circuits.map(item => `${item.providerId}:${item.state}@${formatLocalTimestamp(item.retryAt)}`).join(', ')
       : '(closed)'}`,
   ].join('\n')
 }
