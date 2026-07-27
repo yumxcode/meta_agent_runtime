@@ -845,7 +845,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
 3. 不要凭记忆猜 ABI。先调用 graph_reference(example)，再只按实际缺口调用 overview、nodes、workspace、lanes、control、capabilities；不要一次加载全部 section，也不要用不完整 skeleton 试探 graph_validate。
 4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 业务终态”开始，只添加 Ledger 明确要求的边界；需要作者处理节点预算耗尽时再增加 exhausted 终态/边。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。优先让同一个 persistent Agent 通过 mode/input 执行常规轮次、反思和 pivot；只有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
-5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
+5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
 
 【稳定语义边界】
 - Agent 直接读写真实项目 Workspace。Lane.workspace 声明 read、write、deny；write mode 只有 owned、atomic_replace、append_only。Kernel 不复制、不投影、不保存第二份用户数据。
@@ -885,7 +885,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - 若最终文件只允许保存评估通过、真正新增或已批准的数据，生产 Agent 先输出候选数据，评估后由单一 writer 提交；不要在评估前写入最终 append-only 文件。
 
 【Traceability 与完成标准】
-- 每个 hard constraint 恰有一条 mapping，graphRefs 必须指向最终 Graph 中真实存在的 JSON pointer。Transition 位于数组，必须用数值下标（例如 /transitions/0/updates/0），绝不能把 transition id 拼进指针；不需要指到单条边时优先使用稳定的 /nodes、/lanes 或 /limits 引用。
+- 每个 hard constraint 恰有一条 mapping，graphRefs 必须指向最终 Graph 中真实存在的**标准 JSON pointer**。Transition 位于数组，必须用数值下标（例如 /transitions/0/updates/0），绝不能把 transition id 拼进指针，也不要在这里使用 graph_patch_validate 的 @id= 选择器语法（那套只用于打补丁，写进 graphRefs 会被校验判为不存在的指针）；不需要指到单条边时优先使用稳定的 /nodes、/lanes 或 /limits 引用。
 - taskSpec 重点解释：Lane/节点合并选择、确定性真值与阈值、Workspace 路径与 owner、外部能力缺口、预算和人工审查点。
 - 验证标准是可执行、安全、可恢复和来源语义完整；不得因为节点数量、名称、Research/Release/Compliance 风格或未采用示例拓扑而自我否决。`
 }

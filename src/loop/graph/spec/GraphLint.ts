@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime'
   at: string
   message: string
 }
@@ -25,6 +25,7 @@ export interface GraphLintFinding {
 export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   const findings: GraphLintFinding[] = []
   lintAgentWorkspacePrompts(spec, findings)
+  lintAgentBudgetWallTime(spec, findings)
   lintPrecomputedRouting(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
@@ -34,6 +35,38 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintStaticEffectIdempotency(spec, findings)
   lintTerminalFanOut(spec, findings)
   return findings
+}
+
+/**
+ * Every Agent segment needs a basic wall-clock window for the model response,
+ * tool execution and durable persistence. The 5-minute floor used to live only
+ * in the Distill Compiler/Reviewer prose prompts, which meant a probabilistic
+ * LLM reviewer was the sole enforcer of a purely mechanical, high-precision
+ * invariant. Making it an error-level lint moves that enforcement into
+ * deterministic code: Distill treats it as blocking (error-level lint blocks
+ * lowering), while `loop create` for a hand-authored graph only PRINTS it — a
+ * human may still overrule (see the contract note at the top of this file). ABI
+ * Validate has already guaranteed any present wallTimeMs is a positive finite
+ * number, so here we only add the floor and the "must be declared" requirement.
+ */
+export const AGENT_MIN_WALLTIME_MS = 300_000
+
+function lintAgentBudgetWallTime(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
+    if (!node || node.type !== 'agent') continue
+    const wallTimeMs = node.budget?.wallTimeMs
+    if (wallTimeMs === undefined) {
+      findings.push({
+        level: 'error', rule: 'agent-budget-walltime', at: `nodes.${nodeId}.budget.wallTimeMs`,
+        message: `agent node must declare budget.wallTimeMs (>= ${AGENT_MIN_WALLTIME_MS}ms / 5 min); it reserves a basic window for the model response, tool execution and durable persistence and does not replace turns/usd/lifetime budgets`,
+      })
+    } else if (typeof wallTimeMs === 'number' && Number.isFinite(wallTimeMs) && wallTimeMs < AGENT_MIN_WALLTIME_MS) {
+      findings.push({
+        level: 'error', rule: 'agent-budget-walltime', at: `nodes.${nodeId}.budget.wallTimeMs`,
+        message: `agent budget.wallTimeMs ${wallTimeMs} is below the ${AGENT_MIN_WALLTIME_MS}ms (5 min) floor; raise it so one segment can finish the model response, tools and persistence`,
+      })
+    }
+  }
 }
 
 /** A lifetime Activation cap cannot release a bounded graph that is already

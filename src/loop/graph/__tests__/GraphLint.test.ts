@@ -9,7 +9,7 @@ function graph(): LoopGraphSpec {
       work: { context: 'persistent', workspace: { read: ['state'], write: [{ path: 'state', mode: 'owned' }], deny: [] } },
     },
     nodes: {
-      work: { type: 'agent', lane: 'work', prompt: 'Perform one bounded iteration.', tools: ['read_file'] },
+      work: { type: 'agent', lane: 'work', prompt: 'Perform one bounded iteration.', tools: ['read_file'], budget: { turns: 20, usd: 5, wallTimeMs: 300_000 } },
       done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
     },
     transitions: [
@@ -24,6 +24,29 @@ describe('graph write-surface lint', () => {
   it('keeps the canonical example and a clean fixture lint-free', () => {
     expect(lintLoopGraph(CANONICAL_GRAPH_DISTILL_EXAMPLE)).toEqual([])
     expect(lintLoopGraph(graph())).toEqual([])
+  })
+
+  it('requires every agent node to declare budget.wallTimeMs >= the 5-minute floor', () => {
+    // Missing budget entirely.
+    const missing = graph()
+    const missingWork = missing.nodes.work
+    if (missingWork.type !== 'agent') throw new Error('expected agent')
+    delete missingWork.budget
+    expect(lintLoopGraph(missing).filter(f => f.rule === 'agent-budget-walltime').map(f => f.level)).toEqual(['error'])
+
+    // Present but below the floor.
+    const tooSmall = graph()
+    const tooSmallWork = tooSmall.nodes.work
+    if (tooSmallWork.type !== 'agent') throw new Error('expected agent')
+    tooSmallWork.budget = { turns: 20, usd: 5, wallTimeMs: 299_999 }
+    expect(lintLoopGraph(tooSmall).filter(f => f.rule === 'agent-budget-walltime').map(f => f.level)).toEqual(['error'])
+
+    // Exactly the floor is accepted (inclusive).
+    const atFloor = graph()
+    const atFloorWork = atFloor.nodes.work
+    if (atFloorWork.type !== 'agent') throw new Error('expected agent')
+    atFloorWork.budget = { turns: 20, usd: 5, wallTimeMs: 300_000 }
+    expect(lintLoopGraph(atFloor).filter(f => f.rule === 'agent-budget-walltime')).toEqual([])
   })
 
   it('flags prompts that direct writes outside the project (the X1 v3 failure)', () => {

@@ -152,6 +152,7 @@ describe('Distill Architect checkpoint', () => {
     }
     lossyGraph.nodes.work = {
       type: 'agent', lane: 'work', prompt: 'Evaluate one round.', tools: [], maxAttempts: 1,
+      budget: { turns: 20, usd: 5, wallTimeMs: 300_000 },
       outputSchema: {
         type: 'object', required: ['new_findings_count', 'trend', 'is_result_better'],
         properties: {
@@ -307,7 +308,7 @@ describe('Distill Architect checkpoint', () => {
     linted.lanes = { work: { context: 'persistent', workspace: { read: [], write: [], deny: ['.git'] } } }
     linted.nodes.work = {
       type: 'agent', lane: 'work', prompt: 'Write `state/progress.json` after the bounded iteration.',
-      tools: ['write_file'], maxAttempts: 1,
+      tools: ['write_file'], maxAttempts: 1, budget: { turns: 20, usd: 5, wallTimeMs: 300_000 },
     }
     const corrected = structuredClone(linted)
     corrected.lanes.work!.workspace.write = [{ path: 'state/progress.json', mode: 'atomic_replace' }]
@@ -349,7 +350,7 @@ describe('Distill Architect checkpoint', () => {
     linted.lanes = { work: { context: 'persistent', workspace: { read: [], write: [], deny: ['.git'] } } }
     linted.nodes.work = {
       type: 'agent', lane: 'work', prompt: 'Write `state/progress.json` after the bounded iteration.',
-      tools: ['write_file'], maxAttempts: 1,
+      tools: ['write_file'], maxAttempts: 1, budget: { turns: 20, usd: 5, wallTimeMs: 300_000 },
     }
     const corrected = structuredClone(linted)
     corrected.lanes.work!.workspace.write = [{ path: 'state/progress.json', mode: 'atomic_replace' }]
