@@ -98,7 +98,6 @@ import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js'
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
-import { getWslFilesystemWarning } from './wslCheck.js'
 import { CLI_VERSION } from './version.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
@@ -5582,18 +5581,6 @@ async function main(): Promise<void> {
   const bwrapWarning = getMissingBwrapWarning()
   if (bwrapWarning) {
     process.stderr.write(`${yellow(bwrapWarning)}\n`)
-  }
-  // WSL2 is the supported way to run on a Windows host, but a workspace (or
-  // $META_AGENT_HOME) on /mnt/<drive> breaks link()/rename()/mtime — the three
-  // primitives the durable Loop scheduler lock and WakeStore rely on.
-  const wslWarning = getWslFilesystemWarning({
-    paths: [
-      { label: 'workspace', path: resolve(opts.workspace ?? process.cwd()) },
-      { label: 'META_AGENT_HOME', path: META_AGENT_HOME },
-    ],
-  })
-  if (wslWarning) {
-    process.stderr.write(`${yellow(wslWarning)}\n`)
   }
   // Loop runtime dispatch first: its pure-code subcommands (list/inspect/…) must
   // work without an API key; runLoopCommand asserts the key only when it needs a
