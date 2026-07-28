@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir'
   at: string
   message: string
 }
@@ -26,6 +26,8 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   const findings: GraphLintFinding[] = []
   lintAgentWorkspacePrompts(spec, findings)
   lintAgentBudgetWallTime(spec, findings)
+  lintLaneWriteOverlap(spec, findings)
+  lintRedundantMkdir(spec, findings)
   lintPrecomputedRouting(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
@@ -288,6 +290,70 @@ function normalizePromptPath(raw: string): string | null {
 function pathCoveredByWriteRule(target: string, declared: string): boolean {
   const prefix = declared.replace(/^\.\//, '').replace(/\/+$/, '')
   return target === prefix || target.startsWith(`${prefix}/`)
+}
+
+function normalizeWritePrefix(path: string): string {
+  return path.replace(/^\.\//, '').replace(/\/+$/, '')
+}
+
+/**
+ * "One path may have only one owning Lane" (see LaneWorkspaceContract.write).
+ * A single-writer boundary is the mechanism Distill relies on to keep durable
+ * state consistent, and two lanes claiming the same prefix silently dissolves
+ * it. The check is a pure prefix comparison over declared rules, so it belongs
+ * in deterministic code rather than in the semantic reviewer's prose contract.
+ */
+function lintLaneWriteOverlap(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const claims: Array<{ laneId: string; prefix: string }> = []
+  for (const [laneId, lane] of Object.entries(spec.lanes ?? {})) {
+    for (const rule of lane?.workspace?.write ?? []) {
+      if (typeof rule?.path === 'string') claims.push({ laneId, prefix: normalizeWritePrefix(rule.path) })
+    }
+  }
+  const reported = new Set<string>()
+  for (let i = 0; i < claims.length; i++) {
+    for (let j = i + 1; j < claims.length; j++) {
+      const a = claims[i]!, b = claims[j]!
+      if (a.laneId === b.laneId) continue
+      if (!pathCoveredByWriteRule(a.prefix, b.prefix) && !pathCoveredByWriteRule(b.prefix, a.prefix)) continue
+      const key = [a.laneId, a.prefix, b.laneId, b.prefix].sort().join('|')
+      if (reported.has(key)) continue
+      reported.add(key)
+      findings.push({
+        level: 'error', rule: 'lane-write-overlap', at: `lanes.${a.laneId}.workspace.write`,
+        message: `lanes '${a.laneId}' ('${a.prefix}') and '${b.laneId}' ('${b.prefix}') both claim write access to overlapping paths; one path may have only one owning Lane — narrow one prefix or route the writes through the single owning Lane`,
+      })
+    }
+  }
+}
+
+const MKDIR_RE = /\bmkdir\b(?:\s+-\w+)*\s+(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\s;&|]+))/gi
+
+/**
+ * write_file / append_file create missing parent directories for an approved
+ * target, so an extra `bash mkdir` is dead weight — and worse, it tempts the
+ * Compiler to widen a precise per-file rule into an `owned` directory just so
+ * the mkdir is permitted. Cheap to detect textually; keep it out of the
+ * reviewer's budget.
+ */
+function lintRedundantMkdir(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
+    if (!node || node.type !== 'agent') continue
+    const lane = spec.lanes?.[node.lane]
+    const text = [node.prompt, node.systemInstructions, lane?.agentProfile?.systemInstructions]
+      .filter((part): part is string => typeof part === 'string').join('\n')
+    for (const match of text.matchAll(MKDIR_RE)) {
+      const raw = match[1] ?? match[2] ?? match[3] ?? match[4]
+      const target = raw ? normalizePromptPath(raw) : undefined
+      if (!target) continue
+      const covered = (lane?.workspace?.write ?? []).some(rule => pathCoveredByWriteRule(target, rule.path))
+      if (!covered) continue
+      findings.push({
+        level: 'warning', rule: 'redundant-mkdir', at: `nodes.${nodeId}.prompt`,
+        message: `prompt runs 'mkdir ${target}' for a path lane '${node.lane}' already covers; write_file/append_file create missing parent directories for approved targets — drop the mkdir instead of widening the write rule to an owned directory`,
+      })
+    }
+  }
 }
 
 const PRECOMPUTED_BOOLEAN_RE = /\$output\.((?:is|should|need|needs|has)_[A-Za-z0-9_]+)\s*[!=]=\s*(?:true|false)/

@@ -53,6 +53,7 @@ import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } from './pasteAccumulator.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { sanitizeTerminalPreview, sanitizeTerminalText, TerminalSanitizer } from './terminalSanitizer.js'
+import { referencesDistillTrace } from './distillTraceGuard.js'
 import { HardwareProfile } from '../robotics/HardwareProfile.js'
 import { ExperiencePendingStore } from '../robotics/ExperiencePendingStore.js'
 import { ExperienceStore } from '../robotics/ExperienceStore.js'
@@ -543,6 +544,16 @@ function buildLoopCliOptions(
   globalArgs: string[],
   loopArgs: string[],
 ): CliOptions {
+  // `--debug` / `--show-thinking` are global observability flags, but they read
+  // as trailing options, so users naturally type them AFTER the `loop` token —
+  // where the split above routes them into loopArgs and they vanish. Worse,
+  // positionalValues() treats any unknown `--flag` as value-taking and would
+  // swallow the following positional (`loop distill --debug f1_loop.md` loses
+  // the requirement path). Hoist them out of the subcommand args first so
+  // placement never silently disables debug capture.
+  const hoistedDebug = takeBooleanFlag(loopArgs, ['--debug', '-d'])
+  const hoistedThinking = takeBooleanFlag(hoistedDebug.args, ['--show-thinking'])
+  const passthroughLoopArgs = hoistedThinking.args
   let g: ReturnType<typeof parseArgs>
   try {
     g = parseArgs({
@@ -553,6 +564,10 @@ function buildLoopCliOptions(
         'base-url': { type: 'string', short: 'b' },
         model:      { type: 'string' },
         json:       { type: 'boolean', short: 'j', default: false },
+        // Declared explicitly: under `strict: false` an undeclared `-d` lands
+        // in values['d'], never values['debug'].
+        debug:      { type: 'boolean', short: 'd', default: false },
+        'show-thinking': { type: 'boolean', default: false },
       },
       strict: false,
       allowPositionals: true,
@@ -581,8 +596,8 @@ function buildLoopCliOptions(
     fallbackModel: undefined,
     system: undefined,
     json:   g.values['json'] as boolean,
-    debug: false,
-    showThinking: false,
+    debug: (g.values['debug'] as boolean) || hoistedDebug.present,
+    showThinking: (g.values['show-thinking'] as boolean) || hoistedThinking.present,
     yes: true,
     autoWorktreeCleanup: undefined,
     prompt: null,
@@ -590,8 +605,16 @@ function buildLoopCliOptions(
     maxBudgetUsd: undefined,
     resume: undefined,
     sessionDir: undefined,
-    loopCommand: { name, args: loopArgs },
+    loopCommand: { name, args: passthroughLoopArgs },
   }
+}
+
+/** Remove every occurrence of `names` from `args` without disturbing the order
+ * of what remains. Used to lift global boolean flags out of `loop` subcommand
+ * args, which are otherwise passed through verbatim. */
+function takeBooleanFlag(args: string[], names: readonly string[]): { args: string[]; present: boolean } {
+  const kept = args.filter(arg => !names.includes(arg))
+  return { args: kept, present: kept.length !== args.length }
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -5415,7 +5438,9 @@ function printDistillDraft(result: Pick<DistillGraphResult, 'graph' | 'taskSpec'
   const graph = result.graph
   const workspaceWrites = Object.values(graph.lanes).reduce((sum, lane) => sum + (lane.workspace.write?.length ?? 0), 0)
   console.log(`${bold('draft')} ${out}  graph=${graph.id}@v${graph.version}  constraints=${result.constraints.constraints.length}  nodes=${Object.keys(graph.nodes).length}  transitions=${graph.transitions.length}  lanes=${Object.keys(graph.lanes).length}  workspace-writes=${workspaceWrites}  review=${result.semanticReview.accepted ? 'accepted' : 'rejected'}`)
-  for (const warning of result.semanticReview.warnings ?? []) console.log(`${yellow('warning:')} ${sanitizeTerminalPreview(warning, 300)}`)
+  // Advisory findings are recorded rather than blocking, so the draft summary
+  // is the one place a human sees them without opening the review artifact.
+  for (const advisory of result.semanticReview.advisories ?? []) console.log(`${yellow('advisory:')} ${sanitizeTerminalPreview(advisory, 300)}`)
   if (result.taskSpec.trim()) console.log(`${dim('compiler note:')}\n${result.taskSpec.trim()}`)
 }
 
@@ -5475,9 +5500,22 @@ function foregroundDistillConfig(
     // simple lowering into a many-minute runaway generation.
     recoverMaxOutputTokens: false,
     debugMode: opts.debug,
-    beforeToolCall: async toolName => allowed.has(toolName)
-      ? { action: 'allow' }
-      : { action: 'deny', reason: `foreground Distill does not allow tool '${toolName}'` },
+    beforeToolCall: async (toolName, input) => {
+      if (!allowed.has(toolName)) {
+        return { action: 'deny', reason: `foreground Distill does not allow tool '${toolName}'` }
+      }
+      // Architect and Reviewer hold read_file/grep/glob over the whole
+      // workspace, and `.loop/distill/` now holds this run's own checkpoint and
+      // per-attempt trace (glob's SKIP_DIRS does not cover it). Reading that is
+      // never source material: it would let a phase anchor on an earlier
+      // attempt's rejected graph or on a previous reviewer verdict — turning
+      // the deliberately independent review into an accidental, non-repeatable
+      // form of state. Host bookkeeping stays out of every phase's evidence.
+      if (referencesDistillTrace(input)) {
+        return { action: 'deny', reason: "'.loop/distill' holds this run's own Distill bookkeeping; it is not source evidence. Read the requirement entry and project files instead." }
+      }
+      return { action: 'allow' }
+    },
   }
   if (rl && !opts.json && isTTY) {
     config.askUser = async (question: string, options?: string[], signal?: AbortSignal) => {

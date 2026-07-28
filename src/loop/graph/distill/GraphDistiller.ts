@@ -6,6 +6,7 @@ import { freezeLoopGraph, validateLoopGraph } from '../spec/GraphValidate.js'
 import { formatGraphLintFindings, lintLoopGraph } from '../spec/GraphLint.js'
 import type { GraphDistillExecutor, GraphDistillPhase } from './ForegroundGraphDistillExecutor.js'
 import type { DistillCheckpointStore } from './DistillCheckpoint.js'
+import { renderTraceOutput, type DistillTraceStore } from './DistillTrace.js'
 import {
   GRAPH_TRACEABILITY_SCHEMA,
   LOOP_CONSTRAINTS_SCHEMA,
@@ -13,6 +14,11 @@ import {
   LOOP_PRECONDITIONS_SCHEMA,
   SEMANTIC_REVIEW_LAYERS,
   SEMANTIC_REVIEW_SCHEMA,
+  SEMANTIC_RULE_CLASSES,
+  BLOCKING_SEMANTIC_RULE_CLASSES,
+  ADVISORY_SEMANTIC_RULE_CLASSES,
+  isBlockingSemanticRuleClass,
+  formatSemanticFinding,
   buildGraphImplementationManifest,
   emptyLoopPreconditions,
   renderLoopBlueprintMarkdown,
@@ -27,6 +33,8 @@ import {
   type LoopBlueprint,
   type LoopConstraintLedger,
   type LoopPreconditions,
+  type SemanticFinding,
+  type SemanticRuleClass,
 } from './DistillDesign.js'
 
 export interface DistillGraphResult {
@@ -188,6 +196,9 @@ export interface DistillGraphDeps {
   semanticReview?: boolean
   /** Optional durable Architect checkpoint. Compiler repair never rewrites it. */
   checkpoint?: DistillCheckpointStore
+  /** Optional per-run trace. Every rejected phase output, frozen graph and
+   * layered verdict is persisted here, so a failed run stays diagnosable. */
+  trace?: DistillTraceStore
   onProgress?: (event: GraphDistillProgressEvent) => void
 }
 
@@ -320,8 +331,10 @@ async function compileLoopGraph(
     if (architectRecord.status === 'cancelled' || signal.aborted) {
       throw new DistillInterruptedError('architect', architectRecord.error ?? abortReason(signal))
     }
+    const architectTag = `architect.r${semanticRevision}.a${attempt}`
     if (architectRecord.status !== 'completed') {
       architectErrors = [`foreground architect ${architectRecord.status}: ${architectRecord.error ?? 'no terminal error detail'}`]
+      await deps.trace?.event({ phase: 'architect', revision: semanticRevision, attempt, outcome: 'not_completed', issues: architectErrors })
       deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
       continue
     }
@@ -329,6 +342,9 @@ async function compileLoopGraph(
     const candidate = parseArchitectOutput(architectRecord.output, architectRecord.summary)
     if (!candidate) {
       architectErrors = ['no parseable {constraints, design} from foreground architect']
+      // The raw envelope is the only evidence of *why* it did not parse.
+      await deps.trace?.artifact(`${architectTag}.output.txt`, renderTraceOutput(architectRecord.output))
+      await deps.trace?.event({ phase: 'architect', revision: semanticRevision, attempt, outcome: 'unparseable', issues: architectErrors })
       deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
       continue
     }
@@ -343,14 +359,18 @@ async function compileLoopGraph(
     }
     if (architectureErrors.length) {
       architectErrors = architectureErrors
+      await deps.trace?.artifact(`${architectTag}.rejected.json`, JSON.stringify({ errors: architectErrors, candidate }, null, 2))
+      await deps.trace?.event({ phase: 'architect', revision: semanticRevision, attempt, outcome: 'invalid', issues: architectErrors })
       deps.onProgress?.({ type: 'validation_failed', phase: 'architect', attempt, issues: architectErrors })
       continue
     }
     architecture = candidate
+    await deps.trace?.artifact(`${architectTag}.accepted.json`, JSON.stringify(candidate, null, 2))
+    await deps.trace?.event({ phase: 'architect', revision: semanticRevision, attempt, outcome: 'accepted' })
     await deps.checkpoint?.save(source, architecture)
   }
   if (!architecture) {
-    throw new Error(`graph architect failed after ${maxAttempts} attempts:\n- ${architectErrors.join('\n- ')}`)
+    throw new Error(`graph architect failed after ${maxAttempts} attempts:\n- ${architectErrors.join('\n- ')}${traceHint(deps.trace)}`)
   }
 
   let compilerErrors: string[] = []
@@ -404,8 +424,10 @@ async function compileLoopGraph(
     if (record.status === 'cancelled' || signal.aborted) {
       throw new DistillInterruptedError('compiler', record.error ?? abortReason(signal))
     }
+    const compilerTag = `compiler.r${semanticRevision}.a${attempt}`
     if (record.status !== 'completed') {
       compilerErrors = [`foreground compiler ${record.status}: ${record.error ?? 'no terminal error detail'}`]
+      await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'not_completed', issues: compilerErrors })
       deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
       continue
     }
@@ -416,6 +438,14 @@ async function compileLoopGraph(
         : null)
     if (!parsed) {
       compilerErrors = [`no parseable {graph, traceability, taskSpec}; foreground compiler status=${record.status} error=${record.error ?? '(none)'}`]
+      // Without the raw envelope a parse rejection is indistinguishable from
+      // prose, truncation or a mis-keyed object. Keep it.
+      await deps.trace?.artifact(`${compilerTag}.output.txt`, renderTraceOutput(record.output))
+      if (validatedGraphDraft) await deps.trace?.artifact(`${compilerTag}.frozen-graph.json`, JSON.stringify(validatedGraphDraft, null, 2))
+      await deps.trace?.event({
+        phase: 'compiler', revision: semanticRevision, attempt, outcome: 'unparseable',
+        hadFrozenGraph: Boolean(validatedGraphDraft), issues: compilerErrors,
+      })
       deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
       // The foreground tool may have frozen a valid graph before the model's
       // final, oversized envelope is truncated or malformed. One compact
@@ -463,6 +493,12 @@ async function compileLoopGraph(
         // exact logical-to-physical compilation Create will perform later.
         freezeLoopGraph(parsed.graph, deps.catalog, 0)
         const manifest = buildGraphImplementationManifest(parsed.graph)
+        // Executable and frozen. Persist it even if semantic review later
+        // rejects it: without this the only artifact proving how close the run
+        // got is destroyed a few lines below.
+        await deps.trace?.artifact(`${compilerTag}.graph.json`, JSON.stringify(parsed.graph, null, 2))
+        await deps.trace?.artifact(`${compilerTag}.traceability.json`, JSON.stringify(parsed.traceability, null, 2))
+        await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'frozen', lintWarnings })
         deps.onProgress?.({ type: 'validation_passed', phase: 'compiler', attempt })
         let semanticReview = skippedSemanticReview()
         if (deps.semanticReview !== false) {
@@ -471,6 +507,12 @@ async function compileLoopGraph(
           }, deps, signal, attempt)
           semanticReview = reviewed.review
           reviewerAttempts += reviewed.attempts
+          // The layered verdict — with its per-layer evidence pointing from
+          // source locators to Graph JSON pointers — is the whole value of the
+          // review. Persist it on every outcome, not just acceptance.
+          const reviewTag = `review.r${semanticRevision}.c${attempt}`
+          await deps.trace?.artifact(`${reviewTag}.json`, JSON.stringify(semanticReview, null, 2))
+          await deps.trace?.artifact(`${reviewTag}.md`, renderSemanticReviewMarkdown(semanticReview))
           if (!semanticReview.accepted) {
             const semanticErrors = semanticReview.issues.length
               ? semanticReview.issues.map(issue => `semantic review: ${issue}`)
@@ -479,6 +521,11 @@ async function compileLoopGraph(
               ...semanticErrors,
               ...lintWarnings.map(warning => `semantic review context: ${warning}`),
             ]
+            await deps.trace?.event({
+              phase: 'semantic_review', revision: semanticRevision, compilerAttempt: attempt, outcome: 'rejected',
+              failedLayers: SEMANTIC_REVIEW_LAYERS.filter(layer => semanticReview.layers[layer].status === 'fail'),
+              issues: semanticReview.issues,
+            })
             deps.onProgress?.({ type: 'semantic_review_rejected', attempt, issues: semanticReview.issues })
             // A graph frozen by graph_validate is immutable only for envelope
             // recovery within the same Compiler attempt. Once semantic review
@@ -507,6 +554,7 @@ async function compileLoopGraph(
             )
             continue
           }
+          await deps.trace?.event({ phase: 'semantic_review', revision: semanticRevision, compilerAttempt: attempt, outcome: 'accepted' })
           deps.onProgress?.({ type: 'semantic_review_accepted', attempt })
         }
         const result: DistillGraphResult = {
@@ -527,10 +575,16 @@ async function compileLoopGraph(
       } catch (error) {
         if (error instanceof DistillInterruptedError) throw error
         compilerErrors = [error instanceof Error ? error.message : String(error)]
+        await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'freeze_failed', issues: compilerErrors })
         deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
         continue
       }
     }
+    await deps.trace?.artifact(`${compilerTag}.rejected.json`, JSON.stringify({ errors, graph: parsed.graph, traceability: parsed.traceability }, null, 2))
+    await deps.trace?.event({
+      phase: 'compiler', revision: semanticRevision, attempt, outcome: 'invalid',
+      executableRepairRequired, issues: errors,
+    })
     if (executableRepairRequired) {
       // Metadata-only recovery is safe only when the frozen executable graph
       // itself remains acceptable. ABI or blocking graph lint needs a real
@@ -549,7 +603,7 @@ async function compileLoopGraph(
     compilerErrors = errors
     deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
   }
-  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${compilerErrors.join('\n- ')}`)
+  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${compilerErrors.join('\n- ')}${traceHint(deps.trace)}`)
 }
 
 async function reviewGraphSemantics(
@@ -660,35 +714,35 @@ Blueprint 是自然语言语义交接，不是第二套 Graph DSL。它只描述
 
 ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Freeze 机械保证，不需复查；你的职责是机器证明不了的部分。按六层逐层审阅：
 1. intent_constraints：目标、成功标准、hard/soft 强度和来源是否完整且未被改写。
-2. workspace_contract：对照 Blueprint workspace，检查 Agent 直接读写路径、write mode、deny、文件 owner 与用户协议是否一致；不要求 Kernel 代写用户文件。lane.scm='git' 是权限升级：只有来源确实要求提交/推送项目仓库时才允许，且 Agent prompt 中的 git 操作必须有对应能力（scm Lane 或 owned 前缀下的嵌套仓库）——prompt 要求 git commit/push 而两者皆无时必须 fail。
-3. lane_ownership：对照 Blueprint lanes，检查强相关生命周期是否保持连续会话；不同 Lane 的写路径不重叠，串行/并发和权限边界合理。
+2. workspace_contract：对照 Blueprint workspace，检查 Agent 直接读写路径、write mode、deny、文件 owner 与用户协议是否一致；不要求 Kernel 代写用户文件。lane.scm='git' 是权限升级：只有来源确实要求提交/推送项目仓库时才允许。
+3. lane_ownership：对照 Blueprint lanes，检查强相关生命周期是否保持连续会话；串行/并发和权限边界合理。
 4. control_flow：对照 Blueprint control，检查确定性路由、状态更新前后语义、success/failure/timeout/event/timer、恢复、预算和终态义务是否闭环且有界。
 5. capability_resolution：每个 hard constraint 的 graphRefs 都指向真实实现；Graph 使用的工具、Skill、Function、Reducer 与 Effect 确实可用，缺口没有被伪装成已实现。
-6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。项目外没有任何可写位置：prompt 把写/编辑/git 操作指向项目外路径（绝对路径、~、"outside this project"、"运行时再寻找"）必须 fail——把它列成 decision 或 precondition 都救不了 sandbox 拒写。
+6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。
+
+【已由确定性 Lint 拥有，不要复查】以下条目已在 lintLoopGraph 中以 error/warning 机械判定，Compiler 收到过同样的诊断。你重复检查只会增加噪声与误报，一律不要作为 finding 提出：Agent prompt 中的绝对路径/家目录路径；指向项目外的写操作；prompt 显式写入但 Lane.workspace.write 未覆盖的路径；git add/commit/push 缺少 scm Lane 或 owned 前缀；每个 agent 节点 budget.wallTimeMs 是否声明及是否达到 300000ms 下限；不同 Lane 写路径前缀重叠；对已被 write rule 覆盖的目录额外调用 bash mkdir；同 Lane 内 Agent 拆分（same-lane-agent-split）。
 
 若原始来源中的 hard constraint 在 Constraint Ledger 或 Blueprint 中漏记，intent_constraints 必须 fail；若合同已经保留、只是最终 Graph 的路由、写权限、能力或前置条件 lower 错误，只在对应实现层 fail。这个分层决定后续由 Architect 还是 Compiler 修复，不得把局部 Graph 错误误报成上游合同缺失。
 
-user prompt 若附带【机械 Lint 提示】，每条都必须在对应层给出核验证据，不得复述提示了事。项目现实类提示用 glob/read_file 实地核验（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或由前置条件保证 .git）；same-lane-agent-split 这类拓扑提示则对照 Manifest、Blueprint 和实际持久/权限/等待/隔离边界核验。核验不成立即 fail。
+user prompt 若附带【机械 Lint 提示】，每条都必须在对应层给出核验证据，不得复述提示了事。项目现实类提示用 glob/read_file 实地核验（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或由前置条件保证 .git）。核验不成立即作为对应层的 finding 提出。
 
-逐个 Agent Manifest 审查 prompt 中声明的读写目标：每个写入文件或目录必须被该 Node 所属 Lane.workspace.write 覆盖，且 mode 与 append/replace 语义一致。Graph annotations 不会注入 Agent prompt，也不执行；hard constraint 不能仅靠 annotations、taskSpec 或 rationale 满足。若 Agent prompt 依赖 annotations 中的值，必须 fail。
+Graph annotations 不会注入 Agent prompt，也不执行；hard constraint 不能仅靠 annotations、taskSpec 或 rationale 满足。若 Agent prompt 依赖 annotations 中的值，记 annotation-only-satisfaction。write mode 与 append/replace 语义不一致记 workspace-mode-mismatch。
 
-write_file 与 append_file 会为获准的目标文件自动创建缺失父目录。若 Lane 以逐文件 atomic_replace/append_only 规则声明首轮文件，首次工具调用本身就是 bootstrap；无需额外 mkdir，也不得仅为建父目录把精确模式扩大成 owned 目录。只有 prompt 明确调用 bash mkdir 而 Lane 没有覆盖该目录时才 fail。
+若 Blueprint 声明唯一文件 writer，枚举每个会产生待提交数据或更新 Graph State 的工作 Agent 成功分支：它们必须先进入该 writer，再由 writer 按提交后的 $state 路由。research→pivot、pivot→pivot 等绕过 writer 的捷径记 writer-boundary-bypass；正确闭环是工作分支→writer，writer 的 pivot_required 分支→pivot。bootstrap 也只能输出初始化 payload，由 writer 创建其拥有的文件，不能因为“首次运行”越权写入。
 
-若 Blueprint 声明唯一文件 writer，枚举每个会产生待提交数据或更新 Graph State 的工作 Agent 成功分支：它们必须先进入该 writer，再由 writer 按提交后的 $state 路由。research→pivot、pivot→pivot 等绕过 writer 的捷径必须 fail；正确闭环是工作分支→writer，writer 的 pivot_required 分支→pivot。bootstrap 也只能输出初始化 payload，由 writer 创建其拥有的文件，不能因为“首次运行”越权写入。
+逐项核对 writer 持久化的路由字段来自哪里：Reducer 更新 Graph State 后，只有 target inputs 中的 $state 引用能读取新值；Reducer 不会修改 $output.progress_patch。若 writer 把 Agent 生成的 progress_patch 原样写入，却声称其中 status/stale_count/iteration/total_findings 已被 Transition updates 确定性覆盖，记 state-routing-divergence。
 
-逐项核对 writer 持久化的路由字段来自哪里：Reducer 更新 Graph State 后，只有 target inputs 中的 $state 引用能读取新值；Reducer 不会修改 $output.progress_patch。若 writer 把 Agent 生成的 progress_patch 原样写入，却声称其中 status/stale_count/iteration/total_findings 已被 Transition updates 确定性覆盖，control_flow 必须 fail。
+来源给出的轮次上限、总时长、最大重试次数等有界性要求，必须在图中有对应的确定性路由（例如按 $state 计数比较后进入终态）；仅有 limits.maxTotalActivations 之类与来源单位无确定性换算关系的图级配额，不算实现，记 missing-source-bound。
 
-检查生产与提交时序：若来源要求“评估后只提交新增/批准结果”，生产 Agent 必须先输出候选数据，评估后再由有写权限的提交 Agent 落盘；不得为了保持 Reviewer 只读而提前污染最终文件。检查确定性分类是否保留来源语义，例如“变差”不能被简化成“没有改善”。对于“零新增或变差才累加 stale”的规则，逐项验证四个分区：attention、pivot、普通 stale 都必须受 no_progress 约束，reset 必须覆盖有新增且 unchanged/improved；when 读取更新前 State 时，新值阈值 2/4 等价于当前值 1/3。检查高优先级分支不会遮蔽完成条件，并检查 iteration、total 等来源要求的每轮计数是否在所有对应提交分支更新。
+以下属于设计观察，按对应 advisory ruleClass 记录，不阻断：生产与提交时序（commit-ordering）；确定性分类是否保留来源语义，例如“变差”被压成“没有改善”（semantic-classification）；stale 四分区等阈值真值表的精确性（threshold-truth-table）；高优先级分支遮蔽完成条件、每轮计数未在所有提交分支更新（branch-priority）；节点拆分与合并粒度（topology-granularity）；紧耦合生命周期是否该同会话（session-continuity）；turns/usd/lifetimeBudget 数值是否与任务规模匹配（budget-shape）。
 
-只按来源原文施加强度，不从候选 rationale、taskSpec 或你熟悉的惯例反推新义务。来源写“status = healthy 或 stale”只约束结果属于该集合，并不自动规定 improved/unchanged 到二者的一一映射；只有来源明确给出映射时才能据此拒绝。
+只按来源原文施加强度，不从候选 rationale、taskSpec 或你熟悉的惯例反推新义务；反推出来的义务记 overreach-obligation。来源写“status = healthy 或 stale”只约束结果属于该集合，并不自动规定 improved/unchanged 到二者的一一映射。
 
-保持拓扑自由：不要按节点数量、角色名称、领域字段或 Scenario 风格套模板拒绝。但 Blueprint 的稀疏控制骨架与 Agent 自主性也是设计合同：紧耦合的 bootstrap、常规轮次、反思、监测和 pivot 若没有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离或终态边界，却被机械拆成多个 Agent，导致重复上下文传递、额外状态往返或把 Agent 内部规划固化成 Graph 阶段，lane_ownership 或 control_flow 必须 fail。不同 prompt、角色名、first-run 标记或独立 budget 本身都不是边界；同一 Lane 的 Agent 共享会话与 workspace 权限，不能据此宣称 writer 与 worker 已隔离。若 Blueprint 要求唯一文件 writer，而 worker 与 writer 共用一条含这些文件 write rule 的 Lane，lane_ownership 必须 fail。相反，确有上述执行边界时，多节点是合理实现。来源 hard constraint 未实现、不可执行、越权、写冲突、恢复不闭合或无界运行必须 fail。
+保持拓扑自由：不要按节点数量、角色名称、领域字段或 Scenario 风格套模板拒绝。多节点在确有持久提交、权限/并发边界、Kernel Wait/Event、失败隔离或终态边界时是合理实现；否则作为 topology-granularity advisory 记录，不要据此阻断。来源 hard constraint 未实现、不可执行、越权、写冲突、恢复不闭合或无界运行才是阻断级。
 
-逐个 Agent Manifest 检查预算：每个 type=agent 节点都必须显式声明 budget.wallTimeMs，且不得小于 300000（5 分钟）。缺失或更小都在 control_flow 层 fail。这个下限为模型响应、工具执行和持久化收尾保留基本窗口，不代表 Agent 可以忽略 turns、usd、lifetimeBudget 或图级 limits。
+【严重度不由你决定】你只负责给出 finding 及其 ruleClass；宿主按 ruleClass 计算 accepted，你输出的 accepted 字段会被丢弃。阻断级 ruleClass 恰好是：${BLOCKING_SEMANTIC_RULE_CLASSES.join('、')}。建议级 ruleClass 恰好是：${ADVISORY_SEMANTIC_RULE_CLASSES.join('、')}。不得为了让候选通过而把真实的硬约束不符填成建议级；也不得为了显得严格而把风格偏好填成阻断级。ruleClass 必须取自上述枚举，其他值会使整份裁决作废。
 
-Reviewer 只做准入判断，不做设计建议：warnings 必须始终为 []。任何你认为值得记录的差异，要么确实不影响来源合同而省略，要么作为 issue 拒绝；禁止把已识别的协议冲突或错误指针降级为 warning。
-
-只输出 JSON，schemaVersion 必须是 ${SEMANTIC_REVIEW_SCHEMA}。layers 必须恰好覆盖 ${SEMANTIC_REVIEW_LAYERS.join(', ')}。每层结构为 {"status":"pass|fail|not_applicable","evidence":[{"sourceRefs":["需求或项目 path:locator"],"designRefs":["Blueprint section"],"graphRefs":["Graph JSON pointer"],"statement":"核验结论"}],"issues":["阻断问题"]}。每层最多 2 条 evidence，同一结论的多个引用合并进数组；不要重复输出第二份 JSON。任一层 fail 时 accepted=false；accepted=true 时根 issues 和所有层 issues 必须为空；始终输出 "warnings":[]。`
+只输出 JSON，schemaVersion 必须是 ${SEMANTIC_REVIEW_SCHEMA}。layers 必须恰好覆盖 ${SEMANTIC_REVIEW_LAYERS.join(', ')}。每层结构为 {"status":"pass|fail|not_applicable","evidence":[{"sourceRefs":["需求或项目 path:locator"],"designRefs":["Blueprint section"],"graphRefs":["Graph JSON pointer"],"statement":"核验结论"}],"findings":[{"ruleClass":"枚举值","statement":"问题陈述","sourceRefs":[],"designRefs":[],"graphRefs":[]}]}。每层最多 2 条 evidence，同一结论的多个引用合并进数组；不要重复输出第二份 JSON。某层含阻断级 finding 时该层 status 必须是 fail；status=fail 的层必须至少含一条阻断级 finding；status 为 pass 或 not_applicable 的层只能含建议级 finding 或空数组。`
 }
 
 function formatDistillSource(source: DistillSource): string {
@@ -1001,31 +1055,33 @@ export function parseLayeredSemanticReview(output: unknown, summary?: string): L
   for (const candidate of structuredCandidates(output, summary)) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
     const object = candidate as Record<string, unknown>
-    if (object.schemaVersion !== SEMANTIC_REVIEW_SCHEMA || typeof object.accepted !== 'boolean') continue
+    // `accepted` is deliberately NOT read from the model: severity belongs to
+    // the host so a reviewer cannot file a hard-contract violation as advisory
+    // and let the graph through.
+    if (object.schemaVersion !== SEMANTIC_REVIEW_SCHEMA) continue
     if (!object.layers || typeof object.layers !== 'object' || Array.isArray(object.layers)) continue
     const layers = object.layers as Record<string, unknown>
     if (Object.keys(layers).length !== SEMANTIC_REVIEW_LAYERS.length || Object.keys(layers).some(name => !SEMANTIC_REVIEW_LAYERS.includes(name as typeof SEMANTIC_REVIEW_LAYERS[number]))) continue
-    const rootIssues = stringArray(object.issues)
-    if (!rootIssues) continue
-    const warnings = object.warnings === undefined ? [] : stringArray(object.warnings)
-    if (!warnings) continue
     let invalid = false
-    let failed = false
-    let layerIssueCount = 0
     const normalizedLayers: Record<string, unknown> = {}
+    const blocking: SemanticFinding[] = []
+    const advisory: SemanticFinding[] = []
     for (const name of SEMANTIC_REVIEW_LAYERS) {
       const rawLayer = layers[name]
       if (!rawLayer || typeof rawLayer !== 'object' || Array.isArray(rawLayer)) { invalid = true; break }
       const layer = rawLayer as Record<string, unknown>
       if (!['pass', 'fail', 'not_applicable'].includes(String(layer.status))) { invalid = true; break }
-      // Empty issues on a passing layer carry no information and models often
-      // omit them in otherwise complete verdicts. Normalize that omission;
-      // failing layers still require explicit actionable issues.
-      const issues = layer.issues === undefined && layer.status !== 'fail' ? [] : stringArray(layer.issues)
-      if (!issues || !Array.isArray(layer.evidence) || !layer.evidence.length) { invalid = true; break }
-      if (layer.status === 'fail' && !issues.length || layer.status !== 'fail' && issues.length) { invalid = true; break }
-      layerIssueCount += issues.length
-      failed ||= layer.status === 'fail'
+      if (!Array.isArray(layer.evidence) || !layer.evidence.length) { invalid = true; break }
+      const findings = parseSemanticFindings(layer.findings)
+      if (!findings) { invalid = true; break }
+      const layerBlocking = findings.filter(finding => isBlockingSemanticRuleClass(finding.ruleClass))
+      // A `fail` layer must name what failed, and a passing layer must not
+      // carry a blocking finding. Advisory findings are legal on any status —
+      // that is the whole point of the split.
+      if (layer.status === 'fail' && !layerBlocking.length) { invalid = true; break }
+      if (layer.status !== 'fail' && layerBlocking.length) { invalid = true; break }
+      blocking.push(...layerBlocking)
+      advisory.push(...findings.filter(finding => !isBlockingSemanticRuleClass(finding.ruleClass)))
       for (const rawEvidence of layer.evidence) {
         if (!rawEvidence || typeof rawEvidence !== 'object' || Array.isArray(rawEvidence)) { invalid = true; break }
         const evidence = rawEvidence as Record<string, unknown>
@@ -1036,19 +1092,39 @@ export function parseLayeredSemanticReview(output: unknown, summary?: string): L
           || layer.status !== 'not_applicable' && (!sourceRefs.length || !designRefs.length && !graphRefs.length)) { invalid = true; break }
       }
       if (invalid) break
-      normalizedLayers[name] = { ...layer, issues }
+      normalizedLayers[name] = { ...layer, findings }
     }
     if (invalid) continue
-    // The semantic reviewer is an acceptance gate, not a design-advice stage.
-    // A previous reviewer reported concrete hard-contract discrepancies as
-    // "warnings" and still accepted the graph. Make that state unrepresentable:
-    // any discovered discrepancy must be repaired before Distill can finish.
-    if (warnings.length) continue
-    if (object.accepted && (failed || rootIssues.length || layerIssueCount)) continue
-    if (!object.accepted && (!failed || !rootIssues.length)) continue
-    return { ...object, layers: normalizedLayers, warnings } as unknown as LayeredSemanticReview
+    return {
+      schemaVersion: SEMANTIC_REVIEW_SCHEMA,
+      accepted: blocking.length === 0,
+      layers: normalizedLayers,
+      issues: blocking.map(formatSemanticFinding),
+      advisories: advisory.map(formatSemanticFinding),
+    } as unknown as LayeredSemanticReview
   }
   return null
+}
+
+/** Findings must name a known rule class; an unrecognized one is treated as a
+ * malformed verdict rather than silently dropped, so a reviewer cannot evade
+ * the blocking set by inventing a class name. */
+function parseSemanticFindings(value: unknown): SemanticFinding[] | null {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) return null
+  const findings: SemanticFinding[] = []
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const item = raw as Record<string, unknown>
+    if (typeof item.ruleClass !== 'string' || !SEMANTIC_RULE_CLASSES.includes(item.ruleClass as SemanticRuleClass)) return null
+    if (typeof item.statement !== 'string' || !item.statement.trim()) return null
+    const sourceRefs = stringArray(item.sourceRefs ?? [])
+    const designRefs = stringArray(item.designRefs ?? [])
+    const graphRefs = stringArray(item.graphRefs ?? [])
+    if (!sourceRefs || !designRefs || !graphRefs) return null
+    findings.push({ ruleClass: item.ruleClass as SemanticRuleClass, statement: item.statement, sourceRefs, designRefs, graphRefs })
+  }
+  return findings
 }
 
 function structuredCandidates(output: unknown, summary?: string): unknown[] {
@@ -1065,21 +1141,28 @@ function skippedSemanticReview(): LayeredSemanticReview {
     layers: Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
       status: 'not_applicable',
       evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: 'Independent semantic review was explicitly disabled by the caller.' }],
-      issues: [],
+      findings: [],
     }])) as unknown as LayeredSemanticReview['layers'],
     issues: [],
-    warnings: [],
+    advisories: [],
   }
 }
 
+/** A reviewer that never produced a valid verdict is not evidence that the
+ * graph is sound, so synthesize a blocking finding rather than accepting. */
 function rejectedSemanticReview(issue: string): LayeredSemanticReview {
   const review = skippedSemanticReview()
+  const finding: SemanticFinding = {
+    ruleClass: 'fabricated-capability', statement: issue, sourceRefs: [], designRefs: [], graphRefs: [],
+  }
   review.accepted = false
   review.layers.capability_resolution = {
-    status: 'fail', evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: issue }], issues: [issue],
+    status: 'fail',
+    evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: issue }],
+    findings: [finding],
   }
-  review.issues = [issue]
-  review.warnings = []
+  review.issues = [formatSemanticFinding(finding)]
+  review.advisories = []
   return review
 }
 
@@ -1089,6 +1172,12 @@ function stringArray(value: unknown): string[] | null {
 
 function abortReason(signal: AbortSignal): string {
   return signal.reason instanceof Error ? signal.reason.message : String(signal.reason ?? 'cancelled')
+}
+
+/** A fatal Distill error is the one message the user is guaranteed to read;
+ * point it at the per-attempt evidence instead of ending the trail there. */
+function traceHint(trace: DistillTraceStore | undefined): string {
+  return trace ? `\nPer-attempt outputs, frozen graphs and reviewer verdicts: ${trace.dir}` : ''
 }
 
 function throwIfDistillAborted(signal: AbortSignal, phase: GraphDistillPhase): void {

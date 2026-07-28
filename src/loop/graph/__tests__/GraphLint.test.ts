@@ -214,4 +214,41 @@ describe('graph write-surface lint', () => {
     spec.transitions[0]!.to = ['done', 'other']
     expect(lintLoopGraph(spec).map(f => f.rule)).toContain('terminal-fanout-cancellation')
   })
+
+  // Moved out of the semantic reviewer's prose contract: a prefix comparison is
+  // deterministic, so re-deriving it from an LLM sample only added variance.
+  it('errors when two lanes claim overlapping write prefixes', () => {
+    const spec = graph()
+    spec.lanes.writer = { context: 'persistent', workspace: { read: [], write: [{ path: 'state/progress.md', mode: 'append_only' }], deny: [] } }
+    const overlap = lintLoopGraph(spec).filter(f => f.rule === 'lane-write-overlap')
+    expect(overlap).toHaveLength(1)
+    expect(overlap[0]!.level).toBe('error')
+    expect(overlap[0]!.message).toContain('only one owning Lane')
+
+    // Disjoint prefixes are the normal single-writer shape and stay clean.
+    spec.lanes.writer.workspace.write = [{ path: 'logs/run.md', mode: 'append_only' }]
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'lane-write-overlap')).toEqual([])
+  })
+
+  it('warns about mkdir for a directory the lane already covers', () => {
+    const spec = graph()
+    spec.nodes.work = {
+      ...spec.nodes.work,
+      prompt: 'Run `mkdir -p state/history` before the first write.',
+    } as typeof spec.nodes.work
+    const findings = lintLoopGraph(spec).filter(f => f.rule === 'redundant-mkdir')
+    expect(findings).toHaveLength(1)
+    expect(findings[0]!.level).toBe('warning')
+
+    // An uncovered path is a genuine workspace gap, reported by the existing
+    // write-surface rules rather than as a redundant mkdir.
+    spec.nodes.work = { ...spec.nodes.work, prompt: 'Run `mkdir -p elsewhere/tmp` first.' } as typeof spec.nodes.work
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'redundant-mkdir')).toEqual([])
+  })
+
+  it('keeps the canonical distill example free of the new deterministic rules', () => {
+    const rules = lintLoopGraph(CANONICAL_GRAPH_DISTILL_EXAMPLE).map(f => f.rule)
+    expect(rules).not.toContain('lane-write-overlap')
+    expect(rules).not.toContain('redundant-mkdir')
+  })
 })

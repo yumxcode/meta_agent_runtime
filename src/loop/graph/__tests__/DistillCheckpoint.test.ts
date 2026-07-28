@@ -33,19 +33,24 @@ const graph: LoopGraphSpec = {
   entrypoints: [{ id: 'start', node: 'work' }], limits: { maxActivations: 3 },
 }
 const review = {
-  schemaVersion: 'loop-semantic-review-2.1', accepted: true, issues: [], warnings: [],
+  schemaVersion: 'loop-semantic-review-2.1', accepted: true, issues: [] as string[], advisories: [] as string[],
   layers: Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
-    status: 'pass', issues: [], evidence: [{ sourceRefs: ['requirements.md:line 1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
+    status: 'pass', findings: [] as unknown[], evidence: [{ sourceRefs: ['requirements.md:line 1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
   }])),
 }
 
+/** A rejection now needs a blocking rule class: the host derives `accepted`
+ * from the findings, so a bare issue string would parse as acceptance. */
 function rejectedReview(
   issue: string,
   failedLayer: typeof SEMANTIC_REVIEW_LAYERS[number] = 'workspace_contract',
+  ruleClass = 'writer-boundary-bypass',
 ): typeof review {
   const layers = Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
     status: layer === failedLayer ? 'fail' : 'pass',
-    issues: layer === failedLayer ? [issue] : [],
+    findings: layer === failedLayer
+      ? [{ ruleClass, statement: issue, sourceRefs: ['requirements.md:line 1'], designRefs: ['workspace'], graphRefs: ['/lanes'] }]
+      : [],
     evidence: [{ sourceRefs: ['requirements.md:line 1'], designRefs: ['workspace'], graphRefs: ['/lanes'], statement: layer === failedLayer ? issue : 'Aligned.' }],
   }]))
   return { ...review, accepted: false, layers, issues: [issue] }

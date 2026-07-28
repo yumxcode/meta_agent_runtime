@@ -116,16 +116,92 @@ export function validateLoopPreconditions(value: LoopPreconditions): string[] {
   return errors
 }
 
+/**
+ * Severity vocabulary for the semantic reviewer.
+ *
+ * The reviewer used to be all-or-nothing: any layer `fail` rejected the graph,
+ * and the prompt forbade `warnings` outright. That made every stylistic
+ * observation as fatal as an unimplemented hard constraint, so a run could
+ * bounce indefinitely on a different cosmetic finding each round while the
+ * mechanical linter — the one component with no sampling variance — happily
+ * distinguished `error` from `warning`.
+ *
+ * Severity is now derived by the HOST from the rule class, never chosen by the
+ * model. That preserves the invariant the old prompt was protecting: a reviewer
+ * cannot downgrade a real hard-contract violation to "advisory" and let the
+ * graph through, because picking `unimplemented-hard-constraint` is by
+ * definition blocking. Misfiling remains possible, but a fixed enum is
+ * auditable in the trace where free-text warnings were not.
+ */
+export const BLOCKING_SEMANTIC_RULE_CLASSES = [
+  'unimplemented-hard-constraint',
+  'constraint-weakened',
+  'dangling-traceability',
+  'fabricated-capability',
+  'annotation-only-satisfaction',
+  'unbounded-or-unreachable-control',
+  'missing-source-bound',
+  'writer-boundary-bypass',
+  'state-routing-divergence',
+  'missing-precondition',
+] as const
+
+export const ADVISORY_SEMANTIC_RULE_CLASSES = [
+  'topology-granularity',
+  'session-continuity',
+  'budget-shape',
+  'semantic-classification',
+  'threshold-truth-table',
+  'branch-priority',
+  'commit-ordering',
+  'workspace-mode-mismatch',
+  'overreach-obligation',
+] as const
+
+export const SEMANTIC_RULE_CLASSES = [
+  ...BLOCKING_SEMANTIC_RULE_CLASSES,
+  ...ADVISORY_SEMANTIC_RULE_CLASSES,
+] as const
+export type SemanticRuleClass = typeof SEMANTIC_RULE_CLASSES[number]
+
+const BLOCKING_RULE_CLASS_SET: ReadonlySet<string> = new Set(BLOCKING_SEMANTIC_RULE_CLASSES)
+
+export function isBlockingSemanticRuleClass(ruleClass: string): ruleClass is typeof BLOCKING_SEMANTIC_RULE_CLASSES[number] {
+  return BLOCKING_RULE_CLASS_SET.has(ruleClass)
+}
+
+export interface SemanticFinding {
+  ruleClass: SemanticRuleClass
+  statement: string
+  sourceRefs: string[]
+  designRefs: string[]
+  graphRefs: string[]
+}
+
 export interface LayeredSemanticReview {
   schemaVersion: typeof SEMANTIC_REVIEW_SCHEMA
+  /** Computed by the host from the findings' rule classes; a model-supplied
+   * value is discarded during parsing. */
   accepted: boolean
   layers: Record<SemanticReviewLayer, {
     status: 'pass' | 'fail' | 'not_applicable'
     evidence: Array<{ sourceRefs: string[]; designRefs: string[]; graphRefs: string[]; statement: string }>
-    issues: string[]
+    findings: SemanticFinding[]
   }>
+  /** Flattened blocking findings — the set that actually rejected the graph. */
   issues: string[]
-  warnings?: string[]
+  /** Flattened advisory findings — recorded and fed back, never blocking. */
+  advisories: string[]
+}
+
+/** Every finding across all layers, in layer order. */
+export function semanticFindings(review: LayeredSemanticReview): SemanticFinding[] {
+  return SEMANTIC_REVIEW_LAYERS.flatMap(layer => review.layers[layer]?.findings ?? [])
+}
+
+export function formatSemanticFinding(finding: SemanticFinding): string {
+  const refs = [...finding.sourceRefs, ...finding.designRefs, ...finding.graphRefs]
+  return refs.length ? `[${finding.ruleClass}] ${finding.statement} (${refs.join(', ')})` : `[${finding.ruleClass}] ${finding.statement}`
 }
 
 export function validateConstraintLedger(value: LoopConstraintLedger): string[] {
@@ -244,11 +320,17 @@ export function renderSemanticReviewMarkdown(review: LayeredSemanticReview): str
     const result = review.layers[layer]
     lines.push(`## ${layer}`, '', `Status: ${result.status}`, '')
     for (const evidence of result.evidence) lines.push(`- ${evidence.statement}  `, `  Sources: ${evidence.sourceRefs.join(', ') || '—'}  `, `  Blueprint: ${evidence.designRefs.join(', ') || '—'}  `, `  Graph: ${evidence.graphRefs.join(', ') || '—'}`)
-    for (const issue of result.issues) lines.push(`- Issue: ${issue}`)
+    for (const finding of result.findings) {
+      const label = isBlockingSemanticRuleClass(finding.ruleClass) ? 'Blocking' : 'Advisory'
+      lines.push(`- ${label} [${finding.ruleClass}]: ${finding.statement}  `,
+        `  Sources: ${finding.sourceRefs.join(', ') || '—'}  `,
+        `  Blueprint: ${finding.designRefs.join(', ') || '—'}  `,
+        `  Graph: ${finding.graphRefs.join(', ') || '—'}`)
+    }
     lines.push('')
   }
   if (review.issues.length) lines.push('## Blocking issues', '', ...review.issues.map(issue => `- ${issue}`), '')
-  if (review.warnings?.length) lines.push('## Warnings', '', ...review.warnings.map(warning => `- ${warning}`), '')
+  if (review.advisories.length) lines.push('## Advisories (recorded, non-blocking)', '', ...review.advisories.map(item => `- ${item}`), '')
   return lines.join('\n')
 }
 

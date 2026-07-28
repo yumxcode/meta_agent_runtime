@@ -5,6 +5,7 @@ import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import type { ProviderId } from '../providers/registry.js'
 import {
   createFileDistillCheckpointStore,
+  createFileDistillTraceStore,
   createDefaultGraphRuntimeCatalog,
   buildLoopReliabilityProfile,
   diagnoseLoop,
@@ -92,18 +93,23 @@ async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   const file = positional(args)
   if (!file) throw new Error('loop distill: requirement document path required')
   const out = flagValue(args, '--out') ?? 'loop.graph.json'
+  // Distill artifacts are written only after the whole pipeline succeeds. The
+  // trace is written as the run happens, so a failure still leaves every
+  // rejected envelope, frozen graph and reviewer verdict on disk.
+  const trace = createFileDistillTraceStore(deps.projectDir)
   const result = await distillLoopGraph({ requirement: file, projectDir: deps.projectDir }, {
     executor: deps.distillExecutor,
     catalog: catalog(deps),
     signal: deps.signal,
     onProgress: deps.onDistillProgress,
     checkpoint: createFileDistillCheckpointStore(deps.projectDir),
+    trace,
   })
   await writeDistillArtifacts(deps.projectDir, out, result)
   const attempts = result.phaseAttempts
     ? `architect=${result.phaseAttempts.architect}, compiler=${result.phaseAttempts.compiler}, reviewer=${result.phaseAttempts.reviewer}`
     : `compiler=${result.attempts}`
-  return `Loop Blueprint and LoopGraphSpec written (${out}, loop.design.md, loop.semantic-review.md; validated; ${attempts}); review then run: meta-agent loop create ${out}`
+  return `Loop Blueprint and LoopGraphSpec written (${out}, loop.design.md, loop.semantic-review.md; validated; ${attempts})\ntrace: ${trace.dir}\nreview then run: meta-agent loop create ${out}`
 }
 
 async function create(args: string[], deps: LoopCliDeps): Promise<string> {

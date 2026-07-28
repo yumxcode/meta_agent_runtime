@@ -129,20 +129,65 @@ describe('graph-v2 Distill contract', () => {
     expect(errors.join('\n')).toContain('only to non-executable annotations')
   })
 
-  it('rejects accepted semantic reviews that still contain discrepancies as warnings', () => {
-    const layers = Object.fromEntries([
-      'intent_constraints', 'workspace_contract', 'lane_ownership', 'control_flow', 'capability_resolution', 'runtime_preconditions',
-    ].map(name => [name, {
-      status: 'pass', issues: [],
-      evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
-    }]))
-    expect(parseLayeredSemanticReview({
+  const passingLayerSet = (): Record<string, Record<string, unknown>> => Object.fromEntries([
+    'intent_constraints', 'workspace_contract', 'lane_ownership', 'control_flow', 'capability_resolution', 'runtime_preconditions',
+  ].map(name => [name, {
+    status: 'pass', findings: [],
+    evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
+  }]))
+
+  const finding = (ruleClass: string, statement: string): Record<string, unknown> => ({
+    ruleClass, statement, sourceRefs: ['requirements.md:L1'], designRefs: ['control'], graphRefs: ['/transitions/0'],
+  })
+
+  it('derives acceptance from rule class, ignoring the model-supplied accepted flag', () => {
+    // A reviewer that files a real hard-contract violation and then claims
+    // acceptance must not get the graph through: severity is the host's.
+    const layers = passingLayerSet()
+    layers.control_flow = {
+      status: 'fail', findings: [finding('missing-source-bound', 'Source caps rounds at 20; no transition routes on it.')],
+      evidence: [{ sourceRefs: ['requirements.md:L152'], designRefs: ['control'], graphRefs: ['/limits'], statement: 'Checked.' }],
+    }
+    const parsed = parseLayeredSemanticReview({
       schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers, issues: [],
-      warnings: ['A declared write target is outside the Lane workspace contract.'],
+    })
+    expect(parsed?.accepted).toBe(false)
+    expect(parsed?.issues).toHaveLength(1)
+    expect(parsed?.issues[0]).toContain('missing-source-bound')
+  })
+
+  it('accepts a verdict whose only findings are advisory, and records them', () => {
+    const layers = passingLayerSet()
+    layers.lane_ownership = {
+      ...layers.lane_ownership,
+      findings: [finding('topology-granularity', 'research and reflect could share one agent.')],
+    }
+    const parsed = parseLayeredSemanticReview({
+      schemaVersion: 'loop-semantic-review-2.1', accepted: false, layers, issues: [],
+    })
+    expect(parsed?.accepted).toBe(true)
+    expect(parsed?.issues).toEqual([])
+    expect(parsed?.advisories[0]).toContain('topology-granularity')
+  })
+
+  it('rejects a blocking finding parked on a passing layer, or an unknown rule class', () => {
+    const smuggled = passingLayerSet()
+    smuggled.control_flow = {
+      ...smuggled.control_flow,
+      findings: [finding('unbounded-or-unreachable-control', 'No terminal is reachable.')],
+    }
+    expect(parseLayeredSemanticReview({
+      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: smuggled, issues: [],
+    })).toBeNull()
+
+    const invented = passingLayerSet()
+    invented.control_flow = { ...invented.control_flow, findings: [finding('cosmetic-nitpick', 'Naming.')] }
+    expect(parseLayeredSemanticReview({
+      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: invented, issues: [],
     })).toBeNull()
   })
 
-  it('normalizes omitted empty issues on passing review layers only', () => {
+  it('normalizes omitted empty findings on passing review layers only', () => {
     const passingLayers = Object.fromEntries([
       'intent_constraints', 'workspace_contract', 'lane_ownership', 'control_flow', 'capability_resolution', 'runtime_preconditions',
     ].map(name => [name, {
@@ -150,17 +195,18 @@ describe('graph-v2 Distill contract', () => {
       evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
     }]))
     const parsed = parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: passingLayers, issues: [], warnings: [],
+      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: passingLayers, issues: [],
     })
-    expect(parsed?.layers.control_flow.issues).toEqual([])
+    expect(parsed?.layers.control_flow.findings).toEqual([])
 
+    // A `fail` layer with no blocking finding names nothing actionable, so the
+    // whole verdict stays invalid.
     passingLayers.control_flow = {
       status: 'fail',
       evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['control'], graphRefs: ['/transitions/0'], statement: 'Broken.' }],
     }
     expect(parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: false, layers: passingLayers,
-      issues: ['Broken.'], warnings: [],
+      schemaVersion: 'loop-semantic-review-2.1', accepted: false, layers: passingLayers, issues: ['Broken.'],
     })).toBeNull()
   })
 
@@ -193,12 +239,19 @@ describe('graph-v2 Distill contract', () => {
     const reviewer = buildGraphSemanticReviewerSystem()
     expect(reviewer).toContain('runtime_preconditions')
     expect(reviewer).toContain('唯一权威项目路径')
-    expect(reviewer).toContain('attention、pivot、普通 stale 都必须受 no_progress 约束')
     expect(reviewer).toContain('只约束结果属于该集合')
     expect(reviewer).toContain('正确闭环是工作分支→writer')
     expect(reviewer).toContain('Reducer 不会修改 $output.progress_patch')
-    expect(reviewer).toContain('自动创建缺失父目录')
-    expect(reviewer).toContain('不得小于 300000（5 分钟）')
+    // Severity is the host's: the reviewer is told both enums and told its own
+    // `accepted` is discarded.
+    expect(reviewer).toContain('【严重度不由你决定】')
+    expect(reviewer).toContain('missing-source-bound')
+    expect(reviewer).toContain('topology-granularity')
+    // Rules owned by deterministic lint must NOT be restated here; duplicating
+    // them is what made every review sample a different subset.
+    expect(reviewer).toContain('【已由确定性 Lint 拥有，不要复查】')
+    expect(reviewer).not.toContain('不得小于 300000（5 分钟）')
+    expect(reviewer).not.toContain('自动创建缺失父目录')
   })
 
   it('returns an exact repair hint for unquoted enum literals', async () => {
