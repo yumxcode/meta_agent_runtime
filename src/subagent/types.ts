@@ -215,6 +215,16 @@ export interface SubAgentConfig {
    */
   autonomy?: import('../core/types.js').AutonomyProfile
   /**
+   * Force the kernel's no-model structural-truncation compaction fallback on
+   * for this sub-agent, independent of whether `autonomy` happens to be set.
+   *
+   * Unattended long-lived seats (Graph Agent lanes) need the guarantee that a
+   * session can never grow into the blocking limit, and must not acquire it by
+   * accident from the parent's auto-mode jail. See G5 in
+   * docs/reviews/graph-loop-token-cost-audit-2026-07-27.md.
+   */
+  compactStructuralFallback?: boolean
+  /**
    * Project working directory for the sub-agent (its workspace jail root and
    * sandbox writable root). When the parent is in auto mode this is set to the
    * jail root (or the per-task git worktree). Defaults to process.cwd().

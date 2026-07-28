@@ -120,10 +120,18 @@ export class AgenticSession {
         // forward 'robotics'/'agentic' through config.compact; bare agentic
         // sessions default to the generic 9-section template.
         promptProfile: config.compact?.promptProfile ?? 'agentic',
-        // Auto mode: enable the no-model structural-truncation fallback so an
-        // unattended run never grows into the blocking limit if the model
-        // compactor's circuit breaker opens.
-        autonomyFallback: config.autonomy !== undefined,
+        // Enable the no-model structural-truncation fallback so an unattended
+        // run never grows into the blocking limit if the model compactor's
+        // circuit breaker opens.
+        //
+        // G5: an explicit compact.structuralFallback wins. Deriving this purely
+        // from `autonomy !== undefined` made the guarantee an accident of how
+        // the backend was wired — a caller that needs it (loop Graph Agent
+        // seats) inherited it only because the loop CLI happens to build its
+        // backend with mode:'auto'. Callers now declare the requirement
+        // themselves; the autonomy derivation stays as the default so existing
+        // auto-mode behaviour is unchanged.
+        autonomyFallback: config.compact?.structuralFallback ?? config.autonomy !== undefined,
       },
       // Thinking on the primary model — sourced from resolved.thinkingConfig
       // (default `{ type: 'adaptive' }`, set in resolveConfig).  When the

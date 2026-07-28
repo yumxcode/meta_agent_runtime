@@ -33,8 +33,19 @@ export interface Capabilities {
   anthropicThinkingParam: boolean
   /** OpenAI-style `reasoning_effort` (DeepSeek and friends). */
   reasoningEffort: boolean
-  /** Supports Anthropic prompt-cache control blocks. */
-  promptCache: boolean
+  // NOTE: a `promptCache` flag used to live here. It was declared and set per
+  // provider but never read anywhere in the codebase — a dead capability bit
+  // that implied behaviour the runtime does not have (nothing emits
+  // `cache_control`, for ANY provider, Anthropic included). Removed rather than
+  // left misleading; see docs/reviews/graph-loop-token-cost-audit-2026-07-27.md
+  // §2.R2-RETRACTED.
+  //
+  // If explicit prompt-cache breakpoints are ever implemented, the gate belongs
+  // here and would be read where the Anthropic request body is assembled
+  // (kernel/api/AnthropicClient). Measured 2026-07-27 via
+  // scripts/probe-glm-cache.mjs: Zhipu already does implicit server-side prefix
+  // caching (cache_read_input_tokens > 0 with no cache_control sent), and
+  // sending cache_control changed nothing, so a flag alone buys nothing there.
 }
 
 /** USD per million tokens. */
@@ -89,20 +100,22 @@ export interface ResolvedProvider {
 // ─────────────────────────────────────────────────────────────────────────────
 
 const CAP_ANTHROPIC: Capabilities = {
-  anthropicBetas: true, anthropicThinkingParam: true, reasoningEffort: false, promptCache: true,
+  anthropicBetas: true, anthropicThinkingParam: true, reasoningEffort: false,
 }
 const CAP_ZHIPU: Capabilities = {
   // GLM speaks the Anthropic wire format and empirically accepts the thinking
-  // param, but rejects Anthropic-only betas and prompt-cache control blocks.
-  anthropicBetas: false, anthropicThinkingParam: true, reasoningEffort: false, promptCache: false,
+  // param, but rejects Anthropic-only betas. (It does NOT reject cache_control
+  // — measured 2026-07-27, HTTP 200; an earlier comment here claimed otherwise.
+  // Nothing sends cache_control anyway; Zhipu caches prefixes implicitly.)
+  anthropicBetas: false, anthropicThinkingParam: true, reasoningEffort: false,
 }
 const CAP_DEEPSEEK: Capabilities = {
-  anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: true, promptCache: false,
+  anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: true,
 }
 const CAP_QWEN: Capabilities = {
   // Qwen rides the DashScope Anthropic-compat endpoint; treat thinking as
   // unsupported until proven (gate it off rather than risk a 400).
-  anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: false, promptCache: false,
+  anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: false,
 }
 
 const CLAUDE_OPUS:   ModelPricing = { input: 15.0, output: 75.0, cacheRead: 1.5,  cacheWrite: 18.75 }

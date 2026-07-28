@@ -3,7 +3,8 @@ import {
   allToolResultsErrored, turnMutatedFs,
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
   AUTO_RECURRING_ERROR_LIMIT, RECURRING_ERROR_WINDOW,
-  normalizeErrorSignature, collectTurnErrors, buildRecurringErrorReflection,
+  normalizeErrorSignature, collectTurnErrors, uniqueTurnErrors,
+  countTurnsWithErrorSignature, buildRecurringErrorReflection,
 } from '../AutoStallGuard.js'
 import type { KernelMessage } from '../../types/KernelMessage.js'
 
@@ -101,6 +102,34 @@ describe('recurring-error axis config + reflection', () => {
   it('limit is soft (>= existing hard stall limit) and window is generous', () => {
     expect(AUTO_RECURRING_ERROR_LIMIT).toBeGreaterThanOrEqual(AUTO_STALL_FAILURE_LIMIT)
     expect(RECURRING_ERROR_WINDOW).toBeGreaterThan(AUTO_RECURRING_ERROR_LIMIT)
+  })
+
+  it('counts matching parallel failures once within a single tool turn', () => {
+    const names = new Map<string, string>(
+      Array.from({ length: AUTO_RECURRING_ERROR_LIMIT }, (_, index) => [`r${index}`, 'read_file']),
+    )
+    const errors = collectTurnErrors(
+      Array.from({ length: AUTO_RECURRING_ERROR_LIMIT }, (_, index) =>
+        errMsg(`r${index}`, `File not found: /workspace/state/file-${index}.json`),
+      ),
+      names,
+    )
+    const unique = uniqueTurnErrors(errors)
+    const recentTurns = [new Set(unique.map(error => error.signature))]
+
+    expect(errors).toHaveLength(AUTO_RECURRING_ERROR_LIMIT)
+    expect(unique).toHaveLength(1)
+    expect(countTurnsWithErrorSignature(recentTurns, unique[0]!.signature)).toBe(1)
+  })
+
+  it('counts the same normalized error once per distinct tool turn', () => {
+    const signature = normalizeErrorSignature('read_file', 'File not found: /workspace/state/progress.json')
+    const recentTurns = Array.from(
+      { length: AUTO_RECURRING_ERROR_LIMIT },
+      () => new Set([signature]),
+    )
+
+    expect(countTurnsWithErrorSignature(recentTurns, signature)).toBe(AUTO_RECURRING_ERROR_LIMIT)
   })
 
   it('reflection includes the error sample and the recurrence count', () => {

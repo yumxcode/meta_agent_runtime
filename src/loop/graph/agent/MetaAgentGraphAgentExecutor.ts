@@ -104,6 +104,16 @@ export class MetaAgentGraphAgentExecutor implements GraphAgentExecutor {
           writeAllowPaths: request.workspace.writeAllowPaths,
           writeDenyPaths: request.workspace.writeDenyPaths,
         },
+        // G5: Graph Agent seats are unattended and long-lived, so the no-model
+        // structural-truncate fallback is a hard requirement, not a nicety —
+        // without it, an opened compactor circuit breaker lets the seat grow
+        // into the blocking limit and every later request is hard-rejected with
+        // no human to recover it. Declared explicitly here because the
+        // downstream default derives it from `autonomy !== undefined`, which
+        // this seat only satisfies by accident of the loop CLI building its
+        // backend with mode:'auto' (cli/index.ts). Re-wire that and the
+        // guarantee would vanish silently.
+        compactStructuralFallback: true,
         lineageSessionId: request.continuity.lineageSessionId,
         workspaceId: request.continuity.workspaceId,
         loopInstanceId: request.continuity.loopInstanceId,

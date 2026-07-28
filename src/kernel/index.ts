@@ -61,6 +61,13 @@ export {
   makeSystemMessage,
 } from './messages/MessageFactory.js'
 
+/**
+ * Boundary slicing used by the kernel query path on every turn. Exported so
+ * persistence callers (loop lineage seats) can store exactly what will still
+ * be sent, instead of re-writing a prefix that is provably dead.
+ */
+export { getMessagesAfterCompactBoundary } from './messages/MessageNormalizer.js'
+
 // ── Token usage / cost ────────────────────────────────────────────────────────
 export type { TokenUsage } from './types/TokenUsage.js'
 export { emptyUsage, addUsage } from './types/TokenUsage.js'

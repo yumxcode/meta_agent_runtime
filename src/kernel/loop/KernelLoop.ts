@@ -11,7 +11,8 @@ import {
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
   AUTO_RECURRING_ERROR_LIMIT, RECURRING_ERROR_WINDOW,
   SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
-  collectTurnErrors, buildRecurringErrorReflection,
+  collectTurnErrors, uniqueTurnErrors, countTurnsWithErrorSignature,
+  buildRecurringErrorReflection,
 } from './AutoStallGuard.js'
 import { MAX_VERIFY_ROUNDS, buildVerifyRejectionPrompt } from './VerifyGate.js'
 import type { VerifyVerdict } from './VerifyGate.js'
@@ -624,11 +625,12 @@ export async function* runKernelLoop(
   let consecutiveAllErrorTurns = 0   // every tool result errored, N turns running
   let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
   let autoSelfEvalInjected = false   // one-shot self-eval nudge per stall episode
-  // Recurring-error axis (soft-only): sliding window of recent error signatures
-  // + the set already reflected on, so each recurring failure mode triggers at
-  // most one reflection. Survives interleaved successes / varied inputs because
-  // it keys on the normalized error, not the tool input or all-error state.
-  const recentErrorSignatures: string[] = []
+  // Recurring-error axis (soft-only): sliding window of tool turns. Each Set
+  // contains the distinct normalized error signatures observed in one turn, so
+  // parallel failures in a single batch cannot impersonate a retry loop.
+  // recurringErrorNudged ensures each live failure mode triggers at most one
+  // reflection until it ages out of the turn window.
+  const recentErrorTurns: Array<Set<string>> = []
   const recurringErrorNudged = new Set<string>()
   let verifyRounds = 0               // auto-mode completion-gate rounds consumed
   let consecutiveDriftGateFailures = 0
@@ -1658,25 +1660,29 @@ export async function* runKernelLoop(
       }
 
       // Recurring-error axis (SOFT-ONLY): the SAME normalized error signature
-      // recurring ≥ AUTO_RECURRING_ERROR_LIMIT times within the recent window —
-      // catches debug/retry loops the all-error & no-FS axes miss (a successful
-      // edit each turn resets those). One reflection per signature; never stops.
+      // appearing in ≥ AUTO_RECURRING_ERROR_LIMIT distinct tool turns within
+      // the recent turn window catches debug/retry loops the all-error & no-FS
+      // axes miss. One reflection per live signature; never stops.
       {
-        const turnErrors = collectTurnErrors(toolsResult.toolResultMessages, toolNameByUseId)
-        for (const e of turnErrors) recentErrorSignatures.push(e.signature)
-        while (recentErrorSignatures.length > RECURRING_ERROR_WINDOW) recentErrorSignatures.shift()
-        // Re-arm a signature once it has fully aged out of the window, so a
-        // genuinely new later recurrence can reflect again.
+        const turnErrors = uniqueTurnErrors(
+          collectTurnErrors(toolsResult.toolResultMessages, toolNameByUseId),
+        )
+        recentErrorTurns.push(new Set(turnErrors.map(error => error.signature)))
+        while (recentErrorTurns.length > RECURRING_ERROR_WINDOW) recentErrorTurns.shift()
+        // Re-arm a signature once it has fully aged out of the turn window, so
+        // a genuinely new later recurrence can reflect again.
         for (const sig of [...recurringErrorNudged]) {
-          if (!recentErrorSignatures.includes(sig)) recurringErrorNudged.delete(sig)
+          if (countTurnsWithErrorSignature(recentErrorTurns, sig) === 0) {
+            recurringErrorNudged.delete(sig)
+          }
         }
         for (const e of turnErrors) {
           if (recurringErrorNudged.has(e.signature)) continue
-          const count = recentErrorSignatures.filter(s => s === e.signature).length
+          const count = countTurnsWithErrorSignature(recentErrorTurns, e.signature)
           if (count >= AUTO_RECURRING_ERROR_LIMIT) {
             recurringErrorNudged.add(e.signature)
             append(makeTextUserMessage(buildRecurringErrorReflection(e.sample, count), { isMeta: true }))
-            yield { type: 'text_delta', delta: `\n[auto] 同一错误反复出现（×${count}），注入一次反思…\n`, sessionId }
+            yield { type: 'text_delta', delta: `\n[auto] 同一错误跨回合出现（${count} 回合），注入一次反思…\n`, sessionId }
             break // at most one recurring-error reflection per turn
           }
         }

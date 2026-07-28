@@ -230,6 +230,12 @@ export class MetaAgentSession {
         // each mode's compact template comes from the single MODE_PROFILES table
         // (auto → 9-section + Autonomous Ledger; agentic → generic).
         promptProfile: config.compact?.promptProfile ?? MODE_PROFILES[this._defaultMode].compactProfile,
+        // G5: forward the caller's explicit structural-truncate requirement.
+        // This object is rebuilt rather than spread, so an un-forwarded key is
+        // silently dropped — keep this in sync when adding compact options.
+        ...(config.compact?.structuralFallback !== undefined
+          ? { structuralFallback: config.compact.structuralFallback }
+          : {}),
       },
     })
 

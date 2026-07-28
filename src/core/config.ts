@@ -173,6 +173,20 @@ export interface MetaAgentConfig {
      * sections.
      */
     promptProfile?: CompactProfile
+    /**
+     * Enable the no-model structural-truncation fallback (kernel
+     * StructuralTruncate), which guarantees forward progress when the
+     * model-based compactor's circuit breaker opens. Without it a session grows
+     * into the blocking limit and the next request is hard-rejected.
+     *
+     * Leave undefined to keep the historical derivation (`autonomy !==
+     * undefined`, i.e. auto mode gets it). Set explicitly when a caller needs
+     * the guarantee on its own terms rather than as a side effect of how its
+     * backend happened to be constructed — unattended callers should not depend
+     * on inheriting it. See G5 in
+     * docs/reviews/graph-loop-token-cost-audit-2026-07-27.md.
+     */
+    structuralFallback?: boolean
   }
 
   /**

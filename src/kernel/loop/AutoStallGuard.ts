@@ -30,15 +30,17 @@ export const FS_MUTATING_TOOLS = new Set(['write_file', 'append_file', 'edit_fil
 
 /**
  * Recurring-error axis: how many times the SAME normalized error signature must
- * recur within the recent window before one reflection nudge is injected. This
- * axis is SOFT-ONLY — it never hard-stops (the maxTurns cap is the backstop). It
- * exists because the all-error and no-FS axes both reset on any successful edit,
- * so a "edit → run → same error → edit → run → same error" debug/retry loop
- * defeats them and burns the whole turn budget. Keyed on the error (not the tool
- * input), so it survives both interleaved successes and varied inputs.
+ * recur in DISTINCT tool turns within the recent window before one reflection
+ * nudge is injected. Multiple matching failures from one parallel tool batch
+ * count as one occurrence. This axis is SOFT-ONLY — it never hard-stops (the
+ * maxTurns cap is the backstop). It exists because the all-error and no-FS axes
+ * both reset on any successful edit, so a
+ * "edit → run → same error → edit → run → same error" debug/retry loop defeats
+ * them and burns the whole turn budget. Keyed on the error (not the tool input),
+ * so it survives both interleaved successes and varied inputs.
  */
 export const AUTO_RECURRING_ERROR_LIMIT = 6
-/** Sliding window (in error occurrences) over which recurrences are counted. */
+/** Sliding window (in tool turns) over which recurrences are counted. */
 export const RECURRING_ERROR_WINDOW = 40
 
 /** The self-eval prompt injected when a soft stall threshold is first crossed. */
@@ -135,10 +137,39 @@ export function collectTurnErrors(
   return out
 }
 
+/**
+ * Collapse matching errors from one parallel tool batch into one observation.
+ *
+ * The recurring-error threshold is defined in distinct tool turns, not raw
+ * tool_result blocks. Keeping the first sample preserves a useful diagnostic
+ * without allowing fan-out within one turn to inflate the recurrence count.
+ */
+export function uniqueTurnErrors(
+  errors: readonly { signature: string; sample: string }[],
+): Array<{ signature: string; sample: string }> {
+  const bySignature = new Map<string, { signature: string; sample: string }>()
+  for (const error of errors) {
+    if (!bySignature.has(error.signature)) bySignature.set(error.signature, error)
+  }
+  return [...bySignature.values()]
+}
+
+/** Count the distinct recent tool turns in which one error signature appeared. */
+export function countTurnsWithErrorSignature(
+  recentTurnSignatures: readonly ReadonlySet<string>[],
+  signature: string,
+): number {
+  let count = 0
+  for (const turn of recentTurnSignatures) {
+    if (turn.has(signature)) count++
+  }
+  return count
+}
+
 /** The one-shot reflection injected when an error signature recurs ≥ the limit. */
 export function buildRecurringErrorReflection(sample: string, count: number): string {
   return (
-    `[系统·自评估] 同一个错误已反复出现约 ${count} 次（即使你中间改过文件，它仍在复现）：\n` +
+    `[系统·自评估] 同一个错误已在约 ${count} 个回合中出现（即使你中间改过文件，它仍在复现）：\n` +
     `${sample}\n` +
     `先停下来想清楚：(1) 这个错误的真正根因是什么，而不是表面症状？` +
     `(2) 你前几次的修法为什么没能消除它？` +

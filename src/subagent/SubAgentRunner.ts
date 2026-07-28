@@ -16,8 +16,9 @@
 
 import { MetaAgentSession } from '../core/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
-import type { MetaAgentTool } from '../core/types.js'
+import type { ConversationMessage, MetaAgentTool } from '../core/types.js'
 import { SessionStore } from '../core/SessionStore.js'
+import { getMessagesAfterCompactBoundary, type KernelMessage } from '../kernel/index.js'
 import { registerModelCallScope } from '../infra/modelCallAdmission.js'
 import { classifyExecutionFailure } from '../infra/failures/ExecutionFailure.js'
 import { resolveProvider } from '../providers/registry.js'
@@ -403,6 +404,11 @@ export class SubAgentRunner {
       ...(cfg.externalPromptAssembly ? { externalPromptAssembly: true } : {}),
       ...(scopedSessionId ? { sessionId: scopedSessionId } : {}),
       ...(priorMessages.length ? { initialMessages: priorMessages } : {}),
+      // G5: an explicit structural-truncate requirement from the spawner beats
+      // the `autonomy !== undefined` derivation downstream.
+      ...(cfg.compactStructuralFallback !== undefined
+        ? { compact: { structuralFallback: cfg.compactStructuralFallback } }
+        : {}),
     }
 
     this.session = new MetaAgentSession(sessionConfig)
@@ -747,11 +753,40 @@ export class SubAgentRunner {
     }
   }
 
-  /** Persist the lineage seat transcript so the next round resumes it (loop). */
+  /**
+   * Persist the lineage seat transcript so the next round resumes it (loop).
+   *
+   * Two invariants, both audited in
+   * docs/reviews/graph-loop-token-cost-audit-2026-07-27.md:
+   *
+   * G3 — only a COMPLETED segment earns the right to extend the lineage. This
+   * method runs from a `finally`, so without the guard a failed / cancelled /
+   * timed-out attempt would leave its whole transcript in the lineage, and the
+   * Graph Kernel's retry (maxAttempts) or replay would then re-run the same
+   * node input on top of a full record of the attempt that just failed. A retry
+   * should start from the last good state, which matches `maxAttempts`
+   * semantics. Note that a timer park writes 'completed' with a {label:'wait'}
+   * payload (see the _parked branch above), so durable continuations still
+   * persist — which is exactly what we want.
+   *
+   * G4 — persist only from the last compact boundary. Everything before it is
+   * never sent to the model again (KernelLoop slices with the same helper
+   * before every request), but it WAS being written and re-read in full on
+   * every activation. Slicing here costs nothing and stops history.jsonl from
+   * growing without bound. isCompactBoundary survives the round-trip: it is
+   * cast straight through on save and restored by messageBridge on load.
+   */
   private async _persistLineageHistory(): Promise<void> {
     const lineageId = this.record.config.lineageSessionId
     if (!lineageId || !this.session) return
-    const messages = this.session.getMessages()
+    // G3: `status` is authoritative here — _writeTerminal syncs this.record
+    // before the finally block runs. A runner that threw before any terminal
+    // write is still 'running' and must not extend the lineage either.
+    if (this.record.status !== 'completed') return
+    // G4: same boundary semantics the kernel query path uses.
+    const messages = getMessagesAfterCompactBoundary(
+      this.session.getMessages() as unknown as readonly KernelMessage[],
+    ) as unknown as readonly ConversationMessage[]
     await SessionStore.replace(lineageId, {
       mode: 'inner_orch_worker',
       startTime: this.record.createdAt,

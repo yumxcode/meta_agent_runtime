@@ -78,7 +78,21 @@ const BUILTIN_BOUNDED_TOOLS = new Set([
   'session_tag', 'skill', 'todo_write', 'write_file', 'append_file',
 ])
 
-const DEFAULT_MAX_RESULT_SIZE_CHARS = 200 * 1024
+/**
+ * Kernel-side backstop applied by applyToolResultBudget to EVERY tool result.
+ *
+ * Invariant: this must stay strictly BELOW the loosest self-cap any individual
+ * tool applies to its own output, or the backstop is inert for that tool. It
+ * was 200KiB while the bash tool already self-truncates at 100KiB
+ * (tools/shell/bash: DEFAULT_MAX_OUT), so the backstop could never fire on the
+ * single largest context contributor in the system — an inversion, not a
+ * tuning choice. 64KiB restores the ordering and still leaves ~16k tokens of
+ * headroom for one tool result.
+ *
+ * Raise per-run with META_AGENT_MAX_TOOL_RESULT_CHARS if a workload genuinely
+ * needs bigger single results.
+ */
+const DEFAULT_MAX_RESULT_SIZE_CHARS = 64 * 1024
 
 /**
  * Lazy getter — reads META_AGENT_MAX_TOOL_RESULT_CHARS at call time, not at
