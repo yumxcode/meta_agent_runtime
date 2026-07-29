@@ -182,6 +182,41 @@ const accepted = blocking.length === 0
 - ruleClass 是**固定枚举**而非自由文本，误分类在 artifact 里可见、可审计、可回归测试；
 - 配合方案 1（全阶段留痕），每轮 findings 都落盘，误分类模式能被统计出来。
 
+## 8.5 执行落点（enforcement locus）
+
+分级解决了「小问题当大问题」，但没有解决**另一类根本不可修的 finding**。
+
+三份提示词是互斥的：Architect 被要求「稀疏控制骨架 + 厚 Agent 节点」却「不得因拓扑合并丢失约束」
+（于是一份祈使语气的操作手册被逐句抽成 hard constraint），Compiler 被要求把紧耦合语义
+**留在 Agent 内**，Reviewer 却被要求每条 hard constraint 都在 Graph 里有可执行落点。
+
+机械校验拦不住这个矛盾：`validateGraphTraceability` 原本只检查 JSON pointer **存在**，
+所以 Compiler 指向 `/nodes/work` 就能过；Reviewer 再语义地判定「这个指针没有真的实现它」。
+像「根据历史发现选择最值得验证的假设」这种约束，Compiler 只有两条路而两条都被堵死——
+伪造 Function（提示词明令禁止）或指向厚 Agent（被判 annotation-only）。**这类 finding 改不好，
+而它的数量随来源文档长度增长。**
+
+落点把这个隐含维度显式化，且**由宿主从 `kind` 机械推导，模型不参与**：
+
+| kind | locus | 含义 |
+|---|---|---|
+| deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / recovery / budget / timer / event / other | **graph** | 必须落在 Transition、Lane.workspace、State 更新、limits 或终态上 |
+| goal / success_criteria | **agent** | Graph 中没有对应元素就是正确设计；只核验责任 Agent 被交底 |
+| capability | **human** | 进 preconditions，由人确认 |
+
+`other` 保守归 graph：分类不清时保持严格读法，让错标响亮地失败而不是悄悄逃逸。
+
+配套改动：
+
+- `validateGraphTraceability` 分档——graph 落点不接受只指向 `/nodes/*/prompt`、
+  `systemInstructions`、`description`；agent 落点接受。annotations 对任何落点都不接受。
+- 新增阻断类 `unbriefed-agent-constraint`：把约束交给 Agent 判断是合法的，交给**没有人**不是。
+- Reviewer 提示新增【执行落点】节，明确 agent 落点「Graph 中没有对应元素**不得据此提出任何 finding**」。
+- Architect 提示说明 `kind` 不再是自由标签，它决定执行落点。
+
+为什么模型无法利用这条逃逸：`kind` 是受限枚举，由 Architect 对着来源原文标注，
+且在任何 Graph 存在**之前**——没有「为了让候选通过而降级」的动机路径。
+
 ## 9. 实施记录
 
 | 步骤 | 状态 | 落点 |
@@ -189,7 +224,11 @@ const accepted = blocking.length === 0
 | 方案 1 全阶段留痕 | 已实施 | 新增 `DistillTrace.ts`；`GraphDistiller` 在每个 attempt 的 accepted/unparseable/invalid/frozen/rejected 分支落盘；`loop/cli.ts` 接线；fatal 追加 trace 目录 |
 | 表 A 移交 lint | 已实施 | 新增 `lane-write-overlap`(error)、`redundant-mkdir`(warning)；reviewer 提示新增「已由确定性 Lint 拥有，不要复查」段并删除对应旧条目 |
 | 表 B/C 分级 | 已实施 | `SEMANTIC_RULE_CLASSES` / `BLOCKING_SEMANTIC_RULE_CLASSES`；`issues`→`findings`；删除 `warnings`，新增 `advisories`；`accepted` 由宿主计算 |
-| 方案 2c 固定清单 | 未做 | 待方案 1 产出的 trace 积累几轮真实 verdict 后再定 |
+| 执行落点 §8.5 | 已实施 | `deriveEnforcementLocus` / `enforcementLocusIndex` / `formatEnforcementLoci`；traceability 分档；新增 `unbriefed-agent-constraint`；三份提示词同步 |
+| 提示词梳理 | 已实施 | Compiler 清除领域模板（`stale_count`/`no_progress`/`attention`/`pivot>=2` 等一组特定 loop 的词汇与字面阈值）；合并 4 条 writer 规则为 2 条；补 hard-park 与时间约束的因果；删除 `parseGraphDistillOutput`、`buildLayeredGraphDistillerSystem` 死代码 |
+| `dead-state-field` lint | 已实施 | error 级；3 张真实图 0 误报（含一张已被 reviewer 接受的） |
+| metadata 回收夹缝 | 已修复 | `graph` 被写成 `null`/占位串/`{}` 时不再丢弃已冻结图 |
+| 方案 2c 固定清单 | 未做 | 待 trace 积累更多真实 verdict 后再定 |
 
 产物布局（`.loop/distill/run-<ISO>/`）：
 

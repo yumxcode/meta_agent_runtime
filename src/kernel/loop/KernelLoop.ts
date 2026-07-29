@@ -4,6 +4,7 @@
  * Direct equivalent of CC's query.ts queryLoop().
  * Step numbers match cc-kernel-rewrite-detailed-plan.md §2.2.
  */
+import { createHash } from 'node:crypto'
 import type { KernelConfig } from '../types/KernelConfig.js'
 import type { KernelEvent, PermissionDenial } from '../types/KernelEvent.js'
 import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
@@ -517,11 +518,45 @@ function finaliseAccumulator(acc: StreamAccumulator): {
 }
 
 const NO_PROGRESS_REPEAT_LIMIT = 3
+
+/**
+ * Ceiling for an identical tool request whose *results keep changing*.
+ *
+ * Repeating a call verbatim is normal whenever the tool observes external state
+ * the agent does not control — polling a CI run, waiting on a job, re-reading a
+ * file another process is writing. There the model is making progress: each
+ * identical request returns new information. Counting those as a stall killed
+ * agent seats after three polls even though the seat's own turn/cost/wall-time
+ * budgets had barely been touched.
+ *
+ * A much higher bound still applies, because polling that never resolves is a
+ * real failure mode; it just is not detectable after three turns.
+ */
+const NO_PROGRESS_POLLING_LIMIT = 20
 const CHECKPOINT_STATE_TOOLS = new Set([
   'todo_write',
   'progress_note',
   'artifacts_register',
 ])
+
+/**
+ * Stable digest of one tool batch's results, used only to tell "same call, new
+ * information" apart from "same call, same answer". Hashing keeps the retained
+ * string bounded regardless of how large a tool result is.
+ */
+function toolResultSignature(messages: readonly { content: readonly unknown[] }[]): string {
+  const parts: string[] = []
+  for (const message of messages) {
+    for (const rawBlock of message.content) {
+      if (!rawBlock || typeof rawBlock !== 'object') continue
+      const block = rawBlock as { type?: string; content?: unknown; is_error?: boolean }
+      if (block.type !== 'tool_result') continue
+      const content = typeof block.content === 'string' ? block.content : stableStringify(block.content)
+      parts.push(`${block.is_error === true ? 'E' : 'O'}:${content}`)
+    }
+  }
+  return createHash('sha256').update(parts.join(' ')).digest('hex')
+}
 
 /**
  * Window length for the A↔B oscillation guard: 6 entries = 3 full ABAB cycles.
@@ -602,6 +637,17 @@ export async function* runKernelLoop(
   let allPermissionDenials: PermissionDenial[] = []
   let resultText = ''
   let lastToolRequestSignature = ''
+  // Result signature of the most recent tool batch, and whether it differed
+  // from the batch before it. An identical request that yields a *different*
+  // result is an observation of changing external state, not a stall.
+  let lastToolResultSignature = ''
+  let hasToolResultSignature = false
+  let lastToolResultChanged = false
+  // Sticky for the current run of identical requests: once a repeated call has
+  // returned something new even once, the run is polling. A poll whose observed
+  // value happens to hold steady for a few turns ("queued", "queued", …) must
+  // not then be judged as a stall.
+  let sawResultChangeInRepeatRun = false
 
   const additionalBudgetUsd = (): number => {
     try {
@@ -621,6 +667,7 @@ export async function* runKernelLoop(
     totalCost + additionalBudgetUsd() >= config.maxBudgetUsd
   reportMainCost()
   let repeatedToolRequestCount = 0
+  let pollingRepeatCount = 0
   // Auto-mode stall circuit.
   let consecutiveAllErrorTurns = 0   // every tool result errored, N turns running
   let turnsSinceFsProgress = 0       // ran tools but mutated no file, N turns running
@@ -1443,21 +1490,39 @@ export async function* runKernelLoop(
       .map(req => `${req.toolName}:${stableStringify(req.input)}`)
       .join('\n')
     // L5: a model stuck in a loop often narrates ("let me try again…") while
-    // re-issuing the *exact* same tool call. The old guard only counted repeats
-    // when assistantText was empty, so any accompanying text disabled the
-    // safety net and the loop could spin until the turn/budget cap. We now count
-    // an identical tool signature as no-progress regardless of narration —
-    // differing tool inputs still reset the counter, so genuine progress is
-    // unaffected.
+    // re-issuing the *exact* same tool call, so an identical tool signature
+    // counts as no-progress regardless of narration.
+    //
+    // The request alone is not enough to judge, though. Identical input with a
+    // *changing* result means the tool is observing external state the agent
+    // does not control — polling a CI run, waiting on a job, re-reading a file
+    // another process writes — and each call returns new information. Treating
+    // that as a stall terminated agent seats on the third poll while their own
+    // turn/cost/wall-time budgets were nowhere near spent, and the retry
+    // restarted the whole segment into the same wall. Only a repeated request
+    // whose result also stopped changing is actually stuck.
     if (toolRequestSignature === lastToolRequestSignature) {
-      repeatedToolRequestCount++
+      pollingRepeatCount++
+      if (lastToolResultChanged) sawResultChangeInRepeatRun = true
+      // Same call, new information at least once: progress on the observation
+      // axis, so only the polling ceiling applies.
+      if (sawResultChangeInRepeatRun) repeatedToolRequestCount = 1
+      else repeatedToolRequestCount++
     } else {
       lastToolRequestSignature = toolRequestSignature
       repeatedToolRequestCount = 1
+      pollingRepeatCount = 1
+      sawResultChangeInRepeatRun = false
     }
     if (repeatedToolRequestCount >= NO_PROGRESS_REPEAT_LIMIT) {
       resultText =
         `Stopped: the model repeated the same tool request ${repeatedToolRequestCount} times without making progress.`
+      yield { type: 'text_delta', delta: resultText, sessionId }
+      return done('no_progress')
+    }
+    if (pollingRepeatCount >= NO_PROGRESS_POLLING_LIMIT) {
+      resultText =
+        `Stopped: the model issued the same tool request ${pollingRepeatCount} times; the results kept changing but the task did not advance.`
       yield { type: 'text_delta', delta: resultText, sessionId }
       return done('no_progress')
     }
@@ -1515,6 +1580,18 @@ export async function* runKernelLoop(
 
     const toolsResult = await runTools(toolUseRequests, config.tools, toolCtx, canUseTool)
     const toolNameByUseId = new Map(toolUseRequests.map(req => [req.toolUseId, req.toolName]))
+
+    // Feed the no-progress guard above: it runs before tools execute, so it can
+    // only ever see whether the *previous* identical request returned something
+    // new. Recorded here, consumed on the next turn.
+    {
+      const signature = toolResultSignature(toolsResult.toolResultMessages)
+      // The very first batch has nothing to differ from; calling it "changed"
+      // would hand every stalled loop one free turn.
+      lastToolResultChanged = hasToolResultSignature && signature !== lastToolResultSignature
+      lastToolResultSignature = signature
+      hasToolResultSignature = true
+    }
 
     // Emit tool_result events
     for (const resultMsg of toolsResult.toolResultMessages) {

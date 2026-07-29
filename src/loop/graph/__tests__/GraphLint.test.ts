@@ -13,7 +13,9 @@ function graph(): LoopGraphSpec {
       done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
     },
     transitions: [
-      { id: 'done', from: 'work', to: 'done' },
+      // `status` is declared in state, so something has to maintain it —
+      // otherwise dead-state-field (correctly) fires on the fixture itself.
+      { id: 'done', from: 'work', to: 'done', updates: [{ target: 'status', reducer: 'builtin/set@1', args: { value: { literal: 'done' } } }] },
       { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
     ],
     entrypoints: [{ id: 'start', node: 'work' }], limits: { maxActivations: 10 },
@@ -250,5 +252,20 @@ describe('graph write-surface lint', () => {
     const rules = lintLoopGraph(CANONICAL_GRAPH_DISTILL_EXAMPLE).map(f => f.rule)
     expect(rules).not.toContain('lane-write-overlap')
     expect(rules).not.toContain('redundant-mkdir')
+    expect(rules).not.toContain('dead-state-field')
+  })
+
+  // A counter the source asked for but no Reducer maintains is frozen at its
+  // initial value, which silently makes every threshold on it unreachable.
+  it('errors on state fields no transition ever updates', () => {
+    const spec = graph()
+    spec.state.iteration = { type: { type: 'integer', minimum: 0 }, initial: 0 }
+    const dead = lintLoopGraph(spec).filter(f => f.rule === 'dead-state-field')
+    expect(dead).toHaveLength(1)
+    expect(dead[0]!.level).toBe('error')
+    expect(dead[0]!.at).toBe('state.iteration')
+
+    spec.transitions[1]!.updates = [{ target: 'iteration', reducer: 'builtin/increment@1' }]
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'dead-state-field')).toEqual([])
   })
 })

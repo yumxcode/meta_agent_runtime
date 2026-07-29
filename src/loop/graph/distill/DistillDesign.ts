@@ -29,6 +29,75 @@ export interface LoopConstraintLedger {
   unresolved?: Array<{ id: string; question: string; affects: string[] }>
 }
 
+/**
+ * Where a constraint is enforced — the missing axis that made semantic review
+ * unsatisfiable.
+ *
+ * Architect and Compiler are both told to prefer a sparse control skeleton with
+ * thick Agent nodes, i.e. to keep tightly-coupled semantics *inside* the Agent.
+ * Review then demanded that every hard constraint resolve to an executable
+ * Graph element. A goal like "pick the hypothesis most worth testing" has no
+ * such element and never can: the only ways to produce one are forbidden
+ * (inventing a Function) or rejected (pointing at prose). Those findings were
+ * unfixable by construction, and their number grew with the length of the
+ * source document.
+ *
+ * The locus makes the split explicit:
+ *   - `graph` — must resolve to routing, permission or a bound. This is the
+ *     determinism the design actually asks for.
+ *   - `agent` — deliberately delegated to Agent judgement; the obligation is
+ *     that the responsible node is briefed, not that the Graph encodes it.
+ *   - `human` — cannot be settled by either; belongs in preconditions.
+ *
+ * Derived by the host from `kind`, never chosen by a model. `kind` is already a
+ * closed enum the Architect assigns against the source text before any Graph
+ * exists, so there is no path by which a later stage can relabel an
+ * inconvenient routing rule as "judgement" to get a candidate through.
+ */
+export type SemanticEnforcementLocus = 'graph' | 'agent' | 'human'
+
+/** Unclassifiable kinds default to `graph`: keeping the strict reading for
+ * anything unrecognized means a mislabelled constraint fails loudly rather than
+ * silently escaping review. */
+const ENFORCEMENT_LOCUS_BY_KIND: Readonly<Record<LoopConstraintKind, SemanticEnforcementLocus>> = {
+  deterministic_rule: 'graph',
+  workspace_protocol: 'graph',
+  ownership: 'graph',
+  terminal_obligation: 'graph',
+  failure_boundary: 'graph',
+  recovery: 'graph',
+  budget: 'graph',
+  timer: 'graph',
+  event: 'graph',
+  other: 'graph',
+  // Intent-shaped: the source states an outcome to pursue, not a rule to encode.
+  goal: 'agent',
+  success_criteria: 'agent',
+  // A capability the runtime does not have is not a lowering defect.
+  capability: 'human',
+}
+
+export function deriveEnforcementLocus(kind: LoopConstraintKind): SemanticEnforcementLocus {
+  return ENFORCEMENT_LOCUS_BY_KIND[kind] ?? 'graph'
+}
+
+/** Constraint id → locus, for the reviewer contract and traceability checks. */
+export function enforcementLocusIndex(ledger: LoopConstraintLedger): Map<string, SemanticEnforcementLocus> {
+  const index = new Map<string, SemanticEnforcementLocus>()
+  for (const constraint of ledger.constraints ?? []) {
+    if (constraint?.id) index.set(constraint.id, deriveEnforcementLocus(constraint.kind))
+  }
+  return index
+}
+
+/** Compact per-constraint locus table injected into the reviewer prompt. */
+export function formatEnforcementLoci(ledger: LoopConstraintLedger): string {
+  const rows = (ledger.constraints ?? [])
+    .filter(constraint => constraint?.id)
+    .map(constraint => `${constraint.id}=${deriveEnforcementLocus(constraint.kind)}(${constraint.kind})`)
+  return rows.join(' · ')
+}
+
 /** Small semantic handoff. The executable structure exists only in LoopGraphSpec. */
 export interface LoopBlueprint {
   schemaVersion: typeof LOOP_BLUEPRINT_SCHEMA
@@ -139,6 +208,10 @@ export const BLOCKING_SEMANTIC_RULE_CLASSES = [
   'dangling-traceability',
   'fabricated-capability',
   'annotation-only-satisfaction',
+  /** An `agent`-locus constraint the responsible node was never told about.
+   * Delegating a constraint to Agent judgement is legitimate; delegating it to
+   * nobody is not. */
+  'unbriefed-agent-constraint',
   'unbounded-or-unreachable-control',
   'missing-source-bound',
   'writer-boundary-bypass',
@@ -250,6 +323,7 @@ export function validateGraphTraceability(mapping: GraphTraceabilityMap, ledger:
   if (mapping.schemaVersion !== GRAPH_TRACEABILITY_SCHEMA) errors.push(`traceability.schemaVersion must be '${GRAPH_TRACEABILITY_SCHEMA}'`)
   const known = new Set(ledger.constraints.map(item => item.id))
   const hard = new Set(ledger.constraints.filter(item => item.strength === 'hard').map(item => item.id))
+  const loci = enforcementLocusIndex(ledger)
   const seen = new Set<string>()
   const mappings = Array.isArray(mapping.mappings) ? mapping.mappings : []
   if (!Array.isArray(mapping.mappings)) errors.push('traceability.mappings must be an array')
@@ -262,12 +336,29 @@ export function validateGraphTraceability(mapping: GraphTraceabilityMap, ledger:
     const refs = safeStrings(item.graphRefs)
     if (!refs.length) errors.push(`${at}.graphRefs must be non-empty`)
     for (const pointer of refs) if (!jsonPointerExists(graph, pointer)) errors.push(`${at}.graphRefs '${pointer}' does not exist in the Graph`)
-    if (hard.has(item.constraintId) && refs.length && refs.every(pointer => pointer === '/annotations' || pointer.startsWith('/annotations/'))) {
+    // Annotations never execute, so they cannot carry a hard constraint of any
+    // locus. Prose inside a node (prompt/systemInstructions) is different: it is
+    // exactly where an `agent`-locus constraint is supposed to live, and exactly
+    // where a `graph`-locus one must not hide.
+    if (hard.has(item.constraintId) && refs.length && refs.every(isAnnotationPointer)) {
       errors.push(`${at} maps hard constraint '${item.constraintId}' only to non-executable annotations`)
+    }
+    if (hard.has(item.constraintId) && loci.get(item.constraintId) === 'graph' && refs.length && refs.every(isProsePointer)) {
+      errors.push(`${at} maps graph-enforced hard constraint '${item.constraintId}' only to node prose (${refs.join(', ')}); routing, permission and bound constraints need a Transition, Lane workspace rule, State update or limit`)
     }
   }
   for (const constraintId of hard) if (!seen.has(constraintId)) errors.push(`hard constraint '${constraintId}' has no Graph traceability`)
   return errors
+}
+
+function isAnnotationPointer(pointer: string): boolean {
+  return pointer === '/annotations' || pointer.startsWith('/annotations/')
+}
+
+/** Node prose: legitimate for an `agent`-locus constraint, insufficient for a
+ * `graph`-locus one. */
+function isProsePointer(pointer: string): boolean {
+  return isAnnotationPointer(pointer) || /^\/nodes\/[^/]+\/(prompt|systemInstructions|description)$/.test(pointer)
 }
 
 export function buildGraphImplementationManifest(graph: LoopGraphSpec): GraphImplementationManifest {

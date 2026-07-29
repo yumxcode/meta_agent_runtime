@@ -268,6 +268,56 @@ describe('KernelSession — max turns', () => {
     expect(result?.resultText).toContain('repeated the same tool request')
     expect(mockStream).toHaveBeenCalledTimes(3)
   })
+
+  // Polling a CI run, waiting on a job or re-reading a file another process
+  // writes all repeat the *request* verbatim while the *result* changes. The
+  // guard used to see only the request and killed such agents on the third
+  // poll, well inside their own turn/cost budgets, and the retry restarted the
+  // whole segment into the same wall.
+  it('does not treat an identical request with changing results as a stall', async () => {
+    let polls = 0
+    const pollTool: KernelTool = {
+      name: 'poll',
+      description: 'poll',
+      inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+      inputJSONSchema: { type: 'object' as const, properties: { job: { type: 'string' } } },
+      call: async () => ({ data: `status=${++polls}` }),
+      isConcurrencySafe: () => false,
+    }
+
+    mockStream.mockImplementation(() => toolUseStream(crypto.randomUUID(), 'poll', { job: 'ci' }))
+
+    const session = new KernelSession(makeConfig({ maxTurns: 8, tools: [pollTool] }))
+    const events = await collectEvents(session, 'Wait for CI')
+    const result = events.find(e => e.type === 'result')
+
+    // Runs to the caller's own turn budget instead of being cut off at 3.
+    expect(result?.subtype).toBe('error_max_turns')
+    expect(result?.resultText ?? '').not.toContain('repeated the same tool request')
+    expect(polls).toBeGreaterThan(3)
+  })
+
+  // The relief above must not become a licence to poll forever.
+  it('still stops an identical request whose results change without end', async () => {
+    let polls = 0
+    const pollTool: KernelTool = {
+      name: 'poll',
+      description: 'poll',
+      inputSchema: { safeParse: (v) => ({ success: true, data: v }) },
+      inputJSONSchema: { type: 'object' as const, properties: { job: { type: 'string' } } },
+      call: async () => ({ data: `status=${++polls}` }),
+      isConcurrencySafe: () => false,
+    }
+
+    mockStream.mockImplementation(() => toolUseStream(crypto.randomUUID(), 'poll', { job: 'ci' }))
+
+    const session = new KernelSession(makeConfig({ maxTurns: Infinity, tools: [pollTool] }))
+    const events = await collectEvents(session, 'Wait forever')
+    const result = events.find(e => e.type === 'result')
+
+    expect(result?.subtype).toBe('error_during_execution')
+    expect(result?.resultText).toContain('the results kept changing but the task did not advance')
+  })
 })
 
 describe('KernelSession — auto checkpoint and drift boundaries', () => {

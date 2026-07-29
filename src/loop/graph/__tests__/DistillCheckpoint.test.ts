@@ -305,6 +305,46 @@ describe('Distill Architect checkpoint', () => {
     expect(compilerPrompts[1]).toContain('只返回上面指定的 metadata JSON')
   })
 
+  // That metadata turn is told the graph is host-retained and must not be
+  // repeated. Models spell "omitted" as an absent key, `null`, or a placeholder
+  // string. Requiring strict absence put the last two in a gap between the two
+  // parsers — one rejects them for not being an object, the other for being
+  // present — and a frozen, executable graph was discarded over the spelling.
+  it.each([
+    ['absent key', undefined],
+    ['null', null],
+    ['placeholder string', '已冻结，见上一轮 graph_validate'],
+    ['empty object', {}],
+  ])('recovers the retained graph when the compiler spells it as %s', async (_label, spelling) => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-metadata-spelling-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          if (++compiles === 1) return { status: 'failed', error: 'envelope timeout', validatedGraph: graph }
+          const envelope: Record<string, unknown> = {
+            traceability: { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] },
+            preconditions: { schemaVersion: 'loop-preconditions-1.0', items: [] },
+            taskSpec: 'metadata only',
+          }
+          if (spelling !== undefined) envelope.graph = spelling
+          return { status: 'completed', output: envelope }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    expect(result.graph).toEqual(graph)
+    expect(result.taskSpec).toBe('metadata only')
+  })
+
   it('unfreezes a validator-accepted graph when host lint requires an executable repair', async () => {
     const root = await mkdtemp(join(tmpdir(), 'distill-lint-unfreeze-'))
     roots.push(root)

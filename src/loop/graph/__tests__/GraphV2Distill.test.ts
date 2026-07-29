@@ -222,26 +222,45 @@ describe('graph-v2 Distill contract', () => {
     expect(compiler).toContain('preconditions')
     expect(compiler).toContain('$input 引用是严格的')
     expect(compiler).toContain('一组确定性 Transition 的 when + updates')
-    expect(compiler).toContain('target inputs 读取 Reducer 更新后的 $state')
     expect(compiler).toContain('同一个 persistent Agent 通过 mode/input')
     expect(compiler).toContain('禁止串联 identity/reduce/status gate')
-    expect(compiler).toContain('不得让 research→pivot 或 pivot→pivot 绕过 writer')
-    expect(compiler).toContain('bootstrap 只读取/发现并输出初始化 payload')
-    expect(compiler).toContain('绝不会回写或合并 Agent 的 $output 对象')
-    expect(compiler).toContain('不要另写 bash mkdir state/、logs/')
+    expect(compiler).toContain('唯一文件 writer')
+    expect(compiler).toContain('绝不回写或合并 Agent 的 $output')
     expect(compiler).toContain('不要一次加载全部 section')
     expect(compiler).toContain('graph_patch_validate')
-    expect(compiler).toContain('attention = no_progress && current_stale_count>=3')
-    expect(compiler).toContain('禁止把 stale_count 阈值与 no_progress 用 OR 连接')
     expect(compiler).toContain('budget.wallTimeMs')
     expect(compiler).toContain('不得小于 300000（5 分钟）')
-    expect(buildLoopArchitectSystem()).toContain('不得虚构')
+    // Enforcement locus: the compiler must know which constraints need an
+    // executable anchor and which are delegated to the Agent, or it invents
+    // structure for intent and the reviewer rejects it either way.
+    expect(compiler).toContain('graph 落点')
+    expect(compiler).toContain('agent 落点')
+    // Choosing a Wait node over a hard park is what makes a per-round time
+    // bound inexpressible; state the consequence, not just the preference.
+    expect(compiler).toContain('lifetimeBudget.elapsedMs')
+    expect(compiler).toContain('State 中声明的每个字段')
+    // Domain templates leaked one project's vocabulary into a
+    // supposedly domain-neutral compiler, and its literal thresholds were wrong
+    // for every other source. They must not come back.
+    for (const leaked of ['stale_count', 'no_progress', 'attention', 'worsened', 'findings', 'bash mkdir state/']) {
+      expect(compiler).not.toContain(leaked)
+    }
+    const architect = buildLoopArchitectSystem()
+    expect(architect).toContain('不得虚构')
+    // `kind` now decides enforcement locus, so the Architect has to be told it
+    // is no longer a free-form label.
+    expect(architect).toContain('它决定该约束**在哪里被执行**')
     const reviewer = buildGraphSemanticReviewerSystem()
     expect(reviewer).toContain('runtime_preconditions')
     expect(reviewer).toContain('唯一权威项目路径')
     expect(reviewer).toContain('只约束结果属于该集合')
     expect(reviewer).toContain('正确闭环是工作分支→writer')
     expect(reviewer).toContain('Reducer 不会修改 $output.progress_patch')
+    // The locus contract is what makes review satisfiable: an intent-shaped
+    // constraint having no Graph element is correct design, not a defect.
+    expect(reviewer).toContain('【执行落点：判断「实现了没有」的唯一标准】')
+    expect(reviewer).toContain('Graph 中没有对应元素是正确设计，不得据此提出任何 finding')
+    expect(reviewer).toContain('unbriefed-agent-constraint')
     // Severity is the host's: the reviewer is told both enums and told its own
     // `accepted` is discarded.
     expect(reviewer).toContain('【严重度不由你决定】')

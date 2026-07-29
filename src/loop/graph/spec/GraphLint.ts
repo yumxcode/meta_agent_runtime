@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field'
   at: string
   message: string
 }
@@ -28,6 +28,7 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintAgentBudgetWallTime(spec, findings)
   lintLaneWriteOverlap(spec, findings)
   lintRedundantMkdir(spec, findings)
+  lintDeadStateFields(spec, findings)
   lintPrecomputedRouting(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
@@ -324,6 +325,31 @@ function lintLaneWriteOverlap(spec: LoopGraphSpec, findings: GraphLintFinding[])
         message: `lanes '${a.laneId}' ('${a.prefix}') and '${b.laneId}' ('${b.prefix}') both claim write access to overlapping paths; one path may have only one owning Lane — narrow one prefix or route the writes through the single owning Lane`,
       })
     }
+  }
+}
+
+/**
+ * A State field no Reducer ever writes is frozen at its initial value, so every
+ * `when` reading it is a dead condition and every threshold on it is
+ * unreachable. Distilled graphs repeatedly declared counters the source asked
+ * for (rounds, retries, stale streaks) and then never incremented them —
+ * detected until now only by the semantic reviewer, which sees each graph once
+ * and reported it inconsistently. Set membership is exact, so this belongs in
+ * deterministic code.
+ */
+function lintDeadStateFields(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const updated = new Set<string>()
+  for (const transition of spec.transitions ?? []) {
+    for (const update of transition.updates ?? []) {
+      if (typeof update?.target === 'string') updated.add(update.target)
+    }
+  }
+  for (const name of Object.keys(spec.state ?? {})) {
+    if (updated.has(name)) continue
+    findings.push({
+      level: 'error', rule: 'dead-state-field', at: `state.${name}`,
+      message: `state field '${name}' is never written by any transition update, so it stays at its initial value forever; add the Reducer update that maintains it, or drop it and route on the raw $output fact instead`,
+    })
   }
 }
 
