@@ -6,6 +6,7 @@ import {
   buildGraphSemanticReviewerSystem,
   buildLoopArchitectSystem,
   createDefaultGraphRuntimeCatalog,
+  formatGraphValidationFeedback,
   createGraphDistillTools,
   freezeLoopGraph,
   graphReference,
@@ -271,6 +272,38 @@ describe('graph-v2 Distill contract', () => {
     expect(reviewer).toContain('【已由确定性 Lint 拥有，不要复查】')
     expect(reviewer).not.toContain('不得小于 300000（5 分钟）')
     expect(reviewer).not.toContain('自动创建缺失父目录')
+  })
+
+  // 67 identical @id= pointer errors once buried 2 blocking lint findings, and
+  // the compiler concluded the graph was fine. The host owns the exact mapping,
+  // so it hands it over instead of restating the rule, and folds the metadata
+  // tail so the blocking findings stay legible.
+  it('hands over the transition pointer map and folds metadata noise behind executable defects', () => {
+    const pointerErrors = CANONICAL_GRAPH_DISTILL_EXAMPLE.transitions.map((transition, index) =>
+      `traceability.mappings[${index}].graphRefs '/transitions/@id=${transition.id}' does not exist in the Graph`)
+    const noise = [...pointerErrors, ...Array.from({ length: 10 }, (_, index) =>
+      `traceability.mappings[${index}].graphRefs '/nodes/ghost${index}' does not exist in the Graph`)]
+
+    const withMap = formatGraphValidationFeedback(pointerErrors, CANONICAL_GRAPH_DISTILL_EXAMPLE)
+    expect(withMap).toContain('goal_reached→/transitions/0')
+    expect(withMap).toContain('work_failed→/transitions/2')
+    // Without a candidate graph the rule is still stated, just without a map.
+    expect(formatGraphValidationFeedback(pointerErrors)).toContain('@id')
+    expect(formatGraphValidationFeedback(pointerErrors)).not.toContain('→/transitions/0')
+
+    // Metadata alone is never folded — there is nothing more important to read.
+    expect(formatGraphValidationFeedback(noise)).not.toContain('条审阅元数据诊断已折叠')
+
+    // With a blocking executable defect present, the tail folds into a class
+    // breakdown and the lint finding stays at the top.
+    const withBlocking = formatGraphValidationFeedback([
+      'lint(error) undeclared-workspace-write at nodes.work.prompt: prompt explicitly writes \'state\'',
+      ...noise,
+    ], CANONICAL_GRAPH_DISTILL_EXAMPLE)
+    expect(withBlocking).toContain('undeclared-workspace-write')
+    expect(withBlocking).toContain('条审阅元数据诊断已折叠')
+    expect(withBlocking).toContain('先修复上面的可执行缺陷')
+    expect(withBlocking.indexOf('undeclared-workspace-write')).toBeLessThan(withBlocking.indexOf('traceability.mappings'))
   })
 
   it('returns an exact repair hint for unquoted enum literals', async () => {

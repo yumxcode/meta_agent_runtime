@@ -374,7 +374,15 @@ async function compileLoopGraph(
     throw new Error(`graph architect failed after ${maxAttempts} attempts:\n- ${architectErrors.join('\n- ')}${traceHint(deps.trace)}`)
   }
 
-  let compilerErrors: string[] = []
+  // Two diagnostic pools with different lifetimes. Mechanical diagnostics
+  // (ABI, traceability, lint) describe the last candidate only and are replaced
+  // every attempt. Semantic-review diagnostics describe an unmet source
+  // contract and stay in force until the next semantic verdict — otherwise one
+  // intervening traceability typo erases the reviewer's diagnosis from the very
+  // attempt that was granted to fix it.
+  let mechanicalErrors: string[] = []
+  let semanticErrors: string[] = []
+  const combinedErrors = (): string[] => [...semanticErrors, ...mechanicalErrors]
   let compilerDraft: {
     graph: LoopGraphSpec
     traceability: GraphTraceabilityMap
@@ -393,6 +401,14 @@ async function compileLoopGraph(
   for (let attempt = 1; attempt <= compilerAttemptLimit; attempt++) {
     throwIfDistillAborted(signal, 'compiler')
     deps.onProgress?.({ type: 'phase_started', phase: 'compiler', attempt, maxAttempts: compilerAttemptLimit })
+    // Metadata-only recovery assumes the frozen graph has nothing left to
+    // prove except metadata. While a semantic rejection is unresolved that
+    // assumption is false for ANY frozen draft — the host cannot verify the
+    // claimed fix actually landed in it — so locking the graph would send an
+    // unverified candidate straight back to the reviewer and burn a scarce
+    // semantic-repair call on it. Every attempt during semantic repair must
+    // remain free to patch executable fields.
+    const metadataOnlyTurn = Boolean(validatedGraphDraft) && !semanticErrors.length
     const record = await deps.executor.execute({
       phase: 'compiler',
       ...GRAPH_DISTILL_PHASE_POLICY.compiler,
@@ -401,8 +417,8 @@ async function compileLoopGraph(
         '【本阶段任务：Compiler / Lowering】',
         '把已经确认的约束台账与轻量 Blueprint lower 为唯一现行 Graph ABI。Blueprint 不是第二套 Graph DSL；你可自由选择节点、Lane、Workspace 合同和路由 ID，但不得重新解释、删除或弱化 hard constraint。只输出 {graph,traceability,taskSpec}。',
         formatDistillSourceIdentity(source),
-        ...(compilerErrors.length ? ['【上一轮 Compiler/Reviewer 诊断】', formatGraphValidationFeedback(compilerErrors)] : []),
-        ...(validatedGraphDraft ? [
+        ...(combinedErrors().length ? ['【上一轮 Compiler/Reviewer 诊断】', formatGraphValidationFeedback(combinedErrors(), compilerDraft?.graph)] : []),
+        ...(metadataOnlyTurn ? [
           '【已冻结 Graph：宿主保留，不要重复输出】',
           '上一轮 graph_validate 已对完整 Graph 返回 valid=true/frozen=true。宿主会自动把本次元数据与该 Graph 合并；你绝不能重建、修改或重复输出 graph，也不要调用任何工具。',
           '【立即执行】只返回一个小 JSON 对象：{"traceability":{...},"preconditions":{...},"taskSpec":"..."}。traceability 必须对应已冻结 Graph 的真实 JSON pointer；若上一轮诊断指出 traceability/preconditions，局部修复它们。',
@@ -413,7 +429,7 @@ async function compileLoopGraph(
         ] : []),
         '【约束台账】', JSON.stringify(architecture.constraints),
         '【Loop Blueprint】', JSON.stringify(architecture.design),
-        validatedGraphDraft
+        metadataOnlyTurn
           ? '【立即执行】不要输出分析、Graph、Markdown 或调用工具；只返回上面指定的 metadata JSON。'
           : '【立即执行】以上合同已完整。不要输出分析、设计过程、字段清单或 Markdown；下一步必须直接调用 graph_validate，参数必须是完整且最小的 graph（不是 skeleton）。若验证失败，只按 errors、repairHints 和 patchSelectors 调用 graph_patch_validate 做局部 set/remove；Transition 必须按 @id=稳定ID 定位，禁止数字下标、整图重发或重建。验证通过后立即返回最终 JSON。来源中的命名阶段默认映射到厚 Agent 内部步骤或 Transition+Reducer，不为阶段名称创建 Function。若存在唯一文件 writer：工作 Agent 的出边直接用 current>=T-1 等条件同时更新 next counter/status 后进入 writer，writer 再按 $state 路由；bootstrap/error/report/pivot 提交都复用该 writer，不得增加 identity/status gate 或第二写者。',
       ].join('\n\n'),
@@ -427,27 +443,32 @@ async function compileLoopGraph(
     }
     const compilerTag = `compiler.r${semanticRevision}.a${attempt}`
     if (record.status !== 'completed') {
-      compilerErrors = [`foreground compiler ${record.status}: ${record.error ?? 'no terminal error detail'}`]
-      await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'not_completed', issues: compilerErrors })
-      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
+      mechanicalErrors = [`foreground compiler ${record.status}: ${record.error ?? 'no terminal error detail'}`]
+      await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'not_completed', issues: mechanicalErrors })
+      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
       continue
     }
     deps.onProgress?.({ type: 'phase_completed', phase: 'compiler', attempt })
+    // Metadata recovery may reuse a retained graph only when that graph is
+    // current: frozen in THIS attempt (the model's own fix candidate), or
+    // carried over with no semantic rejection outstanding. Merging metadata
+    // onto a stale draft during semantic repair would re-submit the rejected
+    // graph to the reviewer unchanged.
     const parsed = parseGraphCompilerOutput(record.output, record.summary)
-      ?? (validatedGraphDraft
+      ?? (validatedGraphDraft && (record.validatedGraph || !semanticErrors.length)
         ? parseGraphCompilerMetadata(record.output, record.summary, validatedGraphDraft)
         : null)
     if (!parsed) {
-      compilerErrors = [`no parseable {graph, traceability, taskSpec}; foreground compiler status=${record.status} error=${record.error ?? '(none)'}`]
+      mechanicalErrors = describeUnparsedCompilerOutput(record, Boolean(validatedGraphDraft))
       // Without the raw envelope a parse rejection is indistinguishable from
       // prose, truncation or a mis-keyed object. Keep it.
       await deps.trace?.artifact(`${compilerTag}.output.txt`, renderTraceOutput(record.output))
       if (validatedGraphDraft) await deps.trace?.artifact(`${compilerTag}.frozen-graph.json`, JSON.stringify(validatedGraphDraft, null, 2))
       await deps.trace?.event({
         phase: 'compiler', revision: semanticRevision, attempt, outcome: 'unparseable',
-        hadFrozenGraph: Boolean(validatedGraphDraft), issues: compilerErrors,
+        hadFrozenGraph: Boolean(validatedGraphDraft), issues: mechanicalErrors,
       })
-      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
+      deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
       // The foreground tool may have frozen a valid graph before the model's
       // final, oversized envelope is truncated or malformed. One compact
       // metadata-only turn is enough to recover it and should not be denied
@@ -467,24 +488,32 @@ async function compileLoopGraph(
     let lintWarnings: string[] = []
     try {
       const graphErrors = validateLoopGraph(parsed.graph, deps.catalog)
-      executableRepairRequired = graphErrors.length > 0
-      errors = [
-        ...graphErrors,
-        ...validateGraphTraceability(parsed.traceability, architecture.constraints, parsed.graph),
-        ...validateLoopPreconditions(preconditions),
-      ]
       // Write-surface lint: error-level findings (external write targets,
       // git without any capability) are certain failures and block Distill.
       // Warning-level findings (nested-repo reliance, precomputed booleans,
       // dead routes) may be legitimate — they are handed to the semantic
       // reviewer, which has the tools to actually verify them per case.
-      if (!errors.length) {
+      //
+      // Lint reads the Graph and nothing else, so ABI validity is its only
+      // real precondition. It used to sit behind traceability and preconditions
+      // too, which let review metadata hide an executable defect: in one run a
+      // single wrong JSON pointer kept the same undeclared-workspace-write
+      // hidden through four consecutive candidates, and the compiler spent
+      // those attempts fixing pointers while the permission bug sat untouched.
+      // Metadata errors are still reported — they just no longer suppress.
+      let blockingLint: string[] = []
+      if (!graphErrors.length) {
         const lint = lintLoopGraph(parsed.graph)
-        const blockingLint = lint.filter(finding => finding.level === 'error')
-        executableRepairRequired = blockingLint.length > 0
-        errors = formatGraphLintFindings(blockingLint)
+        blockingLint = formatGraphLintFindings(lint.filter(finding => finding.level === 'error'))
         lintWarnings = formatGraphLintFindings(lint.filter(finding => finding.level === 'warning'))
       }
+      executableRepairRequired = graphErrors.length > 0 || blockingLint.length > 0
+      errors = [
+        ...graphErrors,
+        ...blockingLint,
+        ...validateGraphTraceability(parsed.traceability, architecture.constraints, parsed.graph),
+        ...validateLoopPreconditions(preconditions),
+      ]
     } catch (error) {
       errors = [`Graph lowering shape could not be validated: ${error instanceof Error ? error.message : String(error)}`]
     }
@@ -515,13 +544,17 @@ async function compileLoopGraph(
           await deps.trace?.artifact(`${reviewTag}.json`, JSON.stringify(semanticReview, null, 2))
           await deps.trace?.artifact(`${reviewTag}.md`, renderSemanticReviewMarkdown(semanticReview))
           if (!semanticReview.accepted) {
-            const semanticErrors = semanticReview.issues.length
+            const reviewIssues = semanticReview.issues.length
               ? semanticReview.issues.map(issue => `semantic review: ${issue}`)
               : ['semantic review rejected the graph without details']
-            compilerErrors = [
-              ...semanticErrors,
+            semanticErrors = [
+              ...reviewIssues,
               ...lintWarnings.map(warning => `semantic review context: ${warning}`),
             ]
+            // The rejected candidate itself was mechanically clean; whatever
+            // mechanical diagnostics preceded it are resolved and must not
+            // dilute the semantic feedback on the next attempt.
+            mechanicalErrors = []
             await deps.trace?.event({
               phase: 'semantic_review', revision: semanticRevision, compilerAttempt: attempt, outcome: 'rejected',
               failedLayers: SEMANTIC_REVIEW_LAYERS.filter(layer => semanticReview.layers[layer].status === 'fail'),
@@ -539,7 +572,7 @@ async function compileLoopGraph(
             // incomplete enough to justify one bounded Architect reread.
             if (semanticRevision < 1 && semanticReview.layers.intent_constraints.status === 'fail') {
               await deps.checkpoint?.clear()
-              const reviewErrors = [...compilerErrors]
+              const reviewErrors = [...semanticErrors]
               return compileLoopGraph(source, { ...deps, checkpoint: undefined }, (nextAttempt, lastErrors) => [
                 buildTask(nextAttempt, [...reviewErrors, ...lastErrors]),
                 '【上一版 Semantic Reviewer 拒绝】',
@@ -575,9 +608,9 @@ async function compileLoopGraph(
         return result
       } catch (error) {
         if (error instanceof DistillInterruptedError) throw error
-        compilerErrors = [error instanceof Error ? error.message : String(error)]
-        await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'freeze_failed', issues: compilerErrors })
-        deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
+        mechanicalErrors = [error instanceof Error ? error.message : String(error)]
+        await deps.trace?.event({ phase: 'compiler', revision: semanticRevision, attempt, outcome: 'freeze_failed', issues: mechanicalErrors })
+        deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
         continue
       }
     }
@@ -601,10 +634,10 @@ async function compileLoopGraph(
         compilerAttemptLimit = Math.min(compilerAttemptCeiling, attempt + 1)
       }
     }
-    compilerErrors = errors
-    deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: compilerErrors })
+    mechanicalErrors = errors
+    deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
   }
-  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${compilerErrors.join('\n- ')}${traceHint(deps.trace)}`)
+  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${combinedErrors().join('\n- ')}${traceHint(deps.trace)}`)
 }
 
 async function reviewGraphSemantics(
@@ -723,7 +756,7 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 5. capability_resolution：graph 落点的 hard constraint，其 graphRefs 指向真实实现；Graph 使用的工具、Skill、Function、Reducer 与 Effect 确实可用，缺口没有被伪装成已实现。
 6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。
 
-【已由确定性 Lint 拥有，不要复查】以下条目已在 lintLoopGraph 中以 error/warning 机械判定，Compiler 收到过同样的诊断。你重复检查只会增加噪声与误报，一律不要作为 finding 提出：Agent prompt 中的绝对路径/家目录路径；指向项目外的写操作；prompt 显式写入但 Lane.workspace.write 未覆盖的路径；git add/commit/push 缺少 scm Lane 或 owned 前缀；每个 agent 节点 budget.wallTimeMs 是否声明及是否达到 300000ms 下限；不同 Lane 写路径前缀重叠；对已被 write rule 覆盖的目录额外调用 bash mkdir；同 Lane 内 Agent 拆分（same-lane-agent-split）。
+【已由确定性 Lint 拥有，不要复查】以下条目已在 lintLoopGraph 中以 error/warning 机械判定，Compiler 收到过同样的诊断。你重复检查只会增加噪声与误报，一律不要作为 finding 提出：Agent prompt 中的绝对路径/家目录路径；指向项目外的写操作；prompt 显式写入但 Lane.workspace.write 未覆盖的路径（undeclared-workspace-write）；prompt 指示写入本 Lane 明确 deny 的路径（prompt-writes-denied-path）；git add/commit/push 缺少 scm Lane 或 owned 前缀；每个 agent 节点 budget.wallTimeMs 是否声明及是否达到 300000ms 下限；不同 Lane 写路径前缀重叠；对已被 write rule 覆盖的目录额外调用 bash mkdir；同 Lane 内 Agent 拆分（same-lane-agent-split）；某输入在所有入边上都被绑定为 literal null 的死输入（dead-null-input）。
 
 若原始来源中的 hard constraint 在 Constraint Ledger 或 Blueprint 中漏记，intent_constraints 必须 fail；若合同已经保留、只是最终 Graph 的路由、写权限、能力或前置条件 lower 错误，只在对应实现层 fail。这个分层决定后续由 Architect 还是 Compiler 修复，不得把局部 Graph 错误误报成上游合同缺失。
 
@@ -805,12 +838,56 @@ export function formatArchitectValidationFeedback(errors: readonly string[]): st
   ].join('\n')
 }
 
+/** Host-owned review metadata, as opposed to diagnostics about the executable
+ * Graph. Both are emitted from this file, so the prefixes are stable. */
+const METADATA_DIAGNOSTIC_RE = /^(traceability\.|preconditions|hard constraint '[^']*' has no Graph traceability)/
+const MAX_SHOWN_METADATA_DIAGNOSTICS = 6
+
+/** Metadata diagnostics can outnumber executable ones by an order of magnitude
+ * — one run put 2 blocking lint findings under 67 identical pointer errors, and
+ * the compiler concluded the candidate had "only a formatting problem", stopped
+ * repairing the Graph and answered with metadata alone until its attempts ran
+ * out. Once a real executable defect is present, fold the metadata tail into a
+ * class breakdown so the blocking findings stay legible. */
+function foldMetadataDiagnostics(errors: readonly string[]): string[] {
+  const classes = new Map<string, number>()
+  for (const error of errors) {
+    const signature = error.replace(/\[\d+\]/g, '[i]').replace(/'[^']*'/g, "'…'")
+    classes.set(signature, (classes.get(signature) ?? 0) + 1)
+  }
+  const shown = errors.slice(0, MAX_SHOWN_METADATA_DIAGNOSTICS)
+  const breakdown = [...classes.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3).map(([signature, count]) => `${count}× ${signature}`)
+  return [
+    ...shown,
+    `（另有 ${errors.length - shown.length} 条审阅元数据诊断已折叠；分布：${breakdown.join('；')}。先修复上面的可执行缺陷——Graph ABI 与 error 级 lint 才是阻断项——再在同一轮顺手修正这些指针/前置条件）`,
+  ]
+}
+
+/** The host knows the exact id→pointer mapping the compiler keeps getting
+ * wrong, so hand it over instead of repeating the rule. */
+function transitionPointerMap(graph: LoopGraphSpec | undefined): string {
+  const transitions = graph?.transitions
+  if (!Array.isArray(transitions) || !transitions.length) return ''
+  const entries = transitions.map((transition, index) => `${typeof transition?.id === 'string' ? transition.id : `#${index}`}→/transitions/${index}`)
+  const shown = entries.slice(0, 80)
+  return ` 上一版完整候选中的 id→pointer 映射：${shown.join('、')}${entries.length > shown.length ? `（其余按数组顺序继续编号）` : ''}。若你改动了 transitions 数组的顺序或增删，请按最终图重新编号。`
+}
+
 /** Turn low-level validator diagnostics into local, ABI-aware repair guidance.
  * The original errors remain authoritative; hints only explain the nesting or
  * invariant that commonly causes a family of errors. */
-export function formatGraphValidationFeedback(errors: readonly string[]): string {
+export function formatGraphValidationFeedback(errors: readonly string[], graph?: LoopGraphSpec): string {
   const hints = new Set<string>()
   const joined = errors.join('\n')
+  const executable = errors.filter(error => !METADATA_DIAGNOSTIC_RE.test(error))
+  const metadata = errors.filter(error => METADATA_DIAGNOSTIC_RE.test(error))
+  errors = [
+    ...executable,
+    ...(executable.length && metadata.length > MAX_SHOWN_METADATA_DIAGNOSTICS ? foldMetadataDiagnostics(metadata) : metadata),
+  ]
+  if (/graphRefs '[^']*@id=/.test(joined)) {
+    hints.add(`traceability.graphRefs 必须是标准 JSON pointer，Transition 用数值下标 /transitions/N。'@id=' 只是 graph_patch_validate 的补丁选择器语法，写进 graphRefs 一律被判为不存在的指针。${transitionPointerMap(graph)}`)
+  }
   if (/state\.[^.]+\.(minimum|maximum|properties|required|enum|minLength|minItems) is not part|state\.[^.]+\.type must be a ShapeSpec object/.test(joined)) {
     hints.add('StateVariableSpec 与 ShapeSpec 是两层：state.x={"type":{"type":"integer","minimum":0},"initial":0}；minimum/properties 等只能放在内层 ShapeSpec。')
   }
@@ -831,6 +908,15 @@ export function formatGraphValidationFeedback(errors: readonly string[]): string
   }
   if (/hard park|timerPolicy|lifetimeBudget|budget\.(turns|usd|wallTimeMs)/.test(joined)) {
     hints.add('hard park Agent 必须位于 persistent Lane，并完整声明 segment budget、lifetimeBudget、timerPolicy.maxDelayMs/maxParks。')
+  }
+  if (/prompt-writes-denied-path/.test(joined)) {
+    hints.add('prompt 指示某 Agent 写入本 Lane 明确 deny 的路径——这不是"少声明了一条 write rule"，而是 prompt 与该 Lane 的所有权边界自相矛盾。正确修法是把这条指令从 prompt 里删掉，改由拥有该路径的节点执行写入（工作 Agent 只输出待持久化的数据，由 writer 落盘）。禁止给该 Lane 补 write rule 来"消错"：那会让同一路径出现两个 writer，紧接着触发 lane-write-overlap 或 writer-boundary-bypass。')
+  }
+  if (/undeclared-workspace-write/.test(joined)) {
+    hints.add('prompt 写入了本 Lane 未授权的路径。先判断该节点是否真的应当拥有这条路径：是则补 Lane.workspace.write 规则；否则删除该指令，交给已拥有该路径的节点写入。另外，write_file/append_file 会自动创建获准文件的缺失父目录，prompt 里"创建 xxx/ 目录"这类句子通常是多余样板——直接删掉即可，不要为它扩大写权限。')
+  }
+  if (/dead-null-input/.test(joined)) {
+    hints.add('某输入在所有入边上都被绑定为 {"literal":null}，消费节点永远只能收到 null——这切断了来源要求的数据流。修复是接通链路而不是删除诊断：让至少一条入边引用真实的 $output/$state 字段（生产者 outputSchema 需声明该字段，途经的中间节点逐跳透传），或将该值持久化到 State/Workspace 文件后由消费者读取；若该输入确实无人需要，连同节点内对它的引用一并删除。')
   }
   if (/lint\((error|warning)\)/.test(joined)) {
     hints.add('lint 指向写面或路由问题：项目外没有任何可写位置——需要编辑的外部仓库必须 clone 进项目内某个 owned 写前缀（或对项目根仓库声明 lane scm:\'git\'），并把该目录列为 blocking directory precondition；when 路由优先引用原始事实字段（计数/枚举）而非 Agent 预折叠布尔；永不可达的死路由直接删除。修复 prompt 与 lane 合同，不要只调措辞绕过规则。')
@@ -914,7 +1000,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - Agent 直接读写真实项目 Workspace。Lane.workspace 声明 read、write、deny；write mode 只有 owned、atomic_replace、append_only。Kernel 不复制、不投影、不保存第二份用户数据。
 - Lane 是连续会话、串行化和 Workspace 所有权边界，不是业务步骤，也不创建 worktree。Node 继承 Lane 的 Workspace 合同；不同 Lane 的写路径不能重叠。
 - 控制层使用 Agent、Function、Effect、Wait、Join、Terminal 和确定性 Transition。State 只存小型路由事实，并只通过注册 Reducer 在 commit 中更新。
-- $input 引用是严格的：节点 inputs、effect idempotencyKey、wait delayMs/correlation、terminal result 中的每个 $input.x，必须被指向该节点的所有 Transition target inputs 与所有 entrypoint 绑定，缺一条边运行时该 Activation 就地失败。只在部分路径存在的可选值，必须在其余每条入边与 entrypoint 上显式绑定 {"literal": null}。只有 when 条件对缺失引用宽松（视为不匹配）；ValueExpression ref 从不宽松。因此 success Transition 的 target inputs/Reducer args 若严格引用 $output.x，x 必须出现在源 Agent/Function outputSchema.required 中；仅在 when 中读取的字段才可以 optional。failure/always 路径的 payload 没有该 success schema 保证，只能绑定整个 $output 或 literal。graph_validate 会机械拒绝任何供给缺口。
+- $input 引用是严格的：节点 inputs、effect idempotencyKey、wait delayMs/correlation、terminal result 中的每个 $input.x，必须被指向该节点的所有 Transition target inputs 与所有 entrypoint 绑定，缺一条边运行时该 Activation 就地失败。只在部分路径存在的可选值，必须在其余每条入边与 entrypoint 上显式绑定 {"literal": null}。只有 when 条件对缺失引用宽松（视为不匹配）；ValueExpression ref 从不宽松。因此 success Transition 的 target inputs/Reducer args 若严格引用 $output.x，x 必须出现在源 Agent/Function outputSchema.required 中；仅在 when 中读取的字段才可以 optional。failure/always 路径的 payload 没有该 success schema 保证，只能绑定整个 $output 或 literal。graph_validate 会机械拒绝任何供给缺口。注意：{"literal": null} 只是"该路径确实无此值"的声明，不是满足闭合的通用填充——若某输入在**所有**入边上都是 literal null，它就是死输入（lint 会机械拒绝）。凡是消费节点真正需要的值，必须从生产者 outputSchema 出发逐跳经中间节点透传到位，或经 State/Workspace 文件持久化后读取；对每个跨节点传递的语义字段，检查 producer→最终 consumer 的完整链路，任一跳绑定 literal null/空串即为断链。
 - entrypoint inputs 只能引用 $state 或 literal——实例创建时 $input/$output 尚不存在。
 - builtin/identity@1 返回完整的 inputs 记录（不是解包后的单值）：identity 节点 inputs 为 {value:...} 时，下游必须用 $output.value 取值，用 $output 只会拿到嵌套对象。
 - 不要用 sleep、bash sleep 或轮询空转来模拟等待——它们烧掉段预算且不可恢复。Kernel 等待一律用 wait 节点（timer/event）或 Agent timer hard-park。
@@ -938,7 +1024,8 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - annotations 可保存非执行领域元数据；不得把领域偏好伪装成 Kernel 语义。
 - graph_reference(capabilities) 返回的是 Create 与 Runtime 共用的唯一 graph_agent Tool Catalog；不要加入当前 Compiler 会话有、运行时没有的工具。
 - Agent 运行时不会自动收到 Graph annotations。Agent 需要的值必须写入 node.prompt/systemInstructions/inputs，或位于 Lane 可读的项目文件中。
-- write_file 与 append_file 会自动创建获准文件的缺失父目录。逐文件 atomic_replace/append_only 初始化时直接写/追加目标文件即可，无需额外建目录，也不要为建父目录把精确模式扩大成 owned。
+- write_file 与 append_file 会自动创建获准文件的缺失父目录。逐文件 atomic_replace/append_only 初始化时直接写/追加目标文件即可，无需额外建目录，也不要为建父目录把精确模式扩大成 owned。因此 prompt 里"首轮创建 xxx/ 目录"这类句子是多余样板，写进去只会与 Lane 合同冲突。
+- prompt 与 Lane 合同必须自洽：Agent prompt 中每条写入指令的目标，都要落在该节点所在 Lane 的 workspace.write 覆盖范围内，且不得命中该 Lane 的 deny。写完每个 Agent 的 prompt 后逐条比对它所在 Lane 的 write/deny 再输出。单写者设计下，工作 Agent 的 prompt 只描述"产出哪些待持久化数据"，具体落盘动作只出现在 writer 的 prompt 里；不要把同一段初始化职责同时写进多个节点的 prompt。
 - 保留来源的确定性语义类别：来源区分三种以上结果时，让 Agent 原样输出该多态枚举，不要压成布尔，也不要用布尔反转代替缺失的那一态——丢掉一态就等于丢掉一条路由。
 - 来源的复合条件按真值表逐分区枚举互斥 Transition，不要用 OR 把不同量级的条件连起来。典型形状：复合条件成立才递增计数器，不成立的分支同时 set 计数器归零与派生状态；多个阈值分支从严到宽排列，且全部先受同一个复合条件约束。任何一个分区没有对应 Transition，就是一条不可达路径。
 - 若某分支会重置计数器，检查更高的阈值分支是否仍可达：先触发的低阈值 reset 会让高阈值永远达不到。这类阈值要么与 reset 分支互斥，要么改用不被重置的累计量。
@@ -1027,6 +1114,117 @@ function parseGraphCompilerMetadata(
     }
   }
   return null
+}
+
+/**
+ * Separate "the envelope was malformed" from "the envelope was a well-formed
+ * metadata-only reply, but the host holds no graph to merge it onto".
+ *
+ * The second case is a protocol disagreement, not a formatting slip. The
+ * Compiler session is persistent, so a graph it froze in an earlier turn is
+ * still visible to the model — while the host deliberately drops that draft
+ * once a blocking executable diagnostic lands, because the frozen graph is
+ * known-defective. The model then answers with metadata alone, believing the
+ * host retained the graph. Reporting that as a generic parse failure tells it
+ * nothing to change, so it repeats the identical reply until the attempt
+ * budget is gone (observed: two consecutive attempts, run aborted). Naming the
+ * disagreement is what breaks the loop.
+ */
+function describeUnparsedCompilerOutput(
+  record: { status: string; error?: string; output?: unknown; summary?: string },
+  hasRetainedGraph: boolean,
+): string[] {
+  if (!hasRetainedGraph && isMetadataOnlyEnvelope(record.output, record.summary)) {
+    return ['你只返回了 metadata（traceability/preconditions/taskSpec）而没有 graph，但宿主当前不持有任何已冻结 Graph：上一版候选因阻断级诊断（Graph ABI 错误或 error 级 lint）已被作废，你在会话里看到的那张图不是宿主持有的现行版本，宿主无法把 metadata 合并上去。必须重新输出完整 {graph,traceability,taskSpec}。若想先验证，请对修复后的完整图再调用一次 graph_validate，然后连同 graph 一起返回；只回 metadata 会无限重复本次失败。']
+  }
+  const base = `no parseable {graph, traceability, taskSpec}; foreground compiler status=${record.status} error=${record.error ?? '(none)'}`
+  const syntax = diagnoseEnvelopeJson(record.output, record.summary)
+  return syntax ? [base, syntax] : [base]
+}
+
+/** How many `{` positions to probe before giving up, and how much text to quote
+ * around the failure. Both are bounded so a large prose+JSON envelope cannot
+ * turn diagnosis into a cost. */
+const MAX_ENVELOPE_PARSE_PROBES = 40
+const ENVELOPE_EXCERPT_BEFORE = 140
+const ENVELOPE_EXCERPT_AFTER = 80
+
+/**
+ * Say WHERE the envelope stopped being valid JSON.
+ *
+ * A bare "no parseable {graph, traceability, taskSpec}" is unactionable: the
+ * Compiler cannot see which character broke, and because its session is
+ * persistent the corrupted text stays in context and gets re-emitted verbatim.
+ * One run lost four attempts to a single stray double quote between two array
+ * elements (`}}}},"{"id":…` instead of `}}}},{"id":…`) — the same byte offset
+ * every time — while a valid, lint-clean graph was already frozen on the host.
+ * A serialization slip must be reported as a serialization slip.
+ */
+function diagnoseEnvelopeJson(output: unknown, summary?: string): string | undefined {
+  for (const text of [output, summary]) {
+    if (typeof text !== 'string') continue
+    const diagnosis = diagnoseJsonText(text)
+    if (diagnosis) return diagnosis
+  }
+  return undefined
+}
+
+function diagnoseJsonText(text: string): string | undefined {
+  // Rank a real syntax error above a mere "trailing content" error, then by how
+  // far into the text it got: the envelope that consumed the most before
+  // breaking is the one the compiler meant to send.
+  let best: { absolute: number; message: string; trailing: boolean } | undefined
+  let probes = 0
+  for (let start = text.indexOf('{'); start >= 0 && probes < MAX_ENVELOPE_PARSE_PROBES; start = text.indexOf('{', start + 1)) {
+    probes++
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(text.slice(start))
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error)
+      const position = Number(/position (\d+)/.exec(message)?.[1] ?? -1)
+      if (position < 0) continue
+      const candidate = { absolute: start + position, message, trailing: /after JSON/.test(message) }
+      const better = !best
+        || (!candidate.trailing && best.trailing)
+        || (candidate.trailing === best.trailing && candidate.absolute > best.absolute)
+      if (better) best = candidate
+      continue
+    }
+    // Valid JSON but not the required envelope: naming the actual keys is more
+    // useful than repeating the contract.
+    if (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) {
+      const keys = Object.keys(parsed as object)
+      if (['graph', 'traceability', 'preconditions', 'taskSpec'].some(key => keys.includes(key))) {
+        return `信封是合法 JSON 但键不完整：实际顶层键为 [${keys.join(', ')}]。必须同时包含 graph（完整 LoopGraphSpec）与 traceability。`
+      }
+    }
+  }
+  if (!best) return undefined
+  if (best.trailing) {
+    return `最终 JSON 信封在 offset ${best.absolute} 之后还有多余内容（${best.message}）。只输出一个 JSON 对象，不要在它前后附加第二份 JSON、Markdown fence 或说明文字。`
+  }
+  const from = Math.max(0, best.absolute - ENVELOPE_EXCERPT_BEFORE)
+  const before = text.slice(from, best.absolute)
+  const after = text.slice(best.absolute, best.absolute + ENVELOPE_EXCERPT_AFTER)
+  return [
+    `最终 JSON 信封在 offset ${best.absolute} 处语法无效（${best.message}）。`,
+    `出错点上下文（⟪HERE⟫ 即报错位置，损坏字符通常就在它前面几个字符内）：…${before}⟪HERE⟫${after}…`,
+    '这是文本序列化损坏，不是设计问题：Graph 内容不需要重新设计。请逐字检查该位置附近的引号、逗号和括号配对（常见成因是数组元素之间多出一个引号或缺少逗号），然后完整重发一次 {graph,traceability,taskSpec}。',
+  ].join(' ')
+}
+
+/** Exactly parseGraphCompilerMetadata's acceptance condition minus the retained
+ * graph, so the two can never disagree about what "metadata-only" means. */
+function isMetadataOnlyEnvelope(output: unknown, summary?: string): boolean {
+  for (const candidate of structuredCandidates(output, summary)) {
+    if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
+    const object = candidate as Record<string, unknown>
+    if (!object.traceability || typeof object.traceability !== 'object' || Array.isArray(object.traceability)) continue
+    if (isUsableGraphObject(object.graph)) continue
+    return true
+  }
+  return false
 }
 
 /** A graph the compiler actually re-sent, as opposed to a placeholder standing

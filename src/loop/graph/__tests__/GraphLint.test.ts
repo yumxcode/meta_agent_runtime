@@ -106,6 +106,36 @@ describe('graph write-surface lint', () => {
     expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
   })
 
+  // A deny is an ownership boundary the design chose, so "add a write rule" is
+  // the one repair that must NOT be suggested — it would install a second
+  // writer and immediately trip lane-write-overlap or writer-boundary-bypass.
+  it('separates a prompt write into a denied path from a merely undeclared one', () => {
+    const spec = graph()
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    spec.lanes.work.workspace.write = [{ path: 'humanoid', mode: 'owned' }]
+    spec.lanes.work.workspace.deny = ['.git', 'state']
+    spec.lanes.writer = { context: 'persistent', workspace: { read: [], write: [{ path: 'state', mode: 'owned' }], deny: ['.git'] } }
+    work.prompt = 'On the first round create state/ and write `state/progress.json`.'
+
+    const denied = lintLoopGraph(spec).filter(f => f.rule === 'prompt-writes-denied-path')
+    expect(denied.map(f => f.level)).toEqual(['error', 'error'])
+    expect(denied[0]!.message).toContain("lane 'work' explicitly denies")
+    // The owning lane is named, and widening is explicitly ruled out.
+    expect(denied[0]!.message).toContain("lane 'writer' owns it")
+    expect(denied[0]!.message).toContain('Do NOT add a write rule')
+    // The same target must not also be reported as merely undeclared.
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')).toEqual([])
+
+    // Without the deny it is an ordinary undeclared write, and the message
+    // offers both directions instead of only "declare it".
+    spec.lanes.work.workspace.deny = ['.git']
+    const undeclared = lintLoopGraph(spec).filter(f => f.rule === 'undeclared-workspace-write')
+    expect(undeclared).toHaveLength(2)
+    expect(undeclared[0]!.message).toContain('either add the write rule')
+    expect(undeclared[0]!.message).toContain("delete the instruction and leave the write to the node on lane 'writer'")
+  })
+
   it('recognizes plain directory write targets without relying on Markdown backticks', () => {
     const spec = graph()
     const work = spec.nodes.work
@@ -267,5 +297,54 @@ describe('graph write-surface lint', () => {
 
     spec.transitions[1]!.updates = [{ target: 'iteration', reducer: 'builtin/increment@1' }]
     expect(lintLoopGraph(spec).filter(f => f.rule === 'dead-state-field')).toEqual([])
+  })
+
+  // The strict $input-closure contract makes { "literal": null } the idiom for
+  // "absent on THIS path" — and therefore an escape hatch: a compiler can
+  // satisfy closure by nulling a field on every path, severing the dataflow
+  // the source demanded (the F1 gate_evidence failure). All-paths-null is
+  // exact, so it is deterministic lint, not semantic review.
+  it('errors when every supplier binds an input to literal null', () => {
+    const spec = graph()
+    spec.nodes.check = {
+      type: 'agent', lane: 'work', prompt: 'Verify the evidence before advancing.',
+      tools: ['read_file'], budget: { turns: 10, usd: 5, wallTimeMs: 300_000 },
+      inputs: { evidence: { ref: '$input.evidence' }, phase: { ref: '$input.phase' } },
+    }
+    spec.transitions.push({
+      id: 'to_check', from: 'work', on: 'success',
+      to: { node: 'check', inputs: { evidence: { literal: null }, phase: { literal: 'bootstrap' } } },
+    })
+    // `work` now has two success transitions; keep routing valid for realism.
+    spec.transitions[0]!.when = '$state.status == \'healthy\''
+    spec.transitions[0]!.priority = 100
+    const dead = lintLoopGraph(spec).filter(f => f.rule === 'dead-null-input')
+    expect(dead).toHaveLength(1)
+    expect(dead[0]!.level).toBe('error')
+    expect(dead[0]!.at).toBe('nodes.check.inputs.evidence')
+    expect(dead[0]!.message).toContain("transition 'to_check'")
+
+    // One real ref on ANY inbound edge is the legitimate optional-value idiom.
+    spec.transitions.push({
+      id: 'retry_check', from: 'check', on: 'failure',
+      to: { node: 'check', inputs: { evidence: { ref: '$state.status' }, phase: { literal: null } } },
+    })
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'dead-null-input')).toEqual([])
+  })
+
+  it('does not confuse empty-string or false constants with severed dataflow', () => {
+    const spec = graph()
+    spec.nodes.writer = {
+      type: 'agent', lane: 'work', prompt: 'Persist the round.',
+      tools: ['read_file'], budget: { turns: 10, usd: 5, wallTimeMs: 300_000 },
+      inputs: { summary: { ref: '$input.summary' }, pivot: { ref: '$input.pivot' } },
+    }
+    spec.transitions.push({
+      id: 'to_writer', from: 'work', on: 'success',
+      to: { node: 'writer', inputs: { summary: { literal: '' }, pivot: { literal: false } } },
+    })
+    spec.transitions[0]!.when = '$state.status == \'healthy\''
+    spec.transitions[0]!.priority = 100
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'dead-null-input')).toEqual([])
   })
 })

@@ -430,6 +430,233 @@ describe('Distill Architect checkpoint', () => {
     expect(result.graph.lanes.work!.workspace.write).toEqual([{ path: 'state/progress.json', mode: 'atomic_replace' }])
   })
 
+  // Regression for the F1 run lost at attempt 5: after a semantic rejection the
+  // compiler re-froze a graph whose claimed fix never landed, then failed on
+  // traceability only. The host locked the graph into metadata-only recovery
+  // AND the traceability errors overwrote the reviewer's diagnosis, so the next
+  // attempt re-submitted the unfixed graph to the reviewer and burned a scarce
+  // semantic-repair call. Both diagnostic pools must survive the interleaving,
+  // and the graph must stay patchable until the reviewer accepts.
+  it('keeps semantic diagnostics and full-graph repair after an intervening metadata failure', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-semantic-metadata-interleave-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Carry the evidence to the gate.', 'utf8')
+    const corrected = structuredClone(graph)
+    corrected.version = 2
+    const goodTraceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const badTraceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/nodes/nonexistent'], rationale: 'Claimed fix.' }] }
+    const prompts: string[] = []
+    const phases: string[] = []
+    let compiles = 0
+    let reviews = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        phases.push(request.phase)
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          compiles++
+          if (compiles === 1) return { status: 'completed', output: { graph, traceability: goodTraceability, taskSpec: 'compiled' }, validatedGraph: graph }
+          if (compiles === 2) return { status: 'completed', output: { graph: corrected, traceability: badTraceability, taskSpec: 'claimed fix' }, validatedGraph: corrected }
+          return { status: 'completed', output: { graph: corrected, traceability: goodTraceability, taskSpec: 'landed fix' }, validatedGraph: corrected }
+        }
+        reviews++
+        return { status: 'completed', output: reviews === 1
+          ? rejectedReview('The gate input is null on every edge, severing the evidence dataflow.', 'control_flow')
+          : review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(),
+    })
+
+    expect(phases).toEqual(['architect', 'compiler', 'semantic_review', 'compiler', 'compiler', 'semantic_review'])
+    // The third compiler turn follows a metadata-only failure while the
+    // semantic rejection is still unresolved: the graph must stay patchable
+    // and BOTH diagnostic pools must reach the model.
+    expect(prompts[2]).not.toContain('只返回上面指定的 metadata JSON')
+    expect(prompts[2]).toContain('上一版完整候选（局部修复锚点）')
+    expect(prompts[2]).toContain('severing the evidence dataflow')
+    expect(prompts[2]).toContain('does not exist in the Graph')
+    expect(result.graph).toEqual(corrected)
+    expect(result.taskSpec).toBe('landed fix')
+  })
+
+  // Lint reads the Graph and nothing else, so review metadata must never
+  // suppress it. It used to run only after traceability and preconditions were
+  // clean, which let one wrong JSON pointer hide the same real permission
+  // defect across four consecutive candidates while the compiler fixed
+  // pointers.
+  it('reports write-surface lint in the same attempt as a broken traceability pointer', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-lint-not-gated-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Write state through the declared lane.', 'utf8')
+    const linted = structuredClone(graph)
+    linted.lanes = { work: { context: 'persistent', workspace: { read: [], write: [], deny: ['.git'] } } }
+    linted.nodes.work = {
+      type: 'agent', lane: 'work', prompt: 'Write `state/progress.json` after the bounded iteration.',
+      tools: ['write_file'], maxAttempts: 1, budget: { turns: 20, usd: 5, wallTimeMs: 300_000 },
+    }
+    const corrected = structuredClone(linted)
+    corrected.lanes.work!.workspace.write = [{ path: 'state/progress.json', mode: 'atomic_replace' }]
+    const goodTraceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const badTraceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/transitions/99/when'], rationale: 'Typo.' }] }
+    const prompts: string[] = []
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          compiles++
+          const candidate = compiles === 1 ? linted : corrected
+          return {
+            status: 'completed',
+            output: { graph: candidate, traceability: compiles === 1 ? badTraceability : goodTraceability, taskSpec: 'compiled' },
+            validatedGraph: candidate,
+          }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    // One attempt, both diagnostics: the pointer typo did not hide the
+    // permission defect, so the repair needs no extra round trip.
+    expect(compiles).toBe(2)
+    expect(prompts[1]).toContain('undeclared-workspace-write')
+    expect(prompts[1]).toContain('does not exist in the Graph')
+    // A blocking lint finding is an executable defect, so the frozen draft must
+    // be unlocked for a full-graph repair rather than metadata-only recovery.
+    expect(prompts[1]).toContain('上一版完整候选（局部修复锚点）')
+    expect(prompts[1]).not.toContain('只返回上面指定的 metadata JSON')
+    expect(result.graph.lanes.work!.workspace.write).toEqual([{ path: 'state/progress.json', mode: 'atomic_replace' }])
+  })
+
+  // The Compiler session is persistent, so a graph frozen in an earlier turn
+  // stays visible to the model — while the host drops that draft once a
+  // blocking lint finding lands. The model then replies with metadata alone,
+  // believing the host still holds the graph. Reporting a generic parse
+  // failure gave it nothing to change and it repeated the identical reply
+  // until the budget ran out; the diagnostic has to name the disagreement.
+  it('tells the compiler to resend the graph when metadata arrives with no retained draft', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-metadata-deadlock-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Write state through the declared lane.', 'utf8')
+    const linted = structuredClone(graph)
+    linted.lanes = { work: { context: 'persistent', workspace: { read: [], write: [], deny: ['.git'] } } }
+    linted.nodes.work = {
+      type: 'agent', lane: 'work', prompt: 'Write `state/progress.json` after the bounded iteration.',
+      tools: ['write_file'], maxAttempts: 1, budget: { turns: 20, usd: 5, wallTimeMs: 300_000 },
+    }
+    const corrected = structuredClone(linted)
+    corrected.lanes.work!.workspace.write = [{ path: 'state/progress.json', mode: 'atomic_replace' }]
+    const traceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const prompts: string[] = []
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          compiles++
+          // 1: blocking lint → host drops the frozen draft.
+          if (compiles === 1) return { status: 'completed', output: { graph: linted, traceability, taskSpec: 'compiled' }, validatedGraph: linted }
+          // 2: model assumes the host kept it and sends metadata only.
+          if (compiles === 2) return { status: 'completed', output: { traceability, preconditions: { schemaVersion: 'loop-preconditions-1.0', items: [] }, taskSpec: 'metadata only' } }
+          return { status: 'completed', output: { graph: corrected, traceability, taskSpec: 'resent' }, validatedGraph: corrected }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    expect(compiles).toBe(3)
+    expect(prompts[2]).toContain('宿主当前不持有任何已冻结 Graph')
+    expect(prompts[2]).toContain('必须重新输出完整 {graph,traceability,taskSpec}')
+    expect(prompts[2]).not.toContain('no parseable')
+    expect(result.graph.lanes.work!.workspace.write).toEqual([{ path: 'state/progress.json', mode: 'atomic_replace' }])
+  })
+
+  // A bare "no parseable" is unactionable, and the persistent Compiler session
+  // keeps the corrupted text in context — one run re-emitted the same stray
+  // double quote at the same byte offset for four attempts and died with a
+  // valid graph already frozen on the host. The diagnostic has to point at the
+  // character.
+  it('points at the offset and excerpt when the envelope is corrupted JSON', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-envelope-syntax-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    const traceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const clean = JSON.stringify({ graph, traceability, taskSpec: 'compiled' })
+    // Exactly the observed corruption: a stray quote between two array
+    // elements, deep inside the graph rather than at the envelope edges.
+    const corrupted = `我已修复诊断项，输出最终 JSON：\n${clean.replace('},{"id":"failed"', '},"{"id":"failed"')}`
+    expect(corrupted).toContain('},"{"id":"failed"')
+
+    const prompts: string[] = []
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          return { status: 'completed', output: ++compiles === 1 ? corrupted : clean }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    expect(compiles).toBe(2)
+    expect(prompts[1]).toMatch(/offset \d+ 处语法无效/)
+    // The excerpt must carry the broken text with the marker at the reported
+    // position — the stray quote sits a few characters ahead of it, which is
+    // exactly what the guidance tells the compiler to look for.
+    expect(prompts[1]).toContain('},"{"⟪HERE⟫id":"failed"')
+    expect(prompts[1]).toContain('Graph 内容不需要重新设计')
+    expect(result.graph).toEqual(graph)
+  })
+
+  it('names the actual keys when the envelope parses but is incomplete', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-envelope-keys-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    const traceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const prompts: string[] = []
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          // Valid JSON, but graph is missing and no draft is retained.
+          return { status: 'completed', output: ++compiles === 1
+            ? JSON.stringify({ taskSpec: 'only the notes', preconditions: { schemaVersion: 'loop-preconditions-1.0', items: [] } })
+            : JSON.stringify({ graph, traceability, taskSpec: 'compiled' }) }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    expect(prompts[1]).toContain('实际顶层键为 [taskSpec, preconditions]')
+    expect(result.graph).toEqual(graph)
+  })
+
   it('reserves compact metadata recovery when a graph freezes at the attempt boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'distill-late-frozen-recovery-'))
     roots.push(root)

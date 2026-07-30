@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input'
   at: string
   message: string
 }
@@ -29,6 +29,7 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintLaneWriteOverlap(spec, findings)
   lintRedundantMkdir(spec, findings)
   lintDeadStateFields(spec, findings)
+  lintDeadNullInputs(spec, findings)
   lintPrecomputedRouting(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
@@ -228,9 +229,21 @@ function lintAgentWorkspacePrompts(spec: LoopGraphSpec, findings: GraphLintFindi
     for (const target of explicitPromptWriteTargets(text)) {
       const declared = (lane?.workspace?.write ?? []).some(rule => pathCoveredByWriteRule(target, rule.path))
       if (declared) continue
+      // Naming the lane that already owns the path turns a "you are missing a
+      // declaration" report into an actionable ownership statement, and steers
+      // the repair away from granting a second writer.
+      const owner = owningLaneOf(spec, target, node.lane)
+      const denied = (lane?.workspace?.deny ?? []).some(path => typeof path === 'string' && pathCoveredByWriteRule(target, path))
+      if (denied) {
+        findings.push({
+          level: 'error', rule: 'prompt-writes-denied-path', at,
+          message: `prompt instructs this Agent to write '${target}', but lane '${node.lane}' explicitly denies that path${owner ? ` and lane '${owner}' owns it` : ''}; a deny is an ownership boundary the design chose on purpose, not a missing declaration — delete the instruction from this prompt and let ${owner ? `the node on lane '${owner}'` : 'the owning node'} perform the write. Do NOT add a write rule to this lane: that installs a second writer on one path`,
+        })
+        continue
+      }
       findings.push({
         level: 'error', rule: 'undeclared-workspace-write', at,
-        message: `prompt explicitly writes '${target}', but lane '${node.lane}' does not declare a covering workspace.write rule`,
+        message: `prompt explicitly writes '${target}', but lane '${node.lane}' does not declare a covering workspace.write rule; either add the write rule when this node genuinely owns the path, or delete the instruction and leave the write to ${owner ? `the node on lane '${owner}', which already owns that path` : 'the node that owns the path'}`,
       })
     }
     if (GIT_MUTATION_RE.test(text)) {
@@ -293,6 +306,17 @@ function pathCoveredByWriteRule(target: string, declared: string): boolean {
   return target === prefix || target.startsWith(`${prefix}/`)
 }
 
+/** The lane that already declares a write rule covering this path, if any.
+ * Used to point a prompt/permission mismatch at the existing owner instead of
+ * suggesting a second writer. */
+function owningLaneOf(spec: LoopGraphSpec, target: string, exclude: string): string | undefined {
+  for (const [laneId, lane] of Object.entries(spec.lanes ?? {})) {
+    if (laneId === exclude) continue
+    if ((lane?.workspace?.write ?? []).some(rule => typeof rule?.path === 'string' && pathCoveredByWriteRule(target, rule.path))) return laneId
+  }
+  return undefined
+}
+
 function normalizeWritePrefix(path: string): string {
   return path.replace(/^\.\//, '').replace(/\/+$/, '')
 }
@@ -351,6 +375,77 @@ function lintDeadStateFields(spec: LoopGraphSpec, findings: GraphLintFinding[]):
       message: `state field '${name}' is never written by any transition update, so it stays at its initial value forever; add the Reducer update that maintains it, or drop it and route on the raw $output fact instead`,
     })
   }
+}
+
+/**
+ * An input every supplier binds to { "literal": null } can never carry data:
+ * the node reads $input.<key>, but its reachable value is exactly null on every
+ * incoming transition and entrypoint. The strict $input-closure contract makes
+ * { "literal": null } the documented idiom for "absent on THIS path", which
+ * also turns it into a validator-blessed escape hatch: a compiler can satisfy
+ * closure by nulling a field on every path, silently severing a producer→
+ * consumer dataflow the source demanded (evidence records, summaries, payloads
+ * — the domain does not matter). All-paths-null is exact set inspection, so it
+ * belongs in deterministic code instead of the semantic reviewer's budget.
+ * Scope is deliberately narrow to stay domain-neutral:
+ * - fires only when EVERY supplier binds literal null — null on just some
+ *   edges is the legitimate optional-value idiom;
+ * - only literal null — empty strings, false or 0 are real values a graph may
+ *   intentionally pass as constants;
+ * - only agent/function nodes — a terminal result or effect key of null is a
+ *   benign "no payload".
+ */
+function lintDeadNullInputs(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const suppliers = new Map<string, Array<{ label: string; inputs: Record<string, unknown> }>>()
+  const supply = (node: unknown, label: string, inputs: unknown): void => {
+    if (typeof node !== 'string') return
+    const list = suppliers.get(node) ?? []
+    list.push({
+      label,
+      inputs: inputs && typeof inputs === 'object' && !Array.isArray(inputs) ? inputs as Record<string, unknown> : {},
+    })
+    suppliers.set(node, list)
+  }
+  for (const entry of spec.entrypoints ?? []) supply(entry?.node, `entrypoint '${entry?.id}'`, entry?.inputs)
+  for (const transition of spec.transitions ?? []) {
+    for (const target of Array.isArray(transition.to) ? transition.to : [transition.to]) {
+      if (typeof target === 'string') supply(target, `transition '${transition.id}'`, {})
+      else supply(target?.node, `transition '${transition.id}'`, target?.inputs)
+    }
+  }
+  for (const [nodeId, node] of Object.entries(spec.nodes ?? {})) {
+    if (!node || (node.type !== 'agent' && node.type !== 'function')) continue
+    const referenced = new Set<string>()
+    if ('inputs' in node) for (const expression of Object.values(node.inputs ?? {})) collectInputKeys(expression, referenced)
+    if (!referenced.size) continue
+    const nodeSuppliers = suppliers.get(nodeId) ?? []
+    if (!nodeSuppliers.length) continue
+    for (const key of referenced) {
+      const allNull = nodeSuppliers.every(supplier => {
+        const binding = supplier.inputs[key]
+        return Boolean(binding) && typeof binding === 'object' && 'literal' in (binding as object)
+          && (binding as { literal: unknown }).literal === null
+      })
+      if (!allNull) continue
+      findings.push({
+        level: 'error', rule: 'dead-null-input', at: `nodes.${nodeId}.inputs.${key}`,
+        message: `every supplier (${nodeSuppliers.map(supplier => supplier.label).join(', ')}) binds $input.${key} to { "literal": null }, so the node can only ever observe null and the dataflow this input was meant to carry is severed; wire at least one edge to a real $output/$state ref (adding the field to the producer outputSchema and passing it through intermediate hops if needed), persist the value into State or a workspace file and read it back, or drop the input`,
+      })
+    }
+  }
+}
+
+/** Mirror of GraphValidate's collectInputKeyRefs: top-level $input keys a node
+ * spec actually reads, including refs nested in call args. Runtime-injected
+ * "__" keys are excluded. */
+function collectInputKeys(expression: unknown, output: Set<string>, depth = 0): void {
+  if (!expression || typeof expression !== 'object' || Array.isArray(expression) || depth > 20) return
+  const record = expression as Record<string, unknown>
+  if (typeof record.ref === 'string') {
+    const match = /^\$input\.([^.]+)/.exec(record.ref)
+    if (match && !match[1]!.startsWith('__')) output.add(match[1]!)
+  }
+  if (Array.isArray(record.args)) for (const argument of record.args) collectInputKeys(argument, output, depth + 1)
 }
 
 const MKDIR_RE = /\bmkdir\b(?:\s+-\w+)*\s+(?:"([^"\n]+)"|'([^'\n]+)'|`([^`\n]+)`|([^\s;&|]+))/gi
