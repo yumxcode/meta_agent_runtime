@@ -213,6 +213,10 @@ Kernel 不保证：
 
 ## 10. 强 Agent 时代的演进约束
 
+- Graph 只拥有可机械审计的路由、权限、预算、等待、重试和终态协议；Agent 不输出 `next_node`、`stop` 等控制命令。
+- 工作 Agent 只提出完成候选与证据，独立只读 Reviewer 或注册的确定性 Function 才能签发完成证书；单个工作 Agent 的 success 不得直达业务 `done`。
+- 资源访问以 Lane Workspace 合同和 Kernel 沙箱为事实源。审计要求不自动引入 writer；只有独立提交权限或多生产者共享写面时才拆 writer。
+- 除上述治理边界以及真实并发、外部事件、失败隔离外，领域规划、实现、评测、恢复与普通记录都保留在一个 persistent 厚 Agent 中。
 - Distill 从流程规划器收缩为治理合同起草器、静态检查器和可靠性画像生成器。
 - Graph 不记录模型完整计划或思维过程，只接收路由、预算、权限和审计必需的结构化事实。
 - 可续期运营 quota 使用可恢复的 budget pause；不可突破的安全上限才使用不可逆 `exhausted`。

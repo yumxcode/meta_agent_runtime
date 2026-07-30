@@ -51,7 +51,7 @@ describe('graph-v2 Distill contract', () => {
     const parsed = JSON.parse(result.content)
     expect(parsed.valid).toBe(true)
     expect(parsed.frozen).toBe(true)
-    expect(parsed.summary).toEqual(expect.objectContaining({ nodes: 3, lanes: 1, workspaceWrites: 0 }))
+    expect(parsed.summary).toEqual(expect.objectContaining({ nodes: 4, transitions: 6, lanes: 2, workspaceWrites: 0 }))
     expect(captured).toEqual(CANONICAL_GRAPH_DISTILL_EXAMPLE)
   })
 
@@ -223,19 +223,21 @@ describe('graph-v2 Distill contract', () => {
     expect(compiler).toContain('preconditions')
     expect(compiler).toContain('$input 引用是严格的')
     expect(compiler).toContain('一组确定性 Transition 的 when + updates')
-    expect(compiler).toContain('同一个 persistent Agent 通过 mode/input')
+    expect(compiler).toContain('一个可写 persistent Worker + 一个独立只读 completion Reviewer')
     expect(compiler).toContain('禁止串联 identity/reduce/status gate')
-    expect(compiler).toContain('唯一文件 writer')
+    expect(compiler).toContain('不得为了“审计”凭空制造 writer')
     expect(compiler).toContain('绝不回写或合并 Agent 的 $output')
     expect(compiler).toContain('不要一次加载全部 section')
     expect(compiler).toContain('graph_patch_validate')
     expect(compiler).toContain('budget.wallTimeMs')
     expect(compiler).toContain('不得小于 300000（5 分钟）')
-    // Enforcement locus: the compiler must know which constraints need an
-    // executable anchor and which are delegated to the Agent, or it invents
-    // structure for intent and the reviewer rejects it either way.
+    // Enforcement locus: governance belongs to Graph, domain procedure to the
+    // thick worker, and completion criteria to an independent authority.
     expect(compiler).toContain('graph 落点')
     expect(compiler).toContain('agent 落点')
+    expect(compiler).toContain('reviewer 落点')
+    expect(compiler).toContain('一个可写 persistent Worker + 一个独立只读 completion Reviewer')
+    expect(compiler).toContain('不能用 stop/done/target_reached/next_node 之类字段直接签发业务终态')
     // Choosing a Wait node over a hard park is what makes a per-round time
     // bound inexpressible; state the consequence, not just the preference.
     expect(compiler).toContain('lifetimeBudget.elapsedMs')
@@ -257,15 +259,16 @@ describe('graph-v2 Distill contract', () => {
     }
     const architect = buildLoopArchitectSystem()
     expect(architect).toContain('不得虚构')
-    // `kind` now decides enforcement locus, so the Architect has to be told it
-    // is no longer a free-form label.
+    // `kind` decides the governance boundary, including independent completion.
     expect(architect).toContain('它决定该约束**在哪里被执行**')
+    expect(architect).toContain('不能给自己签发完成证书')
     const reviewer = buildGraphSemanticReviewerSystem()
     expect(reviewer).toContain('runtime_preconditions')
     expect(reviewer).toContain('唯一权威项目路径')
     expect(reviewer).toContain('只约束结果属于该集合')
-    expect(reviewer).toContain('正确闭环是工作分支→writer')
-    expect(reviewer).toContain('Reducer 不会修改 $output.progress_patch')
+    expect(reviewer).toContain('不得反推出“必须有 writer Agent”')
+    expect(reviewer).toContain('不能给自己签发完成证书')
+    expect(reviewer).toContain('single-agent-terminal-authority')
     // The locus contract is what makes review satisfiable: an intent-shaped
     // constraint having no Graph element is correct design, not a defect.
     expect(reviewer).toContain('【执行落点：判断「实现了没有」的唯一标准】')
@@ -321,16 +324,17 @@ describe('graph-v2 Distill contract', () => {
   // four such errors with every semantic finding already addressed.
   it('states the legal index range and the when-less edges for failing numeric pointers', () => {
     const errors = [
-      "traceability.mappings[9].graphRefs '/transitions/3' does not exist in the Graph",
+      "traceability.mappings[9].graphRefs '/transitions/6' does not exist in the Graph",
       "traceability.mappings[9].graphRefs '/transitions/1/when' does not exist in the Graph",
     ]
     const feedback = formatGraphValidationFeedback(errors, CANONICAL_GRAPH_DISTILL_EXAMPLE)
-    // 3 transitions → legal 0..2, and /transitions/3 must be called out as absent.
-    expect(feedback).toContain('合法下标是 0..2')
-    expect(feedback).toContain('不存在 /transitions/3')
+    // 6 transitions → legal 0..5, and /transitions/6 must be called out as absent.
+    expect(feedback).toContain('合法下标是 0..5')
+    expect(feedback).toContain('不存在 /transitions/6')
     expect(feedback).toContain('下标从 0 开始不是从 1 开始')
-    // continue_work (1) and work_failed (2) carry no `when`.
-    expect(feedback).toContain('/transitions/1、/transitions/2')
+    // continue_work (1), work_failed (2), completion_rejected (4), and
+    // review_failed (5) carry no `when`.
+    expect(feedback).toContain('/transitions/1、/transitions/2、/transitions/4、/transitions/5')
     expect(feedback).toContain('没有 when 字段')
     expect(feedback).toContain('goal_reached→/transitions/0')
     // The @id= selector rule is a different mistake and must not be mixed in.

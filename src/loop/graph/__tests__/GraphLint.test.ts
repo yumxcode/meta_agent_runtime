@@ -7,16 +7,20 @@ function graph(): LoopGraphSpec {
     state: { status: { type: { type: 'string' }, initial: 'healthy' } },
     lanes: {
       work: { context: 'persistent', workspace: { read: ['state'], write: [{ path: 'state', mode: 'owned' }], deny: [] } },
+      review: { context: 'fresh_per_activation', workspace: { read: ['state'], write: [], deny: ['.git'] } },
     },
     nodes: {
       work: { type: 'agent', lane: 'work', prompt: 'Perform one bounded iteration.', tools: ['read_file'], budget: { turns: 20, usd: 5, wallTimeMs: 300_000 } },
+      review: { type: 'agent', lane: 'review', prompt: 'Independently verify the completion candidate.', tools: ['read_file'], budget: { turns: 10, usd: 1, wallTimeMs: 300_000 } },
       done: { type: 'terminal', status: 'done' }, failed: { type: 'terminal', status: 'failed' },
     },
     transitions: [
       // `status` is declared in state, so something has to maintain it —
       // otherwise dead-state-field (correctly) fires on the fixture itself.
-      { id: 'done', from: 'work', to: 'done', updates: [{ target: 'status', reducer: 'builtin/set@1', args: { value: { literal: 'done' } } }] },
+      { id: 'candidate', from: 'work', to: 'review', updates: [{ target: 'status', reducer: 'builtin/set@1', args: { value: { literal: 'done' } } }] },
       { id: 'failed', from: 'work', on: 'failure', to: 'failed' },
+      { id: 'verified', from: 'review', to: 'done' },
+      { id: 'review_failed', from: 'review', on: 'failure', to: 'failed' },
     ],
     entrypoints: [{ id: 'start', node: 'work' }], limits: { maxActivations: 10 },
   }
@@ -181,6 +185,47 @@ describe('graph write-surface lint', () => {
     const rules = lintLoopGraph(spec).map(f => f.rule)
     expect(rules).toContain('precomputed-routing')
     expect(rules).toContain('dead-literal-route')
+  })
+
+  it('surfaces a work agent that signs its own business terminal but accepts an independent read-only reviewer', () => {
+    const direct = graph()
+    direct.transitions[0] = {
+      id: 'done', from: 'work', on: 'success',
+      when: '$output.complete == true', to: 'done',
+      updates: [{ target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'done' }] }],
+    }
+    const finding = lintLoopGraph(direct).find(item => item.rule === 'single-agent-terminal-authority')
+    expect(finding?.level).toBe('warning')
+    expect(finding?.message).toContain('independent read-only Agent')
+    delete direct.transitions[0]!.when
+    expect(lintLoopGraph(direct).map(item => item.rule)).toContain('single-agent-terminal-authority')
+
+    const reviewed = structuredClone(direct)
+    reviewed.lanes.review = {
+      context: 'fresh_per_activation',
+      workspace: { read: ['state'], write: [], deny: ['.git'] },
+    }
+    reviewed.nodes.review = {
+      type: 'agent', lane: 'review', prompt: 'Independently review the completion candidate.',
+      inputs: { candidate: { ref: '$input.candidate' } },
+      outputSchema: {
+        type: 'object', required: ['accepted'],
+        properties: { accepted: { type: 'boolean' } },
+        additionalProperties: false,
+      },
+      tools: ['read_file'],
+      budget: { turns: 10, usd: 1, wallTimeMs: 300_000 },
+    }
+    reviewed.transitions[0] = {
+      id: 'propose', from: 'work', on: 'success',
+      when: '$output.complete == true',
+      to: { node: 'review', inputs: { candidate: { ref: '$output' } } },
+    }
+    reviewed.transitions.push({
+      id: 'verified', from: 'review', on: 'success',
+      when: '$output.accepted == true', to: 'done',
+    })
+    expect(lintLoopGraph(reviewed).filter(item => item.rule === 'single-agent-terminal-authority')).toEqual([])
   })
 
   it('blocks duplicate deterministic predicates that shadow later routes', () => {

@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.2` · Node.js `>= 18`
+> 当前版本:`0.8.3` · Node.js `>= 18`
 
 ---
 
@@ -198,9 +198,16 @@ verify 关卡判定子代理的预算可通过环境变量覆盖(默认面向多
 
 跨阶段长任务使用唯一执行模型 `durable-graph-v2`。它只有三类核心概念：Graph 控制流、Execution Lane、真实项目 Workspace。Agent 直接读写 Workspace；Kernel 只保存路由 State、Activation journal、timer/event 和能力锁，不维护用户数据的副本，也不创建 Lane worktree。
 
+Graph Loop 的默认设计遵循四条边界：
+
+- 路由、计数、阈值、预算、等待和终态转移由 Graph/Kernel 确定执行，不让 Agent 输出 `next_node`、`stop` 等路由命令。
+- 工作 Agent 只能提出完成候选与证据；独立只读 Reviewer（或已注册的确定性 Function）核验后，Graph 才能进入业务 `done`。
+- 文件访问由 `lane.workspace` 的 read/write/deny 与单写者规则审计并由沙箱执行；可审查不等于必须增加 writer Agent。
+- 除真实的权限、并发、外部事件或失败隔离边界外，研究、实现、评测、恢复和记录尽量留在同一个 persistent Worker 中。
+
 Lane 负责连续会话、串行化和写路径所有权。`workspace.read` 声明输入路径，`workspace.write` 的通用模式只有 `owned | atomic_replace | append_only`，`workspace.deny` 始终优先；Freeze 会拒绝不同 Lane 的重叠写路径。`write_file` 使用原子替换，`append_file` 提供串行追加。强相关的长生命周期工作放在一个 persistent Lane/Agent Activation 中，timer hard park 后仍以同一 Activation 和会话继续。
 
-`loop distill` 是可见的前台 Agentic 编译会话：Architect 读取需求与必要项目文件，生成 Constraint Ledger 和简明 Blueprint（Workspace、Lanes、Control）；Compiler 通过 `graph_reference` 获取精确 `graph-2.0` ABI，生成完整图并调用 `graph_validate`；独立 Reviewer 再对原始需求、Agent prompt 中的直接读写、Workspace ownership、Lane、控制闭环和能力可用性做语义核验。Distill、Create 和 Runtime 使用同一个 `graph_agent` Tool Catalog，Freeze 锁定图实际引用的工具；Reviewer 发现任何合同差异都会拒绝，不允许以 warning 通过。Distill prompt、Validator、Freeze 和 Runtime 共用同一 ABI，不接受旧字段或隐式兼容。
+`loop distill` 是可见的前台 Agentic 编译会话：Architect 读取需求与必要项目文件，生成 Constraint Ledger 和简明 Blueprint（Workspace、Lanes、Control）；Compiler 通过 `graph_reference` 获取精确 `graph-2.0` ABI，默认从“厚 Worker + 独立完成 Reviewer + 终态”开始生成完整图并调用 `graph_validate`；独立 Semantic Reviewer 再对原始需求、Agent prompt 中的直接读写、Workspace ownership、Lane、控制闭环和能力可用性做语义核验。Distill 会机械提示 Worker success 直达业务终态，并将其作为 `single-agent-terminal-authority` 交给语义审阅阻断。Distill、Create 和 Runtime 使用同一个 `graph_agent` Tool Catalog，Freeze 锁定图实际引用的工具；阻断级合同差异会拒绝候选，拓扑粒度等 advisory 只记录、不阻断。Distill prompt、Validator、Freeze 和 Runtime 共用同一 ABI，不接受旧字段或隐式兼容。
 
 Node 默认使用 `Agent | Wait | Terminal`；只有真实需要纯函数、幂等外部操作或并发汇合时才添加 `Function | Effect | Join`。`$state`、Reducer 和 `when` 提供确定性计数/阈值路由，开放领域判断仍交给 Agent。Kernel 支持 crash recovery、timer、早到 event inbox、event timeout 和 `source + deliveryId` 幂等去重。
 
@@ -470,4 +477,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.2`。
+当前包版本:`0.8.3`。

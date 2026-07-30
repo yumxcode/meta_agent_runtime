@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'single-agent-terminal-authority' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap'
   at: string
   message: string
 }
@@ -31,6 +31,7 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintDeadStateFields(spec, findings)
   lintDeadNullInputs(spec, findings)
   lintPrecomputedRouting(spec, findings)
+  lintSingleAgentTerminalAuthority(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
   lintShadowedRoutes(spec, findings)
   lintTerminalRouteShadowing(spec, findings)
@@ -839,6 +840,44 @@ function lintPrecomputedRouting(spec: LoopGraphSpec, findings: GraphLintFinding[
       message: `routes on the agent-precomputed boolean '$output.${match[1]}'; prefer raw facts so the deterministic rule lives in the graph (e.g. "$output.new_findings_count == 0 || $output.improvement == 'worsened'") and add those fields to the outputSchema`,
     })
   }
+}
+
+/**
+ * A work Agent may propose completion, but a semantic boolean from that same
+ * Agent is not an independent completion certificate. This is a warning rather
+ * than a mechanical rejection because a read-only independent reviewer is also
+ * an Agent node; semantic review verifies that authority boundary using the
+ * source contract and Lane ownership.
+ */
+function lintSingleAgentTerminalAuthority(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const transition of spec.transitions ?? []) {
+    if ((transition.on ?? 'success') !== 'success') continue
+    const source = spec.nodes[transition.from]
+    if (source?.type !== 'agent') continue
+    const businessTerminal = targetNodeIds(transition.to).some(nodeId => {
+      const target = spec.nodes[nodeId]
+      return target?.type === 'terminal' && (target.status === 'done' || target.status === 'failed')
+    })
+    if (!businessTerminal || isIndependentReadOnlyReviewer(spec, transition.from)) continue
+    findings.push({
+      level: 'warning',
+      rule: 'single-agent-terminal-authority',
+      at: `transitions '${transition.id}'`,
+      message: `work-producing agent '${transition.from}' reaches a business Terminal from its own success; route the completion candidate and evidence through an independent read-only Agent on a different Lane (or a registered deterministic Function) before done/failed`,
+    })
+  }
+}
+
+function isIndependentReadOnlyReviewer(spec: LoopGraphSpec, nodeId: string): boolean {
+  const node = spec.nodes[nodeId]
+  if (node?.type !== 'agent') return false
+  const lane = spec.lanes[node.lane]
+  if ((lane?.workspace.write ?? []).length > 0) return false
+  return (spec.transitions ?? []).some(transition =>
+    transition.from !== nodeId &&
+    spec.nodes[transition.from]?.type === 'agent' &&
+    targetNodeIds(transition.to).includes(nodeId) &&
+    (spec.nodes[transition.from] as { lane?: string }).lane !== node.lane)
 }
 
 /**

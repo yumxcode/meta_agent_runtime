@@ -29,7 +29,14 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
 - `loop.semantic-review.json` / `.md`：独立语义审阅（六层，含 runtime_preconditions）。
 - `loop.graph.review.md`：Compiler 的关键决策和运行前注意事项。
 
-成功 Distill 的可运行性合同：Compiler 校验、`loop create` 和 Scheduler 使用同一个 `graph_agent` Tool Catalog；Freeze 记录图实际使用的工具名，Runtime 在执行前再次核对。Semantic Reviewer 会看到 Agent prompt 和 Lane Workspace 合同，任何已发现的协议差异都是阻断问题，`warnings` 必须为空。
+成功 Distill 的可运行性合同：Compiler 校验、`loop create` 和 Scheduler 使用同一个 `graph_agent` Tool Catalog；Freeze 记录图实际使用的工具名，Runtime 在执行前再次核对。Semantic Reviewer 会看到 Agent prompt 和 Lane Workspace 合同；宿主按固定 rule class 判定严重度，阻断级合同差异拒绝候选，拓扑粒度等 advisory 只记录。
+
+默认 lowering 不是把需求中的每个阶段翻译成一个节点，而是从“一个可写 persistent Worker + 一个独立只读 completion Reviewer + 终态”开始：
+
+- Graph/Kernel 执行路由、计数、阈值、预算、等待与重试；Agent 只返回原始事实，不能心算 `next_node`。
+- Worker 维护普通项目文件并提出完成候选；Reviewer 或确定性 Function 独立签发完成证书，Worker success 不得直达业务 `done`。
+- `lane.workspace` 本身就是可审查且由沙箱强制的资源合同；单一 Worker 已拥有写面时无需再造 record writer。
+- 没有独立权限、并发、外部事件或失败隔离边界的工作步骤，都留在同一个厚 Worker 内。
 
 这些是设计产物，不是运行实例状态。修改意见可以在交互会话中继续输入；满意后 `/exit`，再执行 `loop create`。
 
@@ -59,37 +66,86 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
         ],
         "deny": [".git"]
       }
+    },
+    "review": {
+      "context": "fresh_per_activation",
+      "maxConcurrency": 1,
+      "workspace": {
+        "read": ["requirements.md", "state"],
+        "write": [],
+        "deny": [".git"]
+      }
     }
   },
   "nodes": {
     "work": {
       "type": "agent",
       "lane": "work",
-      "prompt": "完成一轮工作；直接维护声明的 Workspace 文件，并返回 done 与 summary。",
+      "prompt": "完成一轮工作并直接维护 Lane 授权的 Workspace 文件；返回完成候选、摘要和证据，不要决定路由或终态。",
       "tools": ["read_file", "write_file", "append_file", "bash"],
       "outputSchema": {
         "type": "object",
-        "required": ["done", "summary"],
+        "required": ["candidate_ready", "summary", "evidence"],
         "properties": {
-          "done": { "type": "boolean" },
-          "summary": { "type": "string" }
+          "candidate_ready": { "type": "boolean" },
+          "summary": { "type": "string" },
+          "evidence": {
+            "type": "array",
+            "items": { "type": "string" }
+          }
         },
         "additionalProperties": false
       },
       "maxAttempts": 3,
       "budget": { "turns": 30, "usd": 2, "wallTimeMs": 900000 }
     },
-    "done": { "type": "terminal", "status": "done" },
-    "failed": { "type": "terminal", "status": "failed" }
+    "review": {
+      "type": "agent",
+      "lane": "review",
+      "prompt": "只读核验完成候选及其证据是否满足原始成功标准；不要执行或修改工作。",
+      "inputs": {
+        "candidate": { "ref": "$input.candidate" }
+      },
+      "tools": ["read_file"],
+      "outputSchema": {
+        "type": "object",
+        "required": ["accepted", "findings"],
+        "properties": {
+          "accepted": { "type": "boolean" },
+          "findings": { "type": "string" }
+        },
+        "additionalProperties": false
+      },
+      "maxAttempts": 2,
+      "budget": { "turns": 10, "usd": 1, "wallTimeMs": 300000 }
+    },
+    "done": {
+      "type": "terminal",
+      "status": "done",
+      "result": { "ref": "$input.result" }
+    },
+    "failed": {
+      "type": "terminal",
+      "status": "failed",
+      "result": { "ref": "$input.error" }
+    }
   },
   "transitions": [
     {
-      "id": "complete",
+      "id": "candidate_ready",
       "from": "work",
       "on": "success",
-      "when": "$output.done == true",
-      "priority": 10,
-      "to": "done"
+      "when": "$output.candidate_ready == true",
+      "priority": 100,
+      "updates": [
+        { "target": "iteration", "reducer": "builtin/increment@1" }
+      ],
+      "to": {
+        "node": "review",
+        "inputs": {
+          "candidate": { "ref": "$output" }
+        }
+      }
     },
     {
       "id": "continue",
@@ -101,7 +157,42 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
       ],
       "to": "work"
     },
-    { "id": "failed", "from": "work", "on": "failure", "to": "failed" }
+    {
+      "id": "work_failed",
+      "from": "work",
+      "on": "failure",
+      "to": {
+        "node": "failed",
+        "inputs": { "error": { "ref": "$output" } }
+      }
+    },
+    {
+      "id": "completion_verified",
+      "from": "review",
+      "on": "success",
+      "when": "$output.accepted == true",
+      "priority": 100,
+      "to": {
+        "node": "done",
+        "inputs": { "result": { "ref": "$input.candidate" } }
+      }
+    },
+    {
+      "id": "completion_rejected",
+      "from": "review",
+      "on": "success",
+      "default": true,
+      "to": "work"
+    },
+    {
+      "id": "review_failed",
+      "from": "review",
+      "on": "failure",
+      "to": {
+        "node": "failed",
+        "inputs": { "error": { "ref": "$output" } }
+      }
+    }
   ],
   "entrypoints": [{ "id": "start", "node": "work" }],
   "limits": { "maxTotalActivations": 100, "maxLiveActivations": 4, "maxWallTimeMs": 86400000, "maxCostUsd": 20 },
@@ -129,7 +220,7 @@ repair 仍失败时，Activation 走既有 `failure` transition，但 `$output` 
 
 ## 工作区边界与写面 Lint
 
-Agent 的一切写入必须落在项目内的 Lane write 范围：**项目根以外没有任何可写位置**（sandbox 基线拒写），需要编辑的外部资源（含其他仓库的 work tree）必须 clone/放置到项目内的 owned 前缀并声明为 directory 前置条件。`lintLoopGraph` 对这一失败类做静态检查：error 级（prompt 中的绝对路径/项目外写目标、无任何 git 能力却要求 commit/push）在 Distill 阶段直接阻断；warning 级（嵌套仓库依赖、Agent 预折叠布尔路由、永不可达的字面量死路由）转交语义 Reviewer 逐条实地核验。`loop create` 与交互 `/validate` 对所有发现仅打印告警（手工作者可自行裁量）。
+Agent 的一切写入必须落在项目内的 Lane write 范围：**项目根以外没有任何可写位置**（sandbox 基线拒写），需要编辑的外部资源（含其他仓库的 work tree）必须 clone/放置到项目内的 owned 前缀并声明为 directory 前置条件。`lintLoopGraph` 对这一失败类做静态检查：error 级（prompt 中的绝对路径/项目外写目标、无任何 git 能力却要求 commit/push）在 Distill 阶段直接阻断；warning 级（嵌套仓库依赖、Agent 预折叠布尔路由、永不可达的字面量死路由、工作 Agent success 直达业务终态）转交语义 Reviewer 逐条实地核验，其中完成权冲突使用阻断类 `single-agent-terminal-authority`。`loop create` 与交互 `/validate` 对所有发现仅打印告警（手工作者可自行裁量）。
 
 ## Git 与版本控制
 

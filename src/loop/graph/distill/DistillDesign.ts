@@ -45,8 +45,13 @@ export interface LoopConstraintLedger {
  * The locus makes the split explicit:
  *   - `graph` — must resolve to routing, permission or a bound. This is the
  *     determinism the design actually asks for.
- *   - `agent` — deliberately delegated to Agent judgement; the obligation is
- *     that the responsible node is briefed, not that the Graph encodes it.
+ *   - `agent` — deliberately delegated to the long-lived work Agent; the
+ *     obligation is that it is briefed, not that the Graph encodes the domain
+ *     procedure.
+ *   - `reviewer` — a completion/gate claim needs an authority independent of
+ *     the Agent that produced the work. It is implemented by a read-only Agent
+ *     reviewer or a registered deterministic Function, never by trusting the
+ *     worker's own "done" boolean.
  *   - `human` — cannot be settled by either; belongs in preconditions.
  *
  * Derived by the host from `kind`, never chosen by a model. `kind` is already a
@@ -54,31 +59,35 @@ export interface LoopConstraintLedger {
  * exists, so there is no path by which a later stage can relabel an
  * inconvenient routing rule as "judgement" to get a candidate through.
  */
-export type SemanticEnforcementLocus = 'graph' | 'agent' | 'human'
+export type SemanticEnforcementLocus = 'graph' | 'agent' | 'reviewer' | 'human'
 
-/** Unclassifiable kinds default to `graph`: keeping the strict reading for
- * anything unrecognized means a mislabelled constraint fails loudly rather than
- * silently escaping review. */
+/** Unclassifiable kinds default to the thick Agent. Graph is the governance
+ * shell, not a domain workflow compiler; an unknown prose obligation must not
+ * manufacture State/Transition structure merely because its label is broad. */
 const ENFORCEMENT_LOCUS_BY_KIND: Readonly<Record<LoopConstraintKind, SemanticEnforcementLocus>> = {
   deterministic_rule: 'graph',
   workspace_protocol: 'graph',
   ownership: 'graph',
   terminal_obligation: 'graph',
   failure_boundary: 'graph',
-  recovery: 'graph',
   budget: 'graph',
   timer: 'graph',
   event: 'graph',
-  other: 'graph',
+  // Operational recovery is normally an in-Activation skill/tool procedure.
+  // Only its cross-Activation bound or terminal consequence is Graph-owned and
+  // should be extracted separately as budget/failure_boundary.
+  recovery: 'agent',
+  other: 'agent',
   // Intent-shaped: the source states an outcome to pursue, not a rule to encode.
   goal: 'agent',
-  success_criteria: 'agent',
+  // The worker may propose completion, but cannot certify its own work.
+  success_criteria: 'reviewer',
   // A capability the runtime does not have is not a lowering defect.
   capability: 'human',
 }
 
 export function deriveEnforcementLocus(kind: LoopConstraintKind): SemanticEnforcementLocus {
-  return ENFORCEMENT_LOCUS_BY_KIND[kind] ?? 'graph'
+  return ENFORCEMENT_LOCUS_BY_KIND[kind] ?? 'agent'
 }
 
 /** Constraint id → locus, for the reviewer contract and traceability checks. */
@@ -214,6 +223,9 @@ export const BLOCKING_SEMANTIC_RULE_CLASSES = [
   'unbriefed-agent-constraint',
   'unbounded-or-unreachable-control',
   'missing-source-bound',
+  /** A work-producing Agent's success output reaches a done/failed business
+   * Terminal without an independent read-only reviewer or deterministic gate. */
+  'single-agent-terminal-authority',
   'writer-boundary-bypass',
   'state-routing-divergence',
   'missing-precondition',

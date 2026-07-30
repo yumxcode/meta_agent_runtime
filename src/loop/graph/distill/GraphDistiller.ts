@@ -130,7 +130,7 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
   schemaVersion: 'graph-2.0',
   id: 'bounded_iterative_loop',
   version: 1,
-  goal: 'Iterate until the semantic worker reports completion, otherwise fail cleanly.',
+  goal: 'Iterate until an independent reviewer verifies the worker completion candidate.',
   state: {
     iteration: {
       type: { type: 'integer', minimum: 0 },
@@ -144,6 +144,12 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
       workspace: { read: ['requirements.md'], write: [], deny: ['.git'] },
       maxConcurrency: 1,
       description: 'One continuous semantic work context.',
+    },
+    review: {
+      context: 'fresh_per_activation',
+      workspace: { read: ['requirements.md'], write: [], deny: ['.git'] },
+      maxConcurrency: 1,
+      description: 'Read-only completion authority independent from the work session.',
     },
   },
   nodes: {
@@ -164,6 +170,24 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
       maxAttempts: 3,
       budget: { turns: 20, usd: 10, wallTimeMs: 600_000 },
     },
+    review: {
+      type: 'agent',
+      lane: 'review',
+      prompt: 'Independently verify the completion candidate against the original requirements and return accepted plus concise findings. Do not perform or modify the work.',
+      inputs: { candidate: { ref: '$input.candidate' } },
+      outputSchema: {
+        type: 'object',
+        required: ['accepted', 'findings'],
+        properties: {
+          accepted: { type: 'boolean' },
+          findings: { type: 'string' },
+        },
+        additionalProperties: false,
+      },
+      tools: ['read_file'],
+      maxAttempts: 2,
+      budget: { turns: 10, usd: 2, wallTimeMs: 300_000 },
+    },
     done: { type: 'terminal', status: 'done', result: { ref: '$input.result' } },
     failed: { type: 'terminal', status: 'failed', result: { ref: '$input.error' } },
   },
@@ -171,7 +195,7 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
     {
       id: 'goal_reached', from: 'work', on: 'success',
       when: '$output.complete == true', priority: 100,
-      to: { node: 'done', inputs: { result: { ref: '$output' } } },
+      to: { node: 'review', inputs: { candidate: { ref: '$output' } } },
     },
     {
       id: 'continue_work', from: 'work', on: 'success', default: true,
@@ -182,9 +206,22 @@ export const CANONICAL_GRAPH_DISTILL_EXAMPLE: LoopGraphSpec = {
       id: 'work_failed', from: 'work', on: 'failure',
       to: { node: 'failed', inputs: { error: { ref: '$output' } } },
     },
+    {
+      id: 'completion_verified', from: 'review', on: 'success',
+      when: '$output.accepted == true', priority: 100,
+      to: { node: 'done', inputs: { result: { ref: '$input.candidate' } } },
+    },
+    {
+      id: 'completion_rejected', from: 'review', on: 'success', default: true,
+      to: 'work',
+    },
+    {
+      id: 'review_failed', from: 'review', on: 'failure',
+      to: { node: 'failed', inputs: { error: { ref: '$output' } } },
+    },
   ],
   entrypoints: [{ id: 'start', node: 'work' }],
-  limits: { maxTotalActivations: 100, maxLiveActivations: 4, maxWallTimeMs: 86_400_000, maxCostUsd: 20 },
+  limits: { maxTotalActivations: 100, maxLiveActivations: 4, maxWallTimeMs: 86_400_000, maxCostUsd: 30 },
   concurrency: { maxActivations: 1, maxPerNode: 1, stateConsistency: 'commit_latest' },
 }
 
@@ -503,7 +540,7 @@ async function compileLoopGraph(
         '【Loop Blueprint】', JSON.stringify(architecture.design),
         metadataOnlyTurn
           ? '【立即执行】不要输出分析、Graph、Markdown 或调用工具；只返回上面指定的 metadata JSON。'
-          : '【立即执行】以上合同已完整。不要输出分析、设计过程、字段清单或 Markdown；下一步必须直接调用 graph_validate，参数必须是完整且最小的 graph（不是 skeleton）。若验证失败，只按 errors、repairHints 和 patchSelectors 调用 graph_patch_validate 做局部 set/remove；Transition 必须按 @id=稳定ID 定位，禁止数字下标、整图重发或重建。验证通过（valid=true && frozen=true）后，最终 JSON 只回 {"traceability":…,"preconditions":…,"taskSpec":…}——**不要把 graph 再抄进文本回答**，宿主已从工具调用取得它；把几十 KB 的图重新序列化一遍只会引入引号/逗号损坏，让整份回答报废。来源中的命名阶段默认映射到厚 Agent 内部步骤或 Transition+Reducer，不为阶段名称创建 Function。若存在唯一文件 writer：工作 Agent 的出边直接用 current>=T-1 等条件同时更新 next counter/status 后进入 writer，writer 再按 $state 路由；bootstrap/error/report/pivot 提交都复用该 writer，不得增加 identity/status gate 或第二写者。',
+          : '【立即执行】以上合同已完整。不要输出分析、设计过程、字段清单或 Markdown；下一步必须直接调用 graph_validate，参数必须是完整且最小的 graph（不是 skeleton）。若验证失败，只按 errors、repairHints 和 patchSelectors 调用 graph_patch_validate 做局部 set/remove；Transition 必须按 @id=稳定ID 定位，禁止数字下标、整图重发或重建。验证通过（valid=true && frozen=true）后，最终 JSON 只回 {"traceability":…,"preconditions":…,"taskSpec":…}——**不要把 graph 再抄进文本回答**，宿主已从工具调用取得它。来源中的命名阶段默认映射到厚 Worker 内部步骤，不为阶段名称创建 Function。默认让唯一 Worker 直接拥有其 Workspace 文件；仅在来源要求独立提交权或多生产者共享正式写面时增加 writer。Worker 完成候选必须先到独立只读 Reviewer/确定性 Function，不能直达业务 done。',
       ].join('\n\n'),
       systemPrompt: compilerSystemPrompt,
       allowedTools: ['ask_user', 'graph_reference', 'graph_validate', 'graph_patch_validate'],
@@ -836,7 +873,7 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 1. intent_constraints：目标、成功标准、hard/soft 强度和来源是否完整且未被改写。
 2. workspace_contract：对照 Blueprint workspace，检查 Agent 直接读写路径、write mode、deny、文件 owner 与用户协议是否一致；不要求 Kernel 代写用户文件。lane.scm='git' 是权限升级：只有来源确实要求提交/推送项目仓库时才允许。
 3. lane_ownership：对照 Blueprint lanes，检查强相关生命周期是否保持连续会话；串行/并发和权限边界合理。
-4. control_flow：对照 Blueprint control，检查确定性路由、状态更新前后语义、success/failure/timeout/event/timer、恢复、预算和终态义务是否闭环且有界。
+4. control_flow：按四条系统边界审阅：Worker 不心算下一节点；业务完成不由产出工作的单一 Agent 自证；Graph 只保留跨 Activation 路由、硬计数/预算和终态；同一 Worker 内的领域步骤、普通恢复和轮内 timer 不应被过度编译。
 5. capability_resolution：graph 落点的 hard constraint，其 graphRefs 指向真实实现；Graph 使用的工具、Skill、Function、Reducer 与 Effect 确实可用，缺口没有被伪装成已实现。
 6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。
 
@@ -847,8 +884,9 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 【执行落点：判断「实现了没有」的唯一标准】
 本设计刻意采用「稀疏控制骨架 + 厚 Agent 节点」：确定性只覆盖路由、权限与边界，其余交给 Agent 判断。因此**不是每条 hard constraint 都应该在 Graph 里有可执行元素**，追着要一个只会逼出伪造的 Function 或空转的 State 字段。user prompt 给出了逐条落点，由宿主从 constraint.kind 机械推导，你不得重新协商：
 
-- **graph**（deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / recovery / budget / timer / event / other）：必须落在真实可执行元素上——Transition 的 when/updates、Lane.workspace 规则、State 更新、limits 或终态路由。落在 node.prompt、systemInstructions、annotations、taskSpec、rationale 上都不算实现，记 unimplemented-hard-constraint 或 annotation-only-satisfaction。
-- **agent**（goal / success_criteria）：**Graph 中没有对应元素是正确设计，不得据此提出任何 finding。**只核验责任 Agent 确实被交底：该义务出现在其 prompt/systemInstructions/inputs 中，或位于该 Lane workspace.read 可读、且 prompt 要求开始时读取的项目文件里。两者皆无才记 unbriefed-agent-constraint。不要评价 Agent 会不会做好——那是运行时的事。
+- **graph**（deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / budget / timer / event）：必须落在真实可执行元素上——Transition 的 when/updates、Lane.workspace 规则、State 更新、limits 或终态路由。落在 node.prompt、systemInstructions、annotations、taskSpec、rationale 上都不算实现。
+- **agent**（goal / recovery / other）：**Graph 中没有对应元素是正确设计，不得据此提出任何 finding。**只核验厚 Worker 已被交底；领域恢复步骤、研究流程和文件维护默认留在同一 persistent Agent 内。
+- **reviewer**（success_criteria）：Worker 可以准备结果、证据和完成候选，但不能给自己签发完成证书。必须由不同 Lane 上无 write rule 的只读 Reviewer，或注册的确定性 Function，根据固定标准核验后才能进入业务 done；否则记 single-agent-terminal-authority。
 - **human**（capability）：必须出现在 preconditions 清单中（decision 或 command/credential），否则记 missing-precondition。图里没有实现不是缺陷。
 
 同一条约束不要跨落点重复提出。若你认为某条的落点判错了（例如一条本质是阈值路由的约束被标成 agent），把它作为 intent_constraints 层的 finding 陈述理由，而不是直接按 graph 标准去要求它。
@@ -857,17 +895,19 @@ user prompt 若附带【机械 Lint 提示】，每条都必须在对应层给�
 
 Graph annotations 不会注入 Agent prompt，也不执行：任何落点的 hard constraint 都不能仅靠 annotations、taskSpec 或 rationale 满足，Agent prompt 依赖 annotations 中的值同样记 annotation-only-satisfaction。write mode 与 append/replace 语义不一致记 workspace-mode-mismatch。
 
-若 Blueprint 声明唯一文件 writer，枚举每个会产生待提交数据或更新 Graph State 的工作 Agent 成功分支：它们必须先进入该 writer，再由 writer 按提交后的 $state 路由。research→pivot、pivot→pivot 等绕过 writer 的捷径记 writer-boundary-bypass；正确闭环是工作分支→writer，writer 的 pivot_required 分支→pivot。bootstrap 也只能输出初始化 payload，由 writer 创建其拥有的文件，不能因为“首次运行”越权写入。
+资源可审查由 Lane.workspace 提供，不得反推出“必须有 writer Agent”。单一 Worker Lane 已经是某文件的唯一 owner 时，直接写入是首选；仅当来源要求独立提交权、多个生产者共享正式写面、或候选必须审批后提交时，才要求 writer。若图确实声明这种边界，只有需要正式提交的路径必须经过它，绕过才记 writer-boundary-bypass。
 
-逐项核对 writer 持久化的路由字段来自哪里：Reducer 更新 Graph State 后，只有 target inputs 中的 $state 引用能读取新值；Reducer 不会修改 $output.progress_patch。若 writer 把 Agent 生成的 progress_patch 原样写入，却声称其中 status/stale_count/iteration/total_findings 已被 Transition updates 确定性覆盖，记 state-routing-divergence。
+若存在独立 writer，逐项核对它持久化的路由字段来源：Reducer 更新 Graph State 后，只有 target inputs 中的 $state 引用能读取新值；旧磁盘快照和 Worker 的 pre-transition output 都不是 post-transition State。此时不一致才记 state-routing-divergence。
+
+枚举所有进入 status=done 的路径：来自工作生产者的 candidate_ready/done/stop/target_reached/gate_passed 等字段只能触发独立核验，不能直接进入 Terminal；record_writer 只记录 Worker 结论也不构成独立核验。Runtime failure 可直接 failed，硬预算可 exhausted，需要人工确认可 paused。
 
 来源给出的轮次上限、总时长、最大重试次数等有界性要求，必须在图中有对应的确定性路由（例如按 $state 计数比较后进入终态）；仅有 limits.maxTotalActivations 之类与来源单位无确定性换算关系的图级配额，不算实现，记 missing-source-bound。
 
-以下属于设计观察，按对应 advisory ruleClass 记录，不阻断：生产与提交时序（commit-ordering）；确定性分类是否保留来源语义，例如“变差”被压成“没有改善”（semantic-classification）；stale 四分区等阈值真值表的精确性（threshold-truth-table）；高优先级分支遮蔽完成条件、每轮计数未在所有提交分支更新（branch-priority）；节点拆分与合并粒度（topology-granularity）；紧耦合生命周期是否该同会话（session-continuity）；turns/usd/lifetimeBudget 数值是否与任务规模匹配（budget-shape）。
+以下属于设计观察，按对应 advisory ruleClass 记录，不阻断：生产与提交时序（commit-ordering）；确定性分类是否保留来源语义（semantic-classification）；阈值真值表精确性（threshold-truth-table）；分支优先级（branch-priority）；节点拆分与合并粒度（topology-granularity）；紧耦合生命周期是否同会话（session-continuity）；turns/usd/lifetimeBudget 数值是否合适（budget-shape）。但“Worker 单独进入业务 done”不是粒度偏好，而是结束权冲突，必须阻断。
 
 只按来源原文施加强度，不从候选 rationale、taskSpec 或你熟悉的惯例反推新义务；反推出来的义务记 overreach-obligation。来源写“status = healthy 或 stale”只约束结果属于该集合，并不自动规定 improved/unchanged 到二者的一一映射。
 
-保持拓扑自由：不要按节点数量、角色名称、领域字段或 Scenario 风格套模板拒绝。多节点在确有持久提交、权限/并发边界、Kernel Wait/Event、失败隔离或终态边界时是合理实现；否则作为 topology-granularity advisory 记录，不要据此阻断。来源 hard constraint 未实现、不可执行、越权、写冲突、恢复不闭合或无界运行才是阻断级。
+保持拓扑自由，但以“一个厚 Worker + 独立完成权”为默认：研究、训练、监测、提取、pivot、普通恢复和项目文件维护没有独立权限/并发/外部 Event 边界时应留在一个 persistent Worker；拆开最多记 topology-granularity advisory。完成 Reviewer 是刻意的第二权力主体，不算过度拆分。不要按领域阶段名套模板。
 
 【严重度不由你决定】你只负责给出 finding 及其 ruleClass；宿主按 ruleClass 计算 accepted，你输出的 accepted 字段会被丢弃。阻断级 ruleClass 恰好是：${BLOCKING_SEMANTIC_RULE_CLASSES.join('、')}。建议级 ruleClass 恰好是：${ADVISORY_SEMANTIC_RULE_CLASSES.join('、')}。不得为了让候选通过而把真实的硬约束不符填成建议级；也不得为了显得严格而把风格偏好填成阻断级。ruleClass 必须取自上述枚举，其他值会使整份裁决作废。
 
@@ -1011,7 +1051,7 @@ export function formatGraphValidationFeedback(errors: readonly string[], graph?:
     hints.add('hard park Agent 必须位于 persistent Lane，并完整声明 segment budget、lifetimeBudget、timerPolicy.maxDelayMs/maxParks。')
   }
   if (/prompt-writes-denied-path/.test(joined)) {
-    hints.add('prompt 指示某 Agent 写入本 Lane 明确 deny 的路径——这不是"少声明了一条 write rule"，而是 prompt 与该 Lane 的所有权边界自相矛盾。正确修法是把这条指令从 prompt 里删掉，改由拥有该路径的节点执行写入（工作 Agent 只输出待持久化的数据，由 writer 落盘）。禁止给该 Lane 补 write rule 来"消错"：那会让同一路径出现两个 writer，紧接着触发 lane-write-overlap 或 writer-boundary-bypass。')
+    hints.add('prompt 指示某 Agent 写入本 Lane 明确 deny 的路径——这不是"少声明了一条 write rule"，而是 prompt 与 Lane 所有权边界自相矛盾。正确修法是把写入职责交给已经拥有该路径的 Lane；只有来源要求独立提交权时才让 Worker 输出候选并由 writer 落盘。禁止给第二条 Lane 补重叠 write rule 来"消错"。')
   }
   if (/undeclared-workspace-write/.test(joined)) {
     hints.add('prompt 写入了本 Lane 未授权的路径。先判断该节点是否真的应当拥有这条路径：是则补 Lane.workspace.write 规则；否则删除该指令，交给已拥有该路径的节点写入。另外，write_file/append_file 会自动创建获准文件的缺失父目录，prompt 里"创建 xxx/ 目录"这类句子通常是多余样板——直接删掉即可，不要为它扩大写权限。')
@@ -1057,7 +1097,7 @@ export function buildLoopArchitectSystem(): string {
 - 约束优先级：用户显式目标/协议/边界 > 适用项目治理与 ownership > 已知部署能力 > 派生设计 > 默认习惯。来源冲突或歧义会改变路由、权限、所有权或安全边界时使用 ask_user。
 - ask_user 不可用、超时或未获回答时，禁止静默采用默认值：把问题原文、拟采用的默认与影响面写入 constraints.unresolved（{id,question,affects}）。unresolved 项会进入运行前置条件清单，由 loop create 强制人工确认。
 - 不预设领域角色、字段、目录或拓扑。任何 Scenario 词汇都只是来源内容，不是机制模板。
-- 用户明确列出的阶段可以合并到厚 Agent，但阶段的先后关系、文件 owner 和提交责任仍是 hard contract；不得在 Ledger 中因拓扑合并而丢失。例如“评估后由 writer 提交”必须保留为约束，而不是只保留文件存在性。
+- 用户明确列出的领域阶段默认合并到同一个厚 Agent；只有阶段切换本身是不可跨越的确定性门禁时，才把 phase 与独立 gate review 留在控制层。文件 owner 是 hard contract，但“可审查写面”不等于必须增加 writer Agent：单一 Worker Lane 已经是单写者时应直接拥有文件。
 - 只回答三类问题：Agent 直接读写哪些 Workspace 路径、哪些工作共享 Lane 会话与写权限、何时继续/等待/失败/结束。
 - 倾向“稀疏控制骨架 + 厚 Agent 节点”：只在确定性计算、持久化提交、并发/权限边界、等待/事件、失败隔离和终态处建议拆分节点；不要把自然语言步骤机械拆成许多节点。
 
@@ -1068,7 +1108,7 @@ Constraint Ledger：
 - schemaVersion 必须是 "${LOOP_CONSTRAINTS_SCHEMA}"。
 - 每个 constraint 必须有 id、kind、statement、strength="hard|soft"、至少一个 {path,locator,excerpt?} 来源；可选 acceptance。
 - kind 只能是 goal|success_criteria|deterministic_rule|workspace_protocol|terminal_obligation|ownership|capability|timer|event|failure_boundary|recovery|budget|other。
-- kind 不只是分类标签，它决定该约束**在哪里被执行**，宿主据此机械推导，后续阶段无权更改：deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / recovery / budget / timer / event / other → 必须在 Graph 中落到路由、权限或边界上；goal / success_criteria → 交给厚 Agent 判断，Graph 不需要也不应该有对应元素；capability → 运行前置条件，由人确认。所以只有当来源真的给出可判定的规则、阈值、路径、时限或终态义务时才用前一组；来源表达的是"要达成什么"而非"如何判定"时用 goal/success_criteria。分类错会直接导致下游要么放过真实约束，要么为一句意图伪造可执行结构。
+- kind 不只是分类标签，它决定该约束**在哪里被执行**，宿主据此机械推导，后续阶段无权更改：deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / budget / timer / event → Graph 的路由、权限或硬边界；goal / recovery / other → 厚 Worker Agent 的领域职责；success_criteria → 独立只读 Reviewer 或注册的确定性 Function，Worker 只能提出完成候选，不能给自己签发完成证书；capability → 运行前置条件，由人确认。一个 recovery 同时含“如何换号”和“最多重试三次”时应拆成 recovery（Agent 操作）与 deterministic_rule/budget（Graph 上限）两条，而不是把整套 skill 流程编译成状态机。
 
 Loop Blueprint：
 - schemaVersion 必须是 "${LOOP_DESIGN_SCHEMA}"，goal 必须与 constraints.goal 完全相同。
@@ -1101,7 +1141,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 1. Constraint Ledger 是权威来源合同；Blueprint 只描述 Workspace、Lane、Control 意图，不预设拓扑。你可以自由选择最小充分的 Node、Lane、State 和 Transition。
 2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
 3. 不要凭记忆猜 ABI。先调用 graph_reference(example)，再只按实际缺口调用 overview、nodes、workspace、lanes、control、capabilities；不要一次加载全部 section，也不要用不完整 skeleton 试探 graph_validate。
-4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 业务终态”开始，只添加 Ledger 明确要求的边界；需要作者处理节点预算耗尽时再增加 exhausted 终态/边。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。优先让同一个 persistent Agent 通过 mode/input 承担常规轮次、反思与策略转向；只有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
+4. 默认从“一个可写 persistent Worker + 一个独立只读 completion Reviewer + done/failed 终态”开始。Worker 承担常规轮次、反思、策略转向、项目文件维护和轮内 timer；Worker 只能输出 candidate_ready/evidence 等完成候选，不能用 stop/done/target_reached/next_node 之类字段直接签发业务终态。Reviewer 与 Worker 不共享 Lane、没有 write rule，只核验固定成功标准与证据；只有 Reviewer accepted 或注册的确定性 Function 证书才能进入 done。只有独立提交权限、多生产者竞争同一写面、并发、固定外部 Event、失败隔离等真实边界才继续拆节点。
 5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON——此时最终 JSON 里**不要再放 graph**（见【输出】）。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
 
 【稳定语义边界】
@@ -1114,16 +1154,16 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - 不要用 sleep、bash sleep 或轮询空转来模拟等待——它们烧掉段预算且不可恢复。Kernel 等待一律用 wait 节点（timer/event）或 Agent timer hard-park。
 - Kernel 默认拒绝项目根 .git 的一切写入：普通 Lane 的 Agent 无法在项目根执行 git commit/push。需求确实要求提交/推送项目仓库时，必须在恰好一个 Lane 上声明 scm:'git'（.git 可写但 hooks/config 仍受保护，该 Lane 需至少一条 write 规则），并在 taskSpec 里说明来源依据；或改用嵌套 clone 惯用法——在 owned 写前缀下维护独立仓库（其内部 .git 不受根保护影响）。不要给 Agent 写"git push"指令却不提供这两种能力之一。
 - 项目外没有任何可写位置：sandbox 对项目根以外的一切路径拒写，"运行时再寻找项目外工作树"的设计必然失败。需求要编辑的外部资源（含其他仓库的 work tree）必须 clone/放置到项目内某个 owned 写前缀，路径在图中固定，并作为 blocking directory precondition 声明。Agent prompt 中禁止出现绝对路径或 ~ 路径作为写目标。
-- when 路由优先引用原始事实字段（计数、三态枚举），把确定性规则留在图里；Agent 预折叠的布尔（is_*/should_* 等）只在无法用原始字段表达时使用，且原始字段仍须保留在 outputSchema 中供存档。
+- when 路由优先引用原始事实字段（计数、三态枚举），把确定性规则留在图里；Agent 不得输出 next_node/route/record_action/stop/target_reached 等等价路由命令。is_*/should_*/gate_passed 等预折叠布尔只可用于“请求独立审阅”，不得直接进入业务 Terminal；能以原始事实表达时必须保留原始字段。
 - Function Node 不是“确定性”标签或占位符：只有 graph_reference(capabilities) 中某个注册 Function 的真实行为恰好完成该计算时才能创建；否则用 when + Reducer 表达小型确定性路由，复杂领域判断留在 Agent 输出中。
 - 来源把某段称为“code node”“reduce phase”或给了阶段名，并不要求创建同名物理 Node：只要没有独立能力、权限或恢复边界，一组确定性 Transition 的 when + updates 就是该阶段的可执行实现，traceability 直接指向这些 Transition。禁止为满足名称而伪造 Function。
-- 来源要求“唯一文件 writer”时，它是一条持久化边界，不是业务角色：该 writer 独占一条 Lane，工作 Agent 所在 Lane 不得包含 writer-owned 文件的 write rule（同 Lane 内换个 Node 名或 prompt 不构成权限隔离）。所有会产生待提交数据的分支——首轮初始化、常规提交、转向提交、异常记录——都汇入这同一个 writer 的 mode/input，不得绕过，也不得为同一文件 owner 再拆出第二个写者。反过来，若这些分支只是同一会话里的不同模式，不要仅因角色名、独立 budget 或 first-run 标记就拆 Agent。
-- 归约与持久化的分工：Reducer 只更新 Graph State，绝不回写或合并 Agent 的 $output。工作 Agent 的多条出边用 when + updates 同时写入“下一计数”和“派生状态”后进入 writer；writer 的 target inputs 逐项绑定提交后的 $state 来落盘，成功后的出边再按 $state 路由。禁止让 Agent 产出一个 patch 对象、writer 原样落盘、再声称其中字段已被 Reducer 覆盖——那会让磁盘状态与确定性路由分叉。writer 可直接持久化已归约状态，无需中转 Function。
+- Lane.workspace 已经是可审查的写权边界。只有来源明确要求独立提交者、多个生产者会竞争同一正式写面、或候选数据必须经批准后才能提交时才增加 writer Agent；单一 Worker 本身就是唯一写者时，直接让其 Lane 拥有项目文件，不得为了“审计”凭空制造 writer。
+- 若确有独立 writer，Reducer 只更新 Graph State，绝不回写或合并 Agent 的 $output；writer 的 target inputs 必须逐项绑定提交后的 $state。所有需要正式提交的分支才汇入 writer，纯等待/同一 Worker 的轮内恢复不应为凑拓扑绕行。禁止让 writer 从旧磁盘快照猜 post-transition State。
 - when 读取更新前 State 不意味着需要 gate。若本轮触发后 next_count=current+1，阈值 next_count>=T 直接改写为 current>=T-1，并按阈值优先级枚举互斥 Transition；reset 分支直接同时 set 计数和状态。只有这个代数改写确实无法表达时才允许一个真实的 commit barrier，禁止串联 identity/reduce/status gate。
 - 确定性阈值、计数和时间规则不得让 Agent 心算；when 读取更新前 State。每个非终态 outcome 必须全覆盖。有界收敛 loop 使用 maxTotalActivations + maxLiveActivations；持续/反应式 loop 省略总量上限，只用 maxLiveActivations 限制同时存活的 ready/running/waiting Activation，并保留业务停止事件到 Terminal 的路由。不要再生成旧字段 maxActivations。
 - Graph 的墙钟、费用、Activation 总量/存活量和 Agent 生命周期预算耗尽会进入独立 exhausted 终态，不等同执行 failure；节点需要在耗尽前整理结果时可显式提供 on:'exhausted' 路由。quiesced without terminal 仍是控制流错误。
 - 并发数大于 1 时必须显式选择 stateConsistency。commit_latest 的 when 不得在需要同一快照语义时混用新鲜 $state 与基于旧 claim 快照生成的 $output；此类决策使用 serializable，或只路由与可变 State 无关的原始 output 事实。
-- Agent 使用 graph_agent；Graph 不选择 agentic/auto mode。研究、训练、监测、提取、评估等紧耦合语义步骤默认留在一个厚 Agent 内，由 Agent 自主规划；Graph 只接收路由所需的闭合事实。
+- Agent 使用 graph_agent；Graph 不选择 agentic/auto mode。研究、训练、监测、提取、普通语义评估、恢复操作与文件维护默认留在一个厚 Worker 内，由它自主规划；Graph 只接收路由必需的原始事实。独立 Reviewer 只在 phase/final gate 候选出现时激活，不接管工作，也不写 Workspace。
 - 轮内等待（轮询外部结果、等待作业完成）用 Agent 的 timer hard park，由 Agent 自选唤醒时间，只需 persistent Lane 与 timerPolicy.maxDelayMs/maxParks。只有固定外部事件边界才用 event Wait，固定图级时间边界才用 timer Wait。这个选择直接决定时间约束能不能表达：budget.wallTimeMs 只覆盖一个进程段（timer continuation 会开新段并重置），lifetimeBudget.elapsedMs 以 firstStartedAt 为起点覆盖同一个 Activation 的全部 continuation，而 limits.maxWallTimeMs 是整图总额。因此来源若要求“单轮/每次任务 ≤T”，就必须让这一轮落在**同一个 Activation** 内并设 lifetimeBudget.elapsedMs=T；一旦中间插入 Wait 节点把轮次切成多个 Activation，就没有任何原语能再累计计时，该约束将无法实现。
 - 凡是 type:"agent" 的节点都必须显式设置 budget.wallTimeMs，且不得小于 300000（5 分钟）。这是 Distill 的 Agent 执行下限，用于覆盖模型响应、工具调用和持久化收尾；仍应按任务规模设置 turns/usd，并在长生命周期任务需要时设置 lifetimeBudget 和图级 limits。
 - 只引用 graph_reference(capabilities) 返回的 Agent Tool、Function、Reducer、Effect 和 Pack。缺能力时在 taskSpec 明确列出，不能伪造。
@@ -1135,17 +1175,17 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - write_file 与 append_file 会自动创建获准文件的缺失父目录。逐文件 atomic_replace/append_only 初始化时直接写/追加目标文件即可，无需额外建目录，也不要为建父目录把精确模式扩大成 owned。因此 prompt 里"首轮创建 xxx/ 目录"这类句子是多余样板，写进去只会与 Lane 合同冲突。
 - **不要在 Agent prompt 里枚举可写路径或目录。** Kernel 每次 Activation 都会把该节点所在 Lane 的 workspace 合同（read/write/deny 及每种 mode 的含义）作为独立 contract 段注入 Agent 的 prompt，Agent 一定看得到权威清单。你在 node.prompt 里再手抄一份，只会制造第二份非权威、且没有任何东西执行的副本——它一旦与 Lane 合同不一致就是缺陷（沙箱按 Lane 合同放行，散文说了不算）。写面的唯一事实源是 lane.workspace。
 - 因此 node.prompt 只描述**持久化职责**："把本轮产出连同其证据引用落盘"、"以 append 语义追加本轮的运行记录"、"原子替换状态快照"，并可按角色引用 Lane 合同中的条目（"追加到你 Lane 合同里那条 append_only 规则所指的日志"）。不要写"创建 xxx/ 目录"、"写入 a/b.json"这类路径清单。需要读取的文件路径可以出现（read 不受 write/deny 约束），但不要写成祈使式的写入句。
-- 单写者设计下，工作 Agent 的 prompt 只描述"产出哪些待持久化数据"，落盘职责只出现在 writer 的 prompt 里；不要把同一段初始化职责同时写进多个节点的 prompt。
+- 只有图确实存在独立 writer 时，Worker prompt 才只产出待提交数据；默认单 Worker 设计中，Worker 直接维护其 Lane 合同授权的项目文件。
 - 保留来源的确定性语义类别：来源区分三种以上结果时，让 Agent 原样输出该多态枚举，不要压成布尔，也不要用布尔反转代替缺失的那一态——丢掉一态就等于丢掉一条路由。
 - 来源的复合条件按真值表逐分区枚举互斥 Transition，不要用 OR 把不同量级的条件连起来。典型形状：复合条件成立才递增计数器，不成立的分支同时 set 计数器归零与派生状态；多个阈值分支从严到宽排列，且全部先受同一个复合条件约束。任何一个分区没有对应 Transition，就是一条不可达路径。
 - 若某分支会重置计数器，检查更高的阈值分支是否仍可达：先触发的低阈值 reset 会让高阈值永远达不到。这类阈值要么与 reset 分支互斥，要么改用不被重置的累计量。
 - State 中声明的每个字段都必须至少被一条 Transition 的 updates 更新，否则它永远等于 initial，所有基于它的 when 都是死条件。只读不写的事实不要放进 State。
 - 业务终态不得被继续循环的分支遮蔽：让终态条件优先级更高，或与循环分支互斥。来源要求每轮更新的计数必须在所有对应提交分支上更新，不能只在主干分支更新。
-- 若最终文件只允许保存已通过评估、真正新增或已批准的数据，生产 Agent 先输出候选数据，评估后由单一 writer 提交；不要在评估前写入最终 append-only 文件。
+- 若某个最终文件只允许保存已通过评估、真正新增或已批准的数据，才采用“Worker 产候选→独立 Reviewer→writer/Effect 提交”；普通进展与实验日志由 Worker 直接写入。
 
 【Traceability 与完成标准】
 - 每个 hard constraint 恰有一条 mapping，graphRefs 必须指向最终 Graph 中真实存在的**标准 JSON pointer**。Transition 位于数组，必须用数值下标（例如 /transitions/0/updates/0），绝不能把 transition id 拼进指针，也不要在这里使用 graph_patch_validate 的 @id= 选择器语法（那套只用于打补丁，写进 graphRefs 会被校验判为不存在的指针）；不需要指到单条边时优先使用稳定的 /nodes、/lanes 或 /limits 引用。
-- 落点决定什么算实现，宿主按 constraint.kind 机械判定，不接受协商：deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / recovery / budget / timer / event / other 属于 **graph 落点**，graphRefs 必须落在 Transition、Lane.workspace、State 更新、limits 或终态上，只指向 /nodes/*/prompt、systemInstructions 或 annotations 会被机械拒绝。goal / success_criteria 属于 **agent 落点**，本就不该有可执行元素——把义务写进责任 Agent 的 prompt/inputs（或它开始时会读的 Lane 可读文件），graphRefs 指向该 Node 即可，不要为它伪造 Function、State 字段或空转 Transition。capability 属于 **human 落点**，写进 preconditions，不要在图里假装已实现。
+- 落点决定什么算实现，宿主按 constraint.kind 机械判定，不接受协商：deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / budget / timer / event 属于 **graph 落点**；goal / recovery / other 属于 **agent 落点**；success_criteria 属于 **reviewer 落点**，必须由独立只读 Agent 或注册确定性 Function 核验，Worker 自己的 done/gate_passed 不算；capability 属于 **human 落点**，写进 preconditions。不要为 Agent 内部步骤伪造 Function、State 或 Transition。
 - taskSpec 重点解释：Lane/节点合并选择、确定性真值与阈值、Workspace 路径与 owner、外部能力缺口、预算和人工审查点。
 - 验证标准是可执行、安全、可恢复和来源语义完整；不得因为节点数量、名称、Research/Release/Compliance 风格或未采用示例拓扑而自我否决。`
 }

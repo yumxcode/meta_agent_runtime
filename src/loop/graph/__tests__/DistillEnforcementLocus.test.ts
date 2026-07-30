@@ -25,25 +25,28 @@ function traceability(mappings: Array<{ constraintId: string; graphRefs: string[
 }
 
 describe('constraint enforcement locus', () => {
-  it('routes rule-shaped kinds to the graph and intent-shaped kinds to the agent', () => {
+  it('keeps governance in graph, domain procedure in worker, and completion in an independent reviewer', () => {
     for (const kind of ['deterministic_rule', 'workspace_protocol', 'ownership', 'terminal_obligation',
-      'failure_boundary', 'recovery', 'budget', 'timer', 'event'] as LoopConstraintKind[]) {
+      'failure_boundary', 'budget', 'timer', 'event'] as LoopConstraintKind[]) {
       expect(deriveEnforcementLocus(kind)).toBe('graph')
     }
     expect(deriveEnforcementLocus('goal')).toBe('agent')
-    expect(deriveEnforcementLocus('success_criteria')).toBe('agent')
+    expect(deriveEnforcementLocus('recovery')).toBe('agent')
+    expect(deriveEnforcementLocus('other')).toBe('agent')
+    expect(deriveEnforcementLocus('success_criteria')).toBe('reviewer')
     expect(deriveEnforcementLocus('capability')).toBe('human')
   })
 
-  it('defaults the catch-all kind to graph so a mislabel fails loudly', () => {
-    expect(deriveEnforcementLocus('other')).toBe('graph')
-    expect(deriveEnforcementLocus('not_a_kind' as LoopConstraintKind)).toBe('graph')
+  it('defaults unknown prose obligations to the thick agent instead of manufacturing control structure', () => {
+    expect(deriveEnforcementLocus('not_a_kind' as LoopConstraintKind)).toBe('agent')
   })
 
   it('indexes and formats loci for the reviewer contract', () => {
-    const l = ledger(['C1', 'deterministic_rule'], ['C2', 'goal'], ['C3', 'capability'])
-    expect(enforcementLocusIndex(l)).toEqual(new Map([['C1', 'graph'], ['C2', 'agent'], ['C3', 'human']]))
-    expect(formatEnforcementLoci(l)).toBe('C1=graph(deterministic_rule) · C2=agent(goal) · C3=human(capability)')
+    const l = ledger(['C1', 'deterministic_rule'], ['C2', 'goal'], ['C3', 'success_criteria'], ['C4', 'capability'])
+    expect(enforcementLocusIndex(l)).toEqual(new Map([
+      ['C1', 'graph'], ['C2', 'agent'], ['C3', 'reviewer'], ['C4', 'human'],
+    ]))
+    expect(formatEnforcementLoci(l)).toBe('C1=graph(deterministic_rule) · C2=agent(goal) · C3=reviewer(success_criteria) · C4=human(capability)')
   })
 
   it('rejects a graph-locus constraint traced only to node prose', () => {
@@ -64,6 +67,15 @@ describe('constraint enforcement locus', () => {
     const errors = validateGraphTraceability(
       traceability([{ constraintId: 'C1', graphRefs: ['/nodes/work/prompt'] }]),
       ledger(['C1', 'goal']),
+      CANONICAL_GRAPH_DISTILL_EXAMPLE,
+    )
+    expect(errors).toEqual([])
+  })
+
+  it('accepts a completion criterion traced to the independent reviewer prompt', () => {
+    const errors = validateGraphTraceability(
+      traceability([{ constraintId: 'C1', graphRefs: ['/nodes/review/prompt'] }]),
+      ledger(['C1', 'success_criteria']),
       CANONICAL_GRAPH_DISTILL_EXAMPLE,
     )
     expect(errors).toEqual([])
