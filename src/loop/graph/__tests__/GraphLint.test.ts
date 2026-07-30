@@ -332,6 +332,101 @@ describe('graph write-surface lint', () => {
     expect(lintLoopGraph(spec).filter(f => f.rule === 'dead-null-input')).toEqual([])
   })
 
+  // Exact implication: the lower-priority edge repeats every condition of a
+  // higher-priority one, so the higher one always wins first.
+  it('blocks a route whose conditions are a superset of a higher-priority route', () => {
+    const spec = graph()
+    spec.state.count = { type: { type: 'integer', minimum: 0 }, initial: 0 }
+    spec.transitions = [
+      { id: 'broad', from: 'work', on: 'success', priority: 100, when: "$state.status == 'healthy'", to: 'done' },
+      { id: 'narrow', from: 'work', on: 'success', priority: 90, when: "$state.status == 'healthy' && $state.count >= 3", to: 'done' },
+      { id: 'fallback', from: 'work', on: 'success', default: true, to: 'done', updates: [{ target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'done' }] }] },
+      { id: 'counted', from: 'work', on: 'failure', to: 'failed', updates: [{ target: 'count', reducer: 'builtin/increment@1' }] },
+    ]
+    const shadowed = lintLoopGraph(spec).filter(f => f.rule === 'shadowed-route')
+    expect(shadowed).toHaveLength(1)
+    expect(shadowed[0]!.level).toBe('error')
+    expect(shadowed[0]!.at).toBe("transitions 'narrow'.when")
+    expect(shadowed[0]!.message).toContain("higher-priority transition 'broad'")
+
+    // Raising the specific edge above the broad one resolves it.
+    spec.transitions[0]!.priority = 90
+    spec.transitions[1]!.priority = 100
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'shadowed-route')).toEqual([])
+  })
+
+  it('does not treat merely overlapping conditions as shadowing', () => {
+    const spec = graph()
+    spec.state.count = { type: { type: 'integer', minimum: 0 }, initial: 0 }
+    spec.transitions = [
+      { id: 'a', from: 'work', on: 'success', priority: 100, when: "$state.status == 'healthy'", to: 'done' },
+      { id: 'b', from: 'work', on: 'success', priority: 90, when: '$state.count >= 3', to: 'done' },
+      { id: 'fallback', from: 'work', on: 'success', default: true, to: 'done', updates: [{ target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'done' }] }] },
+      { id: 'counted', from: 'work', on: 'failure', to: 'failed', updates: [{ target: 'count', reducer: 'builtin/increment@1' }] },
+    ]
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'shadowed-route')).toEqual([])
+  })
+
+  // A source-mandated bound is only enforced if its edge wins when the threshold
+  // is met. An unproven overlap with a higher-priority looping edge is advisory.
+  it('warns when a looping route can outrank a $state-threshold terminal route', () => {
+    const spec = graph()
+    spec.state.rounds = { type: { type: 'integer', minimum: 0 }, initial: 0 }
+    spec.transitions = [
+      { id: 'keep_going', from: 'work', on: 'success', priority: 100, when: "$state.status == 'healthy'", to: 'work' },
+      { id: 'round_cap', from: 'work', on: 'success', priority: 90, when: '$state.rounds >= 20', to: 'done' },
+      { id: 'fallback', from: 'work', on: 'success', default: true, to: 'work', updates: [{ target: 'rounds', reducer: 'builtin/increment@1' }, { target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'healthy' }] }] },
+      { id: 'boom', from: 'work', on: 'failure', to: 'failed' },
+    ]
+    const warned = lintLoopGraph(spec).filter(f => f.rule === 'terminal-route-shadowed')
+    expect(warned).toHaveLength(1)
+    expect(warned[0]!.level).toBe('warning')
+    expect(warned[0]!.at).toBe("transitions 'round_cap'.when")
+    expect(warned[0]!.message).toContain("'keep_going'")
+
+    // A provably exclusive guard on the looping edge removes the warning.
+    spec.transitions[0]!.when = "$state.status == 'healthy' && $state.rounds < 20"
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'terminal-route-shadowed')).toEqual([])
+
+    // So does giving the bound the higher priority.
+    spec.transitions[0]!.when = "$state.status == 'healthy'"
+    spec.transitions[0]!.priority = 90
+    spec.transitions[1]!.priority = 100
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'terminal-route-shadowed')).toEqual([])
+  })
+
+  // Only speaks when the conditional edges otherwise tile their own value space
+  // and the uncovered pocket is small enough to enumerate; a broad default with
+  // a large legitimate remainder must stay silent.
+  it('reports a small truth-table pocket but stays quiet about a broad default', () => {
+    const spec = graph()
+    spec.state.count = { type: { type: 'integer', minimum: 0 }, initial: 0 }
+    const edge = (id: string, priority: number, when: string) => ({ id, from: 'work', on: 'success' as const, priority, when, to: 'done' })
+    // trend × count tiles fully except trend=='up' && count==2.
+    spec.transitions = [
+      edge('up_low', 140, "$output.trend == 'up' && $state.count < 2"),
+      edge('flat_low', 130, "$output.trend == 'flat' && $state.count < 2"),
+      edge('flat_high', 120, "$output.trend == 'flat' && $state.count >= 2"),
+      edge('down_low', 110, "$output.trend == 'down' && $state.count < 2"),
+      edge('down_high', 100, "$output.trend == 'down' && $state.count >= 2"),
+      { id: 'fallback', from: 'work', on: 'success', default: true, to: 'done', updates: [{ target: 'count', reducer: 'builtin/increment@1' }, { target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'done' }] }] },
+      { id: 'boom', from: 'work', on: 'failure', to: 'failed' },
+    ]
+    const work = spec.nodes.work
+    if (work.type !== 'agent') throw new Error('expected agent')
+    work.outputSchema = { type: 'object', required: ['trend'], properties: { trend: { type: 'string' } }, additionalProperties: false }
+
+    const gaps = lintLoopGraph(spec).filter(f => f.rule === 'route-partition-gap')
+    expect(gaps).toHaveLength(1)
+    expect(gaps[0]!.level).toBe('warning')
+    expect(gaps[0]!.message).toContain("$output.trend=up")
+    expect(gaps[0]!.message).toContain("default 'fallback'")
+
+    // Cover the pocket and the finding disappears.
+    spec.transitions.splice(5, 0, edge('up_high', 105, "$output.trend == 'up' && $state.count >= 2"))
+    expect(lintLoopGraph(spec).filter(f => f.rule === 'route-partition-gap')).toEqual([])
+  })
+
   it('does not confuse empty-string or false constants with severed dataflow', () => {
     const spec = graph()
     spec.nodes.writer = {

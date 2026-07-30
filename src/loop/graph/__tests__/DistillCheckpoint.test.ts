@@ -657,6 +657,205 @@ describe('Distill Architect checkpoint', () => {
     expect(result.graph).toEqual(graph)
   })
 
+  // The reviewer reports a few findings per round, so a graph converges over
+  // several rounds. Replacing the previous round's feedback made convergence
+  // impossible when two findings constrain the same mechanism: one run was told
+  // a counter reset made a terminal unreachable, removed the reset, and was
+  // then told the source mandates that reset — never seeing both at once.
+  it('carries earlier semantic findings forward instead of replacing them', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-semantic-accumulate-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Reset the counter after a pivot, and stop at four.', 'utf8')
+    const traceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const prompts: string[] = []
+    let compiles = 0
+    let reviews = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          compiles++
+          return { status: 'completed', output: { graph, traceability, taskSpec: `attempt ${compiles}` } }
+        }
+        reviews++
+        if (reviews === 1) return { status: 'completed', output: rejectedReview('The pivot reset makes the attention terminal unreachable.', 'control_flow', 'unbounded-or-unreachable-control') }
+        if (reviews === 2) return { status: 'completed', output: rejectedReview('The source mandates the pivot reset at L196.', 'control_flow', 'constraint-weakened') }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    expect(result.semanticReview.accepted).toBe(true)
+    // Second repair turn: the newest finding AND the one from the round before
+    // are both present, with the older one marked as still binding.
+    expect(prompts[2]).toContain('The source mandates the pivot reset')
+    expect(prompts[2]).toContain('The pivot reset makes the attention terminal unreachable')
+    expect(prompts[2]).toContain('compiler attempt 1 提出，未被撤销，仍须满足')
+    expect(prompts[2]).toContain('【累积约束】')
+    // The first repair turn has only one round, so no accumulation preamble.
+    expect(prompts[1]).toContain('The pivot reset makes the attention terminal unreachable')
+    expect(prompts[1]).not.toContain('【累积约束】')
+  })
+
+  it('does not duplicate a semantic finding that recurs across rounds', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-semantic-dedupe-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Stop at four.', 'utf8')
+    const traceability = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const repeated = 'The threshold is still 3 where the source says 4.'
+    const prompts: string[] = []
+    let reviews = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          return { status: 'completed', output: { graph, traceability, taskSpec: 'compiled' } }
+        }
+        reviews++
+        return { status: 'completed', output: reviews <= 2
+          ? rejectedReview(repeated, 'control_flow', 'constraint-weakened')
+          : review }
+      },
+    }
+
+    await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    const occurrences = prompts[2]!.split(repeated).length - 1
+    expect(occurrences).toBe(1)
+  })
+
+  // A wrong traceability pointer is the cheapest boundary failure to repair —
+  // the host still holds the frozen, ABI-valid, lint-clean graph — but the
+  // boundary reserve used to be granted only for executable defects, so this
+  // one class died at the limit. One run lost its last attempt to four
+  // out-of-range array indices with every semantic finding already addressed.
+  it('reserves a repair when only review metadata fails at the attempt boundary', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-late-metadata-repair-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    const good = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const bad = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/transitions/99'], rationale: 'Off by one.' }] }
+    const prompts: string[] = []
+    let compiles = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          compiles++
+          return {
+            status: 'completed',
+            output: { graph, traceability: compiles <= 3 ? bad : good, taskSpec: 'compiled' },
+            validatedGraph: graph,
+          }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      // maxAttempts 1 → ordinary limit 3; the third failure sits exactly on the
+      // boundary and must still earn the reserved fourth attempt.
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    expect(compiles).toBe(4)
+    expect(result.traceability).toEqual(good)
+    // The reserved turn must carry the host's pointer facts, not just the raw error.
+    expect(prompts[3]).toContain('does not exist in the Graph')
+    expect(prompts[3]).toContain('合法下标是 0..1')
+  })
+
+  // Fix 1: the graph reaches the host through graph_validate's structured
+  // argument, so re-serializing it into the text envelope buys nothing and risks
+  // a corruption that discards a perfectly good graph. A metadata-only reply on
+  // the very first attempt must therefore be the normal, accepted shape.
+  it('accepts a metadata-only reply on the first attempt when graph_validate froze the graph', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-metadata-default-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    const prompts: string[] = []
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          prompts.push(request.taskDescription)
+          return {
+            status: 'completed',
+            validatedGraph: graph,
+            output: {
+              traceability: { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] },
+              preconditions: { schemaVersion: 'loop-preconditions-1.0', items: [] },
+              taskSpec: 'metadata only',
+            },
+          }
+        }
+        return { status: 'completed', output: review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 2,
+    })
+
+    expect(result.graph).toEqual(graph)
+    expect(result.taskSpec).toBe('metadata only')
+    // The first prompt must state which side holds the graph and ask for
+    // metadata only after validation.
+    expect(prompts[0]).toContain('【宿主持图状态】')
+    expect(prompts[0]).toContain('宿主当前**不持有**任何 Graph')
+    expect(prompts[0]).toContain('不要把 graph 再抄进文本回答')
+  })
+
+  // Fix 5: metadata repairs are granted on top of the design allowance, so a
+  // wrong pointer cannot consume an attempt that a real repair needed.
+  it('does not spend design budget on metadata-only failures', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'distill-metadata-pool-'))
+    roots.push(root)
+    await writeFile(join(root, 'requirements.md'), 'Resume compilation.', 'utf8')
+    const good = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/goal'], rationale: 'Goal is exact.' }] }
+    const bad = { schemaVersion: 'graph-traceability-2.0', mappings: [{ constraintId: 'C1', graphRefs: ['/transitions/99'], rationale: 'Off by one.' }] }
+    const phases: string[] = []
+    let compiles = 0
+    let reviews = 0
+    const executor: GraphDistillExecutor = {
+      async execute(request) {
+        phases.push(request.phase)
+        if (request.phase === 'architect') return { status: 'completed', output: { constraints, design } }
+        if (request.phase === 'compiler') {
+          compiles++
+          // Two metadata-only failures, then a real semantic repair cycle.
+          return {
+            status: 'completed',
+            validatedGraph: graph,
+            output: { graph, traceability: compiles <= 2 ? bad : good, taskSpec: `attempt ${compiles}` },
+          }
+        }
+        reviews++
+        return { status: 'completed', output: reviews === 1
+          ? rejectedReview('Control flow needs one real repair.', 'control_flow')
+          : review }
+      },
+    }
+
+    const result = await distillLoopGraph({ projectDir: root, requirement: 'requirements.md' }, {
+      // Design allowance is 1 + 2 semantic repairs; the two metadata failures
+      // must be paid for from their own pool, leaving the semantic repair intact.
+      executor, catalog: createDefaultGraphRuntimeCatalog(), maxAttempts: 1,
+    })
+
+    expect(result.semanticReview.accepted).toBe(true)
+    // a1,a2 metadata → a3 reviewed+rejected → a4 reviewed+accepted.
+    expect(phases).toEqual(['architect', 'compiler', 'compiler', 'compiler', 'semantic_review', 'compiler', 'semantic_review'])
+  })
+
   it('reserves compact metadata recovery when a graph freezes at the attempt boundary', async () => {
     const root = await mkdtemp(join(tmpdir(), 'distill-late-frozen-recovery-'))
     roots.push(root)

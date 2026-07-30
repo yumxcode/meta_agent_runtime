@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap'
   at: string
   message: string
 }
@@ -32,6 +32,9 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintDeadNullInputs(spec, findings)
   lintPrecomputedRouting(spec, findings)
   lintDuplicateRouteConditions(spec, findings)
+  lintShadowedRoutes(spec, findings)
+  lintTerminalRouteShadowing(spec, findings)
+  lintRoutePartitionGaps(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
   lintDeadLiteralRoutes(spec, findings)
   lintUnboundedWaits(spec, findings)
@@ -196,6 +199,353 @@ function lintDuplicateRouteConditions(spec: LoopGraphSpec, findings: GraphLintFi
   }
 }
 
+/**
+ * Deterministic routing analysis over one `from`+`on` group.
+ *
+ * Nearly every semantic rejection observed in real Distill runs lived in a
+ * single node's out-edge set: a source-mandated bound whose edge was outranked
+ * by a looping edge, a terminal that no reachable predicate could select, or a
+ * truth-table partition that silently fell through to a `default` whose updates
+ * meant the opposite. ABI Validate only guarantees "every outcome has an edge
+ * and at most one default", so a `default` makes any group look covered. These
+ * rules move the decidable part of that review into code, where it lands on the
+ * first attempt instead of the fourth — and, unlike the sampling reviewer, lands
+ * every time.
+ */
+interface RouteAtom { ref: string; op: string; value: string }
+type RouteExpr =
+  | { kind: 'or'; parts: RouteExpr[] }
+  | { kind: 'and'; parts: RouteExpr[] }
+  | { kind: 'atom'; atom: RouteAtom }
+
+const ROUTE_ATOM_RE = /^(\$[A-Za-z_][A-Za-z0-9_.]*)\s*(==|!=|>=|<=|>|<)\s*('[^']*'|"[^"]*"|-?\d+(?:\.\d+)?|true|false|null)/
+
+/** Restricted grammar: refs compared to literals, joined by && / || with
+ * parentheses. Anything else returns undefined and the caller skips the group —
+ * these rules only speak when they fully understand every condition. */
+function parseRouteExpression(source: string): RouteExpr | undefined {
+  let index = 0
+  const skip = (): void => { while (index < source.length && /\s/.test(source[index]!)) index++ }
+  const eat = (token: string): boolean => {
+    skip()
+    if (!source.startsWith(token, index)) return false
+    index += token.length
+    return true
+  }
+  const parseFactor = (): RouteExpr | undefined => {
+    skip()
+    if (eat('(')) {
+      const inner = parseOr()
+      return inner && eat(')') ? inner : undefined
+    }
+    const match = ROUTE_ATOM_RE.exec(source.slice(index))
+    if (!match) return undefined
+    index += match[0]!.length
+    return { kind: 'atom', atom: { ref: match[1]!, op: match[2]!, value: unquoteRouteLiteral(match[3]!) } }
+  }
+  const parseAnd = (): RouteExpr | undefined => {
+    const parts: RouteExpr[] = []
+    for (;;) {
+      const part = parseFactor()
+      if (!part) return undefined
+      parts.push(part)
+      if (!eat('&&')) break
+    }
+    return parts.length === 1 ? parts[0] : { kind: 'and', parts }
+  }
+  const parseOr = (): RouteExpr | undefined => {
+    const parts: RouteExpr[] = []
+    for (;;) {
+      const part = parseAnd()
+      if (!part) return undefined
+      parts.push(part)
+      if (!eat('||')) break
+    }
+    return parts.length === 1 ? parts[0] : { kind: 'or', parts }
+  }
+  const expr = parseOr()
+  skip()
+  return expr && index === source.length ? expr : undefined
+}
+
+function unquoteRouteLiteral(raw: string): string {
+  return /^['"]/.test(raw) ? raw.slice(1, -1) : raw
+}
+
+function evaluateRouteExpression(expr: RouteExpr, env: ReadonlyMap<string, string>): boolean {
+  if (expr.kind === 'or') return expr.parts.some(part => evaluateRouteExpression(part, env))
+  if (expr.kind === 'and') return expr.parts.every(part => evaluateRouteExpression(part, env))
+  const actual = env.get(expr.atom.ref)
+  // A missing ref is treated as non-matching, mirroring Kernel `when` semantics.
+  return actual === undefined ? false : compareRouteValue(actual, expr.atom.op, expr.atom.value)
+}
+
+function compareRouteValue(actual: string, op: string, expected: string): boolean {
+  const left = Number(actual), right = Number(expected)
+  const numeric = Number.isFinite(left) && Number.isFinite(right)
+  switch (op) {
+    case '==': return actual === expected
+    case '!=': return actual !== expected
+    case '>=': return numeric && left >= right
+    case '<=': return numeric && left <= right
+    case '>': return numeric && left > right
+    case '<': return numeric && left < right
+    default: return false
+  }
+}
+
+function routeAtomsOf(expr: RouteExpr, output: RouteAtom[] = []): RouteAtom[] {
+  if (expr.kind === 'atom') output.push(expr.atom)
+  else for (const part of expr.parts) routeAtomsOf(part, output)
+  return output
+}
+
+/** Conditional edges of one from+on group, in descending priority. */
+function conditionalRouteGroup(spec: LoopGraphSpec, from: string, on: string): LoopGraphSpec['transitions'] {
+  return (spec.transitions ?? [])
+    .filter(transition => transition.from === from && (transition.on ?? 'success') === on
+      && typeof transition.when === 'string' && transition.when.trim() && transition.default !== true)
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0))
+}
+
+function routeGroupKeys(spec: LoopGraphSpec): Array<{ from: string; on: string }> {
+  const keys = new Map<string, { from: string; on: string }>()
+  for (const transition of spec.transitions ?? []) {
+    const on = transition.on ?? 'success'
+    keys.set(`${transition.from}\0${on}`, { from: transition.from, on })
+  }
+  return [...keys.values()]
+}
+
+/** Normalized `&&` conjuncts, used for the exact implication test. */
+function conjunctsOf(when: string): string[] {
+  return when.split('&&')
+    .map(part => part.trim().replace(/^\((.*)\)$/s, '$1').trim().replace(/\s+/g, ' '))
+    .filter(Boolean)
+}
+
+/**
+ * Exact shadowing: if every conjunct of a higher-priority edge also appears in a
+ * lower-priority edge, the lower one implies the higher one, so the higher one
+ * always wins and the lower edge is dead. Pure conjunct-set containment, no
+ * inference — a hit is certain, which is why it blocks.
+ */
+function lintShadowedRoutes(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const { from, on } of routeGroupKeys(spec)) {
+    const group = conditionalRouteGroup(spec, from, on)
+    for (let lower = 0; lower < group.length; lower++) {
+      const weak = group[lower]!
+      const weakConjuncts = new Set(conjunctsOf(weak.when!))
+      for (let higher = 0; higher < lower; higher++) {
+        const strong = group[higher]!
+        const strongConjuncts = conjunctsOf(strong.when!)
+        if (!strongConjuncts.length || !strongConjuncts.every(conjunct => weakConjuncts.has(conjunct))) continue
+        findings.push({
+          level: 'error', rule: 'shadowed-route', at: `transitions '${weak.id}'.when`,
+          message: `every condition of higher-priority transition '${strong.id}' (priority ${strong.priority ?? 0}) also appears in this one (priority ${weak.priority ?? 0}), so whenever this edge matches '${strong.id}' matches too and wins — this route can never fire; either raise this edge above '${strong.id}', or add the condition that distinguishes them (commonly the negation of what '${strong.id}' handles)`,
+        })
+        break
+      }
+    }
+  }
+}
+
+/** Reachable-value candidates for one ref, derived from the constants the group
+ * compares it against. Numeric refs get each cut point and its neighbours;
+ * enumerated refs get their literals plus one value outside the set. */
+function routeValueDomain(atoms: readonly RouteAtom[]): string[] | undefined {
+  const numeric = atoms.filter(atom => Number.isFinite(Number(atom.value)))
+  const literal = atoms.filter(atom => !Number.isFinite(Number(atom.value)))
+  if (numeric.length && literal.length) return undefined // mixed use: not modellable
+  if (numeric.length) {
+    const values = new Set<number>([0])
+    for (const atom of numeric) {
+      const cut = Number(atom.value)
+      values.add(cut - 1); values.add(cut); values.add(cut + 1)
+    }
+    return [...values].filter(value => value >= -1).sort((a, b) => a - b).slice(0, 6).map(String)
+  }
+  const values = [...new Set(literal.map(atom => atom.value))]
+  // A boolean ref always has exactly two values, whichever one the conditions
+  // happen to mention — modelling it as the single mentioned literal would
+  // collapse the space and hide the partitions where it takes the other value.
+  if (values.every(value => value === 'true' || value === 'false')) return ['true', 'false']
+  // Deliberately NO sentinel for "some other enum value". Adding one invents
+  // partitions the design never distinguishes (a status the group simply leaves
+  // to the default), and on a healthy graph those invented rows were the only
+  // thing this rule reported — pure noise in the reviewer's must-verify list.
+  // Enumerating exactly the values the conditions themselves distinguish keeps
+  // a finding meaningful: some combination of cases the design DOES separate is
+  // claimed by nobody.
+  return values.slice(0, 6)
+}
+
+const MAX_PARTITION_REFS = 10
+const MAX_PARTITION_COMBOS = 50_000
+const MIN_CONDITIONAL_EDGES_FOR_PARTITION_CHECK = 4
+const MAX_REPORTED_PARTITIONS = 6
+/**
+ * Speak only when the uncovered pocket is small enough to enumerate exhaustively.
+ * That single gate is what separates a real truth-table hole from the ordinary
+ * "a few specific conditions over a broad default" style: on a graph that passed
+ * review 378 partitions legitimately fell through to a "keep iterating" default,
+ * while the graph whose recovery branch was genuinely mis-routed had a pocket of
+ * ~18. A ratio test looked equivalent but is not — one missing cell in a small
+ * table is a large fraction of it — so the bound is absolute, and the finding
+ * then lists every gap instead of asking anyone to hand-verify hundreds of rows.
+ */
+const MAX_PARTITION_GAPS = 24
+
+/**
+ * Enumerate the group's truth table over the constants its own conditions use,
+ * and report the partitions that no conditional edge claims. Falling through to
+ * `default` is legal, so this is advisory — but it is exactly the information a
+ * reviewer needs and repeatedly failed to derive by hand: in one run a partition
+ * meaning "improved, with new findings, after a long stall" fell into a default
+ * whose updates incremented the stall counter and escalated to a stop.
+ */
+function lintRoutePartitionGaps(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  for (const { from, on } of routeGroupKeys(spec)) {
+    const group = conditionalRouteGroup(spec, from, on)
+    if (group.length < MIN_CONDITIONAL_EDGES_FOR_PARTITION_CHECK) continue
+    const fallback = (spec.transitions ?? []).find(transition =>
+      transition.from === from && (transition.on ?? 'success') === on && transition.default === true)
+    if (!fallback) continue
+
+    const parsed: RouteExpr[] = []
+    for (const transition of group) {
+      const expr = parseRouteExpression(transition.when!)
+      if (!expr) { parsed.length = 0; break }
+      parsed.push(expr)
+    }
+    if (!parsed.length) continue
+
+    const byRef = new Map<string, RouteAtom[]>()
+    for (const expr of parsed) for (const atom of routeAtomsOf(expr)) {
+      byRef.set(atom.ref, [...(byRef.get(atom.ref) ?? []), atom])
+    }
+    if (!byRef.size || byRef.size > MAX_PARTITION_REFS) continue
+    const domains: Array<{ ref: string; values: string[] }> = []
+    let combos = 1
+    for (const [ref, atoms] of byRef) {
+      const values = routeValueDomain(atoms)
+      if (!values?.length) { combos = Number.POSITIVE_INFINITY; break }
+      domains.push({ ref, values })
+      combos *= values.length
+    }
+    if (!Number.isFinite(combos) || combos > MAX_PARTITION_COMBOS) continue
+
+    const gaps: string[] = []
+    let total = 0
+    const walk = (position: number, env: Map<string, string>): void => {
+      if (position === domains.length) {
+        total++
+        if (parsed.some(expr => evaluateRouteExpression(expr, env))) return
+        if (gaps.length < MAX_REPORTED_PARTITIONS) {
+          gaps.push([...env].map(([ref, value]) => `${ref}=${value}`).join(', '))
+        } else gaps.push('')
+        return
+      }
+      const { ref, values } = domains[position]!
+      for (const value of values) {
+        env.set(ref, value)
+        walk(position + 1, env)
+      }
+      env.delete(ref)
+    }
+    walk(0, new Map())
+    const examples = gaps.filter(Boolean)
+    if (!examples.length || gaps.length > MAX_PARTITION_GAPS) continue
+    findings.push({
+      level: 'warning', rule: 'route-partition-gap', at: `transitions from '${from}' on '${on}'`,
+      message: `only ${gaps.length} of ${total} enumerated partitions match no conditional edge, so these edges nearly tile their own value space and that small pocket falls through to default '${fallback.id}': ${examples.map(example => `{${example}}`).join(' ; ')}${gaps.length > examples.length ? ` (+${gaps.length - examples.length} more)` : ''}. Falling through is legal, so verify '${fallback.id}'.updates and target are right for each — a partition needing different updates (a counter reset instead of an increment, a different terminal) needs its own Transition`,
+    })
+  }
+}
+
+/** Provable mutual exclusion between two atoms over the same ref. Used only to
+ * SUPPRESS a warning, so an inconclusive answer is the safe default. */
+function provablyExclusiveAtoms(a: RouteAtom, b: RouteAtom): boolean {
+  if (a.ref !== b.ref) return false
+  if (a.op === '==' && b.op === '==') return a.value !== b.value
+  if (a.op === '==' && b.op === '!=' || a.op === '!=' && b.op === '==') return a.value === b.value
+  const left = Number(a.value), right = Number(b.value)
+  if (!Number.isFinite(left) || !Number.isFinite(right)) return false
+  // Strictness is tracked as a flag, never as an epsilon: at magnitudes above 1
+  // `value - Number.EPSILON` rounds straight back to `value`, which silently
+  // turned "< 20" and ">= 20" into an unproven overlap.
+  interface Interval { lo: number; loOpen: boolean; hi: number; hiOpen: boolean }
+  const bound = (atom: RouteAtom, value: number): Interval | undefined => {
+    switch (atom.op) {
+      case '>=': return { lo: value, loOpen: false, hi: Number.POSITIVE_INFINITY, hiOpen: true }
+      case '>': return { lo: value, loOpen: true, hi: Number.POSITIVE_INFINITY, hiOpen: true }
+      case '<=': return { lo: Number.NEGATIVE_INFINITY, loOpen: true, hi: value, hiOpen: false }
+      case '<': return { lo: Number.NEGATIVE_INFINITY, loOpen: true, hi: value, hiOpen: true }
+      case '==': return { lo: value, loOpen: false, hi: value, hiOpen: false }
+      default: return undefined
+    }
+  }
+  const first = bound(a, left), second = bound(b, right)
+  if (!first || !second) return false
+  const disjoint = (low: Interval, high: Interval): boolean =>
+    low.hi < high.lo || (low.hi === high.lo && (low.hiOpen || high.loOpen))
+  return disjoint(first, second) || disjoint(second, first)
+}
+
+/** Pure conjunction of atoms, or undefined when the condition contains an `||`
+ * we cannot reason about. */
+function conjunctAtomsOf(expr: RouteExpr): RouteAtom[] | undefined {
+  if (expr.kind === 'atom') return [expr.atom]
+  if (expr.kind === 'or') return undefined
+  const atoms: RouteAtom[] = []
+  for (const part of expr.parts) {
+    const inner = conjunctAtomsOf(part)
+    if (!inner) return undefined
+    atoms.push(...inner)
+  }
+  return atoms
+}
+
+/**
+ * A bound the source mandates ("stop after N rounds", "escalate at N stalls") is
+ * only enforced if its edge actually wins when the threshold is met. When a
+ * higher-priority edge continues the loop and the two conditions are not
+ * provably exclusive, the bound is unenforceable in the overlap — the exact
+ * defect behind two `missing-source-bound` / unreachable-terminal rejections.
+ * Proving exclusion is only partly decidable, so an unproven overlap is a
+ * warning for the reviewer rather than a block.
+ */
+function lintTerminalRouteShadowing(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const isTerminal = (transition: LoopGraphSpec['transitions'][number]): boolean =>
+    targetNodeIds(transition.to).some(nodeId => spec.nodes?.[nodeId]?.type === 'terminal')
+  for (const { from, on } of routeGroupKeys(spec)) {
+    const group = conditionalRouteGroup(spec, from, on)
+    for (let lower = 0; lower < group.length; lower++) {
+      const bound = group[lower]!
+      if (!isTerminal(bound)) continue
+      const boundExpr = parseRouteExpression(bound.when!)
+      const boundAtoms = boundExpr && conjunctAtomsOf(boundExpr)
+      // Only guard bounds expressed as a threshold on persistent State — that is
+      // what a source-mandated limit looks like, and it keeps this narrow.
+      if (!boundAtoms?.some(atom => atom.ref.startsWith('$state.') && Number.isFinite(Number(atom.value)))) continue
+      for (let higher = 0; higher < lower; higher++) {
+        const looping = group[higher]!
+        if (isTerminal(looping)) continue
+        const loopingExpr = parseRouteExpression(looping.when!)
+        const loopingAtoms = loopingExpr && conjunctAtomsOf(loopingExpr)
+        if (!loopingAtoms) continue
+        const exclusive = boundAtoms.some(a => loopingAtoms.some(b => provablyExclusiveAtoms(a, b)))
+        if (exclusive) continue
+        findings.push({
+          level: 'warning', rule: 'terminal-route-shadowed', at: `transitions '${bound.id}'.when`,
+          message: `this edge routes to a Terminal on a $state threshold, but higher-priority transition '${looping.id}' (priority ${looping.priority ?? 0} vs ${bound.priority ?? 0}) continues the loop and its condition is not provably exclusive with this one — in the overlap the loop wins and the bound never takes effect; either raise this edge above '${looping.id}', or add the mutually exclusive guard (e.g. the complementary threshold) to '${looping.id}'`,
+        })
+        break
+      }
+    }
+  }
+}
+
 const ABSOLUTE_PATH_RE = /(?:^|[\s"'`(=])(?:\/(?:Users|home|root|srv|Volumes)\/|~\/)/
 const WRITE_VERB_RE = /\b(edit|write|modify|update|commit|push|clone|create|save|append)\b|编辑|修改|写入|提交|推送/i
 const OUTSIDE_PROJECT_RE = /outside\s+(?:of\s+)?(?:this|the)\s+project|项目之?外/i
@@ -237,13 +587,13 @@ function lintAgentWorkspacePrompts(spec: LoopGraphSpec, findings: GraphLintFindi
       if (denied) {
         findings.push({
           level: 'error', rule: 'prompt-writes-denied-path', at,
-          message: `prompt instructs this Agent to write '${target}', but lane '${node.lane}' explicitly denies that path${owner ? ` and lane '${owner}' owns it` : ''}; a deny is an ownership boundary the design chose on purpose, not a missing declaration — delete the instruction from this prompt and let ${owner ? `the node on lane '${owner}'` : 'the owning node'} perform the write. Do NOT add a write rule to this lane: that installs a second writer on one path`,
+          message: `prompt instructs this Agent to write '${target}', but lane '${node.lane}' explicitly denies that path${owner ? ` and lane '${owner}' owns it` : ''}; a deny is an ownership boundary the design chose on purpose, not a missing declaration — delete the instruction from this prompt and let ${owner ? `the node on lane '${owner}'` : 'the owning node'} perform the write. Do NOT add a write rule to this lane: that installs a second writer on one path. Note the Kernel already injects this lane's workspace contract (read/write/deny plus mode semantics) into every Activation prompt, so the Agent does not need a hand-written path list — describe the persistence responsibility instead of enumerating paths`,
         })
         continue
       }
       findings.push({
         level: 'error', rule: 'undeclared-workspace-write', at,
-        message: `prompt explicitly writes '${target}', but lane '${node.lane}' does not declare a covering workspace.write rule; either add the write rule when this node genuinely owns the path, or delete the instruction and leave the write to ${owner ? `the node on lane '${owner}', which already owns that path` : 'the node that owns the path'}`,
+        message: `prompt explicitly writes '${target}', but lane '${node.lane}' does not declare a covering workspace.write rule; either add the write rule when this node genuinely owns the path, or delete the instruction and leave the write to ${owner ? `the node on lane '${owner}', which already owns that path` : 'the node that owns the path'}. The Kernel injects this lane's workspace contract into every Activation prompt, so a hand-written path list in the prose is a second, non-authoritative copy — prefer describing the persistence responsibility and let lane.workspace be the single source of truth for the write surface`,
       })
     }
     if (GIT_MUTATION_RE.test(text)) {

@@ -240,6 +240,64 @@ export const GRAPH_DISTILL_PHASE_POLICY: Record<GraphDistillPhase, {
 const MAX_LOCAL_SEMANTIC_REPAIRS = 2
 const MAX_LATE_COMPILER_RECOVERIES = 1
 
+/**
+ * Review metadata (traceability pointers, preconditions) gets its own allowance.
+ *
+ * The attempt counter used to charge every failure the same price, but a wrong
+ * JSON pointer and a 40KB graph redesign are not the same work: the host still
+ * holds the frozen, ABI-valid, lint-clean graph and the fix is a handful of
+ * numbers. Measured across real runs, roughly a fifth of all compiler attempts
+ * were consumed by metadata alone — budget that never reached the design. These
+ * repairs are therefore granted on top of the design allowance rather than out
+ * of it.
+ */
+const MAX_METADATA_ONLY_REPAIRS = 2
+
+/** How many past semantic rounds to keep in front of the Compiler. Bounded so a
+ * long repair chain cannot grow the prompt without limit; findings are also
+ * deduplicated, so a recurring one costs nothing. */
+const MAX_ACCUMULATED_SEMANTIC_ROUNDS = 4
+
+/**
+ * Carry every still-binding semantic finding, not just the newest round.
+ *
+ * The reviewer reports a handful of findings per round rather than enumerating
+ * the whole constraint set, so a graph converges over several rounds. Replacing
+ * the previous round's feedback made that convergence impossible whenever two
+ * findings constrain the same mechanism: one run was told a counter reset made a
+ * terminal unreachable, removed the reset, and was then told the source mandates
+ * that reset — each verdict correct, jointly satisfiable, but never visible at
+ * the same time. With all rounds in view the Compiler can look for the design
+ * that satisfies them together instead of alternating between two horns.
+ */
+function formatAccumulatedSemanticErrors(
+  history: readonly { attempt: number; issues: readonly string[] }[],
+  lintWarnings: readonly string[],
+): string[] {
+  const rounds = history.slice(-MAX_ACCUMULATED_SEMANTIC_ROUNDS)
+  const latest = rounds[rounds.length - 1]
+  const seen = new Set<string>()
+  const carried: string[] = []
+  // Oldest first, so the newest findings sit closest to the instruction that
+  // follows them in the prompt.
+  for (const round of rounds) {
+    for (const issue of round.issues) {
+      if (seen.has(issue)) continue
+      seen.add(issue)
+      carried.push(round === latest
+        ? `semantic review: ${issue}`
+        : `semantic review: [compiler attempt ${round.attempt} 提出，未被撤销，仍须满足] ${issue}`)
+    }
+  }
+  return [
+    ...carried,
+    ...(rounds.length > 1
+      ? ['semantic review: 【累积约束】以上是本次 Distill 多轮独立复核的全部未撤销 finding，每一条都仍然有效。已经修好的不要改回去。若两条看起来互相冲突（例如一条指出某个计数重置使终态不可达、另一条指出来源强制要求该重置），那是要求你找到同时满足两者的设计，而不是在两者之间来回切换：通常保留来源强制的语义不动，改阈值、优先级，或补一条缺失的分支让另一条也成立。若你确信两条在来源语义下真的无法共存，在 taskSpec 中写明理由与取舍，不要静默丢弃其中一条。']
+      : []),
+    ...lintWarnings.map(warning => `semantic review context: ${warning}`),
+  ]
+}
+
 export type GraphDistillProgressEvent =
   | { type: 'checkpoint_resumed'; phase: 'architect' }
   | { type: 'phase_started'; phase: GraphDistillPhase; attempt: number; maxAttempts: number }
@@ -382,6 +440,11 @@ async function compileLoopGraph(
   // attempt that was granted to fix it.
   let mechanicalErrors: string[] = []
   let semanticErrors: string[] = []
+  // Every semantic rejection in this revision, oldest first. The reviewer
+  // samples a few findings per round rather than enumerating all of them, so
+  // the constraint set is revealed incrementally and earlier findings stay
+  // binding even after the candidate changes.
+  const semanticHistory: Array<{ attempt: number; issues: string[] }> = []
   const combinedErrors = (): string[] => [...semanticErrors, ...mechanicalErrors]
   let compilerDraft: {
     graph: LoopGraphSpec
@@ -395,9 +458,11 @@ async function compileLoopGraph(
   // rejection then reserves its own bounded local-repair calls dynamically;
   // otherwise late mechanical retries can consume the advertised allowance.
   let compilerAttemptLimit = maxAttempts + MAX_LOCAL_SEMANTIC_REPAIRS
-  const compilerAttemptCeiling = compilerAttemptLimit + MAX_LOCAL_SEMANTIC_REPAIRS + MAX_LATE_COMPILER_RECOVERIES
+  const compilerAttemptCeiling = compilerAttemptLimit + MAX_LOCAL_SEMANTIC_REPAIRS
+    + MAX_LATE_COMPILER_RECOVERIES + MAX_METADATA_ONLY_REPAIRS
   let localSemanticRepairs = 0
   let lateCompilerRecoveries = 0
+  let metadataOnlyRepairs = 0
   for (let attempt = 1; attempt <= compilerAttemptLimit; attempt++) {
     throwIfDistillAborted(signal, 'compiler')
     deps.onProgress?.({ type: 'phase_started', phase: 'compiler', attempt, maxAttempts: compilerAttemptLimit })
@@ -415,8 +480,15 @@ async function compileLoopGraph(
       sessionKey: 'distill-compiler',
       taskDescription: [
         '【本阶段任务：Compiler / Lowering】',
-        '把已经确认的约束台账与轻量 Blueprint lower 为唯一现行 Graph ABI。Blueprint 不是第二套 Graph DSL；你可自由选择节点、Lane、Workspace 合同和路由 ID，但不得重新解释、删除或弱化 hard constraint。只输出 {graph,traceability,taskSpec}。',
+        '把已经确认的约束台账与轻量 Blueprint lower 为唯一现行 Graph ABI。Blueprint 不是第二套 Graph DSL；你可自由选择节点、Lane、Workspace 合同和路由 ID，但不得重新解释、删除或弱化 hard constraint。Graph 经 graph_validate 交付，最终文本只回 {traceability,preconditions,taskSpec}。',
         formatDistillSourceIdentity(source),
+        // The host must state which side currently holds the graph. Leaving this
+        // implicit is what produced a metadata-only deadlock: the model's
+        // persistent session still showed a graph it had frozen, while the host
+        // had discarded that draft after a blocking diagnostic.
+        validatedGraphDraft
+          ? '【宿主持图状态】宿主当前持有上一轮 graph_validate 冻结的完整 Graph。'
+          : '【宿主持图状态】宿主当前**不持有**任何 Graph（首次 lowering，或上一版因阻断级诊断被作废）。本轮必须让 graph_validate 重新返回 valid=true && frozen=true，否则你的 metadata 无处可合并。',
         ...(combinedErrors().length ? ['【上一轮 Compiler/Reviewer 诊断】', formatGraphValidationFeedback(combinedErrors(), compilerDraft?.graph)] : []),
         ...(metadataOnlyTurn ? [
           '【已冻结 Graph：宿主保留，不要重复输出】',
@@ -425,13 +497,13 @@ async function compileLoopGraph(
         ] : compilerDraft ? [
           '【上一版完整候选（局部修复锚点）】',
           JSON.stringify(compilerDraft),
-          '保留未被诊断否定的拓扑、命名和合同；只修改诊断涉及的可执行字段及其 traceability/preconditions。最终仍返回完整对象，不要返回 patch。',
+          '保留未被诊断否定的拓扑、命名和合同；只修改诊断涉及的可执行字段及其 traceability/preconditions。修图请用 graph_patch_validate 局部 set/remove 后重新验证；最终文本回答仍然只回 {traceability,preconditions,taskSpec}，不要把整张图抄进来。',
         ] : []),
         '【约束台账】', JSON.stringify(architecture.constraints),
         '【Loop Blueprint】', JSON.stringify(architecture.design),
         metadataOnlyTurn
           ? '【立即执行】不要输出分析、Graph、Markdown 或调用工具；只返回上面指定的 metadata JSON。'
-          : '【立即执行】以上合同已完整。不要输出分析、设计过程、字段清单或 Markdown；下一步必须直接调用 graph_validate，参数必须是完整且最小的 graph（不是 skeleton）。若验证失败，只按 errors、repairHints 和 patchSelectors 调用 graph_patch_validate 做局部 set/remove；Transition 必须按 @id=稳定ID 定位，禁止数字下标、整图重发或重建。验证通过后立即返回最终 JSON。来源中的命名阶段默认映射到厚 Agent 内部步骤或 Transition+Reducer，不为阶段名称创建 Function。若存在唯一文件 writer：工作 Agent 的出边直接用 current>=T-1 等条件同时更新 next counter/status 后进入 writer，writer 再按 $state 路由；bootstrap/error/report/pivot 提交都复用该 writer，不得增加 identity/status gate 或第二写者。',
+          : '【立即执行】以上合同已完整。不要输出分析、设计过程、字段清单或 Markdown；下一步必须直接调用 graph_validate，参数必须是完整且最小的 graph（不是 skeleton）。若验证失败，只按 errors、repairHints 和 patchSelectors 调用 graph_patch_validate 做局部 set/remove；Transition 必须按 @id=稳定ID 定位，禁止数字下标、整图重发或重建。验证通过（valid=true && frozen=true）后，最终 JSON 只回 {"traceability":…,"preconditions":…,"taskSpec":…}——**不要把 graph 再抄进文本回答**，宿主已从工具调用取得它；把几十 KB 的图重新序列化一遍只会引入引号/逗号损坏，让整份回答报废。来源中的命名阶段默认映射到厚 Agent 内部步骤或 Transition+Reducer，不为阶段名称创建 Function。若存在唯一文件 writer：工作 Agent 的出边直接用 current>=T-1 等条件同时更新 next counter/status 后进入 writer，writer 再按 $state 路由；bootstrap/error/report/pivot 提交都复用该 writer，不得增加 identity/status gate 或第二写者。',
       ].join('\n\n'),
       systemPrompt: compilerSystemPrompt,
       allowedTools: ['ask_user', 'graph_reference', 'graph_validate', 'graph_patch_validate'],
@@ -544,13 +616,13 @@ async function compileLoopGraph(
           await deps.trace?.artifact(`${reviewTag}.json`, JSON.stringify(semanticReview, null, 2))
           await deps.trace?.artifact(`${reviewTag}.md`, renderSemanticReviewMarkdown(semanticReview))
           if (!semanticReview.accepted) {
-            const reviewIssues = semanticReview.issues.length
-              ? semanticReview.issues.map(issue => `semantic review: ${issue}`)
-              : ['semantic review rejected the graph without details']
-            semanticErrors = [
-              ...reviewIssues,
-              ...lintWarnings.map(warning => `semantic review context: ${warning}`),
-            ]
+            semanticHistory.push({
+              attempt,
+              issues: semanticReview.issues.length
+                ? [...semanticReview.issues]
+                : ['semantic review rejected the graph without details'],
+            })
+            semanticErrors = formatAccumulatedSemanticErrors(semanticHistory, lintWarnings)
             // The rejected candidate itself was mechanically clean; whatever
             // mechanical diagnostics preceded it are resolved and must not
             // dilute the semantic feedback on the next attempt.
@@ -624,15 +696,27 @@ async function compileLoopGraph(
       // itself remains acceptable. ABI or blocking graph lint needs a real
       // patch on the next Compiler attempt.
       validatedGraphDraft = undefined
-      // A frozen candidate can spend the ordinary retries on envelope and
-      // traceability recovery before host lint finally sees it. Preserve one
-      // bounded full-graph repair when that first executable diagnostic lands
-      // at the current boundary; otherwise the actionable feedback is emitted
-      // only as the fatal error and can never be applied.
-      if (attempt >= compilerAttemptLimit && lateCompilerRecoveries < MAX_LATE_COMPILER_RECOVERIES) {
-        lateCompilerRecoveries++
-        compilerAttemptLimit = Math.min(compilerAttemptCeiling, attempt + 1)
-      }
+    }
+    // A failure that is purely review metadata does not spend design budget:
+    // the executable graph is still frozen and acceptable, and only a few
+    // pointers or precondition entries are wrong.
+    if (!executableRepairRequired && metadataOnlyRepairs < MAX_METADATA_ONLY_REPAIRS) {
+      metadataOnlyRepairs++
+      compilerAttemptLimit = Math.min(compilerAttemptCeiling, compilerAttemptLimit + 1)
+    }
+    // Preserve one bounded repair when the first actionable diagnostic lands at
+    // the current boundary; otherwise that feedback is emitted only as the fatal
+    // error and can never be applied.
+    //
+    // This deliberately covers a metadata-only failure too. Gating the reserve
+    // on executableRepairRequired inverted the priority: a wrong traceability
+    // pointer is the CHEAPEST boundary failure to repair — the host still holds
+    // the frozen, ABI-valid, lint-clean graph and only a few numbers are wrong —
+    // yet it was the one class denied a retry. One run died on four
+    // out-of-range array indices with every semantic finding already addressed.
+    if (attempt >= compilerAttemptLimit && lateCompilerRecoveries < MAX_LATE_COMPILER_RECOVERIES) {
+      lateCompilerRecoveries++
+      compilerAttemptLimit = Math.min(compilerAttemptCeiling, attempt + 1)
     }
     mechanicalErrors = errors
     deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
@@ -863,14 +947,29 @@ function foldMetadataDiagnostics(errors: readonly string[]): string[] {
   ]
 }
 
-/** The host knows the exact id→pointer mapping the compiler keeps getting
- * wrong, so hand it over instead of repeating the rule. */
+/**
+ * The host knows everything the compiler keeps getting wrong about Transition
+ * pointers — the legal index range, the id of every edge, and which edges carry
+ * no `when` — so hand it all over instead of restating the rule. Observed
+ * failures: 1-based off-by-one past the end of the array, and `/transitions/N/when`
+ * aimed at a default edge that has no `when` field at all.
+ */
 function transitionPointerMap(graph: LoopGraphSpec | undefined): string {
   const transitions = graph?.transitions
   if (!Array.isArray(transitions) || !transitions.length) return ''
   const entries = transitions.map((transition, index) => `${typeof transition?.id === 'string' ? transition.id : `#${index}`}→/transitions/${index}`)
   const shown = entries.slice(0, 80)
-  return ` 上一版完整候选中的 id→pointer 映射：${shown.join('、')}${entries.length > shown.length ? `（其余按数组顺序继续编号）` : ''}。若你改动了 transitions 数组的顺序或增删，请按最终图重新编号。`
+  const withoutWhen = transitions
+    .map((transition, index) => (typeof transition?.when === 'string' && transition.when.trim() ? undefined : index))
+    .filter((index): index is number => index !== undefined)
+  return [
+    ` 上一版完整候选共 ${transitions.length} 条 Transition，合法下标是 0..${transitions.length - 1}（不存在 /transitions/${transitions.length}，下标从 0 开始不是从 1 开始）。`,
+    withoutWhen.length
+      ? `下列下标是 default 或无条件边，本身没有 when 字段，引用它们的 /when 一定判为不存在：${withoutWhen.map(index => `/transitions/${index}`).join('、')}——要指认这些边请直接指向 /transitions/N 或其 /updates、/to。`
+      : '',
+    `id→pointer 映射：${shown.join('、')}${entries.length > shown.length ? '（其余按数组顺序继续编号）' : ''}。`,
+    '若你改动了 transitions 数组的顺序或增删，请按最终图重新编号。',
+  ].filter(Boolean).join('')
 }
 
 /** Turn low-level validator diagnostics into local, ABI-aware repair guidance.
@@ -887,6 +986,8 @@ export function formatGraphValidationFeedback(errors: readonly string[], graph?:
   ]
   if (/graphRefs '[^']*@id=/.test(joined)) {
     hints.add(`traceability.graphRefs 必须是标准 JSON pointer，Transition 用数值下标 /transitions/N。'@id=' 只是 graph_patch_validate 的补丁选择器语法，写进 graphRefs 一律被判为不存在的指针。${transitionPointerMap(graph)}`)
+  } else if (/graphRefs '\/transitions\/[^']*' does not exist/.test(joined)) {
+    hints.add(`失效的 graphRefs 指向 Transition：逐条按下面的事实核对，不要凭记忆编号。${transitionPointerMap(graph)}`)
   }
   if (/state\.[^.]+\.(minimum|maximum|properties|required|enum|minLength|minItems) is not part|state\.[^.]+\.type must be a ShapeSpec object/.test(joined)) {
     hints.add('StateVariableSpec 与 ShapeSpec 是两层：state.x={"type":{"type":"integer","minimum":0},"initial":0}；minimum/properties 等只能放在内层 ShapeSpec。')
@@ -914,6 +1015,9 @@ export function formatGraphValidationFeedback(errors: readonly string[], graph?:
   }
   if (/undeclared-workspace-write/.test(joined)) {
     hints.add('prompt 写入了本 Lane 未授权的路径。先判断该节点是否真的应当拥有这条路径：是则补 Lane.workspace.write 规则；否则删除该指令，交给已拥有该路径的节点写入。另外，write_file/append_file 会自动创建获准文件的缺失父目录，prompt 里"创建 xxx/ 目录"这类句子通常是多余样板——直接删掉即可，不要为它扩大写权限。')
+  }
+  if (/prompt-writes-denied-path|undeclared-workspace-write/.test(joined)) {
+    hints.add('根治办法：不要在 node.prompt 里枚举可写路径。Kernel 每次 Activation 都会把该 Lane 的 workspace 合同（read/write/deny 及各 mode 语义）作为独立 contract 段注入 Agent prompt，Agent 一定看得到权威清单。prompt 只写持久化职责（"把本轮产出连同证据引用落盘"、"以 append 语义追加运行记录"），需要时按角色引用 Lane 合同中的条目，不要重复一份非权威的路径清单——这类诊断反复出现，正是因为同一事实被写了两遍。')
   }
   if (/dead-null-input/.test(joined)) {
     hints.add('某输入在所有入边上都被绑定为 {"literal":null}，消费节点永远只能收到 null——这切断了来源要求的数据流。修复是接通链路而不是删除诊断：让至少一条入边引用真实的 $output/$state 字段（生产者 outputSchema 需声明该字段，途经的中间节点逐跳透传），或将该值持久化到 State/Workspace 文件后由消费者读取；若该输入确实无人需要，连同节点内对它的引用一并删除。')
@@ -982,9 +1086,13 @@ ${JSON.stringify(loopBlueprintShapeExample(), null, 2)}
 export function buildGraphDistillerSystem(_catalog: GraphRuntimeCatalog): string {
   return `你是 durable-graph-v2 的前台 Distill Compiler。你只负责把已确认的 Constraint Ledger 与简明 Loop Blueprint lower 为最终 LoopGraphSpec；不要执行用户任务，也不要创造第二套中间图 DSL。
 
-【输出】
-最终只输出一个 JSON 对象：
-{"graph":<完整 LoopGraphSpec>,"traceability":{"schemaVersion":"${GRAPH_TRACEABILITY_SCHEMA}","mappings":[{"constraintId":"C1","graphRefs":["/nodes/example"],"rationale":"如何满足约束"}]},"preconditions":{"schemaVersion":"${LOOP_PRECONDITIONS_SCHEMA}","items":[{"kind":"file|directory|command|credential|decision","target":"路径/命令/凭据/决策id","reason":"为何必须在启动前就绪","blocking":true}]},"taskSpec":"供人审阅的关键 lowering 决策、假设、能力缺口和运行前配置"}
+【输出：Graph 与 metadata 走两条不同通道】
+Graph **只通过 graph_validate 工具调用交付**。该调用的参数是结构化的，一旦返回 valid=true 且 frozen=true，宿主就已完整持有这张图。因此你的最终文本回答**不要再包含 graph**：
+
+{"traceability":{"schemaVersion":"${GRAPH_TRACEABILITY_SCHEMA}","mappings":[{"constraintId":"C1","graphRefs":["/nodes/example"],"rationale":"如何满足约束"}]},"preconditions":{"schemaVersion":"${LOOP_PRECONDITIONS_SCHEMA}","items":[{"kind":"file|directory|command|credential|decision","target":"路径/命令/凭据/决策id","reason":"为何必须在启动前就绪","blocking":true}]},"taskSpec":"供人审阅的关键 lowering 决策、假设、能力缺口和运行前配置"}
+
+把几十 KB 的 Graph 再抄进文本信封只会带来一类纯粹的损失：长 JSON 的序列化损坏（多一个引号、少一个逗号）会让整份回答无法解析，而图本身明明已经安全抵达。所以规则是——**先用 graph_validate 冻结图，再只回上面这个小对象**。
+唯一例外：如果本轮你还没有让 graph_validate 返回 valid=true && frozen=true，那宿主手里没有图，此时必须回 {"graph":<完整 LoopGraphSpec>,"traceability":…,"preconditions":…,"taskSpec":…}。宿主会在诊断里明确告诉你它是否持有图。
 不要输出 Markdown fence、解释前缀、patch 或 Freeze-owned 字段。
 
 preconditions 是机器可校验的启动合同：列出 loop 自身不会创建、但首个 Activation 就依赖的文件与目录（例如需求方要先写好的 spec 文件）、必须已安装的外部 CLI、必须已配置的凭据，以及 Ledger 中所有 unresolved 或被默认代答的决策。loop create 会机械校验 file/directory 是否存在，并在 blocking 决策未确认时拒绝启动。由 loop 首轮自建的文件不要列入。没有前置条件时输出 {"schemaVersion":"${LOOP_PRECONDITIONS_SCHEMA}","items":[]}。
@@ -994,7 +1102,7 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
 3. 不要凭记忆猜 ABI。先调用 graph_reference(example)，再只按实际缺口调用 overview、nodes、workspace、lanes、control、capabilities；不要一次加载全部 section，也不要用不完整 skeleton 试探 graph_validate。
 4. 默认从“一条 Lane、一个长生命周期 Agent、done/failed 业务终态”开始，只添加 Ledger 明确要求的边界；需要作者处理节点预算耗尽时再增加 exhausted 终态/边。不要把自然语言步骤、Agent 内部工作阶段或每个文件操作逐项翻译成 Node。优先让同一个 persistent Agent 通过 mode/input 承担常规轮次、反思与策略转向；只有独立持久提交、权限/并发边界、Kernel Wait/Event、失败隔离和终态才拆节点。
-5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
+5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON——此时最终 JSON 里**不要再放 graph**（见【输出】）。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
 
 【稳定语义边界】
 - Agent 直接读写真实项目 Workspace。Lane.workspace 声明 read、write、deny；write mode 只有 owned、atomic_replace、append_only。Kernel 不复制、不投影、不保存第二份用户数据。
@@ -1025,7 +1133,9 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - graph_reference(capabilities) 返回的是 Create 与 Runtime 共用的唯一 graph_agent Tool Catalog；不要加入当前 Compiler 会话有、运行时没有的工具。
 - Agent 运行时不会自动收到 Graph annotations。Agent 需要的值必须写入 node.prompt/systemInstructions/inputs，或位于 Lane 可读的项目文件中。
 - write_file 与 append_file 会自动创建获准文件的缺失父目录。逐文件 atomic_replace/append_only 初始化时直接写/追加目标文件即可，无需额外建目录，也不要为建父目录把精确模式扩大成 owned。因此 prompt 里"首轮创建 xxx/ 目录"这类句子是多余样板，写进去只会与 Lane 合同冲突。
-- prompt 与 Lane 合同必须自洽：Agent prompt 中每条写入指令的目标，都要落在该节点所在 Lane 的 workspace.write 覆盖范围内，且不得命中该 Lane 的 deny。写完每个 Agent 的 prompt 后逐条比对它所在 Lane 的 write/deny 再输出。单写者设计下，工作 Agent 的 prompt 只描述"产出哪些待持久化数据"，具体落盘动作只出现在 writer 的 prompt 里；不要把同一段初始化职责同时写进多个节点的 prompt。
+- **不要在 Agent prompt 里枚举可写路径或目录。** Kernel 每次 Activation 都会把该节点所在 Lane 的 workspace 合同（read/write/deny 及每种 mode 的含义）作为独立 contract 段注入 Agent 的 prompt，Agent 一定看得到权威清单。你在 node.prompt 里再手抄一份，只会制造第二份非权威、且没有任何东西执行的副本——它一旦与 Lane 合同不一致就是缺陷（沙箱按 Lane 合同放行，散文说了不算）。写面的唯一事实源是 lane.workspace。
+- 因此 node.prompt 只描述**持久化职责**："把本轮产出连同其证据引用落盘"、"以 append 语义追加本轮的运行记录"、"原子替换状态快照"，并可按角色引用 Lane 合同中的条目（"追加到你 Lane 合同里那条 append_only 规则所指的日志"）。不要写"创建 xxx/ 目录"、"写入 a/b.json"这类路径清单。需要读取的文件路径可以出现（read 不受 write/deny 约束），但不要写成祈使式的写入句。
+- 单写者设计下，工作 Agent 的 prompt 只描述"产出哪些待持久化数据"，落盘职责只出现在 writer 的 prompt 里；不要把同一段初始化职责同时写进多个节点的 prompt。
 - 保留来源的确定性语义类别：来源区分三种以上结果时，让 Agent 原样输出该多态枚举，不要压成布尔，也不要用布尔反转代替缺失的那一态——丢掉一态就等于丢掉一条路由。
 - 来源的复合条件按真值表逐分区枚举互斥 Transition，不要用 OR 把不同量级的条件连起来。典型形状：复合条件成立才递增计数器，不成立的分支同时 set 计数器归零与派生状态；多个阈值分支从严到宽排列，且全部先受同一个复合条件约束。任何一个分区没有对应 Transition，就是一条不可达路径。
 - 若某分支会重置计数器，检查更高的阈值分支是否仍可达：先触发的低阈值 reset 会让高阈值永远达不到。这类阈值要么与 reset 分支互斥，要么改用不被重置的累计量。

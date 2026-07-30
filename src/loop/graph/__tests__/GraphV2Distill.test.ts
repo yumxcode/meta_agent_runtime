@@ -240,6 +240,15 @@ describe('graph-v2 Distill contract', () => {
     // bound inexpressible; state the consequence, not just the preference.
     expect(compiler).toContain('lifetimeBudget.elapsedMs')
     expect(compiler).toContain('State 中声明的每个字段')
+    // Graph travels via graph_validate's structured argument; the text envelope
+    // carries metadata only, so a long-JSON serialization slip cannot discard a
+    // graph that already arrived.
+    expect(compiler).toContain('Graph **只通过 graph_validate 工具调用交付**')
+    expect(compiler).toContain('最终文本回答**不要再包含 graph**')
+    // The write surface has one source of truth: the Kernel already injects the
+    // lane workspace contract into every Activation prompt.
+    expect(compiler).toContain('不要在 Agent prompt 里枚举可写路径或目录')
+    expect(compiler).toContain('写面的唯一事实源是 lane.workspace')
     // Domain templates leaked one project's vocabulary into a
     // supposedly domain-neutral compiler, and its literal thresholds were wrong
     // for every other source. They must not come back.
@@ -304,6 +313,32 @@ describe('graph-v2 Distill contract', () => {
     expect(withBlocking).toContain('条审阅元数据诊断已折叠')
     expect(withBlocking).toContain('先修复上面的可执行缺陷')
     expect(withBlocking.indexOf('undeclared-workspace-write')).toBeLessThan(withBlocking.indexOf('traceability.mappings'))
+  })
+
+  // Numeric pointers fail the same way for two reasons the host can state
+  // exactly: 1-based off-by-one past the end of the array, and /when aimed at a
+  // default edge that has no `when` field. One run lost its last attempt to
+  // four such errors with every semantic finding already addressed.
+  it('states the legal index range and the when-less edges for failing numeric pointers', () => {
+    const errors = [
+      "traceability.mappings[9].graphRefs '/transitions/3' does not exist in the Graph",
+      "traceability.mappings[9].graphRefs '/transitions/1/when' does not exist in the Graph",
+    ]
+    const feedback = formatGraphValidationFeedback(errors, CANONICAL_GRAPH_DISTILL_EXAMPLE)
+    // 3 transitions → legal 0..2, and /transitions/3 must be called out as absent.
+    expect(feedback).toContain('合法下标是 0..2')
+    expect(feedback).toContain('不存在 /transitions/3')
+    expect(feedback).toContain('下标从 0 开始不是从 1 开始')
+    // continue_work (1) and work_failed (2) carry no `when`.
+    expect(feedback).toContain('/transitions/1、/transitions/2')
+    expect(feedback).toContain('没有 when 字段')
+    expect(feedback).toContain('goal_reached→/transitions/0')
+    // The @id= selector rule is a different mistake and must not be mixed in.
+    expect(feedback).not.toContain('graph_patch_validate 的补丁选择器语法')
+
+    // Without a candidate graph there is nothing to enumerate, but the feedback
+    // must not fabricate a range.
+    expect(formatGraphValidationFeedback(errors)).not.toContain('合法下标是')
   })
 
   it('returns an exact repair hint for unquoted enum literals', async () => {
