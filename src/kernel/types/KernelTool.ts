@@ -51,7 +51,18 @@ export interface KernelToolResult {
   newMessages?: KernelMessage[]
   /** Optional context modifier applied after this tool runs */
   contextModifier?: (ctx: KernelToolContext) => KernelToolContext
+  /** Optional control-flow request consumed mechanically by KernelLoop. */
+  control?: KernelToolControl
 }
+
+export interface KernelParkControl {
+  kind: 'park'
+  afterMs: number
+  reason: string
+  checkpoint?: Record<string, unknown>
+}
+
+export type KernelToolControl = KernelParkControl
 
 export type ContentBlockLike =
   | { type: 'text'; text: string }

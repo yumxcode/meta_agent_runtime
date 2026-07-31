@@ -189,6 +189,7 @@ export function toKernelTool(
       return {
         data: result.content,
         isError: result.isError,
+        control: result.control,
       }
     },
 

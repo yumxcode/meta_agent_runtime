@@ -7,7 +7,7 @@
  *   - Non-safe tools → individual batches, run serially
  *   - contextModifiers applied: serially after each tool; concurrently after batch
  */
-import type { KernelTool, KernelToolContext } from '../types/KernelTool.js'
+import type { KernelTool, KernelToolContext, KernelToolControl } from '../types/KernelTool.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
@@ -79,6 +79,7 @@ export interface RunToolsResult {
   extraMessages: KernelMessage[]
   permissionDenials: PermissionDenial[]
   finalContext: KernelToolContext
+  control?: KernelToolControl
 }
 
 /**
@@ -102,7 +103,9 @@ export async function runTools(
   const permissionDenials: PermissionDenial[] = []
   let currentContext = context
 
-  for (const batch of batches) {
+  let control: KernelToolControl | undefined
+
+  batchLoop: for (const batch of batches) {
     if (batch.isConcurrencySafe) {
       // ── Parallel batch ─────────────────────────────────────────────────────
       // Limit concurrency
@@ -122,6 +125,7 @@ export async function runTools(
         for (const result of results) {
           orderedResults.set(result.toolUseId, result)
           if (result.permissionDenial) permissionDenials.push(result.permissionDenial)
+          control ??= result.control
         }
 
         // Apply context modifiers in original request order
@@ -131,6 +135,7 @@ export async function runTools(
             currentContext = result.contextModifier(currentContext)
           }
         }
+        if (control) break batchLoop
       }
     } else {
       // ── Serial batch ──────────────────────────────────────────────────────
@@ -143,7 +148,31 @@ export async function runTools(
         if (result.contextModifier) {
           currentContext = result.contextModifier(currentContext)
         }
+        if (result.control) {
+          control = result.control
+          break batchLoop
+        }
       }
+    }
+  }
+
+  // Preserve the provider's tool_use/tool_result pairing invariant even though
+  // a control-flow tool stopped execution part-way through the model's batch.
+  // Skipped calls are explicit errors in history; they were never executed.
+  if (control) {
+    for (const req of requests) {
+      if (orderedResults.has(req.toolUseId)) continue
+      orderedResults.set(req.toolUseId, {
+        toolUseId: req.toolUseId,
+        toolName: req.toolName,
+        resultMessage: makeToolResultMessage(
+          req.toolUseId,
+          'Skipped: the session was parked by an earlier self_timer call.',
+          true,
+          req.assistantMessageUuid,
+        ),
+        extraMessages: [],
+      })
     }
   }
 
@@ -159,7 +188,13 @@ export async function runTools(
     }
   }
 
-  return { toolResultMessages, extraMessages, permissionDenials, finalContext: currentContext }
+  return {
+    toolResultMessages,
+    extraMessages,
+    permissionDenials,
+    finalContext: currentContext,
+    ...(control ? { control } : {}),
+  }
 }
 
 // ── yieldMissingToolResultBlocks ─────────────────────────────────────────────

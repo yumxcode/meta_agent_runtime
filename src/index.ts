@@ -21,11 +21,37 @@ export type {
   MetaAgentTool,
   ToolCallContext,
   ToolResult,
+  ToolControl,
+  ToolParkControl,
   TokenUsage,
   EngineeringDomain,
   ConversationMessage,
 } from './core/types.js'
 export { EMPTY_USAGE, accumulateUsage } from './core/types.js'
+export {
+  AutoContinuationStore,
+  autoContinuationClaimOwner,
+} from './core/auto/AutoContinuationStore.js'
+export type {
+  AutoContinuationRecord,
+  AutoContinuationRuntime,
+  AutoContinuationScheduleOptions,
+  AutoContinuationStatus,
+  AutoContinuationStoreOptions,
+} from './core/auto/AutoContinuationStore.js'
+export { AutoScheduler } from './core/auto/AutoScheduler.js'
+export type {
+  AutoSchedulerOptions,
+  AutoResumeHandler,
+  AutoResumeOutcome,
+} from './core/auto/AutoScheduler.js'
+export { AttachedAutoScheduler } from './core/auto/AttachedAutoScheduler.js'
+export type {
+  AttachedAutoResumeHandler,
+  AttachedAutoResumeResult,
+  AttachedAutoRunOutcome,
+  AttachedAutoSchedulerOptions,
+} from './core/auto/AttachedAutoScheduler.js'
 
 // ── Async job system ──────────────────────────────────────────────────────────
 export type {

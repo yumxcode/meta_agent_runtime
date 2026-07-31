@@ -31,6 +31,7 @@ import type { AgentMode } from '../core/dynamicPrompt.js'
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { AutoCheckpointCoordinator } from '../core/auto/AutoCheckpointCoordinator.js'
 import { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
+import { createSelfTimerTool } from '../core/auto/SelfTimerTool.js'
 import { FlashClient } from '../core/flash/FlashClient.js'
 import { defaultRoleCatalog } from '../core/roles/index.js'
 import {
@@ -103,8 +104,9 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     ? readAutoCheckpoint(projectDir, resumeSessionId)
     : null
   const autoBudgetUsd = baseConfig.maxBudgetUsd
+  const resumedCostUsd = resumeCheckpoint?.estimatedCostUsd ?? 0
   const costLedger = !budgetManagedExternally && hasAutonomyJail && typeof autoBudgetUsd === 'number' && Number.isFinite(autoBudgetUsd)
-    ? new AutoCostLedger(autoBudgetUsd)
+    ? new AutoCostLedger(autoBudgetUsd, resumedCostUsd)
     : null
 
   // Lazy dispatcher facade — the bridge is created after the session below, so
@@ -210,6 +212,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
       : undefined,
     initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
     initialCheckpointRevision: resumeCheckpoint?.revision ?? 0,
+    initialCostUsd: resumedCostUsd,
   })
   sessionIdForRoles = session.getSessionId()
 
@@ -269,6 +272,17 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // (async) + status/cancel/list controls.
   session.registerTool(await createRunAgentTool(bridge))
   for (const tool of makeSubAgentTools(bridge)) session.registerTool(tool)
+  if (wantsGates) {
+    session.registerTool(createSelfTimerTool({
+      getOutstandingSubAgents: () => {
+        const stats = bridge.getSchedulerStats()
+        return {
+          runningIds: stats.activeTaskIds,
+          queued: stats.queued,
+        }
+      },
+    }))
+  }
   // Completion/failure notifications flow into the volatile prefix.
   session.setSubAgentBridge(bridge)
 

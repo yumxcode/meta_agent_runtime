@@ -82,7 +82,7 @@ export function translateKernelEvent(
         subtype,
         sessionId: state.sessionId,
         result: event.resultText,
-        isError: subtype !== 'success',
+        isError: subtype !== 'success' && subtype !== 'parked',
         durationMs,
         numTurns: state.turnCount,
         stopReason: event.stopReason,
@@ -90,6 +90,7 @@ export function translateKernelEvent(
         usage: kernelUsageToMetaAgentUsage(event.usage),
         ...(event.errors?.length ? { errors: event.errors } : {}),
         ...(event.failure ? { failure: event.failure } : {}),
+        ...(event.parkRequest ? { parkRequest: event.parkRequest } : {}),
       }]
     }
 
@@ -123,10 +124,11 @@ export function translateKernelEvent(
   }
 }
 
-type MetaResultSubtype = 'success' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
+type MetaResultSubtype = 'success' | 'parked' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
 
 function mapResultSubtype(subtype: string): MetaResultSubtype {
   if (subtype === 'success')           return 'success'
+  if (subtype === 'parked')            return 'parked'
   if (subtype === 'error_max_turns')   return 'error_max_turns'
   if (subtype === 'error_max_budget_usd') return 'error_max_budget'
   if (subtype === 'error_max_output_tokens') return 'error_max_output_tokens'

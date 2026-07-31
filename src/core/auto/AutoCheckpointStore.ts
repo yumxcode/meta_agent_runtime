@@ -59,6 +59,17 @@ export interface AutoCheckpoint {
   estimatedCostUsd?: number
   /** Why the run stopped, when known (e.g. 'max_budget_usd', 'max_turns'). */
   stopReason?: string
+  /**
+   * Durable park context for the next scheduler-driven resume. null means a
+   * previously armed wake has been consumed/cleared.
+   */
+  pendingWake?: {
+    wakeId: string
+    requestedAt: number
+    fireAt: number
+    reason: string
+    checkpoint?: Record<string, unknown>
+  } | null
   // ── Run-health counters (monotonic, deterministic) ────────────────────────
   // Lifecycle signals the drift gate uses to judge run TRAJECTORY, not just the
   // current state: repeated corrections with no progress = stalling; a recent
@@ -137,6 +148,12 @@ export function buildAutoResumePreamble(cp: AutoCheckpoint | null): string | nul
     lines.push(`上次在途的子代理：${cp.activeSubAgentIds.join(', ')}`)
   }
   if (cp.stopReason) lines.push(`上次停止原因：${cp.stopReason}`)
+  if (cp.pendingWake) {
+    lines.push(`定时恢复原因：${cp.pendingWake.reason}`)
+    if (cp.pendingWake.checkpoint) {
+      lines.push(`定时恢复 checkpoint：${JSON.stringify(cp.pendingWake.checkpoint)}`)
+    }
+  }
   if (lines.length === 0) return null
   return (
     '[系统·会话恢复] 这是一次被恢复的自动(auto)会话。以下是上次中断时的进度快照，' +
@@ -272,6 +289,7 @@ export async function updateAutoCheckpointWithStatus(
     turnCount: maxDefined(prior?.turnCount, patch.turnCount),
     estimatedCostUsd: patch.estimatedCostUsd ?? prior?.estimatedCostUsd,
     stopReason: patch.stopReason ?? prior?.stopReason,
+    pendingWake: patch.pendingWake !== undefined ? patch.pendingWake : prior?.pendingWake,
     // Run-health counters use latest-wins, not max: the coordinator always writes
     // its absolute current value (so they climb monotonically during a task), and
     // a re-anchor deliberately resets them to 0 for the new goal — which max would

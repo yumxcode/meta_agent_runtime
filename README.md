@@ -138,6 +138,12 @@ meta-agent --mode auto "把构建跑绿,修掉所有失败用例"      # 或 --y
 # 轻量无人值守(同款工作区监狱,但不启用 checkpoint/drift/verify,适合简单短任务)
 meta-agent --mode simple_auto "把 README 里的死链接都修掉"
 
+# plain auto 的持久定时恢复调度器（一个 workspace 一个常驻进程）
+meta-agent -w /path/to/project auto-scheduler
+
+# attached：原命令窗口等待，到期后仍在原窗口继续输出
+meta-agent -w /path/to/project --mode auto --attached "持续检查任务，必要时用 self_timer 等待"
+
 # 长周期多 Agent Loop（从需求文档生成可审核的执行图）
 meta-agent loop distill requirements.md
 
@@ -150,7 +156,9 @@ meta-agent --resume last "继续"
 meta-agent --json "检查项目结构"
 ```
 
-CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-b/--base-url`、`--model`、`--fallback-model`、`-t/--max-turns`、`--max-budget-usd`、`-r/--resume`、`--session-dir <dir>`(单次 prompt 运行时把会话历史持久化到该目录,便于后续 `--resume`)、`-y/--yes`、`-d/--debug`、`--show-thinking`、`-j/--json`。交互期内 `Ctrl+G` 注入修正(在下一步边界引导模型,不打断生成),`Ctrl+C` 中断当前轮。运行 `meta-agent --help` 查看全部交互命令(`/team`、`/experience`、`/principle`、`/anchor`、`/memory`、`/sessions`、`/compact` 等)。
+`auto` 中的 `self_timer` 是持久化 park，不是让 Agent 进程内 `sleep`：CLI 先保存完整会话与 checkpoint，再写 wake。默认命令随后退出，由 `auto-scheduler` 到期恢复同一 session/goal；加 `--attached` 时，原 CLI 只保留轻量宿主并续租 wake，到期后在原窗口恢复输出。`simple_auto` 不暴露该工具。机制与部署说明见 [Auto Scheduler](docs/auto-scheduler.md)。
+
+CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-b/--base-url`、`--model`、`--fallback-model`、`-t/--max-turns`、`--max-budget-usd`、`-r/--resume`、`--session-dir <dir>`(单次 prompt 运行时把会话历史持久化到该目录,便于后续 `--resume`)、`--attached`(仅 one-shot plain auto)、`-y/--yes`、`-d/--debug`、`--show-thinking`、`-j/--json`。交互期内 `Ctrl+G` 注入修正(在下一步边界引导模型,不打断生成),`Ctrl+C` 中断当前轮。运行 `meta-agent --help` 查看全部交互命令(`/team`、`/experience`、`/principle`、`/anchor`、`/memory`、`/sessions`、`/compact` 等)。
 
 ---
 

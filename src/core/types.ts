@@ -48,7 +48,7 @@ export interface MetaAgentToolResultEvent {
 /** Terminal success result for the full turn */
 export interface MetaAgentResultEvent {
   type: 'result'
-  subtype: 'success' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
+  subtype: 'success' | 'parked' | 'error_max_turns' | 'error_max_budget' | 'error_max_output_tokens' | 'error_during_execution'
   sessionId: string
   result: string
   isError: boolean
@@ -61,6 +61,8 @@ export interface MetaAgentResultEvent {
   errors?: string[]
   /** Structured failure classification retained across orchestration layers. */
   failure?: ExecutionFailure
+  /** Durable suspension requested by self_timer. */
+  parkRequest?: ToolParkControl
 }
 
 /** API-level stream events (pass-through for advanced consumers) */
@@ -198,7 +200,22 @@ export interface ToolCallContext {
 export interface ToolResult {
   content: string
   isError: boolean
+  /**
+   * Optional host control signal. A successful park is a durable suspension,
+   * not task completion: the kernel commits this tool result, stops the current
+   * run, and lets the host persist/arm the continuation before exiting.
+   */
+  control?: ToolControl
 }
+
+export interface ToolParkControl {
+  kind: 'park'
+  afterMs: number
+  reason: string
+  checkpoint?: Record<string, unknown>
+}
+
+export type ToolControl = ToolParkControl
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Tool description context — passed to dynamic description functions

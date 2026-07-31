@@ -182,6 +182,9 @@ export interface KernelConfig {
   /** Maximum cumulative USD budget across this session's lifetime */
   maxBudgetUsd?: number
 
+  /** Resume seed for cumulative spend from a prior durable process segment. */
+  initialCostUsd?: number
+
   /** Report this kernel's cumulative main-agent spend to an outer ledger. */
   onMainCostUsd?: (costUsd: number) => void
 

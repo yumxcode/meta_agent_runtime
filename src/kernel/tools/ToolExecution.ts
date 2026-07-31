@@ -2,7 +2,7 @@
  * ToolExecution — execute a single tool call and produce a tool_result message.
  * Mirrors CC's toolExecution.ts.
  */
-import type { KernelTool, KernelToolContext } from '../types/KernelTool.js'
+import type { KernelTool, KernelToolContext, KernelToolControl } from '../types/KernelTool.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
@@ -79,6 +79,7 @@ export interface ToolCallResult {
   extraMessages: KernelMessage[]
   permissionDenial?: PermissionDenial
   contextModifier?: (ctx: KernelToolContext) => KernelToolContext
+  control?: KernelToolControl
 }
 
 /**
@@ -273,6 +274,7 @@ export async function executeToolCall(
       resultMessage,
       extraMessages: result.newMessages ?? [],
       contextModifier: result.contextModifier,
+      control: result.control,
     }
   } catch (error: unknown) {
     const errorMsg =

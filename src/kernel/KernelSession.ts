@@ -203,6 +203,10 @@ export class KernelSession {
 
   constructor(config: KernelConfig) {
     this._config = { ...config }
+    this._totalCostUsd =
+      Number.isFinite(config.initialCostUsd) && (config.initialCostUsd ?? 0) > 0
+        ? config.initialCostUsd!
+        : 0
     this._messages = [...(config.initialMessages ?? [])]
     // Resume path: recover the goal from the earliest real user messages in
     // the restored history (best available source; pre-compact history is gone).
@@ -585,6 +589,7 @@ export class KernelSession {
       type Subtype = ResultEvent['subtype']
         const subtypeMap: Record<LoopTerminationReason, Subtype> = {
           success:           'success',
+          parked:            'parked',
           max_turns:         'error_max_turns',
           no_progress:       'error_during_execution',
           blocking_limit:    'error_blocking_limit',
@@ -608,7 +613,7 @@ export class KernelSession {
       }
 
       const subtype = subtypeMap[loopResult.reason]
-      const failure = subtype === 'success'
+      const failure = subtype === 'success' || subtype === 'parked'
         ? undefined
         : classifyExecutionFailure({
             subtype,
@@ -630,6 +635,7 @@ export class KernelSession {
         stopReason: loopResult.reason === 'success' ? null : loopResult.reason,
         resultText: loopResult.resultText,
         permissionDenials: loopResult.permissionDenials,
+        ...(loopResult.parkRequest ? { parkRequest: loopResult.parkRequest } : {}),
         ...(failure ? { failure } : {}),
       }
     }

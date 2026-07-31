@@ -34,6 +34,16 @@ describe('AutoCostLedger', () => {
     })
   })
 
+  it('seeds committed spend when a durable Auto segment resumes', () => {
+    const ledger = new AutoCostLedger(10, 7.5)
+    expect(ledger.getBreakdown()).toMatchObject({
+      mainCostUsd: 7.5,
+      committedCostUsd: 7.5,
+      remainingBudgetUsd: 2.5,
+    })
+    expect(ledger.tryReserveTask('too-large', 3)).toBe(false)
+  })
+
   it('gives direct autonomous-session construction the same finite default', () => {
     expect(resolveConfig({ apiKey: 'test', promptMode: 'auto' }).maxBudgetUsd).toBe(20)
     expect(resolveConfig({ apiKey: 'test', promptMode: 'auto', maxBudgetUsd: 7 }).maxBudgetUsd).toBe(7)

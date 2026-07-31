@@ -20,6 +20,7 @@ import type { VerifyVerdict } from './VerifyGate.js'
 import { DRIFT_TURN_INTERVAL, buildDriftCorrectionPrompt } from './DriftGate.js'
 import type { DriftVerdict } from './DriftGate.js'
 import type { KernelToolContext } from '../types/KernelTool.js'
+import type { KernelParkControl } from '../types/KernelTool.js'
 import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
 import { initialLoopState, type LoopState } from './LoopState.js'
@@ -72,6 +73,7 @@ import type {
 
 export type LoopTerminationReason =
   | 'success'
+  | 'parked'
   | 'max_turns'
   | 'no_progress'
   | 'blocking_limit'
@@ -105,6 +107,8 @@ export interface LoopResult {
   checkpointRevision: number
   lastDriftToolBatchCount: number
   lastDriftCheckpointRevision: number
+  /** Present only when reason === 'parked'. */
+  parkRequest?: KernelParkControl
 }
 
 // ── Context passed in from KernelSession ─────────────────────────────────────
@@ -776,6 +780,8 @@ export async function* runKernelLoop(
     }
   }
 
+  let parkRequest: KernelParkControl | undefined
+
   function done(reason: LoopTerminationReason): LoopResult {
     if (autoRuntimeTimer) clearTimeout(autoRuntimeTimer)
     return {
@@ -793,6 +799,7 @@ export async function* runKernelLoop(
       checkpointRevision,
       lastDriftToolBatchCount,
       lastDriftCheckpointRevision,
+      ...(parkRequest ? { parkRequest } : {}),
     }
   }
 
@@ -1703,6 +1710,23 @@ export async function* runKernelLoop(
         successfulToolNames: durableProgressTools,
         mutatedPaths: mutatedPaths.length > 0 ? [...new Set(mutatedPaths)] : undefined,
       })
+    }
+
+    // A park is a first-class suspension boundary. It is checked only after all
+    // tool_result messages have been committed and the batch counter advanced,
+    // but before stall/drift/completion logic can reinterpret it as failure or
+    // success. KernelSession's termination boundary then flushes the checkpoint.
+    if (toolsResult.control?.kind === 'park') {
+      parkRequest = toolsResult.control
+      resultText =
+        `Auto session parked for ${toolsResult.control.afterMs}ms: ` +
+        toolsResult.control.reason
+      yield {
+        type: 'text_delta',
+        delta: `\n[auto] ${resultText}\n`,
+        sessionId,
+      }
+      return done('parked')
     }
 
     // ── Auto-mode stall circuit ──────────────────────────────────────────────

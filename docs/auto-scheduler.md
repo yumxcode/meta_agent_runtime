@@ -1,0 +1,74 @@
+# Auto Scheduler
+
+`auto + self_timer` uses durable suspension, not an in-process `sleep`.
+
+## Lifecycle
+
+1. A plain `auto` Agent calls `self_timer({ afterMs, reason, checkpoint? })`.
+2. The Kernel commits the timer's `tool_result`, skips later calls in the same
+   tool batch, flushes an Auto termination checkpoint, and returns `parked`.
+3. The CLI atomically persists the complete session history.
+4. Only after history is confirmed on disk does the CLI create a wake record at
+   `<workspace>/.meta-agent/auto/wakes/`.
+5. In the default detached mode, the current Auto process exits.
+6. One `auto-scheduler` process claims due wakes and resumes the same session
+   with the original goal, checkpoint, timer reason, and cumulative budget.
+
+With `--attached`, step 5 changes: the CLI atomically leases the new wake before
+publishing it, releases the model/router resources, and keeps only a lightweight
+host alive. It renews the lease while waiting, resumes in the same terminal at
+the deadline, and repeats if the Agent parks again.
+
+Start the workspace scheduler:
+
+```bash
+meta-agent -w /path/to/project auto-scheduler
+```
+
+Useful operator options:
+
+```bash
+meta-agent -w /path/to/project auto-scheduler \
+  --poll-ms 1000 \
+  --max-concurrent 1
+
+# Claim and run currently-due work once, then exit.
+meta-agent -w /path/to/project auto-scheduler --once
+```
+
+Keep one one-shot Auto run attached to its original terminal:
+
+```bash
+meta-agent -w /path/to/project --mode auto --attached \
+  "持续检查构建状态；等待期间使用 self_timer"
+```
+
+`--attached` is valid only for a one-shot plain `auto` prompt. It is not an
+interactive REPL and does not start a second daemon.
+
+Global provider flags belong before `auto-scheduler`. API keys are never written
+to wake files; provide them through the scheduler environment or global flags.
+
+## Guarantees
+
+- `self_timer` exists only in plain `auto`; `simple_auto` has no durable
+  checkpoint and does not expose it.
+- A timer is rejected while sub-agents are running or queued.
+- Pending timers coalesce per session.
+- Claims use a cross-process lock, owner token, TTL, heartbeat, and stale-claim
+  recovery.
+- Attached wake creation and initial claiming are one atomic store operation, so
+  a workspace daemon cannot steal the wake between park and wait.
+- `Ctrl+C` while attached releases the current lease back to `pending` and
+  returns to the shell. The durable wake can then be recovered by
+  `auto-scheduler`; a hard process crash is recovered after claim TTL expiry.
+- A wake is cancelled as stale if the persisted history count, workspace, mode,
+  or original goal no longer matches.
+- A scheduler failure requeues the wake with exponential backoff.
+- Cumulative spend is restored from the Auto checkpoint, so waking does not
+  reset the session budget.
+- Scheduler startup and idle polling are local filesystem operations; optional
+  MCP connections are opened only after a due wake passes stale-state checks.
+
+The scheduler is a long-lived host process (service, launchd/systemd unit, tmux,
+or foreground command), not one thread or process per timer.

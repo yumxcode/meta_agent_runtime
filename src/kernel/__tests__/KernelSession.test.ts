@@ -750,6 +750,63 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
   })
 })
 
+describe('KernelSession — durable park boundary', () => {
+  it('emits parked only after committing the timer result and termination checkpoint', async () => {
+    mockStream.mockImplementation(() =>
+      toolUseStream('timer-1', 'self_timer', {
+        afterMs: 5_000,
+        reason: 'wait for deploy',
+      }),
+    )
+    const boundaries: string[] = []
+    const timerTool: KernelTool = {
+      name: 'self_timer',
+      description: 'park',
+      abortSupport: 'bounded',
+      inputSchema: { safeParse: value => ({ success: true, data: value }) },
+      inputJSONSchema: { type: 'object' },
+      isConcurrencySafe: () => false,
+      call: async () => ({
+        data: 'park requested',
+        control: {
+          kind: 'park',
+          afterMs: 5_000,
+          reason: 'wait for deploy',
+          checkpoint: { deploymentId: 'dep-1' },
+        },
+      }),
+    }
+    const session = new KernelSession(makeConfig({
+      tools: [timerTool],
+      autonomousMode: true,
+      onCheckpointBoundary: async (event: { type: string }) => {
+        boundaries.push(event.type)
+        return { updated: true, revision: boundaries.length }
+      },
+    }))
+
+    const events = await collectEvents(session, 'deploy')
+    const toolResultIndex = events.findIndex(event => event.type === 'tool_result')
+    const resultIndex = events.findIndex(event => event.type === 'result')
+    const result = events[resultIndex]
+
+    expect(toolResultIndex).toBeGreaterThanOrEqual(0)
+    expect(resultIndex).toBeGreaterThan(toolResultIndex)
+    expect(result?.type).toBe('result')
+    if (result?.type === 'result') {
+      expect(result.subtype).toBe('parked')
+      expect(result.parkRequest).toEqual({
+        kind: 'park',
+        afterMs: 5_000,
+        reason: 'wait for deploy',
+        checkpoint: { deploymentId: 'dep-1' },
+      })
+    }
+    expect(boundaries.at(-1)).toBe('termination')
+    expect(mockStream).toHaveBeenCalledTimes(1)
+  })
+})
+
 describe('KernelSession — interrupt', () => {
   it('interrupt() can be called at any time without throwing', () => {
     const session = new KernelSession(makeConfig())

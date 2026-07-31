@@ -178,6 +178,12 @@ export class SessionRouter {
   private _autoCheckpointCoordinator: AutoCheckpointCoordinator | null = null
   /** Auto/simple_auto shared main + child cost ledger. */
   private _autoCostLedger: AutoCostLedger | null = null
+  /** One-shot context supplied by auto-scheduler for the next resume submit. */
+  private _scheduledAutoWake: {
+    wakeId: string
+    reason: string
+    checkpoint?: Record<string, unknown>
+  } | null = null
 
   constructor(config: MetaAgentConfig & RouterOptions = {}) {
     const { mode, debugMode, robot, explicitResume, resumeSessionId, onEscalationRequest, subAgentBudgetOwner, ...sessionConfig } = config
@@ -283,6 +289,18 @@ export class SessionRouter {
   }
 
   /**
+   * Attach scheduler-owned wake context without turning it into a new user
+   * goal. Consumed on the next explicit Auto continuation submit.
+   */
+  setScheduledAutoWake(context: {
+    wakeId: string
+    reason: string
+    checkpoint?: Record<string, unknown>
+  }): void {
+    this._scheduledAutoWake = context
+  }
+
+  /**
    * Submit a prompt. On the first call, the selected backend is created.
    * Subsequent calls reuse the same backend.
    */
@@ -323,10 +341,22 @@ export class SessionRouter {
           ? readAutoCheckpoint(this._cfg.projectDir ?? process.cwd(), this._resumeSessionId)
           : null
         const preamble = buildAutoResumePreamble(cp)
-        if (preamble) {
-          effectivePrompt = `${preamble}\n\n[本次用户输入]\n${prompt}`
+        const wakePreamble = this._scheduledAutoWake
+          ? [
+              '[系统·定时恢复]',
+              `wakeId：${this._scheduledAutoWake.wakeId}`,
+              `等待原因：${this._scheduledAutoWake.reason}`,
+              ...(this._scheduledAutoWake.checkpoint
+                ? [`checkpoint：${JSON.stringify(this._scheduledAutoWake.checkpoint)}`]
+                : []),
+              '请检查等待条件的当前状态，并从原目标继续；不要把这段系统恢复信息当成新目标。',
+            ].join('\n')
+          : null
+        if (preamble || wakePreamble) {
+          effectivePrompt = `${[preamble, wakePreamble].filter(Boolean).join('\n\n')}\n\n[本次用户输入]\n${prompt}`
           this._autoGoal = cp?.goal ?? null
         }
+        this._scheduledAutoWake = null
         if (this._autoGoal === null) this._autoGoal = prompt
       } else if (isFirstTurn) {
         // Fresh session OR resumed-with-a-NEW-requirement: the user's input is

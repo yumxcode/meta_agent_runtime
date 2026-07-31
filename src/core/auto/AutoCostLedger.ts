@@ -32,10 +32,11 @@ export class AutoCostLedger {
   private readonly settledTaskCosts = new Map<string, number>()
   private readonly reservedTaskBudgets = new Map<string, number>()
 
-  constructor(readonly budgetUsd: number) {
+  constructor(readonly budgetUsd: number, initialCommittedCostUsd = 0) {
     if (!Number.isFinite(budgetUsd) || budgetUsd <= 0) {
       throw new Error('AutoCostLedger requires a finite positive budget.')
     }
+    this.mainCostUsd = normalizedUsd(initialCommittedCostUsd)
   }
 
   recordMainCost(costUsd: number): void {

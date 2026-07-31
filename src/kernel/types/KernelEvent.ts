@@ -5,6 +5,7 @@
  */
 import type { TokenUsage } from './TokenUsage.js'
 import type { ExecutionFailure } from '../../infra/failures/ExecutionFailure.js'
+import type { KernelParkControl } from './KernelTool.js'
 
 // ── Individual event types ────────────────────────────────────────────────────
 
@@ -90,6 +91,7 @@ export interface SystemMessageEvent {
 
 export type ResultSubtype =
   | 'success'
+  | 'parked'
   | 'error_max_turns'
   | 'error_max_budget_usd'
   | 'error_max_output_tokens'
@@ -108,6 +110,7 @@ export interface ResultEvent {
   errors?: string[]
   failure?: ExecutionFailure
   permissionDenials?: PermissionDenial[]
+  parkRequest?: KernelParkControl
 }
 
 // ── Permission denial (mirrors CC's SDKPermissionDenial) ─────────────────────

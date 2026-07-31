@@ -16,6 +16,7 @@
   },
   "files": [
     "dist",
+    "docs/auto-scheduler.md",
     "!dist/**/__tests__/**",
     "!dist/**/__tests__",
     "!dist/core/auto_orch/**"

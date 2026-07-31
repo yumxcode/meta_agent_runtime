@@ -232,6 +232,9 @@ export interface MetaAgentConfig {
   /** Maximum USD cost before stopping. */
   maxBudgetUsd?: number
 
+  /** Internal resume seed for cumulative spend across durable Auto segments. */
+  initialCostUsd?: number
+
   /**
    * Internal auto-mode hook: reports the main kernel's cumulative cost to a
    * shared session ledger. Absent for ordinary agentic/campaign/robotics runs.
@@ -483,6 +486,7 @@ export type ResolvedConfig = Required<
     | 'onCheckpointBoundary'
     | 'initialToolBatchCount'
     | 'initialCheckpointRevision'
+    | 'initialCostUsd'
     | 'getExperienceRecallBlock'
     | 'initialMessages'
     | 'debugMode'
@@ -528,6 +532,7 @@ export type ResolvedConfig = Required<
   onCheckpointBoundary?: MetaAgentConfig['onCheckpointBoundary']
   initialToolBatchCount?: number
   initialCheckpointRevision?: number
+  initialCostUsd?: number
   /** Auto mode experience recall provider; absent → no recall injection. */
   getExperienceRecallBlock?: MetaAgentConfig['getExperienceRecallBlock']
   initialMessages?: MetaAgentConfig['initialMessages']
@@ -625,6 +630,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
         ? RuntimeEnv.autoSessionBudgetUsd()
         : Infinity
     ),
+    initialCostUsd: config.initialCostUsd,
     onMainCostUsd: config.onMainCostUsd,
     getAdditionalBudgetUsd: config.getAdditionalBudgetUsd,
     maxTokens: config.maxTokens ?? 131_072,

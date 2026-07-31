@@ -18,6 +18,7 @@
  *       --model <model>     Model override (default: auto-detected from provider)
  *   -s, --system <prompt>   Custom system prompt
  *       --session-dir <dir> Persist one-shot session history under this folder
+ *       --attached          Keep a one-shot Auto process attached across self_timer wakes
  *   -j, --json              Output raw JSON events (for piping)
  *   -y, --yes               Auto-approve sensitive tools in trusted scripts
  *       --auto-worktree-cleanup <preserve|safe|aggressive> Auto worktree cleanup policy
@@ -95,7 +96,17 @@ import type { SessionMode } from '../core/modes.js'
 import type { MetaAgentEvent, MetaAgentResultEvent } from '../core/types.js'
 import type { ConversationMessage } from '../core/types.js'
 import { createStandardTools } from '../tools/index.js'
-import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
+import {
+  readAutoCheckpoint,
+  updateAutoCheckpointWithStatus,
+} from '../core/auto/AutoCheckpointStore.js'
+import {
+  AutoContinuationStore,
+  autoContinuationClaimOwner,
+  type AutoContinuationRecord,
+} from '../core/auto/AutoContinuationStore.js'
+import { AutoScheduler } from '../core/auto/AutoScheduler.js'
+import { AttachedAutoScheduler } from '../core/auto/AttachedAutoScheduler.js'
 import { loadMcpConfig, buildMcpServerInstructions } from '../tools/mcp/index.js'
 import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
@@ -235,6 +246,7 @@ ${bold('OPTIONS')}
       --max-budget-usd <n>  Whole-session USD budget (auto/simple_auto default: 20)
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
       --session-dir <dir>  Persist one-shot session history under this folder
+      --attached         In one-shot auto, wait and resume self_timer in this terminal
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
       --show-thinking   Show model thinking deltas in the terminal
@@ -262,6 +274,14 @@ ${bold('LOOP RUNTIME (durable graph only)')}
   meta-agent loop-scheduler [options]      Run the loop daemon until idle (unattended driver)
       --poll-ms <n> --idle-exit-ms <n> --max-concurrent-graphs <n>
   (put global flags like -w <dir> BEFORE the loop token: meta-agent -w <dir> loop tick)
+
+${bold('AUTO SCHEDULER (plain auto self_timer)')}
+  meta-agent -w <dir> auto-scheduler       Resume due durable Auto sessions
+      --poll-ms <n> --max-concurrent <n> [--once]
+  meta-agent -w <dir> --mode auto --attached "goal"
+      Keep the original terminal attached across repeated self_timer wakes.
+  By default self_timer persists state and exits; --attached instead keeps
+  that terminal as the durable wake lease holder.
 
 ${bold('INTERACTIVE COMMANDS')}
   /mode                 Show current session mode
@@ -388,8 +408,9 @@ interface CliOptions {
   maxBudgetUsd: number | undefined // --max-budget-usd override; undefined → mode default
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
   sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
-  /** `loop <cmd>` / `loop-scheduler` (v2 loop runtime, L2). Args pass through verbatim. */
-  loopCommand: { name: 'loop' | 'loop-scheduler'; args: string[] } | null
+  attached: boolean               // --attached: keep one-shot auto in this terminal
+  /** Durable runtime subcommands. Args pass through verbatim. */
+  loopCommand: { name: 'loop' | 'loop-scheduler' | 'auto-scheduler'; args: string[] } | null
 }
 
 function parseCliArgs(): CliOptions {
@@ -398,10 +419,11 @@ function parseCliArgs(): CliOptions {
   // that the strict global parser would reject, so split them off up front.
   // Global flags (-w/-k/-b/--model) go BEFORE the `loop` token.
   const rawArgs = process.argv.slice(2)
-  const loopIdx = rawArgs.findIndex(a => a === 'loop' || a === 'loop-scheduler')
+  const loopIdx = rawArgs.findIndex(a =>
+    a === 'loop' || a === 'loop-scheduler' || a === 'auto-scheduler')
   if (loopIdx !== -1) {
     return buildLoopCliOptions(
-      rawArgs[loopIdx] as 'loop' | 'loop-scheduler',
+      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler',
       rawArgs.slice(0, loopIdx),
       rawArgs.slice(loopIdx + 1),
     )
@@ -424,6 +446,7 @@ function parseCliArgs(): CliOptions {
         'max-budget-usd': { type: 'string' },
         resume:       { type: 'string',  short: 'r' },
         'session-dir': { type: 'string' },
+        attached:     { type: 'boolean', default: false },
         yes:          { type: 'boolean', short: 'y', default: false },
         debug:        { type: 'boolean', short: 'd', default: false },
         'show-thinking': { type: 'boolean', default: false },
@@ -530,6 +553,7 @@ function parseCliArgs(): CliOptions {
     maxBudgetUsd,
     resume:     parsed.values['resume']   as string | undefined,
     sessionDir,
+    attached:    parsed.values['attached'] as boolean,
     loopCommand: null,
   }
 }
@@ -540,7 +564,7 @@ function parseCliArgs(): CliOptions {
  * `loop` token is handed verbatim to runLoopCli, which does its own flag parsing.
  */
 function buildLoopCliOptions(
-  name: 'loop' | 'loop-scheduler',
+  name: 'loop' | 'loop-scheduler' | 'auto-scheduler',
   globalArgs: string[],
   loopArgs: string[],
 ): CliOptions {
@@ -605,6 +629,7 @@ function buildLoopCliOptions(
     maxBudgetUsd: undefined,
     resume: undefined,
     sessionDir: undefined,
+    attached: false,
     loopCommand: { name, args: passthroughLoopArgs },
   }
 }
@@ -1761,6 +1786,7 @@ function canShowActiveThinkingMeter(): boolean {
 interface StreamPromptSession {
   submit(prompt: string): AsyncGenerator<MetaAgentEvent>
   steer(text: string): boolean
+  interrupt?(): void
   getEstimatedCost(): number
   readonly mode: SessionMode | null
 }
@@ -1776,7 +1802,11 @@ async function streamPrompt(
   jsonMode: boolean,
   showThinking = false,
   steerHooks?: SteerHooks,
+  signal?: AbortSignal,
 ): Promise<StreamPromptResult> {
+  if (signal?.aborted) throw abortError(signal.reason)
+  const onAbort = () => router.interrupt?.()
+  signal?.addEventListener('abort', onAbort, { once: true })
   const gen = router.submit(prompt)
   const steering = steerHooks ?? null
   let hasText = false
@@ -1916,6 +1946,7 @@ async function streamPrompt(
         recentToolTrail.push(`${event.toolName} ${JSON.stringify(event.toolInput).slice(0, 80)}`)
         if (recentToolTrail.length > 40) recentToolTrail.shift()
       }
+      if (event.type === 'result') terminalResult = event
 
       if (jsonMode) {
         console.log(JSON.stringify(event))
@@ -1923,7 +1954,7 @@ async function streamPrompt(
         // bare reason code on abnormal exit. Emit a follow-up diagnosis event so
         // they receive the same LLM analysis a human would see.
         if (
-          event.type === 'result' && event.subtype !== 'success' &&
+          event.type === 'result' && event.isError &&
           isAutonomousMode(router.mode)
         ) {
           const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
@@ -2024,7 +2055,6 @@ async function streamPrompt(
           break
         }
         case 'result': {
-          terminalResult = event
           meter.hide()
           await closeThinkingBlock()
           if (hasText) await safeStdoutWrite('\n')
@@ -2052,10 +2082,18 @@ async function streamPrompt(
               `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
               (errDetails ? `${red('  错误详情：')} ${errDetails}\n` : ''),
             )
+          } else if (event.subtype === 'parked') {
+            const wakeAt = event.parkRequest
+              ? new Date(Date.now() + event.parkRequest.afterMs).toLocaleString()
+              : 'unknown'
+            await safeStdoutWrite(
+              `\n${yellow('⏲')}  ${yellow('Auto 会话已停放。')} ` +
+              `${dim(`预计恢复时间：${wakeAt}`)}\n`,
+            )
           }
           // Auto-series abnormal exit: replace the bare reason with an actual
           // LLM diagnosis (what happened / root cause / what's needed next).
-          if (event.subtype !== 'success' && isAutonomousMode(router.mode)) {
+          if (event.isError && isAutonomousMode(router.mode)) {
             const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
               goal: prompt, subtype: event.subtype,
               recentText: recentAgentText, toolTrail: recentToolTrail,
@@ -2094,6 +2132,7 @@ async function streamPrompt(
     if ((err as NodeJS.ErrnoException)?.code === 'ERR_STREAM_PREMATURE_CLOSE') return { text: capturedText, ...(terminalResult ? { result: terminalResult } : {}) }
     throw err
   } finally {
+    signal?.removeEventListener('abort', onAbort)
     // Always tear down the spinner timer and wipe any lingering status line —
     // including on interrupt/error paths — so it never bleeds into the prompt.
     if (meterTimer) clearInterval(meterTimer)
@@ -2102,6 +2141,14 @@ async function streamPrompt(
     setActiveThinkingMeterSuppressed(false)
   }
   return { text: capturedText, ...(terminalResult ? { result: terminalResult } : {}) }
+}
+
+function abortError(reason?: unknown): Error {
+  const error = new Error(
+    typeof reason === 'string' && reason ? reason : 'Operation aborted.',
+  )
+  error.name = 'AbortError'
+  return error
 }
 
 // ── Session resume picker ─────────────────────────────────────────────────────
@@ -2244,6 +2291,72 @@ async function persistSessionSnapshot({
     // session save is best-effort — never crash the active run
     return savedMessageCount
   }
+}
+
+async function armAutoContinuation(input: {
+  sessionId: string
+  opts: CliOptions
+  result: MetaAgentResultEvent
+  historyMessageCount: number
+  claimOwner?: string
+}): Promise<AutoContinuationRecord> {
+  const park = input.result.parkRequest
+  if (input.result.subtype !== 'parked' || !park) {
+    throw new Error('armAutoContinuation requires a parked result with parkRequest.')
+  }
+  if (input.opts.mode !== 'auto') {
+    throw new Error('self_timer is supported only by plain auto mode.')
+  }
+  const projectDir = resolve(input.opts.workspace ?? process.cwd())
+  const sessionId = input.sessionId
+  if (!sessionId) throw new Error('Cannot arm Auto wake without a persisted session id.')
+  const cp = readAutoCheckpoint(projectDir, sessionId)
+  if (cp?.activeSubAgentIds?.length) {
+    throw new Error(
+      `Refusing to arm Auto wake while checkpoint still lists active sub-agents: ` +
+      cp.activeSubAgentIds.join(', '),
+    )
+  }
+  const store = new AutoContinuationStore(projectDir)
+  const record = await store.schedule(
+    {
+      sessionId,
+      fireAt: Date.now() + park.afterMs,
+      reason: park.reason,
+      checkpoint: park.checkpoint,
+      goal: cp?.goal,
+      checkpointRevision: cp?.revision,
+      historyMessageCount: input.historyMessageCount,
+      runtime: {
+        model: input.opts.model,
+        fallbackModel: input.opts.fallbackModel,
+        baseUrl: input.opts.baseUrl,
+        maxTurns: Number.isFinite(input.opts.maxTurns) ? input.opts.maxTurns : undefined,
+        maxBudgetUsd: input.opts.maxBudgetUsd,
+        sessionDir: input.opts.sessionDir,
+      },
+    },
+    input.claimOwner ? { claimOwner: input.claimOwner } : undefined,
+  )
+  const checkpointWrite = await updateAutoCheckpointWithStatus(
+    projectDir,
+    sessionId,
+    {
+      stopReason: 'parked',
+      pendingWake: {
+        wakeId: record.wakeId,
+        requestedAt: record.createdAt,
+        fireAt: record.fireAt,
+        reason: record.reason,
+        checkpoint: record.checkpoint,
+      },
+    },
+  )
+  if (!checkpointWrite.written) {
+    await store.cancel(record.wakeId, record.claim?.token)
+    throw new Error('Auto history was saved, but the wake checkpoint could not be persisted; wake was cancelled.')
+  }
+  return record
 }
 
 function renderPromptContent(content: unknown): string {
@@ -4922,8 +5035,9 @@ async function runRepl(opts: CliOptions): Promise<void> {
       _steerNotify = null
       _isStreaming = true
     }
+    let turnStream: StreamPromptResult | undefined
     try {
-      await streamPrompt(
+      turnStream = await streamPrompt(
         router, input, opts.json, opts.showThinking,
         _steerEnabled ? steerHooks : undefined,
       )
@@ -4992,7 +5106,35 @@ async function runRepl(opts: CliOptions): Promise<void> {
     // ── Persist session after each turn ──────────────────────────────────────
     // Append only the new messages (since savedMessageCount) so the file grows
     // incrementally rather than being rewritten on every turn.
+    const expectedMessageCount = router.getMessages().length
     await persistCurrentSession(input)
+
+    if (turnStream?.result?.subtype === 'parked') {
+      if (savedMessageCount !== expectedMessageCount) {
+        throw new Error(
+          `Auto session requested a durable park, but only ${savedMessageCount}/` +
+          `${expectedMessageCount} messages were confirmed persisted. Wake was not armed.`,
+        )
+      }
+      const parkedSessionId = router.getSessionId()
+      await router.dispose().catch(() => undefined)
+      const record = await armAutoContinuation({
+        sessionId: parkedSessionId,
+        opts,
+        result: turnStream.result,
+        historyMessageCount: savedMessageCount,
+      })
+      if (!opts.json) {
+        console.log(
+          `${yellow('⏲')} Auto wake armed: ${record.wakeId}\n` +
+          `${dim(`auto-scheduler 将在 ${new Date(record.fireAt).toLocaleString()} 后恢复同一会话。`)}\n`,
+        )
+      }
+      exiting = true
+      if (teamReminderTimer) clearInterval(teamReminderTimer)
+      rl.close()
+      break
+    }
 
     // Fire-and-forget: generate (new sessions) or persist (carried titles).
     maybeGenerateSessionTitle()
@@ -5003,7 +5145,21 @@ async function runRepl(opts: CliOptions): Promise<void> {
 
 // ── Single-turn mode ──────────────────────────────────────────────────────────
 
-async function runSingleTurn(opts: CliOptions): Promise<void> {
+interface SingleTurnRunOptions {
+  claimOwner?: string
+  signal?: AbortSignal
+}
+
+interface SingleTurnRunResult {
+  result?: MetaAgentResultEvent
+  armedWake?: AutoContinuationRecord
+}
+
+async function runSingleTurn(
+  opts: CliOptions,
+  scheduledWake?: AutoContinuationRecord,
+  runOptions: SingleTurnRunOptions = {},
+): Promise<SingleTurnRunResult> {
   const storeOptions = opts.sessionDir ? { rootDir: opts.sessionDir } : undefined
   let resumedMessages: ConversationMessage[] = []
   let resumedSessionId: string | undefined
@@ -5058,6 +5214,13 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
     undefined,
     resumedSessionId,
   )
+  if (scheduledWake) {
+    router.setScheduledAutoWake({
+      wakeId: scheduledWake.wakeId,
+      reason: scheduledWake.reason,
+      checkpoint: scheduledWake.checkpoint,
+    })
+  }
 
   // Register standard tools (robotics registers its own)
   if (opts.mode !== 'robotics') {
@@ -5079,24 +5242,259 @@ async function runSingleTurn(opts: CliOptions): Promise<void> {
     }
   }
 
+  let streamed: StreamPromptResult | undefined
+  let parkedHistoryCount: number | null = null
+  let parkedSessionId: string | null = null
+  let parkPersistenceError: Error | null = null
   try {
-    await streamPrompt(router, opts.prompt!, opts.json, opts.showThinking)
+    streamed = await streamPrompt(
+      router,
+      opts.prompt!,
+      opts.json,
+      opts.showThinking,
+      undefined,
+      runOptions.signal,
+    )
   } catch (err) {
-    const msg = terminalText(err instanceof Error ? err.message : String(err))
-    console.error(red(`Error: ${msg}`))
-    process.exitCode = 1
+    if (!runOptions.signal?.aborted) {
+      const msg = terminalText(err instanceof Error ? err.message : String(err))
+      console.error(red(`Error: ${msg}`))
+      process.exitCode = 1
+    }
   } finally {
-    if (opts.sessionDir || resumedSessionId) {
-      await persistSessionSnapshot({
+    const parked = streamed?.result?.subtype === 'parked'
+    if (opts.sessionDir || resumedSessionId || parked) {
+      const expectedMessageCount = router.getMessages().length
+      savedMessageCount = await persistSessionSnapshot({
         router,
         opts,
         currentInput: opts.prompt!,
         savedMessageCount,
         sessionRoot: opts.sessionDir,
       })
+      if (parked) {
+        if (savedMessageCount !== expectedMessageCount) {
+          parkPersistenceError = new Error(
+            `Auto session requested a durable park, but only ${savedMessageCount}/` +
+            `${expectedMessageCount} messages were confirmed persisted. Wake was not armed.`,
+          )
+        } else {
+          parkedHistoryCount = savedMessageCount
+          parkedSessionId = router.getSessionId()
+        }
+      }
     }
     await router.dispose().catch(() => undefined)
   }
+  if (parkPersistenceError) throw parkPersistenceError
+  let armedWake: AutoContinuationRecord | undefined
+  if (streamed?.result?.subtype === 'parked') {
+    armedWake = await armAutoContinuation({
+      sessionId: parkedSessionId ?? '',
+      opts,
+      result: streamed.result,
+      historyMessageCount: parkedHistoryCount ?? 0,
+      claimOwner: runOptions.claimOwner,
+    })
+    if (!opts.json) {
+      process.stderr.write(
+        `${yellow('⏲')} Auto wake ${runOptions.claimOwner ? 'attached' : 'armed'}: ` +
+        `${armedWake.wakeId} at ${new Date(armedWake.fireAt).toLocaleString()}\n`,
+      )
+    }
+  }
+  return {
+    ...(streamed?.result ? { result: streamed.result } : {}),
+    ...(armedWake ? { armedWake } : {}),
+  }
+}
+
+async function resumeAutoContinuation(
+  opts: CliOptions,
+  projectDir: string,
+  record: AutoContinuationRecord,
+  signal: AbortSignal,
+  claimOwner?: string,
+): Promise<{ outcome: 'done' | 'cancelled'; next?: AutoContinuationRecord }> {
+  const storeOptions = record.runtime?.sessionDir
+    ? { rootDir: record.runtime.sessionDir }
+    : undefined
+  const meta = await SessionStore.getSession(record.sessionId, storeOptions)
+  if (
+    !meta ||
+    meta.mode !== 'auto' ||
+    (meta.workspace && resolve(meta.workspace) !== projectDir)
+  ) {
+    return { outcome: 'cancelled' }
+  }
+  const history = await SessionStore.loadHistory(record.sessionId, storeOptions)
+  // Exact history count is the session-generation fence. Any manual resume
+  // after this wake was armed makes the old timer stale, even if the goal
+  // string happens to be unchanged.
+  if (history.length !== record.historyMessageCount) return { outcome: 'cancelled' }
+
+  const cp = readAutoCheckpoint(projectDir, record.sessionId)
+  if (!cp || (record.goal !== undefined && cp.goal !== record.goal)) {
+    return { outcome: 'cancelled' }
+  }
+
+  const resumedOpts: CliOptions = {
+    ...opts,
+    mode: 'auto',
+    modeExplicit: true,
+    workspace: projectDir,
+    model: record.runtime?.model ?? opts.model,
+    fallbackModel: record.runtime?.fallbackModel ?? opts.fallbackModel,
+    baseUrl: record.runtime?.baseUrl ?? opts.baseUrl,
+    maxTurns: record.runtime?.maxTurns ?? opts.maxTurns,
+    maxBudgetUsd: record.runtime?.maxBudgetUsd ?? opts.maxBudgetUsd,
+    prompt: '继续',
+    resume: record.sessionId,
+    sessionDir: record.runtime?.sessionDir,
+    attached: claimOwner !== undefined,
+    loopCommand: null,
+  }
+  // Scheduler startup/idle polling is pure local I/O. Connect optional MCP
+  // servers only after a due wake has passed all stale-history fences.
+  await ensureMcpServerInstructions()
+  const turn = await runSingleTurn(resumedOpts, record, { claimOwner, signal })
+  const result = turn.result
+  if (!result) throw new Error('resumed Auto session produced no terminal result')
+  if (result.subtype === 'error_during_execution') {
+    throw new Error(result.errors?.join('; ') || result.result || result.stopReason || 'Auto resume failed')
+  }
+  if (result.subtype !== 'parked') {
+    await updateAutoCheckpointWithStatus(projectDir, record.sessionId, {
+      pendingWake: null,
+    })
+  }
+  return {
+    outcome: 'done',
+    ...(turn.armedWake ? { next: turn.armedWake } : {}),
+  }
+}
+
+async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
+  const args = opts.loopCommand?.args ?? []
+  let parsed: ReturnType<typeof parseArgs>
+  try {
+    parsed = parseArgs({
+      args,
+      options: {
+        once: { type: 'boolean', default: false },
+        'poll-ms': { type: 'string' },
+        'max-concurrent': { type: 'string' },
+      },
+      strict: true,
+      allowPositionals: false,
+    })
+  } catch (error) {
+    throw new Error(
+      `auto-scheduler: ${error instanceof Error ? error.message : String(error)}`,
+    )
+  }
+  const pollIntervalMs = parsePositiveIntOption(
+    parsed.values['poll-ms'] as string | undefined,
+    '--poll-ms',
+    1_000,
+  )
+  const maxConcurrent = parsePositiveIntOption(
+    parsed.values['max-concurrent'] as string | undefined,
+    '--max-concurrent',
+    1,
+  )
+  const projectDir = resolve(opts.workspace ?? process.cwd())
+  const store = new AutoContinuationStore(projectDir)
+  const abort = new AbortController()
+  const stop = () => abort.abort('signal')
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+
+  const scheduler = new AutoScheduler(
+    store,
+    async (record, signal) =>
+      (await resumeAutoContinuation(opts, projectDir, record, signal)).outcome,
+    {
+      pollIntervalMs,
+      maxConcurrent,
+      onEvent: message => {
+        if (opts.json) console.log(JSON.stringify({ type: 'auto_scheduler', message }))
+        else process.stderr.write(`${message}\n`)
+      },
+    },
+  )
+
+  try {
+    const healed = await store.reconcileOrphans()
+    if (!opts.json) {
+      process.stderr.write(
+        `[auto-scheduler] workspace=${projectDir} poll=${pollIntervalMs}ms ` +
+        `concurrency=${maxConcurrent}` +
+        (healed.length ? ` recovered=${healed.length}` : '') +
+        `\n`,
+      )
+    }
+    if (parsed.values['once']) {
+      await scheduler.tickOnce(Date.now(), abort.signal)
+    } else {
+      await scheduler.run(abort.signal)
+    }
+  } finally {
+    process.removeListener('SIGINT', stop)
+    process.removeListener('SIGTERM', stop)
+  }
+}
+
+async function runAttachedAuto(opts: CliOptions): Promise<void> {
+  const projectDir = resolve(opts.workspace ?? process.cwd())
+  const store = new AutoContinuationStore(projectDir)
+  const claimOwner = `${autoContinuationClaimOwner()}:attached`
+  const abort = new AbortController()
+  const stop = () => abort.abort('attached Auto interrupted')
+  process.once('SIGINT', stop)
+  process.once('SIGTERM', stop)
+
+  try {
+    const initial = await runSingleTurn(opts, undefined, {
+      claimOwner,
+      signal: abort.signal,
+    })
+    if (!initial.armedWake || abort.signal.aborted) return
+
+    const attached = new AttachedAutoScheduler(
+      store,
+      (record, signal) =>
+        resumeAutoContinuation(opts, projectDir, record, signal, claimOwner),
+      {
+        onEvent: message => {
+          if (opts.json) console.log(JSON.stringify({ type: 'auto_attached', message }))
+          else process.stderr.write(`${message}\n`)
+        },
+      },
+    )
+    const outcome = await attached.run(initial.armedWake, abort.signal)
+    if (!opts.json && outcome === 'detached') {
+      process.stderr.write(
+        `${dim('当前窗口已停止等待；wake 保留在持久队列中，可由 auto-scheduler 接管。')}\n`,
+      )
+    }
+  } finally {
+    process.removeListener('SIGINT', stop)
+    process.removeListener('SIGTERM', stop)
+  }
+}
+
+function parsePositiveIntOption(
+  value: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (value === undefined) return fallback
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isSafeInteger(parsed) || parsed < 1) {
+    throw new Error(`${name} must be a positive integer (got "${value}")`)
+  }
+  return parsed
 }
 
 // ── Loop runtime (v2, L2) ─────────────────────────────────────────────────────
@@ -5625,16 +6023,31 @@ async function main(): Promise<void> {
   // work without an API key; runLoopCommand asserts the key only when it needs a
   // backend (tick/distill/loop-scheduler).
   if (opts.loopCommand) {
+    if (opts.loopCommand.name === 'auto-scheduler') {
+      assertApiKeyConfigured(opts)
+      await runAutoSchedulerCommand(opts)
+      return
+    }
     await runLoopCommand(opts)
     return
   }
 
   assertApiKeyConfigured(opts)
+  if (opts.attached && opts.mode !== 'auto') {
+    throw new Error('--attached is supported only with --mode auto (or --yolo).')
+  }
+  if (opts.attached && opts.prompt === null) {
+    throw new Error('--attached requires a one-shot prompt.')
+  }
   await ensureMcpServerInstructions()
 
   if (opts.prompt !== null) {
     if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })
-    await runSingleTurn(opts)
+    if (opts.attached) {
+      await runAttachedAuto(opts)
+    } else {
+      await runSingleTurn(opts)
+    }
   } else {
     if (opts.sessionDir) {
       console.error(red('Error: --session-dir is only supported for one-shot prompt runs.'))

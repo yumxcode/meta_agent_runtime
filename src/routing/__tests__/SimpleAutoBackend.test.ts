@@ -26,6 +26,7 @@ const mockState = vi.hoisted(() => ({
   configs: [] as Array<Record<string, unknown>>,
   autonomyJailCalls: [] as Array<{ jail: unknown; opts: unknown }>,
   bridgeOptions: [] as unknown[],
+  registeredToolNames: [] as string[],
 }))
 
 vi.mock('../../core/MetaAgentSession.js', () => ({
@@ -35,7 +36,9 @@ vi.mock('../../core/MetaAgentSession.js', () => ({
     }
     getSessionId(): string { return 'simple-auto-test-session' }
     getToolRegistry(): unknown { return {} }
-    registerTool(): void {}
+    registerTool(tool: { name?: string }): void {
+      if (tool.name) mockState.registeredToolNames.push(tool.name)
+    }
     setSubAgentBridge(): void {}
     async dispose(): Promise<void> {}
   },
@@ -88,6 +91,7 @@ describe('simple_auto backend wiring', () => {
     mockState.configs.length = 0
     mockState.autonomyJailCalls.length = 0
     mockState.bridgeOptions.length = 0
+    mockState.registeredToolNames.length = 0
   })
 
   afterEach(() => {
@@ -139,6 +143,16 @@ describe('simple_auto backend wiring', () => {
     expect(config['driftGate']).toBeTypeOf('function')
     expect(config['onCheckpointBoundary']).toBeTypeOf('function')
     expect(config['getExperienceRecallBlock']).toBeTypeOf('function')
+    expect(mockState.registeredToolNames).toContain('self_timer')
+  })
+
+  it('exposes self_timer only on plain auto, never simple_auto', async () => {
+    await buildBackend('simple_auto')
+    expect(mockState.registeredToolNames).not.toContain('self_timer')
+
+    mockState.registeredToolNames.length = 0
+    await buildBackend('auto')
+    expect(mockState.registeredToolNames).toContain('self_timer')
   })
 
   it('only restores auto checkpoint counters for the matching resumed session', async () => {
@@ -149,6 +163,7 @@ describe('simple_auto backend wiring', () => {
       updatedAt: Date.now(),
       revision: 9,
       turnCount: 42,
+      estimatedCostUsd: 4.25,
     })
 
     const mismatched = await buildBackend('auto', {
@@ -158,6 +173,7 @@ describe('simple_auto backend wiring', () => {
     })
     expect(mismatched.config['initialCheckpointRevision']).toBe(0)
     expect(mismatched.config['initialToolBatchCount']).toBe(0)
+    expect(mismatched.config['initialCostUsd']).toBe(0)
 
     await writeAutoCheckpoint(projectDir, {
       schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
@@ -165,6 +181,7 @@ describe('simple_auto backend wiring', () => {
       updatedAt: Date.now(),
       revision: 7,
       turnCount: 13,
+      estimatedCostUsd: 4.25,
     })
     const matched = await buildBackend('auto', {
       projectDir,
@@ -173,5 +190,6 @@ describe('simple_auto backend wiring', () => {
     })
     expect(matched.config['initialCheckpointRevision']).toBe(7)
     expect(matched.config['initialToolBatchCount']).toBe(13)
+    expect(matched.config['initialCostUsd']).toBe(4.25)
   })
 })

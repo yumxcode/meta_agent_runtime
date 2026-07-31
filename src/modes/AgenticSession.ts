@@ -100,6 +100,7 @@ export class AgenticSession {
       initialCheckpointRevision: config.initialCheckpointRevision,
       maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
+      initialCostUsd: resolved.initialCostUsd,
       onMainCostUsd: resolved.onMainCostUsd,
       getAdditionalBudgetUsd: resolved.getAdditionalBudgetUsd,
       maxOutputTokens: resolved.maxTokens,
@@ -151,6 +152,7 @@ export class AgenticSession {
     })
 
     this._sessionId = this._engine.getSessionId()
+    this._totalCostUsd = Math.max(0, resolved.initialCostUsd ?? 0)
 
     for (const tool of resolved.tools) {
       this.registerTool(tool)

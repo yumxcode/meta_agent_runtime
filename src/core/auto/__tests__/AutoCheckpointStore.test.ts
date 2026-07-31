@@ -121,6 +121,21 @@ describe('AutoCheckpointStore', () => {
     expect(cp.stopReason).toBe('max_turns')
   })
 
+  it('persists and explicitly clears pending wake context', async () => {
+    const parked = await updateAutoCheckpoint(ws, 's1', {
+      pendingWake: {
+        wakeId: 'wake-1',
+        requestedAt: 10,
+        fireAt: 20,
+        reason: 'wait for deploy',
+        checkpoint: { deploymentId: 'dep-1' },
+      },
+    })
+    expect(parked.pendingWake?.wakeId).toBe('wake-1')
+    const resumed = await updateAutoCheckpoint(ws, 's1', { pendingWake: null })
+    expect(resumed.pendingWake).toBeNull()
+  })
+
   it('turnCount never regresses (takes the max across updates/resume)', async () => {
     await updateAutoCheckpoint(ws, 's1', { turnCount: 42 })
     // A resumed run restarts its in-memory counter from 1.
@@ -160,6 +175,13 @@ describe('buildAutoResumePreamble', () => {
       artifacts: ['src/x.ts'],
       activeSubAgentIds: ['subtask-1'],
       stopReason: 'max_turns',
+      pendingWake: {
+        wakeId: 'wake-1',
+        requestedAt: 10,
+        fireAt: 20,
+        reason: 'wait for deploy',
+        checkpoint: { deploymentId: 'dep-1' },
+      },
     })
     expect(text).toBeTruthy()
     expect(text).toContain('ship feature X')
@@ -167,5 +189,7 @@ describe('buildAutoResumePreamble', () => {
     expect(text).toContain('src/x.ts')
     expect(text).toContain('subtask-1')
     expect(text).toContain('max_turns')
+    expect(text).toContain('wait for deploy')
+    expect(text).toContain('dep-1')
   })
 })
