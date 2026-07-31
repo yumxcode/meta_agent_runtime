@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.3` · Node.js `>= 18`
+> 当前版本:`0.8.4` · Node.js `>= 18`
 
 ---
 
@@ -158,6 +158,8 @@ meta-agent --json "检查项目结构"
 
 `auto` 中的 `self_timer` 是持久化 park，不是让 Agent 进程内 `sleep`：CLI 先保存完整会话与 checkpoint，再写 wake。默认命令随后退出，由 `auto-scheduler` 到期恢复同一 session/goal；加 `--attached` 时，原 CLI 只保留轻量宿主并续租 wake，到期后在原窗口恢复输出。`simple_auto` 不暴露该工具。机制与部署说明见 [Auto Scheduler](docs/auto-scheduler.md)。
 
+Attached 模式下，等待阶段按 `Ctrl+C` 仅解除附着并保留 wake；Agent 正在执行时按 `Ctrl+C` 则表示放弃当前 Auto 会话，会取消该 session 的全部 wake，后续命令将创建新会话。已经写入工作区的文件修改不会自动回滚。
+
 CLI 常用选项:`-m/--mode`、`--yolo`、`-w/--workspace`、`-k/--api-key`、`-b/--base-url`、`--model`、`--fallback-model`、`-t/--max-turns`、`--max-budget-usd`、`-r/--resume`、`--session-dir <dir>`(单次 prompt 运行时把会话历史持久化到该目录,便于后续 `--resume`)、`--attached`(仅 one-shot plain auto)、`-y/--yes`、`-d/--debug`、`--show-thinking`、`-j/--json`。交互期内 `Ctrl+G` 注入修正(在下一步边界引导模型,不打断生成),`Ctrl+C` 中断当前轮。运行 `meta-agent --help` 查看全部交互命令(`/team`、`/experience`、`/principle`、`/anchor`、`/memory`、`/sessions`、`/compact` 等)。
 
 ---
@@ -217,11 +219,17 @@ Lane 负责连续会话、串行化和写路径所有权。`workspace.read` 声�
 
 `loop distill` 是可见的前台 Agentic 编译会话：Architect 读取需求与必要项目文件，生成 Constraint Ledger 和简明 Blueprint（Workspace、Lanes、Control）；Compiler 通过 `graph_reference` 获取精确 `graph-2.0` ABI，默认从“厚 Worker + 独立完成 Reviewer + 终态”开始生成完整图并调用 `graph_validate`；独立 Semantic Reviewer 再对原始需求、Agent prompt 中的直接读写、Workspace ownership、Lane、控制闭环和能力可用性做语义核验。Distill 会机械提示 Worker success 直达业务终态，并将其作为 `single-agent-terminal-authority` 交给语义审阅阻断。Distill、Create 和 Runtime 使用同一个 `graph_agent` Tool Catalog，Freeze 锁定图实际引用的工具；阻断级合同差异会拒绝候选，拓扑粒度等 advisory 只记录、不阻断。Distill prompt、Validator、Freeze 和 Runtime 共用同一 ABI，不接受旧字段或隐式兼容。
 
+`loop intake` 是可选的前置步骤。有些拒绝 Compiler 修不好——「最多 20 个有效候选轮次」没给出与 Activation 的换算关系、完成标准没写死、首轮要读的文件在项目里并不存在——缺的信息从来就不在系统里，却要等到多轮编译之后才由 Reviewer 发现。Intake 把这些缺口提前问出来：探针题库由阻断枚举反查而非开放访谈，先机械预检（查文件、查 PATH、比对已注册能力）再只问真正查不出的部分，产出人已逐条确认的 Constraint Ledger（`loop.intake.json`）。其中最有价值的是 `kind` 的确认——它机械决定约束在 Graph、Agent、独立 Reviewer 还是人那里被执行。需求文件一改，记录按 sha 自动失效；`distill` 自动拾取匹配的记录，`--no-intake` 强制走原路径。带 Intake 时 Architect 从抽取者变为校验者：可以追加它在项目里发现的新约束，但不得改动人已确认条目的 statement/kind/strength（宿主逐字节校验）。
+
+语义复核按“可观测优先于可阻断”收敛：宿主持有跨轮 verdict 台账，证据区域未变的约束不再重新裁决（指纹并入 `/limits`、`/concurrency` 与相关 Lane，任何不确定都倒向重审）；Reviewer 必须为本轮范围内每条 hard constraint 给出一行裁决，缺行整份作废，`satisfied` 必须给出真实可解析的 JSON pointer——这消除了“没提等于没问题”的歧义，也是“每轮报的问题都不一样”的机制来源。终态可达性下沉为确定性 lint（`terminal-unreachable`，忽略 `when` 取可达性上界，零假阳性）；`unbounded-or-unreachable-control` 等三类控制流阻断必须附带宿主可机械核对的反例（State 赋值 + 首尾相接的 Transition id 序列），给不出的自动降级为建议级 `unwitnessed-control-flow`。`loop distill` 结尾打印本轮收敛统计（沿用数、out-of-scope 放行数、降级数），其中「既被判为 out_of_scope 又被棘轮沿用」是这套取舍唯一的盲区，非零时直接给出人工复核警告。设计与取舍依据见 [Distill Intake 与语义复核收敛方案](docs/distill-intake-and-review-convergence-2026-07-31.md)。
+
 Node 默认使用 `Agent | Wait | Terminal`；只有真实需要纯函数、幂等外部操作或并发汇合时才添加 `Function | Effect | Join`。`$state`、Reducer 和 `when` 提供确定性计数/阈值路由，开放领域判断仍交给 Agent。Kernel 支持 crash recovery、timer、早到 event inbox、event timeout 和 `source + deliveryId` 幂等去重。
 
 快速开始：
 
 ```bash
+# 可选：需求含"最多 N 轮""完成即结束"这类需要澄清的约束时，先共创约束台账
+meta-agent -w /path/to/workspace loop intake requirements.md
 meta-agent -w /path/to/workspace loop distill requirements.md --out loop.graph.json
 # 审阅冻结前的图、权限、预算与边
 meta-agent -w /path/to/workspace loop create loop.graph.json
@@ -485,4 +493,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.3`。
+当前包版本:`0.8.4`。

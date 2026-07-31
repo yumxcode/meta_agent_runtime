@@ -59,9 +59,15 @@ to wake files; provide them through the scheduler environment or global flags.
   recovery.
 - Attached wake creation and initial claiming are one atomic store operation, so
   a workspace daemon cannot steal the wake between park and wait.
-- `Ctrl+C` while attached releases the current lease back to `pending` and
-  returns to the shell. The durable wake can then be recovered by
-  `auto-scheduler`; a hard process crash is recovered after claim TTL expiry.
+- `Ctrl+C` while the attached host is waiting releases the current lease back
+  to `pending` and returns to the shell. The durable wake can then be recovered
+  by `auto-scheduler`.
+- `Ctrl+C` while an attached model turn is actively running means "abandon this
+  Auto session": every wake for that session is cancelled and its checkpoint
+  is marked `cancelled_by_user`, so a daemon cannot revive it. Workspace changes
+  already made are not rolled back.
+- `SIGTERM` remains recoverable, and a hard process crash is recovered after
+  claim TTL expiry.
 - A wake is cancelled as stale if the persisted history count, workspace, mode,
   or original goal no longer matches.
 - A scheduler failure requeues the wake with exponential backoff.

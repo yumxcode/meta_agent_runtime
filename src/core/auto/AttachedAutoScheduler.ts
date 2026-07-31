@@ -15,11 +15,17 @@ export type AttachedAutoResumeHandler = (
   signal: AbortSignal,
 ) => Promise<AttachedAutoResumeResult>
 
-export type AttachedAutoRunOutcome = 'completed' | 'detached'
+export type AttachedAutoRunOutcome = 'completed' | 'detached' | 'cancelled'
 
 export interface AttachedAutoSchedulerOptions {
   heartbeatIntervalMs?: number
   onEvent?: (message: string) => void
+  /**
+   * Waiting aborts always detach and preserve the wake. During an active model
+   * turn, callers may classify an abort reason as an explicit user
+   * cancellation, which makes the wake terminal instead of requeueing it.
+   */
+  cancelActiveAbort?: (reason: unknown) => boolean
 }
 
 /**
@@ -97,19 +103,26 @@ export class AttachedAutoScheduler {
           throw new Error(`Attached wake claim lost: ${current.wakeId}`)
         }
         if (signal.aborted) {
-          await this.store.release(current.wakeId, token, result.outcome)
+          const cancelled = this.shouldCancelActiveAbort(signal.reason)
+          await this.store.release(
+            current.wakeId,
+            token,
+            cancelled ? 'cancelled' : result.outcome,
+          )
           if (result.next?.claim?.token) {
             await this.store.release(
               result.next.wakeId,
               result.next.claim.token,
-              'pending',
+              cancelled ? 'cancelled' : 'pending',
               result.next.fireAt,
             )
           }
           this.options.onEvent?.(
-            `[auto-attached] detached ${current.sessionId}; wake remains durable (${current.wakeId})`,
+            cancelled
+              ? `[auto-attached] cancelled ${current.sessionId}; it will not resume (${current.wakeId})`
+              : `[auto-attached] detached ${current.sessionId}; wake remains durable (${current.wakeId})`,
           )
-          return 'detached'
+          return cancelled ? 'cancelled' : 'detached'
         }
 
         if (result.outcome === 'done' && result.next) {
@@ -123,12 +136,20 @@ export class AttachedAutoScheduler {
         if (result.outcome !== 'done' || !result.next) return 'completed'
         record = result.next
       } catch (error) {
-        await this.store.release(current.wakeId, token, 'pending', current.fireAt)
+        const cancelled = signal.aborted && this.shouldCancelActiveAbort(signal.reason)
+        await this.store.release(
+          current.wakeId,
+          token,
+          cancelled ? 'cancelled' : 'pending',
+          current.fireAt,
+        )
         if (signal.aborted) {
           this.options.onEvent?.(
-            `[auto-attached] detached ${current.sessionId}; wake remains durable (${current.wakeId})`,
+            cancelled
+              ? `[auto-attached] cancelled ${current.sessionId}; it will not resume (${current.wakeId})`
+              : `[auto-attached] detached ${current.sessionId}; wake remains durable (${current.wakeId})`,
           )
-          return 'detached'
+          return cancelled ? 'cancelled' : 'detached'
         }
         throw error
       } finally {
@@ -168,6 +189,10 @@ export class AttachedAutoScheduler {
         `Attached resume returned an invalid successor wake for ${prior.wakeId}.`,
       )
     }
+  }
+
+  private shouldCancelActiveAbort(reason: unknown): boolean {
+    return this.options.cancelActiveAbort?.(reason) ?? false
   }
 }
 

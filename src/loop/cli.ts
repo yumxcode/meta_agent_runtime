@@ -4,9 +4,18 @@ import { delimiter, join, resolve } from 'node:path'
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import type { ProviderId } from '../providers/registry.js'
 import {
+  buildLoopIntakeSystem,
   createFileDistillCheckpointStore,
   createFileDistillTraceStore,
+  createFileLoopIntakeStore,
   createDefaultGraphRuntimeCatalog,
+  formatDistillTraceStats,
+  parseIntakeEnvelope,
+  readDistillTraceStats,
+  validateLoopIntakeRecord,
+  GRAPH_DISTILL_PHASE_POLICY,
+  LOOP_INTAKE_FILE,
+  LOOP_INTAKE_RAW_FILE,
   buildLoopReliabilityProfile,
   diagnoseLoop,
   DISTILL_ARTIFACT_FILES,
@@ -57,6 +66,7 @@ export interface LoopCliDeps {
 export async function runLoopCli(argv: string[], deps: LoopCliDeps): Promise<string> {
   const [command, ...args] = argv
   switch (command) {
+    case 'intake': return intake(args, deps)
     case 'distill':
     case 'distill-graph': return distill(args, deps)
     case 'create':
@@ -88,16 +98,112 @@ function catalog(deps: LoopCliDeps): GraphRuntimeCatalog {
   return deps.graphCatalog ?? createDefaultGraphRuntimeCatalog()
 }
 
+/**
+ * Human-in-the-loop intake. Separate command rather than a Distill sub-step:
+ * it is an interactive session whose lifecycle (and cost) has nothing to do
+ * with the batch compile that follows, and its output is durable, so re-running
+ * Distill must not re-run it.
+ */
+async function intake(args: string[], deps: LoopCliDeps): Promise<string> {
+  if (!deps.distillExecutor) throw new Error('loop intake needs a foreground Distill executor')
+  const file = positional(args)
+  if (!file) throw new Error('loop intake: requirement document path required')
+  const source = { requirement: file, projectDir: deps.projectDir }
+  const store = createFileLoopIntakeStore(deps.projectDir)
+  const signal = deps.signal ?? new AbortController().signal
+  const rawPath = resolve(deps.projectDir, LOOP_INTAKE_RAW_FILE)
+  const run = async (taskDescription: string): ReturnType<GraphDistillExecutor['execute']> =>
+    deps.distillExecutor!.execute({
+      phase: 'intake',
+      ...GRAPH_DISTILL_PHASE_POLICY.intake,
+      // One conversation across both turns: the repair turn must be able to see
+      // the envelope it is fixing, not reconstruct it.
+      sessionKey: 'distill-intake',
+      taskDescription,
+      systemPrompt: buildLoopIntakeSystem(),
+      allowedTools: ['read_file', 'grep', 'glob', 'ask_user'],
+      signal,
+    })
+
+  let record = await run([
+    '【本阶段任务：Intake】',
+    `用户的 Loop 需求是：${file}`,
+    `项目地址是：${deps.projectDir}`,
+    '先用 read_file 读取需求原文，再对项目做最小充分的机械预检，然后用 ask_user 逐条澄清真正查不出答案的缺口。最终只输出 {constraints,approvedConstraintIds,preconditions,probes,deferred}。',
+  ].join('\n\n'))
+  if (record.status !== 'completed') throw new Error(`loop intake ${record.status}: ${record.error ?? 'no terminal error detail'}`)
+
+  // Persist the raw envelope BEFORE parsing. Everything downstream can be
+  // recomputed from a model call; this cannot — it has the human's answers in
+  // it. A parse failure must never be the reason someone re-answers nine
+  // questions.
+  await writeFile(rawPath, renderIntakeOutput(record.output, record.summary), 'utf8')
+  let attempt = parseIntakeEnvelope(record.output, record.summary)
+  if (!attempt.record) {
+    record = await run([
+      '【格式重试：上一次的信封无法解析】',
+      attempt.diagnosis,
+      '你刚才产出的内容本身是对的，不要重新提问，也不要改变任何结论——只把同一份内容重新序列化为合法 JSON。',
+      '特别注意：中文叙述里引用文档原文时不要使用未转义的半角双引号，改用「」或“”。',
+      '只输出那一个 JSON 对象，不要 Markdown fence 或任何解释文字。',
+    ].join('\n\n'))
+    if (record.status === 'completed') {
+      await writeFile(rawPath, renderIntakeOutput(record.output, record.summary), 'utf8')
+      attempt = parseIntakeEnvelope(record.output, record.summary)
+    }
+  }
+  if (!attempt.record) {
+    throw new Error([
+      `loop intake: 信封无法解析——${attempt.diagnosis}`,
+      `原始输出已保留：${LOOP_INTAKE_RAW_FILE}（含本次全部人工回答，可手工修正后另存为 ${LOOP_INTAKE_FILE}）`,
+    ].join('\n'))
+  }
+  const saved = await store.save(source, attempt.record)
+  const errors = validateLoopIntakeRecord(saved)
+  if (errors.length) {
+    throw new Error([
+      `loop intake produced an invalid record:\n- ${errors.join('\n- ')}`,
+      `已写出 ${LOOP_INTAKE_FILE} 与原始输出 ${LOOP_INTAKE_RAW_FILE}；修正后可直接用于 loop distill。`,
+    ].join('\n'))
+  }
+  return [
+    `${LOOP_INTAKE_FILE} written: ${saved.constraints.constraints.length} constraints, `
+      + `${saved.approvedConstraintIds.length} confirmed, ${saved.preconditions.items.length} preconditions, ${saved.deferred.length} deferred`,
+    // The sha binding is the reason a stale intake cannot silently claim human
+    // sign-off, so say it out loud rather than letting it surprise someone.
+    '需求文件一旦改动，本记录自动失效，需要重新运行 intake。',
+    `next: meta-agent loop distill ${file}`,
+  ].join('\n')
+}
+
+/** The raw envelope, kept verbatim so a formatting failure never destroys the
+ * human answers embedded in it. */
+function renderIntakeOutput(output: unknown, summary?: string): string {
+  if (typeof output === 'string' && output.trim()) return output
+  if (output !== undefined) {
+    try { return JSON.stringify(output, null, 2) ?? String(output) } catch { return String(output) }
+  }
+  return summary ?? '(no output)'
+}
+
 async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   if (!deps.distillExecutor) throw new Error('loop distill needs a foreground Distill executor')
   const file = positional(args)
   if (!file) throw new Error('loop distill: requirement document path required')
   const out = flagValue(args, '--out') ?? 'loop.graph.json'
+  // Intake is optional. Absent (or stale — the store checks the requirement
+  // hash) means the compatibility path, which must behave exactly as before.
+  const intakeRecord = args.includes('--no-intake')
+    ? null
+    : await createFileLoopIntakeStore(deps.projectDir).load({ requirement: file, projectDir: deps.projectDir })
   // Distill artifacts are written only after the whole pipeline succeeds. The
   // trace is written as the run happens, so a failure still leaves every
   // rejected envelope, frozen graph and reviewer verdict on disk.
   const trace = createFileDistillTraceStore(deps.projectDir)
-  const result = await distillLoopGraph({ requirement: file, projectDir: deps.projectDir }, {
+  const result = await distillLoopGraph({
+    requirement: file, projectDir: deps.projectDir,
+    ...(intakeRecord ? { intake: intakeRecord } : {}),
+  }, {
     executor: deps.distillExecutor,
     catalog: catalog(deps),
     signal: deps.signal,
@@ -109,7 +215,17 @@ async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   const attempts = result.phaseAttempts
     ? `architect=${result.phaseAttempts.architect}, compiler=${result.phaseAttempts.compiler}, reviewer=${result.phaseAttempts.reviewer}`
     : `compiler=${result.attempts}`
-  return `Loop Blueprint and LoopGraphSpec written (${out}, loop.design.md, loop.semantic-review.md; validated; ${attempts})\ntrace: ${trace.dir}\nreview then run: meta-agent loop create ${out}`
+  // Two of this pipeline's design decisions traded strictness for throughput on
+  // the explicit condition that the cost stays visible. Printing the counters
+  // is what makes that condition hold.
+  const stats = formatDistillTraceStats(await readDistillTraceStats(trace.dir))
+  return [
+    `Loop Blueprint and LoopGraphSpec written (${out}, loop.design.md, loop.semantic-review.md; validated; ${attempts})`,
+    ...(intakeRecord ? [`intake: ${intakeRecord.approvedConstraintIds.length} human-confirmed constraints applied`] : []),
+    stats,
+    `trace: ${trace.dir}`,
+    `review then run: meta-agent loop create ${out}`,
+  ].join('\n')
 }
 
 async function create(args: string[], deps: LoopCliDeps): Promise<string> {
@@ -732,7 +848,8 @@ function capabilities(deps: LoopCliDeps): string {
 function usage(): string {
   return [
     'Usage: meta-agent loop <command>',
-    '  distill <requirements.md> [--out loop.graph.json] [--non-interactive]',
+    '  intake <requirements.md>   (optional: co-author the confirmed constraint ledger before distilling)',
+    '  distill <requirements.md> [--out loop.graph.json] [--non-interactive] [--no-intake]',
     '  create <loop.graph.json> [--id instanceId] [--force]  (verifies loop.preconditions.json)',
     '  tick [--until-quiescent]',
     '  event <instanceId> <name> [--source NAME --delivery-id ID] [--correlation JSON] [--payload JSON]',
@@ -749,7 +866,7 @@ function positional(args: string[]): string | undefined { return positionalValue
 
 function positionalValues(args: string[]): string[] {
   const values: string[] = []
-  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--apply', '--include-archives', '--force', '--json', '--run'])
+  const booleanFlags = new Set(['--until-quiescent', '--non-interactive', '--no-intake', '--apply', '--include-archives', '--force', '--json', '--run'])
   for (let index = 0; index < args.length; index++) {
     const value = args[index]!
     if (value.startsWith('--')) {

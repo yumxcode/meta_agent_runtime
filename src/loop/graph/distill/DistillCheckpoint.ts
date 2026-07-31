@@ -58,6 +58,13 @@ export function createFileDistillCheckpointStore(projectDir: string): DistillChe
   }
 }
 
+/** Shared by the Intake record, which must invalidate on exactly the same
+ * condition: the requirement text changed, so a human's confirmations no longer
+ * describe the document being compiled. */
+export async function distillSourceIdentity(source: DistillCheckpointSource): Promise<DistillArchitectCheckpoint['source']> {
+  return sourceIdentity(source)
+}
+
 async function sourceIdentity(source: DistillCheckpointSource): Promise<DistillArchitectCheckpoint['source']> {
   const projectDir = await realpath(resolve(source.projectDir))
   const requirementPath = await realpath(resolve(projectDir, source.requirement))

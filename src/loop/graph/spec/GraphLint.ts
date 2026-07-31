@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'single-agent-terminal-authority' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'single-agent-terminal-authority' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap' | 'terminal-unreachable'
   at: string
   message: string
 }
@@ -42,6 +42,7 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintMixedSnapshotRouting(spec, findings)
   lintStaticEffectIdempotency(spec, findings)
   lintTerminalFanOut(spec, findings)
+  lintUnreachableTerminals(spec, findings)
   return findings
 }
 
@@ -911,6 +912,57 @@ function lintDeadLiteralRoutes(spec: LoopGraphSpec, findings: GraphLintFinding[]
         })
       }
     }
+  }
+}
+
+/**
+ * Terminal reachability — a graph algorithm, not a judgement call.
+ *
+ * "The terminal cannot be reached" used to be part of a blocking semantic rule
+ * class, which meant a sampling LLM was asked to infer, from prose and a JSON
+ * manifest, something that is exactly decidable. It produced both false
+ * positives (rejecting graphs that ran fine) and a re-derivation cost on every
+ * review round.
+ *
+ * The closure below deliberately ignores `when`: every Transition is treated as
+ * potentially firing, so the result is an UPPER BOUND on reachability. A
+ * terminal outside an upper bound is unreachable under every possible condition
+ * assignment, which makes this rule exact in one direction and silent in the
+ * other — zero false positives, which is the property that lets the reviewer
+ * stop checking it entirely.
+ */
+function lintUnreachableTerminals(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const terminals = Object.entries(spec.nodes ?? {}).filter(([, node]) => node?.type === 'terminal').map(([id]) => id)
+  if (!terminals.length) return
+  const outgoing = new Map<string, string[]>()
+  for (const transition of spec.transitions ?? []) {
+    if (typeof transition?.from !== 'string') continue
+    const targets = (Array.isArray(transition.to) ? transition.to : [transition.to])
+      .map(target => typeof target === 'string' ? target : target?.node)
+      .filter((node): node is string => typeof node === 'string')
+    outgoing.set(transition.from, [...(outgoing.get(transition.from) ?? []), ...targets])
+  }
+  const reachable = new Set<string>()
+  const queue = (spec.entrypoints ?? []).map(entrypoint => entrypoint?.node).filter((node): node is string => typeof node === 'string')
+  // No entrypoints at all is an ABI concern, not this rule's business; without
+  // a starting set every terminal would be reported and the signal would be
+  // noise.
+  if (!queue.length) return
+  for (const node of queue) reachable.add(node)
+  while (queue.length) {
+    const current = queue.shift()!
+    for (const next of outgoing.get(current) ?? []) {
+      if (reachable.has(next)) continue
+      reachable.add(next)
+      queue.push(next)
+    }
+  }
+  for (const terminal of terminals) {
+    if (reachable.has(terminal)) continue
+    findings.push({
+      level: 'error', rule: 'terminal-unreachable', at: `nodes.${terminal}`,
+      message: 'no sequence of Transitions reaches this terminal from any entrypoint, even ignoring every `when` condition; route to it or remove it',
+    })
   }
 }
 

@@ -1,3 +1,4 @@
+import { createHash } from 'node:crypto'
 import type { JsonValue, LoopGraphSpec, NodeSpec, ValueExpression } from '../spec/GraphTypes.js'
 
 export const LOOP_CONSTRAINTS_SCHEMA = 'loop-constraints-2.0' as const
@@ -5,7 +6,17 @@ export const LOOP_BLUEPRINT_SCHEMA = 'loop-blueprint-2.0' as const
 export const LOOP_DESIGN_SCHEMA = LOOP_BLUEPRINT_SCHEMA
 export const GRAPH_TRACEABILITY_SCHEMA = 'graph-traceability-2.0' as const
 export const GRAPH_MANIFEST_SCHEMA = 'graph-manifest-2.0' as const
-export const SEMANTIC_REVIEW_SCHEMA = 'loop-semantic-review-2.1' as const
+/**
+ * 2.2 adds the per-constraint verdict table. The reviewer used to report a
+ * sampled handful of findings per round, which made "it did not mention C7"
+ * indistinguishable from "it decided C7 is satisfied" — the mechanism behind
+ * the observed "every round reports different problems". A complete table
+ * removes the ambiguity; the ratchet below then keeps the answered subset from
+ * being re-derived every round.
+ */
+export const SEMANTIC_REVIEW_SCHEMA = 'loop-semantic-review-2.2' as const
+/** Read-compatible only: historical artifacts render, but never re-adjudicate. */
+export const LEGACY_SEMANTIC_REVIEW_SCHEMAS = ['loop-semantic-review-2.1'] as const
 export const LOOP_PRECONDITIONS_SCHEMA = 'loop-preconditions-1.0' as const
 
 export type LoopConstraintKind =
@@ -14,6 +25,21 @@ export type LoopConstraintKind =
   | 'failure_boundary' | 'recovery' | 'budget' | 'other'
 
 export interface LoopSourceRef { path: string; locator: string; excerpt?: string }
+
+/**
+ * Who produced a ledger entry.
+ *
+ * Absent means `architect`, which keeps the compatibility path (no Intake
+ * record) byte-identical to its previous behaviour. When an Intake record is
+ * present the Architect may still APPEND entries — it is the only stage that
+ * reads the real project, so discovering an obligation the human never wrote
+ * down is its job — but it may not restate, reclassify or weaken an entry the
+ * human already confirmed. That asymmetry is enforced mechanically by
+ * `validateIntakeLedgerPreservation`, not by prompt discipline.
+ */
+export type LoopConstraintOrigin = 'intake' | 'architect'
+export const LOOP_CONSTRAINT_ORIGINS: readonly LoopConstraintOrigin[] = ['intake', 'architect']
+
 export interface LoopConstraint {
   id: string
   kind: LoopConstraintKind
@@ -21,6 +47,7 @@ export interface LoopConstraint {
   strength: 'hard' | 'soft'
   sources: LoopSourceRef[]
   acceptance?: string[]
+  origin?: LoopConstraintOrigin
 }
 export interface LoopConstraintLedger {
   schemaVersion: typeof LOOP_CONSTRAINTS_SCHEMA
@@ -232,6 +259,10 @@ export const BLOCKING_SEMANTIC_RULE_CLASSES = [
 ] as const
 
 export const ADVISORY_SEMANTIC_RULE_CLASSES = [
+  /** A control-flow rejection the reviewer could not back with a structurally
+   * valid witness. The observation is kept — it is often a real smell — but it
+   * no longer stops a graph that nobody could demonstrate is broken. */
+  'unwitnessed-control-flow',
   'topology-granularity',
   'session-continuity',
   'budget-shape',
@@ -255,11 +286,107 @@ export function isBlockingSemanticRuleClass(ruleClass: string): ruleClass is typ
   return BLOCKING_RULE_CLASS_SET.has(ruleClass)
 }
 
+/**
+ * Control-flow rejections must come with a witness.
+ *
+ * These three classes are the ones that ask the reviewer to derive a truth
+ * table from prose, and they are where false positives concentrate. A real
+ * unreachable terminal, a real exceeded bound and a real stale read all have a
+ * concrete witness: an assignment of State plus the sequence of Transitions it
+ * enables. "This looks under-specified" does not. Requiring the witness costs
+ * a genuine finding nothing and costs a guess everything.
+ */
+export const WITNESS_REQUIRED_RULE_CLASSES = [
+  'unbounded-or-unreachable-control',
+  'missing-source-bound',
+  'state-routing-divergence',
+] as const
+
+export type ControlFlowWitnessOutcome =
+  | 'terminal_unreachable' | 'bound_exceeded' | 'route_uncovered' | 'stale_state_read'
+export const CONTROL_FLOW_WITNESS_OUTCOMES: readonly ControlFlowWitnessOutcome[] =
+  ['terminal_unreachable', 'bound_exceeded', 'route_uncovered', 'stale_state_read']
+
+export interface ControlFlowWitness {
+  /** Keys must be real `graph.state` fields. */
+  state: Record<string, JsonValue>
+  /** Transition ids, in trigger order, each real and each chained end-to-start. */
+  path: string[]
+  outcome: ControlFlowWitnessOutcome
+}
+
+export function requiresControlFlowWitness(ruleClass: string): boolean {
+  return (WITNESS_REQUIRED_RULE_CLASSES as readonly string[]).includes(ruleClass)
+}
+
+/**
+ * Mechanical witness check. Deliberately structural only: the host verifies
+ * that the cited State fields and Transition ids exist and that the path is
+ * actually connected, never that the scenario is semantically compelling.
+ * Fabricating a structurally valid path is more work than filing the finding as
+ * advisory, and the attempt is visible in the trace.
+ */
+export function validateControlFlowWitness(witness: ControlFlowWitness, graph: LoopGraphSpec): string[] {
+  const errors: string[] = []
+  if (!witness || typeof witness !== 'object' || Array.isArray(witness)) return ['witness must be an object']
+  if (!CONTROL_FLOW_WITNESS_OUTCOMES.includes(witness.outcome)) {
+    errors.push(`witness.outcome must be one of ${CONTROL_FLOW_WITNESS_OUTCOMES.join(', ')}`)
+  }
+  if (!witness.state || typeof witness.state !== 'object' || Array.isArray(witness.state)) {
+    errors.push('witness.state must be an object of State field assignments')
+  } else {
+    for (const field of Object.keys(witness.state)) {
+      if (!(field in (graph.state ?? {}))) errors.push(`witness.state references unknown State field '${field}'`)
+    }
+  }
+  if (!Array.isArray(witness.path) || !witness.path.length) {
+    errors.push('witness.path must be a non-empty array of Transition ids')
+    return errors
+  }
+  const transitions = new Map((graph.transitions ?? []).filter(item => typeof item?.id === 'string').map(item => [item.id, item]))
+  let previousTargets: Set<string> | undefined
+  for (const [index, id] of witness.path.entries()) {
+    const transition = transitions.get(id)
+    if (!transition) { errors.push(`witness.path[${index}] references unknown Transition '${id}'`); previousTargets = undefined; continue }
+    if (previousTargets && !previousTargets.has(transition.from)) {
+      errors.push(`witness.path[${index}] ('${id}') starts at '${transition.from}', which the previous Transition does not reach`)
+    }
+    previousTargets = new Set((Array.isArray(transition.to) ? transition.to : [transition.to])
+      .map(target => typeof target === 'string' ? target : target.node))
+  }
+  return errors
+}
+
 export interface SemanticFinding {
   ruleClass: SemanticRuleClass
   statement: string
   sourceRefs: string[]
   designRefs: string[]
+  graphRefs: string[]
+  /** Required for `WITNESS_REQUIRED_RULE_CLASSES`; a finding whose witness is
+   * missing or structurally invalid is demoted to advisory by the host. */
+  witness?: ControlFlowWitness
+}
+
+export type ConstraintVerdictValue = 'satisfied' | 'violated' | 'out_of_scope'
+
+/**
+ * One row per hard constraint in the round's review scope.
+ *
+ * `out_of_scope` is an intentionally open door: it does not block, because
+ * closing it would push the pipeline back toward "cannot produce a graph",
+ * which is the binding constraint today. It is instead made expensive to use
+ * carelessly — `justification` is mandatory, and every use on a graph- or
+ * reviewer-locus constraint is traced and surfaced as an advisory. Whether it
+ * becomes a real escape hatch is a question for the trace, not for a guess.
+ */
+export interface ConstraintVerdictRow {
+  constraintId: string
+  verdict: ConstraintVerdictValue
+  /** Required when `violated`. */
+  ruleClass?: SemanticRuleClass
+  /** Required when `out_of_scope`. */
+  justification?: string
   graphRefs: string[]
 }
 
@@ -268,6 +395,10 @@ export interface LayeredSemanticReview {
   /** Computed by the host from the findings' rule classes; a model-supplied
    * value is discarded during parsing. */
   accepted: boolean
+  /** Must cover every hard constraint in this round's review scope. A missing
+   * row voids the whole verdict — the enumeration contract is worth nothing if
+   * rows may be skipped. */
+  verdicts: ConstraintVerdictRow[]
   layers: Record<SemanticReviewLayer, {
     status: 'pass' | 'fail' | 'not_applicable'
     evidence: Array<{ sourceRefs: string[]; designRefs: string[]; graphRefs: string[]; statement: string }>
@@ -282,6 +413,123 @@ export interface LayeredSemanticReview {
 /** Every finding across all layers, in layer order. */
 export function semanticFindings(review: LayeredSemanticReview): SemanticFinding[] {
   return SEMANTIC_REVIEW_LAYERS.flatMap(layer => review.layers[layer]?.findings ?? [])
+}
+
+/**
+ * Cross-round verdict ledger — the host's answer to a moving target.
+ *
+ * The reviewer is stateless and re-derives its verdict from scratch every
+ * round, so a graph could bounce indefinitely: round 1 reports C3, the compiler
+ * fixes C3, round 2 reports C9 (which round 1 never mentioned and which was
+ * always broken), and the semantic repair budget — three rounds — is gone. The
+ * ledger makes the reviewer's answers stick: a constraint that passed is not
+ * re-adjudicated while the evidence it was judged against is unchanged.
+ *
+ * There is deliberately NO full re-review before acceptance. That was
+ * considered and rejected: it puts its cost on the single most valuable round,
+ * and today's binding failure is "no graph at all" rather than "a wrong graph".
+ * The residual risk — a carried verdict that a later edit silently invalidated
+ * — is instead made observable: the fingerprint reaches beyond the constraint's
+ * own pointers (see `hashPointerRegions`), and every carry is traced so the
+ * question can later be settled with data instead of intuition.
+ */
+export interface ConstraintVerdict {
+  constraintId: string
+  verdict: 'pass' | 'fail'
+  /** Fingerprint of the graph regions this conclusion rested on. */
+  evidenceHash: string
+  ruleClass?: SemanticRuleClass
+  decidedAtCompilerAttempt: number
+  /** The `pass` came from `out_of_scope`, not from a positive verification.
+   * Carrying one of these forward is the single blind spot this design
+   * knowingly creates, so it is labelled rather than blended in. */
+  outOfScope?: boolean
+}
+
+/**
+ * Fingerprint the evidence a verdict rested on.
+ *
+ * Beyond the constraint's own `graphRefs` this folds in three regions that are
+ * known to change a conclusion from a distance: `/limits`, `/concurrency`, and
+ * the Lane contract of every node the constraint points at. Editing any of them
+ * invalidates every verdict at once — which is exactly the intent, since
+ * without a final full re-review those are the edits most likely to break a
+ * constraint whose own pointers never moved.
+ *
+ * Any ambiguity resolves toward re-review: a pointer that no longer resolves
+ * hashes differently from one that does, so a vanished mapping re-opens the
+ * constraint rather than silently preserving its verdict.
+ */
+export function hashPointerRegions(graph: LoopGraphSpec, refs: readonly string[]): string {
+  const regions: unknown[] = []
+  for (const pointer of [...refs].sort()) regions.push([pointer, resolveJsonPointer(graph, pointer)])
+  regions.push(['/limits', (graph as { limits?: unknown }).limits ?? null])
+  regions.push(['/concurrency', (graph as { concurrency?: unknown }).concurrency ?? null])
+  for (const laneId of [...lanesTouchedBy(graph, refs)].sort()) {
+    regions.push([`/lanes/${laneId}`, graph.lanes?.[laneId] ?? null])
+  }
+  return createHash('sha256').update(canonicalJson(regions)).digest('hex')
+}
+
+function lanesTouchedBy(graph: LoopGraphSpec, refs: readonly string[]): Set<string> {
+  const lanes = new Set<string>()
+  for (const pointer of refs) {
+    const nodeMatch = /^\/nodes\/([^/]+)/.exec(pointer)
+    if (nodeMatch) {
+      const node = graph.nodes?.[decodePointerSegment(nodeMatch[1]!)] as { lane?: unknown } | undefined
+      if (typeof node?.lane === 'string') lanes.add(node.lane)
+      continue
+    }
+    const laneMatch = /^\/lanes\/([^/]+)/.exec(pointer)
+    if (laneMatch) lanes.add(decodePointerSegment(laneMatch[1]!))
+  }
+  return lanes
+}
+
+/** Constraints whose evidence moved since their verdict, and therefore need a
+ * fresh adjudication this round. */
+export function staleVerdicts(
+  ledger: readonly ConstraintVerdict[],
+  traceability: GraphTraceabilityMap,
+  graph: LoopGraphSpec,
+): Set<string> {
+  const refsById = new Map((traceability?.mappings ?? []).map(item => [item.constraintId, safeStrings(item.graphRefs)]))
+  const stale = new Set<string>()
+  for (const verdict of ledger) {
+    const refs = refsById.get(verdict.constraintId)
+    // No mapping at all is not "unchanged" — the constraint lost its anchor.
+    if (!refs) { stale.add(verdict.constraintId); continue }
+    if (hashPointerRegions(graph, refs) !== verdict.evidenceHash) stale.add(verdict.constraintId)
+  }
+  return stale
+}
+
+/** Deterministic serialization: object key order must not perturb a hash. */
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value ?? null) ?? 'null'
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(',')}]`
+  const entries = Object.entries(value as Record<string, unknown>)
+    .filter(([, item]) => item !== undefined)
+    .sort(([a], [b]) => a < b ? -1 : a > b ? 1 : 0)
+  return `{${entries.map(([key, item]) => `${JSON.stringify(key)}:${canonicalJson(item)}`).join(',')}}`
+}
+
+function decodePointerSegment(segment: string): string {
+  return segment.replace(/~1/g, '/').replace(/~0/g, '~')
+}
+
+function resolveJsonPointer(root: unknown, pointer: string): unknown {
+  if (pointer === '') return root
+  if (!pointer.startsWith('/')) return undefined
+  let value: unknown = root
+  for (const raw of pointer.slice(1).split('/')) {
+    const part = decodePointerSegment(raw)
+    if (!value || typeof value !== 'object') return undefined
+    if (Array.isArray(value) && !/^\d+$/.test(part)) return undefined
+    if (!(part in (value as Record<string, unknown>))) return undefined
+    value = (value as Record<string, unknown>)[part]
+  }
+  return value
 }
 
 export function formatSemanticFinding(finding: SemanticFinding): string {
@@ -310,8 +558,47 @@ export function validateConstraintLedger(value: LoopConstraintLedger): string[] 
       if (!text(source.path) || !text(source.locator)) errors.push(`${at}.sources[${sourceIndex}] needs path and locator`)
     }
     if (constraint.acceptance !== undefined && !stringList(constraint.acceptance)) errors.push(`${at}.acceptance must be a string array`)
+    if (constraint.origin !== undefined && !LOOP_CONSTRAINT_ORIGINS.includes(constraint.origin)) {
+      errors.push(`${at}.origin must be one of ${LOOP_CONSTRAINT_ORIGINS.join(', ')}`)
+    }
   }
   if (value.unresolved !== undefined && !Array.isArray(value.unresolved)) errors.push('constraints.unresolved must be an array')
+  return errors
+}
+
+/**
+ * The human's confirmed entries are immutable; everything else is the model's.
+ *
+ * Intake exists so the single highest-leverage decision in the pipeline — a
+ * constraint's `kind`, which mechanically derives its enforcement locus — gets
+ * human review instead of a one-shot guess. That value evaporates entirely if
+ * a later stage may quietly restate the entry, so the check is byte-exact and
+ * lives in the host rather than in the Architect's system prompt.
+ *
+ * Appending is deliberately allowed (see `LoopConstraintOrigin`); only the
+ * approved subset is frozen.
+ */
+export function validateIntakeLedgerPreservation(
+  candidate: LoopConstraintLedger,
+  intake: { constraints: LoopConstraintLedger; approvedConstraintIds: readonly string[] },
+): string[] {
+  const errors: string[] = []
+  const approved = new Set(intake.approvedConstraintIds ?? [])
+  const byId = new Map((candidate.constraints ?? []).filter(item => item?.id).map(item => [item.id, item]))
+  for (const original of intake.constraints?.constraints ?? []) {
+    if (!original?.id || !approved.has(original.id)) continue
+    const current = byId.get(original.id)
+    if (!current) {
+      errors.push(`constraint '${original.id}' was confirmed during Intake and must not be removed`)
+      continue
+    }
+    for (const field of ['statement', 'kind', 'strength'] as const) {
+      if (current[field] !== original[field]) {
+        errors.push(`constraint '${original.id}'.${field} was confirmed during Intake as ${JSON.stringify(original[field])} and must not be changed to ${JSON.stringify(current[field])}`)
+      }
+    }
+    if (current.origin !== 'intake') errors.push(`constraint '${original.id}'.origin must stay 'intake'`)
+  }
   return errors
 }
 
@@ -419,6 +706,12 @@ export function renderLayeredDesignMarkdown(ledger: LoopConstraintLedger, design
 
 export function renderSemanticReviewMarkdown(review: LayeredSemanticReview): string {
   const lines = ['# Loop Semantic Review', '', `Accepted: ${review.accepted ? 'yes' : 'no'}`, '']
+  if (review.verdicts?.length) {
+    lines.push('## Per-constraint verdicts', '',
+      table(['Constraint', 'Verdict', 'Rule class', 'Graph refs', 'Justification'],
+        review.verdicts.map(row => [row.constraintId, row.verdict, row.ruleClass ?? '—', row.graphRefs.join(', ') || '—', row.justification ?? '—'])),
+      '')
+  }
   for (const layer of SEMANTIC_REVIEW_LAYERS) {
     const result = review.layers[layer]
     lines.push(`## ${layer}`, '', `Status: ${result.status}`, '')
@@ -429,6 +722,9 @@ export function renderSemanticReviewMarkdown(review: LayeredSemanticReview): str
         `  Sources: ${finding.sourceRefs.join(', ') || '—'}  `,
         `  Blueprint: ${finding.designRefs.join(', ') || '—'}  `,
         `  Graph: ${finding.graphRefs.join(', ') || '—'}`)
+      if (finding.witness) {
+        lines.push(`  Witness: ${finding.witness.outcome} via ${finding.witness.path.join(' → ')} with state ${JSON.stringify(finding.witness.state)}`)
+      }
     }
     lines.push('')
   }

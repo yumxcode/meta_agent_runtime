@@ -2,6 +2,19 @@ import { describe, expect, it } from 'vitest'
 import { createSelfTimerTool } from '../SelfTimerTool.js'
 
 describe('self_timer', () => {
+  it('directs long remote training waits to durable scheduling', () => {
+    const tool = createSelfTimerTool({
+      getOutstandingSubAgents: () => ({ runningIds: [], queued: 0 }),
+    })
+    expect(tool.description).toContain('remote training')
+    expect(tool.description).toContain('longer than 1 hour')
+    expect(tool.description).toContain('instead of sleep')
+    expect(
+      (tool.inputSchema.properties?.['afterMs'] as { description?: string })
+        .description,
+    ).toContain('remote training expected to run longer than 1 hour')
+  })
+
   it('returns a first-class park control request', async () => {
     const tool = createSelfTimerTool({
       getOutstandingSubAgents: () => ({ runningIds: [], queued: 0 }),

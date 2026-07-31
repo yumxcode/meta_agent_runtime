@@ -4,6 +4,7 @@ import { join } from 'node:path'
 import { afterEach, describe, expect, it } from 'vitest'
 import {
   SEMANTIC_REVIEW_LAYERS,
+  WITNESS_REQUIRED_RULE_CLASSES,
   createDefaultGraphRuntimeCatalog,
   createFileDistillCheckpointStore,
   distillLoopGraph,
@@ -32,28 +33,46 @@ const graph: LoopGraphSpec = {
   transitions: [{ id: 'done', from: 'work', to: 'done' }, { id: 'failed', from: 'work', on: 'failure', to: 'done' }],
   entrypoints: [{ id: 'start', node: 'work' }], limits: { maxActivations: 3 },
 }
+// Every hard constraint in scope needs a row, and `satisfied` needs a pointer
+// that actually resolves — the enumeration contract is what makes "not
+// mentioned" stop meaning "probably fine".
 const review = {
-  schemaVersion: 'loop-semantic-review-2.1', accepted: true, issues: [] as string[], advisories: [] as string[],
+  schemaVersion: 'loop-semantic-review-2.2', accepted: true, issues: [] as string[], advisories: [] as string[],
+  verdicts: [{ constraintId: 'C1', verdict: 'satisfied', graphRefs: ['/goal'] }] as unknown[],
   layers: Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
     status: 'pass', findings: [] as unknown[], evidence: [{ sourceRefs: ['requirements.md:line 1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
   }])),
 }
 
 /** A rejection now needs a blocking rule class: the host derives `accepted`
- * from the findings, so a bare issue string would parse as acceptance. */
+ * from the findings, so a bare issue string would parse as acceptance.
+ *
+ * Control-flow classes additionally need a structurally valid witness, or the
+ * host demotes them to advisory. The fixture supplies a real Transition id from
+ * `graph` so these rejections keep testing accumulation rather than accidentally
+ * exercising the demotion path. */
 function rejectedReview(
   issue: string,
   failedLayer: typeof SEMANTIC_REVIEW_LAYERS[number] = 'workspace_contract',
   ruleClass = 'writer-boundary-bypass',
 ): typeof review {
+  const witness = WITNESS_REQUIRED_RULE_CLASSES.includes(ruleClass as typeof WITNESS_REQUIRED_RULE_CLASSES[number])
+    ? { state: {}, path: ['done'], outcome: 'terminal_unreachable' }
+    : undefined
   const layers = Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
     status: layer === failedLayer ? 'fail' : 'pass',
     findings: layer === failedLayer
-      ? [{ ruleClass, statement: issue, sourceRefs: ['requirements.md:line 1'], designRefs: ['workspace'], graphRefs: ['/lanes'] }]
+      ? [{
+          ruleClass, statement: issue, sourceRefs: ['requirements.md:line 1'], designRefs: ['workspace'], graphRefs: ['/lanes'],
+          ...(witness ? { witness } : {}),
+        }]
       : [],
     evidence: [{ sourceRefs: ['requirements.md:line 1'], designRefs: ['workspace'], graphRefs: ['/lanes'], statement: layer === failedLayer ? issue : 'Aligned.' }],
   }]))
-  return { ...review, accepted: false, layers, issues: [issue] }
+  return {
+    ...review, accepted: false, layers, issues: [issue],
+    verdicts: [{ constraintId: 'C1', verdict: 'violated', ruleClass, graphRefs: ['/lanes'] }],
+  }
 }
 
 describe('Distill Architect checkpoint', () => {

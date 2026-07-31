@@ -3,10 +3,11 @@ import { dirname, resolve } from 'node:path'
 import type { GraphRuntimeCatalog } from '../runtime/GraphCatalog.js'
 import type { LoopGraphSpec } from '../spec/GraphTypes.js'
 import { freezeLoopGraph, validateLoopGraph } from '../spec/GraphValidate.js'
-import { formatGraphLintFindings, lintLoopGraph } from '../spec/GraphLint.js'
+import { formatGraphLintFindings, lintLoopGraph, type GraphLintFinding } from '../spec/GraphLint.js'
 import type { GraphDistillExecutor, GraphDistillPhase } from './ForegroundGraphDistillExecutor.js'
 import type { DistillCheckpointStore } from './DistillCheckpoint.js'
 import { renderTraceOutput, type DistillTraceStore } from './DistillTrace.js'
+import { structuredJsonCandidates } from './JsonEnvelope.js'
 import {
   GRAPH_TRACEABILITY_SCHEMA,
   LOOP_CONSTRAINTS_SCHEMA,
@@ -22,21 +23,38 @@ import {
   formatEnforcementLoci,
   buildGraphImplementationManifest,
   emptyLoopPreconditions,
+  enforcementLocusIndex,
+  hashPointerRegions,
   renderLoopBlueprintMarkdown,
   renderSemanticReviewMarkdown,
+  requiresControlFlowWitness,
+  staleVerdicts,
   validateConstraintLedger,
+  validateControlFlowWitness,
   validateGraphTraceability,
+  validateIntakeLedgerPreservation,
   validateLoopBlueprint,
   validateLoopPreconditions,
+  CONTROL_FLOW_WITNESS_OUTCOMES,
+  WITNESS_REQUIRED_RULE_CLASSES,
+  type ConstraintVerdict,
+  type ConstraintVerdictRow,
+  type ControlFlowWitness,
   type GraphImplementationManifest,
   type GraphTraceabilityMap,
   type LayeredSemanticReview,
   type LoopBlueprint,
   type LoopConstraintLedger,
   type LoopPreconditions,
+  type SemanticEnforcementLocus,
   type SemanticFinding,
   type SemanticRuleClass,
 } from './DistillDesign.js'
+import {
+  formatIntakeLedgerForArchitect,
+  intakeGuidanceForIssues,
+  type LoopIntakeRecord,
+} from './DistillIntake.js'
 
 export interface DistillGraphResult {
   constraints: LoopConstraintLedger
@@ -121,6 +139,26 @@ async function atomicWrite(path: string, content: string): Promise<void> {
 export interface DistillSource {
   requirement: string
   projectDir: string
+  /** Human-confirmed ledger from `loop intake`, when one exists for exactly
+   * this requirement text. Optional by design: forcing Intake would make
+   * "change one word and re-run" expensive, and a well-specified document does
+   * not need it. Its presence changes the Architect from an extractor into a
+   * validator (see `buildLoopArchitectSystem`). */
+  intake?: LoopIntakeRecord
+}
+
+/** Raised when a reviewer rejects a contract the human already signed off. The
+ * model may not overrule an Intake ledger by re-deriving it; the question goes
+ * back to the person who answered it. */
+export class DistillIntakeGateError extends Error {
+  readonly name = 'DistillIntakeGateError'
+  constructor(readonly issues: readonly string[], readonly requirement: string) {
+    super([
+      'Semantic review rejected constraints that were confirmed during Intake, so Distill stopped instead of re-deriving them:',
+      ...issues.map(issue => `- ${issue}`),
+      `Resolve them in the source or re-run: meta-agent loop intake ${requirement}`,
+    ].join('\n'))
+  }
 }
 
 /** Scenario-neutral source graph embedded verbatim in the Compiler prompt.
@@ -250,6 +288,13 @@ export const GRAPH_DISTILL_PHASE_POLICY: Record<GraphDistillPhase, {
   maxTurns: number
   maxBudgetUsd: number
 }> = {
+  // Intake is a conversation with a human, not a compilation step: it spends
+  // most of its turns on ask_user round-trips and mechanical pre-checks, so it
+  // needs a much larger turn allowance than the batch phases.
+  intake: {
+    thinkingBudgetTokens: 8_000, maxOutputTokens: 32_768,
+    maxWallTimeMs: 3_600_000, maxTurns: 60, maxBudgetUsd: 10,
+  },
   architect: {
     thinkingBudgetTokens: 12_000, maxOutputTokens: 32_768,
     maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10,
@@ -387,7 +432,7 @@ async function compileLoopGraph(
 ): Promise<DistillGraphResult> {
   const maxAttempts = deps.maxAttempts ?? 3
   const signal = deps.signal ?? new AbortController().signal
-  const architectSystemPrompt = buildLoopArchitectSystem()
+  const architectSystemPrompt = buildLoopArchitectSystem(Boolean(source.intake))
   const compilerSystemPrompt = buildGraphDistillerSystem(deps.catalog)
   let architecture: { constraints: LoopConstraintLedger; design: LoopBlueprint } | undefined
   let architectErrors: string[] = []
@@ -418,7 +463,10 @@ async function compileLoopGraph(
       taskDescription: [
         buildTask(attempt, architectErrors),
         '【本阶段任务：Architect】',
-        '读取来源并只输出 {constraints,design}。先把自然语言约束稳定为可审查的三面 Loop Blueprint，不要在本阶段输出 Graph。若缺少会改变权限、路由或安全边界的信息，使用 ask_user。',
+        source.intake
+          ? '来源的约束台账已由人在 Intake 阶段逐条确认。本阶段不重新抽取：核对台账与来源、按需**追加**你在项目中发现的新约束，然后输出 {constraints,design}。不要在本阶段输出 Graph。'
+          : '读取来源并只输出 {constraints,design}。先把自然语言约束稳定为可审查的三面 Loop Blueprint，不要在本阶段输出 Graph。若缺少会改变权限、路由或安全边界的信息，使用 ask_user。',
+        ...(source.intake ? [formatIntakeLedgerForArchitect(source.intake)] : []),
       ].join('\n\n'),
       systemPrompt: architectSystemPrompt,
       allowedTools: ['read_file', 'grep', 'glob', 'ask_user'],
@@ -449,6 +497,11 @@ async function compileLoopGraph(
       architectureErrors = [
         ...validateConstraintLedger(candidate.constraints),
         ...validateLoopBlueprint(candidate.design, candidate.constraints),
+        // Appending is welcome; restating what the human settled is not. This
+        // is enforced here rather than trusted to the system prompt, because
+        // the immutability of the confirmed subset is the entire reason Intake
+        // is worth running.
+        ...(source.intake ? validateIntakeLedgerPreservation(candidate.constraints, source.intake) : []),
       ]
     } catch (error) {
       architectureErrors = [`layered design shape could not be validated: ${error instanceof Error ? error.message : String(error)}`]
@@ -482,6 +535,16 @@ async function compileLoopGraph(
   // the constraint set is revealed incrementally and earlier findings stay
   // binding even after the candidate changes.
   const semanticHistory: Array<{ attempt: number; issues: string[] }> = []
+  // Cross-round verdict ledger. The reviewer is stateless and re-derives its
+  // conclusions from scratch, so without this the compiler chases a target that
+  // moves every round while the semantic repair budget — three rounds — drains.
+  // See `ConstraintVerdict`: there is deliberately no full re-review before
+  // acceptance, and the cost of that choice is traced rather than hidden.
+  const verdictLedger = new Map<string, ConstraintVerdict>()
+  const enforcementLoci = enforcementLocusIndex(architecture.constraints)
+  const hardConstraintIds = architecture.constraints.constraints
+    .filter(constraint => constraint.strength === 'hard' && constraint.id)
+    .map(constraint => constraint.id)
   const combinedErrors = (): string[] => [...semanticErrors, ...mechanicalErrors]
   let compilerDraft: {
     graph: LoopGraphSpec
@@ -595,6 +658,7 @@ async function compileLoopGraph(
     let errors: string[]
     let executableRepairRequired = false
     let lintWarnings: string[] = []
+    let lintWarningFindings: GraphLintFinding[] = []
     try {
       const graphErrors = validateLoopGraph(parsed.graph, deps.catalog)
       // Write-surface lint: error-level findings (external write targets,
@@ -614,7 +678,8 @@ async function compileLoopGraph(
       if (!graphErrors.length) {
         const lint = lintLoopGraph(parsed.graph)
         blockingLint = formatGraphLintFindings(lint.filter(finding => finding.level === 'error'))
-        lintWarnings = formatGraphLintFindings(lint.filter(finding => finding.level === 'warning'))
+        lintWarningFindings = lint.filter(finding => finding.level === 'warning')
+        lintWarnings = formatGraphLintFindings(lintWarningFindings)
       }
       executableRepairRequired = graphErrors.length > 0 || blockingLint.length > 0
       errors = [
@@ -641,11 +706,31 @@ async function compileLoopGraph(
         deps.onProgress?.({ type: 'validation_passed', phase: 'compiler', attempt })
         let semanticReview = skippedSemanticReview()
         if (deps.semanticReview !== false) {
+          // Carry forward every verdict whose evidence has not moved, and ask
+          // the reviewer only about the rest. `staleVerdicts` resolves any
+          // ambiguity toward re-review, which is the only safety margin left
+          // once the final full re-review was dropped.
+          const stale = staleVerdicts([...verdictLedger.values()], parsed.traceability, parsed.graph)
+          const carried = [...verdictLedger.values()]
+            .filter(verdict => verdict.verdict === 'pass' && !stale.has(verdict.constraintId))
+          const carriedIds = new Set(carried.map(verdict => verdict.constraintId))
+          const reviewScope = hardConstraintIds.filter(id => !carriedIds.has(id))
           const reviewed = await reviewGraphSemantics(reviewSource, {
-            ...architecture, ...parsed, manifest, preconditions, lintWarnings,
-          }, deps, signal, attempt)
+            ...architecture, ...parsed, manifest, preconditions, lintWarningFindings,
+          }, deps, signal, attempt, { carried, reviewScope, loci: enforcementLoci })
           semanticReview = reviewed.review
           reviewerAttempts += reviewed.attempts
+          for (const verdict of carried) {
+            await deps.trace?.event({
+              phase: 'semantic_review', revision: semanticRevision, compilerAttempt: attempt,
+              outcome: 'verdict_carried', constraintId: verdict.constraintId,
+              decidedAtCompilerAttempt: verdict.decidedAtCompilerAttempt,
+              evidenceHash: verdict.evidenceHash, outOfScope: verdict.outOfScope === true,
+            })
+          }
+          await recordConstraintVerdicts(verdictLedger, semanticReview, parsed.traceability, parsed.graph, attempt, {
+            loci: enforcementLoci, revision: semanticRevision, trace: deps.trace,
+          })
           // The layered verdict — with its per-layer evidence pointing from
           // source locators to Graph JSON pointers — is the whole value of the
           // review. Persist it on every outcome, not just acceptance.
@@ -680,6 +765,13 @@ async function compileLoopGraph(
             // intent_constraints means the source ledger/Blueprint itself is
             // incomplete enough to justify one bounded Architect reread.
             if (semanticRevision < 1 && semanticReview.layers.intent_constraints.status === 'fail') {
+              // With a human-confirmed ledger the reread is the wrong remedy
+              // for the confirmed subset: re-deriving it would discard the very
+              // decisions Intake exists to capture. Findings that only touch
+              // entries the Architect appended are still the model's own work,
+              // so those keep the original recursion.
+              const confirmed = confirmedConstraintIssues(semanticReview, source.intake)
+              if (confirmed.length) throw new DistillIntakeGateError(confirmed, source.requirement)
               await deps.checkpoint?.clear()
               const reviewErrors = [...semanticErrors]
               return compileLoopGraph(source, { ...deps, checkpoint: undefined }, (nextAttempt, lastErrors) => [
@@ -758,7 +850,33 @@ async function compileLoopGraph(
     mechanicalErrors = errors
     deps.onProgress?.({ type: 'validation_failed', phase: 'compiler', attempt, issues: mechanicalErrors })
   }
-  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${combinedErrors().join('\n- ')}${traceHint(deps.trace)}`)
+  throw new Error(`graph compiler failed after ${compilerAttemptLimit} attempts (bounded lowering/envelope recovery plus ${MAX_LOCAL_SEMANTIC_REPAIRS} semantic and ${MAX_LATE_COMPILER_RECOVERIES} late compiler recovery reserve):\n- ${combinedErrors().join('\n- ')}${traceHint(deps.trace)}`
+    // Point at Intake only when the source is what failed. Suggesting it for a
+    // wrong JSON pointer would send the user to answer questions about a
+    // problem that was never theirs.
+    + intakeGuidanceForIssues(combinedErrors(), source.requirement, Boolean(source.intake)))
+}
+
+/** Blocking findings that name a constraint the human confirmed during Intake. */
+function confirmedConstraintIssues(review: LayeredSemanticReview, intake: LoopIntakeRecord | undefined): string[] {
+  if (!intake?.approvedConstraintIds?.length) return []
+  const approved = new Set(intake.approvedConstraintIds)
+  const violated = new Set((review.verdicts ?? [])
+    .filter(row => row.verdict === 'violated' && approved.has(row.constraintId))
+    .map(row => row.constraintId))
+  const named = review.issues.filter(issue => [...approved].some(id => issue.includes(id)))
+  return [...new Set([
+    ...named,
+    ...[...violated].map(id => `constraint ${id} (confirmed during Intake) was reported as violated`),
+  ])]
+}
+
+export interface SemanticReviewRound {
+  /** Verdicts the host is carrying forward; the reviewer must not revisit them. */
+  carried: readonly ConstraintVerdict[]
+  /** Hard constraint ids this round must adjudicate. */
+  reviewScope: readonly string[]
+  loci: ReadonlyMap<string, SemanticEnforcementLocus>
 }
 
 async function reviewGraphSemantics(
@@ -770,15 +888,18 @@ async function reviewGraphSemantics(
     traceability: GraphTraceabilityMap
     manifest: GraphImplementationManifest
     preconditions: LoopPreconditions
-    lintWarnings?: string[]
+    lintWarningFindings?: readonly GraphLintFinding[]
     taskSpec: string
   },
   deps: DistillGraphDeps,
   signal: AbortSignal,
   compilerAttempt: number,
+  round: SemanticReviewRound,
 ): Promise<{ review: LayeredSemanticReview; attempts: number }> {
   const maxReviewAttempts = 2
   let lastError = 'semantic reviewer returned no valid verdict'
+  const relevantLint = formatGraphLintFindings(
+    selectRelevantLintWarnings(parsed.lintWarningFindings ?? [], parsed.graph, parsed.traceability, round.reviewScope))
   for (let attempt = 1; attempt <= maxReviewAttempts; attempt++) {
     throwIfDistillAborted(signal, 'semantic_review')
     deps.onProgress?.({ type: 'phase_started', phase: 'semantic_review', attempt, maxAttempts: maxReviewAttempts })
@@ -797,8 +918,9 @@ async function reviewGraphSemantics(
         '【约束到 Graph 的 Traceability】', JSON.stringify(parsed.traceability),
         '【Kernel 机械提取的实现清单】', JSON.stringify(parsed.manifest),
         '【运行前置条件清单】', JSON.stringify(parsed.preconditions),
-        ...(parsed.lintWarnings?.length
-          ? ['【机械 Lint 提示（须逐条用工具核验，不得忽略）】', parsed.lintWarnings.map(item => `- ${item}`).join('\n')]
+        formatSemanticReviewScope(round),
+        ...(relevantLint.length
+          ? ['【机械 Lint 提示（与本轮待裁决约束相关，供定位用）】', relevantLint.map(item => `- ${item}`).join('\n')]
           : []),
         '【编译说明】', parsed.taskSpec,
       ].join('\n\n'),
@@ -814,11 +936,129 @@ async function reviewGraphSemantics(
       continue
     }
     deps.onProgress?.({ type: 'phase_completed', phase: 'semantic_review', attempt })
-    const parsedReview = parseLayeredSemanticReview(record.output, record.summary)
+    const parsedReview = parseLayeredSemanticReview(record.output, record.summary, {
+      graph: parsed.graph,
+      requiredConstraintIds: round.reviewScope,
+    })
     if (parsedReview) return { review: parsedReview, attempts: attempt }
-    lastError = `status=${record.status} error=${record.error ?? '(none)'}`
+    lastError = `status=${record.status} error=${record.error ?? '(none)'}；`
+      + `裁决必须为本轮范围内的每条 hard constraint 给出一行 verdict（缺行即作废），`
+      + `satisfied 必须带真实存在的 graphRefs，out_of_scope 必须带 justification`
   }
   return { review: rejectedSemanticReview(`semantic reviewer returned no valid layered verdict after ${maxReviewAttempts} attempts; ${lastError}`), attempts: maxReviewAttempts }
+}
+
+/**
+ * Tell the reviewer exactly what it is being asked to decide.
+ *
+ * Without this the reviewer re-derives the whole constraint set every round and
+ * reports a different sample of it each time, which is indistinguishable from
+ * the graph getting worse. Naming the carried set is as important as naming the
+ * scope: a reviewer that re-litigates a settled constraint would reintroduce
+ * the moving target the ledger exists to remove.
+ */
+function formatSemanticReviewScope(round: SemanticReviewRound): string {
+  const lines = ['【本轮复核范围（宿主判定，不可自行扩大）】']
+  if (round.carried.length) {
+    lines.push(
+      `以下约束在此前轮次已核验通过，且其证据区域本轮未改动，**不要重新裁决，也不要为它们产出 finding 或 verdict 行**：${round.carried.map(item => item.constraintId).join('、')}`,
+    )
+  }
+  lines.push(round.reviewScope.length
+    ? `本轮必须逐条裁决的 hard constraint：${round.reviewScope.join('、')}。verdicts 数组必须为其中**每一条**给出一行，缺行整份裁决作废。`
+    : '本轮没有需要重新裁决的 hard constraint；verdicts 可以为空数组，但仍需给出各层证据。')
+  const scoped = new Set(round.reviewScope)
+  const loci = round.reviewScope
+    .map(id => `${id}=${round.loci.get(id) ?? 'agent'}`)
+    .join(' · ')
+  if (loci) lines.push(`本轮范围内各约束的执行落点：${loci}`)
+  if ([...scoped].some(id => round.loci.get(id) === 'graph' || round.loci.get(id) === 'reviewer')) {
+    lines.push('提醒：graph / reviewer 落点的约束填 out_of_scope 会被记录并呈现给人类审阅者；只有当该约束确实不该由 Graph 层核验时才这样填，并写清理由。')
+  }
+  return lines.join('\n')
+}
+
+/**
+ * Only hand the reviewer lint warnings it can act on this round.
+ *
+ * The whole warning set used to be injected with an instruction to verify every
+ * item. Warnings change with the graph, so each round produced a fresh batch of
+ * mandatory questions — the host was manufacturing exactly the round-to-round
+ * variance the ratchet is meant to remove.
+ *
+ * `single-agent-terminal-authority` is dropped outright: it is also a blocking
+ * semantic class, and one rule belongs in one place. Lint sees topology, the
+ * reviewer judges independence; keeping both made the reviewer re-derive a
+ * conclusion it was already primed with.
+ */
+function selectRelevantLintWarnings(
+  findings: readonly GraphLintFinding[],
+  graph: LoopGraphSpec,
+  traceability: GraphTraceabilityMap,
+  reviewScope: readonly string[],
+): GraphLintFinding[] {
+  const scope = new Set(reviewScope)
+  const refs = (traceability?.mappings ?? [])
+    .filter(mapping => scope.has(mapping.constraintId))
+    .flatMap(mapping => Array.isArray(mapping.graphRefs) ? mapping.graphRefs : [])
+  const anchors = new Set<string>()
+  for (const pointer of refs) {
+    const node = /^\/nodes\/([^/]+)/.exec(pointer)?.[1]
+    if (node) {
+      const decoded = node.replace(/~1/g, '/').replace(/~0/g, '~')
+      anchors.add(decoded)
+      const lane = (graph.nodes?.[decoded] as { lane?: unknown } | undefined)?.lane
+      if (typeof lane === 'string') anchors.add(lane)
+    }
+    const lane = /^\/lanes\/([^/]+)/.exec(pointer)?.[1]
+    if (lane) anchors.add(lane.replace(/~1/g, '/').replace(/~0/g, '~'))
+  }
+  return findings.filter(finding => {
+    if (finding.rule === 'single-agent-terminal-authority') return false
+    if (!anchors.size) return false
+    return [...anchors].some(anchor => finding.at.includes(anchor))
+  })
+}
+
+/**
+ * Fold this round's verdicts into the ledger and surface the one escape hatch.
+ *
+ * `out_of_scope` on a graph- or reviewer-locus constraint is legal and
+ * non-blocking by decision, so the only thing standing between it and a silent
+ * pass is that it gets written down twice: into the trace for later counting,
+ * and into the advisories, where a human reading the draft summary will see it.
+ */
+async function recordConstraintVerdicts(
+  ledger: Map<string, ConstraintVerdict>,
+  review: LayeredSemanticReview,
+  traceability: GraphTraceabilityMap,
+  graph: LoopGraphSpec,
+  attempt: number,
+  context: { loci: ReadonlyMap<string, SemanticEnforcementLocus>; revision: number; trace?: DistillTraceStore },
+): Promise<void> {
+  const refsById = new Map((traceability?.mappings ?? [])
+    .map(mapping => [mapping.constraintId, Array.isArray(mapping.graphRefs) ? mapping.graphRefs : []]))
+  for (const row of review.verdicts ?? []) {
+    const refs = refsById.get(row.constraintId) ?? row.graphRefs
+    const locus = context.loci.get(row.constraintId)
+    if (row.verdict === 'out_of_scope' && (locus === 'graph' || locus === 'reviewer')) {
+      const note = `[out-of-scope] ${row.constraintId}（${locus} 落点）被判为不适用而非核验通过：${row.justification ?? '(未给出理由)'}`
+      if (!review.advisories.includes(note)) review.advisories.push(note)
+      await context.trace?.event({
+        phase: 'semantic_review', revision: context.revision, compilerAttempt: attempt,
+        outcome: 'out_of_scope_escape', constraintId: row.constraintId, locus,
+        justification: row.justification ?? null,
+      })
+    }
+    ledger.set(row.constraintId, {
+      constraintId: row.constraintId,
+      verdict: row.verdict === 'violated' ? 'fail' : 'pass',
+      evidenceHash: hashPointerRegions(graph, refs),
+      decidedAtCompilerAttempt: attempt,
+      ...(row.ruleClass ? { ruleClass: row.ruleClass } : {}),
+      ...(row.verdict === 'out_of_scope' ? { outOfScope: true } : {}),
+    })
+  }
 }
 
 function formatGraphVisibilityManifest(graph: LoopGraphSpec): string {
@@ -877,7 +1117,7 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 5. capability_resolution：graph 落点的 hard constraint，其 graphRefs 指向真实实现；Graph 使用的工具、Skill、Function、Reducer 与 Effect 确实可用，缺口没有被伪装成已实现。
 6. runtime_preconditions：用 glob/read_file 抽查运行现实——Agent prompt 声明读取的每个具体文件、每个 Lane 写路径，在真实项目中要么已存在，要么由 loop 自身创建，要么出现在 preconditions 清单中；首个 Activation 依赖但项目中缺失且不在清单里的文件、未列出的外部 CLI/凭据、以及被默认代答却未列为 decision 的决策，都必须 fail。凭空发明的目录名（项目中不存在且无人创建）必须 fail。
 
-【已由确定性 Lint 拥有，不要复查】以下条目已在 lintLoopGraph 中以 error/warning 机械判定，Compiler 收到过同样的诊断。你重复检查只会增加噪声与误报，一律不要作为 finding 提出：Agent prompt 中的绝对路径/家目录路径；指向项目外的写操作；prompt 显式写入但 Lane.workspace.write 未覆盖的路径（undeclared-workspace-write）；prompt 指示写入本 Lane 明确 deny 的路径（prompt-writes-denied-path）；git add/commit/push 缺少 scm Lane 或 owned 前缀；每个 agent 节点 budget.wallTimeMs 是否声明及是否达到 300000ms 下限；不同 Lane 写路径前缀重叠；对已被 write rule 覆盖的目录额外调用 bash mkdir；同 Lane 内 Agent 拆分（same-lane-agent-split）；某输入在所有入边上都被绑定为 literal null 的死输入（dead-null-input）。
+【已由确定性 Lint 拥有，不要复查】以下条目已在 lintLoopGraph 中以 error/warning 机械判定，Compiler 收到过同样的诊断。你重复检查只会增加噪声与误报，一律不要作为 finding 提出：Agent prompt 中的绝对路径/家目录路径；指向项目外的写操作；prompt 显式写入但 Lane.workspace.write 未覆盖的路径（undeclared-workspace-write）；prompt 指示写入本 Lane 明确 deny 的路径（prompt-writes-denied-path）；git add/commit/push 缺少 scm Lane 或 owned 前缀；每个 agent 节点 budget.wallTimeMs 是否声明及是否达到 300000ms 下限；不同 Lane 写路径前缀重叠；对已被 write rule 覆盖的目录额外调用 bash mkdir；同 Lane 内 Agent 拆分（same-lane-agent-split）；某输入在所有入边上都被绑定为 literal null 的死输入（dead-null-input）；从 entrypoints 出发不可达的终态（terminal-unreachable）——可达性是纯图算法，已被精确判定，你不要再自行推断哪个终态到不了。
 
 若原始来源中的 hard constraint 在 Constraint Ledger 或 Blueprint 中漏记，intent_constraints 必须 fail；若合同已经保留、只是最终 Graph 的路由、写权限、能力或前置条件 lower 错误，只在对应实现层 fail。这个分层决定后续由 Architect 还是 Compiler 修复，不得把局部 Graph 错误误报成上游合同缺失。
 
@@ -891,7 +1131,9 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 
 同一条约束不要跨落点重复提出。若你认为某条的落点判错了（例如一条本质是阈值路由的约束被标成 agent），把它作为 intent_constraints 层的 finding 陈述理由，而不是直接按 graph 标准去要求它。
 
-user prompt 若附带【机械 Lint 提示】，每条都必须在对应层给出核验证据，不得复述提示了事。项目现实类提示用 glob/read_file 实地核验（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或由前置条件保证 .git）。核验不成立即作为对应层的 finding 提出。
+user prompt 若附带【机械 Lint 提示】，那是宿主为你**定位**本轮待裁决约束而挑出的相关提示，不是必答题清单。核验不成立才提 finding；成立则无需为它单独产出 evidence。项目现实类提示用 glob/read_file 实地核验（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或由前置条件保证 .git）。
+
+【本轮复核范围】user prompt 会给出宿主判定的复核范围。已被宿主标记为"此前轮次已通过且证据未变"的约束，**不要重新裁决、不要产出 verdict 行、也不要为它们提 finding**——重新翻案会让整个复核退回到每轮换一批问题的状态，那正是这套机制要消除的。你只对本轮范围内的约束负责。
 
 Graph annotations 不会注入 Agent prompt，也不执行：任何落点的 hard constraint 都不能仅靠 annotations、taskSpec 或 rationale 满足，Agent prompt 依赖 annotations 中的值同样记 annotation-only-satisfaction。write mode 与 append/replace 语义不一致记 workspace-mode-mismatch。
 
@@ -911,9 +1153,24 @@ Graph annotations 不会注入 Agent prompt，也不执行：任何落点的 har
 
 【严重度不由你决定】你只负责给出 finding 及其 ruleClass；宿主按 ruleClass 计算 accepted，你输出的 accepted 字段会被丢弃。阻断级 ruleClass 恰好是：${BLOCKING_SEMANTIC_RULE_CLASSES.join('、')}。建议级 ruleClass 恰好是：${ADVISORY_SEMANTIC_RULE_CLASSES.join('、')}。不得为了让候选通过而把真实的硬约束不符填成建议级；也不得为了显得严格而把风格偏好填成阻断级。ruleClass 必须取自上述枚举，其他值会使整份裁决作废。
 
-【提出 finding 前自检】① 该约束的落点是什么？agent 落点不要求 Graph 元素。② 这条是否已被确定性 Lint 拥有？是则不提。③ 证据是否指向真实存在的 JSON pointer 或来源行号？拿不出引用的判断属于猜测，不要提。④ 这是"来源合同没被满足"还是"我会换个写法"？后者最多是建议级。
+【反例义务：控制流阻断必须可核验】以下三类 ruleClass 的 finding 必须附带 witness，否则宿主会自动把它降级为建议级 unwitnessed-control-flow：${WITNESS_REQUIRED_RULE_CLASSES.join('、')}。
 
-只输出 JSON，schemaVersion 必须是 ${SEMANTIC_REVIEW_SCHEMA}。layers 必须恰好覆盖 ${SEMANTIC_REVIEW_LAYERS.join(', ')}。每层结构为 {"status":"pass|fail|not_applicable","evidence":[{"sourceRefs":["需求或项目 path:locator"],"designRefs":["Blueprint section"],"graphRefs":["Graph JSON pointer"],"statement":"核验结论"}],"findings":[{"ruleClass":"枚举值","statement":"问题陈述","sourceRefs":[],"designRefs":[],"graphRefs":[]}]}。每层最多 2 条 evidence，同一结论的多个引用合并进数组；不要重复输出第二份 JSON。某层含阻断级 finding 时该层 status 必须是 fail；status=fail 的层必须至少含一条阻断级 finding；status 为 pass 或 not_applicable 的层只能含建议级 finding 或空数组。`
+witness 的结构是 {"state":{State 字段名: 取值},"path":["transition-id", …],"outcome":"${CONTROL_FLOW_WITNESS_OUTCOMES.join('|')}"}。宿主会机械核对：state 的每个键必须是 graph.state 中真实存在的字段；path 的每个元素必须是真实存在的 Transition id，且相邻两条首尾相接（前一条的 to 必须包含后一条的 from）。
+
+这条不是形式主义：真实的终态不可达、真实的上限突破、真实的状态分叉，都能给出一条具体的见证路径；"我觉得这里不够严谨"给不出。给不出反例时请直接填建议级 ruleClass（threshold-truth-table / branch-priority 等），不要填阻断级——填了也会被降级，只是白白让人多读一条噪声。
+
+【提出 finding 前自检】① 该约束的落点是什么？agent 落点不要求 Graph 元素。② 这条是否已被确定性 Lint 拥有？是则不提。③ 证据是否指向真实存在的 JSON pointer 或来源行号？拿不出引用的判断属于猜测，不要提。④ 这是"来源合同没被满足"还是"我会换个写法"？后者最多是建议级。⑤ 若属于上面三类控制流阻断，我能给出结构合法的 witness 吗？给不出就填建议级。
+
+只输出 JSON，schemaVersion 必须是 ${SEMANTIC_REVIEW_SCHEMA}。顶层必须同时包含 verdicts 与 layers。
+
+【verdicts：本轮范围内每条 hard constraint 恰好一行】结构为 {"constraintId":"C7","verdict":"satisfied|violated|out_of_scope","ruleClass":"违规时必填","justification":"out_of_scope 时必填","graphRefs":["JSON pointer"]}。
+
+- **缺行整份裁决作废。** 这张表的全部意义在于"你没提"不再等于"大概没问题"——所以每一条都必须表态，包括那些你认为显然没问题的。
+- satisfied 必须给出至少一个**真实存在**的 graphRefs 指针（指向实现处）。给不出指针就说明你没有核验过它，请如实填 violated 或 out_of_scope。
+- violated 的 ruleClass 必须取自枚举，并与 layers 中对应的 finding 一致。
+- out_of_scope 用于"这条约束本就不该由 Graph 层核验"，必须写清理由。graph / reviewer 落点上使用它会被记录并呈现给人类审阅者。
+
+【layers】必须恰好覆盖 ${SEMANTIC_REVIEW_LAYERS.join(', ')}。每层结构为 {"status":"pass|fail|not_applicable","evidence":[{"sourceRefs":["需求或项目 path:locator"],"designRefs":["Blueprint section"],"graphRefs":["Graph JSON pointer"],"statement":"核验结论"}],"findings":[{"ruleClass":"枚举值","statement":"问题陈述","sourceRefs":[],"designRefs":[],"graphRefs":[],"witness":{…}}]}。每层最多 2 条 evidence，同一结论的多个引用合并进数组；不要重复输出第二份 JSON。某层含阻断级 finding 时该层 status 必须是 fail；status=fail 的层必须至少含一条阻断级 finding；status 为 pass 或 not_applicable 的层只能含建议级 finding 或空数组。`
 }
 
 function formatDistillSource(source: DistillSource): string {
@@ -1087,8 +1344,20 @@ export function formatGraphValidationFeedback(errors: readonly string[], graph?:
 
 /** Architect deliberately does not receive the executable Graph ABI. The
  * Blueprint is a semantic handoff, not another executable schema. */
-export function buildLoopArchitectSystem(): string {
+export function buildLoopArchitectSystem(hasIntake = false): string {
+  const intakeContract = hasIntake ? `
+【本次运行带有人已确认的约束台账（Intake）】
+user prompt 中的台账不是草稿，是人逐条看过的决定。规则是不对称的：
+
+- 标注为「已确认·不可改动」的条目：**不得修改、删除或弱化**其 statement、kind、strength，也不得改动 origin。原样保留，包括你不同意的那些；有异议写进 design.assumptions 说明理由。宿主会逐字节比对，改动会导致本阶段校验失败并重试。
+- 你**可以追加**新条目。你是全流程唯一读取项目的阶段，发现来源没写但项目现实要求的约束是你的职责（例如某个 Lane 要写的目录并不存在）。追加的条目必须设 origin:"architect"。
+- 标注为「未确认·可修订」的条目（人跳过没看的）：可以修订，修订后仍设 origin:"intake"。
+- 人已明确暂缓的决策不要替它们代答；它们已在运行前置条件里，由 loop create 拦截。
+
+你在本次运行中的职责因此收窄为：核对台账与来源是否一致、补齐项目现实缺口、产出 Blueprint。
+` : ''
   return `你是 Loop Distill 的前台 Architect。你只负责从原始来源抽取约束并建立简明、领域无关的 Loop Blueprint；不要输出 Graph，不要猜测 Graph ABI，也不要执行任务本身。
+${intakeContract}
 
 【工作方式】
 - user prompt 只给需求文件入口和项目地址。先用 read_file 读取原文；只有设计依赖项目结构、文件、命令、Skill 或 ownership 时，才用 glob/grep/read_file 做最小充分检查。
@@ -1403,7 +1672,28 @@ export function mergeUnresolvedIntoPreconditions(preconditions: LoopPrecondition
   return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items }
 }
 
-export function parseLayeredSemanticReview(output: unknown, summary?: string): LayeredSemanticReview | null {
+/**
+ * Context the host supplies so the verdict can be checked rather than trusted.
+ *
+ * All three fields are optional because the parser is also called directly by
+ * tests and by callers that only want shape validation; the real review path
+ * always supplies them, and that is where the enumeration and witness contracts
+ * are actually enforced.
+ */
+export interface SemanticReviewParseContext {
+  /** Needed to check witnesses and `satisfied` pointers against reality. */
+  graph?: LoopGraphSpec
+  /** Hard constraints this round must adjudicate. A missing row voids the
+   * verdict: the whole point of enumeration is that silence stops meaning
+   * "probably fine". */
+  requiredConstraintIds?: readonly string[]
+}
+
+export function parseLayeredSemanticReview(
+  output: unknown,
+  summary?: string,
+  context?: SemanticReviewParseContext,
+): LayeredSemanticReview | null {
   for (const candidate of structuredCandidates(output, summary)) {
     if (!candidate || typeof candidate !== 'object' || Array.isArray(candidate)) continue
     const object = candidate as Record<string, unknown>
@@ -1414,6 +1704,12 @@ export function parseLayeredSemanticReview(output: unknown, summary?: string): L
     if (!object.layers || typeof object.layers !== 'object' || Array.isArray(object.layers)) continue
     const layers = object.layers as Record<string, unknown>
     if (Object.keys(layers).length !== SEMANTIC_REVIEW_LAYERS.length || Object.keys(layers).some(name => !SEMANTIC_REVIEW_LAYERS.includes(name as typeof SEMANTIC_REVIEW_LAYERS[number]))) continue
+    const verdicts = parseConstraintVerdicts(object.verdicts, context)
+    if (!verdicts) continue
+    if (context?.requiredConstraintIds?.length) {
+      const covered = new Set(verdicts.map(row => row.constraintId))
+      if (context.requiredConstraintIds.some(id => !covered.has(id))) continue
+    }
     let invalid = false
     const normalizedLayers: Record<string, unknown> = {}
     const blocking: SemanticFinding[] = []
@@ -1424,14 +1720,19 @@ export function parseLayeredSemanticReview(output: unknown, summary?: string): L
       const layer = rawLayer as Record<string, unknown>
       if (!['pass', 'fail', 'not_applicable'].includes(String(layer.status))) { invalid = true; break }
       if (!Array.isArray(layer.evidence) || !layer.evidence.length) { invalid = true; break }
-      const findings = parseSemanticFindings(layer.findings)
-      if (!findings) { invalid = true; break }
-      const layerBlocking = findings.filter(finding => isBlockingSemanticRuleClass(finding.ruleClass))
+      const declared = parseSemanticFindings(layer.findings)
+      if (!declared) { invalid = true; break }
+      const declaredBlocking = declared.filter(finding => isBlockingSemanticRuleClass(finding.ruleClass))
       // A `fail` layer must name what failed, and a passing layer must not
       // carry a blocking finding. Advisory findings are legal on any status —
-      // that is the whole point of the split.
-      if (layer.status === 'fail' && !layerBlocking.length) { invalid = true; break }
-      if (layer.status !== 'fail' && layerBlocking.length) { invalid = true; break }
+      // that is the whole point of the split. Both checks run against what the
+      // reviewer DECLARED, before the host demotes anything: an unwitnessed
+      // control-flow claim is still a contract violation if it was parked on a
+      // passing layer.
+      if (layer.status === 'fail' && !declaredBlocking.length) { invalid = true; break }
+      if (layer.status !== 'fail' && declaredBlocking.length) { invalid = true; break }
+      const findings = declared.map(finding => demoteUnwitnessedFinding(finding, context?.graph))
+      const layerBlocking = findings.filter(finding => isBlockingSemanticRuleClass(finding.ruleClass))
       blocking.push(...layerBlocking)
       advisory.push(...findings.filter(finding => !isBlockingSemanticRuleClass(finding.ruleClass)))
       for (const rawEvidence of layer.evidence) {
@@ -1444,18 +1745,96 @@ export function parseLayeredSemanticReview(output: unknown, summary?: string): L
           || layer.status !== 'not_applicable' && (!sourceRefs.length || !designRefs.length && !graphRefs.length)) { invalid = true; break }
       }
       if (invalid) break
-      normalizedLayers[name] = { ...layer, findings }
+      // Every blocking finding on this layer may have been demoted. The layer
+      // then describes only advisory observations, so `fail` would misreport a
+      // graph the host is about to accept.
+      const status = layer.status === 'fail' && !layerBlocking.length ? 'pass' : layer.status
+      normalizedLayers[name] = { ...layer, status, findings }
     }
     if (invalid) continue
     return {
       schemaVersion: SEMANTIC_REVIEW_SCHEMA,
       accepted: blocking.length === 0,
+      verdicts,
       layers: normalizedLayers,
       issues: blocking.map(formatSemanticFinding),
       advisories: advisory.map(formatSemanticFinding),
     } as unknown as LayeredSemanticReview
   }
   return null
+}
+
+/**
+ * One row per hard constraint in scope.
+ *
+ * `satisfied` carries a pointer obligation on purpose: the cheapest way to
+ * satisfy an enumeration requirement is to answer "fine" to everything, and a
+ * pointer that must resolve in the real graph is the one cost a batch answer
+ * cannot pay. `out_of_scope` has no such gate by design (it is the deliberately
+ * lenient path), which is precisely why every use of it on a graph- or
+ * reviewer-locus constraint is traced.
+ */
+function parseConstraintVerdicts(value: unknown, context?: SemanticReviewParseContext): ConstraintVerdictRow[] | null {
+  if (value === undefined) return []
+  if (!Array.isArray(value)) return null
+  const rows: ConstraintVerdictRow[] = []
+  const seen = new Set<string>()
+  for (const raw of value) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+    const item = raw as Record<string, unknown>
+    if (typeof item.constraintId !== 'string' || !item.constraintId.trim()) return null
+    if (seen.has(item.constraintId)) return null
+    seen.add(item.constraintId)
+    const verdict = item.verdict
+    if (verdict !== 'satisfied' && verdict !== 'violated' && verdict !== 'out_of_scope') return null
+    const graphRefs = stringArray(item.graphRefs ?? [])
+    if (!graphRefs) return null
+    if (verdict === 'violated'
+      && (typeof item.ruleClass !== 'string' || !SEMANTIC_RULE_CLASSES.includes(item.ruleClass as SemanticRuleClass))) return null
+    if (verdict === 'out_of_scope' && (typeof item.justification !== 'string' || !item.justification.trim())) return null
+    if (verdict === 'satisfied') {
+      if (!graphRefs.length) return null
+      if (context?.graph && !graphRefs.some(pointer => jsonPointerResolves(context.graph!, pointer))) return null
+    }
+    rows.push({
+      constraintId: item.constraintId,
+      verdict,
+      graphRefs,
+      ...(typeof item.ruleClass === 'string' ? { ruleClass: item.ruleClass as SemanticRuleClass } : {}),
+      ...(typeof item.justification === 'string' ? { justification: item.justification } : {}),
+    })
+  }
+  return rows
+}
+
+/**
+ * Blocking control-flow claims need a witness; unwitnessed ones become
+ * advisory rather than disappearing.
+ *
+ * These classes are where the reviewer must infer a truth table from prose, and
+ * they produced rejections nobody could act on. A genuine unreachable terminal
+ * or exceeded bound always has a concrete path; demanding it costs a real
+ * finding nothing. The observation is preserved as `unwitnessed-control-flow`
+ * so the pattern stays countable in the trace instead of vanishing.
+ */
+function demoteUnwitnessedFinding(finding: SemanticFinding, graph?: LoopGraphSpec): SemanticFinding {
+  if (!requiresControlFlowWitness(finding.ruleClass)) return finding
+  const reason = witnessDefect(finding.witness, graph)
+  if (!reason) return finding
+  return {
+    ...finding,
+    ruleClass: 'unwitnessed-control-flow',
+    statement: `[原判 ${finding.ruleClass}，因缺少可核验反例降级为建议] ${finding.statement}（${reason}）`,
+  }
+}
+
+function witnessDefect(witness: ControlFlowWitness | undefined, graph?: LoopGraphSpec): string | undefined {
+  if (!witness) return '未提供反例：需要给出一组具体的 State 赋值与触发的 Transition 序列'
+  // Without a graph the host cannot check the witness, so it takes the
+  // reviewer's word rather than demoting on missing information of its own.
+  if (!graph) return undefined
+  const errors = validateControlFlowWitness(witness, graph)
+  return errors.length ? `反例不成立：${errors.join('；')}` : undefined
 }
 
 /** Findings must name a known rule class; an unrecognized one is treated as a
@@ -1474,22 +1853,59 @@ function parseSemanticFindings(value: unknown): SemanticFinding[] | null {
     const designRefs = stringArray(item.designRefs ?? [])
     const graphRefs = stringArray(item.graphRefs ?? [])
     if (!sourceRefs || !designRefs || !graphRefs) return null
-    findings.push({ ruleClass: item.ruleClass as SemanticRuleClass, statement: item.statement, sourceRefs, designRefs, graphRefs })
+    const witness = parseControlFlowWitness(item.witness)
+    if (witness === null) return null
+    findings.push({
+      ruleClass: item.ruleClass as SemanticRuleClass, statement: item.statement, sourceRefs, designRefs, graphRefs,
+      ...(witness ? { witness } : {}),
+    })
   }
   return findings
 }
 
+/** `undefined` means absent (legal — the host demotes instead); `null` means
+ * malformed, which voids the verdict like any other schema breach. */
+function parseControlFlowWitness(value: unknown): ControlFlowWitness | undefined | null {
+  if (value === undefined || value === null) return undefined
+  if (typeof value !== 'object' || Array.isArray(value)) return null
+  const item = value as Record<string, unknown>
+  if (!item.state || typeof item.state !== 'object' || Array.isArray(item.state)) return null
+  const path = stringArray(item.path)
+  if (!path || !path.length) return null
+  if (typeof item.outcome !== 'string' || !CONTROL_FLOW_WITNESS_OUTCOMES.includes(item.outcome as ControlFlowWitness['outcome'])) return null
+  return {
+    state: item.state as ControlFlowWitness['state'],
+    path,
+    outcome: item.outcome as ControlFlowWitness['outcome'],
+  }
+}
+
+function jsonPointerResolves(root: unknown, pointer: string): boolean {
+  if (pointer === '') return true
+  if (!pointer.startsWith('/')) return false
+  let value: unknown = root
+  for (const raw of pointer.slice(1).split('/')) {
+    const part = raw.replace(/~1/g, '/').replace(/~0/g, '~')
+    if (!value || typeof value !== 'object') return false
+    if (Array.isArray(value) && !/^\d+$/.test(part)) return false
+    if (!(part in (value as Record<string, unknown>))) return false
+    value = (value as Record<string, unknown>)[part]
+  }
+  return true
+}
+
+/** Shared with Intake, including the unescaped-quote repair: a model quoting a
+ * document inside Chinese prose breaks the envelope the same way in every
+ * phase, and here it silently costs an attempt. */
 function structuredCandidates(output: unknown, summary?: string): unknown[] {
-  const candidates: unknown[] = [output]
-  if (typeof output === 'string') candidates.push(tryJson(output), ...extractJsonObjects(output))
-  if (summary) candidates.push(tryJson(summary), ...extractJsonObjects(summary))
-  return candidates
+  return structuredJsonCandidates(output, summary)
 }
 
 function skippedSemanticReview(): LayeredSemanticReview {
   return {
     schemaVersion: SEMANTIC_REVIEW_SCHEMA,
     accepted: true,
+    verdicts: [],
     layers: Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(layer => [layer, {
       status: 'not_applicable',
       evidence: [{ sourceRefs: [], designRefs: [], graphRefs: [], statement: 'Independent semantic review was explicitly disabled by the caller.' }],
@@ -1558,30 +1974,3 @@ function loopBlueprintShapeExample(): unknown {
   }
 }
 
-function extractJsonObjects(source: string): unknown[] {
-  const output: unknown[] = []
-  for (let start = 0; start < source.length; start++) {
-    if (source[start] !== '{') continue
-    let depth = 0, inString = false, escaped = false
-    for (let end = start; end < source.length; end++) {
-      const char = source[end]!
-      if (inString) {
-        if (escaped) escaped = false
-        else if (char === '\\') escaped = true
-        else if (char === '"') inString = false
-      } else if (char === '"') inString = true
-      else if (char === '{') depth++
-      else if (char === '}' && --depth === 0) {
-        const parsed = tryJson(source.slice(start, end + 1))
-        if (parsed !== null) output.push(parsed)
-        start = end
-        break
-      }
-    }
-  }
-  return output
-}
-
-function tryJson(value: string): unknown {
-  try { return JSON.parse(value.trim()) } catch { return null }
-}

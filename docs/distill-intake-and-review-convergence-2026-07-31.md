@@ -1,7 +1,7 @@
 # Distill Intake 与语义复核收敛方案
 
-状态：**设计定稿，待实施**。§9 的四项取舍已于 2026-07-31 拍板，方向是
-「先跑通、把严格性做成可观测而非可阻断」；每项都带复核触发条件，见 §9 表。
+状态：**已实施**（S1 + S2 + S3 全部）。§9 的四项取舍已于 2026-07-31 拍板，方向是
+「先跑通、把严格性做成可观测而非可阻断」；每项都带复核触发条件，见 §9 表。实施记录见 §12。
 日期：2026-07-31
 上承：`docs/distill-semantic-severity-2026-07-28.md`（分级 + 执行落点）
 关联落点：`src/loop/graph/distill/GraphDistiller.ts`、`DistillDesign.ts`、`DistillCheckpoint.ts`、
@@ -598,3 +598,39 @@ S1 与 S2 都可以用现有 `.loop/distill/run-*/` 的 trace 目录直接回归
 
 `would_have_flipped` 需要额外的 reviewer 调用，因此它是**离线抽样**指标，不进 CI；
 其余三个是纯 trace 统计，可以每次 run 后自动算出来打印在 `loop distill` 的结尾。
+
+---
+
+## 12. 实施记录（2026-07-31）
+
+| 项 | 状态 | 落点 |
+|---|---|---|
+| §4.1 verdict 棘轮 | 已实施 | `DistillDesign.ts`：`ConstraintVerdict` / `hashPointerRegions` / `staleVerdicts` / `canonicalJson`；`GraphDistiller.compileLoopGraph` 持 `verdictLedger`，每轮算 carried 与 reviewScope |
+| §4.1 指纹扩容 | 已实施 | `hashPointerRegions` 并入 `/limits`、`/concurrency` 及 graphRefs 所涉节点的 Lane；指针消失、mapping 消失均按需重审 |
+| §4.1 不做全量兜底 | 按决定 1 执行 | 接受路径无二次复核；改为落 `verdict_carried` trace 事件 |
+| §4.2 枚举裁决 | 已实施 | schema 升 `loop-semantic-review-2.2`；`ConstraintVerdictRow`；`parseConstraintVerdicts` 缺行作废、`satisfied` 需可解析指针、`out_of_scope` 需 `justification` |
+| §4.2 `out_of_scope` 宽松 | 按决定 2 执行 | 不阻断；graph/reviewer 落点每次使用落 `out_of_scope_escape` trace 并写入 `advisories`（在 `printDistillDraft` 可见） |
+| §4.3 lint 收敛 | 已实施 | `selectRelevantLintWarnings` 按 reviewScope 的 graphRefs 锚点过滤；reviewer 提示从「逐条必答」改为「供定位」；`single-agent-terminal-authority` 退出必答题（语义侧保留） |
+| §5.1 反例义务 | 已实施 | `ControlFlowWitness` / `validateControlFlowWitness` / `WITNESS_REQUIRED_RULE_CLASSES`；`demoteUnwitnessedFinding` 把无效反例的阻断改判为新增建议级 `unwitnessed-control-flow`，并把只剩建议的 `fail` 层归正为 `pass` |
+| §5.2 可达性下沉 | 已实施 | `GraphLint.lintUnreachableTerminals`（error 级 `terminal-unreachable`，忽略 `when` 取可达性上界，零假阳性）；reviewer 提示的「已由 Lint 拥有」清单同步追加 |
+| §3 Intake | 已实施 | 新增 `DistillIntake.ts`（`loop-intake-1.0`、题库、store、提示词、解析）；`GraphDistillPhase` 增 `intake` 与预算档；`loop intake` 命令；`distill` 自动拾取且支持 `--no-intake` |
+| §3.4 折中方案 | 按决定 4 执行 | `LoopConstraint.origin`（可选，缺省 `architect`）；`validateIntakeLedgerPreservation` 机械校验已确认条目不可变、允许追加；Architect 提示分双路径 |
+| §3.4 intent gate | 已实施 | `DistillIntakeGateError`：finding 命中人已确认条目时停下问人；只涉及 `origin:'architect'` 追加条目时仍走原递归 |
+| §3.5 按需引导 | 按决定 3 执行 | `intakeGuidanceForIssues` 仅在 blocking finding 属于来源侧类别时追加建议，接在 fatal 的 `traceHint` 之后 |
+| §11.1 盲区统计 | 已实施 | 新增 `DistillTraceStats.ts`；`loop distill` 结尾打印 `carried / carriedRatio / oosEscapes / oosCarried / unwitnessedDemotions`，`oosCarried > 0` 直接给出人工复核警告 |
+
+与设计文档的两处偏差，均为实施中发现后从严处理：
+
+1. **降级不是复用既有 advisory 类，而是新增 `unwitnessed-control-flow`。** 文档原写「填 threshold-truth-table 或 branch-priority」，
+   但那会把「阈值推导不精确」和「拿不出反例」混成同一个统计口径，事后无法分辨。新增专用类后 §11.1 的
+   `unwitnessedDemotions` 才是可信的。
+2. **witness 的合法性检查在有图时才做，无图时只检查"有没有"。** `parseLayeredSemanticReview` 可以被不带 graph 的调用方使用（单测、
+   仅校验形状）。缺失 witness 与否不依赖图，照常降级；结构是否成立则不拿宿主自己的信息缺失去惩罚 reviewer。
+
+验证：`tsc --noEmit` 通过；`vitest run` 全量 **172 文件全部通过**。新增 `DistillReviewConvergence.test.ts` 共 23 例，覆盖
+棘轮沿用/失效（含 `/limits` 与 Lane 改动使全部 verdict 失效、mapping 消失、键序不影响指纹）5 例、
+枚举裁决缺行与 `satisfied` 指针门槛 5 例、`out_of_scope` justification 1 例、反例义务 5 例、
+`terminal-unreachable` 4 例、Intake 台账不可变 3 例、盲区统计 1 例。
+
+`DistillCheckpoint.test.ts` 的 `rejectedReview` 夹具同步升级：控制流类 ruleClass 自动附带合法 witness，
+使既有的「跨轮累积」用例继续测累积本身，而不是意外走进降级路径。

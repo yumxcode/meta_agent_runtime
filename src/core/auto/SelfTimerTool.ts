@@ -27,10 +27,13 @@ export function createSelfTimerTool(deps: SelfTimerToolDeps): MetaAgentTool {
     description: `Durably park this plain Auto session and resume the same goal later.
 
 Use this only when useful progress depends on time passing (for example waiting
-for an external job, deployment, review, or rate-limit window). Do not use it as
-ordinary retry backoff while work can continue now. The host persists the full
-conversation and Auto checkpoint, exits this execution segment, then the single
-auto-scheduler resumes the same session after the delay.
+for an external job, remote training run, deployment, review, or rate-limit
+window). Remote training is a primary use case: when a remote training run is
+expected to take longer than 1 hour, you should use self_timer instead of sleep
+or repeated polling. Do not use it as ordinary retry backoff while work can
+continue now. The host persists the full conversation and Auto checkpoint,
+exits this execution segment, then the single auto-scheduler resumes the same
+session after the delay.
 
 You may not park while sub-agents are running or queued. checkpoint is a small
 JSON object containing only facts needed on wake. A successful call mechanically
@@ -44,7 +47,9 @@ ends the current run; later tool calls in the same model batch are skipped.`,
           type: 'integer',
           minimum: 1,
           maximum: maxDelayMs,
-          description: 'Delay before the scheduler may resume this session, in milliseconds.',
+          description:
+            'Delay before the scheduler may resume this session, in milliseconds. ' +
+            'Use this for remote training expected to run longer than 1 hour.',
         },
         reason: {
           type: 'string',

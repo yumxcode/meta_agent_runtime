@@ -112,6 +112,7 @@ import type { McpServerInstruction } from '../core/dynamicPrompt.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { CLI_VERSION } from './version.js'
 import { formatLocalClock, formatLocalTimestamp } from '../loop/localTime.js'
+import { shouldSuppressAttachedParkPresentation } from './autoPresentation.js'
 
 // ── Version ───────────────────────────────────────────────────────────────────
 
@@ -1803,6 +1804,7 @@ async function streamPrompt(
   showThinking = false,
   steerHooks?: SteerHooks,
   signal?: AbortSignal,
+  attachedLease = false,
 ): Promise<StreamPromptResult> {
   if (signal?.aborted) throw abortError(signal.reason)
   const onAbort = () => router.interrupt?.()
@@ -2055,6 +2057,8 @@ async function streamPrompt(
           break
         }
         case 'result': {
+          const suppressParkedPresentation =
+            shouldSuppressAttachedParkPresentation(attachedLease, event.subtype)
           meter.hide()
           await closeThinkingBlock()
           if (hasText) await safeStdoutWrite('\n')
@@ -2082,7 +2086,7 @@ async function streamPrompt(
               `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
               (errDetails ? `${red('  错误详情：')} ${errDetails}\n` : ''),
             )
-          } else if (event.subtype === 'parked') {
+          } else if (event.subtype === 'parked' && !suppressParkedPresentation) {
             const wakeAt = event.parkRequest
               ? new Date(Date.now() + event.parkRequest.afterMs).toLocaleString()
               : 'unknown'
@@ -2106,24 +2110,26 @@ async function streamPrompt(
               )
             }
           }
-          const usage = event.usage
-          const cost  = router.getEstimatedCost()
-          const mode  = router.mode ?? 'agentic'
-          const modeTag = mode === 'campaign' ? cyan(mode)
-                        : mode === 'agentic'  ? green(mode)
-                        : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
-                        : mode === 'auto'     ? yellow(mode)
-                        : mode === 'simple_auto' ? yellow(mode)
-                        : gray(mode)
-          const thinkTag = meter.charCount > 0
-            ? `  ${gray(`think:~${meter.tokenEstimate}`)}`
-            : ''
-          await safeStdoutWrite(
-            `\n${gray('─'.repeat(56))}\n` +
-            `${modeTag}  ` +
-            `${gray(`in:${usage.inputTokens} out:${usage.outputTokens}`)}${thinkTag}  ` +
-            `${gray(`$${cost.toFixed(4)}`)}\n`,
-          )
+          if (!suppressParkedPresentation) {
+            const usage = event.usage
+            const cost  = router.getEstimatedCost()
+            const mode  = router.mode ?? 'agentic'
+            const modeTag = mode === 'campaign' ? cyan(mode)
+                          : mode === 'agentic'  ? green(mode)
+                          : mode === 'robotics' ? `${c.magenta}${mode}${c.reset}`
+                          : mode === 'auto'     ? yellow(mode)
+                          : mode === 'simple_auto' ? yellow(mode)
+                          : gray(mode)
+            const thinkTag = meter.charCount > 0
+              ? `  ${gray(`think:~${meter.tokenEstimate}`)}`
+              : ''
+            await safeStdoutWrite(
+              `\n${gray('─'.repeat(56))}\n` +
+              `${modeTag}  ` +
+              `${gray(`in:${usage.inputTokens} out:${usage.outputTokens}`)}${thinkTag}  ` +
+              `${gray(`$${cost.toFixed(4)}`)}\n`,
+            )
+          }
           break
         }
       }
@@ -5153,6 +5159,7 @@ interface SingleTurnRunOptions {
 interface SingleTurnRunResult {
   result?: MetaAgentResultEvent
   armedWake?: AutoContinuationRecord
+  sessionId?: string
 }
 
 async function runSingleTurn(
@@ -5245,6 +5252,7 @@ async function runSingleTurn(
   let streamed: StreamPromptResult | undefined
   let parkedHistoryCount: number | null = null
   let parkedSessionId: string | null = null
+  let runSessionId: string | undefined
   let parkPersistenceError: Error | null = null
   try {
     streamed = await streamPrompt(
@@ -5254,6 +5262,7 @@ async function runSingleTurn(
       opts.showThinking,
       undefined,
       runOptions.signal,
+      runOptions.claimOwner !== undefined,
     )
   } catch (err) {
     if (!runOptions.signal?.aborted) {
@@ -5284,6 +5293,7 @@ async function runSingleTurn(
         }
       }
     }
+    runSessionId = router.getSessionId()
     await router.dispose().catch(() => undefined)
   }
   if (parkPersistenceError) throw parkPersistenceError
@@ -5296,7 +5306,7 @@ async function runSingleTurn(
       historyMessageCount: parkedHistoryCount ?? 0,
       claimOwner: runOptions.claimOwner,
     })
-    if (!opts.json) {
+    if (!opts.json && runOptions.claimOwner === undefined) {
       process.stderr.write(
         `${yellow('⏲')} Auto wake ${runOptions.claimOwner ? 'attached' : 'armed'}: ` +
         `${armedWake.wakeId} at ${new Date(armedWake.fireAt).toLocaleString()}\n`,
@@ -5306,6 +5316,7 @@ async function runSingleTurn(
   return {
     ...(streamed?.result ? { result: streamed.result } : {}),
     ...(armedWake ? { armedWake } : {}),
+    ...(runSessionId ? { sessionId: runSessionId } : {}),
   }
 }
 
@@ -5446,26 +5457,42 @@ async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
 }
 
 async function runAttachedAuto(opts: CliOptions): Promise<void> {
+  const userCancelReason = 'attached-auto:user-cancel'
   const projectDir = resolve(opts.workspace ?? process.cwd())
   const store = new AutoContinuationStore(projectDir)
   const claimOwner = `${autoContinuationClaimOwner()}:attached`
   const abort = new AbortController()
-  const stop = () => abort.abort('attached Auto interrupted')
-  process.once('SIGINT', stop)
-  process.once('SIGTERM', stop)
+  const interrupt = () => abort.abort(userCancelReason)
+  const terminate = () => abort.abort('attached-auto:terminated')
+  process.once('SIGINT', interrupt)
+  process.once('SIGTERM', terminate)
 
   try {
     const initial = await runSingleTurn(opts, undefined, {
       claimOwner,
       signal: abort.signal,
     })
-    if (!initial.armedWake || abort.signal.aborted) return
+    if (abort.signal.aborted) {
+      if (abort.signal.reason === userCancelReason && initial.sessionId) {
+        await cancelAttachedAutoSession(store, projectDir, initial.sessionId)
+      } else if (initial.armedWake?.claim?.token) {
+        await store.release(
+          initial.armedWake.wakeId,
+          initial.armedWake.claim.token,
+          'pending',
+          initial.armedWake.fireAt,
+        )
+      }
+      return
+    }
+    if (!initial.armedWake) return
 
     const attached = new AttachedAutoScheduler(
       store,
       (record, signal) =>
         resumeAutoContinuation(opts, projectDir, record, signal, claimOwner),
       {
+        cancelActiveAbort: reason => reason === userCancelReason,
         onEvent: message => {
           if (opts.json) console.log(JSON.stringify({ type: 'auto_attached', message }))
           else process.stderr.write(`${message}\n`)
@@ -5473,15 +5500,38 @@ async function runAttachedAuto(opts: CliOptions): Promise<void> {
       },
     )
     const outcome = await attached.run(initial.armedWake, abort.signal)
-    if (!opts.json && outcome === 'detached') {
+    if (outcome === 'cancelled') {
+      await cancelAttachedAutoSession(
+        store,
+        projectDir,
+        initial.sessionId ?? initial.armedWake.sessionId,
+      )
+      if (!opts.json) {
+        process.stderr.write(
+          `${dim('当前 Auto 会话及其定时恢复已取消；下次命令会创建全新会话。')}\n`,
+        )
+      }
+    } else if (!opts.json && outcome === 'detached') {
       process.stderr.write(
         `${dim('当前窗口已停止等待；wake 保留在持久队列中，可由 auto-scheduler 接管。')}\n`,
       )
     }
   } finally {
-    process.removeListener('SIGINT', stop)
-    process.removeListener('SIGTERM', stop)
+    process.removeListener('SIGINT', interrupt)
+    process.removeListener('SIGTERM', terminate)
   }
+}
+
+async function cancelAttachedAutoSession(
+  store: AutoContinuationStore,
+  projectDir: string,
+  sessionId: string,
+): Promise<void> {
+  await store.cancelSession(sessionId)
+  await updateAutoCheckpointWithStatus(projectDir, sessionId, {
+    stopReason: 'cancelled_by_user',
+    pendingWake: null,
+  })
 }
 
 function parsePositiveIntOption(
@@ -5549,7 +5599,10 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
     graphCatalog.agentTools = new Set([...graphCatalog.agentTools].filter(name => runtimeToolNames.has(name)))
   }
   const sub = args[0]
-  const isDistill = name === 'loop' && (sub === 'distill' || sub === 'distill-graph')
+  // Intake runs on the same foreground executor as Distill: same tools, same
+  // session plumbing, same reporter. Only the phase and the artifact differ.
+  const isIntake = name === 'loop' && sub === 'intake'
+  const isDistill = name === 'loop' && (sub === 'distill' || sub === 'distill-graph' || isIntake)
   const runLifecycle = (sub === 'resume' || sub === 'recover') && args.includes('--run')
   const needsGraphAgent = name === 'loop-scheduler' || sub === 'tick' || runLifecycle
   const modelConfig = loadModelConfig({ projectDir })
@@ -5629,7 +5682,9 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
         graphCatalog,
         onDistillProgress: reporter.onProgress,
       }))
-      if (interactiveDistill && distillRl) {
+      // The follow-up revision loop reads the Distill artifacts, which an
+      // Intake run never produces — it ends at loop.intake.json by design.
+      if (interactiveDistill && distillRl && !isIntake) {
         await runDistillSession({
           args, projectDir, executor: distillExecutor, graphCatalog,
           signal: abort.signal, reporter, rl: distillRl,
@@ -5946,7 +6001,9 @@ function createForegroundDistillReporter(): {
   onProgress(event: GraphDistillProgressEvent): void
 } {
   const phaseLabel = (phase: GraphDistillPhase): string =>
-    phase === 'architect' ? 'architect' : phase === 'compiler' ? 'compiler' : 'reviewer'
+    phase === 'intake' ? 'intake'
+      : phase === 'architect' ? 'architect'
+        : phase === 'compiler' ? 'compiler' : 'reviewer'
   return {
     onProgress(event): void {
       if (event.type === 'checkpoint_resumed') {

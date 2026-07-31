@@ -137,8 +137,15 @@ describe('graph-v2 Distill contract', () => {
     evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
   }]))
 
-  const finding = (ruleClass: string, statement: string): Record<string, unknown> => ({
+  const finding = (ruleClass: string, statement: string, witness?: unknown): Record<string, unknown> => ({
     ruleClass, statement, sourceRefs: ['requirements.md:L1'], designRefs: ['control'], graphRefs: ['/transitions/0'],
+    ...(witness ? { witness } : {}),
+  })
+
+  /** Enumeration is only enforced when the host names a scope, so the standalone
+   * parse tests below can keep an empty table. */
+  const reviewEnvelope = (layers: Record<string, unknown>, verdicts: unknown[] = []): Record<string, unknown> => ({
+    schemaVersion: 'loop-semantic-review-2.2', accepted: true, layers, verdicts, issues: [],
   })
 
   it('derives acceptance from rule class, ignoring the model-supplied accepted flag', () => {
@@ -146,12 +153,12 @@ describe('graph-v2 Distill contract', () => {
     // acceptance must not get the graph through: severity is the host's.
     const layers = passingLayerSet()
     layers.control_flow = {
-      status: 'fail', findings: [finding('missing-source-bound', 'Source caps rounds at 20; no transition routes on it.')],
+      status: 'fail',
+      findings: [finding('missing-source-bound', 'Source caps rounds at 20; no transition routes on it.',
+        { state: { rounds: 20 }, path: ['loop-back'], outcome: 'bound_exceeded' })],
       evidence: [{ sourceRefs: ['requirements.md:L152'], designRefs: ['control'], graphRefs: ['/limits'], statement: 'Checked.' }],
     }
-    const parsed = parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers, issues: [],
-    })
+    const parsed = parseLayeredSemanticReview(reviewEnvelope(layers))
     expect(parsed?.accepted).toBe(false)
     expect(parsed?.issues).toHaveLength(1)
     expect(parsed?.issues[0]).toContain('missing-source-bound')
@@ -163,29 +170,27 @@ describe('graph-v2 Distill contract', () => {
       ...layers.lane_ownership,
       findings: [finding('topology-granularity', 'research and reflect could share one agent.')],
     }
-    const parsed = parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: false, layers, issues: [],
-    })
+    const parsed = parseLayeredSemanticReview(reviewEnvelope(layers))
     expect(parsed?.accepted).toBe(true)
     expect(parsed?.issues).toEqual([])
     expect(parsed?.advisories[0]).toContain('topology-granularity')
   })
 
   it('rejects a blocking finding parked on a passing layer, or an unknown rule class', () => {
+    // Checked against what the reviewer DECLARED, before any witness demotion:
+    // parking a blocking claim on a passing layer is a contract breach whether
+    // or not the claim would have survived.
     const smuggled = passingLayerSet()
     smuggled.control_flow = {
       ...smuggled.control_flow,
-      findings: [finding('unbounded-or-unreachable-control', 'No terminal is reachable.')],
+      findings: [finding('unbounded-or-unreachable-control', 'No terminal is reachable.',
+        { state: {}, path: ['t0'], outcome: 'terminal_unreachable' })],
     }
-    expect(parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: smuggled, issues: [],
-    })).toBeNull()
+    expect(parseLayeredSemanticReview(reviewEnvelope(smuggled))).toBeNull()
 
     const invented = passingLayerSet()
     invented.control_flow = { ...invented.control_flow, findings: [finding('cosmetic-nitpick', 'Naming.')] }
-    expect(parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: invented, issues: [],
-    })).toBeNull()
+    expect(parseLayeredSemanticReview(reviewEnvelope(invented))).toBeNull()
   })
 
   it('normalizes omitted empty findings on passing review layers only', () => {
@@ -195,9 +200,7 @@ describe('graph-v2 Distill contract', () => {
       status: 'pass',
       evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
     }]))
-    const parsed = parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: true, layers: passingLayers, issues: [],
-    })
+    const parsed = parseLayeredSemanticReview(reviewEnvelope(passingLayers))
     expect(parsed?.layers.control_flow.findings).toEqual([])
 
     // A `fail` layer with no blocking finding names nothing actionable, so the
@@ -206,9 +209,7 @@ describe('graph-v2 Distill contract', () => {
       status: 'fail',
       evidence: [{ sourceRefs: ['requirements.md:L1'], designRefs: ['control'], graphRefs: ['/transitions/0'], statement: 'Broken.' }],
     }
-    expect(parseLayeredSemanticReview({
-      schemaVersion: 'loop-semantic-review-2.1', accepted: false, layers: passingLayers, issues: ['Broken.'],
-    })).toBeNull()
+    expect(parseLayeredSemanticReview(reviewEnvelope(passingLayers))).toBeNull()
   })
 
   it('teaches strict $input dataflow and runtime preconditions to the model', () => {

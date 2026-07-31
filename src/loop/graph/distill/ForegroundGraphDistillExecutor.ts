@@ -1,7 +1,7 @@
 import type { MetaAgentEvent } from '../../../core/types.js'
 import type { LoopGraphSpec } from '../spec/GraphTypes.js'
 
-export type GraphDistillPhase = 'architect' | 'compiler' | 'semantic_review'
+export type GraphDistillPhase = 'intake' | 'architect' | 'compiler' | 'semantic_review'
 
 export interface GraphDistillModelRequest {
   phase: GraphDistillPhase

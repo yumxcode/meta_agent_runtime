@@ -205,6 +205,37 @@ describe('AttachedAutoScheduler', () => {
     expect(released?.claim).toBeUndefined()
   })
 
+  it('cancels a wake when Ctrl+C abandons an active resumed turn', async () => {
+    const store = await makeStore()
+    const record = await store.schedule({
+      sessionId: 's1',
+      fireAt: 0,
+      reason: 'now',
+      historyMessageCount: 1,
+    }, { claimOwner: 'attached-owner' })
+    const abort = new AbortController()
+    const scheduler = new AttachedAutoScheduler(
+      store,
+      async (_record, signal) => new Promise((_resolve, reject) => {
+        signal.addEventListener('abort', () => reject(new Error('interrupted')), {
+          once: true,
+        })
+      }),
+      {
+        heartbeatIntervalMs: 10,
+        cancelActiveAbort: reason => reason === 'user-cancel',
+      },
+    )
+
+    const running = scheduler.run(record, abort.signal)
+    await new Promise(resolve => setTimeout(resolve, 10))
+    abort.abort('user-cancel')
+    await expect(running).resolves.toBe('cancelled')
+    const [cancelled] = await store.list()
+    expect(cancelled?.status).toBe('cancelled')
+    expect(await store.claimDue(Date.now(), 'daemon')).toEqual([])
+  })
+
   it('renews the wake lease while the resumed model turn is running', async () => {
     const store = await makeStore(30)
     const record = await store.schedule({

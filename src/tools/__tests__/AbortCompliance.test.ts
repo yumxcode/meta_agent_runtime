@@ -4,6 +4,13 @@ import { resolveToolAbortSupport } from '../../modes/toolAdapter.js'
 import type { ToolCallContext } from '../../core/types.js'
 
 describe('built-in abort compliance', () => {
+  it('directs long remote training waits away from sleep', async () => {
+    const tool = await createSleepTool()
+    expect(tool.description).toContain('remote training')
+    expect(tool.description).toContain('longer than 1 hour')
+    expect(tool.description).toContain('use self_timer')
+  })
+
   it('cooperative sleep settles promptly after AbortSignal', async () => {
     const tool = await createSleepTool()
     expect(resolveToolAbortSupport(tool)).toBe('cooperative')
