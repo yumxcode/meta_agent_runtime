@@ -1,9 +1,15 @@
+import { mkdtemp, rm, writeFile } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { describe, expect, it } from 'vitest'
 import {
   describeJsonDefect,
   normalizeIntakePreconditions,
   normalizeIntakeProbes,
+  createFileLoopIntakeStore,
+  mergeIntakePreconditions,
   parseIntakeEnvelope,
+  resolveIntakePickup,
   repairUnescapedQuotes,
   structuredJsonCandidates,
   validateLoopIntakeRecord,
@@ -174,5 +180,106 @@ describe('envelope diagnostics', () => {
     const { record, diagnosis } = parseIntakeEnvelope({ approvedConstraintIds: [], probes: [] })
     expect(record).toBeUndefined()
     expect(diagnosis).toContain('constraints')
+  })
+})
+
+describe('intake pickup notice', () => {
+  it('says which path a run is on, and why', async () => {
+    // The decision changes what the Architect may do, so it has to be legible
+    // before the compile rather than in the summary afterwards.
+    const root = await mkdtemp(join(tmpdir(), 'intake-pickup-'))
+    try {
+      await writeFile(join(root, 'req.md'), 'Converge.', 'utf8')
+
+      const missing = await resolveIntakePickup(root, 'req.md', false)
+      expect(missing.record).toBeUndefined()
+      expect(missing.notice).toContain('无 loop.intake.json')
+
+      const store = createFileLoopIntakeStore(root)
+      const { record } = parseIntakeEnvelope(brokenEnvelope)
+      await store.save({ requirement: 'req.md', projectDir: root }, record!)
+
+      const used = await resolveIntakePickup(root, 'req.md', false)
+      expect(used.record).toBeDefined()
+      expect(used.notice).toContain('采用 loop.intake.json')
+      expect(used.notice).toContain('1 条经人确认')
+
+      const disabled = await resolveIntakePickup(root, 'req.md', true)
+      expect(disabled.record).toBeUndefined()
+      expect(disabled.notice).toContain('--no-intake')
+
+      // A requirement edit must never let an artifact claim a sign-off the
+      // human gave to a different document — and must say so out loud.
+      await writeFile(join(root, 'req.md'), 'Converge, but differently.', 'utf8')
+      const stale = await resolveIntakePickup(root, 'req.md', false)
+      expect(stale.record).toBeUndefined()
+      expect(stale.notice).toContain('被修改过')
+      expect(stale.notice).toContain('loop intake req.md')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+
+  it('explains an unusable record instead of falling back in silence', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'intake-invalid-'))
+    try {
+      await writeFile(join(root, 'req.md'), 'Converge.', 'utf8')
+      await writeFile(join(root, 'loop.intake.json'), '{ not json', 'utf8')
+      expect((await resolveIntakePickup(root, 'req.md', false)).notice).toContain('不是合法 JSON')
+
+      await writeFile(join(root, 'loop.intake.json'), JSON.stringify({ schemaVersion: 'loop-intake-1.0' }), 'utf8')
+      expect((await resolveIntakePickup(root, 'req.md', false)).notice).toContain('记录不合法')
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('intake launch contract reaches loop create', () => {
+  const intake = {
+    preconditions: {
+      schemaVersion: 'loop-preconditions-1.0' as const,
+      items: [
+        { kind: 'directory' as const, target: 'humanoid/', reason: 'PPO 基线代码', blocking: true },
+        { kind: 'command' as const, target: 'isaacgym', reason: '训练依赖', blocking: true },
+        { kind: 'file' as const, target: 'optional.md', reason: '可选输入', blocking: false },
+      ],
+    },
+    deferred: [{ id: 'DEF-THRESHOLDS', question: '阈值设为多少？', assumedDefault: '训练前冻结', affects: ['C1'] }],
+  }
+
+  it('carries confirmed preconditions and deferrals into the final artifact', () => {
+    // Without this the chain "human confirms → loop create refuses to start"
+    // is broken at its last link, and the confirmation buys nothing.
+    const merged = mergeIntakePreconditions(
+      { schemaVersion: 'loop-preconditions-1.0', items: [{ kind: 'file', target: 'compiler.md', reason: 'r', blocking: true }] },
+      intake,
+    )
+    const targets = merged.items.map(item => item.target)
+    expect(targets).toContain('compiler.md')
+    expect(targets).toContain('humanoid/')
+    expect(targets).toContain('isaacgym')
+    expect(targets).toContain('DEF-THRESHOLDS')
+    expect(merged.items.find(item => item.target === 'DEF-THRESHOLDS')?.kind).toBe('decision')
+    expect(merged.items.find(item => item.target === 'humanoid/')?.reason).toContain('Intake 已确认')
+  })
+
+  it('does not let the Compiler soften a human-declared blocking precondition', () => {
+    const merged = mergeIntakePreconditions(
+      { schemaVersion: 'loop-preconditions-1.0', items: [{ kind: 'directory', target: 'humanoid/', reason: '推导所得', blocking: false }] },
+      intake,
+    )
+    expect(merged.items).toHaveLength(4)
+    expect(merged.items.find(item => item.target === 'humanoid/')?.blocking).toBe(true)
+  })
+
+  it('preserves a non-blocking item the human marked optional', () => {
+    const merged = mergeIntakePreconditions({ schemaVersion: 'loop-preconditions-1.0', items: [] }, intake)
+    expect(merged.items.find(item => item.target === 'optional.md')?.blocking).toBe(false)
+  })
+
+  it('is a no-op without an intake record', () => {
+    const base = { schemaVersion: 'loop-preconditions-1.0' as const, items: [] }
+    expect(mergeIntakePreconditions(base, undefined)).toBe(base)
   })
 })

@@ -137,12 +137,15 @@ export function validateLoopGraph(spec: LoopGraphSpec, registries: GraphCapabili
       const defaults = routes.filter(item => item.default || !item.when)
       if (defaults.length > 1) errors.push(`node '${nodeId}' outcome '${outcome}' has multiple default/unconditional transitions`)
       if (routes.some(item => item.when) && defaults.length !== 1) errors.push(`node '${nodeId}' outcome '${outcome}' needs exactly one default transition`)
-      const priorities = new Set<number>()
-      for (const route of routes.filter(item => item.when)) {
-        const priority = route.priority ?? 0
-        if (priorities.has(priority)) errors.push(`node '${nodeId}' outcome '${outcome}' has duplicate priority ${priority}`)
-        priorities.add(priority)
-      }
+      // Duplicate priorities used to be rejected here, because the runtime broke
+      // ties alphabetically by transition id — an order no author can express on
+      // purpose, so any tie was a latent bug. The consequence was that every
+      // conditional edge needed its own invented number, and since those numbers
+      // form a single total order per node, branches that can never both hold
+      // still had to be ranked against each other. Declaration order is now
+      // authoritative (see decideTransition), so a shared priority is
+      // well-defined: earlier in the array wins. A decision list can be written
+      // in source order with no priorities at all.
     }
     const always = outgoing.some(item => item.on === 'always')
     for (const outcome of requiredOutcomes(node)) if (!always && !outgoing.some(item => (item.on ?? 'success') === outcome)) {

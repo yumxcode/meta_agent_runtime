@@ -12,6 +12,7 @@ import {
   formatDistillTraceStats,
   parseIntakeEnvelope,
   readDistillTraceStats,
+  resolveIntakePickup,
   validateLoopIntakeRecord,
   GRAPH_DISTILL_PHASE_POLICY,
   LOOP_INTAKE_FILE,
@@ -54,6 +55,9 @@ export interface LoopCliDeps {
   /** Foreground compiler/reviewer model boundary used only by loop distill. */
   distillExecutor?: GraphDistillExecutor
   onDistillProgress?: (event: GraphDistillProgressEvent) => void
+  /** Host-level notices a long-running command must surface before it starts,
+   * not in its final summary. */
+  onDistillNotice?: (notice: string) => void
   /** Replaceable graph_agent execution substrate. Defaults to the MetaAgent adapter. */
   graphAgent?: GraphAgentExecutor
   signal?: AbortSignal
@@ -191,11 +195,14 @@ async function distill(args: string[], deps: LoopCliDeps): Promise<string> {
   const file = positional(args)
   if (!file) throw new Error('loop distill: requirement document path required')
   const out = flagValue(args, '--out') ?? 'loop.graph.json'
-  // Intake is optional. Absent (or stale — the store checks the requirement
-  // hash) means the compatibility path, which must behave exactly as before.
-  const intakeRecord = args.includes('--no-intake')
-    ? null
-    : await createFileLoopIntakeStore(deps.projectDir).load({ requirement: file, projectDir: deps.projectDir })
+  // Intake is optional, and whether it was picked up changes what the Architect
+  // may do. Announce the decision BEFORE the compile rather than in the summary
+  // afterwards: a reader watching the Architect read the requirement and glob
+  // the project cannot otherwise tell which path they are on, and a record
+  // rejected for a stale hash used to vanish without a word.
+  const pickup = await resolveIntakePickup(deps.projectDir, file, args.includes('--no-intake'))
+  const intakeRecord = pickup.record
+  deps.onDistillNotice?.(pickup.notice)
   // Distill artifacts are written only after the whole pipeline succeeds. The
   // trace is written as the run happens, so a failure still leaves every
   // rejected envelope, frozen graph and reviewer verdict on disk.

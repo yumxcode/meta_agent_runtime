@@ -110,7 +110,9 @@ describe('Distill Architect checkpoint', () => {
     expect(phases).toEqual(['compiler', 'semantic_review'])
     expect(policies).toEqual([
       { phase: 'compiler', thinkingBudgetTokens: 0, maxOutputTokens: 49_152, maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10 },
-      { phase: 'semantic_review', thinkingBudgetTokens: 0, maxOutputTokens: 16_384, maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10 },
+      // The verdict table scales with the ledger, so review shares the 32K
+      // ceiling rather than the old 16K one it kept overrunning.
+      { phase: 'semantic_review', thinkingBudgetTokens: 0, maxOutputTokens: 32_768, maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10 },
     ])
     expect(result.phaseAttempts).toMatchObject({ architect: 0, compiler: 1, reviewer: 1 })
     expect(await checkpoint.load(source)).toBeNull()

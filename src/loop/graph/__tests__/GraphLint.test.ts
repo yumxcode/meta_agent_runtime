@@ -243,15 +243,29 @@ describe('graph write-surface lint', () => {
     expect(lintLoopGraph(spec).filter(f => f.rule === 'duplicate-route-condition')).toEqual([])
   })
 
-  it('asks semantic review to justify multiple Agents sharing one persistent session', () => {
-    const spec = graph()
-    spec.nodes.pivot = { type: 'agent', lane: 'work', prompt: 'Perform a pivot phase.', tools: ['read_file'] }
-    const finding = lintLoopGraph(spec).find(f => f.rule === 'same-lane-agent-split')
-    expect(finding?.level).toBe('warning')
-    expect(finding?.message).toContain('work, pivot')
+  it('flags alternating same-lane Agents but not sequential phase stages', () => {
+    // Sequential stages are the shape the Compiler is now told to produce for a
+    // source-mandated phase order: it keeps the phase out of every `when`
+    // conjunct. Flagging it would argue against the design.
+    const sequential = graph()
+    sequential.nodes.stage_two = { type: 'agent', lane: 'work', prompt: 'Run the second phase.', tools: ['read_file'] }
+    sequential.transitions = [
+      { id: 'advance', from: 'work', on: 'success', to: 'stage_two' },
+      { id: 'work_failed', from: 'work', on: 'failure', to: 'failed' },
+      { id: 'finish', from: 'stage_two', on: 'success', to: 'done' },
+      { id: 'stage_two_failed', from: 'stage_two', on: 'failure', to: 'failed' },
+    ]
+    expect(lintLoopGraph(sequential).filter(f => f.rule === 'same-lane-agent-split')).toEqual([])
 
-    spec.lanes.work!.context = 'fresh_per_activation'
-    expect(lintLoopGraph(spec).filter(f => f.rule === 'same-lane-agent-split')).toEqual([])
+    // Add a way back and they become alternatives the loop flips between.
+    const alternating = structuredClone(sequential)
+    alternating.transitions.push({ id: 'back', from: 'stage_two', on: 'timer', to: 'work' })
+    const finding = lintLoopGraph(alternating).find(f => f.rule === 'same-lane-agent-split')
+    expect(finding?.level).toBe('warning')
+    expect(finding?.message).toContain('work, stage_two')
+
+    alternating.lanes.work!.context = 'fresh_per_activation'
+    expect(lintLoopGraph(alternating).filter(f => f.rule === 'same-lane-agent-split')).toEqual([])
   })
 
   it('warns when a bounded graph can wait forever but permits intentional continuous waits', () => {
@@ -392,9 +406,10 @@ describe('graph write-surface lint', () => {
     expect(shadowed).toHaveLength(1)
     expect(shadowed[0]!.level).toBe('error')
     expect(shadowed[0]!.at).toBe("transitions 'narrow'.when")
-    expect(shadowed[0]!.message).toContain("higher-priority transition 'broad'")
+    expect(shadowed[0]!.message).toContain("earlier transition 'broad'")
 
-    // Raising the specific edge above the broad one resolves it.
+    // Ordering the specific edge before the broad one resolves it — with or
+    // without priorities, since declaration order is authoritative.
     spec.transitions[0]!.priority = 90
     spec.transitions[1]!.priority = 100
     expect(lintLoopGraph(spec).filter(f => f.rule === 'shadowed-route')).toEqual([])
@@ -443,35 +458,6 @@ describe('graph write-surface lint', () => {
   // Only speaks when the conditional edges otherwise tile their own value space
   // and the uncovered pocket is small enough to enumerate; a broad default with
   // a large legitimate remainder must stay silent.
-  it('reports a small truth-table pocket but stays quiet about a broad default', () => {
-    const spec = graph()
-    spec.state.count = { type: { type: 'integer', minimum: 0 }, initial: 0 }
-    const edge = (id: string, priority: number, when: string) => ({ id, from: 'work', on: 'success' as const, priority, when, to: 'done' })
-    // trend × count tiles fully except trend=='up' && count==2.
-    spec.transitions = [
-      edge('up_low', 140, "$output.trend == 'up' && $state.count < 2"),
-      edge('flat_low', 130, "$output.trend == 'flat' && $state.count < 2"),
-      edge('flat_high', 120, "$output.trend == 'flat' && $state.count >= 2"),
-      edge('down_low', 110, "$output.trend == 'down' && $state.count < 2"),
-      edge('down_high', 100, "$output.trend == 'down' && $state.count >= 2"),
-      { id: 'fallback', from: 'work', on: 'success', default: true, to: 'done', updates: [{ target: 'count', reducer: 'builtin/increment@1' }, { target: 'status', reducer: 'builtin/set@1', args: [{ literal: 'done' }] }] },
-      { id: 'boom', from: 'work', on: 'failure', to: 'failed' },
-    ]
-    const work = spec.nodes.work
-    if (work.type !== 'agent') throw new Error('expected agent')
-    work.outputSchema = { type: 'object', required: ['trend'], properties: { trend: { type: 'string' } }, additionalProperties: false }
-
-    const gaps = lintLoopGraph(spec).filter(f => f.rule === 'route-partition-gap')
-    expect(gaps).toHaveLength(1)
-    expect(gaps[0]!.level).toBe('warning')
-    expect(gaps[0]!.message).toContain("$output.trend=up")
-    expect(gaps[0]!.message).toContain("default 'fallback'")
-
-    // Cover the pocket and the finding disappears.
-    spec.transitions.splice(5, 0, edge('up_high', 105, "$output.trend == 'up' && $state.count >= 2"))
-    expect(lintLoopGraph(spec).filter(f => f.rule === 'route-partition-gap')).toEqual([])
-  })
-
   it('does not confuse empty-string or false constants with severed dataflow', () => {
     const spec = graph()
     spec.nodes.writer = {

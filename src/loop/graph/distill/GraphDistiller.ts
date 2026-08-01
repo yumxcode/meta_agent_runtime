@@ -53,6 +53,7 @@ import {
 import {
   formatIntakeLedgerForArchitect,
   intakeGuidanceForIssues,
+  mergeIntakePreconditions,
   type LoopIntakeRecord,
 } from './DistillIntake.js'
 
@@ -309,8 +310,13 @@ export const GRAPH_DISTILL_PHASE_POLICY: Record<GraphDistillPhase, {
   // Review is an evidence-directed acceptance gate, not another design pass.
   // Extended thinking repeatedly consumed the entire wall window without a
   // verdict on real projects, so keep the contract bounded and output-focused.
+  //
+  // The output ceiling is 32K rather than 16K because the verdict table scales
+  // with the ledger: a real 35-constraint run has to emit a row per hard
+  // constraint on top of six layers of evidence, and at 16K it returned no
+  // usable verdict twice in a row and burned the attempt.
   semantic_review: {
-    thinkingBudgetTokens: 0, maxOutputTokens: 16_384,
+    thinkingBudgetTokens: 0, maxOutputTokens: 32_768,
     maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10,
   },
 }
@@ -651,7 +657,13 @@ async function compileLoopGraph(
       }
       continue
     }
-    const preconditions = mergeUnresolvedIntoPreconditions(parsed.preconditions ?? emptyLoopPreconditions(), architecture.constraints)
+    // Three sources feed the launch contract, in increasing authority: what the
+    // Compiler derived, what the Architect could not resolve, and what a human
+    // confirmed during Intake. The last one used to be dropped entirely.
+    const preconditions = mergeIntakePreconditions(
+      mergeUnresolvedIntoPreconditions(parsed.preconditions ?? emptyLoopPreconditions(), architecture.constraints),
+      source.intake,
+    )
     // The persistent Compiler conversation can be compacted. Repeating the
     // complete candidate gives the next retry a durable local-repair anchor.
     compilerDraft = { ...parsed, preconditions }
@@ -941,9 +953,19 @@ async function reviewGraphSemantics(
       requiredConstraintIds: round.reviewScope,
     })
     if (parsedReview) return { review: parsedReview, attempts: attempt }
-    lastError = `status=${record.status} error=${record.error ?? '(none)'}；`
-      + `裁决必须为本轮范围内的每条 hard constraint 给出一行 verdict（缺行即作废），`
-      + `satisfied 必须带真实存在的 graphRefs，out_of_scope 必须带 justification`
+    // A missing verdict row voids an otherwise complete review, and telling the
+    // reviewer only "the table was incomplete" makes the retry a guess. Re-parse
+    // without the coverage requirement: if that succeeds, the sole defect was
+    // coverage and the host can name the exact rows that were absent.
+    const withoutCoverage = parseLayeredSemanticReview(record.output, record.summary, { graph: parsed.graph })
+    const missing = withoutCoverage
+      ? round.reviewScope.filter(id => !withoutCoverage.verdicts.some(row => row.constraintId === id))
+      : []
+    lastError = missing.length
+      ? `verdicts 缺少这些约束的裁决行：${missing.join('、')}。其余内容都是好的，不要重做分析——只把缺的行补齐后重新输出完整 JSON。`
+      : `status=${record.status} error=${record.error ?? '(none)'}；`
+        + `裁决必须为本轮范围内的每条 hard constraint 给出一行 verdict（缺行即作废），`
+        + `satisfied 必须带真实存在且可解析的 graphRefs，out_of_scope 必须带 justification`
   }
   return { review: rejectedSemanticReview(`semantic reviewer returned no valid layered verdict after ${maxReviewAttempts} attempts; ${lastError}`), attempts: maxReviewAttempts }
 }
@@ -1298,8 +1320,8 @@ export function formatGraphValidationFeedback(errors: readonly string[], graph?:
   if (/must contain exactly one of literal, ref, or call|must be a value expression|unsupported root/.test(joined)) {
     hints.add('ValueExpression 必须恰好是 {"literal":...}、{"ref":"$state.x"}、{"call":"id@version","args":[...]} 之一，不能直接写裸值或混合多个形式。')
   }
-  if (/needs exactly one default transition|multiple default\/unconditional|must route outcome|conditional transitions sharing priority/.test(joined)) {
-    hints.add('逐个 from+on 分组修路由：有条件边时恰好一个 default:true，条件边 priority 唯一；并覆盖该节点所有 success/failure/timer/event/timeout/resume outcome。')
+  if (/needs exactly one default transition|multiple default\/unconditional|must route outcome/.test(joined)) {
+    hints.add('逐个 from+on 分组修路由：有条件边时恰好一个 default:true；条件边按数组声明顺序 first-match，不需要 priority；并覆盖该节点所有 success/failure/timer/event/timeout/resume outcome。')
   }
   if (/workspace|write path|read path|deny|overlap|write rule/.test(joined)) {
     hints.add('Lane.workspace 只有 read、write、deny；write 元素为 {path,mode}，mode 只能是 owned|atomic_replace|append_only。不同 Lane 写路径不得重叠。')
@@ -1410,8 +1432,8 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 1. Constraint Ledger 是权威来源合同；Blueprint 只描述 Workspace、Lane、Control 意图，不预设拓扑。你可以自由选择最小充分的 Node、Lane、State 和 Transition。
 2. Compiler 不读取需求文件、不扫描项目，也不重新解释来源。Architect 的 Ledger 与 Blueprint 是本阶段完整输入；若缺少影响 executable lowering 的必要事实，使用 ask_user 暂停确认。
 3. 不要凭记忆猜 ABI。先调用 graph_reference(example)，再只按实际缺口调用 overview、nodes、workspace、lanes、control、capabilities；不要一次加载全部 section，也不要用不完整 skeleton 试探 graph_validate。
-4. 默认从“一个可写 persistent Worker + 一个独立只读 completion Reviewer + done/failed 终态”开始。Worker 承担常规轮次、反思、策略转向、项目文件维护和轮内 timer；Worker 只能输出 candidate_ready/evidence 等完成候选，不能用 stop/done/target_reached/next_node 之类字段直接签发业务终态。Reviewer 与 Worker 不共享 Lane、没有 write rule，只核验固定成功标准与证据；只有 Reviewer accepted 或注册的确定性 Function 证书才能进入 done。只有独立提交权限、多生产者竞争同一写面、并发、固定外部 Event、失败隔离等真实边界才继续拆节点。
-5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON——此时最终 JSON 里**不要再放 graph**（见【输出】）。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
+4. 默认从“一个可写 persistent Worker + 一个独立只读 completion Reviewer + done/failed 终态”开始。**但当来源规定了多个互斥阶段、且各阶段有自己的计数器、阈值或门禁时，为每个阶段复制这一对节点**（worker_a/review_a、worker_b/review_b…），阶段推进就是从一对走到下一对。它们可以共用同一个 Lane（同一持续会话与写权），same-lane-agent-split 这条 lint 对按阶段的顺序拆分不适用。这不是过度拆分：它把"我在哪个阶段"从每条 when 里的合取项变成节点位置，跨阶段的边因此不可能相互干扰。Worker 承担常规轮次、反思、策略转向、项目文件维护和轮内 timer；Worker 只能输出 candidate_ready/evidence 等完成候选，不能用 stop/done/target_reached/next_node 之类字段直接签发业务终态。Reviewer 与 Worker 不共享 Lane、没有 write rule，只核验固定成功标准与证据；只有 Reviewer accepted 或注册的确定性 Function 证书才能进入 done。只有独立提交权限、多生产者竞争同一写面、并发、固定外部 Event、失败隔离等真实边界才继续拆节点。
+5. 先在内部形成一个完整、最小的候选，再只传入 graph 调用 graph_validate。若返回错误，必须优先调用 graph_patch_validate，以 set/remove/insert/move operations 只改报错字段并重新验证；Transition 一律使用返回的稳定路径 /transitions/@id=<transition-id>/...，禁止数字下标。分支顺序错了（shadowed-route、terminal-route-shadowed）用 move 调整，不要重发整张图：{"op":"move","path":"/transitions/@id=晚的边","before":"/transitions/@id=早的边"}；在中间插入新分支用 {"op":"insert","path":"/transitions/@id=某条边","value":{...}}（插到该边之前）。注意：@id= 只是 graph_patch_validate 的**选择器语法**，专门用来在补丁里稳定定位数组元素，它不是 JSON pointer；最终输出的 traceability.graphRefs 是另一套约定（标准 JSON pointer，Transition 用数值下标），两者不可混用，详见【Traceability 与完成标准】。不得重发整张 Graph，也不得借机械错误重建已正确的拓扑。已有 valid 基线后，失败 patch 会自动回滚到该基线。只有 valid=true 且 frozen=true 后才补充简短 traceability 并返回最终 JSON——此时最终 JSON 里**不要再放 graph**（见【输出】）。不要输出过程性设计分析，不要让审阅元数据阻塞 Graph ABI 的局部修复；graph_validate 验证的是最终 LoopGraphSpec，不是新的 IR。
 
 【稳定语义边界】
 - Agent 直接读写真实项目 Workspace。Lane.workspace 声明 read、write、deny；write mode 只有 owned、atomic_replace、append_only。Kernel 不复制、不投影、不保存第二份用户数据。
@@ -1428,7 +1450,19 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - 来源把某段称为“code node”“reduce phase”或给了阶段名，并不要求创建同名物理 Node：只要没有独立能力、权限或恢复边界，一组确定性 Transition 的 when + updates 就是该阶段的可执行实现，traceability 直接指向这些 Transition。禁止为满足名称而伪造 Function。
 - Lane.workspace 已经是可审查的写权边界。只有来源明确要求独立提交者、多个生产者会竞争同一正式写面、或候选数据必须经批准后才能提交时才增加 writer Agent；单一 Worker 本身就是唯一写者时，直接让其 Lane 拥有项目文件，不得为了“审计”凭空制造 writer。
 - 若确有独立 writer，Reducer 只更新 Graph State，绝不回写或合并 Agent 的 $output；writer 的 target inputs 必须逐项绑定提交后的 $state。所有需要正式提交的分支才汇入 writer，纯等待/同一 Worker 的轮内恢复不应为凑拓扑绕行。禁止让 writer 从旧磁盘快照猜 post-transition State。
-- when 读取更新前 State 不意味着需要 gate。若本轮触发后 next_count=current+1，阈值 next_count>=T 直接改写为 current>=T-1，并按阈值优先级枚举互斥 Transition；reset 分支直接同时 set 计数和状态。只有这个代数改写确实无法表达时才允许一个真实的 commit barrier，禁止串联 identity/reduce/status gate。
+- when 读取更新前 State 不意味着需要 gate。若本轮触发后 next_count=current+1，阈值 next_count>=T 直接改写为 current>=T-1，并把阈值分支从严到宽**按顺序**写；reset 分支直接同时 set 计数和状态。只有这个代数改写确实无法表达时才允许一个真实的 commit barrier，禁止串联 identity/reduce/status gate。
+
+【路由是有序决策列表，不是优先级谜题】
+同一个 (from, on) 下的条件边按**数组声明顺序 first-match**：第一条 when 成立的边被选中，都不成立才走唯一的 default。因此：
+
+- **不要写 priority。** 它只用于覆盖数组顺序，正常设计里一条都不需要。把分支按来源陈述的顺序自上而下排好即可（从严到宽、终态在前、兜底在后）。
+- **分支之间不需要互斥。** 不要在后面的分支里重述前面分支的否定（"&& unrecoverable == false && remote_job_started == false"）。想让某个情况更晚匹配，就把它排在后面。重复的守卫合取项是图跑不通的最大单一来源。
+- **绝不用 when 里的条件来表达"我处在哪个互斥阶段"。** 来源若描述了多个互斥阶段（例如 phase=A/B/C，各自有独立计数器与阈值），为每个阶段生成自己的节点，让阶段由**所处位置**表达。不同阶段的边此时在结构上不可能相遇，你也不必再证明它们互斥。
+
+反例（多个阶段压在一个共享节点上，靠数字排序区分）：
+  priority 185  when: ... && $state.phase == 'P2' && $state.counter_b >= 5
+  priority 183  when: ... && $state.phase != 'P2' && $state.counter_a >= 9
+这两条永远不可能同时成立，却被迫排出先后；一旦排错，计数上限就永远到不了，终态不可达。正确做法是每个阶段各有各的节点，每个节点下三四条无需互斥的有序分支。
 - 确定性阈值、计数和时间规则不得让 Agent 心算；when 读取更新前 State。每个非终态 outcome 必须全覆盖。有界收敛 loop 使用 maxTotalActivations + maxLiveActivations；持续/反应式 loop 省略总量上限，只用 maxLiveActivations 限制同时存活的 ready/running/waiting Activation，并保留业务停止事件到 Terminal 的路由。不要再生成旧字段 maxActivations。
 - Graph 的墙钟、费用、Activation 总量/存活量和 Agent 生命周期预算耗尽会进入独立 exhausted 终态，不等同执行 failure；节点需要在耗尽前整理结果时可显式提供 on:'exhausted' 路由。quiesced without terminal 仍是控制流错误。
 - 并发数大于 1 时必须显式选择 stateConsistency。commit_latest 的 when 不得在需要同一快照语义时混用新鲜 $state 与基于旧 claim 快照生成的 $output；此类决策使用 serializable，或只路由与可变 State 无关的原始 output 事实。
@@ -1446,10 +1480,10 @@ preconditions 是机器可校验的启动合同：列出 loop 自身不会创建
 - 因此 node.prompt 只描述**持久化职责**："把本轮产出连同其证据引用落盘"、"以 append 语义追加本轮的运行记录"、"原子替换状态快照"，并可按角色引用 Lane 合同中的条目（"追加到你 Lane 合同里那条 append_only 规则所指的日志"）。不要写"创建 xxx/ 目录"、"写入 a/b.json"这类路径清单。需要读取的文件路径可以出现（read 不受 write/deny 约束），但不要写成祈使式的写入句。
 - 只有图确实存在独立 writer 时，Worker prompt 才只产出待提交数据；默认单 Worker 设计中，Worker 直接维护其 Lane 合同授权的项目文件。
 - 保留来源的确定性语义类别：来源区分三种以上结果时，让 Agent 原样输出该多态枚举，不要压成布尔，也不要用布尔反转代替缺失的那一态——丢掉一态就等于丢掉一条路由。
-- 来源的复合条件按真值表逐分区枚举互斥 Transition，不要用 OR 把不同量级的条件连起来。典型形状：复合条件成立才递增计数器，不成立的分支同时 set 计数器归零与派生状态；多个阈值分支从严到宽排列，且全部先受同一个复合条件约束。任何一个分区没有对应 Transition，就是一条不可达路径。
+- 来源的复合条件按有序分支列表书写，不要用 OR 把不同量级的条件连起来。典型形状：复合条件成立才递增计数器，不成立的分支同时 set 计数器归零与派生状态；多个阈值分支从严到宽**依次排列**（靠顺序而非互斥保证只命中一条）。列表末尾的 default 承接其余情况；无需为每个分区各写一条边。
 - 若某分支会重置计数器，检查更高的阈值分支是否仍可达：先触发的低阈值 reset 会让高阈值永远达不到。这类阈值要么与 reset 分支互斥，要么改用不被重置的累计量。
 - State 中声明的每个字段都必须至少被一条 Transition 的 updates 更新，否则它永远等于 initial，所有基于它的 when 都是死条件。只读不写的事实不要放进 State。
-- 业务终态不得被继续循环的分支遮蔽：让终态条件优先级更高，或与循环分支互斥。来源要求每轮更新的计数必须在所有对应提交分支上更新，不能只在主干分支更新。
+- 业务终态不得被继续循环的分支遮蔽：把终态分支排在循环分支**之前**。来源要求每轮更新的计数必须在所有对应提交分支上更新，不能只在主干分支更新。
 - 若某个最终文件只允许保存已通过评估、真正新增或已批准的数据，才采用“Worker 产候选→独立 Reviewer→writer/Effect 提交”；普通进展与实验日志由 Worker 直接写入。
 
 【Traceability 与完成标准】
@@ -1920,6 +1954,15 @@ function skippedSemanticReview(): LayeredSemanticReview {
  * graph is sound, so synthesize a blocking finding rather than accepting. */
 function rejectedSemanticReview(issue: string): LayeredSemanticReview {
   const review = skippedSemanticReview()
+  // `skippedSemanticReview` states that review was disabled by the caller.
+  // That is false here — it ran and failed — and the sentence lands verbatim in
+  // loop.semantic-review.md, telling a reader the one thing that did not happen.
+  for (const layer of SEMANTIC_REVIEW_LAYERS) {
+    review.layers[layer].evidence = [{
+      sourceRefs: [], designRefs: [], graphRefs: [],
+      statement: 'Independent semantic review ran but returned no usable verdict; this layer was never adjudicated.',
+    }]
+  }
   const finding: SemanticFinding = {
     ruleClass: 'fabricated-capability', statement: issue, sourceRefs: [], designRefs: [], graphRefs: [],
   }

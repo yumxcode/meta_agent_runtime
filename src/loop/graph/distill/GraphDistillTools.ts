@@ -76,7 +76,22 @@ function validateTool(
   }
 }
 
-type GraphPatchOperation = { op: 'set' | 'remove'; path: string; value?: unknown }
+/**
+ * `move` exists because routing order became semantic.
+ *
+ * Conditional edges out of one (from, on) are an ordered first-match list, so
+ * the single most common repair is now "evaluate this branch before that one" —
+ * and it is exactly what the `shadowed-route` and `terminal-route-shadowed`
+ * findings ask for. With only set/remove that is inexpressible: `set` on an
+ * array index REPLACES the element rather than inserting, and appending to `-`
+ * puts the edge last, which is the opposite of what those findings need. The
+ * model's only remaining option would be to resend the whole graph — the very
+ * thing that corrupts a 30KB envelope and costs an attempt.
+ *
+ * `insert` covers adding a branch in the middle; `move` covers reordering
+ * without restating the element.
+ */
+type GraphPatchOperation = { op: 'set' | 'remove' | 'insert' | 'move'; path: string; value?: unknown; before?: string }
 
 /** Keeps the last graph_validate candidate in tool-local memory so an ABI
  * repair changes only the reported fields. The executable graph stays simple;
@@ -88,7 +103,7 @@ function patchValidateTool(
 ): MetaAgentTool {
   return {
     name: 'graph_patch_validate',
-    description: 'Apply small set/remove operations to the last graph_validate candidate, then Validate and Freeze it. Use stable transition selectors such as /transitions/@id=route_id/when instead of numeric indexes. Use after validation errors instead of resending the whole graph.',
+    description: "Apply small set/remove/insert/move operations to the last graph_validate candidate, then Validate and Freeze it. Use stable transition selectors such as /transitions/@id=route_id/when instead of numeric indexes. Routing is first-match in transitions-array order, so reorder a branch with {op:'move', path:'/transitions/@id=late_edge', before:'/transitions/@id=early_edge'} (omit `before` to move it last); add one with {op:'insert', path:'/transitions/@id=existing', value:{…}} to place it just before that edge. Use after validation errors instead of resending the whole graph.",
     abortSupport: 'bounded', isConcurrencySafe: false, permission: { category: 'read', planMode: 'allow' }, maxResultSizeChars: 48_000,
     inputSchema: {
       type: 'object', additionalProperties: false,
@@ -98,9 +113,10 @@ function patchValidateTool(
           items: {
             type: 'object', additionalProperties: false,
             properties: {
-              op: { type: 'string', enum: ['set', 'remove'] },
+              op: { type: 'string', enum: ['set', 'remove', 'insert', 'move'] },
               path: { type: 'string' },
               value: {},
+              before: { type: 'string' },
             },
             required: ['op', 'path'],
           },
@@ -184,13 +200,30 @@ function validateCandidate(
   }
 }
 
+const GRAPH_PATCH_OPS = ['set', 'remove', 'insert', 'move'] as const
+
+/** Patch application is pure and order-sensitive, so it is worth testing on its
+ * own rather than only through a full validate/freeze round trip. */
+export function applyGraphPatchForTest(root: Record<string, unknown>, operation: unknown): void {
+  applyGraphPatch(root, operation as GraphPatchOperation)
+}
+
 function applyGraphPatch(root: Record<string, unknown>, operation: GraphPatchOperation): void {
-  if (!operation || (operation.op !== 'set' && operation.op !== 'remove')) throw new Error("op must be 'set' or 'remove'")
+  if (!operation || !(GRAPH_PATCH_OPS as readonly string[]).includes(operation.op)) {
+    throw new Error(`op must be one of ${GRAPH_PATCH_OPS.join(', ')}`)
+  }
+  if (operation.op === 'move') { applyGraphMove(root, operation); return }
   const parts = decodeJsonPointer(operation.path)
   if (!parts.length) throw new Error('root replacement/removal is not supported')
   let parent: unknown = root
   for (const part of parts.slice(0, -1)) parent = graphPatchChild(parent, part, operation.path)
   const key = parts.at(-1)!
+  if (operation.op === 'insert') {
+    if (!Array.isArray(parent)) throw new Error(`'insert' needs an array path; '${operation.path}' does not address an array element`)
+    const at = key === '-' ? parent.length : graphPatchArrayIndex(parent, key, operation.path, true)
+    parent.splice(at, 0, structuredClone(operation.value))
+    return
+  }
   if (Array.isArray(parent)) {
     if (operation.op === 'set' && key === '-') {
       parent.push(structuredClone(operation.value))
@@ -238,6 +271,37 @@ function graphPatchArrayIndex(parent: unknown[], key: string, path: string, allo
   const upper = allowEnd ? parent.length : parent.length - 1
   if (index < 0 || index > upper) throw new Error(`array index ${index} is out of bounds`)
   return index
+}
+
+/**
+ * Reorder one array element. `before` names the element it must precede;
+ * omitting it moves the element last.
+ *
+ * Resolved as index-then-splice on the SAME array so the operation is total:
+ * removing first would invalidate a `before` index that sits after the source.
+ */
+function applyGraphMove(root: Record<string, unknown>, operation: GraphPatchOperation): void {
+  const parts = decodeJsonPointer(operation.path)
+  if (!parts.length) throw new Error("'move' needs a path to an array element")
+  let parent: unknown = root
+  for (const part of parts.slice(0, -1)) parent = graphPatchChild(parent, part, operation.path)
+  if (!Array.isArray(parent)) throw new Error(`'move' needs an array path; '${operation.path}' does not address an array element`)
+  const from = graphPatchArrayIndex(parent, parts.at(-1)!, operation.path, false)
+  if (from < 0 || from >= parent.length) throw new Error(`array index ${from} is out of bounds`)
+
+  let to = parent.length - 1
+  if (operation.before !== undefined) {
+    const beforeParts = decodeJsonPointer(operation.before)
+    let beforeParent: unknown = root
+    for (const part of beforeParts.slice(0, -1)) beforeParent = graphPatchChild(beforeParent, part, operation.before)
+    if (beforeParent !== parent) throw new Error("'move' and its `before` selector must address the same array")
+    const target = graphPatchArrayIndex(parent, beforeParts.at(-1)!, operation.before, false)
+    if (target < 0 || target >= parent.length) throw new Error(`array index ${target} is out of bounds`)
+    // Removing the source first shifts everything after it down by one.
+    to = target > from ? target - 1 : target
+  }
+  const [element] = parent.splice(from, 1)
+  parent.splice(to, 0, element)
 }
 
 function graphPatchSelectors(graph: LoopGraphSpec): { transitions: Record<string, string> } {
@@ -291,7 +355,7 @@ export function graphReference(section: GraphReferenceSection, catalog: GraphRun
     },
     optionalTopLevel: ['capabilityPacks', 'concurrency', 'annotations'],
     freezeOwned: ['capabilityLock', 'graphHash', 'frozenAt'],
-    repairWorkflow: 'Call graph_validate once with the complete candidate. After any errors, use graph_patch_validate set/remove operations against its saved draft; do not resend the full graph.',
+    repairWorkflow: "Call graph_validate once with the complete candidate. After any errors, use graph_patch_validate set/remove/insert/move operations against its saved draft; do not resend the full graph. To fix a shadowed or unreachable branch, reorder it: {op:'move', path:'/transitions/@id=late', before:'/transitions/@id=early'}.",
     rule: 'Unknown executable fields are rejected. Domain-only notes belong under annotations.',
   })
   if (section === 'nodes') return document({
@@ -365,8 +429,8 @@ export function graphReference(section: GraphReferenceSection, catalog: GraphRun
   })
   if (section === 'control') return document({
     exactTransitionTemplates: {
-      conditional: { id: 'done_route', from: 'worker', on: 'success', when: '$output.done == true', priority: 100, to: { node: 'done', inputs: { result: { ref: '$output' } } } },
-      stringEnumConditional: { id: 'worsened_route', from: 'worker', on: 'success', when: "$output.trend == 'worsened'", priority: 90, to: 'writer' },
+      conditional: { id: 'done_route', from: 'worker', on: 'success', when: '$output.done == true', to: { node: 'done', inputs: { result: { ref: '$output' } } } },
+      stringEnumConditional: { id: 'worsened_route', from: 'worker', on: 'success', when: "$output.trend == 'worsened'", to: 'writer' },
       defaultWithUpdate: { id: 'continue_route', from: 'worker', on: 'success', default: true, updates: [{ target: 'iteration', reducer: 'builtin/increment@1', args: [{ literal: 1 }] }], to: 'worker' },
       failure: { id: 'worker_failed', from: 'worker', on: 'failure', to: { node: 'failed', inputs: { error: { ref: '$output' } } } },
     },
@@ -376,7 +440,9 @@ export function graphReference(section: GraphReferenceSection, catalog: GraphRun
     exactConcurrency: { maxActivations: 1, maxPerNode: 1, stateConsistency: 'commit_latest' },
     rules: [
       'updates.args is an array of ValueExpression objects.',
-      'Conditional routes need unique priorities and exactly one default.',
+      'Conditional routes out of one (from, on) are an ORDERED first-match list: the FIRST edge in array order whose `when` holds is taken, then the single default. Write branches in the order the source states them and OMIT `priority` — it exists only to override array order and is almost never needed.',
+      'Because matching is first-match, branches do NOT have to be mutually exclusive. Do not restate the negation of earlier branches ("&& x == false && y == false") in later ones — put the broader case later in the list instead. Duplicated guard conjuncts are the single largest source of unroutable graphs.',
+      'Never encode "which mutually-exclusive phase am I in" as a `when` conjunct across one shared node. Give each phase its own node(s) so the phase is expressed by position; edges of different phases then cannot interact at all.',
       'Agent/Function/Effect need success and failure routes; Wait routes use timer/event/timeout/failure; a paused terminal needs a resume route.',
       'Bounded loops declare maxTotalActivations plus maxLiveActivations. Continuous/reactive loops omit the total cap and use maxLiveActivations; maxActivations is a legacy input alias and must not be emitted.',
       "Limit exhaustion is an exhausted graph status, not failure. An Agent may route on:'exhausted' for a final deterministic cleanup/summary path.",

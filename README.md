@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.4` · Node.js `>= 18`
+> 当前版本:`0.8.5` · Node.js `>= 18`
 
 ---
 
@@ -222,6 +222,10 @@ Lane 负责连续会话、串行化和写路径所有权。`workspace.read` 声�
 `loop intake` 是可选的前置步骤。有些拒绝 Compiler 修不好——「最多 20 个有效候选轮次」没给出与 Activation 的换算关系、完成标准没写死、首轮要读的文件在项目里并不存在——缺的信息从来就不在系统里，却要等到多轮编译之后才由 Reviewer 发现。Intake 把这些缺口提前问出来：探针题库由阻断枚举反查而非开放访谈，先机械预检（查文件、查 PATH、比对已注册能力）再只问真正查不出的部分，产出人已逐条确认的 Constraint Ledger（`loop.intake.json`）。其中最有价值的是 `kind` 的确认——它机械决定约束在 Graph、Agent、独立 Reviewer 还是人那里被执行。需求文件一改，记录按 sha 自动失效；`distill` 自动拾取匹配的记录，`--no-intake` 强制走原路径。带 Intake 时 Architect 从抽取者变为校验者：可以追加它在项目里发现的新约束，但不得改动人已确认条目的 statement/kind/strength（宿主逐字节校验）。
 
 语义复核按“可观测优先于可阻断”收敛：宿主持有跨轮 verdict 台账，证据区域未变的约束不再重新裁决（指纹并入 `/limits`、`/concurrency` 与相关 Lane，任何不确定都倒向重审）；Reviewer 必须为本轮范围内每条 hard constraint 给出一行裁决，缺行整份作废，`satisfied` 必须给出真实可解析的 JSON pointer——这消除了“没提等于没问题”的歧义，也是“每轮报的问题都不一样”的机制来源。终态可达性下沉为确定性 lint（`terminal-unreachable`，忽略 `when` 取可达性上界，零假阳性）；`unbounded-or-unreachable-control` 等三类控制流阻断必须附带宿主可机械核对的反例（State 赋值 + 首尾相接的 Transition id 序列），给不出的自动降级为建议级 `unwitnessed-control-flow`。`loop distill` 结尾打印本轮收敛统计（沿用数、out-of-scope 放行数、降级数），其中「既被判为 out_of_scope 又被棘轮沿用」是这套取舍唯一的盲区，非零时直接给出人工复核警告。设计与取舍依据见 [Distill Intake 与语义复核收敛方案](docs/distill-intake-and-review-convergence-2026-07-31.md)。
+
+**路由是有序决策列表。** 同一个 `(from, on)` 下的条件边按**数组声明顺序 first-match**：第一条 `when` 成立的边被选中，都不成立才走唯一的 `default`。因此分支之间**不需要互斥**，也不需要 `priority`（它只用于覆盖数组顺序）。这一条不是风格偏好：早先校验器要求每条条件边有唯一 priority、运行时按 id 字母序决胜，等于逼模型把所有分支塞进一根数轴——包括永不同时成立的分支。在一张实测的图上，18 条条件边产生了 76 对必须人工保证的互斥义务，其中 **66 对（87%）的两条边根本不可能同时为真**，而全部路由失败都是这些数字排错导致的。改为声明顺序后，同一份决策的互斥义务降到 0，平均合取项从 3.6 降到 1.0。
+
+配套地：来源若规定了多个**互斥阶段**（各有自己的计数器与门禁），为每个阶段生成自己的节点，让阶段由**所处位置**表达，而不是塞进每条 `when` 的合取项——跨阶段的边此时在结构上不可能相互干扰。`graph_patch_validate` 提供 `move`/`insert`，重排分支不必重发整张图。
 
 Node 默认使用 `Agent | Wait | Terminal`；只有真实需要纯函数、幂等外部操作或并发汇合时才添加 `Function | Effect | Join`。`$state`、Reducer 和 `when` 提供确定性计数/阈值路由，开放领域判断仍交给 Agent。Kernel 支持 crash recovery、timer、早到 event inbox、event timeout 和 `source + deliveryId` 幂等去重。
 
@@ -493,4 +497,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.4`。
+当前包版本:`0.8.5`。

@@ -17,7 +17,7 @@ import type { LoopGraphSpec } from './GraphTypes.js'
  */
 export interface GraphLintFinding {
   level: 'error' | 'warning'
-  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'single-agent-terminal-authority' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'route-partition-gap' | 'terminal-unreachable'
+  rule: 'absolute-path' | 'outside-project-write' | 'undeclared-workspace-write' | 'prompt-writes-denied-path' | 'git-without-capability' | 'precomputed-routing' | 'single-agent-terminal-authority' | 'duplicate-route-condition' | 'same-lane-agent-split' | 'dead-literal-route' | 'unbounded-wait' | 'mixed-snapshot-routing' | 'static-effect-idempotency' | 'terminal-fanout-cancellation' | 'agent-budget-walltime' | 'lane-write-overlap' | 'redundant-mkdir' | 'dead-state-field' | 'dead-null-input' | 'shadowed-route' | 'terminal-route-shadowed' | 'terminal-unreachable'
   at: string
   message: string
 }
@@ -35,7 +35,6 @@ export function lintLoopGraph(spec: LoopGraphSpec): GraphLintFinding[] {
   lintDuplicateRouteConditions(spec, findings)
   lintShadowedRoutes(spec, findings)
   lintTerminalRouteShadowing(spec, findings)
-  lintRoutePartitionGaps(spec, findings)
   lintSameLaneAgentSplits(spec, findings)
   lintDeadLiteralRoutes(spec, findings)
   lintUnboundedWaits(spec, findings)
@@ -166,18 +165,56 @@ function targetNodeIds(to: LoopGraphSpec['transitions'][number]['to']): string[]
 /** A persistent Lane is a continuous session boundary, not a phase bucket.
  * Multiple Agents can be legitimate, so this is deliberately an advisory for
  * semantic review rather than a mechanical rejection. */
+/**
+ * Splitting one agent's work across nodes is a smell only when the nodes are
+ * ALTERNATIVES — bootstrap/pivot/monitor variants the loop keeps flipping
+ * between. Nodes arranged in SEQUENCE are a different thing entirely: a
+ * source-mandated phase order (convert → retarget → train, each with its own
+ * counters and gate) is exactly the structure that keeps the phase out of every
+ * `when` conjunct, and flagging it would argue against the design the Compiler
+ * is now told to produce.
+ *
+ * Mutual reachability separates the two precisely: alternatives can reach each
+ * other, sequential stages cannot go back.
+ */
 function lintSameLaneAgentSplits(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
+  const reach = reachableNodeSets(spec)
   for (const [laneId, lane] of Object.entries(spec.lanes ?? {})) {
     if (lane.context !== 'persistent') continue
     const agents = Object.entries(spec.nodes ?? {})
       .filter(([, node]) => node?.type === 'agent' && node.lane === laneId)
       .map(([nodeId]) => nodeId)
     if (agents.length < 2) continue
+    const alternating = agents.filter(agent =>
+      agents.some(other => other !== agent && reach.get(agent)?.has(other) && reach.get(other)?.has(agent)))
+    if (alternating.length < 2) continue
     findings.push({
       level: 'warning', rule: 'same-lane-agent-split', at: `lanes.${laneId}`,
-      message: `persistent lane contains ${agents.length} Agent nodes (${agents.join(', ')}); verify every split has an independent persistence, permission/concurrency, Kernel Wait/Event, failure-isolation, or terminal boundary — a different prompt, role name, first-run flag, or budget is not such a boundary; otherwise merge bootstrap/pivot/monitor phases into one autonomous Agent mode`,
+      message: `persistent lane contains ${alternating.length} mutually reachable Agent nodes (${alternating.join(', ')}) — the loop can flip between them, so they are alternatives rather than sequential stages; verify every split has an independent persistence, permission/concurrency, Kernel Wait/Event, failure-isolation, or terminal boundary — a different prompt, role name, first-run flag, or budget is not such a boundary; otherwise merge bootstrap/pivot/monitor phases into one autonomous Agent mode`,
     })
   }
+}
+
+/** Forward reachability closure over transition targets, for every node. */
+function reachableNodeSets(spec: LoopGraphSpec): Map<string, Set<string>> {
+  const edges = new Map<string, string[]>()
+  for (const transition of spec.transitions ?? []) {
+    if (typeof transition?.from !== 'string') continue
+    edges.set(transition.from, [...(edges.get(transition.from) ?? []), ...targetNodeIds(transition.to)])
+  }
+  const closure = new Map<string, Set<string>>()
+  for (const start of Object.keys(spec.nodes ?? {})) {
+    const seen = new Set<string>()
+    const queue = [...(edges.get(start) ?? [])]
+    while (queue.length) {
+      const next = queue.shift()!
+      if (seen.has(next)) continue
+      seen.add(next)
+      queue.push(...(edges.get(next) ?? []))
+    }
+    closure.set(start, seen)
+  }
+  return closure
 }
 
 /** Two transitions with the same source, outcome and predicate are not two
@@ -196,7 +233,7 @@ function lintDuplicateRouteConditions(spec: LoopGraphSpec, findings: GraphLintFi
     }
     findings.push({
       level: 'error', rule: 'duplicate-route-condition', at: `transitions '${transition.id}'.when`,
-      message: `has the same from/on/when predicate as transition '${first}'; one branch will always shadow the other — make the predicates mutually exclusive (including any state threshold)`,
+      message: `has the same from/on/when predicate as transition '${first}'; routing is first-match in declaration order, so '${first}' always wins and this edge is dead — merge the two branches, or change this predicate to the case it was actually meant to catch`,
     })
   }
 }
@@ -296,13 +333,11 @@ function compareRouteValue(actual: string, op: string, expected: string): boolea
   }
 }
 
-function routeAtomsOf(expr: RouteExpr, output: RouteAtom[] = []): RouteAtom[] {
-  if (expr.kind === 'atom') output.push(expr.atom)
-  else for (const part of expr.parts) routeAtomsOf(part, output)
-  return output
-}
 
 /** Conditional edges of one from+on group, in descending priority. */
+/** Evaluation order for one (from, on): priority first, then declaration order.
+ * `Array.prototype.sort` is stable, so equal priorities keep array order —
+ * exactly what `decideTransition` does. */
 function conditionalRouteGroup(spec: LoopGraphSpec, from: string, on: string): LoopGraphSpec['transitions'] {
   return (spec.transitions ?? [])
     .filter(transition => transition.from === from && (transition.on ?? 'success') === on
@@ -344,7 +379,7 @@ function lintShadowedRoutes(spec: LoopGraphSpec, findings: GraphLintFinding[]): 
         if (!strongConjuncts.length || !strongConjuncts.every(conjunct => weakConjuncts.has(conjunct))) continue
         findings.push({
           level: 'error', rule: 'shadowed-route', at: `transitions '${weak.id}'.when`,
-          message: `every condition of higher-priority transition '${strong.id}' (priority ${strong.priority ?? 0}) also appears in this one (priority ${weak.priority ?? 0}), so whenever this edge matches '${strong.id}' matches too and wins — this route can never fire; either raise this edge above '${strong.id}', or add the condition that distinguishes them (commonly the negation of what '${strong.id}' handles)`,
+          message: `every condition of the earlier transition '${strong.id}' also appears in this one, so whenever this edge matches '${strong.id}' matches too and is evaluated first — this route can never fire; move this edge BEFORE '${strong.id}' in the transitions array (routing is first-match in declaration order), or drop it if '${strong.id}' already covers it`,
         })
         break
       }
@@ -352,118 +387,21 @@ function lintShadowedRoutes(spec: LoopGraphSpec, findings: GraphLintFinding[]): 
   }
 }
 
-/** Reachable-value candidates for one ref, derived from the constants the group
- * compares it against. Numeric refs get each cut point and its neighbours;
- * enumerated refs get their literals plus one value outside the set. */
-function routeValueDomain(atoms: readonly RouteAtom[]): string[] | undefined {
-  const numeric = atoms.filter(atom => Number.isFinite(Number(atom.value)))
-  const literal = atoms.filter(atom => !Number.isFinite(Number(atom.value)))
-  if (numeric.length && literal.length) return undefined // mixed use: not modellable
-  if (numeric.length) {
-    const values = new Set<number>([0])
-    for (const atom of numeric) {
-      const cut = Number(atom.value)
-      values.add(cut - 1); values.add(cut); values.add(cut + 1)
-    }
-    return [...values].filter(value => value >= -1).sort((a, b) => a - b).slice(0, 6).map(String)
-  }
-  const values = [...new Set(literal.map(atom => atom.value))]
-  // A boolean ref always has exactly two values, whichever one the conditions
-  // happen to mention — modelling it as the single mentioned literal would
-  // collapse the space and hide the partitions where it takes the other value.
-  if (values.every(value => value === 'true' || value === 'false')) return ['true', 'false']
-  // Deliberately NO sentinel for "some other enum value". Adding one invents
-  // partitions the design never distinguishes (a status the group simply leaves
-  // to the default), and on a healthy graph those invented rows were the only
-  // thing this rule reported — pure noise in the reviewer's must-verify list.
-  // Enumerating exactly the values the conditions themselves distinguish keeps
-  // a finding meaningful: some combination of cases the design DOES separate is
-  // claimed by nobody.
-  return values.slice(0, 6)
-}
 
-const MAX_PARTITION_REFS = 10
-const MAX_PARTITION_COMBOS = 50_000
-const MIN_CONDITIONAL_EDGES_FOR_PARTITION_CHECK = 4
-const MAX_REPORTED_PARTITIONS = 6
-/**
- * Speak only when the uncovered pocket is small enough to enumerate exhaustively.
- * That single gate is what separates a real truth-table hole from the ordinary
- * "a few specific conditions over a broad default" style: on a graph that passed
- * review 378 partitions legitimately fell through to a "keep iterating" default,
- * while the graph whose recovery branch was genuinely mis-routed had a pocket of
- * ~18. A ratio test looked equivalent but is not — one missing cell in a small
- * table is a large fraction of it — so the bound is absolute, and the finding
- * then lists every gap instead of asking anyone to hand-verify hundreds of rows.
- */
-const MAX_PARTITION_GAPS = 24
 
 /**
- * Enumerate the group's truth table over the constants its own conditions use,
- * and report the partitions that no conditional edge claims. Falling through to
- * `default` is legal, so this is advisory — but it is exactly the information a
- * reviewer needs and repeatedly failed to derive by hand: in one run a partition
- * meaning "improved, with new findings, after a long stall" fell into a default
- * whose updates incremented the stall counter and escalated to a stop.
+ * `route-partition-gap` used to live here.
+ *
+ * It enumerated a group's truth table and reported the partitions no
+ * conditional edge claimed. That was worth reporting only while routing was a
+ * flat set of edges that had to tile their own value space: a cell nobody
+ * claimed might have been an oversight. Conditional edges out of one (from, on)
+ * are now an ORDERED first-match list ending in an explicit default, so
+ * "matches no earlier branch, therefore takes the default" is not a gap — it is
+ * how the construct is defined. On a real graph the rule fired with 20 of 288
+ * partitions falling through, every one of them correct, and that noise went
+ * into the reviewer's must-verify list.
  */
-function lintRoutePartitionGaps(spec: LoopGraphSpec, findings: GraphLintFinding[]): void {
-  for (const { from, on } of routeGroupKeys(spec)) {
-    const group = conditionalRouteGroup(spec, from, on)
-    if (group.length < MIN_CONDITIONAL_EDGES_FOR_PARTITION_CHECK) continue
-    const fallback = (spec.transitions ?? []).find(transition =>
-      transition.from === from && (transition.on ?? 'success') === on && transition.default === true)
-    if (!fallback) continue
-
-    const parsed: RouteExpr[] = []
-    for (const transition of group) {
-      const expr = parseRouteExpression(transition.when!)
-      if (!expr) { parsed.length = 0; break }
-      parsed.push(expr)
-    }
-    if (!parsed.length) continue
-
-    const byRef = new Map<string, RouteAtom[]>()
-    for (const expr of parsed) for (const atom of routeAtomsOf(expr)) {
-      byRef.set(atom.ref, [...(byRef.get(atom.ref) ?? []), atom])
-    }
-    if (!byRef.size || byRef.size > MAX_PARTITION_REFS) continue
-    const domains: Array<{ ref: string; values: string[] }> = []
-    let combos = 1
-    for (const [ref, atoms] of byRef) {
-      const values = routeValueDomain(atoms)
-      if (!values?.length) { combos = Number.POSITIVE_INFINITY; break }
-      domains.push({ ref, values })
-      combos *= values.length
-    }
-    if (!Number.isFinite(combos) || combos > MAX_PARTITION_COMBOS) continue
-
-    const gaps: string[] = []
-    let total = 0
-    const walk = (position: number, env: Map<string, string>): void => {
-      if (position === domains.length) {
-        total++
-        if (parsed.some(expr => evaluateRouteExpression(expr, env))) return
-        if (gaps.length < MAX_REPORTED_PARTITIONS) {
-          gaps.push([...env].map(([ref, value]) => `${ref}=${value}`).join(', '))
-        } else gaps.push('')
-        return
-      }
-      const { ref, values } = domains[position]!
-      for (const value of values) {
-        env.set(ref, value)
-        walk(position + 1, env)
-      }
-      env.delete(ref)
-    }
-    walk(0, new Map())
-    const examples = gaps.filter(Boolean)
-    if (!examples.length || gaps.length > MAX_PARTITION_GAPS) continue
-    findings.push({
-      level: 'warning', rule: 'route-partition-gap', at: `transitions from '${from}' on '${on}'`,
-      message: `only ${gaps.length} of ${total} enumerated partitions match no conditional edge, so these edges nearly tile their own value space and that small pocket falls through to default '${fallback.id}': ${examples.map(example => `{${example}}`).join(' ; ')}${gaps.length > examples.length ? ` (+${gaps.length - examples.length} more)` : ''}. Falling through is legal, so verify '${fallback.id}'.updates and target are right for each — a partition needing different updates (a counter reset instead of an increment, a different terminal) needs its own Transition`,
-    })
-  }
-}
 
 /** Provable mutual exclusion between two atoms over the same ref. Used only to
  * SUPPRESS a warning, so an inconclusive answer is the safe default. */
@@ -540,7 +478,7 @@ function lintTerminalRouteShadowing(spec: LoopGraphSpec, findings: GraphLintFind
         if (exclusive) continue
         findings.push({
           level: 'warning', rule: 'terminal-route-shadowed', at: `transitions '${bound.id}'.when`,
-          message: `this edge routes to a Terminal on a $state threshold, but higher-priority transition '${looping.id}' (priority ${looping.priority ?? 0} vs ${bound.priority ?? 0}) continues the loop and its condition is not provably exclusive with this one — in the overlap the loop wins and the bound never takes effect; either raise this edge above '${looping.id}', or add the mutually exclusive guard (e.g. the complementary threshold) to '${looping.id}'`,
+          message: `this edge routes to a Terminal on a $state threshold, but the earlier transition '${looping.id}' continues the loop and its condition is not provably exclusive with this one — in the overlap the loop is matched first and the bound never takes effect; move this edge BEFORE '${looping.id}' in the transitions array (a source-mandated limit belongs above the branches that continue the loop)`,
         })
         break
       }

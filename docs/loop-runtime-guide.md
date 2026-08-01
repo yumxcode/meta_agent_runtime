@@ -136,7 +136,6 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
       "from": "work",
       "on": "success",
       "when": "$output.candidate_ready == true",
-      "priority": 100,
       "updates": [
         { "target": "iteration", "reducer": "builtin/increment@1" }
       ],
@@ -171,7 +170,6 @@ Distill 是前台可见的 Agentic 会话，不创建后台子任务。它会自
       "from": "review",
       "on": "success",
       "when": "$output.accepted == true",
-      "priority": 100,
       "to": {
         "node": "done",
         "inputs": { "result": { "ref": "$input.candidate" } }
@@ -293,6 +291,8 @@ meta-agent loop capabilities
 - append 文件使用 `append_file`，replace 文件使用 `write_file`；
 - Agent tools/skills 在目标机器可用（工具目录以 `DEFAULT_GRAPH_AGENT_TOOLS` 为唯一权威，扩展走 Capability Pack）；
 - 确定性阈值由 `when`/Reducer 计算；
+- 同一 `(from, on)` 下的条件边**按数组声明顺序 first-match**，末尾恰有一条 `default`：分支之间不需要互斥，终止/上限分支排在继续循环的分支**之前**；`priority` 只用于覆盖数组顺序，正常设计里不需要；
+- 互斥阶段由**节点位置**表达，而不是把 phase 判别写进每条 `when` 的合取项；
 - 所有 failure、timeout、event 和 timer 路由闭合；
 - 节点读取的每个 `$input.x` 在所有入边与 entrypoint 上都有绑定（可选值绑定 `{"literal": null}`；validator 会机械拒绝缺口）；
 - `loop.preconditions.json` 中的文件/CLI/凭据已就绪，未决决策已人工确认；

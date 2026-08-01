@@ -38,9 +38,24 @@ export async function decideTransition(input: {
     output: input.output,
     clock: { now: input.now },
   }
+  // Conditional edges out of one (node, outcome) are an ORDERED first-match
+  // decision list: declaration order decides, and `priority` only overrides it.
+  //
+  // The tie-break used to be `id.localeCompare`, i.e. alphabetical — an order
+  // nobody can author intentionally. That forced every graph to encode its
+  // branch order as invented numbers, and because those numbers form one total
+  // order per node, branches that could never both hold still had to be ranked
+  // against each other. In a real graph 87% of the resulting mutual-exclusion
+  // obligations were between conditions that are jointly unsatisfiable, and the
+  // failures were all mis-ranked numbers rather than mis-stated logic.
+  //
+  // With declaration order authoritative, a decision list is written the way
+  // the source states it — top to bottom — and later branches no longer need to
+  // restate the negation of everything above them.
+  const order = new Map(candidates.map((transition, index) => [transition, index]))
   const conditional = candidates
     .filter(transition => transition.when)
-    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || a.id.localeCompare(b.id))
+    .sort((a, b) => (b.priority ?? 0) - (a.priority ?? 0) || order.get(a)! - order.get(b)!)
   let selected: TransitionSpec | undefined
   for (const transition of conditional) {
     if (evaluateCondition(compileCondition(transition.when!), context)) { selected = transition; break }

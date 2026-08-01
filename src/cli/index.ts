@@ -41,7 +41,7 @@ import {
   runLoopCli, runLoopScheduler, createDefaultGraphRuntimeCatalog, loadGraphCapabilityPacks,
   createGraphDistillTools,
   ForegroundGraphDistillExecutor, MetaAgentGraphAgentExecutor, reviseLoopGraph,
-  readDistillArtifacts, writeDistillArtifacts,
+  readDistillArtifacts, writeDistillArtifacts, resolveIntakePickup,
   freezeLoopGraph, validateLoopGraph, lintLoopGraph, formatGraphLintFindings,
   type GraphDistillModelRequest, type GraphDistillPhase, type GraphDistillProgressEvent,
   type DistillGraphResult, type GraphRuntimeCatalog, type GraphProgressEvent, type LoopGraphSpec,
@@ -5681,6 +5681,7 @@ async function runLoopCommand(opts: CliOptions): Promise<void> {
         signal: abort.signal,
         graphCatalog,
         onDistillProgress: reporter.onProgress,
+        onDistillNotice: notice => console.log(`${dim('[distill]')} ${notice}`),
       }))
       // The follow-up revision loop reads the Distill artifacts, which an
       // Intake run never produces — it ends at loop.intake.json by design.
@@ -5816,7 +5817,15 @@ async function runDistillSession(options: {
   const requirementArg = distillRequirementArg(options.args)
   if (!requirementArg) throw new Error('interactive Distill lost the requirement document path')
   const outArg = loopOptionValue(options.args, '--out') ?? 'loop.graph.json'
-  const source = { requirement: requirementArg, projectDir: options.projectDir }
+  // The follow-up turns recompile from the Architect down, so they need the
+  // same human-confirmed ledger the initial run used. Omitting it here let a
+  // revision silently drop back to extraction mode and rewrite constraints the
+  // person had already signed off on.
+  const pickup = await resolveIntakePickup(options.projectDir, requirementArg, options.args.includes('--no-intake'))
+  const source = {
+    requirement: requirementArg, projectDir: options.projectDir,
+    ...(pickup.record ? { intake: pickup.record } : {}),
+  }
   let current: DistillGraphResult = await readDistillArtifacts(options.projectDir, outArg)
   const feedback: string[] = []
   console.log(`\n${bold(green('Distill session'))}`)

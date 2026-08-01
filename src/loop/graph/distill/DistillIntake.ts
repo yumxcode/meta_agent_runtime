@@ -124,6 +124,26 @@ export const INTAKE_PROBE_BANK: ReadonlyArray<{
     ruleClass: 'constraint-weakened',
     question: '以下条目被标记为 hard（不可协商）约束，请逐条确认强度与分类是否正确。',
   },
+  // Routing probes. These exist because the genuinely ambiguous branch pairs in
+  // a real loop are few — in one measured graph, 10 out of 76 — and they are
+  // questions the source does not answer, not defects the Compiler could fix.
+  // They used to surface as reviewer rejections several attempts in; asking a
+  // human up front is both cheaper and the only place the answer exists.
+  {
+    ruleClass: 'unbounded-or-unreachable-control',
+    question: '把来源里每个阶段的路由写成一张有序决策表（从上到下先匹配先赢）。逐条确认：条件同时成立时哪一条优先？表末尾兜底走哪里？',
+    precheckKind: 'source-scan',
+  },
+  {
+    ruleClass: 'missing-source-bound',
+    question: '来源为每个阶段各声明了独立计数器还是共用一个？（例如 A/B/C 三阶段各自的失败计数）合并会让一个阶段的失败推动另一个阶段的上限。',
+    precheckKind: 'source-scan',
+  },
+  {
+    ruleClass: 'unbounded-or-unreachable-control',
+    question: '有没有哪个分支会重置计数器，而更高的阈值依赖同一个计数器？若较低阈值先触发并重置，较高阈值将永远到不了——这个上限还要不要？',
+    precheckKind: 'source-scan',
+  },
 ]
 
 /**
@@ -170,8 +190,19 @@ export function validateLoopIntakeRecord(value: LoopIntakeRecord): string[] {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return ['intake must be an object']
   if (value.schemaVersion !== LOOP_INTAKE_SCHEMA) errors.push(`intake.schemaVersion must be '${LOOP_INTAKE_SCHEMA}'`)
   if (!value.source || typeof value.source.sha256 !== 'string' || !value.source.sha256) errors.push('intake.source.sha256 must be present')
-  errors.push(...validateConstraintLedger(value.constraints).map(error => `intake.${error}`))
-  errors.push(...validateLoopPreconditions(value.preconditions).map(error => `intake.${error}`))
+  // Guard before delegating: a truncated or hand-edited record reaches this
+  // function too, and a validator that throws would take down `loop distill`
+  // instead of letting it fall back to the compatibility path.
+  if (!value.constraints || typeof value.constraints !== 'object' || Array.isArray(value.constraints)) {
+    errors.push('intake.constraints must be a constraint ledger object')
+  } else {
+    errors.push(...validateConstraintLedger(value.constraints).map(error => `intake.${error}`))
+  }
+  if (!value.preconditions || typeof value.preconditions !== 'object' || Array.isArray(value.preconditions)) {
+    errors.push('intake.preconditions must be a preconditions object')
+  } else {
+    errors.push(...validateLoopPreconditions(value.preconditions).map(error => `intake.${error}`))
+  }
   if (!Array.isArray(value.approvedConstraintIds)) errors.push('intake.approvedConstraintIds must be an array')
   else {
     const known = new Set((value.constraints?.constraints ?? []).map(item => item?.id))
@@ -187,6 +218,52 @@ export function validateLoopIntakeRecord(value: LoopIntakeRecord): string[] {
     if (constraint?.origin !== 'intake') errors.push(`intake.constraints.constraints[${index}].origin must be 'intake'`)
   }
   return errors
+}
+
+/**
+ * Carry the human's launch contract through to the artifact `loop create` reads.
+ *
+ * Without this the chain that justifies Intake is broken at its last link: a
+ * person confirms that `humanoid/` must exist and `isaacgym` must be installed,
+ * and then the final `loop.preconditions.json` contains only whatever the
+ * Compiler happened to re-derive on its own. The whole point of the `capability
+ * → human → preconditions → loop create refuses to start` path is that the
+ * confirmation is binding, so the host merges it rather than hoping.
+ *
+ * Intake wins on `blocking`: a Compiler may add preconditions, but may not
+ * soften one a human declared mandatory. Deferred decisions become blocking
+ * `decision` items, which is what makes `loop create` stop and ask.
+ */
+export function mergeIntakePreconditions(
+  preconditions: LoopPreconditions,
+  intake: Pick<LoopIntakeRecord, 'preconditions' | 'deferred'> | undefined,
+): LoopPreconditions {
+  if (!intake) return preconditions
+  const items = [...(Array.isArray(preconditions.items) ? preconditions.items : [])]
+  const indexOf = new Map(items.map((item, index) => [`${item?.kind}:${item?.target}`, index]))
+  const upsert = (item: LoopPreconditions['items'][number]): void => {
+    const key = `${item.kind}:${item.target}`
+    const existing = indexOf.get(key)
+    if (existing === undefined) {
+      indexOf.set(key, items.length)
+      items.push(item)
+      return
+    }
+    if (item.blocking !== false) items[existing] = { ...items[existing]!, blocking: true }
+  }
+  for (const item of intake.preconditions?.items ?? []) {
+    if (item?.kind && item.target) upsert({ ...item, reason: `${item.reason}（Intake 已确认）` })
+  }
+  for (const decision of intake.deferred ?? []) {
+    if (!decision?.id) continue
+    upsert({
+      kind: 'decision',
+      target: decision.id,
+      reason: `Intake 中人明确暂缓的决策：${decision.question}${decision.assumedDefault ? `（拟用默认：${decision.assumedDefault}）` : ''}`,
+      blocking: true,
+    })
+  }
+  return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items }
 }
 
 /** Compact, reviewable rendering of the confirmed ledger for the Architect. */
@@ -205,6 +282,65 @@ export function formatIntakeLedgerForArchitect(intake: LoopIntakeRecord): string
         ...intake.deferred.map(item => `- ${item.id}: ${item.question}（拟用默认：${item.assumedDefault}）`)]
       : []),
   ].join('\n')
+}
+
+/**
+ * Why this run is or is not using the human-confirmed ledger.
+ *
+ * Pickup silently changes what the Architect is allowed to do, and a record
+ * that exists but cannot be used — a stale hash, a failed validation — used to
+ * fall back with no signal at all. That left no way to tell which path a
+ * multi-minute compile was on until it finished, which is exactly when the
+ * information is least useful. The decision is now stated before the run.
+ */
+export interface IntakePickup {
+  record?: LoopIntakeRecord
+  notice: string
+}
+
+export async function resolveIntakePickup(
+  projectDir: string,
+  requirement: string,
+  disabled: boolean,
+): Promise<IntakePickup> {
+  const path = resolve(projectDir, LOOP_INTAKE_FILE)
+  if (disabled) {
+    return { notice: `intake: 已用 --no-intake 显式跳过（${LOOP_INTAKE_FILE} 不会被读取）` }
+  }
+  const raw = await readFile(path, 'utf8').catch(() => null)
+  if (raw === null) {
+    return { notice: `intake: 无 ${LOOP_INTAKE_FILE}，走兼容路径（Architect 自行抽取约束）` }
+  }
+  let parsed: LoopIntakeRecord
+  try {
+    parsed = JSON.parse(raw) as LoopIntakeRecord
+  } catch (error) {
+    return { notice: `intake: 忽略 ${LOOP_INTAKE_FILE}（文件不是合法 JSON：${error instanceof Error ? error.message : String(error)}）` }
+  }
+  const errors = validateLoopIntakeRecord(parsed)
+  if (errors.length) {
+    return { notice: `intake: 忽略 ${LOOP_INTAKE_FILE}（记录不合法：${errors.slice(0, 3).join('；')}${errors.length > 3 ? ` 等 ${errors.length} 项` : ''}）` }
+  }
+  const identity = await distillSourceIdentity({ requirement, projectDir }).catch(() => null)
+  if (!identity) {
+    return { notice: `intake: 忽略 ${LOOP_INTAKE_FILE}（无法读取需求文件以校验其指纹）` }
+  }
+  if (parsed.source.requirement !== requirement) {
+    return { notice: `intake: 忽略 ${LOOP_INTAKE_FILE}（记录针对的是 ${parsed.source.requirement}，本次需求是 ${requirement}）` }
+  }
+  if (parsed.source.sha256 !== identity.sha256) {
+    // The single most likely reason, and the one whose silent version is worst:
+    // the artifact would claim human sign-off on a document nobody signed.
+    return {
+      notice: `intake: 忽略 ${LOOP_INTAKE_FILE}（${requirement} 在 intake 之后被修改过，人的确认已不适用于当前版本）\n`
+        + `        如需继续使用人工确认，请重新运行：meta-agent loop intake ${requirement}`,
+    }
+  }
+  return {
+    record: parsed,
+    notice: `intake: 采用 ${LOOP_INTAKE_FILE}——${parsed.constraints.constraints.length} 条约束，其中 ${parsed.approvedConstraintIds.length} 条经人确认后不可改动；`
+      + `${parsed.preconditions.items.length} 条启动前置条件，${parsed.deferred.length} 条暂缓决策。Architect 本轮只做校验与追加，不重新抽取。`,
+  }
 }
 
 export interface LoopIntakeStore {
@@ -264,6 +400,16 @@ export function buildLoopIntakeSystem(): string {
 2. **先机械预检，再提问。** 文件是否存在、命令是否可用、能力是否注册——先自己查。只问真正查不出答案的问题。把已经查清的事实直接写进台账，不要拿它去占用人的注意力。
 3. 用 ask_user 逐条提问，一次一个主题，给出你的推荐答案和它的后果。人可以回答，也可以明确暂缓。
 4. 人选择暂缓时，不要静默采用默认值：记入 deferred，它会进入运行前置条件，由 loop create 在启动前再拦一次。
+
+【路由审查：本阶段的第二件正事】
+来源里描述路由的段落（阶段、门禁、计数器、阈值、status 取值）要先整理成**每个阶段一张有序决策表**，再逐项和人确认。表的语义是"从上到下，第一条成立的赢"，因此分支之间**不需要互斥**，你要确认的是**顺序**和**兜底**：
+
+1. **重叠但来源没给先后**：把两条同时可能成立的分支摆出来问人谁优先。例如"失败计数已逼近上限"与"这一轮通过了"同时成立时，是判通过还是停下来要人介入？这类问题来源通常真的没写。
+2. **计数器是否被合并**：来源若为每个阶段声明了各自的计数器，不要合成一个。合并会让某阶段的失败推动另一阶段的上限，是静默的语义丢失。
+3. **被重置掐死的阈值**：若较低阈值的分支会重置计数器，而较高阈值依赖同一个计数器，那么高阈值永远到不了。把这个矛盾原样交给人：是改用不被重置的累计量，还是这个上限本来就不要？
+4. **兜底去哪**：每张表末尾必须有一条"其余情况"的去向。
+
+把确认后的顺序写进对应 constraint 的 acceptance（例如"分支顺序：先判 X 终止，再判 Y 转向，其余继续"）。**不要在这一阶段设计 Graph、节点或 priority 数字** —— 你只负责把决策表和它的顺序问清楚。
 
 【kind 的确认是本阶段最重要的产出】
 kind 不是分类标签，它机械决定该约束**在哪里被执行**，后续阶段无权更改：
