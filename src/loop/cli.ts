@@ -125,7 +125,7 @@ async function intake(args: string[], deps: LoopCliDeps): Promise<string> {
       sessionKey: 'distill-intake',
       taskDescription,
       systemPrompt: buildLoopIntakeSystem(),
-      allowedTools: ['read_file', 'grep', 'glob', 'ask_user'],
+      allowedTools: ['read_file', 'grep', 'glob', 'list_dir', 'ask_user'],
       signal,
     })
 

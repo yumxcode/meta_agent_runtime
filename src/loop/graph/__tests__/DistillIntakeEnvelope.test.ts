@@ -5,8 +5,14 @@ import { describe, expect, it } from 'vitest'
 import {
   describeJsonDefect,
   normalizeIntakePreconditions,
+  normalizePreconditionKind,
+  validateLoopPreconditions,
   normalizeIntakeProbes,
   createFileLoopIntakeStore,
+  deferredConstraintIds,
+  formatIntakeFactsForReviewer,
+  parseLayeredSemanticReview,
+  SEMANTIC_REVIEW_LAYERS,
   mergeIntakePreconditions,
   parseIntakeEnvelope,
   resolveIntakePickup,
@@ -281,5 +287,153 @@ describe('intake launch contract reaches loop create', () => {
   it('is a no-op without an intake record', () => {
     const base = { schemaVersion: 'loop-preconditions-1.0' as const, items: [] }
     expect(mergeIntakePreconditions(base, undefined)).toBe(base)
+  })
+})
+
+describe('what the reviewer is told a human already settled', () => {
+  const intake = {
+    schemaVersion: LOOP_INTAKE_SCHEMA,
+    source: { requirement: 'amp_loop.md', projectDir: '/p', sha256: 'abc' },
+    completedAt: 1,
+    constraints: {
+      schemaVersion: 'loop-constraints-2.0' as const,
+      goal: 'g',
+      constraints: [
+        { id: 'GATE-C', kind: 'success_criteria' as const, statement: 'Gate C 验收', strength: 'hard' as const, origin: 'intake' as const, sources: [{ path: 'amp_loop.md', locator: 'L126' }] },
+        { id: 'ROUTE-C', kind: 'deterministic_rule' as const, statement: '先判 error 再判 attention', strength: 'hard' as const, origin: 'intake' as const, sources: [{ path: 'amp_loop.md', locator: 'L182' }] },
+      ],
+    },
+    approvedConstraintIds: ['GATE-C', 'ROUTE-C'],
+    preconditions: { schemaVersion: 'loop-preconditions-1.0' as const, items: [] },
+    probes: [{
+      ruleClass: 'unbounded-or-unreachable-control' as const,
+      question: 'stale_countC >= 6 是否可达？',
+      status: 'answered' as const,
+      answer: '确认不可达，用户同意反转顺序并拆成双计数器。',
+      affects: ['ROUTE-C'],
+    }],
+    deferred: [{ id: 'DEF-THRESHOLDS', question: '阈值设为多少？', assumedDefault: '训练前冻结', affects: ['GATE-C'] }],
+  }
+
+  it('states the confirmed set, the deferrals and the answered probes', () => {
+    const text = formatIntakeFactsForReviewer(intake)
+    expect(text).toContain('GATE-C、ROUTE-C')
+    expect(text).toContain('DEF-THRESHOLDS')
+    expect(text).toContain('确认不可达，用户同意反转顺序')
+  })
+
+  it('keeps intent and implementation apart', () => {
+    // Blanket deference would be worse than the problem it solves: a human
+    // agreeing to a remedy says nothing about whether the Compiler applied it.
+    const text = formatIntakeFactsForReviewer(intake)
+    expect(text).toContain('意图已定，不要重新裁决')
+    expect(text).toContain('照查不误')
+    expect(text).toContain('overreach-obligation')
+  })
+
+  it('collects the constraints a deferral covers', () => {
+    expect([...deferredConstraintIds(intake)]).toEqual(['GATE-C'])
+    expect(deferredConstraintIds(undefined).size).toBe(0)
+  })
+})
+
+describe('a deliberately deferred value is not an unimplemented constraint', () => {
+  const envelope = (ruleClass: string, statement: string, witness?: unknown): Record<string, unknown> => {
+    const layers = Object.fromEntries(SEMANTIC_REVIEW_LAYERS.map(name => [name, {
+      status: 'pass', findings: [],
+      evidence: [{ sourceRefs: ['amp_loop.md:L1'], designRefs: ['intent'], graphRefs: ['/goal'], statement: 'Aligned.' }],
+    }]))
+    layers.control_flow = {
+      status: 'fail',
+      findings: [{
+        ruleClass, statement, sourceRefs: ['amp_loop.md:L131'], designRefs: ['control'], graphRefs: ['/limits'],
+        ...(witness ? { witness } : {}),
+      }],
+      evidence: [{ sourceRefs: ['amp_loop.md:L131'], designRefs: ['control'], graphRefs: ['/limits'], statement: 'Checked.' }],
+    }
+    return { schemaVersion: 'loop-semantic-review-2.2', accepted: false, layers, verdicts: [], issues: [] }
+  }
+  const deferred = { deferredConstraintIds: new Set(['GATE-C']) }
+
+  it('demotes a missing-value finding against a deferred constraint', () => {
+    const parsed = parseLayeredSemanticReview(
+      envelope('unimplemented-hard-constraint', 'GATE-C 的速度阈值在图中没有任何实现'), undefined, deferred)
+    expect(parsed?.accepted).toBe(true)
+    expect(parsed?.advisories[0]).toContain('已由人在 Intake 阶段明确暂缓')
+    expect(parsed?.layers.control_flow.status).toBe('pass')
+  })
+
+  it('leaves the same class blocking for a constraint nobody deferred', () => {
+    const parsed = parseLayeredSemanticReview(
+      envelope('unimplemented-hard-constraint', 'OTHER-C 的轮次上限在图中没有任何实现'), undefined, deferred)
+    expect(parsed?.accepted).toBe(false)
+  })
+
+  it('prefers the deferral reason over the missing-witness reason', () => {
+    // Both rules demote, but only one of them is the truth. Telling the next
+    // round "you gave no counterexample" would send it hunting for evidence
+    // about a value nobody has chosen yet.
+    const parsed = parseLayeredSemanticReview(
+      envelope('missing-source-bound', 'GATE-C 的阈值没有确定性路由'), undefined, deferred)
+    expect(parsed?.accepted).toBe(true)
+    expect(parsed?.advisories[0]).toContain('已由人在 Intake 阶段明确暂缓')
+    expect(parsed?.advisories[0]).not.toContain('未提供反例')
+  })
+
+  it('only demotes the "value is missing" reading, not every finding', () => {
+    // Whether Gate C has an independent reviewer is unrelated to whether its
+    // threshold has been chosen, and must still block.
+    const parsed = parseLayeredSemanticReview(
+      envelope('single-agent-terminal-authority', 'GATE-C 由产出工作的 Agent 自行签发'), undefined, deferred)
+    expect(parsed?.accepted).toBe(false)
+  })
+})
+
+describe('precondition kinds the Distill vocabulary invites', () => {
+  it('repairs kind="capability", which our own prompts teach the model to write', () => {
+    // Every Distill prompt says a kind=capability CONSTRAINT resolves to the
+    // human and lands in preconditions. The model then writes "capability" on
+    // the precondition too — and two such items failed a whole Intake after the
+    // person had already answered everything.
+    const items = [
+      { kind: 'capability', target: 'isaacgym', reason: '训练依赖' },
+      { kind: 'capability', target: 'gradmotion', reason: '远端训练' },
+    ]
+    const normalized = normalizeIntakePreconditions({ schemaVersion: 'loop-preconditions-1.0', items })
+    expect(normalized.items.map(item => item.kind)).toEqual(['command', 'command'])
+    expect(validateLoopPreconditions(normalized)).toEqual([])
+  })
+
+  it('maps the other synonyms models reach for', () => {
+    const items = [
+      { kind: 'skill', target: 'gradmotion', reason: 'r' },
+      { kind: 'secret', target: 'ANTHROPIC_API_KEY', reason: 'r' },
+      { kind: 'folder', target: 'humanoid/', reason: 'r' },
+      { kind: 'question', target: 'DEF-X', reason: 'r' },
+    ]
+    expect(normalizeIntakePreconditions({ schemaVersion: 'loop-preconditions-1.0', items }).items.map(i => i.kind))
+      .toEqual(['command', 'credential', 'directory', 'decision'])
+  })
+
+  it('infers from the target when the kind is unrecognisable', () => {
+    expect(normalizePreconditionKind('nonsense', 'data/motion.npz')).toBe('file')
+    expect(normalizePreconditionKind('nonsense', 'humanoid/')).toBe('directory')
+    // Not path-like and not classifiable: make it a blocking question rather
+    // than dropping it silently.
+    expect(normalizePreconditionKind('nonsense', 'something')).toBe('decision')
+  })
+
+  it('leaves already-valid kinds untouched', () => {
+    const items = [
+      { kind: 'file' as const, target: 'a.md', reason: 'r', blocking: true },
+      { kind: 'decision' as const, target: 'DEF-1', reason: 'r', blocking: true },
+    ]
+    expect(normalizeIntakePreconditions({ schemaVersion: 'loop-preconditions-1.0', items }).items).toEqual(items)
+  })
+
+  it('keeps a non-blocking item non-blocking', () => {
+    const items = [{ kind: 'capability', target: 'optional-cli', reason: 'r', blocking: false }]
+    const [item] = normalizeIntakePreconditions({ schemaVersion: 'loop-preconditions-1.0', items }).items
+    expect(item).toMatchObject({ kind: 'command', blocking: false })
   })
 })

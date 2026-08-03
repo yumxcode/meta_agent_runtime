@@ -51,6 +51,8 @@ import {
   type SemanticRuleClass,
 } from './DistillDesign.js'
 import {
+  deferredConstraintIds,
+  formatIntakeFactsForReviewer,
   formatIntakeLedgerForArchitect,
   intakeGuidanceForIssues,
   mergeIntakePreconditions,
@@ -475,7 +477,7 @@ async function compileLoopGraph(
         ...(source.intake ? [formatIntakeLedgerForArchitect(source.intake)] : []),
       ].join('\n\n'),
       systemPrompt: architectSystemPrompt,
-      allowedTools: ['read_file', 'grep', 'glob', 'ask_user'],
+      allowedTools: ['read_file', 'grep', 'glob', 'list_dir', 'ask_user'],
       signal,
     })
     if (architectRecord.status === 'cancelled' || signal.aborted) {
@@ -729,7 +731,10 @@ async function compileLoopGraph(
           const reviewScope = hardConstraintIds.filter(id => !carriedIds.has(id))
           const reviewed = await reviewGraphSemantics(reviewSource, {
             ...architecture, ...parsed, manifest, preconditions, lintWarningFindings,
-          }, deps, signal, attempt, { carried, reviewScope, loci: enforcementLoci })
+          }, deps, signal, attempt, {
+            carried, reviewScope, loci: enforcementLoci,
+            ...(source.intake ? { intake: source.intake } : {}),
+          })
           semanticReview = reviewed.review
           reviewerAttempts += reviewed.attempts
           for (const verdict of carried) {
@@ -889,6 +894,8 @@ export interface SemanticReviewRound {
   /** Hard constraint ids this round must adjudicate. */
   reviewScope: readonly string[]
   loci: ReadonlyMap<string, SemanticEnforcementLocus>
+  /** What a human already settled before compilation started. */
+  intake?: LoopIntakeRecord
 }
 
 async function reviewGraphSemantics(
@@ -930,6 +937,7 @@ async function reviewGraphSemantics(
         '【约束到 Graph 的 Traceability】', JSON.stringify(parsed.traceability),
         '【Kernel 机械提取的实现清单】', JSON.stringify(parsed.manifest),
         '【运行前置条件清单】', JSON.stringify(parsed.preconditions),
+        ...(round.intake ? [formatIntakeFactsForReviewer(round.intake)] : []),
         formatSemanticReviewScope(round),
         ...(relevantLint.length
           ? ['【机械 Lint 提示（与本轮待裁决约束相关，供定位用）】', relevantLint.map(item => `- ${item}`).join('\n')]
@@ -937,7 +945,7 @@ async function reviewGraphSemantics(
         '【编译说明】', parsed.taskSpec,
       ].join('\n\n'),
       systemPrompt: buildGraphSemanticReviewerSystem(),
-      allowedTools: ['read_file', 'grep', 'glob'],
+      allowedTools: ['read_file', 'grep', 'glob', 'list_dir'],
       signal,
     })
     if (record.status === 'cancelled' || signal.aborted) {
@@ -951,13 +959,16 @@ async function reviewGraphSemantics(
     const parsedReview = parseLayeredSemanticReview(record.output, record.summary, {
       graph: parsed.graph,
       requiredConstraintIds: round.reviewScope,
+      deferredConstraintIds: deferredConstraintIds(round.intake),
     })
     if (parsedReview) return { review: parsedReview, attempts: attempt }
     // A missing verdict row voids an otherwise complete review, and telling the
     // reviewer only "the table was incomplete" makes the retry a guess. Re-parse
     // without the coverage requirement: if that succeeds, the sole defect was
     // coverage and the host can name the exact rows that were absent.
-    const withoutCoverage = parseLayeredSemanticReview(record.output, record.summary, { graph: parsed.graph })
+    const withoutCoverage = parseLayeredSemanticReview(record.output, record.summary, {
+      graph: parsed.graph, deferredConstraintIds: deferredConstraintIds(round.intake),
+    })
     const missing = withoutCoverage
       ? round.reviewScope.filter(id => !withoutCoverage.verdicts.some(row => row.constraintId === id))
       : []
@@ -1123,9 +1134,9 @@ function formatGraphVisibilityManifest(graph: LoopGraphSpec): string {
 export function buildGraphSemanticReviewerSystem(): string {
   return `你是 Loop Distill 的独立语义审阅器。候选 Graph 已通过 ABI Validate 与 Freeze。你不重做字段 lint；你读取原始需求和适用项目合同，并审阅 Constraint Ledger、简明 Loop Blueprint、Constraint→Graph Traceability、Kernel 机械提取的 Graph Manifest 与运行前置条件清单（preconditions）。
 
-必须先根据 user prompt 的“Distill 来源身份”和需求入口使用 read_file 读取原始需求；这是唯一权威项目路径。Graph annotations、node prompt、Constraint Ledger 与 taskSpec 中的路径都是待核验陈述，不能覆盖来源身份。只有设计实际依赖项目结构、文件、命令或 Skill 时，才用 glob/grep/read_file 做最小充分的治理、ownership 和能力检查。Constraint Ledger 与 taskSpec 都不能代替原始来源。
+必须先根据 user prompt 的“Distill 来源身份”和需求入口使用 read_file 读取原始需求；这是唯一权威项目路径。Graph annotations、node prompt、Constraint Ledger 与 taskSpec 中的路径都是待核验陈述，不能覆盖来源身份。只有设计实际依赖项目结构、文件、命令或 Skill 时，才用 list_dir/glob/grep/read_file 做最小充分的治理、ownership 和能力检查。Constraint Ledger 与 taskSpec 都不能代替原始来源。
 
-隐藏控制目录可能不会出现在 glob 结果中；核验 .git/config、.git/HEAD 等已知路径时必须先用项目相对路径直接 read_file。只有 direct read 也失败后才能断言缺失，不能仅凭 glob 的 “No files found” 判定仓库不存在。
+【断言"不存在"之前必须换一种手段确认】某个目录/文件是否存在，用 list_dir——它一步给出确定答案，并区分"不存在"与"存在但为空"。glob 是遍历匹配，仓库里若有大型 vendored 依赖树（node_modules、site-packages、vendor 等），扫描可能在到达目标目录前就被截断，此时它会明确提示 TRUNCATED，那是"没扫完"而不是"不存在"。隐藏控制目录也可能不出现在 glob 结果中：核验 .git/config、.git/HEAD 等已知路径时必须用项目相对路径直接 read_file。只有 list_dir 或 direct read 也失败后，才能断言缺失。
 
 约束优先级：用户显式 hard constraint 与协议 > 适用项目治理/ownership > 已冻结 Runtime/Capability > 派生设计 > Scenario guidance。不得用同 Lane、共享上下文、默认习惯或 taskSpec 解释来绕过更高优先级约束。
 
@@ -1154,6 +1165,12 @@ ABI 与输入数据流闭合（含 $input 供给完整性）已由 Validate/Free
 同一条约束不要跨落点重复提出。若你认为某条的落点判错了（例如一条本质是阈值路由的约束被标成 agent），把它作为 intent_constraints 层的 finding 陈述理由，而不是直接按 graph 标准去要求它。
 
 user prompt 若附带【机械 Lint 提示】，那是宿主为你**定位**本轮待裁决约束而挑出的相关提示，不是必答题清单。核验不成立才提 finding；成立则无需为它单独产出 evidence。项目现实类提示用 glob/read_file 实地核验（例如"嵌套仓库依赖"须确认 owned 前缀下确实存在或由前置条件保证 .git）。
+
+【人已确认的事实：意图归人，实现归你】user prompt 若附带【人已确认的事实（Intake 产出）】，那是编译开始前人逐条签过字的内容。分界线必须守住：
+
+- **意图不重新裁决。** 已确认约束的 statement/kind/strength 是人的决定，不得判为"来源被改写或弱化"；人已回答过的核查问题不要作为 finding 重新提出；人明确暂缓的决策，其具体取值在图中缺席是**预期状态**，不得据此提 missing-source-bound 或 unimplemented-hard-constraint（宿主会把这类误报机械降级，提了只是白白多一条噪声）。
+- **实现照查不误。** 人同意某个修法，不等于 Compiler 做到了。约定的分支顺序有没有真的排对、约定的双计数器有没有真的建起来、约定的独立 Reviewer 在不在——这些恰恰是你的本职，一条都不能放过。
+- 若你确信某条人工决定本身有问题，用建议级 overreach-obligation 陈述理由，不要阻断：那是人的取舍，不是候选图的缺陷。
 
 【本轮复核范围】user prompt 会给出宿主判定的复核范围。已被宿主标记为"此前轮次已通过且证据未变"的约束，**不要重新裁决、不要产出 verdict 行、也不要为它们提 finding**——重新翻案会让整个复核退回到每轮换一批问题的状态，那正是这套机制要消除的。你只对本轮范围内的约束负责。
 
@@ -1383,7 +1400,8 @@ ${intakeContract}
 
 【工作方式】
 - user prompt 只给需求文件入口和项目地址。先用 read_file 读取原文；只有设计依赖项目结构、文件、命令、Skill 或 ownership 时，才用 glob/grep/read_file 做最小充分检查。
-- Workspace 事实必须核实，不得虚构：Blueprint 中每个写路径、以及需求或设计声明 Agent 要读取的每个具体文件，都必须用 glob/read_file 确认在项目中真实存在；不存在的要么在 workspace 中显式标注"由 loop 首轮自建"，要么写入 constraints.unresolved 或 capabilityGaps。禁止基于惯例发明项目中不存在的目录名（例如凭空假设 src/）。你是全流程唯一读取项目的阶段——Compiler 与 Runtime 都不会替你补查。
+- Workspace 事实必须核实，不得虚构：Blueprint 中每个写路径、以及需求或设计声明 Agent 要读取的每个具体文件，都必须确认在项目中真实存在；不存在的要么在 workspace 中显式标注"由 loop 首轮自建"，要么写入 constraints.unresolved 或 capabilityGaps。禁止基于惯例发明项目中不存在的目录名（例如凭空假设 src/）。你是全流程唯一读取项目的阶段——Compiler 与 Runtime 都不会替你补查。
+- **判断某个目录/文件是否存在，用 list_dir，不要用 glob。** glob 是遍历匹配：仓库里若有大型 vendored 依赖树（node_modules、site-packages、vendor 等），扫描可能在到达你要找的目录之前就被截断。list_dir 一步给出确定答案，并区分"不存在"与"存在但为空"。glob 的结果若提示 TRUNCATED，那是"没扫完"而不是"不存在"，**绝不可据此断言缺失**——换用 list_dir 或把 pattern 锚定到具体子目录（如 "src/**/*.py"）重查。
 - 项目外没有可写位置：Agent 沙箱对项目根以外的一切路径拒写。需求要求编辑的外部资源（例如另一个 git 仓库的工作树），Blueprint 必须以"clone/放置到项目内某个目录"的形式表达并作为启动前置条件；禁止设计"运行时再寻找项目外路径"的方案。
 - 约束优先级：用户显式目标/协议/边界 > 适用项目治理与 ownership > 已知部署能力 > 派生设计 > 默认习惯。来源冲突或歧义会改变路由、权限、所有权或安全边界时使用 ask_user。
 - ask_user 不可用、超时或未获回答时，禁止静默采用默认值：把问题原文、拟采用的默认与影响面写入 constraints.unresolved（{id,question,affects}）。unresolved 项会进入运行前置条件清单，由 loop create 强制人工确认。
@@ -1721,6 +1739,29 @@ export interface SemanticReviewParseContext {
    * verdict: the whole point of enumeration is that silence stops meaning
    * "probably fine". */
   requiredConstraintIds?: readonly string[]
+  /** Constraints whose concrete value a human deliberately postponed. */
+  deferredConstraintIds?: ReadonlySet<string>
+}
+
+/**
+ * Two finding classes mean "this number is not in the Graph". When a human
+ * explicitly chose to freeze that number later — and the decision is already a
+ * blocking `loop create` precondition — the absence is the intended state, not
+ * a defect, and the Compiler can never clear it. Everything else about such a
+ * constraint stays fully blocking; only the "value is missing" reading is
+ * demoted.
+ */
+const DEFERRABLE_RULE_CLASSES: ReadonlySet<string> = new Set(['missing-source-bound', 'unimplemented-hard-constraint'])
+
+function demoteDeferredFinding(finding: SemanticFinding, deferred: ReadonlySet<string> | undefined): SemanticFinding {
+  if (!deferred?.size || !DEFERRABLE_RULE_CLASSES.has(finding.ruleClass)) return finding
+  const mentioned = [...deferred].filter(id => finding.statement.includes(id) || finding.sourceRefs.some(ref => ref.includes(id)))
+  if (!mentioned.length) return finding
+  return {
+    ...finding,
+    ruleClass: 'overreach-obligation',
+    statement: `[原判 ${finding.ruleClass}，但 ${mentioned.join('、')} 的具体取值已由人在 Intake 阶段明确暂缓并登记为启动前置条件，图中没有该数值是预期状态] ${finding.statement}`,
+  }
 }
 
 export function parseLayeredSemanticReview(
@@ -1765,7 +1806,14 @@ export function parseLayeredSemanticReview(
       // passing layer.
       if (layer.status === 'fail' && !declaredBlocking.length) { invalid = true; break }
       if (layer.status !== 'fail' && declaredBlocking.length) { invalid = true; break }
-      const findings = declared.map(finding => demoteUnwitnessedFinding(finding, context?.graph))
+      // Deferral is checked BEFORE the witness rule. Both demote to advisory,
+      // but they give different reasons, and "a human deliberately postponed
+      // this value" is the accurate one — reporting "you supplied no
+      // counterexample" would send the next round chasing evidence for a
+      // question nobody is asking yet.
+      const findings = declared
+        .map(finding => demoteDeferredFinding(finding, context?.deferredConstraintIds))
+        .map(finding => demoteUnwitnessedFinding(finding, context?.graph))
       const layerBlocking = findings.filter(finding => isBlockingSemanticRuleClass(finding.ruleClass))
       blocking.push(...layerBlocking)
       advisory.push(...findings.filter(finding => !isBlockingSemanticRuleClass(finding.ruleClass)))

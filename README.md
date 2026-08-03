@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.5` · Node.js `>= 18`
+> 当前版本:`0.8.7` · Node.js `>= 18`
 
 ---
 
@@ -278,7 +278,7 @@ meta-agent -w /path/to/workspace loop disk <instanceId>
 
 | 类别 | 工具 |
 | --- | --- |
-| 文件系统 | `read_file`、`write_file`、`edit_file`、`glob`、`grep`、`notebook_edit` |
+| 文件系统 | `read_file`、`write_file`、`append_file`、`edit_file`、`glob`、`list_dir`、`grep`、`notebook_edit` |
 | Shell | `bash`、`powershell` |
 | 网络 | `web_fetch`、`web_search` |
 | MCP | `mcp_call`、`list_mcp_resources`、`read_mcp_resource` |
@@ -288,6 +288,8 @@ meta-agent -w /path/to/workspace loop disk <instanceId>
 | 溯源 | `get_provenance`、`list_recent`、`find_duplicate`、`get_lineage` |
 | 工作流 | `workflow_status`、`workflow_advance`、`workflow_complete_gate`、`workflow_list_phases` |
 | Robotics | `experiment_dispatch`、`paper_search`、`experience_*`、`principle_*`、`physical_anchor_*`、`hardware_profile_*`、team 工具、git 协调工具 |
+
+判断"某个目录/文件在不在"请用 `list_dir` 而不是 `glob`:前者一次 `readdir` 给出确定答案,并区分**不存在**、**存在但为空**、**存在且有内容** —— 这三者是模式搜索表达不了的。`glob` 是遍历匹配,会跳过 vendored 依赖树(`node_modules`、`site-packages`、`pylibs`、`vendor` 等,但 pattern 里字面点名时照搜),并在扫描被截断时**明确标注 TRUNCATED**;那句话的意思是"没扫完",不是"不存在",不可据此断言缺失。
 
 > 在 `SessionRouter` 下,子代理委派工具与 research_dispatch 会按模式自动注册;auto 模式还会装配工作区监狱、worktree 隔离与合并工具。`createAutoUiTools()` 为无人值守场景排除 `ask_user`/`send_message`。
 
@@ -497,4 +499,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.5`。
+当前包版本:`0.8.7`。

@@ -20,7 +20,7 @@ import { CapabilityPackRegistry } from '../registry/CapabilityPack.js'
  * locked by the parity test in GraphV2Cli.test.ts.
  */
 export const DEFAULT_GRAPH_AGENT_TOOLS = new Set([
-  'read_file', 'write_file', 'append_file', 'edit_file', 'glob', 'grep', 'bash',
+  'read_file', 'write_file', 'append_file', 'edit_file', 'glob', 'list_dir', 'grep', 'bash',
   'web_fetch', 'web_search', 'skill',
 ])
 

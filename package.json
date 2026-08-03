@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.8.5",
+  "version": "0.8.7",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -28,7 +28,7 @@
     "version:sync": "node scripts/sync-readme-version.js",
     "version:check": "node scripts/sync-readme-version.js --check",
     "version": "node scripts/sync-readme-version.js && git add README.md",
-    "prepack": "node scripts/sync-readme-version.js",
+    "prepack": "node scripts/check-publishable-manifest.js && node scripts/sync-readme-version.js",
     "pack": "npm run build && npm pack",
     "dev": "tsc --project tsconfig.json --watch",
     "test": "vitest run",
@@ -41,7 +41,9 @@
     "test:provider": "tsx examples/smoke-test-deepseek.ts",
     "inspect:prompt": "tsx examples/inspect-prompt.ts",
     "inspect:prompt:live": "INSPECT_LIVE=1 tsx examples/inspect-prompt.ts",
-    "typecheck": "tsc --noEmit"
+    "typecheck": "tsc --noEmit",
+    "check:manifest": "node scripts/check-publishable-manifest.js",
+    "clean:selfdep": "node scripts/clean-self-dependency.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.54.0",

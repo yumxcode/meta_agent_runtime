@@ -266,6 +266,60 @@ export function mergeIntakePreconditions(
   return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items }
 }
 
+/**
+ * What the reviewer must be told a human already settled.
+ *
+ * Without this the reviewer re-derives, from scratch, questions a person
+ * answered minutes earlier — and in one real run it filed exactly the
+ * unreachable-threshold finding the human had already diagnosed AND agreed a
+ * fix for. Worse, a deliberately deferred value (a threshold the human chose to
+ * freeze later, recorded as a blocking precondition) looks identical to an
+ * unimplemented constraint from the reviewer's seat, so it produces a blocker
+ * the Compiler can never clear.
+ *
+ * The boundary matters: what the human settled is the INTENT. Whether the Graph
+ * actually implements the agreed remedy is still entirely the reviewer's job,
+ * and this text says so explicitly rather than inviting blanket deference.
+ */
+export function formatIntakeFactsForReviewer(intake: LoopIntakeRecord): string {
+  const approved = new Set(intake.approvedConstraintIds)
+  const confirmed = intake.constraints.constraints.filter(constraint => approved.has(constraint.id))
+  const answered = intake.probes.filter(probe => probe.status === 'answered' && probe.answer)
+  const lines = [
+    '【人已确认的事实（Intake 产出）——意图已定，不要重新裁决】',
+    '以下内容是人在编译开始前逐条确认过的。**你没有立场推翻它们的意图**；但"图有没有真的照此实现"仍然完全是你的职责，照查不误。',
+  ]
+  if (confirmed.length) {
+    lines.push(`· 已确认的约束（statement/kind/strength 均由人签字，不得判为"来源被改写/弱化"）：${confirmed.map(item => item.id).join('、')}`)
+  }
+  if (intake.deferred.length) {
+    lines.push('· **人明确暂缓的决策**——具体取值是人故意还没定，已作为 blocking 前置条件由 loop create 拦截。'
+      + '因此这些约束在图中找不到具体数值是**正确状态**，不得据此提出 missing-source-bound 或 unimplemented-hard-constraint：')
+    for (const item of intake.deferred) {
+      lines.push(`  - ${item.id}：${item.question}（拟用默认：${item.assumedDefault}）${item.affects?.length ? ` → 涉及约束 ${item.affects.join('、')}` : ''}`)
+    }
+  }
+  if (answered.length) {
+    lines.push('· 人已回答过的核查问题——不要把它们作为 finding 重新提出：')
+    for (const probe of answered) lines.push(`  - [${probe.ruleClass}] ${probe.question}\n    人的回答：${probe.answer}`)
+  }
+  lines.push('若你确信某条人工决定本身有问题，用建议级 overreach-obligation 陈述理由，不要阻断——那是人的取舍，不是候选图的缺陷。')
+  return lines.join('\n')
+}
+
+/**
+ * Constraint ids whose concrete value a human deliberately postponed.
+ *
+ * Used to demote exactly the two finding classes that "the number is not
+ * decided yet" produces. Everything else about such a constraint — whether it
+ * has an independent reviewer, whether its routing is closed — stays blocking.
+ */
+export function deferredConstraintIds(intake: Pick<LoopIntakeRecord, 'deferred'> | undefined): Set<string> {
+  const ids = new Set<string>()
+  for (const decision of intake?.deferred ?? []) for (const id of decision.affects ?? []) ids.add(id)
+  return ids
+}
+
 /** Compact, reviewable rendering of the confirmed ledger for the Architect. */
 export function formatIntakeLedgerForArchitect(intake: LoopIntakeRecord): string {
   const approved = new Set(intake.approvedConstraintIds)
@@ -398,6 +452,7 @@ export function buildLoopIntakeSystem(): string {
 【工作方式】
 1. 先用 read_file 读取需求原文；再用 glob/grep/read_file 对项目做最小充分的核查。
 2. **先机械预检，再提问。** 文件是否存在、命令是否可用、能力是否注册——先自己查。只问真正查不出答案的问题。把已经查清的事实直接写进台账，不要拿它去占用人的注意力。
+   **判断目录/文件是否存在一律用 list_dir，不要用 glob。** glob 是遍历匹配，仓库里若有大型 vendored 依赖树（node_modules、site-packages、vendor 等），它可能在到达你要找的目录之前就被截断；list_dir 一步给出确定答案，并区分"不存在"与"存在但为空"。glob 结果提示 TRUNCATED 时意思是"没扫完"而不是"不存在"，**绝不可据此把某个目录记成 missing precondition** —— 把一份真实存在的代码目录写成"缺失"，会让人在启动前去确认一件根本不存在的问题。
 3. 用 ask_user 逐条提问，一次一个主题，给出你的推荐答案和它的后果。人可以回答，也可以明确暂缓。
 4. 人选择暂缓时，不要静默采用默认值：记入 deferred，它会进入运行前置条件，由 loop create 在启动前再拦一次。
 
@@ -439,24 +494,25 @@ kind 不是分类标签，它机械决定该约束**在哪里被执行**，后�
   "preconditions": {
     "schemaVersion": "${LOOP_PRECONDITIONS_SCHEMA}",
     "items": [
-      {"kind":"file","target":"data/motion.npz","reason":"首个 Activation 就要读取","blocking":true},
-      {"kind":"directory","target":"humanoid/","reason":"改造 PPO 基线的代码目录","blocking":true},
-      {"kind":"command","target":"mujoco","reason":"回放与 Sim2Sim 验证","blocking":true},
-      {"kind":"credential","target":"account-pool","reason":"远端训练换号","blocking":true},
-      {"kind":"decision","target":"DEF-THRESHOLDS","reason":"阈值待首次正式训练前冻结","blocking":true}
+      {"kind":"file","target":"input/dataset.csv","reason":"首个 Activation 就要读取，loop 自身不创建","blocking":true},
+      {"kind":"directory","target":"pipeline/","reason":"要改造的既有代码目录","blocking":true},
+      {"kind":"command","target":"some-cli","reason":"执行阶段需要调用","blocking":true},
+      {"kind":"credential","target":"SERVICE_TOKEN","reason":"访问外部服务","blocking":true},
+      {"kind":"decision","target":"DEF-1","reason":"人明确暂缓、须在某个节点前敲定的取值","blocking":true}
     ]
   },
   "probes": [
     {"ruleClass":"missing-precondition","question":"问过的问题",
-     "precheck":{"kind":"file","target":"humanoid/","found":false},
+     "precheck":{"kind":"file","target":"pipeline/","found":false},
      "status":"answered","answer":"人的回答","affects":["C1"]}
   ],
   "deferred": [
-    {"id":"DEF-THRESHOLDS","question":"暂缓的问题","assumedDefault":"无默认值，训练前冻结","affects":["C1"]}
+    {"id":"DEF-THRESHOLDS","question":"暂缓的问题","assumedDefault":"无默认值，须由人在指定节点前敲定","affects":["C1"]}
   ]
 }
 
 - **preconditions 是扁平的 items 数组**，不是按 paths / commands / credentials 分组的对象。kind 只能是 file|directory|command|credential|decision，target 必须是项目相对路径、命令名、凭据名或决策 id。
+- **注意不要把 constraint 的 kind 词汇搬到这里**：约束有 kind="capability"，但 preconditions **没有** capability 这一类。需要安装或可调用的东西（外部 CLI、运行时依赖、某个 skill）一律写 kind="command"；需要配置的密钥/账号写 kind="credential"。
 - 每条 constraint 的 origin 必须是 "intake"；kind 只能取 goal|success_criteria|deterministic_rule|workspace_protocol|terminal_obligation|ownership|capability|timer|event|failure_boundary|recovery|budget|other。
 - approvedConstraintIds 只列出人**明确确认过** kind 与 strength 的 id。人没看过或跳过的不要列进去——列进去会让后续阶段无法修正你的错误。
 - probes[].status 只能是 answered|deferred|not_applicable（不要用 resolved）；precheck 是对象 {kind,target,found}，kind 取 file|command|capability|source-scan。
@@ -527,11 +583,55 @@ export function parseIntakeEnvelope(output: unknown, summary?: string): { record
  * and rejecting it costs the whole session. The prompt now shows the shape,
  * and this maps the variant rather than punishing it.
  */
+/**
+ * Repair a precondition `kind` the model got wrong.
+ *
+ * `capability` is the one that actually happens, and it is our own vocabulary's
+ * fault: every Distill prompt says a `kind=capability` CONSTRAINT resolves to
+ * the human and lands in preconditions, so the model writes `kind:"capability"`
+ * on the precondition too. Two items — `isaacgym` and `gradmotion` — failed a
+ * whole Intake that way, after the human had already answered everything.
+ *
+ * Unrecognised kinds fall back to `decision` rather than being dropped: a
+ * decision is blocking and shown to a person at `loop create`, so a
+ * misclassified item becomes a question instead of a silent omission.
+ */
+export function normalizePreconditionKind(kind: unknown, target: string): LoopPreconditions['items'][number]['kind'] {
+  const raw = String(kind ?? '').trim().toLowerCase()
+  if (['file', 'directory', 'command', 'credential', 'decision'].includes(raw)) {
+    return raw as LoopPreconditions['items'][number]['kind']
+  }
+  // Something the runtime must be able to invoke.
+  if (['capability', 'tool', 'skill', 'binary', 'executable', 'cli', 'package', 'dependency'].includes(raw)) return 'command'
+  if (['credentials', 'secret', 'token', 'apikey', 'api_key', 'env', 'environment'].includes(raw)) return 'credential'
+  if (['dir', 'folder'].includes(raw)) return 'directory'
+  if (['choice', 'question', 'open_question', 'deferred'].includes(raw)) return 'decision'
+  // `path` and unknown kinds: let the target itself decide when it looks like one.
+  const looksLikePath = target.includes('/') || target.includes('\\') || /\.[A-Za-z0-9]{1,8}$/.test(target)
+  if (looksLikePath) return /[/\\]$/.test(target) ? 'directory' : 'file'
+  return 'decision'
+}
+
 export function normalizeIntakePreconditions(value: unknown): LoopPreconditions {
   if (!value || typeof value !== 'object' || Array.isArray(value)) return emptyLoopPreconditions()
   const object = value as Record<string, unknown>
   if (Array.isArray(object.items)) {
-    return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items: object.items as LoopPreconditions['items'] }
+    // The shape is right, but the enum values inside it may not be. Normalising
+    // only the shape is what let `kind:"capability"` through to the validator.
+    const items = object.items
+      .filter((item): item is Record<string, unknown> => Boolean(item) && typeof item === 'object' && !Array.isArray(item))
+      .map(item => {
+        const target = text(item.target) ?? ''
+        return {
+          ...item,
+          kind: normalizePreconditionKind(item.kind, target),
+          target,
+          reason: text(item.reason) ?? 'declared during Intake',
+          blocking: item.blocking !== false,
+        } as LoopPreconditions['items'][number]
+      })
+      .filter(item => item.target)
+    return { schemaVersion: LOOP_PRECONDITIONS_SCHEMA, items }
   }
   const items: LoopPreconditions['items'] = []
   for (const raw of asArray(object.paths)) {
