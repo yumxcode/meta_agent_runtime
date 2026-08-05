@@ -150,6 +150,13 @@ const KNOWN_OS_ROOT_DIRS = new Set([
   'private', 'Library', 'System', 'Applications', 'Volumes', 'cores', 'Network',
   // Other real roots
   'data', 'snap', 'app', 'tmp',
+  // 'dev' was MISSING here, which made the scan skip every /dev/ path before it
+  // reached any check — so `dd of=/dev/sda`, `mkfs /dev/nvme0n1` and
+  // `cat img > /dev/sdb` were never examined at all. (The explicit `/dev/`
+  // exemption further down was therefore dead code that merely made the hole
+  // look intentional.) With 'dev' recognised as a real root, benign character
+  // devices are carved out by ALLOWED_DEV_PATHS and block devices are denied.
+  'dev',
 ])
 
 /**
@@ -191,6 +198,36 @@ const READONLY_SYSTEM_PATH_PREFIXES = [
   '/System/Library/', '/Library/Developer/',
 ]
 
+/**
+ * Device files a shell command may legitimately reference.
+ *
+ * The previous rule exempted the WHOLE `/dev/` prefix, which let block-device
+ * writes (`dd of=/dev/sda`, `mkfs /dev/nvme0n1`, `> /dev/sdb`) sail through the
+ * workspace scan — and `dd`/`mkfs` are not in SENSITIVE_SHELL_PATTERNS either,
+ * so under auto mode's autoApproveInWorkspace nothing else stopped them. On a
+ * host with bwrap the fresh `--dev /dev` namespace hides real block devices,
+ * but on the noop-sandbox path (see sandbox/index.ts) the command reached the
+ * host unfiltered.
+ *
+ * So the exemption is an explicit allowlist now: the standard character devices
+ * and FD aliases that ordinary pipelines need, nothing else. Anything else under
+ * /dev/ falls through to the normal out-of-workspace denial.
+ */
+const ALLOWED_DEV_PATHS = new Set([
+  '/dev/null', '/dev/zero', '/dev/full', '/dev/random', '/dev/urandom',
+  '/dev/tty', '/dev/stdin', '/dev/stdout', '/dev/stderr',
+])
+/** `/dev/fd/3`, `/dev/fd/12` — process FD aliases used by `<(…)` and `>(…)`. */
+const ALLOWED_DEV_PATTERN = /^\/dev\/fd\/\d+$/
+
+function isAllowedDevicePath(candidate: string): boolean {
+  // Tolerate a trailing slash from the scanner's `\/?` group.
+  const path = candidate.length > 1 && candidate.endsWith('/')
+    ? candidate.slice(0, -1)
+    : candidate
+  return ALLOWED_DEV_PATHS.has(path) || ALLOWED_DEV_PATTERN.test(path)
+}
+
 function findWorkspaceViolation(
   tool: KernelTool,
   input: Record<string, unknown>,
@@ -226,7 +263,7 @@ function findWorkspaceViolation(
       if (READONLY_SYSTEM_PATH_PREFIXES.some(p => candidate.startsWith(p))) continue
       if (
         !(allowTmp && (candidate.startsWith('/tmp/') || candidate.startsWith('/var/tmp/'))) &&
-        !candidate.startsWith('/dev/') &&
+        !isAllowedDevicePath(candidate) &&
         !isInsideWorkspace(candidate, workspaceRoot)
       ) {
         return `bash command references path outside workspace: ${candidate.slice(0, 120)}`
@@ -278,13 +315,33 @@ function detectSensitiveBash(input: Record<string, unknown>): string | null {
  */
 function findBashRelativeEscape(input: Record<string, unknown>): string | null {
   const command = String(input['command'] ?? '')
-  if (/(?:^|[\s'"=:(])~(?:\/|\s|$|['"])/.test(command)) {
+  // `~` / `..` are only treated as PATHS when what follows them looks like a
+  // path or ends the argument: a `/`, a quote, end-of-command, or optional
+  // whitespace followed by a shell separator (`&&`, `||`, `;`, `|`, `)`, `>`).
+  //
+  // The trailing alternative used to be a bare `\s`, i.e. "anything followed by
+  // a space". That made `~` and `..` un-typable in their far more common
+  // NON-path roles and denied ordinary commands with a message pointing at the
+  // wrong thing entirely:
+  //   awk '$1 ~ /x/'   → "references home (~) — outside workspace"
+  //   echo "a .. b"    → "references parent path (..)"
+  // `~` is awk's regex-match operator and appears in nearly every awk one-liner,
+  // so the jail was rejecting a staple of shell work.
+  //
+  // Real escapes are still caught, because a path-shaped `~`/`..` always ends
+  // the argument or is followed by `/`:
+  //   cat ~/.ssh/id_rsa · rm -rf ~ · cd ~ && ls · rm -rf "~"
+  //   cat ../../etc/passwd · cd .. · cd .. ; ls
+  const PATH_TAIL = String.raw`(?:\/|['"]|$|\s*(?:$|[;&|)]|>{1,2}))`
+  const homeRe   = new RegExp(String.raw`(?:^|[\s'"=:(])~${PATH_TAIL}`)
+  const parentRe = new RegExp(String.raw`(?:^|[\s'"=:(])\.\.${PATH_TAIL}`)
+  if (homeRe.test(command)) {
     return 'bash command references home (~) — outside workspace'
   }
   if (/\$\{?HOME\b/.test(command)) {
     return 'bash command references $HOME — outside workspace'
   }
-  if (/(?:^|[\s'"=:(])\.\.(?:\/|\s|$|['"])/.test(command)) {
+  if (parentRe.test(command)) {
     return 'bash command references parent path (..) — may escape workspace'
   }
   // Filesystem root as a target: `/` or `/*` (optionally quoted). The leading
@@ -400,10 +457,33 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       }
     }
 
-    const sensitiveLabel = tool.name === 'bash' || tool.name === 'powershell'
-      ? detectSensitiveBash(record)
-      : null
-    if (sensitiveLabel || (permission.sensitive === true && tool.name !== 'bash' && tool.name !== 'powershell')) {
+    const isShellTool = tool.name === 'bash' || tool.name === 'powershell'
+    const sensitiveLabel = isShellTool ? detectSensitiveBash(record) : null
+
+    // Resolve whether this call needs an approval gate.
+    //
+    // Shell tools are special-cased because their BUILT-IN `sensitive: true`
+    // declaration (DEFAULT_TOOL_PERMISSIONS + the tool's own permission block)
+    // means "ask when a SENSITIVE_SHELL_PATTERNS rule matches", NOT "ask on
+    // every command" — prompting for every `ls` would make the tool unusable.
+    //
+    // That special case used to be written as `tool.name !== 'bash'` inside the
+    // gate condition, which silently swallowed an operator's explicit
+    // `permissions.json` override too: `{"tools":{"bash":{"sensitive":true}}}`
+    // did nothing at all, with no warning — on the single most dangerous tool.
+    // So the user config is now read separately from the merged declaration and
+    // is authoritative in BOTH directions:
+    //   true      → every shell command needs approval
+    //   false     → no shell command needs approval (not even pattern matches)
+    //   undefined → built-in behaviour: approve-on-pattern-match
+    // Non-shell tools keep using the merged declaration, where the user config
+    // already wins by merge precedence.
+    const userSensitiveOverride = permissionConfig.tools?.[tool.name]?.sensitive
+    const needsApproval = isShellTool
+      ? (userSensitiveOverride ?? sensitiveLabel !== null)
+      : permission.sensitive === true
+
+    if (needsApproval) {
       // Auto mode: a sensitive op that passed the jail's path checks is
       // auto-approved without a prompt. jailActive means the absolute-path
       // violation scan + relative/root-escape checks already ran, so the

@@ -1172,6 +1172,11 @@ user prompt 若附带【机械 Lint 提示】，那是宿主为你**定位**本�
 - **实现照查不误。** 人同意某个修法，不等于 Compiler 做到了。约定的分支顺序有没有真的排对、约定的双计数器有没有真的建起来、约定的独立 Reviewer 在不在——这些恰恰是你的本职，一条都不能放过。
 - 若你确信某条人工决定本身有问题，用建议级 overreach-obligation 陈述理由，不要阻断：那是人的取舍，不是候选图的缺陷。
 
+【落点判错时的出口：不要反复权衡，填 locus-misclassified 然后继续】
+落点由 kind 机械推导，**你无权重新推导它**。但你会遇到这种情况：某条约束的落点是 graph，可它的内容是一段**只有 Agent 能执行的流程**（典型形如"首次运行必须先全面审计 X，逐项核对 A、B、C 并列出差异"）。此时两种读法都成立——按落点说 prompt 不算实现，按内容说除了 prompt 无处可放——**你会发现自己在两者之间来回论证。一旦察觉，立刻停止。**
+
+这是上游分类错误，不是候选图的缺陷：Compiler 对这张图做任何修改都解决不了它。正确动作是**一次性**填一条建议级 locus-misclassified，写清"该约束是流程、应为 agent 落点"，然后继续下一条。不要反复重读 prompt，不要重新推导落点，更不要因此拖住整份裁决——**没有产出裁决比产出一条不完美的裁决糟糕得多**。
+
 【本轮复核范围】user prompt 会给出宿主判定的复核范围。已被宿主标记为"此前轮次已通过且证据未变"的约束，**不要重新裁决、不要产出 verdict 行、也不要为它们提 finding**——重新翻案会让整个复核退回到每轮换一批问题的状态，那正是这套机制要消除的。你只对本轮范围内的约束负责。
 
 Graph annotations 不会注入 Agent prompt，也不执行：任何落点的 hard constraint 都不能仅靠 annotations、taskSpec 或 rationale 满足，Agent prompt 依赖 annotations 中的值同样记 annotation-only-satisfaction。write mode 与 append/replace 语义不一致记 workspace-mode-mismatch。
@@ -1418,6 +1423,7 @@ Constraint Ledger：
 - 每个 constraint 必须有 id、kind、statement、strength="hard|soft"、至少一个 {path,locator,excerpt?} 来源；可选 acceptance。
 - kind 只能是 goal|success_criteria|deterministic_rule|workspace_protocol|terminal_obligation|ownership|capability|timer|event|failure_boundary|recovery|budget|other。
 - kind 不只是分类标签，它决定该约束**在哪里被执行**，宿主据此机械推导，后续阶段无权更改：deterministic_rule / workspace_protocol / ownership / terminal_obligation / failure_boundary / budget / timer / event → Graph 的路由、权限或硬边界；goal / recovery / other → 厚 Worker Agent 的领域职责；success_criteria → 独立只读 Reviewer 或注册的确定性 Function，Worker 只能提出完成候选，不能给自己签发完成证书；capability → 运行前置条件，由人确认。一个 recovery 同时含“如何换号”和“最多重试三次”时应拆成 recovery（Agent 操作）与 deterministic_rule/budget（Graph 上限）两条，而不是把整套 skill 流程编译成状态机。
+- **祈使语气不决定 kind，可判定性才决定。** 来源写“必须/务必/一律”并不使某条变成 deterministic_rule。判据只有一个：**这件事由谁裁决**。Graph 能不看内容就判真假的（计数、阈值、状态取值、路由、权限、时限、终态）才是 deterministic_rule；需要读文件、看现场、逐项核对才能完成的**流程**（“首次运行必须先全面审计 X，核对 A/B/C 并列出差异”）无论语气多强都是 Agent 的职责，应标 other 或 recovery。一个简单的自测：**你能写出一条 when 表达式来判断它是否满足吗？** 写不出来就不是 deterministic_rule。把流程误标成 deterministic_rule 会制造一条谁都修不好的约束——它要求 Graph 里存在某个元素，而这类要求唯一可能的归宿只有 Agent prompt。
 
 Loop Blueprint：
 - schemaVersion 必须是 "${LOOP_DESIGN_SCHEMA}"，goal 必须与 constraints.goal 完全相同。

@@ -26,7 +26,22 @@ export interface ToolRuntimeGuardsOptions {
  * calls pay only a Map lookup.
  */
 export class ToolRuntimeGuards {
-  private readonly sandboxHandles = new Map<string, SandboxHandle>()
+  /**
+   * Cache of IN-FLIGHT-OR-SETTLED handle creations, keyed by resolved policy.
+   *
+   * The Promise — not the handle — is what is cached. Caching the resolved
+   * handle left a window between the cache miss and the `await executor.create()`
+   * resolving: two concurrent bash calls both missed, both created a handle, and
+   * the second `set()` overwrote the first. The overwritten handle was then
+   * unreachable from `dispose()`, so it never got `destroy()`ed. Today's handles
+   * are stateless (bwrap is one-shot per command, `destroy()` is a no-op) so
+   * nothing leaked in practice — but it was a live trap for the first stateful
+   * backend (a persistent container, a VM, a mounted overlay).
+   *
+   * A rejected creation is evicted so the next call retries rather than
+   * permanently caching the failure.
+   */
+  private readonly sandboxHandles = new Map<string, Promise<SandboxHandle>>()
   private readonly options: ToolRuntimeGuardsOptions
   private readonly writeMutex: ReturnType<typeof getGlobalWriteMutex> | undefined
 
@@ -57,12 +72,20 @@ export class ToolRuntimeGuards {
   }
 
   async dispose(): Promise<void> {
-    const handles = [...this.sandboxHandles.values()]
+    const pending = [...this.sandboxHandles.values()]
     this.sandboxHandles.clear()
-    await Promise.allSettled(handles.map(handle => handle.destroy()))
+    // Await each creation before destroying it: a handle whose creation is still
+    // in flight when dispose() runs must not escape teardown. A creation that
+    // rejected has nothing to destroy.
+    await Promise.allSettled(
+      pending.map(async promise => {
+        const handle = await promise.catch(() => null)
+        await handle?.destroy()
+      }),
+    )
   }
 
-  private async getOrCreateSandboxHandle(policy: true | SandboxConfig): Promise<SandboxHandle> {
+  private getOrCreateSandboxHandle(policy: true | SandboxConfig): Promise<SandboxHandle> {
     const baseConfig: SandboxConfig = policy === true ? {} : policy
     // Merge operator-configured extra writable paths (config.json
     // sandbox.writeAllowPaths) into the policy's own writeAllowPaths.
@@ -77,17 +100,30 @@ export class ToolRuntimeGuards {
     const cacheKey = JSON.stringify(config)
     const cached = this.sandboxHandles.get(cacheKey)
     if (cached) return cached
-    const workspaceRoot = this.options.projectDir ?? process.cwd()
-    const executor = createSandboxExecutor()
-    if (executor.platform === 'noop' && !config.allowUnsandboxedFallback) {
-      throw new Error(
-        'Sandbox requested, but no supported sandbox backend is available. ' +
-        'Install sandbox-exec/bwrap or set sandbox.allowUnsandboxedFallback=true.',
-      )
-    }
 
-    const handle = await executor.create(config, workspaceRoot)
-    this.sandboxHandles.set(cacheKey, handle)
-    return handle
+    // Install the promise BEFORE the first await, so a concurrent caller that
+    // arrives mid-creation joins this one instead of starting a second.
+    const creation = (async (): Promise<SandboxHandle> => {
+      const workspaceRoot = this.options.projectDir ?? process.cwd()
+      const executor = createSandboxExecutor()
+      if (executor.platform === 'noop' && !config.allowUnsandboxedFallback) {
+        throw new Error(
+          'Sandbox requested, but no supported sandbox backend is available. ' +
+          'Install sandbox-exec/bwrap or set sandbox.allowUnsandboxedFallback=true.',
+        )
+      }
+      return executor.create(config, workspaceRoot)
+    })()
+
+    this.sandboxHandles.set(cacheKey, creation)
+    creation.catch(() => {
+      // Don't cache a failure: a transient one (bwrap briefly missing, a bind
+      // source not yet created) must not poison every later call for the
+      // session's lifetime.
+      if (this.sandboxHandles.get(cacheKey) === creation) {
+        this.sandboxHandles.delete(cacheKey)
+      }
+    })
+    return creation
   }
 }

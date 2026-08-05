@@ -10,7 +10,7 @@
  *   import { atomicWriteJson, readJsonFile, listJsonIds } from '../persist/index.js' (or core/persist shim)
  */
 
-import { mkdir, open, readFile, rename, writeFile, unlink, readdir, stat } from 'fs/promises'
+import { mkdir, open, readFile, rename, writeFile, unlink, readdir, stat, utimes } from 'fs/promises'
 import { dirname } from 'path'
 import { randomUUID } from 'crypto'
 
@@ -62,7 +62,11 @@ export async function readJsonFile<T = unknown>(filePath: string): Promise<T | n
       err instanceof Error ? err.message : String(err),
     )
     // Best-effort quarantine; never throw from a read helper.
-    await rename(filePath, `${filePath}.corrupt`).catch(() => {})
+    //
+    // The quarantine name carries a timestamp because a fixed `.corrupt`
+    // suffix meant the SECOND corruption silently overwrote the forensic copy
+    // of the first — exactly when you most want both.
+    await rename(filePath, `${filePath}.${Date.now()}.corrupt`).catch(() => {})
     return null
   }
 }
@@ -79,12 +83,26 @@ export async function readJsonFile<T = unknown>(filePath: string): Promise<T | n
  *
  * A crash between steps 2 and 3 leaves an orphaned .tmp file but never
  * corrupts the live `filePath`.
+ *
+ * Durability level is `process-crash-local-posix` (see
+ * loop/graph/operations/ReliabilityProfile.ts): there is deliberately no
+ * fsync, so a process crash is safe but a machine power-loss can still lose
+ * the most recent write. Raising this to `fsync-local-posix` is a change to
+ * THIS function alone — every store in the codebase funnels through it.
  */
 export async function atomicWriteJson(filePath: string, data: unknown): Promise<void> {
   await ensureParentDir(filePath)
   const tmp = `${filePath}.${randomUUID().slice(0, 8)}.tmp`
-  await writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8')
-  await rename(tmp, filePath)
+  try {
+    await writeFile(tmp, JSON.stringify(data, null, 2), 'utf-8')
+    await rename(tmp, filePath)
+  } catch (err) {
+    // A failed rename (cross-device, ENOSPC, permissions) used to strand the
+    // temp file forever; they accumulated in .loop/ and .meta-agent/ where
+    // nothing ever swept them.
+    await unlink(tmp).catch(() => {})
+    throw err
+  }
 }
 
 /**
@@ -97,8 +115,13 @@ export async function atomicWriteJson(filePath: string, data: unknown): Promise<
 export async function atomicWriteFile(filePath: string, contents: string): Promise<void> {
   await ensureParentDir(filePath)
   const tmp = `${filePath}.${randomUUID().slice(0, 8)}.tmp`
-  await writeFile(tmp, contents, 'utf-8')
-  await rename(tmp, filePath)
+  try {
+    await writeFile(tmp, contents, 'utf-8')
+    await rename(tmp, filePath)
+  } catch (err) {
+    await unlink(tmp).catch(() => {})   // don't strand the temp file (see atomicWriteJson)
+    throw err
+  }
 }
 
 // ── Directory listing ─────────────────────────────────────────────────────────
@@ -148,6 +171,22 @@ function sleep(ms: number): Promise<void> {
  *   - timeoutMs: how long to wait for the lock before throwing.
  *
  * The lock file is always removed in a finally block, even if `fn` throws.
+ *
+ * M3: the lock file's mtime is REFRESHED while the lock is held (see
+ * `keepAlive` below). Previously mtime was stamped once at creation and never
+ * touched again, so staleness was measured against acquisition time rather than
+ * liveness: any critical section that outlived `staleMs` (default 30s) was
+ * reclaimed out from under its live holder and two processes entered the
+ * section together. The owner-token check in the finally block only prevented
+ * the LOSER from deleting the winner's lock — the mutual exclusion was already
+ * gone by then, so the data race had happened.
+ *
+ * This was reachable in practice: `ExperienceStore.rebuildIndex` holds the
+ * default 30s lock across an `rm -rf` of the index directory plus one write per
+ * experience entry, which exceeds 30s on a large store or a slow/network disk.
+ * With the heartbeat, `staleMs` now means what it reads like — "the holder has
+ * stopped heartbeating, so it died" — and stale reclamation only fires for
+ * genuinely dead holders.
  */
 export async function withFileLock<T>(
   targetPath: string,
@@ -207,9 +246,22 @@ export async function withFileLock<T>(
     }
   }
 
+  // M3: heartbeat the lock's mtime for as long as we hold it, so a slow `fn`
+  // is never mistaken for a crashed holder. staleMs/3 gives two missed beats of
+  // headroom before another process is entitled to reclaim. The timer is
+  // unref'd so it can never keep the process alive on its own, and the write is
+  // best-effort: a transient utimes failure just means one skipped beat.
+  const heartbeatMs = Math.max(50, Math.floor(staleMs / 3))
+  const keepAlive = setInterval(() => {
+    const now = new Date()
+    void utimes(lockPath, now, now).catch(() => {})
+  }, heartbeatMs)
+  keepAlive.unref?.()
+
   try {
     return await fn()
   } finally {
+    clearInterval(keepAlive)
     // M1: only remove the lock if it is still the one WE created. If `fn` ran
     // longer than staleMs another process may have reclaimed the lock and
     // written its own token; unlinking unconditionally would delete that fresh

@@ -12,7 +12,28 @@ export function registerMcpClient(serverName: string, client: McpClient): void {
 }
 
 export function unregisterMcpClient(serverName: string): void {
+  const client = mcpClients.get(serverName)
   mcpClients.delete(serverName)
+  closeClient(client)
+}
+
+/**
+ * Shut down every registered MCP client.
+ *
+ * Stdio clients now hold a LONG-LIVED server process (previously one process
+ * was spawned and discarded per RPC, so there was nothing to clean up). Without
+ * this, `npx …` servers would outlive the CLI as orphans, holding ports and
+ * file locks. Call it from process-exit cleanup.
+ */
+export function disposeMcpClients(): void {
+  const clients = [...mcpClients.values()]
+  mcpClients.clear()
+  for (const client of clients) closeClient(client)
+}
+
+function closeClient(client: McpClient | undefined): void {
+  const closable = client as { close?: () => void } | undefined
+  try { closable?.close?.() } catch { /* shutdown is best-effort */ }
 }
 
 export function getRegisteredMcpServers(): string[] {

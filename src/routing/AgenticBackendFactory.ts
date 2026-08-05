@@ -186,9 +186,16 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
               .map(todo => todo.content),
             note: getProgressNoteForSession(sessionId),
             artifacts: getArtifactsForSession(sessionId) ?? [],
+            // MUST agree with the self_timer guard below, which asks the bridge
+            // the same question. It previously unioned in `activeTasks()`, which
+            // keeps a record until the branch is merged — so a sub-agent that had
+            // finished but was still `awaiting_merge` counted as active HERE but
+            // not THERE. self_timer let the session park; armAutoContinuation
+            // then refused to arm the wake ("still lists active sub-agents") and
+            // the session was lost. `busyTasks()` is the in-flight-only view.
             activeSubAgentIds: [...new Set([
               ...(bridgeRef?.getSchedulerStats().activeTaskIds ?? []),
-              ...(bridgeRef?.getWorktreeCoordinator()?.activeTasks() ?? []),
+              ...(bridgeRef?.getWorktreeCoordinator()?.busyTasks() ?? []),
             ])],
           }
         },
@@ -274,10 +281,17 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   for (const tool of makeSubAgentTools(bridge)) session.registerTool(tool)
   if (wantsGates) {
     session.registerTool(createSelfTimerTool({
+      // Same union as the checkpoint snapshot above — deliberately, so the
+      // "can we park?" answer and the "may we arm the wake?" answer can never
+      // disagree. They diverged before (bridge-only here, bridge ∪ worktree
+      // there), which let a park succeed and its wake then be refused.
       getOutstandingSubAgents: () => {
         const stats = bridge.getSchedulerStats()
         return {
-          runningIds: stats.activeTaskIds,
+          runningIds: [...new Set([
+            ...stats.activeTaskIds,
+            ...(bridge.getWorktreeCoordinator()?.busyTasks() ?? []),
+          ])],
           queued: stats.queued,
         }
       },

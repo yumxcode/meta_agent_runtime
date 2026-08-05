@@ -13,10 +13,10 @@ export default defineConfig({
     globals: false,
     environment: 'node',
     include: ['src/**/__tests__/**/*.test.ts'],
-    // src/core/auto_orch is the retired v1 engine (T4.3b). Its files are emptied
-    // in place pending `git rm`; exclude the dir so its stub test files are not
-    // loaded as empty suites.
-    exclude: [...configDefaults.exclude, 'src/core/auto_orch/**'],
+    // The `src/core/auto_orch/**` exclusion that used to live here is gone: the
+    // retired v1 engine's emptied stub files have now actually been deleted, so
+    // there is nothing left to skip.
+    exclude: [...configDefaults.exclude],
     setupFiles: ['src/__tests__/setup.ts'],
     env: {
       META_AGENT_HOME: TEST_META_AGENT_HOME,

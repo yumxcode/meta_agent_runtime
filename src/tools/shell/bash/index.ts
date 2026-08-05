@@ -5,6 +5,7 @@ import { dynamicDescription } from '../../util.js'
 import { resolveInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
 import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
+import { buildChildEnv, type ShellEnvPolicy } from '../../../infra/env/childProcessEnv.js'
 
 const DEFAULT_MAX_OUT = 100 * 1024
 const DEFAULT_TIMEOUT_MS = 30_000
@@ -46,61 +47,15 @@ export function redactSensitiveShellOutput(value: string): string {
 }
 
 /**
- * H5: Build the env passed to the spawned shell.
+ * H5: the env passed to the spawned shell.
  *
- *   'inherit'  → forward process.env verbatim (legacy behaviour)
- *   'filtered' → drop common credential-bearing variables (default)
- *   'empty'    → start with PATH / HOME / LANG only
- *
- * The "filtered" policy strips anything matching /(_API_KEY|_TOKEN|_SECRET|
- * _PASSWORD|_CREDENTIALS|_AUTH)$/i plus a small explicit blocklist.
+ * The policy itself now lives in infra/env/childProcessEnv.ts so that EVERY
+ * child process this runtime spawns shares one credential-hygiene rule — the
+ * MCP stdio client used to hand out the full `process.env`, quietly undoing the
+ * protection this tool was written to provide. `ShellEnvPolicy` is re-exported
+ * here because it was part of this module's public surface.
  */
-const SENSITIVE_ENV_PATTERN =
-  /(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|SESSION_KEY|ACCESS_KEY|REFRESH_TOKEN|AUTH)$/i
-const EXPLICIT_ENV_BLOCKLIST = new Set([
-  'ANTHROPIC_API_KEY', 'DEEPSEEK_API_KEY', 'QWEN_API_KEY', 'OPENAI_API_KEY',
-  'NPM_TOKEN',
-  'AWS_ACCESS_KEY_ID', 'AWS_SECRET_ACCESS_KEY', 'AWS_SESSION_TOKEN',
-])
-
-/**
- * Git remote credentials are deliberately allowed through the 'filtered' policy
- * so auto-mode `git push` over HTTPS works. These names take precedence over
- * BOTH the explicit blocklist and the SENSITIVE_ENV_PATTERN below (which would
- * otherwise strip anything ending in _TOKEN). Scope is intentionally narrow:
- * only git-remote auth — npm / AWS / model-provider keys stay stripped, and SSH
- * key auth (~/.ssh) is unaffected since it never travels through the env.
- */
-const GIT_CREDENTIAL_ALLOWLIST = new Set([
-  'GITHUB_TOKEN', 'GH_TOKEN', 'GIT_TOKEN', 'GITLAB_TOKEN',
-])
-const MINIMAL_ENV_KEYS = ['PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'SHELL', 'TMPDIR', 'TEMP', 'TMP']
-
-export type ShellEnvPolicy = 'inherit' | 'filtered' | 'empty'
-
-function buildShellEnv(policy: ShellEnvPolicy): NodeJS.ProcessEnv {
-  const src = process.env
-  if (policy === 'inherit') return { ...src }
-  if (policy === 'empty') {
-    const out: NodeJS.ProcessEnv = {}
-    for (const key of MINIMAL_ENV_KEYS) {
-      if (src[key] !== undefined) out[key] = src[key]
-    }
-    return out
-  }
-  // 'filtered' (default)
-  const out: NodeJS.ProcessEnv = {}
-  for (const [key, value] of Object.entries(src)) {
-    // Git remote credentials are allowed through (see GIT_CREDENTIAL_ALLOWLIST):
-    // checked first so the blocklist / sensitive-pattern below cannot strip them.
-    if (!GIT_CREDENTIAL_ALLOWLIST.has(key)) {
-      if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue
-      if (SENSITIVE_ENV_PATTERN.test(key)) continue
-    }
-    out[key] = value
-  }
-  return out
-}
+export type { ShellEnvPolicy } from '../../../infra/env/childProcessEnv.js'
 
 export interface BashToolOptions {
   /**
@@ -338,7 +293,7 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
         const res = await runProcessGroup(execSpec.file, execSpec.args, {
           timeoutMs,
           cwd,
-          env: buildShellEnv(envPolicy),
+          env: buildChildEnv(envPolicy),
           signal: ctx.abortSignal,
           captureLimit: limit * 2,
         })

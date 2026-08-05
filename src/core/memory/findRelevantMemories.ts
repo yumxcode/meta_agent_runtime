@@ -506,7 +506,7 @@ const PREFETCH_MAX_ENTRIES = 8
 const _prefetchCache = new Map<string, PrefetchEntry>()
 
 function _prefetchKey(opts: FindRelevantMemoriesOptions): string {
-  return `${opts.query.trim()} ${opts.memoryDir ?? MEMORY_DIR}`
+  return `${opts.query.trim()}\x00${opts.memoryDir ?? MEMORY_DIR}`
 }
 
 /** Serialise every option that influences the recall RESULT (see contract above). */

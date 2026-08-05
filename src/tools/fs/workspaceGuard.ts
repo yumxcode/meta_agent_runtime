@@ -11,21 +11,49 @@ function findExistingAncestor(path: string): string {
   return current
 }
 
-function resolvePathForGuard(path: string, workspaceRoot: string): string {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(workspaceRoot, path)
+/**
+ * Canonicalise `path` for boundary checking: resolve the real path of the
+ * nearest EXISTING ancestor (defeating symlink escapes) and re-attach the
+ * not-yet-created tail (so a check works for files about to be written).
+ *
+ * Exported because every guard in the codebase needs exactly this, and the ones
+ * that reimplemented it drifted — see the note on isInsideWorkspace.
+ */
+export function canonicalizeForGuard(path: string, base: string): string {
+  const absolute = isAbsolute(path) ? resolve(path) : resolve(base, path)
   if (existsSync(absolute)) return realpathSync(absolute)
   const ancestor = findExistingAncestor(absolute)
   const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor)
   return resolve(realAncestor, relative(ancestor, absolute))
 }
 
+/** Internal alias kept for readability at the original call sites. */
+const resolvePathForGuard = canonicalizeForGuard
+
+/**
+ * Containment test on ALREADY-CANONICAL absolute paths.
+ *
+ * Uses path segments, not string prefixes: `startsWith` says
+ * `/home/u/proj-backup` is inside `/home/u/proj`, which is how a prefix check
+ * silently waves through a sibling directory.
+ */
+export function pathIsUnder(absolutePath: string, root: string): boolean {
+  const rel = relative(root, absolutePath)
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
+}
+
 /**
  * Single source of truth for "is this path inside the workspace?".
  *
- * Both the kernel PermissionPolicy and the bash tool import THIS function so
- * the symlink-escape handling (resolve real path of the nearest existing
- * ancestor, then re-attach the non-existent tail) cannot drift between the
- * three call sites that historically each had their own copy.
+ * The kernel PermissionPolicy, the bash tool, the CLI's sensitive-op guard and
+ * the sub-agent seat write guard all import from THIS module so the symlink
+ * handling above cannot drift between them.
+ *
+ * That drift was not hypothetical. Two call sites had grown private copies:
+ * `SubAgentRunner.canonicalGuardPath` (a line-for-line duplicate) and the CLI's
+ * `detectSensitiveOp`, which used bare `filePath.startsWith(workspace)` — so
+ * with workspace `/home/u/proj` it treated `/home/u/proj-backup/secret` as
+ * inside and skipped the confirmation prompt entirely.
  */
 export function isInsideWorkspace(path: string, workspaceRoot = process.cwd()): boolean {
   const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)

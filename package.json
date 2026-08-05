@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.8.7",
+  "version": "0.8.10",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -18,8 +18,7 @@
     "dist",
     "docs/auto-scheduler.md",
     "!dist/**/__tests__/**",
-    "!dist/**/__tests__",
-    "!dist/core/auto_orch/**"
+    "!dist/**/__tests__"
   ],
   "scripts": {
     "build": "tsc --project tsconfig.json && node scripts/build-cli.js",
@@ -33,6 +32,7 @@
     "dev": "tsc --project tsconfig.json --watch",
     "test": "vitest run",
     "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage.enabled --coverage.provider=v8 --coverage.reporter=text --coverage.reporter=html",
     "test:integration": "tsx examples/mock-test.ts && tsx examples/smoke-test-mock-server.ts",
     "test:unit": "tsx examples/mock-test.ts",
     "test:smoke": "tsx examples/smoke-test-mock-server.ts",
@@ -52,6 +52,7 @@
   },
   "devDependencies": {
     "@types/node": "^25.6.0",
+    "@vitest/coverage-v8": "^4.1.10",
     "esbuild": "^0.28.0",
     "tsx": "^4.21.0",
     "typescript": "^6.0.2",

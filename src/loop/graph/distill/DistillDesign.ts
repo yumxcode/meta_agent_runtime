@@ -263,6 +263,22 @@ export const ADVISORY_SEMANTIC_RULE_CLASSES = [
    * valid witness. The observation is kept — it is often a real smell — but it
    * no longer stops a graph that nobody could demonstrate is broken. */
   'unwitnessed-control-flow',
+  /**
+   * A `graph`-locus constraint whose content only an Agent can carry out.
+   *
+   * The locus is derived from `kind`, and an Architect reading an imperative
+   * source ("first, audit the repository and cross-check A, B and C") reliably
+   * labels a PROCEDURE as `deterministic_rule`. The reviewer is then asked to
+   * find a Transition, State update or limit for something whose only possible
+   * home is a prompt — and both readings are defensible, so it can deliberate
+   * without end. One real run spent its entire review window re-deriving the
+   * same paragraph and produced no verdict at all.
+   *
+   * Naming the situation gives that deliberation an exit. It is advisory
+   * because the defect is upstream classification, not the candidate graph:
+   * nothing the Compiler does to this graph could resolve it.
+   */
+  'locus-misclassified',
   'topology-granularity',
   'session-continuity',
   'budget-shape',

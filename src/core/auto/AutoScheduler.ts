@@ -1,5 +1,6 @@
 import {
   AutoContinuationStore,
+  AutoWakeConsumedError,
   type AutoContinuationRecord,
 } from './AutoContinuationStore.js'
 
@@ -85,6 +86,26 @@ export class AutoScheduler {
         `[auto-scheduler] ${outcome} ${record.sessionId} (${record.wakeId})`,
       )
     } catch (error) {
+      // A CONSUMED wake must never be retried. The turn already ran and grew the
+      // session history, so this record's historyMessageCount fence no longer
+      // matches — a retry would fail that fence and mark the wake `cancelled`,
+      // which is terminal, silently destroying a live session. (That is exactly
+      // how a transient "cannot arm while sub-agents are active" turned into a
+      // lost 55-minute run.) Release it as done and report the real cause.
+      if (error instanceof AutoWakeConsumedError) {
+        await this.store.release(record.wakeId, token, 'done')
+        this.options.onEvent?.(
+          `[auto-scheduler] wake consumed for ${record.sessionId} (${record.wakeId}) but the ` +
+          `turn failed afterwards — NOT retrying (a retry would cancel the session). ` +
+          `Cause: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}. ` +
+          `Session history is persisted; resume it with: ` +
+          `meta-agent --mode auto --resume ${record.sessionId} "继续"`,
+        )
+        return
+      }
+
+      // Everything else failed BEFORE the turn ran, so the wake is still
+      // unconsumed and safe to retry.
       const backoff = Math.min(
         5 * 60_000,
         this.retryBaseMs * (2 ** Math.min(8, Math.max(0, record.attempts - 1))),

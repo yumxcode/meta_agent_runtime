@@ -40,7 +40,9 @@ import { HttpMcpClient } from './HttpMcpClient.js'
 import { registerMcpClient, mcpClients } from './registry.js'
 import type { McpClient } from './registry.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
+import { buildChildEnv } from '../../infra/env/childProcessEnv.js'
 import { timeout } from '../../core/timeouts.js'
+import { CLI_VERSION } from '../../cli/version.js'
 
 // ── Config path ───────────────────────────────────────────────────────────────
 
@@ -131,107 +133,278 @@ function interpolateRecord(
 // ── Stdio MCP client ──────────────────────────────────────────────────────────
 
 /**
- * Minimal stdio MCP client.  Spawns the command and communicates over
- * stdin/stdout using newline-delimited JSON-RPC 2.0.
+ * Stdio MCP client — ONE long-lived server process per configured server,
+ * speaking newline-delimited JSON-RPC 2.0 over stdin/stdout (the framing the
+ * MCP stdio transport specifies).
+ *
+ * This replaces a spawn-per-RPC implementation that was wrong in three ways:
+ *
+ *   1. STATE. Every call — `initialize`, `tools/list`, each `tools/call` — got
+ *      a brand-new process, whose stdin was then closed. Any server holding a
+ *      connection, cache, auth session or subscription was reset between calls,
+ *      so the `initialize` handshake could never mean anything. Stateful
+ *      servers simply could not work.
+ *   2. COST. A process launch (often `npx …`) per tool call, on the latency
+ *      path of every model turn.
+ *   3. TERMINAL CORRUPTION. stderr was 'inherit', so a chatty server wrote
+ *      straight into the CLI's TTY — scrambling the REPL, the thinking meter
+ *      and bracketed-paste state. It is piped and prefixed now.
+ *
+ * Responses are routed by JSON-RPC id, so concurrent in-flight requests are
+ * safe. A dead/wedged process is torn down and lazily respawned on the next
+ * call, so a crashed server degrades to "this call failed" rather than
+ * "this server is gone for the session".
  */
 const DEFAULT_STDIO_TIMEOUT_MS = 60_000
 const DEFAULT_STDIO_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
+/** Bound on a single unterminated stdout line, so a server that never emits a newline can't grow the buffer forever. */
+const MAX_PENDING_LINE_BYTES = 64 * 1024 * 1024
+
+interface PendingRpc {
+  resolve: (value: unknown) => void
+  reject: (err: Error) => void
+  timer: ReturnType<typeof setTimeout>
+  method: string
+}
 
 export class StdioMcpClient implements McpClient {
   private readonly _config: StdioServerConfig
+  private readonly _serverName: string
   private _idCounter = 1
+  private _child: ReturnType<typeof spawn> | null = null
+  private _pending = new Map<number, PendingRpc>()
+  private _stdoutBuffer = ''
+  private _bytesSinceLastMessage = 0
+  private _handshake: Promise<void> | null = null
+  private _closed = false
 
-  constructor(config: StdioServerConfig) {
+  constructor(config: StdioServerConfig, serverName = config.command) {
     this._config = config
+    this._serverName = serverName
+  }
+
+  private get _timeoutMs(): number {
+    const cfg = this._config
+    return Number.isFinite(cfg.timeoutMs) && (cfg.timeoutMs ?? 0) > 0
+      ? cfg.timeoutMs!
+      : timeout('mcpStdioMs')
+  }
+
+  private get _maxBytes(): number {
+    const cfg = this._config
+    return Number.isFinite(cfg.maxResponseBytes) && (cfg.maxResponseBytes ?? 0) > 0
+      ? cfg.maxResponseBytes!
+      : RuntimeEnv.mcpStdioMaxResponseBytes(DEFAULT_STDIO_MAX_RESPONSE_BYTES)
+  }
+
+  /**
+   * Tear down the process and fail every in-flight request with `reason`.
+   *
+   * `source` guards against a STALE generation tearing down a live one. Killing
+   * a process makes its own 'close'/'error' handlers fire a tick later, by
+   * which time a retry may already have spawned a replacement and queued new
+   * requests against it — the late event would then kill the healthy process
+   * and reject those requests with the *previous* generation's error. (This
+   * showed up immediately as "server exited with code null" surfacing where a
+   * timeout error belonged.) Handlers pass the child they belong to; anything
+   * that isn't the current child is ignored.
+   */
+  private _teardown(reason: Error, source?: ReturnType<typeof spawn>): void {
+    if (source !== undefined && this._child !== source) return
+    const child = this._child
+    this._child = null
+    this._handshake = null
+    this._stdoutBuffer = ''
+    this._bytesSinceLastMessage = 0
+
+    const pending = [...this._pending.values()]
+    this._pending.clear()
+    for (const p of pending) {
+      clearTimeout(p.timer)
+      p.reject(reason)
+    }
+
+    if (child?.pid !== undefined) {
+      try {
+        // Kill the whole group: MCP servers are commonly `npx <pkg>` wrappers,
+        // so signalling only the direct child orphans the real server.
+        if (process.platform !== 'win32') process.kill(-child.pid, 'SIGKILL')
+        else child.kill('SIGKILL')
+      } catch { /* already exited */ }
+    }
+  }
+
+  /** Consume complete newline-delimited JSON messages out of the stdout buffer. */
+  private _drainStdout(): void {
+    for (;;) {
+      const newlineAt = this._stdoutBuffer.indexOf('\n')
+      if (newlineAt < 0) break
+      const line = this._stdoutBuffer.slice(0, newlineAt).trim()
+      this._stdoutBuffer = this._stdoutBuffer.slice(newlineAt + 1)
+      this._bytesSinceLastMessage = 0
+      if (!line) continue
+
+      let parsed: { id?: unknown; result?: unknown; error?: { code: number; message: string } }
+      try {
+        parsed = JSON.parse(line)
+      } catch {
+        // Not JSON — some servers print banners to stdout before speaking
+        // protocol. Ignore rather than failing the whole session.
+        continue
+      }
+
+      // Notifications carry no id and need no routing.
+      if (typeof parsed.id !== 'number') continue
+      const entry = this._pending.get(parsed.id)
+      if (!entry) continue
+      this._pending.delete(parsed.id)
+      clearTimeout(entry.timer)
+      if (parsed.error) entry.reject(new Error(`MCP error: ${parsed.error.message}`))
+      else entry.resolve(parsed.result)
+    }
+  }
+
+  /** Start the server process if it isn't running. Idempotent. */
+  private _ensureProcess(): ReturnType<typeof spawn> {
+    if (this._child && this._child.exitCode === null && !this._child.killed) return this._child
+    if (this._closed) throw new Error(`MCP stdio server "${this._serverName}" is closed`)
+
+    const cfg = this._config
+    const child = spawn(cfg.command, cfg.args ?? [], {
+      cwd: cfg.cwd,
+      // Credential hygiene: the server gets the SAME filtered env the bash tool
+      // gets, plus exactly the variables its mcp.json entry declares. Previously
+      // this was `{...process.env}` — every provider key, GITHUB_TOKEN and AWS
+      // secret handed to an arbitrary third-party binary. Declaring `env` in
+      // mcp.json is now the audit point for "which server sees which secret".
+      env: buildChildEnv('filtered', cfg.env),
+      stdio: ['pipe', 'pipe', 'pipe'],
+      detached: process.platform !== 'win32',
+    })
+    this._child = child
+
+    child.stdout?.setEncoding('utf8')
+    child.stdout?.on('data', (chunk: string) => {
+      if (this._child !== child) return          // stale generation
+      this._bytesSinceLastMessage += Buffer.byteLength(chunk, 'utf8')
+      if (this._bytesSinceLastMessage > this._maxBytes) {
+        this._teardown(new Error(`MCP stdio response exceeded ${this._maxBytes} bytes`), child)
+        return
+      }
+      this._stdoutBuffer += chunk
+      if (this._stdoutBuffer.length > MAX_PENDING_LINE_BYTES) {
+        this._teardown(new Error('MCP stdio server produced an unterminated line larger than the buffer cap'), child)
+        return
+      }
+      this._drainStdout()
+    })
+
+    // stderr is PIPED (not inherited) and prefixed, so server logs are
+    // attributable and cannot corrupt the CLI's terminal rendering.
+    child.stderr?.setEncoding('utf8')
+    let stderrLine = ''
+    child.stderr?.on('data', (chunk: string) => {
+      stderrLine += chunk
+      const lines = stderrLine.split('\n')
+      stderrLine = lines.pop() ?? ''
+      for (const line of lines) {
+        if (line.trim()) process.stderr.write(`[mcp:${this._serverName}] ${line.trim()}\n`)
+      }
+    })
+
+    child.on('error', err => this._teardown(err instanceof Error ? err : new Error(String(err)), child))
+    child.on('close', code => {
+      // Only meaningful if requests are still outstanding; an idle exit is fine.
+      this._teardown(new Error(`MCP stdio server "${this._serverName}" exited with code ${code}`), child)
+    })
+    child.stdin?.on('error', err => this._teardown(err instanceof Error ? err : new Error(String(err)), child))
+
+    return child
+  }
+
+  /** Send a request and await its id-matched response. */
+  private _request<T>(method: string, params?: unknown): Promise<T> {
+    return new Promise<T>((resolve, reject) => {
+      let child: ReturnType<typeof spawn>
+      try {
+        child = this._ensureProcess()
+      } catch (err) {
+        reject(err instanceof Error ? err : new Error(String(err)))
+        return
+      }
+
+      const id = this._idCounter++
+      const timeoutMs = this._timeoutMs
+      const timer = setTimeout(() => {
+        // A server that missed a response is assumed wedged: tear the process
+        // down (killing the group) so the next call gets a clean one, rather
+        // than queueing behind a hung server forever.
+        this._teardown(new Error(`MCP stdio RPC "${method}" timed out after ${timeoutMs}ms`), child)
+      }, timeoutMs)
+
+      this._pending.set(id, {
+        resolve: value => resolve(value as T),
+        reject,
+        timer,
+        method,
+      })
+
+      const body = JSON.stringify({
+        jsonrpc: '2.0',
+        id,
+        method,
+        ...(params !== undefined ? { params } : {}),
+      })
+      try {
+        child.stdin?.write(body + '\n')
+      } catch (err) {
+        this._teardown(err instanceof Error ? err : new Error(String(err)), child)
+      }
+    })
+  }
+
+  /** Fire-and-forget JSON-RPC notification (no id, no response expected). */
+  private _notify(method: string, params?: unknown): void {
+    try {
+      const child = this._ensureProcess()
+      child.stdin?.write(JSON.stringify({ jsonrpc: '2.0', method, ...(params !== undefined ? { params } : {}) }) + '\n')
+    } catch { /* best-effort */ }
+  }
+
+  /**
+   * Run the MCP `initialize` handshake once per process lifetime.
+   *
+   * Best-effort by design: the previous implementation never sent `initialize`
+   * at all, so servers that tolerate its absence are already in the wild and
+   * must keep working. A handshake failure is therefore logged-and-ignored
+   * rather than fatal — but for a spec-conforming stateful server it is what
+   * makes the persistent connection usable.
+   */
+  private _ensureHandshake(): Promise<void> {
+    this._handshake ??= (async () => {
+      try {
+        await this._request('initialize', {
+          protocolVersion: '2024-11-05',
+          capabilities: {},
+          clientInfo: { name: 'meta-agent', version: CLI_VERSION },
+        })
+        this._notify('notifications/initialized')
+      } catch {
+        // Server does not implement initialize, or it failed. Continue anyway.
+      }
+    })()
+    return this._handshake
   }
 
   private async _rpc<T>(method: string, params?: unknown): Promise<T> {
-    const cfg = this._config
-    const mergedEnv = { ...process.env, ...(cfg.env ?? {}) } as Record<string, string>
-    const body = JSON.stringify({
-      jsonrpc: '2.0',
-      id: this._idCounter++,
-      method,
-      ...(params !== undefined ? { params } : {}),
-    })
+    await this._ensureHandshake()
+    return this._request<T>(method, params)
+  }
 
-    return new Promise((resolve, reject) => {
-      const useProcessGroup = process.platform !== 'win32'
-      const child = spawn(cfg.command, cfg.args ?? [], {
-        cwd: cfg.cwd,
-        env: mergedEnv,
-        stdio: ['pipe', 'pipe', 'inherit'],
-        detached: useProcessGroup,
-      })
-
-      let stdout = ''
-      let stdoutBytes = 0
-      let settled = false
-      const timeoutMs = Number.isFinite(cfg.timeoutMs) && (cfg.timeoutMs ?? 0) > 0
-        ? cfg.timeoutMs!
-        : timeout('mcpStdioMs')
-      const maxBytes = Number.isFinite(cfg.maxResponseBytes) && (cfg.maxResponseBytes ?? 0) > 0
-        ? cfg.maxResponseBytes!
-        : RuntimeEnv.mcpStdioMaxResponseBytes(DEFAULT_STDIO_MAX_RESPONSE_BYTES)
-
-      const killProcessGroup = (): void => {
-        if (child.pid === undefined) return
-        try {
-          if (useProcessGroup) process.kill(-child.pid, 'SIGKILL')
-          else child.kill('SIGKILL')
-        } catch { /* process already exited */ }
-      }
-      const finish = (fn: () => void): void => {
-        if (settled) return
-        settled = true
-        clearTimeout(timer)
-        fn()
-      }
-      const fail = (err: Error): void => finish(() => {
-        killProcessGroup()
-        reject(err)
-      })
-      const timer = setTimeout(() => {
-        fail(new Error(`MCP stdio RPC "${method}" timed out after ${timeoutMs}ms`))
-      }, timeoutMs)
-
-      child.stdout.on('data', (chunk: Buffer) => {
-        if (settled) return
-        stdoutBytes += chunk.byteLength
-        if (stdoutBytes > maxBytes) {
-          fail(new Error(`MCP stdio response exceeded ${maxBytes} bytes`))
-          return
-        }
-        stdout += chunk.toString()
-      })
-      child.on('error', err => fail(err))
-      child.on('close', (code) => {
-        if (settled) return
-        if (code !== 0 && !stdout.trim()) {
-          finish(() => reject(new Error(`MCP stdio process exited with code ${code}`)))
-          return
-        }
-        try {
-          // Find last complete JSON object in output
-          const lines = stdout.trim().split('\n').filter(Boolean)
-          for (let i = lines.length - 1; i >= 0; i--) {
-            try {
-              const parsed = JSON.parse(lines[i]!) as { result?: T; error?: { code: number; message: string } }
-              if (parsed.error) finish(() => reject(new Error(`MCP error: ${parsed.error!.message}`)))
-              else finish(() => resolve(parsed.result as T))
-              return
-            } catch { /* try previous line */ }
-          }
-          finish(() => reject(new Error('No valid JSON-RPC response from stdio MCP server')))
-        } catch (err) {
-          finish(() => reject(err))
-        }
-      })
-
-      child.stdin.on('error', err => fail(err))
-      child.stdin.write(body + '\n')
-      child.stdin.end()
-    })
+  /** Stop the server process. Safe to call more than once. */
+  close(): void {
+    this._closed = true
+    this._teardown(new Error(`MCP stdio server "${this._serverName}" was closed`))
   }
 
   async listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
@@ -282,7 +455,7 @@ function buildClient(name: string, cfg: McpServerConfig): McpClient | null {
       console.warn(`[mcp] Skipping server "${name}": missing environment variable in env`)
       return null
     }
-    return new StdioMcpClient({ ...cfg, env: resolvedEnv })
+    return new StdioMcpClient({ ...cfg, env: resolvedEnv }, name)
   }
 
   console.warn(`[mcp] Unknown server type "${(cfg as McpServerConfig & { type: string }).type}" for "${name}", skipping`)

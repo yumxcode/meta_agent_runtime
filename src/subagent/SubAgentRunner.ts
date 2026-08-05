@@ -39,9 +39,9 @@ import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
 import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
-import { isAbsolute, relative, resolve, sep } from 'path'
+import { isAbsolute, relative, resolve } from 'path'
 import { tmpdir } from 'os'
-import { existsSync, realpathSync } from 'fs'
+import { canonicalizeForGuard, pathIsUnder } from '../tools/fs/workspaceGuard.js'
 import { dirname } from 'path'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -957,15 +957,17 @@ export function wrapWithSandboxWriteGuard(
     resolve('/private/tmp'),
     ...(sandbox.readonlyWorkspace ? [] : [resolve(workspaceRoot)]),
   ]
+  // Canonicalise the policy roots ONCE. They are fixed for the tool's lifetime,
+  // but used to be re-realpath'd inside the per-field loop on every single call.
+  const canonicalDenyRoots = denyRoots.map(root => canonicalizeForGuard(root, workspaceRoot))
+  const canonicalAllowRoots = allowRoots.map(root => canonicalizeForGuard(root, workspaceRoot))
   return {
     ...tool,
     call: async (input, ctx) => {
       for (const field of pathFields) {
         const raw = input[field]
         if (typeof raw !== 'string' || !raw) continue
-        const abs = canonicalGuardPath(raw, workspaceRoot)
-        const canonicalDenyRoots = denyRoots.map(root => canonicalGuardPath(root, workspaceRoot))
-        const canonicalAllowRoots = allowRoots.map(root => canonicalGuardPath(root, workspaceRoot))
+        const abs = canonicalizeForGuard(raw, workspaceRoot)
         if (canonicalDenyRoots.some(root => pathIsUnder(abs, root))) {
           return {
             content: `Error: '${raw}' is write-protected for this seat (sandbox writeDenyPaths). ` +
@@ -987,20 +989,7 @@ export function wrapWithSandboxWriteGuard(
   }
 }
 
-function canonicalGuardPath(path: string, base: string): string {
-  const absolute = isAbsolute(path) ? resolve(path) : resolve(base, path)
-  if (existsSync(absolute)) return realpathSync(absolute)
-  let ancestor = absolute
-  while (!existsSync(ancestor)) {
-    const parent = dirname(ancestor)
-    if (parent === ancestor) break
-    ancestor = parent
-  }
-  const realAncestor = existsSync(ancestor) ? realpathSync(ancestor) : resolve(ancestor)
-  return resolve(realAncestor, relative(ancestor, absolute))
-}
-
-function pathIsUnder(abs: string, root: string): boolean {
-  const rel = relative(root, abs)
-  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel))
-}
+// canonicalGuardPath / pathIsUnder used to live here as line-for-line copies of
+// tools/fs/workspaceGuard.ts — exactly the duplication that module's docstring
+// says it exists to prevent. They are imported from there now, so a fix to the
+// symlink handling lands in every guard at once.

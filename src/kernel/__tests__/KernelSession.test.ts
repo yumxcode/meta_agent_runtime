@@ -191,29 +191,72 @@ describe('KernelSession — tool registration', () => {
     }
   }
 
-  it('addTool adds a new tool', () => {
+  /**
+   * Drive one turn and return the tool list the session actually handed to the
+   * API. `_config` is private, so this is the observable surface — and it is
+   * the surface that matters, since it is what the model gets to call.
+   *
+   * These three tests previously asserted NOTHING ("No assertion needed — just
+   * ensuring no error is thrown"), so they passed identically against a no-op
+   * `addTool`. They are only meaningful if the registration is observed.
+   */
+  async function toolsSentToApi(session: KernelSession): Promise<KernelTool[]> {
+    mockStream.mockImplementation(() => textStream('done'))
+    for await (const _ of session.submitMessage('go')) { /* drain */ }
+    const params = mockStream.mock.calls.at(-1)?.[0] as { tools: KernelTool[] } | undefined
+    return params?.tools ?? []
+  }
+
+  it('addTool adds a new tool', async () => {
     const session = new KernelSession(makeConfig())
     session.addTool(makeTool('my_tool'))
-    // Verify the tool is now registered by checking config (via submitMessage call shape)
-    // We can't inspect _config directly, so we verify indirectly via the stream call
+    expect((await toolsSentToApi(session)).map(t => t.name)).toContain('my_tool')
   })
 
-  it('addTool ignores duplicate (no-op)', () => {
+  it('addTool ignores duplicate (no-op)', async () => {
     const session = new KernelSession(makeConfig())
     const tool = makeTool('dup')
     session.addTool(tool)
-    session.addTool(tool) // should not throw or duplicate
-    // No assertion needed — just ensuring no error is thrown
+    session.addTool(tool)
+    const names = (await toolsSentToApi(session)).map(t => t.name)
+    expect(names.filter(n => n === 'dup')).toHaveLength(1)
+  })
+
+  it('addTool keeps the FIRST registration when a name collides', async () => {
+    const session = new KernelSession(makeConfig())
+    session.addTool({ ...makeTool('collide'), description: 'first' })
+    session.addTool({ ...makeTool('collide'), description: 'second' })
+    const collide = (await toolsSentToApi(session)).filter(t => t.name === 'collide')
+    expect(collide).toHaveLength(1)
+    expect(collide[0]?.description).toBe('first')
   })
 
   it('upsertTool replaces existing tool', async () => {
-    mockStream.mockImplementation(() => textStream('done'))
     const session = new KernelSession(makeConfig())
-    const original = makeTool('replace_me')
-    const replacement = { ...makeTool('replace_me'), description: 'updated' }
-    session.addTool(original)
-    session.upsertTool(replacement)
-    // No assertion on description — just ensures no error
+    session.addTool({ ...makeTool('replace_me'), description: 'original' })
+    session.upsertTool({ ...makeTool('replace_me'), description: 'updated' })
+    const matches = (await toolsSentToApi(session)).filter(t => t.name === 'replace_me')
+    expect(matches).toHaveLength(1)
+    expect(matches[0]?.description).toBe('updated')
+  })
+
+  it('upsertTool appends when the tool is not registered yet', async () => {
+    const session = new KernelSession(makeConfig())
+    session.upsertTool({ ...makeTool('brand_new'), description: 'fresh' })
+    const matches = (await toolsSentToApi(session)).filter(t => t.name === 'brand_new')
+    expect(matches).toHaveLength(1)
+    expect(matches[0]?.description).toBe('fresh')
+  })
+
+  it('upsertTool preserves the position of the tool it replaces', async () => {
+    const session = new KernelSession(makeConfig())
+    session.addTool(makeTool('a'))
+    session.addTool(makeTool('b'))
+    session.addTool(makeTool('c'))
+    session.upsertTool({ ...makeTool('b'), description: 'updated-b' })
+    const names = (await toolsSentToApi(session)).map(t => t.name)
+    expect(names.indexOf('b')).toBeLessThan(names.indexOf('c'))
+    expect(names.indexOf('a')).toBeLessThan(names.indexOf('b'))
   })
 })
 

@@ -134,8 +134,46 @@ export class AutoWorktreeCoordinator {
     return this.gwm.enabled
   }
 
+  /**
+   * EVERY task the coordinator still holds a record for, regardless of phase.
+   *
+   * Used by lifecycle sweeps (`cleanupAll`, outcome reconciliation) that must
+   * see finished-but-unmerged work too. This is NOT the right question to ask
+   * when deciding whether the session is busy — see `busyTasks()`.
+   */
   activeTasks(): string[] {
     return [...this.records.keys()]
+  }
+
+  /**
+   * Tasks whose worktree is genuinely IN FLIGHT — something is, or is about to
+   * be, writing.
+   *
+   * The distinction matters because `activeTasks()` keeps a record until the
+   * branch is merged and removed, so a sub-agent that finished cleanly still
+   * appears there while it sits in `awaiting_merge`. Treating that as "busy"
+   * made a durable park impossible to arm: `self_timer` correctly allowed the
+   * park (the bridge had no running task), then `armAutoContinuation` refused it
+   * because the checkpoint — which unions in `activeTasks()` — still listed the
+   * finished sub-agent. The session could never be parked and was ultimately
+   * cancelled.
+   *
+   * Phase rationale:
+   *   allocated/running/finalizing — the sub-agent is or may still be writing
+   *   merging                      — the PRIMARY tree is being mutated right now
+   *   awaiting_merge               — work is already committed on its own branch;
+   *                                  the merge is a separate agent-driven step
+   *                                  (`auto_merge_subagent`) that resumes fine
+   *                                  after a wake, so parking here loses nothing
+   *   conflicted/failed            — nothing in flight; needs a decision, not a wait
+   *   merged                       — done (record is removed)
+   */
+  busyTasks(): string[] {
+    const BUSY: ReadonlySet<AutoWorktreePhase> =
+      new Set<AutoWorktreePhase>(['allocated', 'running', 'finalizing', 'merging'])
+    return [...this.records.entries()]
+      .filter(([, record]) => BUSY.has(record.phase))
+      .map(([taskId]) => taskId)
   }
 
   branchFor(taskId: string): string | undefined {

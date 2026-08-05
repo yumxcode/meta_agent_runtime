@@ -1352,20 +1352,49 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         if (lineageId) this.activeLineages.set(lineageId, taskId)
         await this._worktreeCoordinator?.markRunning(taskId).catch(() => undefined)
 
+        // Release-on-completion bookkeeping.
+        //
+        // Two hazards this shape is written to avoid:
+        //
+        // 1. UNHANDLED REJECTION KILLING THE HOST. This used to read
+        //    `.catch(...).finally(async () => …)`: the catch sat BEFORE the
+        //    finally, so anything thrown inside the async finally body escaped
+        //    into a floating rejection. The CLI registers
+        //    `process.once('unhandledRejection', … disposeAndExit(1))`, so a
+        //    throw from an injected costLedger or from the drain it kicks off
+        //    would terminate the whole session. The catch is now LAST.
+        //
+        // 2. A HALF-RELEASED SLOT. If the settle step threw, the runner/active
+        //    maps below it never got cleaned, so the bridge kept believing the
+        //    seat was occupied and stopped draining the queue — a silent
+        //    deadlock. Slot release is therefore unconditional and runs before
+        //    anything that can fail.
         void runner.start()
           .catch(() => undefined)
-          .finally(async () => {
+          .then(async () => {
             const finalRecord = await readTask(taskId).catch(() => null)
-            this._settleBudget(taskId, finalRecord?.result?.costUsd)
+
+            // Unconditional slot release first — pure Map/counter work.
             this.runners.delete(taskId)
             this.activeTaskIds.delete(taskId)
             if (lineageId && this.activeLineages.get(lineageId) === taskId) {
               this.activeLineages.delete(lineageId)
             }
-            this._clearParentAbortForwarder(taskId)
             this._finishedCount++
-            this._scheduleDrain()
-        })
+
+            // Everything below reaches injected/external code, so each step is
+            // isolated: one failing accounting hook must not strand the others.
+            try {
+              this._settleBudget(taskId, finalRecord?.result?.costUsd)
+            } catch { /* accounting is best-effort; the slot is already free */ }
+            try {
+              this._clearParentAbortForwarder(taskId)
+            } catch { /* listener cleanup is best-effort */ }
+            try {
+              this._scheduleDrain()
+            } catch { /* a failed drain is retried by the next completion */ }
+          })
+          .catch(() => undefined)
 
         if (this.startDelayMs > 0 && this.startQueue.length > 0) {
           await this._sleepStartDelay(this.startDelayMs)

@@ -559,7 +559,7 @@ function toolResultSignature(messages: readonly { content: readonly unknown[] }[
       parts.push(`${block.is_error === true ? 'E' : 'O'}:${content}`)
     }
   }
-  return createHash('sha256').update(parts.join(' ')).digest('hex')
+  return createHash('sha256').update(parts.join('\x00')).digest('hex')
 }
 
 /**

@@ -19,6 +19,32 @@ import {
 
 export type AutoContinuationStatus = 'pending' | 'claimed' | 'done' | 'cancelled'
 
+/**
+ * Raised when a wake has already been CONSUMED — a turn ran against it and
+ * persisted new history — but something failed afterwards (typically arming the
+ * follow-up wake).
+ *
+ * The distinction matters because a consumed wake can never be re-run: its
+ * `historyMessageCount` fence was invalidated by its own execution, so a retry
+ * is guaranteed to fail that fence and CANCEL the session outright. Before this
+ * existed, a transient arming failure therefore destroyed the session:
+ *
+ *   attempt 1 → turn runs, history grows, arming throws → scheduler retries
+ *   attempt 2 → history.length !== record.historyMessageCount → cancelled (terminal)
+ *
+ * Schedulers must treat this as terminal-but-successful for the wake, and
+ * surface the cause instead of retrying.
+ */
+export class AutoWakeConsumedError extends Error {
+  override readonly name = 'AutoWakeConsumedError'
+  constructor(readonly sessionId: string, override readonly cause: unknown) {
+    super(
+      `Auto wake for session ${sessionId} was consumed by a turn that then failed: ` +
+      `${cause instanceof Error ? cause.message : String(cause)}`,
+    )
+  }
+}
+
 export interface AutoContinuationRuntime {
   model?: string
   fallbackModel?: string

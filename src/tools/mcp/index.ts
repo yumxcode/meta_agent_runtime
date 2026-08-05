@@ -1,4 +1,4 @@
-export { registerMcpClient, unregisterMcpClient, getRegisteredMcpServers } from './registry.js'
+export { registerMcpClient, unregisterMcpClient, getRegisteredMcpServers, disposeMcpClients } from './registry.js'
 export type { McpClient } from './registry.js'
 export { HttpMcpClient } from './HttpMcpClient.js'
 export { loadMcpConfig, MCP_CONFIG_PATH, buildMcpServerInstructions } from './mcpConfigFile.js'

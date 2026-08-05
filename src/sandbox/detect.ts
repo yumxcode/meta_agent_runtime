@@ -10,6 +10,7 @@
  */
 
 import { execFileSync } from 'child_process'
+import { readFileSync } from 'node:fs'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Internal probe cache
@@ -130,9 +131,18 @@ export function isInsideBwrap(): boolean {
   // Environment variable set by some bwrap wrappers
   if (process.env['BWRAP_SANDBOX_PID']) return true
 
-  // Check /proc/1/cmdline for bwrap signature (Linux-only, best-effort)
+  // Check /proc/1/cmdline for bwrap signature (Linux-only, best-effort).
+  //
+  // This used to call `require('fs')` inline. The package is ESM
+  // ("type": "module", module: ESNext), so `require` is not defined and that
+  // line threw ReferenceError on EVERY call — swallowed by the catch below,
+  // which silently reduced nested-sandbox detection to the env-var branch
+  // alone. On a host already inside bwrap (containerised CI, Flatpak, some
+  // devcontainers) LinuxSandboxExecutor therefore never took its graceful
+  // fallback and instead failed at exec time with an opaque
+  // "Creating new namespace failed: Operation not permitted" on every bash
+  // call. Use the static import at the top of the file instead.
   try {
-    const { readFileSync } = require('fs') as typeof import('fs')
     const cmdline = readFileSync('/proc/1/cmdline', 'utf8')
     if (cmdline.includes('bwrap')) return true
   } catch {

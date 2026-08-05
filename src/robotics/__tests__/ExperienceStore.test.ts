@@ -1,4 +1,4 @@
-import { access, mkdtemp, rm, writeFile } from 'fs/promises'
+import { mkdtemp, readdir, rm, writeFile } from 'fs/promises'
 import { join } from 'path'
 import { tmpdir } from 'os'
 import { afterEach, describe, expect, it } from 'vitest'
@@ -68,6 +68,15 @@ describe('ExperienceStore id validation', () => {
 
     const results = await store.search({ domain: 'general', limit: 10 })
     expect(results.map(item => item.title)).toEqual(expect.arrayContaining(['First', 'Second']))
-    await expect(access(join(dir, `${first}.json.corrupt`))).rejects.toBeDefined()
+    // The incremental path must not have READ the corrupted record — if it had,
+    // readJsonFile would have quarantined it. Match on the suffix rather than an
+    // exact filename: the quarantine name now carries a timestamp
+    // (`<file>.<ts>.corrupt`, so a second corruption can't overwrite the first
+    // forensic copy), and asserting the old exact name would pass vacuously
+    // whether or not a quarantine happened.
+    const quarantined = (await readdir(dir)).filter(
+      name => name.startsWith(`${first}.json.`) && name.endsWith('.corrupt'),
+    )
+    expect(quarantined).toEqual([])
   })
 })
