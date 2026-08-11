@@ -81,6 +81,7 @@ import { createWebFetchTool } from '../tools/network/web_fetch/index.js'
 import { createWebSearchTool } from '../tools/network/web_search/index.js'
 import { createMcpTools } from '../tools/mcp/index.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
+import { createSleepTool } from '../tools/system/sleep/index.js'
 import { createSkillTool } from '../tools/system/skill/index.js'
 import { createMemoryWriteTool } from '../tools/system/memory_write/index.js'
 import { makeSubAgentTools } from '../subagent/tools/index.js'
@@ -610,6 +611,15 @@ export class RoboticsSession implements RoboticsCapabilities {
       this._registerRuntimeTool(tool)
     }
     this._registerRuntimeTool(await createBashTool())
+    // `sleep` is the only sanctioned way to wait longer than a bash command's
+    // timeout. Robotics never had it: this session builds its tool surface by
+    // hand and skipped createSystemTools(), while `self_timer` — the escape
+    // hatch sleep's own prompt points at — is auto-mode only and deliberately
+    // stays that way (robotics is interactive; a durable park does not fit).
+    // The result was an agent with NO legal way to wait out a CI run or a
+    // training job, writing `bash("sleep 180 && …")` that the bash tool killed
+    // every time.
+    this._registerRuntimeTool(await createSleepTool())
     // Generic delegation tools, parallel to robotics' domain dispatchers
     // (experiment_dispatch / paper_search). run_agent is SYNCHRONOUS (blocks
     // until done — use when the next step depends on the result); spawn_sub_agent

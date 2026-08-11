@@ -6,11 +6,54 @@ import { resolveInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
 import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
 import { buildChildEnv, type ShellEnvPolicy } from '../../../infra/env/childProcessEnv.js'
+import { timeout } from '../../../core/timeouts.js'
 
 const DEFAULT_MAX_OUT = 100 * 1024
 const DEFAULT_TIMEOUT_MS = 30_000
-const MAX_TIMEOUT_MS = 120_000
 const MIN_TIMEOUT_MS = 1_000
+
+/**
+ * Absolute ceiling for one shell command, regardless of configuration.
+ *
+ * Was a flat 120s. Too tight for robotics work — a build, a sim run or a test
+ * suite routinely exceeds two minutes — and, worse, it CONTRADICTED the layer
+ * above it: the kernel's own per-tool budget (`timeouts.toolMs`) defaults to
+ * 180s, so raising this constant alone changed nothing; ToolExecution would
+ * abort the call first and the model would see a bare "Command aborted"
+ * instead of bash's own message with the captured output.
+ *
+ * So the effective cap is now DERIVED from that budget (see maxTimeoutMs), and
+ * this constant is only the hard ceiling an operator cannot exceed even by
+ * raising `timeouts.toolMs`.
+ */
+const HARD_MAX_TIMEOUT_MS = 600_000
+
+/**
+ * Headroom left between bash's own timer and the kernel's abort.
+ *
+ * Both bound the same call, and we want BASH's timer to be the one that fires:
+ * it kills the whole process group and returns the output captured so far, so
+ * the model learns how far the command got. The kernel's abort is a blunter
+ * fallback. One second is enough — these are the same event loop.
+ */
+const KERNEL_ABORT_MARGIN_MS = 1_000
+
+/**
+ * The largest timeout a single command may request right now.
+ *
+ * Read lazily, not captured at module load, so a config-file / env override of
+ * `timeouts.toolMs` takes effect without a restart — same rule as every other
+ * timeout in this codebase.
+ */
+function maxTimeoutMs(): number {
+  const kernelBudget = timeout('toolMs')
+  // toolMs = 0 means "no kernel timeout"; only the hard ceiling applies then.
+  if (!Number.isFinite(kernelBudget) || kernelBudget <= 0) return HARD_MAX_TIMEOUT_MS
+  return Math.min(
+    HARD_MAX_TIMEOUT_MS,
+    Math.max(MIN_TIMEOUT_MS, kernelBudget - KERNEL_ABORT_MARGIN_MS),
+  )
+}
 
 /**
  * Lazy getter so tests can set META_AGENT_MAX_TOOL_OUTPUT_CHARS after importing
@@ -22,12 +65,13 @@ function getMaxOut(): number {
 
 /**
  * H4: Validate timeout_ms input. Accepts only finite numbers; out-of-range
- * values are clamped to [1s, 120s]. Returns DEFAULT_TIMEOUT_MS for everything
- * non-numeric / NaN / Infinity.
+ * values are clamped to [MIN_TIMEOUT_MS, maxTimeoutMs()]. Returns the default
+ * for everything non-numeric / NaN / Infinity.
  */
 function resolveTimeoutMs(raw: unknown): number {
-  if (typeof raw !== 'number' || !Number.isFinite(raw)) return DEFAULT_TIMEOUT_MS
-  return Math.min(MAX_TIMEOUT_MS, Math.max(MIN_TIMEOUT_MS, raw))
+  const max = maxTimeoutMs()
+  if (typeof raw !== 'number' || !Number.isFinite(raw)) return Math.min(DEFAULT_TIMEOUT_MS, max)
+  return Math.min(max, Math.max(MIN_TIMEOUT_MS, raw))
 }
 
 /** Last-resort transcript guard for CLIs that print credentials despite the
@@ -253,7 +297,13 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
       type: 'object',
       properties: {
         command: { type: 'string', description: 'Bash command to execute' },
-        timeout_ms: { type: 'number', description: 'Timeout ms. Default: 30000, max: 120000' },
+        timeout_ms: {
+          type: 'number',
+          // Rendered at construction time so the number the model sees is the one
+          // actually enforced — a hard-coded literal here drifted the moment
+          // the cap became derived from timeouts.toolMs.
+          description: `Timeout ms. Default: ${Math.min(DEFAULT_TIMEOUT_MS, maxTimeoutMs())}, max: ${maxTimeoutMs()}`,
+        },
         cwd: { type: 'string', description: 'Working directory. Default: process.cwd()' },
       },
       required: ['command'],

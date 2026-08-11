@@ -231,3 +231,42 @@ describe('RoboticsSession _state re-hydration', () => {
     expect(state?.git.subAgentBranches[task.taskId]).toBe(task.branchName)
   })
 })
+
+/**
+ * The robotics tool surface must include a way to WAIT.
+ *
+ * RoboticsSession builds its tool surface by hand rather than calling
+ * createSystemTools(), and `sleep` fell through that gap. Meanwhile
+ * `self_timer` — the escape hatch sleep's own prompt points at — is auto-mode
+ * only (AgenticBackendFactory registers it behind `wantsGates`) and stays that
+ * way, because robotics is interactive and a durable park does not fit it.
+ *
+ * So a robotics agent waiting on a CI run or a training job had no legal way to
+ * wait past a bash command's timeout, and wrote `bash("sleep 180 && …")` —
+ * which bash clamps and kills every time. This test pins the tool's presence.
+ */
+describe('RoboticsSession tool surface', () => {
+  function toolNames(session: RoboticsSession): string[] {
+    const inner = (session as unknown as { inner: { _registeredTools: MetaAgentTool[] } }).inner
+    return inner._registeredTools.map(t => t.name)
+  }
+
+  it('registers `sleep`, the only sanctioned long wait in an interactive mode', async () => {
+    const { session } = await freshSession()
+    expect(toolNames(session)).toContain('sleep')
+  })
+
+  it('still does NOT register self_timer — robotics is not scheduler-backed', async () => {
+    // Guarding the deliberate absence: a durable park has no meaning in a mode
+    // where the user is sitting at the prompt.
+    const { session } = await freshSession()
+    expect(toolNames(session)).not.toContain('self_timer')
+  })
+
+  it('keeps bash alongside it — sleep replaces the shell WAIT, not the shell', async () => {
+    const { session } = await freshSession()
+    const names = toolNames(session)
+    expect(names).toContain('bash')
+    expect(names).toContain('read_file')
+  })
+})
