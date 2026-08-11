@@ -233,6 +233,22 @@ export interface RoboticsProjectState {
   /** Classified on first submit; persisted so resumed sessions stay in same mode. */
   agentMode?: RoboticsAgentMode
   /**
+   * Project-level query intent, established by ONE LLM call on the first submit
+   * and refreshed only when the topic actually moves (see IntentScheduler).
+   *
+   * Persisted for the same reason `agentMode` is: a resumed session should not
+   * pay to re-derive something that is a property of the project rather than of
+   * the turn. With this on disk, resuming costs ZERO intent calls.
+   *
+   * Only the long-lived fields live here. searchKeywords / intent are per-turn
+   * and are recomputed locally every turn.
+   */
+  projectIntent?: {
+    domains: RoboticsDomain[]
+    hasHardware: boolean
+    hasSimulation: boolean
+  }
+  /**
    * User-set star flag.  Starred sessions are exempt from 7-day auto-purge.
    * Defaults to false (not starred).
    */

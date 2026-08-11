@@ -378,3 +378,61 @@ describe('principle_ids passthrough', () => {
     await pending.flush()
   })
 })
+
+/**
+ * Request budgets for the recognition-before-generation flash calls.
+ *
+ * All three used to hard-code `timeoutMs: 8_000`, roughly 5× tighter than this
+ * codebase's own flash latency model (`flashTimeoutMs`: a 30s first-token
+ * allowance plus maxTokens/20s ⇒ ~42–50s for these payloads). Each of them
+ * fails into a plausible-looking NEGATIVE — `[]`, `[trigger]`, `[]` — which is
+ * indistinguishable downstream from a real judgement, so on any provider slower
+ * than 8s the whole pipeline returned `below_convergence` forever and no
+ * experience was ever promoted to a principle. Silently.
+ */
+describe('flash request budgets', () => {
+  it('no call site pins its own timeout — all take the derived budget', async () => {
+    const seen: FlashQueryOpts[] = []
+    const flash = {
+      query: vi.fn(async (opts: FlashQueryOpts) => {
+        seen.push(opts)
+        const key = opts.cacheKey ?? ''
+        if (key.startsWith('anchor-claim:')) return JSON.stringify({ verdicts: [] })
+        if (key.startsWith('principle-claim:')) return JSON.stringify({ applicable: [] })
+        if (key.startsWith('principle-cluster-members:')) return JSON.stringify({ cluster: [] })
+        return null
+      }),
+    } as unknown as FlashClient
+
+    const deps = await makeDeps(flash)
+    const expId = await writeExperience(deps.experienceStore)
+    // A stored principle + a second experience make claim/cluster reachable.
+    await seedPrinciple(deps.principleStore)
+    await writeExperience(deps.experienceStore, { title: 'second' })
+    await evaluatePromotion(expId, deps)
+
+    expect(seen.length).toBeGreaterThan(0)
+    for (const opts of seen) {
+      expect(opts.timeoutMs, `${opts.cacheKey} pinned its own timeout`).toBeUndefined()
+    }
+  })
+
+  it('these are NOT speculative — a failure changes the answer the user gets', async () => {
+    // Unlike QueryAnalyzer's cache-warm, a timeout here makes /experience review
+    // report "no principle applies" when one might. It must still warn.
+    const seen: FlashQueryOpts[] = []
+    const flash = {
+      query: vi.fn(async (opts: FlashQueryOpts) => { seen.push(opts); return null }),
+    } as unknown as FlashClient
+
+    const deps = await makeDeps(flash)
+    const expId = await writeExperience(deps.experienceStore)
+    // A stored principle + a second experience make claim/cluster reachable.
+    await seedPrinciple(deps.principleStore)
+    await writeExperience(deps.experienceStore, { title: 'second' })
+    await evaluatePromotion(expId, deps)
+
+    expect(seen.length).toBeGreaterThan(0)
+    for (const opts of seen) expect(opts.speculative).toBeFalsy()
+  })
+})

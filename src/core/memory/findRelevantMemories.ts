@@ -134,18 +134,43 @@ function truncateToBytes(content: string, maxBytes: number, totalBytes: number):
 /**
  * P1-2: header-scan cache, keyed by directory path.
  *
- * Invalidation strategy (two layers, both cheap):
- *   1. Directory mtime — memory files are written via atomic write-then-rename,
- *      and renames into the directory bump its mtime, so create/update/delete
- *      through the runtime are all detected with ONE stat() call.
- *   2. 30 s TTL — covers the one case dir-mtime misses: a file hand-edited
- *      IN PLACE outside the runtime (file mtime changes, dir mtime does not).
+ * The cache exists to avoid re-READING and re-PARSING every topic file on every
+ * turn. It does not try to avoid the `readdir` — that one syscall is what makes
+ * invalidation correct, and it is orders of magnitude cheaper than the scan it
+ * protects.
+ *
+ * Invalidation, in the order the checks run:
+ *   1. Directory LISTING — the set of `.md` entries. Catches every create,
+ *      delete and rename with certainty.
+ *   2. Directory mtime — catches an in-place overwrite that leaves the listing
+ *      unchanged (atomic write-then-rename does bump dir mtime).
+ *   3. 30 s TTL — backstop for a file hand-edited in place outside the runtime,
+ *      which changes neither the listing nor the directory mtime.
+ *
+ * Why the listing and not just mtime: the check used to be mtime alone, and
+ * `stat().mtimeMs` has millisecond resolution — one measured ext4 mount here
+ * reports the same value for five consecutive file creations. Two memory files
+ * written inside one tick produced an identical cache key, so the second stayed
+ * INVISIBLE for the full 30s TTL: a memory written at the end of a turn was
+ * missing from the very next turn's recall. Nanosecond mtime does not rescue
+ * this — the filesystem simply does not carry the resolution. It also made the
+ * invalidation test pass or fail depending on machine speed (it failed under
+ * coverage instrumentation, which is fast enough to collide), i.e. a real bug
+ * that read as test noise.
  *
  * Race-safety: the cache stores resolved header arrays (never shared mutable
  * state); a concurrent writer simply causes the next call to re-scan.
  */
 const SCAN_CACHE_TTL_MS = 30_000
-const _scanCache = new Map<string, { dirMtimeMs: number; at: number; headers: TopicFileHeader[] }>()
+const _scanCache = new Map<
+  string,
+  { listing: string; dirMtimeMs: number; at: number; headers: TopicFileHeader[] }
+>()
+
+/** Order-independent fingerprint of the `.md` entries in a directory. */
+function listingSignature(entries: readonly string[]): string {
+  return entries.filter(e => e.endsWith('.md')).sort().join('\0')
+}
 
 /** @testonly — drop all cached directory scans. */
 export function clearTopicScanCache(): void {
@@ -159,27 +184,29 @@ export function clearTopicScanCache(): void {
 export async function scanTopicFiles(
   memoryDir: string = MEMORY_DIR,
 ): Promise<TopicFileHeader[]> {
+  let entries: string[]
+  try {
+    entries = await readdir(memoryDir)
+  } catch {
+    return []
+  }
+
   // P1-2: serve from cache when the directory is unchanged and the TTL is fresh.
+  const listing = listingSignature(entries)
   let dirMtimeMs = -1
   try {
     dirMtimeMs = (await stat(memoryDir)).mtimeMs
     const cached = _scanCache.get(memoryDir)
     if (
       cached &&
+      cached.listing === listing &&
       cached.dirMtimeMs === dirMtimeMs &&
       Date.now() - cached.at < SCAN_CACHE_TTL_MS
     ) {
       return cached.headers
     }
   } catch {
-    // Directory missing/unstatable — fall through; readdir below handles it.
-  }
-
-  let entries: string[]
-  try {
-    entries = await readdir(memoryDir)
-  } catch {
-    return []
+    // Directory unstatable — fall through and re-scan rather than serve stale.
   }
 
   // Parallelise all file reads across the directory (Fix #9: was a serial loop).
@@ -242,7 +269,7 @@ export async function scanTopicFiles(
 
   const headers = results.filter((h): h is TopicFileHeader => h !== null)
   if (dirMtimeMs >= 0) {
-    _scanCache.set(memoryDir, { dirMtimeMs, at: Date.now(), headers })
+    _scanCache.set(memoryDir, { listing, dirMtimeMs, at: Date.now(), headers })
     // Bound: callers only ever use a handful of distinct memory dirs.
     if (_scanCache.size > 8) {
       const oldest = _scanCache.keys().next().value

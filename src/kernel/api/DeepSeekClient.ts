@@ -257,7 +257,9 @@ export async function* streamDeepSeekMessages(
       else activeAbortSignal.addEventListener('abort', forwardAbort, { once: true })
 
       try {
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
+        // DeepSeek-only request fields (thinking, reasoning_effort) are not in
+        // OpenAI's TypeScript types, so the create call is re-typed rather than
+        // the payload being narrowed to fit them.
         const stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk> =
           await (client.chat.completions.create as (params: unknown, opts: unknown) => Promise<AsyncIterable<OpenAI.Chat.ChatCompletionChunk>>)(
             baseRequest,
@@ -368,8 +370,50 @@ async function* processStream(
   }
 }
 
-/** Pure normalization of the OpenAI chunk stream into Anthropic-shaped events. */
-async function* processStreamInner(
+/**
+ * One in-flight tool call, accumulated across chunks.
+ *
+ * `id` and `name` MUST be accumulated rather than snapshotted, because the
+ * OpenAI chunk protocol does not guarantee they arrive in the first delta for a
+ * given `index`. The previous code read both exactly once, at the moment the
+ * index was first seen, with no path to correct them afterwards — KernelLoop
+ * takes `name` off `content_block_start` (`:1078-1084`) and finaliseAccumulator
+ * builds the `tool_use` block straight from it, and no `content_block_delta`
+ * can change a name. Two spec-legal shapes therefore produced broken calls:
+ *
+ *   opener carries only `type`, id+name follow  →  id `call_0`, name `''`
+ *   name streamed in fragments ('ba' + 'sh')    →  name truncated to 'ba'
+ *
+ * An empty name misses `toolByName` and fails the whole batch; a synthetic
+ * `call_0` id is echoed back as `tool_call_id` and the provider 400s it. Both
+ * surface as "the model's tool call vanished", pointing nowhere near the stream
+ * decoder.
+ */
+interface PendingToolCall {
+  blockIdx: number
+  id: string
+  name: string
+  /** arguments seen before the block could be opened (needs a name first). */
+  buffered: string
+  started: boolean
+}
+
+/**
+ * Name given to a tool call whose `function.name` never arrived on the wire.
+ *
+ * Deliberately not `''`: an empty name produces `Tool "" not found`, which
+ * reads like a registry problem. This one says where to look.
+ */
+export const UNNAMED_TOOL_CALL = '__unnamed_tool_call__'
+
+/** Pure normalization of the OpenAI chunk stream into Anthropic-shaped events.
+ *
+ * Exported for tests. This is the only place the OpenAI wire format is
+ * interpreted, it is a pure function of the chunk sequence, and every
+ * interesting case is a chunk shape rather than a network condition — so it is
+ * exactly what a table-driven test should drive. It had 6% coverage and no test
+ * file when the tool-call accumulation bug above was found. */
+export async function* processStreamInner(
   stream: AsyncIterable<OpenAI.Chat.ChatCompletionChunk>,
 ): AsyncGenerator<StreamEvent> {
   {
@@ -377,7 +421,7 @@ async function* processStreamInner(
     let nextBlockIdx = 0
     let thinkingBlockIdx = -1
     let textBlockIdx = -1
-    const toolBlockByCallIdx = new Map<number, number>()   // tc.index → block index
+    const toolCalls = new Map<number, PendingToolCall>()   // tc.index → accumulator
 
     // Usage (populated from final usage chunk)
     let inputTokens = 0
@@ -445,26 +489,59 @@ async function* processStreamInner(
       for (const tc of delta.tool_calls) {
         const tcIdx = tc.index ?? 0
 
-        if (!toolBlockByCallIdx.has(tcIdx)) {
-          const blockIdx = nextBlockIdx++
-          toolBlockByCallIdx.set(tcIdx, blockIdx)
+        // Reserve the block index on FIRST sight so ordering matches the wire
+        // order even when the block cannot be opened yet, but accumulate
+        // id/name across every chunk that mentions this index.
+        let pending = toolCalls.get(tcIdx)
+        if (!pending) {
+          pending = { blockIdx: nextBlockIdx++, id: '', name: '', buffered: '', started: false }
+          toolCalls.set(tcIdx, pending)
+        }
+        if (tc.id) pending.id = tc.id
+        // APPEND, never assign: a provider may fragment the name across deltas
+        // ('ba' then 'sh'). Snapshotting it truncated the tool name to 'ba'.
+        if (tc.function?.name) pending.name += tc.function.name
+
+        // WHEN is a name known to be complete? The protocol's own signal is the
+        // first non-empty `arguments` fragment: names never interleave with
+        // args for the same index. So hold the block open-able but unopened
+        // until args start flowing (or the stream ends), rather than committing
+        // to whatever prefix happened to arrive first.
+        const args = tc.function?.arguments ?? ''
+        if (!pending.started && pending.name && args) {
+          pending.started = true
           yield {
             type: 'content_block_start',
-            index: blockIdx,
+            index: pending.blockIdx,
             content_block: {
               type: 'tool_use',
-              id: tc.id ?? `call_${tcIdx}`,
-              name: tc.function?.name ?? '',
+              // A provider that never sends an id leaves us no choice but to
+              // synthesize one; that at least keeps a single-call turn usable.
+              id: pending.id || `call_${tcIdx}`,
+              name: pending.name,
               input: {},
             } as never,
           }
+          if (pending.buffered) {
+            yield {
+              type: 'content_block_delta',
+              index: pending.blockIdx,
+              delta: { type: 'input_json_delta', partial_json: pending.buffered } as never,
+            }
+            pending.buffered = ''
+          }
         }
 
-        if (tc.function?.arguments) {
-          yield {
-            type: 'content_block_delta',
-            index: toolBlockByCallIdx.get(tcIdx)!,
-            delta: { type: 'input_json_delta', partial_json: tc.function.arguments } as never,
+        if (args) {
+          if (pending.started) {
+            yield {
+              type: 'content_block_delta',
+              index: pending.blockIdx,
+              delta: { type: 'input_json_delta', partial_json: args } as never,
+            }
+          } else {
+            // Args before a usable name — keep them in wire order for the flush.
+            pending.buffered += args
           }
         }
       }
@@ -473,6 +550,35 @@ async function* processStreamInner(
     if (choice.finish_reason) {
       stopReason = mapFinishReason(choice.finish_reason)
     }
+    }
+
+    // Flush every tool call that never saw an `arguments` fragment: a zero-arg
+    // tool, or a call whose name arrived but whose args did not. Sorted by tool
+    // index so parallel calls keep wire order.
+    //
+    // A call whose name NEVER arrived gets an explicit sentinel rather than
+    // ''. An empty name fails `toolByName` with `Tool "" not found`, which
+    // reads like a registry problem and sends the reader to the wrong file;
+    // dropping the call silently would lose the turn's intent entirely.
+    for (const [tcIdx, pending] of [...toolCalls.entries()].sort((a, b) => a[0] - b[0])) {
+      if (pending.started) continue
+      yield {
+        type: 'content_block_start',
+        index: pending.blockIdx,
+        content_block: {
+          type: 'tool_use',
+          id: pending.id || `call_${tcIdx}`,
+          name: pending.name || UNNAMED_TOOL_CALL,
+          input: {},
+        } as never,
+      }
+      if (pending.buffered) {
+        yield {
+          type: 'content_block_delta',
+          index: pending.blockIdx,
+          delta: { type: 'input_json_delta', partial_json: pending.buffered } as never,
+        }
+      }
     }
 
     // ── Emit usage + stop events AFTER content ─────────────────────────────────

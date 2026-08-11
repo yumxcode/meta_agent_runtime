@@ -989,7 +989,9 @@ export async function runRepl(opts: CliOptions): Promise<void> {
       rl.setPrompt(_steerPrompt)
       rl.prompt()
     },
-    read: (): Promise<string | null> => _nextInput(),
+    // Fresh input only — see _nextFreshInput for why draining the queue here
+    // made Ctrl+G look like it cancelled itself.
+    read: (): Promise<string | null> => _nextFreshInput(),
     endInput: (): void => {
       _steerInputActive = false
       setInteractiveActive(false)
@@ -1008,6 +1010,30 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   function _nextInput(): Promise<string | null> {
     if (_rlClosed && _inputQueue.length === 0) return Promise.resolve(null)
     if (_inputQueue.length > 0) return Promise.resolve(_inputQueue.shift()!)
+    return new Promise<string | null>(resolve => _inputResolvers.push(resolve))
+  }
+
+  /**
+   * Read the next line the user types FROM NOW ON, never one that was already
+   * queued.
+   *
+   * `_nextInput()` drains `_inputQueue` first, which is right for the main loop
+   * (that queue is type-ahead: lines the user submitted while a turn was
+   * streaming, meant as the next prompt). It is wrong for a steer prompt.
+   *
+   * The bug: nothing consumes `_inputQueue` during a streaming turn — the main
+   * loop is parked inside streamPrompt — so every Enter pressed mid-turn parks
+   * a line there. Press Ctrl+G afterwards and `read()` popped that stale line
+   * instantly. A bare Enter left `''`, so the `steer ›` prompt was drawn and
+   * overwritten by "已取消，继续。" in the same tick — no cursor, no chance to
+   * type, which is exactly what it looked like. Worse, if the stale line had
+   * TEXT in it, that text was silently injected as the correction.
+   *
+   * Waiting for a genuinely fresh line fixes both, and leaves the type-ahead in
+   * the queue for the main loop to pick up after the turn, as before.
+   */
+  function _nextFreshInput(): Promise<string | null> {
+    if (_rlClosed) return Promise.resolve(null)
     return new Promise<string | null>(resolve => _inputResolvers.push(resolve))
   }
 
@@ -1141,6 +1167,13 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     // interrupt is not submitted after the drain window expires.
     _paste.clear()
     clearPasteNotice()
+    // Release anyone blocked on a fresh line. Without this, Ctrl+C while the
+    // `steer ›` prompt is up leaves streamPrompt awaiting a line that the
+    // drain window is busy discarding — the turn hangs until a SECOND Ctrl+C
+    // closes readline and resolves the pending resolvers with null.
+    if (_steerInputActive || interactiveInputActive) {
+      for (const resolve of _inputResolvers.splice(0)) resolve(null)
+    }
     if (isTTY) rl.setPrompt(PROMPT_YOU)   // paste-collection may have blanked it
     process.stdout.write(`\n${yellow('Interrupted')} ${dim('(press Ctrl+C again to exit)')}\n`)
     setTimeout(() => { ctrlCPressed = false }, 2000)

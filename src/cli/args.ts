@@ -75,12 +75,15 @@ ${bold('LOOP RUNTIME (durable graph only)')}
   meta-agent loop gc [--apply]              Dry-run/apply terminal wake and optional archive cleanup
   meta-agent loop capabilities             List frozen-capable Functions/Reducers/Effects/Packs
   meta-agent loop-scheduler [options]      Run the loop daemon until idle (unattended driver)
-      --poll-ms <n> --idle-exit-ms <n> --max-concurrent-graphs <n>
+      --poll-ms <n> --max-concurrent-graphs <n>
+      --idle-exit-ms <n>    ${dim('Exit once the workspace has NO live graphs left (default 60s; 0 = stay up)')}
   (put global flags like -w <dir> BEFORE the loop token: meta-agent -w <dir> loop tick)
 
 ${bold('AUTO SCHEDULER (plain auto self_timer)')}
   meta-agent -w <dir> auto-scheduler       Resume due durable Auto sessions
       --poll-ms <n> --max-concurrent <n> [--once]
+      --idle-exit-ms <n>    ${dim('Exit once the workspace has NO wakes left (default 60s; 0 = stay up)')}
+      --stale-wake-ms <n>   ${dim('Retire a wake left unexecuted this long past due (default 7d; 0 = never)')}
   meta-agent -w <dir> --mode auto --attached "goal"
       Keep the original terminal attached across repeated self_timer wakes.
   By default self_timer persists state and exits; --attached instead keeps

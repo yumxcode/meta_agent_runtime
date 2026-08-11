@@ -37,4 +37,9 @@ _show_worker_prompt.mts
 permissions.json
 _tmp_branchcycle.removed
 __trash_stale_auto_orch/
-src/core/auto_orch/
+
+# NOTE: `src/core/auto_orch/` used to be listed here, left over from retiring
+# the v1 auto-orchestration engine. Its files are long gone, but the rule
+# outlived them and had become a trap: anything created under that path would
+# be invisible to `git status` and silently skipped by `git add .`. An ignore
+# rule inside src/ is a landmine; deleted deliberately.

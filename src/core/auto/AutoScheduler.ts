@@ -9,7 +9,21 @@ export interface AutoSchedulerOptions {
   maxConcurrent?: number
   retryBaseMs?: number
   onEvent?: (message: string) => void
+  /**
+   * Exit once the queue has held no live work (no pending, no claimed, nothing
+   * running) for this long. 0 disables it and the scheduler polls forever.
+   *
+   * "Idle" deliberately means EMPTY, not "nothing due right now": a wake parked
+   * 55 minutes out is still live work and keeps the scheduler alive. Only a
+   * queue with nothing left in it counts, which is precisely the case where the
+   * process was otherwise sitting in an empty workspace burning a terminal tab
+   * for no reason.
+   */
+  idleExitMs?: number
 }
+
+/** Why `run()` returned. */
+export type AutoSchedulerExitReason = 'aborted' | 'idle'
 
 export type AutoResumeOutcome = 'done' | 'cancelled'
 export type AutoResumeHandler = (
@@ -25,6 +39,7 @@ export class AutoScheduler {
   private readonly pollIntervalMs: number
   private readonly maxConcurrent: number
   private readonly retryBaseMs: number
+  private readonly idleExitMs: number
   private readonly active = new Set<Promise<void>>()
 
   constructor(
@@ -35,30 +50,120 @@ export class AutoScheduler {
     this.pollIntervalMs = Math.max(50, options.pollIntervalMs ?? 1_000)
     this.maxConcurrent = Math.max(1, options.maxConcurrent ?? 1)
     this.retryBaseMs = Math.max(100, options.retryBaseMs ?? 5_000)
+    this.idleExitMs = Math.max(0, options.idleExitMs ?? 0)
   }
 
-  async tickOnce(now = Date.now(), signal?: AbortSignal): Promise<number> {
+  /**
+   * Is there any work left that this scheduler could ever run?
+   *
+   * `pending` counts even when its fireAt is far in the future — that is a wake
+   * we are legitimately waiting for. `claimed` counts because someone (possibly
+   * another process) is mid-flight. Terminal records are just an audit trail.
+   */
+  private async hasLiveWork(): Promise<boolean> {
+    if (this.active.size > 0) return true
+    const records = await this.store.list()
+    return records.some(r => r.status === 'pending' || r.status === 'claimed')
+  }
+
+  /**
+   * Claim every due wake that fits in the free capacity and START it.
+   * Returns immediately — the claims keep running in `this.active`.
+   *
+   * This is the piece `run()` needs. `tickOnce` below adds the drain because
+   * its one-shot callers (`--once`, unit tests) want "this batch finished".
+   *
+   * `maxConcurrent` is a genuine CONCURRENCY CEILING here, which is what the
+   * flag has always been named. It used not to be: tickOnce awaited every
+   * in-flight claim before returning, so `active` was empty at the top of each
+   * poll and `maxConcurrent - active.size` was a constant. The effect was that
+   * one slow wake blocked every wake that came due while it ran — measured at
+   * 1.78s for a 2s claim with 3 slots free, and an auto turn is minutes, not
+   * seconds. `loop/daemon.ts` had this right all along; this now matches it.
+   */
+  async dispatchDue(now = Date.now(), signal?: AbortSignal): Promise<number> {
     if (signal?.aborted) return 0
     await this.store.reconcileOrphans(now)
+    // Only claims whose lease has actually EXPIRED are reclaimed, and runClaim
+    // heartbeats every 30s against a 10min TTL, so sweeping on every poll can
+    // never steal a claim this process is still working on.
     const capacity = Math.max(0, this.maxConcurrent - this.active.size)
     if (capacity === 0) return 0
     const records = await this.store.claimDue(now, undefined, capacity)
     for (const record of records) {
-      const task = this.runClaim(record, signal).finally(() => this.active.delete(task))
+      // runClaim already funnels every failure into a release + onEvent, but a
+      // throw from the release itself would now escape as an UNHANDLED
+      // rejection (nothing awaits this promise any more), and the CLI treats
+      // unhandledRejection as fatal. Terminate the chain here.
+      const task = this.runClaim(record, signal)
+        .catch(error => {
+          this.options.onEvent?.(
+            `[auto-scheduler] claim handler crashed for ${record.sessionId} ` +
+            `(${record.wakeId}): ${error instanceof Error ? error.message : String(error)}`,
+          )
+        })
+        .finally(() => this.active.delete(task))
       this.active.add(task)
     }
-    if (records.length > 0) await Promise.all([...this.active])
     return records.length
   }
 
-  async run(signal: AbortSignal): Promise<void> {
+  /** Wait for every in-flight claim to settle. */
+  async drain(): Promise<void> {
+    // Re-read after each wait: a settling claim cannot add work, but draining
+    // twice is cheap and makes the method safe to call from anywhere.
+    while (this.active.size > 0) await Promise.allSettled([...this.active])
+  }
+
+  /**
+   * Claim due wakes and wait for that batch to finish.
+   *
+   * Kept blocking on purpose: `--once` means "do the due work and exit", and a
+   * non-blocking version would turn it into fire-and-forget.
+   */
+  async tickOnce(now = Date.now(), signal?: AbortSignal): Promise<number> {
+    const claimed = await this.dispatchDue(now, signal)
+    if (claimed > 0) await this.drain()
+    return claimed
+  }
+
+  async run(signal: AbortSignal): Promise<AutoSchedulerExitReason> {
     await this.store.reconcileOrphans()
+    // Timestamp of the moment the queue first went empty; null while it holds
+    // live work. Tracked rather than counted so a single long poll interval
+    // cannot skip past the threshold.
+    let emptySince: number | null = null
+
     while (!signal.aborted) {
-      await this.tickOnce(Date.now(), signal)
+      // dispatchDue, NOT tickOnce: the polling loop must stay responsive to
+      // newly-due wakes while earlier ones are still running.
+      await this.dispatchDue(Date.now(), signal)
       if (signal.aborted) break
+
+      if (this.idleExitMs > 0) {
+        if (await this.hasLiveWork()) {
+          emptySince = null
+        } else {
+          emptySince ??= Date.now()
+          if (Date.now() - emptySince >= this.idleExitMs) {
+            this.options.onEvent?.(
+              `[auto-scheduler] no wakes left in this workspace — exiting after ` +
+              `${Math.round(this.idleExitMs / 1000)}s idle.`,
+            )
+            await this.drain()
+            return 'idle'
+          }
+        }
+      }
+
       await abortableDelay(this.pollIntervalMs, signal)
     }
-    await Promise.allSettled([...this.active])
+    // An abort does NOT abandon in-flight claims: runClaim forwards the signal
+    // to each turn and then releases its wake, so draining is what turns a
+    // Ctrl-C into a clean queue rather than a pile of orphaned `claimed`
+    // records waiting on reconcileOrphans to time out.
+    await this.drain()
+    return 'aborted'
   }
 
   private async runClaim(

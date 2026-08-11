@@ -210,6 +210,18 @@ export const RuntimeEnv = {
   maxToolOutputChars(fallback: number): number {
     return readIntEnvOr('META_AGENT_MAX_TOOL_OUTPUT_CHARS', fallback, 1024, 1024 * 1024)
   },
+  /**
+   * Force the `grep` tool onto its portable Node fallback even when ripgrep is
+   * installed.
+   *
+   * Two real uses: reproducing a result on a machine that has no rg, and
+   * exercising the fallback in tests — without it the fallback is unreachable
+   * on any developer machine or CI image that ships ripgrep, which is how it
+   * came to hold an unguarded synchronous regex that could freeze the process.
+   */
+  disableRipgrep(): boolean {
+    return envEquals('META_AGENT_DISABLE_RIPGREP', '1', 'true')
+  },
   /** Max chars of a tool RESULT surfaced to the model. Clamped [1KiB, 1MiB]. */
   maxToolResultChars(fallback: number): number {
     return readIntEnvOr('META_AGENT_MAX_TOOL_RESULT_CHARS', fallback, 1024, 1024 * 1024)
@@ -284,6 +296,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_KEEP_TERMINAL_JOBS', type: 'int', default: '200', description: 'Max terminal jobs retained in memory (LRU).' },
   { name: 'META_AGENT_MCP_STDIO_MAX_RESPONSE_BYTES', type: 'int', default: '10485760', description: 'Maximum stdout bytes retained from one stdio MCP RPC.' },
   { name: 'META_AGENT_IGNORE_USER_PERMISSIONS', type: 'flag', default: 'off', description: 'Ignore on-disk permission configs (hermetic mode).' },
+  { name: 'META_AGENT_DISABLE_RIPGREP', type: 'flag', default: 'off', description: 'Force the grep tool onto its portable Node fallback even when ripgrep is installed.' },
   { name: 'META_AGENT_WEB_FETCH_UA', type: 'string', default: 'built-in UA', description: 'User-Agent header for web_fetch.' },
   { name: 'META_AGENT_TRUST_FAKE_IP', type: 'flag', default: 'off', description: 'Allow spoofed client IP headers in web_fetch (testing).' },
   { name: 'TAVILY_API_KEY', type: 'string', default: 'unset', description: 'Tavily key for the preferred web_search provider.' },

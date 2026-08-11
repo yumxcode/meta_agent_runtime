@@ -19,7 +19,10 @@
  *   for passing to MetaAgentSession.registerTool().
  */
 
-import type { MetaAgentTool } from '../../../src/core/types.js'
+// Was '../../../src/core/types.js' — it resolved (repo root + src/…) but only
+// by accident of this file's depth, and it is the only import in the codebase
+// that climbs out of src/ to come back in.
+import type { MetaAgentTool } from '../../core/types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Fidelity level
@@ -209,8 +212,12 @@ export class EngineeringToolRegistry {
    */
   toString(): string {
     const lines: string[] = ['EngineeringToolRegistry:']
-    for (const [cap, fMap] of [...this.map.entries()].sort()) {
-      for (const [level, entry] of [...fMap.entries()].sort()) {
+    // Explicit comparators: a bare .sort() stringifies each [key, value] PAIR
+    // ("capability,[object Object]"), which happened to order capabilities
+    // correctly and ordered numeric fidelity levels as 0, 1, 10, 2. list() and
+    // fidelitiesFor() both got this right; only the diagnostic dump did not.
+    for (const [cap, fMap] of [...this.map.entries()].sort((a, b) => a[0].localeCompare(b[0]))) {
+      for (const [level, entry] of [...fMap.entries()].sort((a, b) => a[0] - b[0])) {
         lines.push(
           `  ${cap} @ ${FIDELITY_LABELS[level as FidelityLevel]}` +
           ` → "${entry.tool.name}"` +

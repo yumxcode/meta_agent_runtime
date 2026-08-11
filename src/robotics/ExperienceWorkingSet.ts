@@ -24,6 +24,15 @@ const EXPERIENCE_TASK_SWITCH_RE = /\b(new task|switch task|different task|anothe
 const EXPERIENCE_INJECTION_LIMIT = 4
 const EXPERIENCE_CANDIDATE_LIMIT = 18
 const EXPERIENCE_STRONG_APPLICABILITY_SCORE = 100
+/**
+ * Soft cap on how long preload() waits for the LLM relevance judgement.
+ *
+ * Matches QueryAnalyzer's budget on purpose: both sit on the same critical path
+ * (submit() awaits the intent, then awaits preload()), so a user who presses
+ * Enter should never wait more than a couple of seconds for context assembly
+ * regardless of how many flash calls it involves.
+ */
+const SELECT_WAIT_BUDGET_MS = 5_000
 
 const EXPERIENCE_RELEVANCE_SYSTEM = `\
 You select stored robotics experiences that should be injected into the current task context.
@@ -98,12 +107,20 @@ export interface ExperienceWorkingSetDeps {
   flashClient: FlashClient | null
   /** Robot/platform name, used as a ranking signal. */
   robot: string | undefined
+  /**
+   * How long preload() will WAIT for the LLM relevance judgement before falling
+   * back to the locally-ranked selection. Defaults to
+   * SELECT_WAIT_BUDGET_MS; 0 waits for the full flash timeout (~41s).
+   * Exposed mainly so tests can shrink it.
+   */
+  selectWaitBudgetMs?: number
 }
 
 export class ExperienceWorkingSetManager {
   private readonly experienceSource: ExperienceSource
   private readonly contextPager: ContextPager
   private readonly flashClient: FlashClient | null
+  private readonly selectWaitBudgetMs: number
   private readonly robot: string | undefined
 
   private _candidatePool: ExperienceMatch[] = []
@@ -118,6 +135,7 @@ export class ExperienceWorkingSetManager {
     this.contextPager = deps.contextPager
     this.flashClient = deps.flashClient
     this.robot = deps.robot
+    this.selectWaitBudgetMs = deps.selectWaitBudgetMs ?? SELECT_WAIT_BUDGET_MS
   }
 
   /** The experiences selected for the current turn (consumed by compaction anchors). */
@@ -242,7 +260,23 @@ export class ExperienceWorkingSetManager {
       return localFallback
     }
 
-    const raw = await this.flashClient.query({
+    // Soft deadline, same shape as QueryAnalyzer's.
+    //
+    // This call had NO wait budget: `preload()` is awaited on the turn's
+    // critical path, and the flash query's derived timeout is ~41s, so a slow
+    // provider could hold the user's Enter key for forty seconds before the
+    // main model was even asked anything. The irony was that the line above it
+    // — the intent analysis — went to great lengths to race a 5s budget, and
+    // then handed control straight to something unbounded.
+    //
+    // `localFallback` is already computed, so losing the race costs nothing but
+    // precision: the locally-ranked, strongly-applicable experiences get
+    // injected instead of the LLM-selected ones. The request keeps running in
+    // the background purely to populate the cache, which a repeat of the same
+    // (prompt, intent, candidate-set) will hit — that is a realistic repeat,
+    // unlike an identical free-text prompt, because the candidate pool is
+    // stable across turns.
+    const raw = await this.raceWithBudget(this.flashClient.query({
       system: EXPERIENCE_RELEVANCE_SYSTEM,
       user: [
         `User task:\n${prompt.slice(0, 800)}`,
@@ -260,7 +294,11 @@ export class ExperienceWorkingSetManager {
           candidates.map(c => c.id).join(','),
         ].join('\n'))
         .digest('hex')}`,
-    })
+      // Losing the race is an expected outcome, not a failure worth a warning
+      // in the middle of the user's turn. See FlashClient.speculative.
+      speculative: true,
+      label: 'experience-working-set',
+    }))
 
     if (!raw) return localFallback
     const ids = parseApplicableExperienceIds(raw, candidates)
@@ -271,6 +309,31 @@ export class ExperienceWorkingSetManager {
       .map(id => byId.get(id))
       .filter((s): s is SelectedExperience => Boolean(s))
       .slice(0, EXPERIENCE_INJECTION_LIMIT)
+  }
+
+  /**
+   * Resolve `work` if it finishes within the wait budget, otherwise null.
+   *
+   * The losing promise is NOT cancelled: it keeps running under the flash
+   * client's own timeout and populates the result cache, so the next turn with
+   * the same (prompt, intent, candidates) gets it for free. Cancelling would
+   * throw that work away for no gain — the cost was already paid the moment the
+   * request went out.
+   */
+  private async raceWithBudget<T>(work: Promise<T | null>): Promise<T | null> {
+    if (this.selectWaitBudgetMs <= 0) return work
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const budget = new Promise<null>(resolve => {
+      timer = setTimeout(() => resolve(null), this.selectWaitBudgetMs)
+      timer.unref?.()
+    })
+    try {
+      // work never rejects (FlashClient.query catches its own errors), so a
+      // plain race is safe here.
+      return await Promise.race([work, budget])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
   }
 
   private _rankCandidates(

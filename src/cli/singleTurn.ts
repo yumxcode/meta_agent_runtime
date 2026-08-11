@@ -58,6 +58,18 @@ interface SingleTurnRunOptions {
 /** How often an unattended run checks the filesystem steer queue. */
 const STEER_POLL_MS = 700
 
+/**
+ * Default idle window before `auto-scheduler` exits on an empty queue.
+ *
+ * A finished project should not keep a terminal tab (and a Node process) alive
+ * indefinitely. 60s is long enough to ride out the gap between one wake being
+ * released and the session arming its successor.
+ */
+const DEFAULT_IDLE_EXIT_MS = 60_000
+
+/** Default staleness window for an unexecuted wake — see AutoContinuationStore. */
+const DEFAULT_STALE_WAKE_MS = 7 * 24 * 60 * 60_000
+
 interface SingleTurnRunResult {
   result?: MetaAgentResultEvent
   armedWake?: AutoContinuationRecord
@@ -355,6 +367,8 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
         once: { type: 'boolean', default: false },
         'poll-ms': { type: 'string' },
         'max-concurrent': { type: 'string' },
+        'idle-exit-ms': { type: 'string' },
+        'stale-wake-ms': { type: 'string' },
       },
       strict: true,
       allowPositionals: false,
@@ -374,8 +388,21 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
     '--max-concurrent',
     1,
   )
+  // Exit once the workspace has no wakes left, instead of holding a terminal
+  // open forever on a project that is finished. `--idle-exit-ms 0` restores the
+  // old always-on behaviour for a machine that acts as a persistent runner.
+  const idleExitMs = parseNonNegativeIntOption(
+    parsed.values['idle-exit-ms'] as string | undefined,
+    '--idle-exit-ms',
+    DEFAULT_IDLE_EXIT_MS,
+  )
+  const staleWakeMs = parseNonNegativeIntOption(
+    parsed.values['stale-wake-ms'] as string | undefined,
+    '--stale-wake-ms',
+    DEFAULT_STALE_WAKE_MS,
+  )
   const projectDir = resolve(opts.workspace ?? process.cwd())
-  const store = new AutoContinuationStore(projectDir)
+  const store = new AutoContinuationStore(projectDir, { staleWakeMs })
   const abort = new AbortController()
   const stop = () => abort.abort('signal')
   process.once('SIGINT', stop)
@@ -388,6 +415,7 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
     {
       pollIntervalMs,
       maxConcurrent,
+      idleExitMs,
       onEvent: message => {
         if (opts.json) console.log(JSON.stringify({ type: 'auto_scheduler', message }))
         else process.stderr.write(`${message}\n`)
@@ -400,18 +428,48 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
     // resumed must not be injected days later, wildly out of context.
     await pruneSteer(projectDir).catch(() => 0)
     const healed = await store.reconcileOrphans()
+
+    // Retire wakes whose moment passed long ago, then delete the terminal
+    // records that have aged out. Neither ran before, so a queue accumulated
+    // every wake a workspace had ever scheduled — 28 records for one project,
+    // 27 of them long finished, all re-read under the store lock on every poll.
+    const expired = await store.expireStale().catch(() => [])
+    const pruned = await store.prune().catch(() => 0)
+
     if (!opts.json) {
       process.stderr.write(
         `[auto-scheduler] workspace=${projectDir} poll=${pollIntervalMs}ms ` +
         `concurrency=${maxConcurrent}` +
+        (idleExitMs > 0 ? ` idle-exit=${Math.round(idleExitMs / 1000)}s` : ' idle-exit=off') +
         (healed.length ? ` recovered=${healed.length}` : '') +
+        (pruned ? ` pruned=${pruned}` : '') +
         `\n`,
       )
+      // Name what was dropped: silently shrinking someone's queue is worse than
+      // the stale wake itself.
+      for (const record of expired) {
+        process.stderr.write(
+          `${yellow('[auto-scheduler]')} expired ${record.sessionId} (${record.wakeId}) — ` +
+          `due ${formatLocalTimestamp(record.fireAt)}, never ran. ` +
+          `${dim(terminalText(record.reason.slice(0, 80)))}\n`,
+        )
+      }
+    } else if (expired.length) {
+      console.log(JSON.stringify({
+        type: 'auto_scheduler_expired',
+        wakes: expired.map(r => ({ sessionId: r.sessionId, wakeId: r.wakeId, fireAt: r.fireAt })),
+      }))
     }
+
     if (parsed.values['once']) {
       await scheduler.tickOnce(Date.now(), abort.signal)
     } else {
-      await scheduler.run(abort.signal)
+      const reason = await scheduler.run(abort.signal)
+      if (reason === 'idle' && !opts.json) {
+        process.stderr.write(
+          `${dim('本工作区已无待处理的 Auto 唤醒，scheduler 正常退出。')}\n`,
+        )
+      }
     }
   } finally {
     process.removeListener('SIGINT', stop)
@@ -507,6 +565,24 @@ async function cancelAttachedAutoSession(
     stopReason: 'cancelled_by_user',
     pendingWake: null,
   })
+}
+
+/**
+ * Like parsePositiveIntOption but accepts 0, which these two flags use to mean
+ * "disable this behaviour" (`--idle-exit-ms 0` = never exit on an empty queue,
+ * `--stale-wake-ms 0` = never expire a wake).
+ */
+function parseNonNegativeIntOption(
+  value: string | undefined,
+  name: string,
+  fallback: number,
+): number {
+  if (value === undefined) return fallback
+  const parsed = Number.parseInt(value, 10)
+  if (!Number.isSafeInteger(parsed) || parsed < 0) {
+    throw new Error(`${name} must be a non-negative integer (got "${value}")`)
+  }
+  return parsed
 }
 
 function parsePositiveIntOption(

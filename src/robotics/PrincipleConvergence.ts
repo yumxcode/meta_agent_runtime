@@ -16,6 +16,26 @@
  *
  * Source diversity affects the proposed confidence tier (observed vs reproduced),
  * NOT whether the principle may be born. It is a soft ranking signal.
+ *
+ * ── On flash timeouts ───────────────────────────────────────────────────────
+ * Every flash call below fails into a PLAUSIBLE-LOOKING NEGATIVE:
+ *   claimPrinciplesForExperience → []          "no principle covers this"
+ *   flashClusterByMechanism      → [trigger]   singleton → below_convergence
+ *   claimAnchorsForExperience    → []          "bore on no anchors"
+ * None of those is distinguishable, downstream, from a genuine judgement.
+ *
+ * All three used to hard-code `timeoutMs: 8_000`. The derived budget for these
+ * payloads is ~42–50s (`flashTimeoutMs`: flashTtftMs 30s + maxTokens/20s), so
+ * 8s was roughly 5× tighter than this codebase's own latency model — the
+ * default FIRST-TOKEN allowance alone is 30s. On any provider slower than that
+ * the whole recognition-before-generation pipeline returned
+ * `{ kind: 'none', reason: 'below_convergence' }` every single time, and no
+ * experience was EVER promoted to a principle. Silently: the negative result is
+ * a normal, expected outcome, so nothing looked wrong.
+ *
+ * They now take the derived budget. They are deliberately NOT marked
+ * `speculative` — unlike QueryAnalyzer's cache-warm, a failure here changes the
+ * answer the user gets from `/experience review`, so it must still warn.
  */
 
 import type { FlashClient } from '../core/flash/FlashClient.js'
@@ -94,7 +114,8 @@ export async function claimPrinciplesForExperience(
       ).join('\n\n'),
     ].join('\n'),
     maxTokens: 200,
-    timeoutMs: 8_000,
+    // No explicit timeoutMs — use the derived budget (see the note at the top
+    // of this file on why the old hard-coded 8s made this path never fire).
     cacheKey: `principle-claim:${exp.id}:${candidates.map(c => c.id).sort().join(',')}`,
   })
   if (!raw) return []
@@ -148,7 +169,6 @@ export async function flashClusterByMechanism(
       others.map(formatExperienceForClaim).join('\n\n'),
     ].join('\n'),
     maxTokens: 300,
-    timeoutMs: 8_000,
     cacheKey: `principle-cluster-members:${trigger.id}:${others.map(e => e.id).sort().join(',')}`,
   })
   if (!raw) return [trigger]
@@ -207,7 +227,6 @@ export async function claimAnchorsForExperience(
       ).join('\n\n'),
     ].join('\n'),
     maxTokens: 250,
-    timeoutMs: 8_000,
     cacheKey: `anchor-claim:${exp.id}:${candidates.map(c => c.id).sort().join(',')}`,
   })
   if (!raw) return []

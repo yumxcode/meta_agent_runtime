@@ -63,18 +63,16 @@ Field rules:
 - searchKeywords: 3-6 specific technical terms (algorithm names, component names, error types). NOT generic words like "robot", "test", "run", "check".
 - intent: "debug" = diagnosing existing issue; "deploy" = running on real hardware; "experiment" = running new sim or algorithm test; "calibrate" = tuning parameters; "query" = asking a question; "plan" = planning future steps.`
 
-/**
- * Hard cap on the underlying flash request (abort). Kept short so a request that
- * loses the wait-budget race below does not linger for minutes burning tokens on
- * a result the current turn has already moved past.
- */
-const QUERY_ANALYSIS_TIMEOUT_MS = 8_000
+/** Output cap for the intent JSON. Drives the derived request timeout below. */
+const QUERY_ANALYSIS_MAX_TOKENS = 250
 
 /**
  * Default soft cap on how long analyze() will WAIT for the flash result before
- * returning the heuristic fallback for the current turn. Decoupled from the
- * request's own abort timeout so the caller is bounded regardless of whether the
- * provider honors the abort signal.
+ * returning the heuristic fallback for the current turn.
+ *
+ * THIS is the bound that protects the turn, and it is the only one that needs
+ * to be tight. The request's own abort timeout is deliberately NOT tightened to
+ * match (see the note in analyze()).
  */
 const QUERY_ANALYSIS_WAIT_BUDGET_MS = 5_000
 
@@ -99,25 +97,57 @@ const SIM_KEYWORDS = [
   '仿真', '虚拟', '模拟',
 ]
 
+/**
+ * Domain tables carry more weight than "a nicer fallback" now: IntentScheduler
+ * uses heuristic domains as its CHANGE DETECTOR, so a domain the table cannot
+ * name is a topic switch the scheduler cannot see.
+ *
+ * The gaps below were found by running three real user messages through the
+ * heuristic — all three returned `general`:
+ *   "把 MPC 的求解频率提到 200Hz 然后在真机上跑一遍"
+ *      → motion_planning had rrt/prm/ompl but no mpc/lqr/wbc/control at all,
+ *        and `真机` lived only in HW_KEYWORDS (which drives hasHardware), never
+ *        in deployment's domain table.
+ *   "好像报错了，查看下"        → genuinely domain-less; still `general`, correctly.
+ *   "…验证重定向的结果"         → retargeting/motion; `重定向` was absent.
+ *
+ * Substring matching means short latin entries must stay specific: 'arm' would
+ * match 'alarm', 'can' would match 'cannot'. Entries here are either ≥4 chars,
+ * word-like enough to be safe in context, or CJK.
+ */
 const DOMAIN_KEYWORDS: Partial<Record<RoboticsDomain, string[]>> = {
   motion_planning:    ['trajectory', 'path planning', 'motion', 'planner', 'rrt', 'prm', 'ompl',
-                       '轨迹', '路径规划', '运动规划', '规划'],
+                       // Optimal / model-predictive control is the single most
+                       // common vocabulary in this domain and was entirely absent.
+                       'mpc', 'lqr', 'ilqr', 'ddp', 'wbc', 'whole-body', 'trajopt',
+                       'controller', 'control loop', 'retarget',
+                       '轨迹', '路径规划', '运动规划', '规划', '控制器', '模型预测', '最优控制',
+                       '重定向', '全身控制'],
   perception:         ['camera', 'lidar', 'point cloud', 'detection', 'yolo', 'slam', 'mapping',
-                       '相机', '摄像头', '激光雷达', '点云', '检测', '识别', '建图', '感知'],
-  manipulation:       ['grasp', 'pick', 'place', 'gripper', 'arm', 'end effector', 'manipulation',
-                       '抓取', '夹爪', '机械臂', '末端', '操作'],
-  locomotion:         ['walk', 'gait', 'locomotion', 'leg', 'quadruped', 'bipedal', 'balance',
-                       '行走', '步态', '四足', '双足', '平衡', '腿足'],
-  navigation:         ['navigate', 'map', 'localization', 'amcl', 'costmap', 'nav2', 'move_base',
-                       '导航', '定位', '地图', '代价地图', '避障'],
+                       'depth', 'stereo', 'segmentation', 'odometry', 'vio',
+                       '相机', '摄像头', '激光雷达', '点云', '检测', '识别', '建图', '感知',
+                       '深度图', '里程计', '分割'],
+  manipulation:       ['grasp', 'pick', 'place', 'gripper', 'end effector', 'manipulation',
+                       'ik ', 'inverse kinematics', 'wrench',
+                       '抓取', '夹爪', '机械臂', '末端', '操作', '逆运动学', '力控'],
+  locomotion:         ['walk', 'gait', 'locomotion', 'quadruped', 'bipedal', 'balance',
+                       'footstep', 'stance', 'swing',
+                       '行走', '步态', '四足', '双足', '平衡', '腿足', '落足', '支撑相'],
+  navigation:         ['navigate', 'localization', 'amcl', 'costmap', 'nav2', 'move_base',
+                       'waypoint', 'global plan', 'local plan',
+                       '导航', '定位', '地图', '代价地图', '避障', '路点'],
   calibration:        ['calibrat', 'tune', 'pid', 'gain', 'parameter', 'offset', 'imu',
-                       '标定', '校准', '调参', '参数', '增益', '偏置', '整定'],
+                       'bias', 'extrinsic', 'intrinsic', 'drift',
+                       '标定', '校准', '调参', '参数', '增益', '偏置', '整定', '零偏', '外参', '内参', '漂移'],
   hardware_interface: ['joint', 'motor', 'actuator', 'sensor', 'interface', 'driver', 'can bus',
-                       '关节', '电机', '驱动', '传感器', '接口', '总线', '舵机'],
+                       'canbus', 'ethercat', 'encoder', 'torque limit', 'firmware', 'gpio',
+                       '关节', '电机', '驱动', '传感器', '接口', '总线', '舵机', '编码器', '固件', '力矩上限'],
   deployment:         ['deploy', 'launch', 'ros2', 'systemd', 'docker', 'real robot',
-                       '部署', '上线', '发布', '启动'],
+                       'on the robot', 'onboard', 'cross-compile', 'rollout',
+                       '部署', '上线', '发布', '启动', '真机', '实机', '实车', '上机', '上电', '板载'],
   simulation:         ['sim', 'gazebo', 'mujoco', 'pybullet', 'isaac', 'virtual', 'simulated',
-                       '仿真', '虚拟', '模拟', '物理引擎'],
+                       'sim2real', 'rollout in sim', 'domain randomization',
+                       '仿真', '虚拟', '模拟', '物理引擎', '域随机化'],
 }
 
 // Noise words that should not become search keywords (bilingual).
@@ -166,6 +196,18 @@ function extractKeywords(lower: string): string[] {
   }
 
   return out.slice(0, 8)
+}
+
+/**
+ * Pure, local, zero-cost intent extraction.
+ *
+ * Exported because IntentScheduler needs it for two jobs beyond being a
+ * fallback: it supplies the per-TURN fields (searchKeywords / intent) on turns
+ * that do not refresh, and its `domains` output is the change detector that
+ * decides when a refresh is warranted at all.
+ */
+export function heuristicIntent(query: string): QueryIntent {
+  return heuristicFallback(query)
 }
 
 function heuristicFallback(query: string): QueryIntent {
@@ -281,13 +323,32 @@ export class QueryAnalyzer {
     // and resolves to null, so this promise never rejects. We do NOT await it
     // directly — it races the wait budget below. When it loses the race it keeps
     // running in the background and populates the cache via cacheKey.
+    //
+    // No explicit timeoutMs: the request gets the standard DERIVED budget
+    // (flashTimeoutMs(250) ≈ 42s with the default flashTtftMs of 30s).
+    //
+    // It used to hard-code 8s, on the reasoning that a request which lost the
+    // race should not "linger burning tokens". That was 5.3× tighter than this
+    // codebase's own latency model — the default first-token budget alone is
+    // 30s — so on any provider that is not unusually fast the call was designed
+    // to fail. Two consequences, both observed in robotics mode:
+    //   • it timed out ~3s after the turn had already moved on, and the failure
+    //     warning printed into the middle of the streaming response;
+    //   • flash therefore NEVER won the race, so intent analysis was silently
+    //     degraded to keyword heuristics on every single turn.
+    // The 8s bought nothing either way: the wait budget above already
+    // guarantees the turn is never blocked, and 250 output tokens is not a cost
+    // worth defending against.
     const flashPromise: Promise<QueryIntent | null> = this.flash
       .query({
         system: ANALYSIS_SYSTEM,
         user: trimmed.slice(0, 800),
-        maxTokens: 250,
-        timeoutMs: QUERY_ANALYSIS_TIMEOUT_MS,
+        maxTokens: QUERY_ANALYSIS_MAX_TOKENS,
         cacheKey,
+        // Losing the race is the normal, expected outcome on a slow provider —
+        // report it as an aggregate, never as a per-turn warning.
+        speculative: true,
+        label: 'query-intent-analysis',
       })
       .then(raw => (raw ? parseFlashResponse(raw) : null))
       .catch(() => null)

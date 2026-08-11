@@ -7,7 +7,20 @@
 export { ContextPager } from './ContextPager.js'
 export type { PageSlot, SlotPriority, SlotSource, ContextPagerOptions } from './types.js'
 export { estimateTokens, estimateTokensForObject } from './TokenEstimator.js'
-export { QueryAnalyzer } from './QueryAnalyzer.js'
+export { QueryAnalyzer, heuristicIntent } from './QueryAnalyzer.js'
 export type { QueryIntent } from './QueryAnalyzer.js'
+export {
+  SessionIntentTracker,
+  decideIntentRefresh,
+  projectIntentOf,
+  projectIntentChanged,
+} from './IntentScheduler.js'
+export type {
+  IntentRefreshReason,
+  IntentDecision,
+  IntentSchedulerOptions,
+  ProjectIntent,
+  TurnIntent,
+} from './IntentScheduler.js'
 export type { IKnowledgeSource, ExperienceMatch, ExperienceListOpts } from './sources/IKnowledgeSource.js'
 export { ExperienceSource } from './sources/ExperienceSource.js'

@@ -65,6 +65,7 @@ import { estimateTokens } from '../context/TokenEstimator.js'
 import { ExperienceSource } from '../context/sources/ExperienceSource.js'
 import { createRoboticsRuntimeContext } from './runtimeContext.js'
 import type { QueryAnalyzer, QueryIntent } from '../context/QueryAnalyzer.js'
+import { SessionIntentTracker } from '../context/IntentScheduler.js'
 import type { ExperienceMatch } from '../context/sources/IKnowledgeSource.js'
 import type { RoboticsAgentMode, RoboticsProjectState } from './types.js'
 import { buildR1Section, buildR2Section, buildR3Section, buildR4Section, buildR5Section, buildR6Section, renderR4Snapshot, renderR5Snapshot } from './dynamicSections.js'
@@ -241,6 +242,8 @@ export class RoboticsSession implements RoboticsCapabilities {
   private readonly experienceSource: ExperienceSource
   /** Flash-model intent analyzer for pre-loading relevant context */
   private queryAnalyzer: QueryAnalyzer | null = null
+  /** Owns WHEN the intent analysis runs; see context/IntentScheduler.ts. */
+  private intentTracker: SessionIntentTracker | null = null
   /** Shared FlashClient — passed to tools that need flash (e.g. experience_write) */
   private _flashClient: import('../core/flash/FlashClient.js').FlashClient | null = null
   /** Explicit caller override; undefined means 'auto' (classify on first submit). */
@@ -386,6 +389,7 @@ export class RoboticsSession implements RoboticsCapabilities {
     })
     this.queryAnalyzer = rtxResult.queryAnalyzer
     this._flashClient = rtxResult.flashClient
+    this.intentTracker = new SessionIntentTracker(rtxResult.queryAnalyzer)
 
     this.experienceWorkingSet = new ExperienceWorkingSetManager({
       experienceSource: this.experienceSource,
@@ -524,6 +528,13 @@ export class RoboticsSession implements RoboticsCapabilities {
       } else if (existing.agentMode) {
         this._agentMode = existing.agentMode
         this._modeClassified = true  // don't re-classify resumed sessions
+      }
+      // Same reasoning as agentMode: the project's domains are a property of
+      // the project, not of this turn. Seeding from disk puts the tracker
+      // straight into its steady state, so a resumed session pays ZERO intent
+      // calls instead of re-deriving what was already established.
+      if (existing.projectIntent) {
+        this.intentTracker?.seed(existing.projectIntent)
       }
     } else {
       // Fresh session — new isolated state file under this.sessionId
@@ -1003,6 +1014,18 @@ export class RoboticsSession implements RoboticsCapabilities {
    * commits new anchors so they incrementally appear without breaking the prompt
    * cache mid-session.
    */
+  /**
+   * Persist the project-level intent so a resumed session skips the LLM call.
+   * Best-effort: this is a cache, and failing to write it costs one call next
+   * time, never correctness.
+   */
+  private async _persistProjectIntent(): Promise<void> {
+    const project = this.intentTracker?.projectIntent
+    if (!project || !this._state) return
+    this._state.projectIntent = project
+    await RoboticsProjectStore.save(this._state).catch(() => undefined)
+  }
+
   invalidateAnchors(): void {
     this._anchorVersion++
     this.sectionRegistry.invalidate('physical_anchors')
@@ -1032,13 +1055,19 @@ export class RoboticsSession implements RoboticsCapabilities {
       // of the snapshot captured at init().
       await this._refreshState()
 
-      // ── QueryAnalyzer: fire in parallel with stable section building ──────────
-      // Heuristic + flash-model intent analysis. analyze() self-bounds its wait
-      // (~5s) and returns heuristics if flash is slow, so this await can never
-      // stall the turn on provider latency. Result drives proactive context
-      // pre-loading before the first tool call this turn.
-      const queryIntentPromise = this.queryAnalyzer
-        ? this.queryAnalyzer.analyze(prompt).catch(() => null)
+      // ── Query intent: scheduled, not per-turn ─────────────────────────────────
+      // SessionIntentTracker decides whether this turn needs an LLM call at all.
+      // It blocks only on the first turn of a FRESH project (where the user is
+      // not mid-stream and _classifyAgentMode above already blocks anyway), and
+      // not at all on a resumed one — the project-level intent is read off disk.
+      // Every other refresh runs in the background and lands for the next turn,
+      // so flash latency is permanently off the critical path.
+      //
+      // This replaced an unconditional per-turn flash call (~876 tok/turn, 0–5s
+      // of critical-path wait) whose result had exactly one consumer: the
+      // experience working set below.
+      const turnIntentPromise = this.intentTracker
+        ? this.intentTracker.intentForTurn(prompt).catch(() => null)
         : Promise.resolve(null)
 
       // ── Stable system prompt (memoized sections) ──────────────────────────────
@@ -1069,7 +1098,23 @@ export class RoboticsSession implements RoboticsCapabilities {
       // ── Await QueryAnalyzer, pre-load intent-driven context ──────────────────
       // Resolves concurrently with stable section rendering; must complete before
       // volatile section build so any pre-loaded pager slots appear in R2 this turn.
-      const intent = await queryIntentPromise
+      const turnIntent = await turnIntentPromise
+      const intent = turnIntent?.intent ?? null
+
+      // A project-level shift (domain changed, or we crossed into real
+      // hardware) invalidates the cached candidate pool: the experiences that
+      // matter are a different set now. Force a store re-query for this turn.
+      //
+      // DELIBERATELY LIMITED to refreshing the working set. An intent change
+      // must never trigger knowledge WRITES (experience_write / physical
+      // anchor / postSessionExtract): new knowledge comes from experiment
+      // results, not from the user changing subject, and wiring writes to a
+      // topic switch would push unsupported entries into the pending-review
+      // queue that this system requires a human to gate.
+      if (turnIntent?.projectIntentChanged) {
+        this.experienceWorkingSet.forceReload()
+        await this._persistProjectIntent()
+      }
 
       await this.experienceWorkingSet.preload(prompt, intent)
 

@@ -50,7 +50,36 @@ export interface FlashQueryOpts {
    * Use a content-hash so cache invalidates naturally when inputs change.
    */
   cacheKey?: string
+  /**
+   * This call is SPECULATIVE: the caller has already raced it against a
+   * deadline and moved on, so a failure here changes nothing the user can see.
+   *
+   * The per-failure `console.warn` below exists because a silently-broken
+   * knowledge pipeline (extraction, principle promotion) degrades to its
+   * fallback with no other symptom. That reasoning does not hold for a request
+   * whose whole purpose is to warm a cache after it already lost a race —
+   * warning there prints an alarming line into the middle of the user's
+   * streaming output for something working exactly as designed. Observed in
+   * robotics mode: QueryAnalyzer's abandoned request timed out mid-turn and
+   * the warning landed on top of the model's response.
+   *
+   * Speculative failures are still COUNTED, and a one-shot summary is printed
+   * once a caller's failures cross SPECULATIVE_WARN_AFTER — so "this side-call
+   * never once succeeded" stays discoverable instead of becoming invisible.
+   * `label` names the caller in that summary.
+   */
+  speculative?: boolean
+  /** Caller name used in the speculative-failure summary. */
+  label?: string
 }
+
+/**
+ * How many speculative failures from one label before we say something.
+ *
+ * Low enough that a permanently-misconfigured flash model is reported inside a
+ * single session, high enough that ordinary jitter stays quiet.
+ */
+const SPECULATIVE_WARN_AFTER = 5
 
 // ─────────────────────────────────────────────────────────────────────────────
 // FlashClient
@@ -61,6 +90,8 @@ export class FlashClient {
   private readonly openaiClient: OpenAI | null
   private readonly model: string
   private readonly cache = new Map<string, string>()
+  /** label → consecutive speculative failures (see noteSpeculativeFailure). */
+  private readonly speculativeFailures = new Map<string, number>()
   private static readonly MAX_CACHE_ENTRIES = 512
   static readonly DEFAULT_TIMEOUT_MS = 30_000
 
@@ -136,21 +167,60 @@ export class FlashClient {
       return text
     } catch (err) {
       // Timeout, network error, or API failure — caller handles fallback.
+      const detail = err instanceof Error ? err.message : String(err)
+      if (opts.speculative) {
+        this.noteSpeculativeFailure(opts.label ?? 'flash', detail, effectiveTimeoutMs, opts.maxTokens)
+        return null
+      }
       // Warn rather than swallow: a persistently failing flash call degrades a
       // whole feature (memory recall, knowledge extraction, principle
       // promotion) into its fallback with no other symptom.
       console.warn(
         `[meta-agent] flash call failed (model=${this.model}, maxTokens=${opts.maxTokens}, ` +
         `timeout=${effectiveTimeoutMs}ms) — using caller fallback:`,
-        err instanceof Error ? err.message : String(err),
+        detail,
       )
       return null
     }
   }
 
+  /**
+   * Record a speculative failure; report ONCE per label when they pile up.
+   *
+   * Silence-by-default plus a threshold is deliberate: the alternative designs
+   * both fail. Warning every time is what put an alarming line in the middle of
+   * a streaming response for a request that was supposed to be abandoned.
+   * Warning never means a flash model that is misconfigured, unreachable, or
+   * simply too slow for its budget produces no signal at all — the feature just
+   * quietly stops contributing forever, which is the exact failure the original
+   * warning was added to prevent.
+   */
+  private noteSpeculativeFailure(
+    label: string,
+    detail: string,
+    timeoutMs: number,
+    maxTokens: number,
+  ): void {
+    const count = (this.speculativeFailures.get(label) ?? 0) + 1
+    this.speculativeFailures.set(label, count)
+    if (count !== SPECULATIVE_WARN_AFTER) return   // exactly once, not every time after
+    console.warn(
+      `[meta-agent] the "${label}" flash side-call has failed ${count} times ` +
+      `(model=${this.model}, maxTokens=${maxTokens}, timeout=${timeoutMs}ms). ` +
+      `It is best-effort, so nothing is broken — but it is contributing nothing. ` +
+      `Last error: ${detail}`,
+    )
+  }
+
   /** Flush all cached results (call at session start or project switch). */
   clearCache(): void {
     this.cache.clear()
+    this.speculativeFailures.clear()
+  }
+
+  /** @testonly — speculative failure count for a label. */
+  speculativeFailureCount(label: string): number {
+    return this.speculativeFailures.get(label) ?? 0
   }
 
   private setCached(key: string, value: string): void {

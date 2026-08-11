@@ -17,7 +17,26 @@ import {
   withFileLock,
 } from '../../infra/persist/index.js'
 
-export type AutoContinuationStatus = 'pending' | 'claimed' | 'done' | 'cancelled'
+export type AutoContinuationStatus =
+  | 'pending' | 'claimed' | 'done' | 'cancelled'
+  /**
+   * The wake came due but nothing ran it for longer than the staleness window,
+   * so it was retired UNEXECUTED.
+   *
+   * Distinct from 'cancelled' on purpose: cancelled means a fence rejected the
+   * wake (history moved on, goal changed), expired means nobody was listening.
+   * The usual cause is the scheduler for that workspace being gone — a closed
+   * terminal, a finished experiment, a machine reboot. Running such a wake days
+   * later is worse than dropping it: its whole premise ("check whether CI run
+   * 30967536149 finished, ~13 min") has long stopped being true, so it would
+   * burn tokens re-deriving a stale situation.
+   */
+  | 'expired'
+
+/** A wake in one of these states will never run again. */
+export function isTerminalWakeStatus(status: AutoContinuationStatus): boolean {
+  return status === 'done' || status === 'cancelled' || status === 'expired'
+}
 
 /**
  * Raised when a wake has already been CONSUMED — a turn ran against it and
@@ -80,6 +99,11 @@ export interface AutoContinuationRecord {
 }
 
 export interface AutoContinuationStoreOptions {
+  /**
+   * How long past fireAt an unexecuted wake survives before being retired as
+   * `expired`. Defaults to DEFAULT_STALE_WAKE_MS (7 days); pass 0 to disable.
+   */
+  staleWakeMs?: number
   dir?: string
   claimTtlMs?: number
 }
@@ -97,6 +121,21 @@ export interface AutoContinuationScheduleOptions {
 const DEFAULT_CLAIM_TTL_MS = 10 * 60_000
 const DEFAULT_RETENTION_MS = 7 * 24 * 60 * 60_000
 
+/**
+ * How long past its fireAt a wake may sit unexecuted before it is retired.
+ *
+ * Measured from `fireAt`, not `createdAt`: a wake legitimately scheduled two
+ * weeks out is not stale, one that came due eight days ago and nobody ran is.
+ *
+ * The failure this guards against is a workspace whose scheduler went away —
+ * terminal closed, experiment abandoned, machine rebooted. Its queue keeps the
+ * wake forever, and the next time anyone starts a scheduler there it resumes a
+ * session whose premise expired long ago ("check whether CI run 30967536149
+ * finished, ETA 13 min" — from nine days back), burning tokens to re-derive a
+ * dead situation.
+ */
+const DEFAULT_STALE_WAKE_MS = 7 * 24 * 60 * 60_000
+
 export function autoContinuationClaimOwner(): string {
   return `${hostname()}#${process.pid}`
 }
@@ -105,11 +144,15 @@ export class AutoContinuationStore {
   private readonly projectDir: string
   private readonly dir: string
   private readonly claimTtlMs: number
+  private readonly staleWakeMs: number
 
   constructor(projectDir: string, options: AutoContinuationStoreOptions = {}) {
     this.projectDir = resolve(projectDir)
     this.dir = options.dir ?? join(this.projectDir, '.meta-agent', 'auto', 'wakes')
     this.claimTtlMs = options.claimTtlMs ?? DEFAULT_CLAIM_TTL_MS
+    // 0 (or negative) disables expiry entirely — useful for a queue that is
+    // deliberately parked for a long time.
+    this.staleWakeMs = options.staleWakeMs ?? DEFAULT_STALE_WAKE_MS
   }
 
   async schedule(input: {
@@ -195,8 +238,23 @@ export class AutoContinuationStore {
       )
       const claimed: AutoContinuationRecord[] = []
       for (const record of all) {
+        if (record.status !== 'pending') continue
+
+        // Retire instead of running: a wake this far past due belongs to a
+        // workspace whose scheduler went away, and its premise no longer holds.
+        // Checked BEFORE the `limit` break so a long backlog cannot hide stale
+        // records behind the concurrency cap forever.
+        if (this.staleWakeMs > 0 && record.fireAt <= now - this.staleWakeMs) {
+          await atomicWriteJson(this.pathFor(record.wakeId), {
+            ...record,
+            status: 'expired',
+            updatedAt: now,
+          } satisfies AutoContinuationRecord)
+          continue
+        }
+
         if (claimed.length >= limit) break
-        if (record.status !== 'pending' || record.fireAt > now) continue
+        if (record.fireAt > now) continue
         if (liveSessions.has(record.sessionId)) continue
         const next: AutoContinuationRecord = {
           ...record,
@@ -265,8 +323,7 @@ export class AutoContinuationStore {
       for (const record of await this.listUnlocked()) {
         if (
           record.sessionId !== sessionId ||
-          record.status === 'done' ||
-          record.status === 'cancelled'
+          isTerminalWakeStatus(record.status)
         ) continue
         await atomicWriteJson(this.pathFor(record.wakeId), {
           ...record,
@@ -289,8 +346,7 @@ export class AutoContinuationStore {
       const record = await readJsonFile<AutoContinuationRecord>(this.pathFor(wakeId))
       if (
         !record ||
-        record.status === 'done' ||
-        record.status === 'cancelled' ||
+        isTerminalWakeStatus(record.status) ||
         (
           expectedClaimToken !== undefined &&
           record.claim?.token !== expectedClaimToken
@@ -327,13 +383,64 @@ export class AutoContinuationStore {
     })
   }
 
+  /**
+   * Retire every wake that came due more than `staleWakeMs` ago and never ran.
+   *
+   * `claimDue` applies the same rule lazily, so this exists for the eager sweep
+   * a scheduler does at startup: it returns the retired records so the operator
+   * is TOLD what was dropped, instead of silently finding a shrunken queue.
+   */
+  async expireStale(
+    staleWakeMs = this.staleWakeMs,
+    now = Date.now(),
+  ): Promise<AutoContinuationRecord[]> {
+    if (staleWakeMs <= 0) return []
+    await ensureDir(this.dir)
+    return withFileLock(this.lockPath(), async () => {
+      const expired: AutoContinuationRecord[] = []
+      for (const record of await this.listUnlocked()) {
+        // A claimed record is someone else's in-flight work, however old the
+        // fireAt looks — reconcileOrphans releases it first if the claim died.
+        if (record.status !== 'pending') continue
+        if (record.fireAt > now - staleWakeMs) continue
+        const next: AutoContinuationRecord = {
+          ...record,
+          status: 'expired',
+          updatedAt: now,
+        }
+        await atomicWriteJson(this.pathFor(next.wakeId), next)
+        expired.push(next)
+      }
+      return expired
+    })
+  }
+
+  /**
+   * Delete terminal records (done / cancelled / expired) older than the
+   * retention window.
+   *
+   * Age is measured from the moment the record STOPPED being live, not from
+   * `updatedAt`. For done/cancelled those are the same instant. For `expired`
+   * they are not: expireStale stamps `updatedAt = now` as it retires the
+   * record, so an `updatedAt` rule reset the clock on exactly the records the
+   * sweep exists to remove — the CLI runs expireStale() and then prune(), and
+   * prune could never delete anything expireStale had just marked. The queue
+   * whose growth motivated this sweep (28 records, 27 long finished, all
+   * re-read under the store lock on every poll) therefore never shrank.
+   *
+   * `fireAt` is the honest "stopped being live" timestamp for an expired wake:
+   * it is the moment nobody serviced.
+   */
   async prune(olderThanMs = DEFAULT_RETENTION_MS, now = Date.now()): Promise<number> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
       let count = 0
       for (const record of await this.listUnlocked()) {
-        if (record.status !== 'done' && record.status !== 'cancelled') continue
-        if (now - record.updatedAt < olderThanMs) continue
+        if (!isTerminalWakeStatus(record.status)) continue
+        const settledAt = record.status === 'expired'
+          ? Math.min(record.fireAt, record.updatedAt)
+          : record.updatedAt
+        if (now - settledAt < olderThanMs) continue
         await deleteJsonFile(this.pathFor(record.wakeId)).catch(() => undefined)
         count++
       }
@@ -368,6 +475,12 @@ function isAutoContinuationRecord(
     typeof value.wakeId === 'string' &&
     typeof value.sessionId === 'string' &&
     typeof value.fireAt === 'number' &&
-    ['pending', 'claimed', 'done', 'cancelled'].includes(value.status),
+    // MUST list every AutoContinuationStatus. A status missing here makes the
+    // record unreadable rather than invalid-looking: listUnlocked silently drops
+    // it, so the wake becomes invisible to list/prune/claimDue while its file
+    // stays on disk forever. Adding 'expired' without this line did exactly
+    // that — expireStale wrote records nothing could ever see again.
+    (['pending', 'claimed', 'done', 'cancelled', 'expired'] satisfies AutoContinuationStatus[])
+      .includes(value.status),
   )
 }

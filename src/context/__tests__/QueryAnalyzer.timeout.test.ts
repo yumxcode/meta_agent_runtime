@@ -88,3 +88,49 @@ describe('QueryAnalyzer bounded wait', () => {
     expect(intent.domains).toContain('general')
   })
 })
+
+/**
+ * The request budget, as distinct from the wait budget.
+ *
+ * These are two different bounds and only ONE of them needs to be tight. The
+ * wait budget (tested above) is what protects the turn. The request's own abort
+ * timeout used to be hard-coded at 8s "so a losing request does not linger" —
+ * but 8s is ~5× tighter than this codebase's own model of flash latency
+ * (`flashTimeoutMs(250)` ≈ 42s; the default first-token allowance alone is
+ * 30s). Two things followed, both seen in the field on glm-4.5-air:
+ *
+ *   1. the abandoned request timed out ~3s AFTER the turn had moved on, and
+ *      FlashClient's warning printed into the middle of the streamed response;
+ *   2. flash never once won the race, so intent analysis was permanently and
+ *      silently degraded to keyword heuristics.
+ */
+describe('QueryAnalyzer request budget', () => {
+  it('does NOT pin its own timeout — it takes the derived flash budget', async () => {
+    let seen: Record<string, unknown> | undefined
+    const analyzer = new QueryAnalyzer(fakeFlash(async (o: unknown) => {
+      seen = o as Record<string, unknown>
+      return VALID_FLASH_JSON
+    }))
+    await analyzer.analyze('deploy the gait controller on the robot')
+
+    // An explicit timeoutMs here is what broke it. flashTimeoutMs(maxTokens)
+    // must be allowed to decide.
+    expect(seen).toBeDefined()
+    expect(seen!['timeoutMs']).toBeUndefined()
+    expect(seen!['maxTokens']).toBe(250)
+  })
+
+  it('marks the call speculative so an abandoned cache-warm cannot spam the user', async () => {
+    let seen: Record<string, unknown> | undefined
+    const analyzer = new QueryAnalyzer(fakeFlash(async (o: unknown) => {
+      seen = o as Record<string, unknown>
+      return VALID_FLASH_JSON
+    }))
+    await analyzer.analyze('why is the estimate drifting')
+
+    expect(seen!['speculative']).toBe(true)
+    expect(seen!['label']).toBe('query-intent-analysis')
+    // A cacheKey is still required — the background request only exists to warm it.
+    expect(typeof seen!['cacheKey']).toBe('string')
+  })
+})

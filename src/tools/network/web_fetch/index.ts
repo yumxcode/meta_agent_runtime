@@ -1,5 +1,5 @@
 import { lookup } from 'node:dns/promises'
-import { isIP } from 'node:net'
+import { isIP, type LookupFunction } from 'node:net'
 import { request as httpRequest } from 'node:http'
 import { request as httpsRequest } from 'node:https'
 import type { LookupAddress } from 'node:dns'
@@ -274,8 +274,11 @@ function requestPinned(
         method: 'GET',
         headers: buildRequestHeaders(),
         signal,
-        // eslint-disable-next-line @typescript-eslint/no-explicit-any
-        lookup: pinnedLookup as any,
+        // createPinnedLookup accepts `opts: unknown` so it can answer both the
+        // `all: true` and single-address call shapes; LookupFunction declares
+        // the narrower overload set, so the cast is on the options parameter
+        // only, not on the callback contract.
+        lookup: pinnedLookup as unknown as LookupFunction,
         servername: isHttps ? target.resolvedHost : undefined,
       },
       (res) => {

@@ -101,4 +101,35 @@ describe('scanTopicFiles cache (P1-2)', () => {
     const second = await scanTopicFiles(dir)
     expect(second.map(h => h.filename).sort()).toEqual(['a.md', 'b.md'])
   })
+
+  it('invalidates even when both writes land in the SAME millisecond', async () => {
+    // The cache keyed on `stat().mtimeMs`. Two files created inside one
+    // millisecond therefore produced an identical key, and the second stayed
+    // invisible for the whole 30s TTL — i.e. a memory written at the end of a
+    // turn was missing from the very next turn's recall. It also made the test
+    // above pass or fail depending on how fast the machine was, which is the
+    // worst kind of signal: a real bug that reads as test noise.
+    //
+    // Nanosecond mtime distinguishes them. This test forces the collision by
+    // doing both writes back-to-back with no await in between.
+    const dir = await tempMemoryDir()
+    await writeFile(join(dir, 'a.md'), userFile('a'), 'utf-8')
+
+    let sawStale = false
+    for (let attempt = 0; attempt < 40; attempt++) {
+      clearTopicScanCache()
+      await rm(join(dir, 'b.md'), { force: true })
+      const before = Date.now()
+      await scanTopicFiles(dir)                                   // populates the cache
+      await writeFile(join(dir, 'b.md'), userFile('b'), 'utf-8')  // same ms as the scan
+      const after = await scanTopicFiles(dir)
+      const sameMillisecond = Date.now() === before
+      if (after.length !== 2) sawStale = true
+      if (sameMillisecond) {
+        // The interesting iteration: assert freshness precisely here.
+        expect(after.map(h => h.filename).sort()).toEqual(['a.md', 'b.md'])
+      }
+    }
+    expect(sawStale).toBe(false)
+  })
 })

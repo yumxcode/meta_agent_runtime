@@ -17,6 +17,17 @@ import { ensureWorkspaceIdentity } from './workspace/WorkspaceIdentity.js'
 
 export interface DaemonOptions extends TickDeps {
   pollMs?: number
+  /**
+   * Exit once the workspace has held no live work for this long. **0 disables
+   * idle exit** and the scheduler polls until aborted.
+   *
+   * 0 used to mean the opposite — `now() - idleSince >= 0` is true on the very
+   * first idle tick, so `--idle-exit-ms 0` exited immediately. The auto
+   * scheduler's identically-named flag documents 0 as "stay up"
+   * (`cli/args.ts`, `AutoSchedulerOptions.idleExitMs`), so the same flag on two
+   * subcommands did opposite things, and the one that contradicted its own help
+   * text was this one.
+   */
   idleExitMs?: number
   onTick?: (result: TickResult) => void
   now?: () => number
@@ -120,12 +131,14 @@ export async function runLoopScheduler(options: DaemonOptions): Promise<DaemonRe
         inFlight.set(wake.wakeId, task)
       }
 
-      const liveWakes = (await wakeStore.list()).some(wake => wake.status === 'pending' || wake.status === 'claimed')
-      const waiting = (await listGraphInstanceRecords(options.projectDir)).some(record => record.status === 'waiting')
-      if (!liveWakes && !waiting && inFlight.size === 0) {
-        idleSince ??= now()
-        if (now() - idleSince >= idleExitMs) return { ticks, graphTicksRun, exitReason: 'idle' }
-      } else idleSince = null
+      if (idleExitMs > 0) {
+        const liveWakes = (await wakeStore.list()).some(wake => wake.status === 'pending' || wake.status === 'claimed')
+        const waiting = (await listGraphInstanceRecords(options.projectDir)).some(record => record.status === 'waiting')
+        if (!liveWakes && !waiting && inFlight.size === 0) {
+          idleSince ??= now()
+          if (now() - idleSince >= idleExitMs) return { ticks, graphTicksRun, exitReason: 'idle' }
+        } else idleSince = null
+      }
       await sleep(pollMs, abort.signal)
     }
   } finally {

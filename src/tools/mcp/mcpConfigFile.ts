@@ -105,29 +105,59 @@ function resolveVar(varName: string): string {
 
 /**
  * Replace "${VAR_NAME}" patterns using env + config.json fallback.
- * Returns undefined if a substitution resolves to an empty string
- * (signals that a required credential is missing → skip this server).
+ *
+ * Missing-ness is decided PER PLACEHOLDER, not on the final string. The old
+ * rule was `value.includes('${') && !result.trim()` — "skip only if the whole
+ * result came out blank" — which silently passed the single most common shape
+ * there is, the one in this file's own example:
+ *
+ *   "Authorization": "Bearer ${ZHIPU_API_KEY}"
+ *
+ * With the key unset that interpolates to `"Bearer "`, whose `.trim()` is
+ * `"Bearer"` — non-empty. So the value was accepted, the server was registered,
+ * buildMcpServerInstructions advertised its tools to the model, and every call
+ * 401'd at the remote end. The operator saw "MCP is flaky", never "you are
+ * missing ZHIPU_API_KEY".
+ *
+ * Returns the names of every placeholder that resolved empty so the caller can
+ * say WHICH variable is missing instead of "missing environment variable".
+ *
+ * Exported for tests: this is a pure function and the failure mode above is
+ * exactly the kind that only a table of input shapes catches.
  */
-function interpolateEnv(value: string): string | undefined {
+export function interpolateEnv(
+  value: string,
+): { ok: true; value: string } | { ok: false; missing: string[] } {
+  const missing: string[] = []
   const result = value.replace(/\$\{([^}]+)\}/g, (_match, varName: string) => {
-    return resolveVar(varName)
+    const resolved = resolveVar(varName)
+    if (!resolved) {
+      if (!missing.includes(varName)) missing.push(varName)
+      return ''
+    }
+    return resolved
   })
-  // If the original value contained a placeholder and the result is empty,
-  // the variable was missing — return undefined to signal "skip".
-  return (value.includes('${') && !result.trim()) ? undefined : result
+  return missing.length > 0 ? { ok: false, missing } : { ok: true, value: result }
 }
 
-function interpolateRecord(
+/**
+ * Interpolate every value in a record. A single missing placeholder rejects the
+ * WHOLE record (and therefore the whole server) — a half-authenticated MCP
+ * client is not a useful thing to hand the model.
+ *
+ * Reports `field` alongside `missing` so the warning can name both the header /
+ * env key and the variable behind it.
+ */
+export function interpolateRecord(
   record?: Record<string, string>,
-): Record<string, string> | undefined {
-  if (!record) return undefined
+): { ok: true; value: Record<string, string> } | { ok: false; field: string; missing: string[] } {
   const result: Record<string, string> = {}
-  for (const [k, v] of Object.entries(record)) {
+  for (const [k, v] of Object.entries(record ?? {})) {
     const resolved = interpolateEnv(v)
-    if (resolved === undefined) return undefined   // missing env var → skip whole server
-    result[k] = resolved
+    if (!resolved.ok) return { ok: false, field: k, missing: resolved.missing }
+    result[k] = resolved.value
   }
-  return result
+  return { ok: true, value: result }
 }
 
 // ── Stdio MCP client ──────────────────────────────────────────────────────────
@@ -425,37 +455,46 @@ export class StdioMcpClient implements McpClient {
 
 // ── Factory ───────────────────────────────────────────────────────────────────
 
+/**
+ * Name the variable, not just the category. "missing environment variable in
+ * headers" makes the operator go read mcp.json and diff it against their shell;
+ * "headers.Authorization needs ZHIPU_API_KEY" ends the investigation.
+ */
+function warnSkipped(
+  name: string,
+  section: 'headers' | 'env',
+  failure: { field: string; missing: string[] },
+): null {
+  console.warn(
+    `[mcp] Skipping server "${name}": ${section}.${failure.field} needs ` +
+    `${failure.missing.map(v => `\${${v}}`).join(', ')}, which resolved empty. ` +
+    `Set the variable (or config.json apiKey for GLM aliases) and restart.`,
+  )
+  return null
+}
+
 function buildClient(name: string, cfg: McpServerConfig): McpClient | null {
   const type = cfg.type
 
-  if (type === 'http' || type === 'streamable-http' || type === 'streamableHttp') {
-    const resolvedHeaders = interpolateRecord(cfg.headers)
-    if (cfg.headers && resolvedHeaders === undefined) {
-      console.warn(`[mcp] Skipping server "${name}": missing environment variable in headers`)
-      return null
-    }
-    return new HttpMcpClient(cfg.url, '', resolvedHeaders ?? {})
-  }
-
-  if (type === 'sse') {
+  if (
+    type === 'http' || type === 'streamable-http' || type === 'streamableHttp' ||
     // SSE servers share the same JSON-RPC over HTTP POST path; the SSE stream
     // is only used for server-push notifications which we don't need here.
+    type === 'sse'
+  ) {
     const resolvedHeaders = interpolateRecord(cfg.headers)
-    if (cfg.headers && resolvedHeaders === undefined) {
-      console.warn(`[mcp] Skipping server "${name}": missing environment variable in headers`)
-      return null
-    }
-    // Reuse HttpMcpClient — for tool calls the POST endpoint is the same.
-    return new HttpMcpClient(cfg.url, '', resolvedHeaders ?? {})
+    if (!resolvedHeaders.ok) return warnSkipped(name, 'headers', resolvedHeaders)
+    return new HttpMcpClient(cfg.url, '', resolvedHeaders.value)
   }
 
   if (type === 'stdio') {
     const resolvedEnv = interpolateRecord(cfg.env)
-    if (cfg.env && resolvedEnv === undefined) {
-      console.warn(`[mcp] Skipping server "${name}": missing environment variable in env`)
-      return null
-    }
-    return new StdioMcpClient({ ...cfg, env: resolvedEnv }, name)
+    if (!resolvedEnv.ok) return warnSkipped(name, 'env', resolvedEnv)
+    // Preserve the "no env block at all" shape: an empty override record and an
+    // absent one mean the same thing to buildChildEnv, but keeping undefined
+    // avoids churning the StdioServerConfig the client stores for diagnostics.
+    const env = cfg.env ? resolvedEnv.value : undefined
+    return new StdioMcpClient({ ...cfg, env }, name)
   }
 
   console.warn(`[mcp] Unknown server type "${(cfg as McpServerConfig & { type: string }).type}" for "${name}", skipping`)

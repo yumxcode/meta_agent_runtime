@@ -452,7 +452,8 @@ function summarizeStreamError(err: unknown): string {
   } else {
     msg = String(err)
   }
-  // eslint-disable-next-line no-control-regex
+  // Control characters in a provider error message would corrupt the terminal
+  // and the debug transcript; collapse them to spaces.
   msg = msg.replace(/[\x00-\x1f\x7f]+/g, ' ').replace(/\s{2,}/g, ' ').trim()
   return msg.length > 500 ? msg.slice(0, 500) + '…' : msg
 }
