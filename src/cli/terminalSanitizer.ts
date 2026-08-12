@@ -9,6 +9,29 @@
 
 type State = 'normal' | 'esc' | 'csi' | 'osc' | 'oscEsc' | 'stString' | 'stEsc'
 
+/**
+ * Maximum characters consumed inside one control sequence before we give up and
+ * treat it as noise.
+ *
+ * T1: without this the state machine could never leave `osc` / `stString`. Their
+ * only terminators are BEL, ST (`ESC \`) and 0x9C — bytes that essentially never
+ * occur in ordinary text — so ONE unterminated `\x1b]` swallowed every
+ * subsequent character. That mattered because streamPrompt keeps a single
+ * sanitizer for the whole turn (deliberately, so a sequence split across chunks
+ * still gets stripped): the agent would go silent mid-sentence while the spinner
+ * kept turning and tools kept running, with no way to tell why.
+ *
+ * The trigger surface is wide (binary output, curl progress, tmux passthrough, a
+ * stray 0x9D from mis-decoded latin-1) and we manufacture it ourselves: the bash
+ * tool truncates at an exact character count, which can cut `\x1b]0;title\x07`
+ * in half and guarantee an unterminated OSC.
+ *
+ * 4096 is far above any legitimate sequence — window titles and OSC-8 hyperlinks
+ * are tens to low hundreds of characters — and far below the point where losing
+ * the run costs the user anything. Real terminals bound these the same way.
+ */
+const MAX_SEQUENCE_CHARS = 4096
+
 function isCsiFinal(code: number): boolean {
   return code >= 0x40 && code <= 0x7e
 }
@@ -23,6 +46,35 @@ function isC1Control(code: number): boolean {
 
 export class TerminalSanitizer {
   private state: State = 'normal'
+  /** Characters consumed since the current control sequence started. */
+  private sequenceChars = 0
+  /**
+   * True when the previous emitted character was a CR that we turned into a
+   * newline, so an immediately following LF must be swallowed.
+   *
+   * W11: a bare CR is a progress-bar redraw and becomes '\n' (showing each
+   * update on its own line beats letting it overwrite). But CRLF is ONE line
+   * break, and mapping the CR and then also emitting the LF double-spaced every
+   * line. On Linux/macOS that only showed up on the occasional CRLF file; on
+   * Windows every child process emits CRLF, so the entire terminal — all tool
+   * output, all pasted logs — would render double-spaced.
+   *
+   * The flag lives on the instance because streamPrompt keeps one sanitizer per
+   * turn and a CRLF can straddle two chunks.
+   */
+  private pendingCr = false
+
+  /**
+   * Enter a control-sequence state, resetting the overflow counter.
+   * `normal` is the only state that is not part of a sequence.
+   */
+  private enter(state: State): void {
+    this.state = state
+    if (state === 'normal') this.sequenceChars = 0
+    // A control sequence between the CR and the LF means they were not a CRLF
+    // pair; do not swallow the next newline.
+    if (state !== 'normal') this.pendingCr = false
+  }
 
   sanitize(input: string): string {
     let out = ''
@@ -31,73 +83,92 @@ export class TerminalSanitizer {
       const ch = input[i]!
       const code = ch.charCodeAt(0)
 
+      // Bail out of a runaway sequence (see MAX_SEQUENCE_CHARS). Everything
+      // consumed so far stays dropped — it was still control-sequence bytes,
+      // and re-emitting it would be worse than losing it — but the CURRENT
+      // character is re-examined as normal text so output resumes here.
+      if (this.state !== 'normal') {
+        if (this.sequenceChars >= MAX_SEQUENCE_CHARS) this.enter('normal')
+        else this.sequenceChars++
+      }
+
       switch (this.state) {
         case 'normal': {
           if (ch === '\x1b') {
-            this.state = 'esc'
+            this.enter('esc')
             break
           }
           if (code === 0x9b) {
-            this.state = 'csi'
+            this.enter('csi')
             break
           }
           if (code === 0x9d) {
-            this.state = 'osc'
+            this.enter('osc')
             break
           }
           if (code === 0x90 || code === 0x98 || code === 0x9e || code === 0x9f) {
-            this.state = 'stString'
+            this.enter('stString')
             break
           }
           if (isC1Control(code)) break
           if (isC0Control(code)) {
-            if (ch === '\n' || ch === '\t') out += ch
-            else if (ch === '\r') out += '\n'
+            if (ch === '\n') {
+              // Second half of a CRLF — the CR already produced the newline.
+              if (this.pendingCr) this.pendingCr = false
+              else out += ch
+            } else if (ch === '\r') {
+              out += '\n'
+              this.pendingCr = true
+            } else {
+              this.pendingCr = false
+              if (ch === '\t') out += ch
+            }
             break
           }
+          this.pendingCr = false
           if (code === 0x7f) break
           out += ch
           break
         }
 
         case 'esc': {
-          if (ch === '[') this.state = 'csi'
-          else if (ch === ']') this.state = 'osc'
-          else if (ch === 'P' || ch === 'X' || ch === '^' || ch === '_') this.state = 'stString'
-          else if (ch === '\x1b') this.state = 'esc'
-          else this.state = 'normal'
+          if (ch === '[') this.enter('csi')
+          else if (ch === ']') this.enter('osc')
+          else if (ch === 'P' || ch === 'X' || ch === '^' || ch === '_') this.enter('stString')
+          else if (ch === '\x1b') this.enter('esc')
+          else this.enter('normal')
           break
         }
 
         case 'csi': {
-          if (ch === '\x1b') this.state = 'esc'
-          else if (isCsiFinal(code)) this.state = 'normal'
+          if (ch === '\x1b') this.enter('esc')
+          else if (isCsiFinal(code)) this.enter('normal')
           break
         }
 
         case 'osc': {
-          if (ch === '\x07' || code === 0x9c) this.state = 'normal'
-          else if (ch === '\x1b') this.state = 'oscEsc'
+          if (ch === '\x07' || code === 0x9c) this.enter('normal')
+          else if (ch === '\x1b') this.enter('oscEsc')
           break
         }
 
         case 'oscEsc': {
-          if (ch === '\\') this.state = 'normal'
-          else if (ch === '\x1b') this.state = 'oscEsc'
-          else this.state = 'osc'
+          if (ch === '\\') this.enter('normal')
+          else if (ch === '\x1b') this.enter('oscEsc')
+          else this.enter('osc')
           break
         }
 
         case 'stString': {
-          if (code === 0x9c) this.state = 'normal'
-          else if (ch === '\x1b') this.state = 'stEsc'
+          if (code === 0x9c) this.enter('normal')
+          else if (ch === '\x1b') this.enter('stEsc')
           break
         }
 
         case 'stEsc': {
-          if (ch === '\\') this.state = 'normal'
-          else if (ch === '\x1b') this.state = 'stEsc'
-          else this.state = 'stString'
+          if (ch === '\\') this.enter('normal')
+          else if (ch === '\x1b') this.enter('stEsc')
+          else this.enter('stString')
           break
         }
       }
@@ -107,7 +178,8 @@ export class TerminalSanitizer {
   }
 
   reset(): void {
-    this.state = 'normal'
+    this.enter('normal')
+    this.pendingCr = false
   }
 }
 

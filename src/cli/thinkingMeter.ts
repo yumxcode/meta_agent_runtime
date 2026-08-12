@@ -21,6 +21,19 @@ const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', 
 const CLEAR_LINE = '\r\x1b[2K'
 
 /**
+ * Hard cap on the rendered status line.
+ *
+ * T6: CLEAR_LINE erases ONE row. If the status line is wider than the terminal
+ * it wraps, and hide() then leaves the wrapped remainder on screen — visible
+ * debris the caller's real output has to write around. Truncating to the
+ * terminal width keeps the "one mutable row" invariant the whole class is built
+ * on. 80 is the fallback when the width is unknown (not a TTY / no winsize).
+ */
+const FALLBACK_COLUMNS = 80
+/** Leave a column free so a full-width line cannot trigger the auto-wrap. */
+const WIDTH_MARGIN = 1
+
+/**
  * Estimate reasoning tokens from a raw character count. DeepSeek/Qwen reasoning
  * traces mix CJK and ASCII; a blended ~3.2 chars/token ratio tracks observed
  * `reasoning_tokens` closely enough for a live gauge. Always shown with a `~`
@@ -40,6 +53,8 @@ export interface ThinkingMeterOptions {
   enabled?: boolean
   /** Whether to wrap the line in ANSI color codes. */
   color?: boolean
+  /** Terminal width source (injected for tests). Defaults to stdout's columns. */
+  columns?: () => number
 }
 
 /**
@@ -58,12 +73,14 @@ export class ThinkingMeter {
   private readonly now: () => number
   private readonly enabled: boolean
   private readonly color: boolean
+  private readonly columns: () => number
 
   constructor(opts: ThinkingMeterOptions = {}) {
     this.write = opts.write ?? ((s: string) => void process.stdout.write(s))
     this.now = opts.now ?? (() => Date.now())
     this.enabled = opts.enabled ?? true
     this.color = opts.color ?? true
+    this.columns = opts.columns ?? (() => process.stdout.columns || FALLBACK_COLUMNS)
     this.startMs = this.now()
   }
 
@@ -105,8 +122,15 @@ export class ThinkingMeter {
     this.write(CLEAR_LINE)
   }
 
-  /** Build the status line string (no trailing newline). Exposed for tests. */
-  render(): string {
+  /**
+   * Build the status line string (no trailing newline). Pure — no output.
+   *
+   * T5: this logic used to live in render(), which also wrote to stdout. The
+   * docstring advertised it as "exposed for tests", so every test that asserted
+   * on the returned string also emitted a status line into the test runner's
+   * output. Formatting and emitting are now separate.
+   */
+  format(): string {
     const spinner = SPINNER_FRAMES[this.frame % SPINNER_FRAMES.length]!
     const secs = ((this.now() - this.startMs) / 1000).toFixed(1)
     const label =
@@ -115,7 +139,20 @@ export class ThinkingMeter {
         : `等待模型响应… · ${secs}s`
     const dim = (s: string): string => (this.color ? `\x1b[2m${s}\x1b[0m` : s)
     const magenta = (s: string): string => (this.color ? `\x1b[35m${s}\x1b[0m` : s)
-    const line = `${CLEAR_LINE}${magenta(spinner)} ${dim(label)}`
+    // Truncate on the VISIBLE text, before colouring, so the cap counts
+    // characters the terminal actually advances the cursor for — measuring the
+    // coloured string would count escape bytes and truncate far too early.
+    const plain = `${spinner} ${label}`
+    const limit = Math.max(1, this.columns() - WIDTH_MARGIN)
+    if (plain.length > limit) {
+      return `${CLEAR_LINE}${dim(plain.slice(0, limit))}`
+    }
+    return `${CLEAR_LINE}${magenta(spinner)} ${dim(label)}`
+  }
+
+  /** Emit the status line when visible. Returns what was built (tests use format()). */
+  render(): string {
+    const line = this.format()
     if (this.enabled && this.visible) this.write(line)
     return line
   }

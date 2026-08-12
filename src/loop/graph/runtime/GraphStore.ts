@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto'
-import { mkdir, readdir } from 'node:fs/promises'
+import { access, mkdir, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
 import {
   atomicWriteJson,
@@ -590,7 +590,7 @@ export class GraphStore {
   /** Caller must hold withTransaction. Journal is written before projections. */
   async appendEventLocked(event: GraphJournalEvent): Promise<SequencedGraphJournalEvent> {
     let sequence = await this.readLastSequenceLocked() + 1
-    while (await readJsonFile<SequencedGraphJournalEvent>(this.journalPath(sequence))) sequence++
+    while (await journalEntryExists(this.journalPath(sequence))) sequence++
     const record: SequencedGraphJournalEvent = {
       schemaVersion: 'graph-journal-1.0', sequence, eventId: randomUUID(), event,
     }
@@ -787,7 +787,7 @@ export class GraphStore {
     const counter = await readJsonFile<{ lastSequence?: number }>(this.paths.journalSequenceJson)
     if (Number.isInteger(counter?.lastSequence) && counter!.lastSequence! >= 0) {
       let lastSequence = counter!.lastSequence!
-      while (await readJsonFile<SequencedGraphJournalEvent>(this.journalPath(lastSequence + 1))) lastSequence++
+      while (await journalEntryExists(this.journalPath(lastSequence + 1))) lastSequence++
       if (lastSequence !== counter!.lastSequence) {
         await atomicWriteJson(this.paths.journalSequenceJson, { schemaVersion: '1.0', lastSequence })
       }
@@ -1016,6 +1016,31 @@ function compareTerminalActivation(a: ActivationRecord, b: ActivationRecord, gra
 
 function isFinalStatus(status: GraphInstanceRecord['status']): boolean {
   return status === 'done' || status === 'exhausted' || status === 'failed'
+}
+
+/**
+ * Pure existence check for one journal entry — deliberately NOT readJsonFile().
+ *
+ * M3-fix: readJsonFile() quarantines a file it cannot parse (renames it to
+ * `<path>.<ts>.corrupt`) and returns null. Both journal scans used it as their
+ * existence probe, so probing a CORRUPT entry deleted it, stopped the scan at
+ * that sequence, and let the next append reuse the number — the event vanished
+ * and, because the numbering stayed contiguous, readJournalRangeLocked's
+ * `journal sequence gap` check never fired. A destructive read was silently
+ * repairing away the very evidence the recovery path is built on.
+ *
+ * With a plain access() the bad entry stays put, so the next reconcile raises
+ * `graph journal sequence gap at N` — which isDeterministicGraphError already
+ * classifies as deterministic, parking the instance as `failed` for inspection
+ * instead of continuing on a corrupted history.
+ */
+async function journalEntryExists(path: string): Promise<boolean> {
+  try {
+    await access(path)
+    return true
+  } catch {
+    return false
+  }
 }
 
 function stableJson(value: JsonValue): string {

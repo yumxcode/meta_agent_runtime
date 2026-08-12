@@ -353,13 +353,18 @@ async function* processStream(
   sessionId?: string,
   reqPayload?: Record<string, unknown>,
 ): AsyncGenerator<StreamEvent> {
-  // Open debug file (no-op when debug is false or sessionId is absent)
-  const writer = await DebugWriter.open(sessionId, reqPayload?.['model'] as string ?? 'deepseek', debug)
-  if (writer && reqPayload) {
-    await writer.writeRequest(reqPayload)
-  }
-
+  // M2-fix: opened INSIDE the try. DebugWriter.open() hands back two file
+  // handles and writeRequest() immediately writes to one of them; both used to
+  // run before the try, so a filesystem failure there leaked the handles that
+  // had already been opened.
+  let writer: DebugWriter | null = null
   try {
+    // Open debug file (no-op when debug is false or sessionId is absent)
+    writer = await DebugWriter.open(sessionId, reqPayload?.['model'] as string ?? 'deepseek', debug)
+    if (writer && reqPayload) {
+      await writer.writeRequest(reqPayload)
+    }
+
     for await (const event of processStreamInner(stream)) {
       // Accumulate response content for the markdown debug twin.
       writer?.recordStreamEvent(event)

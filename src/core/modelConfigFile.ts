@@ -24,8 +24,11 @@
  * grouped values win when both are present. Internally everything is
  * flattened into the same ModelConfigFile shape, so consumers are unchanged.
  *
- * Location (global only): `$META_AGENT_HOME/config.json` (defaults to
- * ~/.meta-agent/config.json — the same root as memory/subtasks).
+ * Location (global only): `$META_AGENT_CONFIG_FILE` when set, otherwise
+ * `$META_AGENT_HOME/config.json` (defaults to ~/.meta-agent/config.json — the
+ * same root as memory/subtasks).  The dedicated `meta-agent-glm` executable
+ * sets this override to `$META_AGENT_HOME/glm_config.json` before loading the
+ * main CLI bundle, allowing multiple provider accounts to run concurrently.
  *
  * Precedence applied by resolveConfig(): config file > CLI flags > built-in
  * provider defaults.  All fields are optional; an absent / malformed file is
@@ -34,7 +37,8 @@
 
 import { readFileSync } from 'fs'
 import { META_AGENT_HOME } from './metaAgentHome.js'
-import { join } from 'path'
+import { homedir } from 'os'
+import { isAbsolute, join, resolve } from 'path'
 import { parseTimeoutSection, type TimeoutConfig } from './timeouts.js'
 
 export interface ModelConfigFile {
@@ -72,6 +76,15 @@ let _pathsOverride: string[] | null = null
 /** Candidate paths, highest priority first. */
 export function modelConfigCandidatePaths(): string[] {
   if (_pathsOverride !== null) return _pathsOverride
+  const explicit = process.env['META_AGENT_CONFIG_FILE']?.trim()
+  if (explicit) {
+    const expanded = explicit === '~'
+      ? homedir()
+      : explicit.startsWith('~/')
+        ? join(homedir(), explicit.slice(2))
+        : explicit
+    return [isAbsolute(expanded) ? expanded : resolve(expanded)]
+  }
   return [join(META_AGENT_HOME, 'config.json')]
 }
 

@@ -16,7 +16,7 @@
  */
 
 import { build } from 'esbuild'
-import { chmod, readFile } from 'fs/promises'
+import { chmod, readFile, writeFile } from 'fs/promises'
 import { fileURLToPath } from 'url'
 import { dirname, join } from 'path'
 
@@ -114,6 +114,26 @@ await build({
 
 await chmod(join(root, 'dist/cli.mjs'), 0o755)
 
+// ── Provider-profile launcher ───────────────────────────────────────────────
+// Keep this wrapper tiny: it must select the alternate config BEFORE the main
+// bundle is imported, because modelConfigFile caches the first resolved file.
+// All other state (sessions, memory, skills, permissions) deliberately remains
+// under the same META_AGENT_HOME so both provider accounts can share work.
+const glmLauncher = `#!/usr/bin/env node
+import { homedir } from 'node:os'
+import { join, resolve } from 'node:path'
+
+if (!process.env.META_AGENT_CONFIG_FILE?.trim()) {
+  const configuredHome = process.env.META_AGENT_HOME?.trim()
+  const metaAgentHome = configuredHome ? resolve(configuredHome) : join(homedir(), '.meta-agent')
+  process.env.META_AGENT_CONFIG_FILE = join(metaAgentHome, 'glm_config.json')
+}
+
+await import('./cli.mjs')
+`
+await writeFile(join(root, 'dist/cli-glm.mjs'), glmLauncher, 'utf8')
+await chmod(join(root, 'dist/cli-glm.mjs'), 0o755)
+
 // ── Mirror prompt.md files into dist ─────────────────────────────────────────
 // The library build (plain tsc) emits only .js/.d.ts; tools load their
 // description from a sibling prompt.md at RUNTIME via loadToolPrompt().
@@ -141,5 +161,6 @@ await chmod(join(root, 'dist/cli.mjs'), 0o755)
 }
 
 console.log('✅  dist/cli.mjs built and marked executable.')
+console.log('✅  dist/cli-glm.mjs profile launcher built and marked executable.')
 console.log('   Install globally:  npm link')
 console.log('   Or run directly:   node dist/cli.mjs --help')

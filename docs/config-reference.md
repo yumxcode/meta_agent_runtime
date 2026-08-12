@@ -2,13 +2,32 @@
 
 > 权限配置(`permissions.json`)是独立文件,不在此文档范围内。
 
-运行时配置由 **ConfigService** 统一管理,文件名固定为 `config.json`,跨三层合并(越具体越优先):
+运行时配置由 **ConfigService** 统一管理,默认文件名为 `config.json`,跨三层合并(越具体越优先):
 
 | 层 | 路径 | 说明 |
 | --- | --- | --- |
 | `global` | `~/.meta-agent/config.json`(或 `$META_AGENT_HOME/config.json`) | 对所有 workspace 生效 |
 | `project` | `<workspace>/.meta-agent/config.json` | 仅当前 workspace |
 | `session` | 进程内存(运行期由 `config` 工具写入) | 不落盘,优先级最高 |
+
+### 多账号 / 多 Provider 配置
+
+CLI 提供两个可并行使用的入口:
+
+```bash
+meta-agent --mode robotics       # 读 ~/.meta-agent/config.json
+meta-agent-glm --mode robotics   # 读 ~/.meta-agent/glm_config.json
+```
+
+`meta-agent-glm` 只切换全局模型配置文件;会话、memory、skills、permissions 等仍共享同一个
+`META_AGENT_HOME`。也可直接用环境变量选择任意配置文件:
+
+```bash
+META_AGENT_CONFIG_FILE=~/.meta-agent/account-b.json meta-agent
+```
+
+`META_AGENT_CONFIG_FILE` 支持绝对路径、相对路径和 `~/...` 路径。项目层 `<workspace>/.meta-agent/config.json`
+仍可按原有优先级覆盖全局配置。
 
 合并优先级:`session > project > global`,**逐字段**覆盖。
 在 `resolveConfig()` 里,合并后的文件值再与调用方/CLI 参数比较,最终顺序为:**配置文件 > CLI/调用方 > Provider 内置默认**。

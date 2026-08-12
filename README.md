@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.13` · Node.js `>= 18`
+> 当前版本:`0.8.16` · Node.js `>= 18`
 
 ---
 
@@ -93,6 +93,16 @@ npm install @meta-agent/runtime
 | 4 | Anthropic | `ANTHROPIC_API_KEY` | `claude` 系列 | Anthropic 原生 |
 
 也可以在代码或 CLI 里显式传入 `apiKey` / `baseURL` / `model` / `fallbackModel` 覆盖自动探测。
+
+多账号并行使用时,`meta-agent` 默认读取 `~/.meta-agent/config.json`,`meta-agent-glm` 读取
+`~/.meta-agent/glm_config.json`:
+
+```bash
+meta-agent --mode robotics
+meta-agent-glm --mode robotics
+```
+
+也可通过 `META_AGENT_CONFIG_FILE=/path/to/account.json meta-agent` 选择任意模型配置文件。
 
 ---
 
@@ -499,4 +509,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.13`。
+当前包版本:`0.8.16`。

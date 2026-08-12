@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import {
   loadModelConfigFile,
+  modelConfigCandidatePaths,
   setModelConfigPathsForTest,
   resetModelConfigFileCache,
 } from '../modelConfigFile.js'
@@ -18,15 +19,20 @@ describe('loadModelConfigFile', () => {
   let dir: string
   let pathA: string
   let pathB: string
+  let previousConfigFile: string | undefined
 
   beforeEach(() => {
     dir = mkdtempSync(join(tmpdir(), 'mcf-'))
     pathA = join(dir, 'a.json')
     pathB = join(dir, 'b.json')
+    previousConfigFile = process.env['META_AGENT_CONFIG_FILE']
+    delete process.env['META_AGENT_CONFIG_FILE']
   })
   afterEach(() => {
     setModelConfigPathsForTest(null)
     resetModelConfigFileCache()
+    if (previousConfigFile === undefined) delete process.env['META_AGENT_CONFIG_FILE']
+    else process.env['META_AGENT_CONFIG_FILE'] = previousConfigFile
     rmSync(dir, { recursive: true, force: true })
   })
 
@@ -105,6 +111,16 @@ describe('loadModelConfigFile', () => {
     writeFileSync(pathB, JSON.stringify({ mainModel: 'from-b' }))
     setModelConfigPathsForTest([pathA, pathB])
     expect(loadModelConfigFile().mainModel).toBe('from-b')
+  })
+
+  it('reads the config selected by META_AGENT_CONFIG_FILE', () => {
+    writeFileSync(pathA, JSON.stringify({ mainModel: 'glm-profile' }))
+    setModelConfigPathsForTest(null)
+    process.env['META_AGENT_CONFIG_FILE'] = pathA
+    resetModelConfigFileCache()
+
+    expect(modelConfigCandidatePaths()).toEqual([pathA])
+    expect(loadModelConfigFile().mainModel).toBe('glm-profile')
   })
 
   it('ignores non-string / empty fields', () => {

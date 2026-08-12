@@ -43,11 +43,52 @@ export const terminalText = (input: unknown): string => sanitizeTerminalText(inp
 
 // ── Output ────────────────────────────────────────────────────────────────────
 
+/**
+ * Make a closed output pipe a clean exit instead of a crash.
+ *
+ * T3: `meta-agent … | head` (or `| less` and pressing q) closes the read end.
+ * Every subsequent write raises EPIPE — delivered as an `'error'` EVENT on the
+ * stream, and an unhandled `'error'` is thrown by EventEmitter. Nothing in this
+ * codebase listened for it, so the REPL's `process.once('uncaughtException')`
+ * caught it and printed `Fatal: write EPIPE` for what is a completely ordinary
+ * shell idiom. It also broke `safeStdoutWrite` differently: `once(stdout,
+ * 'drain')` REJECTS on 'error', surfacing EPIPE as a turn error.
+ *
+ * Exiting silently on EPIPE is the standard CLI convention (grep, cat, git all
+ * do it). Any other stream error is still reported — a full disk writing to a
+ * redirected file must not vanish.
+ *
+ * Idempotent, so the CLI entry point and tests can both call it.
+ */
+let _pipeGuardsInstalled = false
+export function installBrokenPipeGuards(): void {
+  if (_pipeGuardsInstalled) return
+  _pipeGuardsInstalled = true
+  for (const stream of [process.stdout, process.stderr]) {
+    stream.on('error', (err: NodeJS.ErrnoException) => {
+      if (err?.code === 'EPIPE' || err?.code === 'ERR_STREAM_DESTROYED') {
+        // The reader is gone; there is nowhere left to report anything.
+        process.exit(0)
+      }
+      // Not a broken pipe — let the normal fatal path handle it.
+      throw err
+    })
+  }
+}
+
 /** Write to stdout, awaiting 'drain' when the pipe applies backpressure. */
 export async function safeStdoutWrite(text: string): Promise<void> {
   if (!text) return
   if (process.stdout.write(text)) return
-  await once(process.stdout, 'drain')
+  try {
+    await once(process.stdout, 'drain')
+  } catch (err) {
+    // `once` rejects if the stream emits 'error' while we wait. A broken pipe
+    // is not this turn's problem to report — installBrokenPipeGuards() is
+    // already exiting the process — so swallow it rather than turning a
+    // `| head` into a turn-level error message.
+    if ((err as NodeJS.ErrnoException)?.code !== 'EPIPE') throw err
+  }
 }
 
 // ── Active thinking-meter registry ────────────────────────────────────────────

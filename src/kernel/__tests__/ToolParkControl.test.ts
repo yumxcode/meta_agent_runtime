@@ -66,5 +66,9 @@ describe('tool park control', () => {
     })
     expect(result.toolResultMessages).toHaveLength(3)
     expect(JSON.stringify(result.toolResultMessages[2])).toContain('Skipped')
+    // L1: the notice names the tool that actually stopped the batch rather
+    // than hard-coding self_timer for every control kind.
+    expect(JSON.stringify(result.toolResultMessages[2])).toContain('self_timer')
+    expect(JSON.stringify(result.toolResultMessages[2])).toContain('parked the session')
   })
 })

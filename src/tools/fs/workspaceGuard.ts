@@ -57,8 +57,12 @@ export function pathIsUnder(absolutePath: string, root: string): boolean {
  */
 export function isInsideWorkspace(path: string, workspaceRoot = process.cwd()): boolean {
   const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
-  const target = resolvePathForGuard(path, workspace)
-  return target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
+  // M4-fix: was a `startsWith(workspace + sep)` string prefix. Equivalent on
+  // POSIX once the separator is appended, but this file's own history is about
+  // guards that drifted apart, and pathIsUnder — the segment-wise test written
+  // 20 lines above for exactly this question — also normalises separators, so
+  // there is no reason for two containment semantics to coexist here.
+  return pathIsUnder(resolvePathForGuard(path, workspace), workspace)
 }
 
 export function assertInsideWorkspace(path: string, workspaceRoot = process.cwd()): string | null {
@@ -85,9 +89,7 @@ export function resolveInsideWorkspace(
 ): { ok: true; path: string } | { ok: false; error: string } {
   const workspace = existsSync(workspaceRoot) ? realpathSync(workspaceRoot) : resolve(workspaceRoot)
   const target = resolvePathForGuard(path, workspace)
-  const inside =
-    target === workspace || target.startsWith(workspace.endsWith(sep) ? workspace : workspace + sep)
-  return inside
+  return pathIsUnder(target, workspace)
     ? { ok: true, path: target }
     : { ok: false, error: `Error: path is outside workspace: ${path}` }
 }

@@ -154,11 +154,13 @@ ${bold('ENVIRONMENT VARIABLES')}
   DEEPSEEK_API_KEY      DeepSeek API key
   ANTHROPIC_API_KEY     Anthropic API key
   QWEN_API_KEY          Qwen API key
+  META_AGENT_CONFIG_FILE  Select an alternate global model config file
 
   Priority: ZHIPU_API_KEY > DEEPSEEK_API_KEY > QWEN_API_KEY > ANTHROPIC_API_KEY
 
 ${bold('CONFIG FILE')}
   ${cyan('~/.meta-agent/config.json')}
+  ${cyan('~/.meta-agent/glm_config.json')}  ${dim('(selected automatically by meta-agent-glm)')}
   Pins model selection without env vars or flags. All fields optional:
     {
       "LLM": {

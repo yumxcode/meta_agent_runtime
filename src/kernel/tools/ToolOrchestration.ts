@@ -104,6 +104,8 @@ export async function runTools(
   let currentContext = context
 
   let control: KernelToolControl | undefined
+  /** Name of the tool whose result carried `control` — used in the skip notice. */
+  let controlToolName: string | undefined
 
   batchLoop: for (const batch of batches) {
     if (batch.isConcurrencySafe) {
@@ -125,7 +127,10 @@ export async function runTools(
         for (const result of results) {
           orderedResults.set(result.toolUseId, result)
           if (result.permissionDenial) permissionDenials.push(result.permissionDenial)
-          control ??= result.control
+          if (!control && result.control) {
+            control = result.control
+            controlToolName = result.toolName
+          }
         }
 
         // Apply context modifiers in original request order
@@ -150,6 +155,7 @@ export async function runTools(
         }
         if (result.control) {
           control = result.control
+          controlToolName = result.toolName
           break batchLoop
         }
       }
@@ -160,6 +166,11 @@ export async function runTools(
   // a control-flow tool stopped execution part-way through the model's batch.
   // Skipped calls are explicit errors in history; they were never executed.
   if (control) {
+    // L1-fix: name the tool that actually stopped the batch. The message used
+    // to hard-code "an earlier self_timer call" for every control kind, so any
+    // other control-flow tool made the model read a confident, wrong causal
+    // explanation for why its remaining calls never ran.
+    const skipReason = describeSkippedByControl(control, controlToolName)
     for (const req of requests) {
       if (orderedResults.has(req.toolUseId)) continue
       orderedResults.set(req.toolUseId, {
@@ -167,7 +178,7 @@ export async function runTools(
         toolName: req.toolName,
         resultMessage: makeToolResultMessage(
           req.toolUseId,
-          'Skipped: the session was parked by an earlier self_timer call.',
+          skipReason,
           true,
           req.assistantMessageUuid,
         ),
@@ -227,4 +238,25 @@ export function buildMissingToolResultMessages(
 
 function findTool(tools: readonly KernelTool[], name: string): KernelTool | undefined {
   return tools.find(t => t.name === name || (t.aliases ?? []).includes(name))
+}
+
+/**
+ * Explain to the model why a tool call in its batch was never executed.
+ *
+ * Attributes the stop to the tool that actually produced the control signal and
+ * describes the control kind, rather than asserting one specific tool. New
+ * control kinds land in the `default` arm with an honest generic message
+ * instead of inheriting a stale, confidently-wrong one.
+ */
+function describeSkippedByControl(
+  control: KernelToolControl,
+  controlToolName: string | undefined,
+): string {
+  const by = controlToolName ? `\`${controlToolName}\`` : 'an earlier tool'
+  switch (control.kind) {
+    case 'park':
+      return `Skipped: not executed — ${by} parked the session earlier in this batch.`
+    default:
+      return `Skipped: not executed — ${by} stopped this tool batch earlier.`
+  }
 }

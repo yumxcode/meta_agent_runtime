@@ -433,7 +433,19 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   const setInteractiveActive = (v: boolean) => { interactiveInputActive = v }
   const teamReminderTimer = (!opts.json && isTTY)
     ? setInterval(() => {
-        if (exiting || teamReminderRunning || interactiveInputActive || !router.ready || router.mode !== 'robotics') return
+        // T2: `_isStreaming` was missing from this guard. The reminder is
+        // advisory and fires on a 45s wall clock, so during a long turn it
+        // printed INTO the middle of the model's streamed sentence, then called
+        // rl.prompt(true) — drawing `you ›` while the turn was still running, so
+        // the user believed it was their turn to type. It also fought the
+        // thinking meter, which redraws the same line every 120ms with
+        // `\r\x1b[2K` and would erase part of what had just been printed.
+        //
+        // `_isStreaming` is declared later in this same scope but is only read
+        // when the timer fires, and it is set under exactly the condition that
+        // gates this timer (isTTY && !opts.json), so the two always agree.
+        if (exiting || teamReminderRunning || interactiveInputActive || _isStreaming ||
+            !router.ready || router.mode !== 'robotics') return
         const controller = router.getRoboticsTeamController()
         if (!controller?.teamWatcherPoll) return
         teamReminderRunning = true
@@ -451,7 +463,11 @@ export async function runRepl(opts: CliOptions): Promise<void> {
               teamReminderInitialized = true
               return
             }
-            if (fresh.length > 0 && teamModeUsed) {
+            // A turn may have started during the await above; re-check rather
+            // than printing into it.
+            if (fresh.length > 0 && teamModeUsed && !_isStreaming && !exiting) {
+              // Wipe any status line before taking over the row.
+              pauseActiveThinkingMeter()
               process.stdout.write(`\n${yellow('Team 动态')}\n`)
               fresh.slice(-5).forEach(event => {
                 process.stdout.write(`  - ${sanitizeTerminalText(event.message)}\n`)
@@ -862,8 +878,11 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   }
 
   function finishPasteNotice(): void {
+    // renderPasteNotice() already clears and nulls the timer, and
+    // pasteNoticeActive() is true whenever the timer is set — so there is no
+    // path out of the line above that leaves one armed. (T8: a redundant
+    // `_pasteNoticeTimer = null` used to sit here, implying otherwise.)
     if (pasteNoticeActive()) renderPasteNotice()
-    _pasteNoticeTimer = null
     _pasteNoticeChars = 0
     _pendingPasteTail = ''
     _pendingPasteText = ''
@@ -1262,7 +1281,14 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     const hardExit = setTimeout(() => process.exit(code), 15_000)
     hardExit.unref?.()
     if (teamReminderTimer) clearInterval(teamReminderTimer)
+    // Give the terminal back BEFORE the slow teardown below. router.dispose()
+    // can legitimately take seconds (worktree purge, sub-agent unwind) and is
+    // fused at 15s; leaving the tty raw with a half-drawn spinner for that whole
+    // window — and losing it entirely if the fuse blows — is what made a crash
+    // look like a hung shell.
+    pauseActiveThinkingMeter()
     disableBracketedPaste()
+    if (isTTY && process.stdin.isTTY && process.stdin.isRaw) process.stdin.setRawMode?.(false)
     if (err) console.error(`\n${red('Fatal:')} ${terminalText(err instanceof Error ? err.message : String(err))}\n`)
     try { await router.dispose() } catch { /* best-effort */ }
     // Stdio MCP servers are long-lived child processes now (one per configured
@@ -1273,6 +1299,12 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     process.exit(code)
   }
   process.once('SIGTERM',            () => { void disposeAndExit(0) })
+  // T7: SIGHUP was missing. Node's default action for it is to terminate
+  // immediately, so a dropped SSH connection or a closed terminal emulator left
+  // the tty in raw mode with bracketed paste still enabled — harmless when the
+  // window is really gone, but over SSH the surviving shell inherits a terminal
+  // that echoes `200~` around every paste.
+  process.once('SIGHUP',             () => { void disposeAndExit(0) })
   process.once('uncaughtException',  (e) => { void disposeAndExit(1, e) })
   process.once('unhandledRejection', (e) => { void disposeAndExit(1, e) })
 

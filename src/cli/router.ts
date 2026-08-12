@@ -22,6 +22,13 @@ import { getMcpServerInstructions } from './mcpInstructions.js'
 import { DEFAULT_CLI_MAX_TURNS, AUTO_CLI_MAX_TURNS } from './limits.js'
 import type { CliOptions } from './args.js'
 
+/**
+ * How long the headless multi-agent escalation prompt waits for a keystroke
+ * before treating silence as "no". Generous enough for a human who is watching,
+ * short enough that an unattended pipe cannot wedge the run indefinitely.
+ */
+const ESCALATION_PROMPT_TIMEOUT_MS = 120_000
+
 // ── Router factory ────────────────────────────────────────────────────────────
 
 export function makeRouter(
@@ -113,20 +120,45 @@ export function makeRouter(
     }
 
     // Fallback (no REPL readline, e.g. piped/headless): raw stdin one-shot read.
+    //
+    // T4: this used to wait on 'data' alone. In the very scenario the comment
+    // names — piped/headless — stdin is often already at EOF, so 'data' never
+    // fires, 'end' is nobody's business, and the escalation prompt hangs the run
+    // forever with no way out. An unanswered escalation is a "no", so EOF and a
+    // closed stream both resolve as declined, and there is a bounded wait so a
+    // stdin that is open-but-silent (a detached tty, a paused pipe) cannot wedge
+    // the process either.
     process.stdout.write(banner)
     return new Promise<boolean>(resolve => {
-      process.stdin.setRawMode?.(true)
-      process.stdin.resume()
-      process.stdin.setEncoding('utf8')
-      const onKey = (key: string) => {
+      let settled = false
+      const finish = (confirmed: boolean, reason?: string): void => {
+        if (settled) return
+        settled = true
+        clearTimeout(timer)
         process.stdin.setRawMode?.(false)
         process.stdin.pause()
         process.stdin.removeListener('data', onKey)
-        const confirmed = key.trim().toLowerCase() === 'y'
-        process.stdout.write(confirmed ? `${green('y')}\n\n` : `${dim('N')}\n\n`)
+        process.stdin.removeListener('end', onEnd)
+        process.stdin.removeListener('close', onEnd)
+        process.stdout.write(
+          confirmed ? `${green('y')}\n\n` : `${dim(reason ?? 'N')}\n\n`,
+        )
         resolve(confirmed)
       }
+      const onKey = (key: string): void => finish(key.trim().toLowerCase() === 'y')
+      const onEnd = (): void => finish(false, 'N (stdin closed — declined)')
+      const timer = setTimeout(
+        () => finish(false, 'N (no answer — declined)'),
+        ESCALATION_PROMPT_TIMEOUT_MS,
+      )
+      timer.unref?.()
+
+      process.stdin.setRawMode?.(true)
+      process.stdin.resume()
+      process.stdin.setEncoding('utf8')
       process.stdin.once('data', onKey)
+      process.stdin.once('end', onEnd)
+      process.stdin.once('close', onEnd)
     })
   }
 

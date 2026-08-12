@@ -696,10 +696,34 @@ export class AutoWorktreeCoordinator {
     return commitCount > 0
   }
 
+  /**
+   * Drop the stash entry whose commit is `commit`, and only that one.
+   *
+   * L2-fix: `stash@{N}` is a POSITION in the reflog, not an identity. The index
+   * was resolved from one `stash list` and then handed to a separate `stash
+   * drop`, so anything that pushed or dropped a stash in between — the user in
+   * another terminal, or the main agent's own bash tool, neither of which the
+   * coordinator's `_exclusive` chain can serialise — shifted every position by
+   * one and this dropped a STRANGER'S stash. Re-resolve the position
+   * immediately before dropping and verify it still points at our commit;
+   * if it moved, retry on the fresh listing rather than deleting blind.
+   */
   private async _dropStashByCommit(commit: string): Promise<void> {
-    const list = await this._git(['stash', 'list', '--format=%H'])
-    const index = list.split('\n').findIndex(hash => hash === commit)
-    if (index >= 0) await this._git(['stash', 'drop', `stash@{${index}}`])
+    for (let attempt = 0; attempt < 3; attempt++) {
+      const list = await this._git(['stash', 'list', '--format=%H'])
+      const index = list.split('\n').findIndex(hash => hash === commit)
+      if (index < 0) return   // already gone — nothing to drop
+      const ref = `stash@{${index}}`
+      // Confirm the ref still resolves to our commit at drop time.
+      const resolved = await this._git(['rev-parse', ref]).catch(() => '')
+      if (resolved !== commit) continue   // the stack moved; re-read and retry
+      await this._git(['stash', 'drop', ref])
+      return
+    }
+    throw new Error(
+      `Could not drop stash ${commit.slice(0, 12)}: the stash stack kept changing underneath. ` +
+      'Drop it manually once concurrent git activity settles.',
+    )
   }
 
   private async _assertNoGitOperation(worktreePath: string): Promise<void> {

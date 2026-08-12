@@ -324,8 +324,40 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   private reservedBudgetUsd = 0
   private settledCostUsd = 0
   private readonly reservedBudgetByTask = new Map<SubAgentTaskId, number>()
+  /**
+   * H1-fix: tasks that have passed admission SYNCHRONOUSLY but have not yet
+   * landed in `queuedStarts` (the worktree allocation and the task-record write
+   * in between are async).
+   *
+   * Without this, the capacity and budget checks in spawnSubAgent were a
+   * check-then-act across an `await`: `spawn_sub_agent` declares
+   * `isConcurrencySafe: true`, so ToolOrchestration runs up to
+   * META_AGENT_TOOL_USE_CONCURRENCY (default 10) of them in one `Promise.all`,
+   * and every one of those calls read the same pre-registration counters. The
+   * queue cap, the bridge-level total budget and the worktree allocation could
+   * all be overshot by (batch size − 1).
+   */
+  private readonly admittingTaskIds = new Set<SubAgentTaskId>()
   /** Internal safety-gate task IDs bypass local queue/worker limits only. */
   private readonly internalTaskIds = new Set<SubAgentTaskId>()
+  /**
+   * Tasks already folded into `settledCostUsd` (M1 — hardening, not a live bug).
+   *
+   * Two call sites can settle the same task: cancelTask's no-runner branch and
+   * the runner's own completion callback. Today that can only happen when the
+   * drain is between `startQueue.splice` and its `await readTask` — and in that
+   * interleaving cancelTask has written a zero-cost `cancelled` tombstone that
+   * `_writeTerminal` then refuses to overwrite, so BOTH settles read the same
+   * record and carry the same value. The double call is therefore currently
+   * harmless.
+   *
+   * It is harmless only because of that early-return structure spread across
+   * four call sites, though, and nothing states the invariant where the
+   * accounting lives. AutoCostLedger.settleTask has always been idempotent for
+   * exactly this reason; making the bridge's own settle match means a future
+   * call site cannot reintroduce double-counting by accident.
+   */
+  private readonly settledTaskIds = new Set<SubAgentTaskId>()
   private drainingStarts = false
   private destroyed = false
   /** Count of tasks that reached a terminal state (success or failure) since this bridge was created. */
@@ -499,12 +531,18 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this.destroyed = true
     CampaignEventBus.off('subagent:completed', this._onCompleted)
     CampaignEventBus.off('subagent:failed',    this._onFailed)
+    // M5-fix: the tombstones planted here are what stop an in-flight
+    // _maybeRetryFailed (already past its `destroyed` check and sitting in
+    // `await readTask`) from dispatching fresh work during teardown. Clearing
+    // the set on the very next line made that write dead code and left the
+    // guarantee resting entirely on the retry timer's own `destroyed` check —
+    // and it disagreed with cancelAll(), which plants the same tombstones and
+    // does NOT clear them. Keep them; the whole bridge is discarded anyway.
     for (const [taskId, timer] of this._retryTimers) {
       this.retryScheduledFor.add(taskId)
       clearTimeout(timer)
     }
     this._retryTimers.clear()
-    this.retryScheduledFor.clear()
     for (const [taskId] of this.pollTimers) this._clearPollTimer(taskId)
     for (const [taskId, queued] of this.queuedStarts) {
       queued.abortController.abort()
@@ -532,6 +570,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this._finishedCount = 0
     this.pendingNotifications.length = 0
     this.internalTaskIds.clear()
+    this.admittingTaskIds.clear()
+    this.settledTaskIds.clear()
+    this.reservedBudgetByTask.clear()
+    this.reservedBudgetUsd = 0
     this.activeLineages.clear()
     SubAgentBridge._bridgesBySessionId.delete(this.parentSessionId)
   }
@@ -574,49 +616,73 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     // sub-agents can never starve the gate that is supposed to police them.
     const isInternal = config.internal === true
 
-    const outstandingTasks = this.activeTaskIds.size + this.queuedStarts.size
-    const maxOutstandingTasks = this.maxConcurrentSubAgents + this.maxQueuedSubAgents
-    if (!isInternal && outstandingTasks >= maxOutstandingTasks) {
-      throw new Error(
-        `[SubAgentBridge] Sub-agent queue is full ` +
-        `(${outstandingTasks}/${maxOutstandingTasks} outstanding; ` +
-        `${this.maxConcurrentSubAgents} running slots, ${this.maxQueuedSubAgents} queued slots). ` +
-        'Wait for queued tasks to start or raise META_AGENT_MAX_QUEUED_SUB_AGENTS.',
-      )
-    }
-
     const taskId = opts.taskId ?? makeSubAgentTaskId()
     config = {
       ...config,
       logicalTaskId: config.logicalTaskId ?? taskId,
     }
     const requestedBudget = Math.max(0, config.maxBudgetUsd)
-    if (
-      !isInternal &&
-      this.maxTotalSubAgentBudgetUsd !== undefined &&
-      this.settledCostUsd + this.reservedBudgetUsd + requestedBudget > this.maxTotalSubAgentBudgetUsd
-    ) {
-      throw new SubAgentBudgetExceededError(
-        `[SubAgentBridge] Sub-agent budget exceeded. ` +
-        `Requested $${requestedBudget.toFixed(4)}, ` +
-        `reserved $${this.reservedBudgetUsd.toFixed(4)}, ` +
-        `settled $${this.settledCostUsd.toFixed(4)}, ` +
-        `limit $${this.maxTotalSubAgentBudgetUsd.toFixed(4)}.`,
-        'bridge',
-      )
-    }
 
+    // ── Admission: check AND claim, with no `await` in between ───────────────
+    //
+    // H1-fix: everything from here to `admittingTaskIds.add` must stay
+    // synchronous. The three limits below are read from in-memory counters that
+    // used to be updated only AFTER the worktree allocation and the task-record
+    // write, so concurrent spawns (see admittingTaskIds) all observed the
+    // pre-claim state and every one of them was admitted. costLedger's own
+    // reservation was already synchronous — this brings the other two in line.
     let ledgerReserved = false
-    if (this.costLedger) {
-      if (!this.costLedger.tryReserveTask(taskId, requestedBudget)) {
-        const stats = this.costLedger.getBreakdown()
-        throw new SubAgentBudgetExceededError(
-          `[SubAgentBridge] Auto session budget exceeded. Requested $${requestedBudget.toFixed(4)}, ` +
-          `committed $${stats.committedCostUsd.toFixed(4)}, limit $${stats.budgetUsd.toFixed(4)}.`,
-          'session',
+    let admitted = false
+    try {
+      const outstandingTasks =
+        this.activeTaskIds.size + this.queuedStarts.size + this.admittingTaskIds.size
+      const maxOutstandingTasks = this.maxConcurrentSubAgents + this.maxQueuedSubAgents
+      if (!isInternal && outstandingTasks >= maxOutstandingTasks) {
+        throw new Error(
+          `[SubAgentBridge] Sub-agent queue is full ` +
+          `(${outstandingTasks}/${maxOutstandingTasks} outstanding; ` +
+          `${this.maxConcurrentSubAgents} running slots, ${this.maxQueuedSubAgents} queued slots). ` +
+          'Wait for queued tasks to start or raise META_AGENT_MAX_QUEUED_SUB_AGENTS.',
         )
       }
-      ledgerReserved = true
+
+      if (
+        !isInternal &&
+        this.maxTotalSubAgentBudgetUsd !== undefined &&
+        this.settledCostUsd + this.reservedBudgetUsd + requestedBudget > this.maxTotalSubAgentBudgetUsd
+      ) {
+        throw new SubAgentBudgetExceededError(
+          `[SubAgentBridge] Sub-agent budget exceeded. ` +
+          `Requested $${requestedBudget.toFixed(4)}, ` +
+          `reserved $${this.reservedBudgetUsd.toFixed(4)}, ` +
+          `settled $${this.settledCostUsd.toFixed(4)}, ` +
+          `limit $${this.maxTotalSubAgentBudgetUsd.toFixed(4)}.`,
+          'bridge',
+        )
+      }
+
+      if (this.costLedger) {
+        if (!this.costLedger.tryReserveTask(taskId, requestedBudget)) {
+          const stats = this.costLedger.getBreakdown()
+          throw new SubAgentBudgetExceededError(
+            `[SubAgentBridge] Auto session budget exceeded. Requested $${requestedBudget.toFixed(4)}, ` +
+            `committed $${stats.committedCostUsd.toFixed(4)}, limit $${stats.budgetUsd.toFixed(4)}.`,
+            'session',
+          )
+        }
+        ledgerReserved = true
+      }
+
+      // Claim the seat and the budget NOW, before the first await.
+      this.admittingTaskIds.add(taskId)
+      admitted = true
+      // Internal tasks bypass only the local normal-worker cap. They still use
+      // the shared auto-session ledger so verify/drift cannot spend unboundedly.
+      if (isInternal) this.internalTaskIds.add(taskId)
+      else this._reserveBudget(taskId, requestedBudget)
+    } catch (err) {
+      if (ledgerReserved) this.costLedger?.releaseTaskReservation(taskId)
+      throw err
     }
 
     // Explicit isolated-write requests fail closed. Silently falling back to
@@ -663,13 +729,16 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       if (isolatedWrite) {
         await this._worktreeCoordinator?.discard(taskId).catch(() => undefined)
       }
+      // Roll the synchronous admission back so a failed spawn does not leak a
+      // seat or a budget reservation for the rest of the session.
+      if (admitted) {
+        this.admittingTaskIds.delete(taskId)
+        this.internalTaskIds.delete(taskId)
+        this._releaseBudgetReservation(taskId)
+      }
       if (ledgerReserved) this.costLedger?.releaseTaskReservation(taskId)
       throw err
     }
-    // Internal tasks bypass only the local normal-worker cap. They still use
-    // the shared auto-session ledger so verify/drift cannot spend unboundedly.
-    if (isInternal) this.internalTaskIds.add(taskId)
-    else this._reserveBudget(taskId, requestedBudget)
 
     const abortController = new AbortController()
     // If parent is aborted, cancel this sub-agent.
@@ -693,7 +762,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       this._startPollTimer(taskId, config.pollIntervalMs, config.maxDurationMs)
     }
 
+    // The seat is now held by queuedStarts; hand it over in one synchronous
+    // step so the outstanding count never dips.
     this.queuedStarts.set(taskId, { record, abortController, onRuntimeEvent: opts.onRuntimeEvent })
+    this.admittingTaskIds.delete(taskId)
     // Internal safety-gate tasks jump the queue so a backlog of research/worker
     // tasks can't delay the gate; ordinary tasks keep FIFO order.
     if (isInternal) this.startQueue.unshift(taskId)
@@ -983,7 +1055,21 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     if (this.destroyed) return
     // Event and poll delivery are intentionally redundant; collapse duplicate
     // failure observations so one physical task can schedule at most one retry.
+    //
+    // H2-fix: claim the dedupe slot BEFORE the first await. The check used to
+    // sit above `await readTask(...)` while the claim sat below it, so the two
+    // redundant delivery paths could both pass the check inside that window and
+    // each dispatch a retry — two independent retry chains for one failure,
+    // doubling worktrees and budget.
+    //
+    // The slot is NOT released on a decision not to retry: a retry always gets a
+    // fresh taskId, so this physical task can never legitimately need the slot
+    // again, and releasing it would also clear the tombstones cancelTaskFamily /
+    // cancelAll deliberately plant here. Keeping it claimed additionally
+    // collapses the duplicate failure notification the redundant delivery paths
+    // used to enqueue twice.
     if (this.retryScheduledFor.has(taskId)) return
+    this.retryScheduledFor.add(taskId)
     const rec = await readTask(taskId).catch(() => null)
     const timeoutPhase = rec?.result?.diagnostics?.timeoutPhase
     const diagnosticSuffix = timeoutPhase ? ` | timeoutPhase=${timeoutPhase}` : ''
@@ -994,9 +1080,11 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       surfaceFailure()
       return
     }
+    // A dispose/cancelAll that landed while we were reading the record has
+    // already decided this family is finished; do not schedule new work.
+    if (this.destroyed) return
 
     const delay = retryBackoffMs(attempt)
-    this.retryScheduledFor.add(taskId)
     this._enqueueNotification(
       `[${taskId}] ↻ 失败，将在 ${Math.round(delay / 1000)}s 后第 ${attempt + 1}/${this._autoRetryLimit} 次重试 | ` +
       `原因: ${error.slice(0, 120)}${diagnosticSuffix}`,
@@ -1250,14 +1338,31 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     this.reservedBudgetUsd += amountUsd
   }
 
+  /** Undo a bridge-level budget reservation without recording any spend. */
+  private _releaseBudgetReservation(taskId: SubAgentTaskId): void {
+    const reserved = this.reservedBudgetByTask.get(taskId) ?? 0
+    if (reserved === 0) return
+    this.reservedBudgetUsd = Math.max(0, this.reservedBudgetUsd - reserved)
+    this.reservedBudgetByTask.delete(taskId)
+  }
+
+  /**
+   * Fold a finished task's actual cost into the bridge total and free its
+   * reservation. Idempotent per task — see the `settledTaskIds` field comment
+   * for why the duplicate call is currently harmless and why the gate is here
+   * anyway.
+   *
+   * Dropping the second call cannot lose cost: every interleaving that reaches
+   * this function twice for one task has both callers reading the same terminal
+   * on-disk record, because neither `_writeTerminal` nor cancelTask will
+   * overwrite an existing terminal state.
+   */
   private _settleBudget(taskId: SubAgentTaskId, actualCostUsd: number | undefined): void {
+    if (this.settledTaskIds.has(taskId)) return
+    this.settledTaskIds.add(taskId)
     const internal = this.internalTaskIds.delete(taskId)
     if (!internal) {
-      const reserved = this.reservedBudgetByTask.get(taskId) ?? 0
-      if (reserved > 0) {
-        this.reservedBudgetUsd = Math.max(0, this.reservedBudgetUsd - reserved)
-        this.reservedBudgetByTask.delete(taskId)
-      }
+      this._releaseBudgetReservation(taskId)
       if (actualCostUsd !== undefined && Number.isFinite(actualCostUsd) && actualCostUsd > 0) {
         this.settledCostUsd += actualCostUsd
       }

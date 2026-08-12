@@ -80,3 +80,56 @@ describe('ThinkingMeter', () => {
     expect(out).toEqual([])
   })
 })
+
+describe('ThinkingMeter status line stays one row', () => {
+  /**
+   * T6: hide() erases exactly one row with `\r\x1b[2K`. If the status line is
+   * wider than the terminal it wraps, and the wrapped remainder survives hide()
+   * as visible debris the caller's real output then writes around.
+   */
+  function narrow(columns: number) {
+    const out: string[] = []
+    const meter = new ThinkingMeter({
+      write: s => out.push(s),
+      now: () => 1000,
+      color: false,
+      enabled: true,
+      columns: () => columns,
+    })
+    return { meter, out }
+  }
+
+  /** Visible length: the rendered line minus the leading clear-line escape. */
+  const visibleLength = (line: string): number =>
+    line.replace('\r\x1b[2K', '').length
+
+  it('truncates the line to the terminal width', () => {
+    const { meter } = narrow(20)
+    meter.note('x'.repeat(100_000))   // drives a long "推理中 · ~N tokens" label
+    expect(visibleLength(meter.format())).toBeLessThanOrEqual(19)
+  })
+
+  it('leaves a short line untouched on a wide terminal', () => {
+    const { meter } = narrow(200)
+    const line = meter.format()
+    expect(line.startsWith('\r\x1b[2K')).toBe(true)
+    expect(line).toContain('等待模型响应…')
+  })
+
+  it('never emits a line that would wrap, at any width', () => {
+    for (const columns of [10, 24, 40, 80, 120]) {
+      const { meter } = narrow(columns)
+      meter.note('y'.repeat(50_000))
+      expect(visibleLength(meter.format())).toBeLessThan(columns)
+    }
+  })
+
+  it('format() is pure — it never writes', () => {
+    const { meter, out } = narrow(80)
+    meter.show()
+    const before = out.length
+    meter.format()
+    meter.format()
+    expect(out.length).toBe(before)
+  })
+})

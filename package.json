@@ -1,6 +1,6 @@
 {
   "name": "@meta-agent/runtime",
-  "version": "0.8.13",
+  "version": "0.8.16",
   "description": "Engineering agent runtime — async jobs, dimensional types, V&V hooks, pluggable tools",
   "type": "module",
   "main": "./dist/index.js",
@@ -12,7 +12,8 @@
     }
   },
   "bin": {
-    "meta-agent": "./dist/cli.mjs"
+    "meta-agent": "./dist/cli.mjs",
+    "meta-agent-glm": "./dist/cli-glm.mjs"
   },
   "files": [
     "dist",

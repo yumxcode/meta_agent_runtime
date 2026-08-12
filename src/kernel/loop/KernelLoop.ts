@@ -587,14 +587,26 @@ export function isAlternatingToolSignatures(history: readonly string[]): boolean
   return recent.every((sig, i) => sig === (i % 2 === 0 ? even : odd))
 }
 
-function stableStringify(value: unknown): string {
+/**
+ * Depth ceiling for stableStringify.
+ *
+ * L6: tool inputs are model-authored, so a pathological nesting depth would
+ * blow the stack inside the no-progress guard — killing a healthy session on a
+ * purely advisory computation. loop/expr/Expr.ts caps depth for the same
+ * reason; this mirrors it. Anything deeper collapses to a marker, which only
+ * ever makes two already-absurd inputs compare equal.
+ */
+const MAX_SIGNATURE_DEPTH = 64
+
+function stableStringify(value: unknown, depth = 0): string {
   if (value === null || typeof value !== 'object') {
     const encoded = JSON.stringify(value)
     return encoded === undefined ? String(value) : encoded
   }
-  if (Array.isArray(value)) return `[${value.map(stableStringify).join(',')}]`
+  if (depth >= MAX_SIGNATURE_DEPTH) return '"[max-depth]"'
+  if (Array.isArray(value)) return `[${value.map(item => stableStringify(item, depth + 1)).join(',')}]`
   const record = value as Record<string, unknown>
-  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableStringify(record[key])}`).join(',')}}`
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableStringify(record[key], depth + 1)}`).join(',')}}`
 }
 
 function errorNote(err: unknown): string {
@@ -639,7 +651,7 @@ export async function* runKernelLoop(
   let state: LoopState = initialLoopState(mutableMessages, config.model, ctx.autoCompactTracking)
   let totalUsage: TokenUsage = emptyUsage()
   let totalCost = ctx.cumulativeCostUsd
-  let allPermissionDenials: PermissionDenial[] = []
+  const allPermissionDenials: PermissionDenial[] = []
   let resultText = ''
   let lastToolRequestSignature = ''
   // Result signature of the most recent tool batch, and whether it differed
@@ -1381,12 +1393,22 @@ export async function* runKernelLoop(
               `没有可见文本，也没有工具调用。将注入提示并重试。`,
             sessionId,
           }
+          // Drop THIS attempt's empty assistant messages by identity, not by
+          // tail position.
+          //
+          // H3-fix: the tail-splice assumed `append(...assistantMessages)` was
+          // the last thing to touch the array, but the post_query phase hook
+          // runs in between and may append its own injected meta messages. With
+          // a hook configured, the splice deleted those injections (and left
+          // part of the empty assistant turn behind), so the recovery corrupted
+          // history exactly in the situation it exists to repair.
           if (assistantMessages.length > 0) {
-            mutableMessages.splice(
-              Math.max(0, mutableMessages.length - assistantMessages.length),
-              assistantMessages.length,
-            )
-            state = { ...state, messages: mutableMessages }
+            const dropUuids = new Set(assistantMessages.map(msg => msg.uuid))
+            const kept = mutableMessages.filter(msg => !dropUuids.has(msg.uuid))
+            if (kept.length !== mutableMessages.length) {
+              mutableMessages.splice(0, mutableMessages.length, ...kept)
+              state = { ...state, messages: mutableMessages }
+            }
           }
           append(makeTextUserMessage(buildEmptyResponseRecoveryText(), { isMeta: true }))
           state = { ...state, emptyResponseRecoveryCount: attempt }

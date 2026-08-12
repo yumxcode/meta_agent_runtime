@@ -211,12 +211,6 @@ export async function* streamMessages(
   const modelAdmission = await acquireRegisteredModelCall(params.sessionId, params.abortSignal)
   const activeAbortSignal = modelAdmission?.signal ?? params.abortSignal
 
-  // Open debug file once (outside retry loop — one file per logical call)
-  const writer = await DebugWriter.open(params.sessionId, params.model, config.debug)
-  if (writer) {
-    await writer.writeRequest(requestParams as unknown as Record<string, unknown>)
-  }
-
   let attempt = 0
   // True once any stream event has been yielded to the caller. After that
   // point a retry would REPLAY the whole response from the start — the caller
@@ -226,7 +220,20 @@ export async function* streamMessages(
   // KernelLoop's stream-error recovery, which injects the error into the
   // conversation and retries the turn without replaying UI output.
   let yieldedAny = false
+  // M2-fix: `writer` is declared here but OPENED inside the try below.
+  // DebugWriter.open() and its first write() both touch the filesystem, and
+  // they used to sit between the admission acquire and the try/finally that
+  // releases it — so an ENOSPC/EACCES there stranded the host-wide model-call
+  // lease (plus its heartbeat interval) for the process lifetime and leaked two
+  // file handles. Everything after the acquire now lives under the finally.
+  let writer: DebugWriter | null = null
   try {
+    // Open debug file once (outside retry loop — one file per logical call)
+    writer = await DebugWriter.open(params.sessionId, params.model, config.debug)
+    if (writer) {
+      await writer.writeRequest(requestParams as unknown as Record<string, unknown>)
+    }
+
     while (true) {
       // Per-ATTEMPT controller so the watchdog can abort THIS request without
       // tearing down the caller's signal (which must stay usable for retries).

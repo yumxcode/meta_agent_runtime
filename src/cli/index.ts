@@ -37,7 +37,7 @@
  */
 
 import { mkdirSync } from 'node:fs'
-import { red, yellow, terminalText } from './term.js'
+import { red, yellow, terminalText, installBrokenPipeGuards } from './term.js'
 import { parseCliArgs } from './args.js'
 import { sanitizeEnvKeys, assertApiKeyConfigured } from './keys.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
@@ -48,6 +48,9 @@ import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
 
 async function main(): Promise<void> {
+  // Before anything writes: make `| head` / `| less`-and-quit a clean exit
+  // rather than `Fatal: write EPIPE`.
+  installBrokenPipeGuards()
   // Sanitize env-var API keys once so detectProvider() receives clean values
   sanitizeEnvKeys()
   const opts = parseCliArgs()

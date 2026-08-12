@@ -220,11 +220,22 @@ function runProcessGroup(
     if (opts.signal.aborted) onAbort()
     else opts.signal.addEventListener('abort', onAbort, { once: true })
 
+    // L4: cap each stream at captureLimit EXACTLY rather than "stop once the
+    // limit is already exceeded". The previous check ran before the append, so
+    // one chunk could overshoot by a whole pipe buffer (~64 KB) — negligible at
+    // the default limit, but a large multiple of a small
+    // META_AGENT_MAX_TOOL_OUTPUT_CHARS. Decoding continues past the cap (it is
+    // cheap and keeps the decoder's multi-byte state consistent), only the
+    // retained text is bounded.
     child.stdout?.on('data', (chunk: Buffer) => {
-      if (stdout.length < opts.captureLimit) stdout += outDecoder.write(chunk)
+      const text = outDecoder.write(chunk)
+      if (!text || stdout.length >= opts.captureLimit) return
+      stdout += text.slice(0, opts.captureLimit - stdout.length)
     })
     child.stderr?.on('data', (chunk: Buffer) => {
-      if (stderr.length < opts.captureLimit) stderr += errDecoder.write(chunk)
+      const text = errDecoder.write(chunk)
+      if (!text || stderr.length >= opts.captureLimit) return
+      stderr += text.slice(0, opts.captureLimit - stderr.length)
     })
 
     const finish = (fn: () => void): void => {
@@ -239,8 +250,14 @@ function runProcessGroup(
     child.on('close', (code) =>
       finish(() => {
         // Flush any bytes the decoders held back at a chunk boundary.
-        if (stdout.length < opts.captureLimit) stdout += outDecoder.end()
-        if (stderr.length < opts.captureLimit) stderr += errDecoder.end()
+        const outTail = outDecoder.end()
+        const errTail = errDecoder.end()
+        if (outTail && stdout.length < opts.captureLimit) {
+          stdout += outTail.slice(0, opts.captureLimit - stdout.length)
+        }
+        if (errTail && stderr.length < opts.captureLimit) {
+          stderr += errTail.slice(0, opts.captureLimit - stderr.length)
+        }
         resolve({ stdout, stderr, code, timedOut, aborted })
       }),
     )
