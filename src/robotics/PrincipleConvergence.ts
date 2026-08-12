@@ -2,7 +2,7 @@
  * PrincipleConvergence — recognition-before-generation pipeline run when an
  * experience is committed (inside /experience review).
  *
- * Order of operations (see docs/principle-mechanism-improvement.md §3.1):
+ * Order of operations (see docs/知识系统/原则机制改进方案.md §3.1):
  *   1. CLAIM     — does an existing committed principle cover this experience?
  *                  If so, link it (appendPrincipleReference) and fold the
  *                  experience's outcome back as an observation/contradiction.

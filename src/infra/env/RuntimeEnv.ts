@@ -284,7 +284,7 @@ export interface EnvVarDoc {
  * Timeout vars are resolved by core/timeouts.ts, NOT by the accessors in this
  * file: each is overridable by the config file's `timeouts` section, which
  * takes PRECEDENCE over the env var. They are registered here so `--help` and
- * docs/config-reference.md stay complete — META_AGENT_MCP_TIMEOUT_MS in
+ * docs/参考手册/配置参考.md stay complete — META_AGENT_MCP_TIMEOUT_MS in
  * particular used to be read by a private helper and appeared in neither.
  */
 export const ENV_REGISTRY: readonly EnvVarDoc[] = [

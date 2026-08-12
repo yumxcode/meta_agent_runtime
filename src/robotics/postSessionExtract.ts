@@ -15,7 +15,7 @@
  *
  * experience ↔ anchor are extracted INDEPENDENTLY here — no cross-links. The
  * bilateral relationship (claim/propagation) is deferred (see
- * docs/anchor-integration-plan.md).
+ * docs/知识系统/物理锚点接入方案.md).
  */
 
 import type { FlashClient } from '../core/flash/FlashClient.js'

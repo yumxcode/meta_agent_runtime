@@ -17,7 +17,7 @@
   },
   "files": [
     "dist",
-    "docs/auto-scheduler.md",
+    "docs/自动模式/自动调度器.md",
     "!dist/**/__tests__/**",
     "!dist/**/__tests__"
   ],

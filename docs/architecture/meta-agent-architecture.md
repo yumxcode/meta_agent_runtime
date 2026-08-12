@@ -91,7 +91,7 @@ kernel/ ← modes/ ← core/ ← robotics/
 ```
 S1  identity_definition         身份定义：Meta-Agent 工程 AI + 能力边界
 S2  system_rules                工具权限模型、溯源 ID 格式、session 规范
-S3  task_execution_rules        工程假设声明、超范围 flag（campaign/agentic 专属规则已移出）
+S3  task_execution_rules        执行纪律（读前改、先诊断、全局视角修 bug）、工程假设声明、超范围 flag
 S5  vv_response_protocol        V&V 响应规范：PRE/POST-CALL ABORT + WARNING 处理
 S6  doe_campaign_knowledge      DOE/Campaign 领域知识：L0/L1/L2、Pareto、escalation
 ```
@@ -390,8 +390,8 @@ const session = new RoboticsSession({
 | 文档 | 状态 | 说明 |
 |------|------|------|
 | `docs/architecture/meta-agent-architecture.md`（本文） | ✅ 当前 | As-built 总参考 |
-| `docs/workflow-system-design.md` | ✅ 当前 | Workflow + AGENT.md 加载机制（as-built） |
-| `docs/permissions.md` | ✅ 有效 | 工具权限声明规范 |
-| `docs/robotics-mode-design.md` | 📦 归档 | v1 设计草稿 + 设计 vs 实现差异说明 |
-| `docs/robotics-mode-design-v2.md` | 📦 归档 | v2 设计草稿 + 设计 vs 实现差异说明 |
-| `docs/prompt-optimization-plan.md` | 📦 归档 | Prompt 演进记录（各轮优化 + 未实现项） |
+| `docs/工作流/工作流系统设计.md` | ✅ 当前 | Workflow + AGENT.md 加载机制（as-built） |
+| `docs/参考手册/权限配置.md` | ✅ 有效 | 工具权限声明规范 |
+| `docs/机器人模式/机器人模式设计-v1-已归档.md` | 📦 归档 | v1 设计草稿 + 设计 vs 实现差异说明 |
+| `docs/机器人模式/机器人模式设计-v2-已归档.md` | 📦 归档 | v2 设计草稿 + 设计 vs 实现差异说明 |
+| `docs/参考手册/提示词演进记录.md` | 📦 归档 | Prompt 演进记录（各轮优化 + 未实现项） |

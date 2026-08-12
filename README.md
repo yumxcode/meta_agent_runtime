@@ -166,7 +166,7 @@ meta-agent --resume last "继续"
 meta-agent --json "检查项目结构"
 ```
 
-`auto` 中的 `self_timer` 是持久化 park，不是让 Agent 进程内 `sleep`：CLI 先保存完整会话与 checkpoint，再写 wake。默认命令随后退出，由 `auto-scheduler` 到期恢复同一 session/goal；加 `--attached` 时，原 CLI 只保留轻量宿主并续租 wake，到期后在原窗口恢复输出。`simple_auto` 不暴露该工具。机制与部署说明见 [Auto Scheduler](docs/auto-scheduler.md)。
+`auto` 中的 `self_timer` 是持久化 park，不是让 Agent 进程内 `sleep`：CLI 先保存完整会话与 checkpoint，再写 wake。默认命令随后退出，由 `auto-scheduler` 到期恢复同一 session/goal；加 `--attached` 时，原 CLI 只保留轻量宿主并续租 wake，到期后在原窗口恢复输出。`simple_auto` 不暴露该工具。机制与部署说明见 [Auto Scheduler](docs/自动模式/自动调度器.md)。
 
 Attached 模式下，等待阶段按 `Ctrl+C` 仅解除附着并保留 wake；Agent 正在执行时按 `Ctrl+C` 则表示放弃当前 Auto 会话，会取消该 session 的全部 wake，后续命令将创建新会话。已经写入工作区的文件修改不会自动回滚。
 
@@ -231,7 +231,7 @@ Lane 负责连续会话、串行化和写路径所有权。`workspace.read` 声�
 
 `loop intake` 是可选的前置步骤。有些拒绝 Compiler 修不好——「最多 20 个有效候选轮次」没给出与 Activation 的换算关系、完成标准没写死、首轮要读的文件在项目里并不存在——缺的信息从来就不在系统里，却要等到多轮编译之后才由 Reviewer 发现。Intake 把这些缺口提前问出来：探针题库由阻断枚举反查而非开放访谈，先机械预检（查文件、查 PATH、比对已注册能力）再只问真正查不出的部分，产出人已逐条确认的 Constraint Ledger（`loop.intake.json`）。其中最有价值的是 `kind` 的确认——它机械决定约束在 Graph、Agent、独立 Reviewer 还是人那里被执行。需求文件一改，记录按 sha 自动失效；`distill` 自动拾取匹配的记录，`--no-intake` 强制走原路径。带 Intake 时 Architect 从抽取者变为校验者：可以追加它在项目里发现的新约束，但不得改动人已确认条目的 statement/kind/strength（宿主逐字节校验）。
 
-语义复核按“可观测优先于可阻断”收敛：宿主持有跨轮 verdict 台账，证据区域未变的约束不再重新裁决（指纹并入 `/limits`、`/concurrency` 与相关 Lane，任何不确定都倒向重审）；Reviewer 必须为本轮范围内每条 hard constraint 给出一行裁决，缺行整份作废，`satisfied` 必须给出真实可解析的 JSON pointer——这消除了“没提等于没问题”的歧义，也是“每轮报的问题都不一样”的机制来源。终态可达性下沉为确定性 lint（`terminal-unreachable`，忽略 `when` 取可达性上界，零假阳性）；`unbounded-or-unreachable-control` 等三类控制流阻断必须附带宿主可机械核对的反例（State 赋值 + 首尾相接的 Transition id 序列），给不出的自动降级为建议级 `unwitnessed-control-flow`。`loop distill` 结尾打印本轮收敛统计（沿用数、out-of-scope 放行数、降级数），其中「既被判为 out_of_scope 又被棘轮沿用」是这套取舍唯一的盲区，非零时直接给出人工复核警告。设计与取舍依据见 [Distill Intake 与语义复核收敛方案](docs/distill-intake-and-review-convergence-2026-07-31.md)。
+语义复核按“可观测优先于可阻断”收敛：宿主持有跨轮 verdict 台账，证据区域未变的约束不再重新裁决（指纹并入 `/limits`、`/concurrency` 与相关 Lane，任何不确定都倒向重审）；Reviewer 必须为本轮范围内每条 hard constraint 给出一行裁决，缺行整份作废，`satisfied` 必须给出真实可解析的 JSON pointer——这消除了“没提等于没问题”的歧义，也是“每轮报的问题都不一样”的机制来源。终态可达性下沉为确定性 lint（`terminal-unreachable`，忽略 `when` 取可达性上界，零假阳性）；`unbounded-or-unreachable-control` 等三类控制流阻断必须附带宿主可机械核对的反例（State 赋值 + 首尾相接的 Transition id 序列），给不出的自动降级为建议级 `unwitnessed-control-flow`。`loop distill` 结尾打印本轮收敛统计（沿用数、out-of-scope 放行数、降级数），其中「既被判为 out_of_scope 又被棘轮沿用」是这套取舍唯一的盲区，非零时直接给出人工复核警告。设计与取舍依据见 [Distill Intake 与语义复核收敛方案](docs/图循环/Distill接入与复核收敛方案-2026-07-31.md)。
 
 **路由是有序决策列表。** 同一个 `(from, on)` 下的条件边按**数组声明顺序 first-match**：第一条 `when` 成立的边被选中，都不成立才走唯一的 `default`。因此分支之间**不需要互斥**，也不需要 `priority`（它只用于覆盖数组顺序）。这一条不是风格偏好：早先校验器要求每条条件边有唯一 priority、运行时按 id 字母序决胜，等于逼模型把所有分支塞进一根数轴——包括永不同时成立的分支。在一张实测的图上，18 条条件边产生了 76 对必须人工保证的互斥义务，其中 **66 对（87%）的两条边根本不可能同时为真**，而全部路由失败都是这些数字排错导致的。改为声明顺序后，同一份决策的互斥义务降到 0，平均合取项从 3.6 降到 1.0。
 
@@ -254,9 +254,9 @@ meta-agent -w /path/to/workspace loop files <instanceId>
 meta-agent -w /path/to/workspace loop disk <instanceId>
 ```
 
-完整命令和 GraphSpec 示例见 [Loop 使用指南](docs/loop-runtime-guide.md)；执行边界见 [`graph_agent` 执行底座](docs/graph-agent-executor.md)；架构与可靠性边界见 [Durable Graph v2 设计](docs/loop-durable-graph-runtime-plan.md)。领域扩展通过 Capability Pack 提供版本化 Function、Reducer、Effect 和 advisory Scenario guidance。
+完整命令和 GraphSpec 示例见 [Loop 使用指南](docs/图循环/图循环使用指南.md)；执行边界见 [`graph_agent` 执行底座](docs/图循环/图代理执行底座.md)；架构与可靠性边界见 [Durable Graph v2 设计](docs/图循环/持久化图循环设计-v2.md)。领域扩展通过 Capability Pack 提供版本化 Function、Reducer、Effect 和 advisory Scenario guidance。
 
-可选的通用 GitHub Actions Pack 保持默认 Effect Registry 为空，只在显式加载时提供“按 workflow + head SHA 精确解析 Run”和“按 run ID 等待完成”两个观察能力；它不包含项目发布、Artifact 解释或领域指标语义。配置与边界见 [Graph Loop Support Packs](docs/graph-loop-support-packs.md#optional-github-actions-pack)。
+可选的通用 GitHub Actions Pack 保持默认 Effect Registry 为空，只在显式加载时提供“按 workflow + head SHA 精确解析 Run”和“按 run ID 等待完成”两个观察能力；它不包含项目发布、Artifact 解释或领域指标语义。配置与边界见 [Graph Loop Support Packs](docs/图循环/支持包-证据与外部契约.md#optional-github-actions-pack)。
 
 ---
 

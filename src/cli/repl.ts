@@ -1487,7 +1487,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
               const store = new ExperienceStore()
               // v1: commit only. Principle promotion / anchor claim / propagation
               // are deferred (code retained, not wired) — see
-              // docs/knowledge-v1-experience-anchor.md.
+              // docs/知识系统/知识系统v1-经验与锚点.md.
               await reviewPendingExperiences(rl, pending, store)
             }
           } else {
