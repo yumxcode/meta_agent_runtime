@@ -6,6 +6,11 @@ import type { AutoResumeOutcome } from './AutoScheduler.js'
 
 export interface AttachedAutoResumeResult {
   outcome: AutoResumeOutcome
+  /**
+   * Why a fence rejected the wake. Logged verbatim on `cancelled`, which is
+   * terminal — without it the line is indistinguishable from a normal finish.
+   */
+  reason?: string
   /** A later self_timer wake, already atomically leased to this host. */
   next?: AutoContinuationRecord
 }
@@ -131,7 +136,11 @@ export class AttachedAutoScheduler {
         const released = await this.store.release(current.wakeId, token, result.outcome)
         if (!released) throw new Error(`Attached wake claim lost: ${current.wakeId}`)
         this.options.onEvent?.(
-          `[auto-attached] ${result.outcome} ${current.sessionId} (${current.wakeId})`,
+          `[auto-attached] ${result.outcome} ${current.sessionId} (${current.wakeId})` +
+          (result.outcome === 'cancelled'
+            ? ` — ${result.reason ?? 'no reason given'}; the turn did NOT run. ` +
+              `Resume manually with: meta-agent --mode auto --resume ${current.sessionId} "继续"`
+            : ''),
         )
         if (result.outcome !== 'done' || !result.next) return 'completed'
         record = result.next

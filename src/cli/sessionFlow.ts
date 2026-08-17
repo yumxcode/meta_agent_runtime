@@ -128,6 +128,38 @@ export async function persistSessionSnapshot({
   }
 }
 
+/**
+ * The wake fence value for a park: how many messages a FRESH resume will see.
+ *
+ * MUST be read back through `loadHistory`, never taken from
+ * `router.getMessages().length`. The write→read round trip is deliberately
+ * lossy, and the fence in `resumeAutoContinuation` is an EXACT equality test,
+ * so any in-memory message that does not survive the trip silently kills the
+ * next wake:
+ *
+ *   - the compact boundary marker has `content: []` and is dropped by
+ *     `serializeMessages` — so EVERY park in a turn that compacted armed a wake
+ *     that was guaranteed to be cancelled on resume (this is not a race; it is
+ *     deterministic, and it cost a 40-minute unattended GPU run);
+ *   - a thinking-only assistant message becomes empty once thinking blocks are
+ *     stripped for storage, and is dropped the same way;
+ *   - `trimToSafeResumeBoundary` drops leading orphan tool_results at LOAD time.
+ *
+ * Reading back closes all three at once, and any future lossy step as well,
+ * because the fence is now defined by the exact code path that later checks it.
+ * Parking is rare (once per wake), so the extra read costs nothing.
+ */
+export async function persistedResumeMessageCount(
+  sessionId: string,
+  sessionRoot?: string,
+): Promise<number> {
+  const history = await SessionStore.loadHistory(
+    sessionId,
+    sessionRoot ? { rootDir: sessionRoot } : {},
+  )
+  return history.length
+}
+
 /** How many times arming re-checks the checkpoint while a sub-agent is still busy. */
 const ARM_BUSY_RETRIES = 6
 const ARM_BUSY_RETRY_MS = 500

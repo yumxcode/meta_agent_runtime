@@ -40,6 +40,7 @@ import { makeRouter } from './router.js'
 import { streamPrompt, getCliMaxVisibleChars, type SteerHooks } from './stream.js'
 import {
   sessionDisplayTitle, runSessionPicker, persistSessionSnapshot, armAutoContinuation,
+  persistedResumeMessageCount,
 } from './sessionFlow.js'
 import { streamExperienceSummary, generateSessionTitle } from './sideCalls.js'
 import { formatAge } from './transcript.js'
@@ -1710,12 +1711,19 @@ export async function runRepl(opts: CliOptions): Promise<void> {
         )
       }
       const parkedSessionId = router.getSessionId()
+      // Read the count back through loadHistory: the fence at resume time uses
+      // that path, and the write→read trip drops messages (compact boundary,
+      // thinking-only) that are still present in `savedMessageCount`.
+      const fencedHistoryCount = await persistedResumeMessageCount(
+        parkedSessionId,
+        opts.sessionDir,
+      )
       await router.dispose().catch(() => undefined)
       const record = await armAutoContinuation({
         sessionId: parkedSessionId,
         opts,
         result: turnStream.result,
-        historyMessageCount: savedMessageCount,
+        historyMessageCount: fencedHistoryCount,
       })
       if (!opts.json) {
         console.log(

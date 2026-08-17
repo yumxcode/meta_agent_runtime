@@ -30,7 +30,11 @@ import { bold, cyan, dim, gray, green, red, yellow, isTTY, terminalText, safeStd
 import { makeRouter } from './router.js'
 import { streamPrompt, type SteerHooks } from './stream.js'
 import { createAttachedSteerHooks } from './attachedSteer.js'
-import { persistSessionSnapshot, armAutoContinuation } from './sessionFlow.js'
+import {
+  persistSessionSnapshot,
+  armAutoContinuation,
+  persistedResumeMessageCount,
+} from './sessionFlow.js'
 import { generateSessionTitle } from './sideCalls.js'
 import { ensureMcpServerInstructions } from './mcpInstructions.js'
 import { assertApiKeyConfigured } from './keys.js'
@@ -245,8 +249,24 @@ export async function runSingleTurn(
             `${expectedMessageCount} messages were confirmed persisted. Wake was not armed.`,
           )
         } else {
-          parkedHistoryCount = savedMessageCount
-          parkedSessionId = router.getSessionId()
+          // Fence on what a fresh resume will actually LOAD, not on what we
+          // hold in memory — see persistedResumeMessageCount. Both counts are
+          // in-memory above; only this read back proves the durable transcript
+          // and the fence agree.
+          const sessionId = router.getSessionId()
+          try {
+            parkedHistoryCount = await persistedResumeMessageCount(sessionId, opts.sessionDir)
+            parkedSessionId = sessionId
+          } catch (error) {
+            // Refuse to arm rather than arm a wake we cannot fence. A wrong
+            // fence is worse: it resumes into a silent `cancelled` an hour
+            // later, with nothing in the log that looks like a failure.
+            parkPersistenceError = new Error(
+              `Auto session requested a durable park, but its persisted history could not ` +
+              `be read back to fence the wake: ` +
+              `${error instanceof Error ? error.message : String(error)}. Wake was not armed.`,
+            )
+          }
         }
       }
     }
@@ -277,6 +297,13 @@ export async function runSingleTurn(
   }
 }
 
+interface AutoResumeResult {
+  outcome: 'done' | 'cancelled'
+  /** Why a fence rejected the wake. Always set when outcome is 'cancelled'. */
+  reason?: string
+  next?: AutoContinuationRecord
+}
+
 async function resumeAutoContinuation(
   opts: CliOptions,
   projectDir: string,
@@ -284,27 +311,49 @@ async function resumeAutoContinuation(
   signal: AbortSignal,
   claimOwner?: string,
   steerHooks?: SteerHooks,
-): Promise<{ outcome: 'done' | 'cancelled'; next?: AutoContinuationRecord }> {
+): Promise<AutoResumeResult> {
   const storeOptions = record.runtime?.sessionDir
     ? { rootDir: record.runtime.sessionDir }
     : undefined
   const meta = await SessionStore.getSession(record.sessionId, storeOptions)
-  if (
-    !meta ||
-    meta.mode !== 'auto' ||
-    (meta.workspace && resolve(meta.workspace) !== projectDir)
-  ) {
-    return { outcome: 'cancelled' }
+  // Every fence below returns a REASON. A bare `cancelled` renders in the log
+  // exactly like a successful `done`, so a wrongly-rejected wake looked like a
+  // clean finish and the scheduler's subsequent idle exit looked correct.
+  if (!meta) {
+    return { outcome: 'cancelled', reason: 'session metadata is gone from the index' }
+  }
+  if (meta.mode !== 'auto') {
+    return { outcome: 'cancelled', reason: `session mode is "${meta.mode}", not auto` }
+  }
+  if (meta.workspace && resolve(meta.workspace) !== projectDir) {
+    return {
+      outcome: 'cancelled',
+      reason: `session workspace ${resolve(meta.workspace)} != scheduler workspace ${projectDir}`,
+    }
   }
   const history = await SessionStore.loadHistory(record.sessionId, storeOptions)
   // Exact history count is the session-generation fence. Any manual resume
   // after this wake was armed makes the old timer stale, even if the goal
   // string happens to be unchanged.
-  if (history.length !== record.historyMessageCount) return { outcome: 'cancelled' }
+  //
+  // The count MUST come from the same loadHistory path at arm time
+  // (persistedResumeMessageCount); comparing against an in-memory count made
+  // this fence reject wakes it was never meant to touch.
+  if (history.length !== record.historyMessageCount) {
+    return {
+      outcome: 'cancelled',
+      reason:
+        `history moved on: loaded ${history.length} messages, wake was armed at ` +
+        `${record.historyMessageCount}`,
+    }
+  }
 
   const cp = readAutoCheckpoint(projectDir, record.sessionId)
-  if (!cp || (record.goal !== undefined && cp.goal !== record.goal)) {
-    return { outcome: 'cancelled' }
+  if (!cp) {
+    return { outcome: 'cancelled', reason: 'auto checkpoint is missing' }
+  }
+  if (record.goal !== undefined && cp.goal !== record.goal) {
+    return { outcome: 'cancelled', reason: 'top-level goal changed since the wake was armed' }
   }
 
   const resumedOpts: CliOptions = {
@@ -408,18 +457,31 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
   process.once('SIGINT', stop)
   process.once('SIGTERM', stop)
 
+  const emit = (message: string): void => {
+    if (opts.json) console.log(JSON.stringify({ type: 'auto_scheduler', message }))
+    else process.stderr.write(`${message}\n`)
+  }
+
   const scheduler = new AutoScheduler(
     store,
-    async (record, signal) =>
-      (await resumeAutoContinuation(opts, projectDir, record, signal)).outcome,
+    async (record, signal) => {
+      const resumed = await resumeAutoContinuation(opts, projectDir, record, signal)
+      // `cancelled` is TERMINAL — the session is dead after this line. Say why,
+      // or the only trace left is a log line shaped exactly like success.
+      if (resumed.outcome === 'cancelled') {
+        emit(
+          `[auto-scheduler] fence rejected ${record.sessionId} (${record.wakeId}) — ` +
+          `${resumed.reason ?? 'no reason given'}. The turn did NOT run; this wake is dead. ` +
+          `Resume manually with: meta-agent --mode auto --resume ${record.sessionId} "继续"`,
+        )
+      }
+      return resumed.outcome
+    },
     {
       pollIntervalMs,
       maxConcurrent,
       idleExitMs,
-      onEvent: message => {
-        if (opts.json) console.log(JSON.stringify({ type: 'auto_scheduler', message }))
-        else process.stderr.write(`${message}\n`)
-      },
+      onEvent: emit,
     },
   )
 
