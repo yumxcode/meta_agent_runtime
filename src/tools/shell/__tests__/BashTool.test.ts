@@ -65,12 +65,37 @@ describe('bash tool — regression fixes (H4 / H5)', () => {
     process.env['ANTHROPIC_API_KEY'] = 'sk-anthropic-secret'
     try {
       const tool = await createBashTool({ envPolicy: 'inherit' })
+      // Assert the child RECEIVED the variable without printing its value.
+      //
+      // Env policy and output redaction are independent controls: 'inherit'
+      // decides what the child process can see, redaction decides what enters
+      // the model's context. Redaction applies to every command regardless of
+      // env policy — so echoing the raw key here would (correctly) come back
+      // as [REDACTED] and tell us nothing about whether the child got it.
+      const result = await tool.call(
+        { command: 'test -n "$ANTHROPIC_API_KEY" && echo PRESENT || echo ABSENT', cwd: dir },
+        makeCtx(dir),
+      )
+      expect(result.isError).toBe(false)
+      expect(String(result.content)).toContain('PRESENT')
+    } finally {
+      if (prev === undefined) delete process.env['ANTHROPIC_API_KEY']
+      else process.env['ANTHROPIC_API_KEY'] = prev
+    }
+  })
+
+  it('redacts a secret from output even under the inherit env policy', async () => {
+    const dir = await mkdtemp(join(tmpdir(), 'bash-test-'))
+    const prev = process.env['ANTHROPIC_API_KEY']
+    process.env['ANTHROPIC_API_KEY'] = 'sk-anthropic-secret'
+    try {
+      const tool = await createBashTool({ envPolicy: 'inherit' })
       const result = await tool.call(
         { command: 'echo "AK=$ANTHROPIC_API_KEY"', cwd: dir },
         makeCtx(dir),
       )
-      expect(result.isError).toBe(false)
-      expect(String(result.content)).toContain('sk-anthropic-secret')
+      expect(String(result.content)).not.toContain('sk-anthropic-secret')
+      expect(String(result.content)).toContain('[REDACTED]')
     } finally {
       if (prev === undefined) delete process.env['ANTHROPIC_API_KEY']
       else process.env['ANTHROPIC_API_KEY'] = prev

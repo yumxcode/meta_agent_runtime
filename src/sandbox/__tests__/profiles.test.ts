@@ -29,7 +29,9 @@ describe('sandbox profiles', () => {
       readonlyWorkspace: true,
       writeAllowPaths: [artifactRoot],
     }, workspaceRoot)
-    expect(bwrapArgs).toEqual(expect.arrayContaining(['--bind', artifactRoot, artifactRoot]))
+    // `--bind-try`: a missing bind source aborts the entire bwrap invocation, so
+    // one stale entry in sandbox.writeAllowPaths would break every shell call.
+    expect(bwrapArgs).toEqual(expect.arrayContaining(['--bind-try', artifactRoot, artifactRoot]))
   })
 
   it('carves writeDenyPaths out of a writable workspace', () => {

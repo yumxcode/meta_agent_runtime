@@ -37,6 +37,21 @@ export interface PermissionPolicyOptions {
    * runner can enable it process-wide without threading the flag everywhere.
    */
   ignoreUserConfig?: boolean
+  /**
+   * Absolute host paths OUTSIDE the workspace that the operator granted via
+   * config.json `sandbox.writeAllowPaths` / `sandbox.readAllowPaths`.
+   *
+   * The jail widens by exactly these roots, so a granted directory is usable as
+   * a bash `cwd`, may appear as an absolute path in a command, and may be passed
+   * in a tool's path fields. Without this the OS sandbox would allow the access
+   * while the jail denied it first — the config setting would appear to do
+   * nothing.
+   *
+   * Resolved by the routing layer (`resolveSandboxPolicy().allowedRoots`) rather
+   * than read here, so the kernel keeps no dependency on the config service and
+   * tests can inject grants directly. When omitted, only the workspace is legal.
+   */
+  externalAllowedRoots?: readonly string[]
 }
 
 export interface PermissionConfig {
@@ -52,6 +67,17 @@ export interface ToolPermissionOverride extends ToolPermissionDeclaration {
   enabled?: boolean
 }
 
+/**
+ * Fallback declarations for tools that ship without their own `permission`
+ * block. A tool's own declaration and then permissions.json override these.
+ *
+ * `commandField` is what subscribes a tool to the command-level guards (see
+ * ToolPermissionDeclaration.commandField) — it must be present on EVERY tool
+ * that hands model-supplied text to a shell. `cron_create` is listed here as a
+ * belt-and-braces backstop: the tool declares its own permission block now, but
+ * this entry means that even if a future refactor drops the declaration, the
+ * command scan still fires.
+ */
 const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   read_file: { category: 'read', pathFields: ['file_path'], requiresWorkspace: true, planMode: 'allow' },
   // write_file / edit_file: NOT sensitive — writes inside the workspace
@@ -65,8 +91,9 @@ const DEFAULT_TOOL_PERMISSIONS: Record<string, ToolPermissionDeclaration> = {
   notebook_edit: { category: 'write', pathFields: ['notebook_path'], requiresWorkspace: true, sensitive: true, planMode: 'ask' },
   glob: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
   grep: { category: 'read', pathFields: ['path'], requiresWorkspace: true, planMode: 'allow' },
-  bash: { category: 'execute', cwdField: 'cwd', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
-  powershell: { category: 'execute', cwdField: 'cwd', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+  bash: { category: 'execute', cwdField: 'cwd', commandField: 'command', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+  powershell: { category: 'execute', cwdField: 'cwd', commandField: 'command', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
+  cron_create: { category: 'execute', commandField: 'command', requiresWorkspace: true, sensitive: true, planMode: 'ask' },
   web_fetch: { category: 'network', planMode: 'allow' },
 }
 
@@ -228,23 +255,49 @@ function isAllowedDevicePath(candidate: string): boolean {
   return ALLOWED_DEV_PATHS.has(path) || ALLOWED_DEV_PATTERN.test(path)
 }
 
+/**
+ * Is `candidate` inside the workspace, or inside one of the external roots the
+ * OPERATOR granted via config.json `sandbox.writeAllowPaths` /
+ * `sandbox.readAllowPaths`?
+ *
+ * The two lists have to agree. The OS sandbox may happily allow a command to
+ * touch `/data/shared`, but if this jail still says "outside workspace" the
+ * call is denied long before the sandbox is consulted — so an operator who
+ * granted the path would see it silently not work. Threading the grants through
+ * here is what makes the config setting actually take effect.
+ *
+ * Grants use the same segment-wise containment as the workspace itself, so
+ * granting `/data/shared` does not also grant `/data/shared-backup`.
+ */
+function isInsideGrantedScope(
+  candidate: string,
+  workspaceRoot: string,
+  allowedRoots: readonly string[],
+): boolean {
+  if (isInsideWorkspace(candidate, workspaceRoot)) return true
+  return allowedRoots.some(root => isInsideWorkspace(candidate, root))
+}
+
 function findWorkspaceViolation(
   tool: KernelTool,
   input: Record<string, unknown>,
   workspaceRoot: string,
   permission: ToolPermissionOverride,
   allowTmp: boolean,
+  allowedRoots: readonly string[],
 ): string | null {
   const toolName = tool.name
   if (permission.cwdField) {
     const cwd = input[permission.cwdField]
-    if (typeof cwd === 'string' && cwd && !isInsideWorkspace(cwd, workspaceRoot)) {
+    if (typeof cwd === 'string' && cwd && !isInsideGrantedScope(cwd, workspaceRoot, allowedRoots)) {
       return `${toolName}.${permission.cwdField} is outside workspace: ${cwd}`
     }
   }
 
-  if (toolName === 'bash' || toolName === 'powershell') {
-    const command = String(input['command'] ?? '')
+  // Command-level scanning is subscribed to by DECLARATION, not by tool name.
+  // See ToolPermissionDeclaration.commandField for why.
+  if (permission.commandField) {
+    const command = String(input[permission.commandField] ?? '')
     // The path may be glued to an option with `=` or `:` (e.g. `--output=/etc/x`,
     // `dd of=/dev/sda`, `rsync src:/etc`). Treat those as boundaries too, otherwise
     // such absolute paths slip past the scan entirely.
@@ -264,9 +317,12 @@ function findWorkspaceViolation(
       if (
         !(allowTmp && (candidate.startsWith('/tmp/') || candidate.startsWith('/var/tmp/'))) &&
         !isAllowedDevicePath(candidate) &&
-        !isInsideWorkspace(candidate, workspaceRoot)
+        !isInsideGrantedScope(candidate, workspaceRoot, allowedRoots)
       ) {
-        return `bash command references path outside workspace: ${candidate.slice(0, 120)}`
+        return `${toolName} command references path outside workspace: ${candidate.slice(0, 120)}` +
+          (allowedRoots.length
+            ? ` (granted external roots: ${allowedRoots.join(', ')})`
+            : ' — grant external directories via config.json sandbox.writeAllowPaths / sandbox.readAllowPaths')
       }
     }
   }
@@ -274,7 +330,7 @@ function findWorkspaceViolation(
   const fields = permission.pathFields ?? []
   for (const field of fields) {
     const value = input[field]
-    if (typeof value === 'string' && value && !isInsideWorkspace(value, workspaceRoot)) {
+    if (typeof value === 'string' && value && !isInsideGrantedScope(value, workspaceRoot, allowedRoots)) {
       return `${toolName}.${field} is outside workspace: ${value}`
     }
   }
@@ -282,9 +338,11 @@ function findWorkspaceViolation(
   return null
 }
 
-function detectSensitiveBash(input: Record<string, unknown>): string | null {
-  const command = String(input['command'] ?? '')
-  return detectSensitiveShellCommand(command)
+function detectSensitiveCommand(
+  input: Record<string, unknown>,
+  commandField: string,
+): string | null {
+  return detectSensitiveShellCommand(String(input[commandField] ?? ''))
 }
 
 /**
@@ -313,8 +371,11 @@ function detectSensitiveBash(input: Record<string, unknown>): string | null {
  *   - a root glob  (e.g. `rm -rf /*`, `chmod -R 777 /*`)
  * Both clearly operate outside the workspace, so under the jail they are denied.
  */
-function findBashRelativeEscape(input: Record<string, unknown>): string | null {
-  const command = String(input['command'] ?? '')
+function findBashRelativeEscape(
+  input: Record<string, unknown>,
+  commandField: string,
+): string | null {
+  const command = String(input[commandField] ?? '')
   // `~` / `..` are only treated as PATHS when what follows them looks like a
   // path or ends the argument: a `/`, a quote, end-of-command, or optional
   // whitespace followed by a shell separator (`&&`, `||`, `;`, `|`, `)`, `>`).
@@ -403,6 +464,9 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
   const allowOutsideWorkspace =
     !autonomy?.lockWorkspace && permissionConfig.workspace?.allowOutsideWorkspace === true
   const allowTmp = permissionConfig.workspace?.allowTmp !== false
+  // Canonicalised once: the containment test runs per path per command, and
+  // realpath()ing the grant list on every call would be pure waste.
+  const allowedRoots = (options.externalAllowedRoots ?? []).map(root => resolve(root))
 
   return async (
     tool: KernelTool,
@@ -443,7 +507,9 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     const jailActive = !!workspaceRoot && !allowOutsideWorkspace && permission.requiresWorkspace !== false
 
     if (jailActive) {
-      const violation = findWorkspaceViolation(tool, record, workspaceRoot!, permission, allowTmp)
+      const violation = findWorkspaceViolation(
+        tool, record, workspaceRoot!, permission, allowTmp, allowedRoots,
+      )
       if (violation) return { behavior: 'deny', reason: violation }
       // Workspace-jail hardening (ALL modes, not just auto): the absolute-path
       // scan misses relative escapes (~, $HOME, leading ../) and bare
@@ -451,14 +517,18 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       // consistent with the absolute-path denial above, and before any
       // auto-approve can fire. Opt out via workspace.allowOutsideWorkspace
       // (which turns jailActive off and skips this block).
-      if (tool.name === 'bash' || tool.name === 'powershell') {
-        const escape = findBashRelativeEscape(record)
+      //
+      // Subscribed by declaration (permission.commandField), not by tool name —
+      // the name-keyed version of this check is exactly what let cron_create
+      // through with a raw `bash -c` payload.
+      if (permission.commandField) {
+        const escape = findBashRelativeEscape(record, permission.commandField)
         if (escape) return { behavior: 'deny', reason: escape }
       }
     }
 
-    const isShellTool = tool.name === 'bash' || tool.name === 'powershell'
-    const sensitiveLabel = isShellTool ? detectSensitiveBash(record) : null
+    const commandField = permission.commandField
+    const sensitiveLabel = commandField ? detectSensitiveCommand(record, commandField) : null
 
     // Resolve whether this call needs an approval gate.
     //
@@ -479,7 +549,7 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     // Non-shell tools keep using the merged declaration, where the user config
     // already wins by merge precedence.
     const userSensitiveOverride = permissionConfig.tools?.[tool.name]?.sensitive
-    const needsApproval = isShellTool
+    const needsApproval = commandField
       ? (userSensitiveOverride ?? sensitiveLabel !== null)
       : permission.sensitive === true
 

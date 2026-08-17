@@ -24,7 +24,27 @@
  * too.
  */
 const SENSITIVE_ENV_PATTERN =
-  /(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|SESSION_KEY|ACCESS_KEY|REFRESH_TOKEN|AUTH)$/i
+  /(API_KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?|PRIVATE_KEY|SESSION_KEY|ACCESS_KEY|REFRESH_TOKEN|AUTH|_KEY|_PAT|_DSN|_URI|_URL)$/i
+
+/**
+ * Names matching SENSITIVE_ENV_PATTERN that are NOT credentials and must keep
+ * flowing, because the suffix list above deliberately over-matches.
+ *
+ * `_URL`/`_URI` are on the sensitive list because connection strings routinely
+ * embed a password (`DATABASE_URL=postgres://user:pw@host/db`), and stripping a
+ * credential-bearing URL matters more than forwarding a plain endpoint. But
+ * `OPENAI_BASE_URL` and friends are how a user points the runtime at a proxy or
+ * a self-hosted gateway — stripping those breaks the runtime's own
+ * configuration, so they are named here explicitly.
+ */
+const ENV_PATTERN_EXEMPTIONS = new Set([
+  'OPENAI_BASE_URL', 'ANTHROPIC_BASE_URL', 'DEEPSEEK_BASE_URL', 'QWEN_BASE_URL',
+  'GLM_BASE_URL', 'ZHIPU_BASE_URL', 'ZAI_BASE_URL', 'OLLAMA_BASE_URL',
+  'META_AGENT_BASE_URL', 'BASE_URL',
+  'NPM_CONFIG_REGISTRY', 'NPM_REGISTRY_URL',
+  'HTTP_PROXY', 'HTTPS_PROXY', 'NO_PROXY', 'ALL_PROXY',
+  'SSH_AUTH_SOCK',
+])
 
 /** Names that don't match the suffix pattern but must still be stripped. */
 const EXPLICIT_ENV_BLOCKLIST = new Set([
@@ -35,16 +55,39 @@ const EXPLICIT_ENV_BLOCKLIST = new Set([
 ])
 
 /**
- * Git remote credentials are deliberately allowed through the 'filtered' policy
- * so auto-mode `git push` over HTTPS works. These names take precedence over
- * BOTH the explicit blocklist and SENSITIVE_ENV_PATTERN (which would otherwise
- * strip anything ending in _TOKEN). Scope is intentionally narrow: only
- * git-remote auth — npm / AWS / model-provider keys stay stripped, and SSH key
- * auth (~/.ssh) is unaffected since it never travels through the env.
+ * Git remote credentials allowed through the 'filtered' policy so auto-mode
+ * `git push` over HTTPS works. These names take precedence over BOTH the
+ * explicit blocklist and SENSITIVE_ENV_PATTERN (which would otherwise strip
+ * anything ending in _TOKEN).
+ *
+ * KNOWN RESIDUAL RISK, and why it is still on by default: a forwarded token is
+ * readable by anything the child runs — including a command the model wrote, so
+ * `echo $GITHUB_TOKEN` puts the value in model context. Two things bound that:
+ * `infra/redaction/secretRedaction.ts` now matches the token's VALUE SHAPE
+ * (`ghp_…`, `github_pat_…`, `glpat-…`) rather than only `NAME=value`, so the
+ * bare-echo leak is caught on the way out; and an operator who does not need
+ * `git push` can turn the passthrough off entirely with
+ * `sandbox.gitCredentialPassthrough: false` in config.json.
+ *
+ * The properly scoped fix is a credential helper / GIT_ASKPASS that hands the
+ * token to one `git` invocation instead of to every descendant of the session;
+ * that is tracked separately because it changes how auto-mode push is wired.
  */
 const GIT_CREDENTIAL_ALLOWLIST = new Set([
   'GITHUB_TOKEN', 'GH_TOKEN', 'GIT_TOKEN', 'GITLAB_TOKEN',
 ])
+
+/**
+ * Operator switch for the allowlist above, resolved lazily so a config change
+ * does not require a restart. Defaults to ON for back-compat with auto-mode push.
+ */
+let _gitPassthrough: boolean | undefined
+export function setGitCredentialPassthrough(enabled: boolean | undefined): void {
+  _gitPassthrough = enabled
+}
+function gitCredentialPassthroughEnabled(): boolean {
+  return _gitPassthrough !== false
+}
 
 const MINIMAL_ENV_KEYS = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'SHELL',
@@ -83,9 +126,12 @@ export function buildChildEnv(
     for (const [key, value] of Object.entries(src)) {
       // Git remote credentials are allowed through (see GIT_CREDENTIAL_ALLOWLIST):
       // checked first so the blocklist / sensitive-pattern below cannot strip them.
-      if (!GIT_CREDENTIAL_ALLOWLIST.has(key)) {
+      const gitAllowed = GIT_CREDENTIAL_ALLOWLIST.has(key) && gitCredentialPassthroughEnabled()
+      if (!gitAllowed) {
         if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue
-        if (SENSITIVE_ENV_PATTERN.test(key)) continue
+        // The suffix pattern deliberately over-matches (it must cover providers
+        // we have never heard of), so named non-credentials are exempted.
+        if (SENSITIVE_ENV_PATTERN.test(key) && !ENV_PATTERN_EXEMPTIONS.has(key)) continue
       }
       out[key] = value
     }

@@ -20,7 +20,19 @@ import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
 import { toKernelMessages } from './messageBridge.js'
 import { ToolRuntimeGuards } from './toolRuntimeGuards.js'
-import { resolveConfiguredWriteAllowPaths } from '../sandbox/configuredWritePaths.js'
+import { resolveSandboxPolicy } from '../sandbox/sandboxPolicyConfig.js'
+import { setGitCredentialPassthrough } from '../infra/env/childProcessEnv.js'
+import { getValue as getConfigValue } from '../core/config/ConfigService.js'
+
+/** `sandbox.gitCredentialPassthrough` — whether GITHUB_TOKEN & co reach children. */
+function readGitCredentialPassthrough(projectDir: string): boolean | undefined {
+  try {
+    const raw = getConfigValue('sandbox.gitCredentialPassthrough', { projectDir })
+    return typeof raw === 'boolean' ? raw : undefined
+  } catch {
+    return undefined
+  }
+}
 
 export class AgenticSession {
   private readonly _engine: KernelSession
@@ -44,10 +56,18 @@ export class AgenticSession {
     const apiKey = resolved.apiKey
     const baseURL = resolved.baseURL
     const caps = resolved.capabilities
+    // The operator's config.json `sandbox.*` policy: external read/write grants,
+    // deny lists, network, credential protection. Resolved ONCE and shared by
+    // both consumers below, so the OS sandbox and the permission jail can never
+    // disagree about which external paths are legal — a disagreement would show
+    // up as "I granted this directory and it still doesn't work".
+    const projectDir = resolved.projectDir ?? process.cwd()
+    const sandboxPolicy = resolveSandboxPolicy(projectDir)
+    setGitCredentialPassthrough(readGitCredentialPassthrough(projectDir))
     this._runtimeGuards = new ToolRuntimeGuards({
-      projectDir: resolved.projectDir ?? process.cwd(),
+      projectDir,
       autonomy: config.autonomy,
-      extraWriteAllowPaths: resolveConfiguredWriteAllowPaths(resolved.projectDir ?? process.cwd()),
+      sandboxPolicy,
     })
     // Anthropic-format providers that don't accept the thinking param (e.g. Qwen)
     // must not receive it; OpenAI-protocol providers map thinking → reasoning_effort
@@ -79,6 +99,9 @@ export class AgenticSession {
         // Auto mode: autonomous (in-workspace ops skip the confirm guard) + hard
         // jail (cannot be unlocked by permissions.json). Absent for other modes.
         autonomy: config.autonomy,
+        // The same external grants the OS sandbox was configured with. Without
+        // this the jail denies a granted path before the sandbox is ever asked.
+        externalAllowedRoots: sandboxPolicy.allowedRoots,
       }),
       planModeRef: config.planModeRef,
       askUser: config.askUser,

@@ -23,8 +23,30 @@ type Provider = (scope: ModelCallScope, signal: AbortSignal) => Promise<ModelCal
 const scopes = new Map<string, ModelCallScope>()
 let provider: Provider | null = null
 
+/**
+ * Install the admission provider.
+ *
+ * First writer wins, as before — but a SECOND registration is now reported
+ * instead of vanishing. `provider ??= next` silently ignored it, so a host that
+ * installed its own provider after another subsystem had already installed one
+ * ran with the wrong concurrency limits and had no way to notice. A setter that
+ * quietly does nothing is a very expensive kind of bug to chase.
+ */
 export function setModelCallAdmissionProvider(next: Provider): void {
-  provider ??= next
+  if (provider && provider !== next) {
+    process.stderr.write(
+      '[meta-agent/admission] WARNING: a model-call admission provider is already ' +
+      'installed; ignoring the second registration. Concurrency limits come from ' +
+      'the FIRST provider installed in this process.\n',
+    )
+    return
+  }
+  provider = next
+}
+
+/** Clear the installed provider (tests, and host teardown). */
+export function resetModelCallAdmissionProvider(): void {
+  provider = null
 }
 
 export function registerModelCallScope(sessionId: string, scope: ModelCallScope): () => void {

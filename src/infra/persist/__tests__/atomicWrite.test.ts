@@ -74,12 +74,25 @@ describe('atomicWriteJson', () => {
 })
 
 describe('readJsonFile corrupt quarantine', () => {
-  it('quarantines a corrupt file and returns null', async () => {
+  it('does NOT quarantine by default — a read helper must not mutate the store', async () => {
+    // Quarantine became opt-in: every listing path calls readJsonFile, and a
+    // read that renames files means two processes scanning the same directory
+    // race to rename the same corrupt file, and a caller that only wanted to
+    // enumerate records ends up mutating them.
     const dir = await scratch()
     const target = join(dir, 'state.json')
     await writeFile(target, '{ not json', 'utf-8')
 
     expect(await readJsonFile(target)).toBeNull()
+    expect((await readdir(dir)).filter(n => n.endsWith('.corrupt'))).toHaveLength(0)
+  })
+
+  it('quarantines a corrupt file when the owner asks for it', async () => {
+    const dir = await scratch()
+    const target = join(dir, 'state.json')
+    await writeFile(target, '{ not json', 'utf-8')
+
+    expect(await readJsonFile(target, { quarantineCorrupt: true })).toBeNull()
 
     const quarantined = (await readdir(dir)).filter(n => n.endsWith('.corrupt'))
     expect(quarantined).toHaveLength(1)
@@ -91,12 +104,12 @@ describe('readJsonFile corrupt quarantine', () => {
     const target = join(dir, 'state.json')
 
     await writeFile(target, '{ first corruption', 'utf-8')
-    expect(await readJsonFile(target)).toBeNull()
+    expect(await readJsonFile(target, { quarantineCorrupt: true })).toBeNull()
 
     // Ensure a distinct Date.now() bucket, then corrupt again.
     await new Promise(r => setTimeout(r, 5))
     await writeFile(target, '{ second corruption', 'utf-8')
-    expect(await readJsonFile(target)).toBeNull()
+    expect(await readJsonFile(target, { quarantineCorrupt: true })).toBeNull()
 
     const quarantined = (await readdir(dir)).filter(n => n.endsWith('.corrupt'))
     expect(quarantined).toHaveLength(2)

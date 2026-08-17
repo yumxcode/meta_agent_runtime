@@ -39,10 +39,16 @@ export type { NetworkToolsOptions, WebSearchToolOptions } from './network/index.
 // ── MCP tools ─────────────────────────────────────────────────────────────────
 export {
   registerMcpClient, unregisterMcpClient, getRegisteredMcpServers,
+  setMcpAppPresenter, getMcpAppPresenter, getMcpAppResourceUri, isMcpToolVisibleTo,
+  MCP_APPS_EXTENSION_ID, MCP_APP_HTML_MIME_TYPE,
   createMcpCallTool, createListMcpResourcesTool, createReadMcpResourceTool,
   createMcpTools,
 } from './mcp/index.js'
-export type { McpClient } from './mcp/index.js'
+export type {
+  McpClient, McpContentBlock, McpToolDefinition, McpToolResult,
+  McpResource, McpResourceContent, McpReadResourceResult,
+  McpAppPresenter, McpAppPresentation,
+} from './mcp/index.js'
 
 // ── UI / conversation tools ───────────────────────────────────────────────────
 export {

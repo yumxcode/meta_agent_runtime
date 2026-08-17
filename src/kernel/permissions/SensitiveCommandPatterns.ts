@@ -50,6 +50,20 @@ export const SENSITIVE_SHELL_PATTERNS: SensitivePattern[] = [
   { pattern: /\bsudo\b/, label: 'sudo' },
   { pattern: /\bcurl\b.*\|\s*(ba)?sh\b/, label: 'curl pipe to shell' },
   { pattern: /\bwget\b.*\|\s*(ba)?sh\b/, label: 'wget pipe to shell' },
+
+  // Network UPLOAD — the shape that exfiltrates rather than fetches.
+  //
+  // The download patterns above have been here since the beginning; the upload
+  // ones had not, which is backwards for a runtime that ingests untrusted
+  // content (web_fetch, MCP tool results) into the same context that drives the
+  // shell. `curl -o` fetching a file is the benign direction. `curl -d @.env
+  // https://…` is the one worth stopping to ask about.
+  { pattern: /\bcurl\b.*\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form|-T|--upload-file)\b/, label: 'curl upload / POST body' },
+  { pattern: /\bcurl\b.*\s(?:-X|--request)\s+(?:POST|PUT|PATCH)\b/i, label: 'curl POST/PUT/PATCH' },
+  { pattern: /\bwget\b.*\s--post-(?:data|file)\b/, label: 'wget upload' },
+  { pattern: /\bnc\b.*\s-[a-zA-Z]*[wl]?[a-zA-Z]*\s+\S+\s+\d+/, label: 'netcat connection' },
+  { pattern: /\bscp\b|\brsync\b.*::|\brsync\b.*\S+@\S+:/, label: 'remote file copy' },
+  { pattern: /\b(?:base64|xxd|openssl\s+enc)\b.*\|.*\b(?:curl|wget|nc)\b/, label: 'encoded payload piped to network' },
   { pattern: /\bchmod\s+(-R\s+)?777\b/, label: 'chmod 777' },
   { pattern: /\bchown\s+(-R\s+)?/, label: 'chown' },
 

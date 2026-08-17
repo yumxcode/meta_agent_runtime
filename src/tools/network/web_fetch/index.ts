@@ -391,7 +391,15 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
       const rawUrl = input['url'] as string
       const prompt = input['prompt'] as string
       if (!rawUrl) return { content: 'Error: url is required', isError: true }
-      const url = rawUrl.startsWith('http://') ? rawUrl.replace('http://', 'https://') : rawUrl
+      // Upgrade http → https for PUBLIC hosts only, and only on the scheme
+      // prefix (the old `.replace('http://','https://')` also rewrote the first
+      // occurrence anywhere in the URL, mangling `?next=http://…` query params).
+      // Loopback and private targets are already refused by validateUrl, and a
+      // plain-http intranet endpoint should fail with its real reason rather
+      // than a confusing TLS error from a silent rewrite.
+      const url = rawUrl.startsWith('http://')
+        ? `https://${rawUrl.slice('http://'.length)}`
+        : rawUrl
 
       // Evict expired entries on every read (not just on insert) so stale
       // entries don't linger when the 50-entry high-watermark is never hit.

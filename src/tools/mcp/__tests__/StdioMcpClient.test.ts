@@ -73,6 +73,36 @@ describe('StdioMcpClient resource bounds', () => {
     })
     client.close()
   })
+
+  it('supports resources/list and resources/read for MCP Apps', async () => {
+    const RESOURCE_SERVER = `
+let buf = ''
+process.stdin.setEncoding('utf8')
+process.stdin.on('data', chunk => {
+  buf += chunk
+  let i
+  while ((i = buf.indexOf('\\n')) >= 0) {
+    const req = JSON.parse(buf.slice(0, i)); buf = buf.slice(i + 1)
+    if (req.id === undefined) continue
+    let result = {}
+    if (req.method === 'resources/list') result = { resources: [{ uri: 'ui://test/app', mimeType: 'text/html;profile=mcp-app' }] }
+    if (req.method === 'resources/read') result = { contents: [{ uri: req.params.uri, mimeType: 'text/html;profile=mcp-app', text: '<html />' }] }
+    process.stdout.write(JSON.stringify({ jsonrpc:'2.0', id:req.id, result }) + '\\n')
+  }
+})
+process.stdin.resume()
+`
+    const client = new StdioMcpClient({
+      type: 'stdio', command: process.execPath, args: ['-e', RESOURCE_SERVER], timeoutMs: 5_000,
+    })
+    expect(await client.listResources()).toEqual([
+      { uri: 'ui://test/app', mimeType: 'text/html;profile=mcp-app' },
+    ])
+    expect(await client.readResource('ui://test/app')).toEqual({
+      contents: [{ uri: 'ui://test/app', mimeType: 'text/html;profile=mcp-app', text: '<html />' }],
+    })
+    client.close()
+  })
 })
 
 describe('StdioMcpClient persistent process', () => {

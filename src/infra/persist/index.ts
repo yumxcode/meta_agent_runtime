@@ -46,7 +46,10 @@ export async function ensureDir(dir: string): Promise<void> {
  * the bad bytes by renaming them to `<filePath>.corrupt` before returning
  * null — letting callers recover/inspect rather than overwriting blindly.
  */
-export async function readJsonFile<T = unknown>(filePath: string): Promise<T | null> {
+export async function readJsonFile<T = unknown>(
+  filePath: string,
+  opts: { quarantineCorrupt?: boolean } = {},
+): Promise<T | null> {
   let raw: string
   try {
     raw = await readFile(filePath, 'utf-8')
@@ -58,15 +61,23 @@ export async function readJsonFile<T = unknown>(filePath: string): Promise<T | n
     return JSON.parse(raw) as T
   } catch (err) {
     console.error(
-      `[meta-agent] corrupt JSON at ${filePath} — keeping a .corrupt backup:`,
+      `[meta-agent] corrupt JSON at ${filePath}:`,
       err instanceof Error ? err.message : String(err),
     )
-    // Best-effort quarantine; never throw from a read helper.
+    // Quarantine is now OPT-IN.
     //
-    // The quarantine name carries a timestamp because a fixed `.corrupt`
-    // suffix meant the SECOND corruption silently overwrote the forensic copy
-    // of the first — exactly when you most want both.
-    await rename(filePath, `${filePath}.${Date.now()}.corrupt`).catch(() => {})
+    // A read helper that renames files is a surprising amount of authority for
+    // something every listing path calls. Two processes scanning the same
+    // directory both hit the same corrupt file and both try to rename it; and a
+    // caller that only wanted to enumerate records ends up mutating the store.
+    // Owners that genuinely want the forensic copy ask for it.
+    //
+    // The quarantine name carries a timestamp because a fixed `.corrupt` suffix
+    // meant the SECOND corruption silently overwrote the forensic copy of the
+    // first — exactly when you most want both.
+    if (opts.quarantineCorrupt) {
+      await rename(filePath, `${filePath}.${Date.now()}.corrupt`).catch(() => {})
+    }
     return null
   }
 }
@@ -187,6 +198,16 @@ function sleep(ms: number): Promise<void> {
  * With the heartbeat, `staleMs` now means what it reads like — "the holder has
  * stopped heartbeating, so it died" — and stale reclamation only fires for
  * genuinely dead holders.
+ *
+ * SCOPE LIMIT — single machine only.
+ * Staleness compares the lock file's mtime (stamped by whoever holds it) against
+ * the local `Date.now()`. On one host those share a clock and the comparison is
+ * sound. Across hosts sharing an NFS/SMB mount they do not: a lock B created one
+ * second ago can look older than `staleMs` to A if A's clock runs ahead, and A
+ * will reclaim a live lock — mutual exclusion is simply gone, quietly. NFS also
+ * gives no atomicity guarantee for `open(…, 'wx')` without `O_EXCL` support.
+ * TeamStore's doc mentions two machines sharing a file; that configuration needs
+ * a lease server or a database, not this function.
  */
 export async function withFileLock<T>(
   targetPath: string,
@@ -223,6 +244,14 @@ export async function withFileLock<T>(
       // critical section.  Instead we claim the stale lock via rename() —
       // atomic, so exactly ONE process wins the claim; the loser's rename
       // fails with ENOENT and it simply retries against the new state.
+      //
+      // M4-fix: EVERY path out of this catch block now falls through to the
+      // deadline check and the sleep below. The two `continue`s that used to
+      // live here jumped straight back to `open()`, skipping both — so a lock
+      // that kept looking stale, or a `stat` that kept failing, span a tight
+      // loop at 100% CPU that `timeoutMs` could never interrupt. Worse, the
+      // catch treated ANY stat error as "the lock vanished", including EACCES
+      // and EIO, which are exactly the conditions that persist.
       try {
         const st = await stat(lockPath)
         if (Date.now() - st.mtimeMs > staleMs) {
@@ -233,11 +262,13 @@ export async function withFileLock<T>(
           } catch {
             // Someone else claimed it first — fall through and retry.
           }
-          continue
         }
-      } catch {
-        // Lock vanished between EEXIST and stat — retry immediately.
-        continue
+      } catch (statErr) {
+        // ENOENT genuinely means the holder released it between our EEXIST and
+        // this stat — retry promptly. Anything else (EACCES, EIO, ELOOP) is a
+        // real fault that will not fix itself by spinning, so surface it rather
+        // than burning the deadline pretending it is contention.
+        if ((statErr as NodeJS.ErrnoException)?.code !== 'ENOENT') throw statErr
       }
       if (Date.now() >= deadline) {
         throw new Error(`withFileLock: timed out after ${timeoutMs}ms waiting for ${lockPath}`)

@@ -1,20 +1,12 @@
-# Test infrastructure — never ship to npm
-dist/**/__tests__/
-src/
-fixtures/
-examples/
-scripts/
-*.test.ts
-*.test.js
-*.test.d.ts
-*.test.js.map
-*.test.d.ts.map
-
-# Dev configs
-tsconfig*.json
-vitest.config.ts
-.eslintrc*
-.prettierrc*
-
-# Misc
-*.tgz
+# INTENTIONALLY MINIMAL — package.json `files` is the source of truth.
+#
+# npm consults `.npmignore` only for paths that `files` did not already decide.
+# This file used to duplicate the whole exclusion list (src/, examples/,
+# tsconfig*, *.test.*), which read like the authoritative manifest while having
+# almost no effect: `files: ["dist", ...]` already excludes everything not
+# listed. Two manifests where one is dead is how a publish quietly ships the
+# wrong thing.
+#
+# To change what gets published, edit `files` in package.json and verify with:
+#   npm run check:manifest   (scripts/check-publishable-manifest.js, runs on prepack)
+#   npm pack --dry-run

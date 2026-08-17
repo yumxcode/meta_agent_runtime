@@ -25,6 +25,7 @@ ${bold('meta-agent')} — Engineering agent runtime CLI  ${dim(`v${VERSION}`)}
 
 ${bold('USAGE')}
   meta-agent [options] [prompt]
+  meta-agent ui [options] [prompt]  Run with the local MCP Apps browser host
   meta-agent env [--json]        Print env-var config (name, current value, default)
 
 ${bold('MODES')}
@@ -53,6 +54,8 @@ ${bold('OPTIONS')}
   -y, --yes             Auto-approve sensitive tools (intended for trusted scripts)
   -d, --debug           Debug mode: log full prompts + responses to stderr each turn
       --show-thinking   Show model thinking deltas in the terminal
+      --ui-port <port>  Port for meta-agent ui (default: random loopback port)
+      --no-open         With meta-agent ui, print the URL without opening a browser
       --auto-worktree-cleanup <preserve|safe|aggressive>  Auto worktree cleanup policy
   -j, --json            Output raw JSON events
   -v, --version         Print version
@@ -227,6 +230,9 @@ export interface CliOptions {
   resume: string | undefined      // --resume <sessionId>: preload history from saved session
   sessionDir: string | undefined  // --session-dir <dir>: one-shot persistence root
   attached: boolean               // --attached: keep one-shot auto in this terminal
+  mcpApps: boolean                // `meta-agent ui`: enable the local browser sidecar
+  mcpAppsPort: number             // 0 asks the OS for an available loopback port
+  mcpAppsOpen: boolean            // open the sidecar URL in the default browser
   /** Durable runtime subcommands. Args pass through verbatim. */
   loopCommand: { name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer'; args: string[] } | null
 }
@@ -270,6 +276,8 @@ export function parseCliArgs(): CliOptions {
         yes:          { type: 'boolean', short: 'y', default: false },
         debug:        { type: 'boolean', short: 'd', default: false },
         'show-thinking': { type: 'boolean', default: false },
+        'ui-port':      { type: 'string' },
+        'no-open':      { type: 'boolean', default: false },
         'auto-worktree-cleanup': { type: 'string' },
         json:         { type: 'boolean', short: 'j', default: false },
         version:      { type: 'boolean', short: 'v', default: false },
@@ -306,7 +314,17 @@ export function parseCliArgs(): CliOptions {
     process.exit(1)
   }
 
-  const promptParts = parsed.positionals
+  // `meta-agent ui [prompt]` — the browser-sidecar subcommand.
+  //
+  // Treated as a subcommand ONLY when `ui` is the sole positional or is followed
+  // by one of its own flags. `meta-agent ui redesign the login page` is a prompt
+  // that happens to start with the word "ui", and swallowing that first word
+  // would silently change what the user asked for. Quote the prompt or pass
+  // `--ui-port`/`--no-open` to get the subcommand with a prompt attached.
+  const uiFlagsPresent =
+    parsed.values['ui-port'] !== undefined || parsed.values['no-open'] === true
+  const mcpApps = parsed.positionals[0] === 'ui' && (parsed.positionals.length === 1 || uiFlagsPresent)
+  const promptParts = mcpApps ? parsed.positionals.slice(1) : parsed.positionals
   const rawWorkspace = parsed.values['workspace'] as string | undefined
   const rawSessionDir = parsed.values['session-dir'] as string | undefined
   let workspace: string | undefined
@@ -328,6 +346,7 @@ export function parseCliArgs(): CliOptions {
   const rawMaxTurns = parsed.values['max-turns'] as string | undefined
   const rawMaxBudgetUsd = parsed.values['max-budget-usd'] as string | undefined
   const rawCleanup = parsed.values['auto-worktree-cleanup'] as string | undefined
+  const rawUiPort = parsed.values['ui-port'] as string | undefined
   if (rawCleanup && !['preserve', 'safe', 'aggressive'].includes(rawCleanup)) {
     console.error(red(`Error: --auto-worktree-cleanup must be preserve, safe, or aggressive (got "${rawCleanup}")`))
     process.exit(1)
@@ -352,6 +371,18 @@ export function parseCliArgs(): CliOptions {
       process.exit(1)
     }
   }
+  let mcpAppsPort = 0
+  if (rawUiPort !== undefined) {
+    mcpAppsPort = Number.parseInt(rawUiPort, 10)
+    if (!/^\d+$/.test(rawUiPort) || mcpAppsPort < 0 || mcpAppsPort > 65_535) {
+      console.error(red(`Error: --ui-port must be an integer in [0, 65535] (got "${rawUiPort}")`))
+      process.exit(1)
+    }
+  }
+  if (!mcpApps && (rawUiPort !== undefined || parsed.values['no-open'] === true)) {
+    console.error(red('Error: --ui-port and --no-open require the `meta-agent ui` command.'))
+    process.exit(1)
+  }
 
   return {
     mode:       rawMode as SessionMode,
@@ -374,6 +405,9 @@ export function parseCliArgs(): CliOptions {
     resume:     parsed.values['resume']   as string | undefined,
     sessionDir,
     attached:    parsed.values['attached'] as boolean,
+    mcpApps,
+    mcpAppsPort,
+    mcpAppsOpen: parsed.values['no-open'] !== true,
     loopCommand: null,
   }
 }
@@ -450,6 +484,9 @@ export function buildLoopCliOptions(
     resume: undefined,
     sessionDir: undefined,
     attached: false,
+    mcpApps: false,
+    mcpAppsPort: 0,
+    mcpAppsOpen: false,
     loopCommand: { name, args: passthroughLoopArgs },
   }
 }

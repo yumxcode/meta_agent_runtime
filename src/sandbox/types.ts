@@ -44,12 +44,31 @@ export interface SandboxConfig {
   writeDenyPaths?: string[]
 
   /**
+   * Absolute paths outside the workspace the sub-agent may READ but not write.
+   * Datasets, model weights, reference checkouts.
+   *
+   * Both current backends expose the whole host filesystem read-only by default
+   * (`--ro-bind / /` on Linux, `(allow default)` on macOS), so on those this
+   * list is informational — it exists so that a read-deny rule can be reconciled
+   * against an explicit grant (an operator who grants `~/.aws` here overrides
+   * the credential defaults), and so a future deny-by-default read backend has
+   * the grants it needs.
+   * Default: [] (no extra read grants)
+   */
+  readAllowPaths?: string[]
+
+  /**
    * Absolute paths the sub-agent may NOT read.
    * Useful for hiding secrets, credentials, or sibling project dirs.
+   *
+   * Populated by default from `DEFAULT_CREDENTIAL_DENY_PATHS` (~/.ssh, ~/.aws,
+   * …) unless the operator sets `sandbox.protectCredentials: false`. See
+   * `sandbox/sandboxPolicyConfig.ts`.
    * Default: [] (no extra read restrictions)
    *
-   * Note: on Linux (bwrap) read-deny is approximated by omitting those paths
-   * from the read-only bind mount.  On macOS (Seatbelt) it uses (deny file-read*).
+   * Note: on Linux (bwrap) read-deny is implemented by mounting a fresh tmpfs
+   * over the path, making it appear empty.  On macOS (Seatbelt) it uses
+   * (deny file-read*).
    */
   readDenyPaths?: string[]
 

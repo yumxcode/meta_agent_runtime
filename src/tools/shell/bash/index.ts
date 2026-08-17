@@ -1,11 +1,10 @@
-import { spawn } from 'child_process'
-import { StringDecoder } from 'string_decoder'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
-import { resolveInsideWorkspace } from '../../fs/workspaceGuard.js'
 import type { SandboxConfig, SandboxHandle } from '../../../sandbox/types.js'
+import { resolveSandboxPolicy } from '../../../sandbox/sandboxPolicyConfig.js'
 import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
-import { buildChildEnv, type ShellEnvPolicy } from '../../../infra/env/childProcessEnv.js'
+import type { ShellEnvPolicy } from '../../../infra/env/childProcessEnv.js'
+import { runShellCommand, ShellCommandRefused } from '../../../infra/exec/runShellCommand.js'
 import { timeout } from '../../../core/timeouts.js'
 
 const DEFAULT_MAX_OUT = 100 * 1024
@@ -64,6 +63,30 @@ function getMaxOut(): number {
 }
 
 /**
+ * External host roots the operator granted in config.json
+ * (`sandbox.writeAllowPaths` / `sandbox.readAllowPaths`).
+ *
+ * Memoised per workspace: resolving the policy stats every configured path, and
+ * a shell-heavy turn would otherwise repeat that work on every single command.
+ * A config change takes effect on the next session, which matches how the rest
+ * of the sandbox settings behave.
+ */
+const _externalRootsCache = new Map<string, string[]>()
+function externalRoots(workspaceRoot: string | undefined): string[] {
+  const key = workspaceRoot ?? ''
+  const cached = _externalRootsCache.get(key)
+  if (cached) return cached
+  const roots = resolveSandboxPolicy(workspaceRoot).allowedRoots
+  _externalRootsCache.set(key, roots)
+  return roots
+}
+
+/** Drop the memoised grants (tests, and after a config write). */
+export function resetSandboxGrantCache(): void {
+  _externalRootsCache.clear()
+}
+
+/**
  * H4: Validate timeout_ms input. Accepts only finite numbers; out-of-range
  * values are clamped to [MIN_TIMEOUT_MS, maxTimeoutMs()]. Returns the default
  * for everything non-numeric / NaN / Infinity.
@@ -74,21 +97,16 @@ function resolveTimeoutMs(raw: unknown): number {
   return Math.min(max, Math.max(MIN_TIMEOUT_MS, raw))
 }
 
-/** Last-resort transcript guard for CLIs that print credentials despite the
- * filtered environment. Workflows should still capture secrets and consume
- * them inside one shell process; this prevents common JSON/env shapes from
- * entering model context, debug logs, and long-lived lineage sessions. */
-export function redactSensitiveShellOutput(value: string): string {
-  return value
-    .replace(
-      /(["']?(?:api[_-]?key|access[_-]?token|refresh[_-]?token|secret|password|credential)["']?\s*[:=]\s*)["']?[^\s,"'}]+["']?/gi,
-      '$1[REDACTED]',
-    )
-    .replace(
-      /\b((?:GM|OPENAI|ANTHROPIC|DEEPSEEK|QWEN|AWS|GITHUB|GITLAB)_[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD))=([^\s]+)/g,
-      '$1=[REDACTED]',
-    )
-}
+/**
+ * Last-resort transcript guard for CLIs that print credentials despite the
+ * filtered environment.
+ *
+ * The implementation moved to `infra/redaction/secretRedaction.ts` so that every
+ * subprocess call site shares it — `runShellCommand` now applies it to stdout
+ * and stderr for all callers, which is why this tool no longer calls it
+ * per-stream. Re-exported because it was part of this module's public surface.
+ */
+export { redactSecrets as redactSensitiveShellOutput } from '../../../infra/redaction/secretRedaction.js'
 
 /**
  * H5: the env passed to the spawned shell.
@@ -143,126 +161,16 @@ export interface BashToolOptions {
   sandbox?: boolean | SandboxConfig
 }
 
-const DEFAULT_MAIN_SANDBOX: SandboxConfig = { allowUnsandboxedFallback: true }
-
-interface RunResult {
-  stdout: string
-  stderr: string
-  code: number | null
-  timedOut: boolean
-  aborted: boolean
-}
-
 /**
- * M4-fix: run a command in its OWN PROCESS GROUP and, on timeout/abort, kill
- * the whole group (`kill(-pid)`), not just the direct child.  The previous
- * execFile({ timeout }) only SIGTERM'd the bash wrapper, so pipelines and
- * backgrounded children (`npm install`, training scripts, …) survived as
- * orphans and accumulated on the machine.
+ * Default OS-sandbox policy for MAIN-AGENT bash.
+ *
+ * `readDenyPaths` is left empty HERE on purpose: the credential deny list is
+ * resolved per-session from the operator's config (`sandbox.protectCredentials`,
+ * default on) and merged in by ToolRuntimeGuards.applySandboxPolicy. Baking a
+ * hard-coded list into the tool would make it unconfigurable, and an operator
+ * whose agent legitimately needs `~/.aws` would have no way to grant it.
  */
-function runProcessGroup(
-  file: string,
-  args: string[],
-  opts: {
-    timeoutMs: number
-    cwd: string
-    env: NodeJS.ProcessEnv
-    signal: AbortSignal
-    /** Per-stream capture cap (bytes kept in memory). */
-    captureLimit: number
-  },
-): Promise<RunResult> {
-  return new Promise<RunResult>((resolve, reject) => {
-    const useGroup = process.platform !== 'win32'
-    let child: ReturnType<typeof spawn>
-    try {
-      child = spawn(file, args, {
-        cwd: opts.cwd,
-        env: opts.env,
-        detached: useGroup,           // own process group → group-killable
-        stdio: ['ignore', 'pipe', 'pipe'],
-      })
-    } catch (err) {
-      reject(err)
-      return
-    }
-
-    let stdout = ''
-    let stderr = ''
-    let timedOut = false
-    let aborted = false
-    let settled = false
-    // L2: decode incrementally so a multi-byte UTF-8 sequence split across two
-    // chunks is not turned into replacement characters at the boundary.
-    const outDecoder = new StringDecoder('utf8')
-    const errDecoder = new StringDecoder('utf8')
-
-    const killGroup = (): void => {
-      if (child.pid === undefined) return
-      try {
-        if (useGroup) {
-          process.kill(-child.pid, 'SIGKILL')   // negative pid = whole group
-        } else {
-          child.kill('SIGKILL')
-        }
-      } catch { /* already exited */ }
-    }
-
-    const timer = setTimeout(() => {
-      timedOut = true
-      killGroup()
-    }, opts.timeoutMs)
-
-    const onAbort = (): void => {
-      aborted = true
-      killGroup()
-    }
-    if (opts.signal.aborted) onAbort()
-    else opts.signal.addEventListener('abort', onAbort, { once: true })
-
-    // L4: cap each stream at captureLimit EXACTLY rather than "stop once the
-    // limit is already exceeded". The previous check ran before the append, so
-    // one chunk could overshoot by a whole pipe buffer (~64 KB) — negligible at
-    // the default limit, but a large multiple of a small
-    // META_AGENT_MAX_TOOL_OUTPUT_CHARS. Decoding continues past the cap (it is
-    // cheap and keeps the decoder's multi-byte state consistent), only the
-    // retained text is bounded.
-    child.stdout?.on('data', (chunk: Buffer) => {
-      const text = outDecoder.write(chunk)
-      if (!text || stdout.length >= opts.captureLimit) return
-      stdout += text.slice(0, opts.captureLimit - stdout.length)
-    })
-    child.stderr?.on('data', (chunk: Buffer) => {
-      const text = errDecoder.write(chunk)
-      if (!text || stderr.length >= opts.captureLimit) return
-      stderr += text.slice(0, opts.captureLimit - stderr.length)
-    })
-
-    const finish = (fn: () => void): void => {
-      if (settled) return
-      settled = true
-      clearTimeout(timer)
-      opts.signal.removeEventListener('abort', onAbort)
-      fn()
-    }
-
-    child.on('error', (err) => finish(() => reject(err)))
-    child.on('close', (code) =>
-      finish(() => {
-        // Flush any bytes the decoders held back at a chunk boundary.
-        const outTail = outDecoder.end()
-        const errTail = errDecoder.end()
-        if (outTail && stdout.length < opts.captureLimit) {
-          stdout += outTail.slice(0, opts.captureLimit - stdout.length)
-        }
-        if (errTail && stderr.length < opts.captureLimit) {
-          stderr += errTail.slice(0, opts.captureLimit - stderr.length)
-        }
-        resolve({ stdout, stderr, code, timedOut, aborted })
-      }),
-    )
-  })
-}
+const DEFAULT_MAIN_SANDBOX: SandboxConfig = { allowUnsandboxedFallback: true }
 
 export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAgentTool> {
   const { sandboxHandle } = opts
@@ -300,6 +208,10 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
     permission: {
       category: 'execute',
       cwdField: 'cwd',
+      // Subscribes this tool to the kernel's command-level guards (absolute-path
+      // workspace scan, ~/$HOME/../ escape scan, sensitive-command detection).
+      // See ToolPermissionDeclaration.commandField.
+      commandField: 'command',
       requiresWorkspace: true,
       sensitive: true,
       planMode: 'ask',
@@ -336,32 +248,30 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
       // Falling back to workspaceRoot keeps the default cwd inside the jail.
       const rawCwd = (input['cwd'] as string | undefined) ?? ctx.workspaceRoot ?? process.cwd()
       if (!command) return { content: 'Error: command is required', isError: true }
-      const resolvedCwd = resolveInsideWorkspace(rawCwd, ctx.workspaceRoot)
-      if (!resolvedCwd.ok) return { content: `Error: cwd is outside workspace: ${rawCwd}`, isError: true }
-      // Run on the canonical absolute cwd the guard approved — a relative cwd
-      // must not be re-resolved against process.cwd() at spawn time.
-      const cwd = resolvedCwd.path
       const limit = getMaxOut()
-      const trunc = (raw: string) => {
-        const s = redactSensitiveShellOutput(raw)
-        return s.length > limit ? s.slice(0, limit) + `\n[Truncated — ${s.length} bytes]` : s
-      }
+      // runShellCommand already redacted the streams; this only bounds length.
+      const trunc = (s: string) =>
+        s.length > limit ? s.slice(0, limit) + `\n[Truncated — ${s.length} bytes]` : s
 
-      // Resolve exec spec — priority order:
+      // Sandbox handle priority:
       //   1. ctx.sandboxHandle  injected by MetaAgentSession._wrapTool() for main-agent calls
       //   2. sandboxHandle      closure-captured for sub-agent calls (SubAgentRunner path)
-      //   3. plain bash         no sandboxing configured
+      //   3. none               no sandboxing configured
       const activeHandle = ctx.sandboxHandle ?? sandboxHandle
-      const execSpec = activeHandle
-        ? activeHandle.wrapExec(command, cwd)
-        : { file: 'bash', args: ['-c', command] }
 
       try {
-        const res = await runProcessGroup(execSpec.file, execSpec.args, {
+        const res = await runShellCommand({
+          command,
+          cwd: rawCwd,
+          workspaceRoot: ctx.workspaceRoot,
+          // External directories the operator granted in config.json. Without
+          // this a granted path would be refused here even though the OS sandbox
+          // was configured to allow it.
+          allowedRoots: externalRoots(ctx.workspaceRoot),
           timeoutMs,
-          cwd,
-          env: buildChildEnv(envPolicy),
           signal: ctx.abortSignal,
+          envPolicy,
+          ...(activeHandle ? { sandboxHandle: activeHandle } : {}),
           captureLimit: limit * 2,
         })
 
@@ -391,6 +301,9 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
         parts.push(`Exit code: ${res.code ?? 'unknown'}`)
         return { content: parts.join('\n'), isError: true }
       } catch (err: unknown) {
+        if (err instanceof ShellCommandRefused) {
+          return { content: `Error: ${err.message}`, isError: true }
+        }
         return {
           content: err instanceof Error ? err.message : String(err),
           isError: true,

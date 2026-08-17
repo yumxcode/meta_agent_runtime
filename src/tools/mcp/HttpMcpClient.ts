@@ -16,7 +16,16 @@
  *   registerMcpClient('web-search-prime', client)
  */
 
-import type { McpClient } from './registry.js'
+import {
+  cachedListTools,
+  collectPaginated,
+  mcpAppsClientCapabilities,
+  type McpClient,
+  type McpReadResourceResult,
+  type McpResource,
+  type McpToolDefinition,
+  type McpToolResult,
+} from './registry.js'
 import { timeout } from '../../core/timeouts.js'
 
 type JsonRpcResponse<T = unknown> = {
@@ -168,7 +177,7 @@ export class HttpMcpClient implements McpClient {
         method: 'initialize',
         params: {
           protocolVersion: this._protocolVersion,
-          capabilities: {},
+          capabilities: mcpAppsClientCapabilities(),
           clientInfo: { name: 'meta-agent', version: '0.2.1' },
         },
       }),
@@ -243,10 +252,25 @@ export class HttpMcpClient implements McpClient {
 
   // ── McpClient interface ───────────────────────────────────────────────────
 
-  async listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
+  /** Stable cache key / log label for this connection. */
+  private _serverLabel(): string {
+    return this._url
+  }
+
+  async listTools(): Promise<McpToolDefinition[]> {
+    // Cached: mcp_call needs the tool's _meta before every invocation, which
+    // would otherwise be a second HTTP round-trip per tool call.
+    //
+    // The error handler is OUTSIDE the cached function on purpose. Catching
+    // inside would resolve the cached promise with `[]`, so one transient
+    // failure — a handshake that lost its session, a 503 — would pin an empty
+    // tool list for the whole TTL and the client would look permanently dead.
+    // Letting it reject evicts the entry, so the next call genuinely retries.
     try {
-      const result = await this._rpc<{ tools: Array<{ name: string; description?: string; inputSchema?: unknown }> }>('tools/list')
-      return result?.tools ?? []
+      return await cachedListTools(this._serverLabel(), async () => {
+        const result = await this._rpc<{ tools: McpToolDefinition[] }>('tools/list')
+        return result?.tools ?? []
+      })
     } catch (err) {
       // Surface the real reason instead of silently reporting "(none)".
       const msg = err instanceof Error ? err.message : String(err)
@@ -258,11 +282,31 @@ export class HttpMcpClient implements McpClient {
   async callTool(
     toolName: string,
     toolInput: Record<string, unknown>,
-  ): Promise<{ content: Array<{ type: string; text?: string }> }> {
-    const result = await this._rpc<{ content: Array<{ type: string; text?: string }> }>(
+  ): Promise<McpToolResult> {
+    const result = await this._rpc<McpToolResult>(
       'tools/call',
       { name: toolName, arguments: toolInput },
     )
-    return result ?? { content: [] }
+    return result ? { ...result, content: Array.isArray(result.content) ? result.content : [] } : { content: [] }
+  }
+
+  async listResources(): Promise<McpResource[]> {
+    // Bounded: an unbounded `while (cursor)` against an untrusted server is a
+    // hang + unbounded allocation waiting to happen. See collectPaginated.
+    return collectPaginated<McpResource>(this._serverLabel(), 'resources/list', async cursor => {
+      const result = await this._rpc<{ resources?: McpResource[]; nextCursor?: string }>(
+        'resources/list',
+        cursor ? { cursor } : undefined,
+      )
+      return {
+        items: result?.resources ?? [],
+        ...(result?.nextCursor ? { nextCursor: result.nextCursor } : {}),
+      }
+    })
+  }
+
+  async readResource(uri: string): Promise<McpReadResourceResult> {
+    const result = await this._rpc<McpReadResourceResult>('resources/read', { uri })
+    return result ?? { contents: [] }
   }
 }

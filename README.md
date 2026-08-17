@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.16` · Node.js `>= 18`
+> 当前版本:`0.8.17` · Node.js `>= 18`
 
 ---
 
@@ -377,6 +377,8 @@ new SessionRouter({ thinkingConfig: { type: 'enabled', budgetTokens: 32_000 } })
 - 敏感 Shell 命令通过 `askUser` 交互确认(`-y/--yes` 可在可信脚本中跳过)。
 - `beforeToolCall` 可在工具执行前 allow / deny / 重定向调用。
 - OS 级 sandbox:Linux 走 bwrap、macOS 走 sandbox-exec;auto 模式强制 fail-closed,只放行工作区为可写根。
+- 默认隐藏凭证目录(`~/.ssh`、`~/.aws`、`~/.config/gh` …)——两个 backend 的基线都是「整个宿主文件系统可读」,不加这一层的话沙箱只挡写不挡读。
+- 子进程环境变量默认过滤,输出按名称与**值形态**双重脱敏(`ghp_…`、`AKIA…`、`postgres://user:pw@…`)。
 - 工具结果按预算截断,避免单次返回撑满上下文。
 
 ```ts
@@ -390,6 +392,38 @@ const router = new SessionRouter({
   },
 })
 ```
+
+### 沙箱外部路径配置
+
+工作区之外的读写授权全部走 `config.json` 的 `sandbox.*`(全局 `~/.meta-agent/config.json`,或项目内 `<project>/.meta-agent/config.json`,后者优先)。**这是唯一能授予宿主路径的地方**——模型改不了,charter/campaign 数据改不了,工具自己的声明也只能「要求」一个已被授权的路径,不能新增。
+
+```jsonc
+{
+  "sandbox": {
+    // 工作区之外可读**且**可写(写隐含读)
+    "writeAllowPaths": ["~/scratch", "/data/shared"],
+    // 只读:数据集、模型权重、参考仓库
+    "readAllowPaths": ["~/datasets", "/opt/models"],
+    // 从上面的授权里再抠掉一块(也可用于工作区自身)
+    "writeDenyPaths": ["/data/shared/golden"],
+    // 在默认凭证清单之外追加
+    "readDenyPaths": ["~/private-notes"],
+
+    "network": "unrestricted",          // "none" = 断网(bwrap --unshare-net / seatbelt deny network*)
+    "protectCredentials": true,         // 默认 true:隐藏 ~/.ssh、~/.aws 等
+    "gitCredentialPassthrough": true,   // 默认 true:GITHUB_TOKEN 等透传给子进程(auto 模式 git push 需要)
+    "allowUnsandboxedFallback": true    // 无 backend 时是否降级为裸 bash;auto 模式强制 false
+  }
+}
+```
+
+几点值得注意:
+
+- **路径写 `~` 可以,写相对路径会被丢弃;不存在的路径也会被丢弃**——bwrap 的 bind 源缺失会让整条命令失败,与其在每次 shell 调用时炸,不如启动时静默跳过。
+- **授权按路径段匹配**:授权 `/data/shared` 不会连带授权 `/data/shared-backup`。
+- **授权同时作用于两层**:OS 沙箱(真正的强制)与 kernel 权限 jail(命令里的绝对路径扫描、`cwd` 校验)。少了后者,授权的目录会在沙箱被问到之前就被 jail 拒掉,表现为「我明明配了却还是不能用」。
+- **`protectCredentials` 是下限不是上限**:显式写进 `readAllowPaths` 的路径会覆盖默认拒绝(这就是「这个 agent 确实需要读 ~/.aws」的表达方式);但显式的 `readDenyPaths` 永远压过显式的 allow。
+- `network: "none"` 是**粘性**的:工具声明与 operator 配置任一方要求断网,就断网。
 
 ---
 
@@ -428,7 +462,7 @@ import { registerMcpClient, type McpClient } from '@meta-agent/runtime'
 class MyMcpClient implements McpClient {
   async listTools() { return [] }
   async callTool(name: string, input: unknown) {
-    return { content: JSON.stringify({ name, input }), isError: false }
+    return { content: [{ type: 'text', text: JSON.stringify({ name, input }) }], isError: false }
   }
 }
 
@@ -436,6 +470,21 @@ registerMcpClient('my-server', new MyMcpClient())
 ```
 
 注册后,模型可通过 `mcp_call` 调用该服务暴露的工具,`list_mcp_resources` / `read_mcp_resource` 访问其资源。
+
+### MCP Apps（可选浏览器 Host）
+
+CLI 默认保持纯文本模式。使用 `ui` 子命令时，Meta-Agent 会在本机回环地址启动一个临时浏览器 sidecar；MCP 工具通过 `_meta.ui.resourceUri` 关联的 `text/html;profile=mcp-app` Resource 会显示在沙箱 iframe 中：
+
+```bash
+meta-agent ui
+meta-agent ui "打开支持交互界面的 MCP 工具"
+meta-agent ui --ui-port 43100 --no-open
+```
+
+- Host 仅监听 `127.0.0.1`，使用每次启动随机生成的 URL token。
+- App iframe 不获得同源权限；外部网络、静态资源和子 iframe 受 Resource `_meta.ui.csp` 白名单约束。
+- App 发起 `tools/call` 时，浏览器父页面会逐次确认，并限制在原 MCP Server 且要求工具对 `app` 可见。
+- 不使用 `ui` 子命令时，MCP Apps 自动降级为工具的文本 `content`；若只有 `structuredContent`，CLI 会用 JSON 表示供模型继续处理。
 
 ---
 
@@ -509,4 +558,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.16`。
+当前包版本:`0.8.17`。

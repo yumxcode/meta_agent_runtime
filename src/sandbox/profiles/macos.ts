@@ -135,9 +135,21 @@ export function buildMacOSProfile(
   }
 
   // ── File-read restrictions ────────────────────────────────────────────────
-  const denyRead = config.readDenyPaths ?? []
+  //
+  // The base is `(allow default)`, so every path on the host is readable unless
+  // it appears here. That is why `sandbox.protectCredentials` populates this
+  // list by default: without it a sandboxed shell can read ~/.ssh and ~/.aws
+  // and — since `network` is unrestricted unless the operator says otherwise —
+  // send them anywhere.
+  const readAllow = config.readAllowPaths ?? []
+  const denyRead = (config.readDenyPaths ?? []).filter(
+    // An explicit read grant wins over a deny. Seatbelt takes the LAST matching
+    // rule, so we could also emit an allow after the deny; filtering instead
+    // keeps the generated profile honest about what it enforces.
+    p => !readAllow.some(granted => granted === p || p.startsWith(`${granted}/`)),
+  )
   if (denyRead.length > 0) {
-    lines.push(';; Caller-specified read-deny paths.')
+    lines.push(';; Caller-specified read-deny paths (credentials, secrets).')
     lines.push('(deny file-read*')
     for (const p of denyRead) {
       lines.push(`  ${subpath(p)}`)

@@ -45,10 +45,13 @@ describe('bwrap argument contract', () => {
       writeDenyPaths:  ['/data/out/protected'],
       readDenyPaths:   ['/home/u/.ssh'],
     }, WORKSPACE).join(' ')
-    expect(joined).toContain('--bind /data/out /data/out')
+    // `--bind-try`, not `--bind`: bwrap aborts the whole command when a bind
+    // source is missing, so one stale entry in sandbox.writeAllowPaths used to
+    // break every shell call in the session with an opaque error.
+    expect(joined).toContain('--bind-try /data/out /data/out')
     expect(joined).toContain('--ro-bind-try /data/out/protected /data/out/protected')
     expect(joined).toContain('--tmpfs /home/u/.ssh')
-    expect(joined.indexOf('--bind /data/out /data/out'))
+    expect(joined.indexOf('--bind-try /data/out /data/out'))
       .toBeLessThan(joined.indexOf('--ro-bind-try /data/out/protected'))
   })
 

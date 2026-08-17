@@ -46,6 +46,7 @@ import { runLoopCommand } from './commands/loop.js'
 import { runSteerCommand } from './commands/steer.js'
 import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
+import { McpAppsBrowserHost } from './mcpAppsHost.js'
 
 async function main(): Promise<void> {
   // Before anything writes: make `| head` / `| less`-and-quit a clean exit
@@ -85,21 +86,45 @@ async function main(): Promise<void> {
   if (opts.attached && opts.prompt === null) {
     throw new Error('--attached requires a one-shot prompt.')
   }
-  await ensureMcpServerInstructions()
+  let mcpAppsHost: McpAppsBrowserHost | undefined
+  if (opts.mcpApps) {
+    mcpAppsHost = new McpAppsBrowserHost({
+      port: opts.mcpAppsPort,
+      openBrowser: opts.mcpAppsOpen,
+    })
+    const info = await mcpAppsHost.start()
+    const suffix = info.browserOpened ? ' (opened in browser)' : ''
+    process.stderr.write(`MCP Apps host: ${info.url}${suffix}\n`)
+    // `process.exit()` in the interactive REPL bypasses async finally blocks, so
+    // the finally below is not enough on its own. An `exit` handler only runs
+    // SYNCHRONOUS work — the previous `void mcpAppsHost?.close()` here scheduled
+    // a promise that could never settle, i.e. it did nothing at all. closeSync()
+    // tears the listener and its SSE streams down in-line, which does work.
+    const host = mcpAppsHost
+    process.once('exit', () => host.closeSync())
+  }
 
-  if (opts.prompt !== null) {
-    if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })
-    if (opts.attached) {
-      await runAttachedAuto(opts)
+  try {
+    // Start the browser host first: MCP initialization then advertises the
+    // io.modelcontextprotocol/ui extension to connected servers.
+    await ensureMcpServerInstructions()
+
+    if (opts.prompt !== null) {
+      if (opts.sessionDir) mkdirSync(opts.sessionDir, { recursive: true })
+      if (opts.attached) {
+        await runAttachedAuto(opts)
+      } else {
+        await runSingleTurn(opts)
+      }
     } else {
-      await runSingleTurn(opts)
+      if (opts.sessionDir) {
+        console.error(red('Error: --session-dir is only supported for one-shot prompt runs.'))
+        process.exit(1)
+      }
+      await runRepl(opts)
     }
-  } else {
-    if (opts.sessionDir) {
-      console.error(red('Error: --session-dir is only supported for one-shot prompt runs.'))
-      process.exit(1)
-    }
-    await runRepl(opts)
+  } finally {
+    await mcpAppsHost?.close()
   }
 }
 

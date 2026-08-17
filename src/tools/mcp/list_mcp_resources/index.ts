@@ -1,6 +1,6 @@
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { loadToolPrompt } from '../../util.js'
-import { mcpClients } from '../registry.js'
+import { isMcpToolVisibleTo, mcpClients } from '../registry.js'
 
 export async function createListMcpResourcesTool(): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
@@ -15,7 +15,7 @@ export async function createListMcpResourcesTool(): Promise<MetaAgentTool> {
       for (const [serverName, client] of mcpClients) {
         const lines: string[] = [`## Server: ${serverName}`]
         try {
-          const tools = await client.listTools()
+          const tools = (await client.listTools()).filter(tool => isMcpToolVisibleTo(tool, 'model'))
           if (tools.length === 0) { lines.push('  Tools: (none)') } else {
             lines.push(`  Tools (${tools.length}):`)
             for (const t of tools) {

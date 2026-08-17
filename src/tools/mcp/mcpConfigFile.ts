@@ -37,8 +37,22 @@ import { join } from 'path'
 import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 import { loadModelConfig } from '../../core/config/ConfigService.js'
 import { HttpMcpClient } from './HttpMcpClient.js'
-import { registerMcpClient, mcpClients } from './registry.js'
-import type { McpClient } from './registry.js'
+import {
+  cachedListTools,
+  collectPaginated,
+  invalidateToolListCache,
+  isMcpToolVisibleTo,
+  mcpAppsClientCapabilities,
+  mcpClients,
+  registerMcpClient,
+} from './registry.js'
+import type {
+  McpClient,
+  McpReadResourceResult,
+  McpResource,
+  McpToolDefinition,
+  McpToolResult,
+} from './registry.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 import { buildChildEnv } from '../../infra/env/childProcessEnv.js'
 import { timeout } from '../../core/timeouts.js'
@@ -415,7 +429,7 @@ export class StdioMcpClient implements McpClient {
       try {
         await this._request('initialize', {
           protocolVersion: '2024-11-05',
-          capabilities: {},
+          capabilities: mcpAppsClientCapabilities(),
           clientInfo: { name: 'meta-agent', version: CLI_VERSION },
         })
         this._notify('notifications/initialized')
@@ -437,19 +451,45 @@ export class StdioMcpClient implements McpClient {
     this._teardown(new Error(`MCP stdio server "${this._serverName}" was closed`))
   }
 
-  async listTools(): Promise<Array<{ name: string; description?: string; inputSchema?: unknown }>> {
+  async listTools(): Promise<McpToolDefinition[]> {
+    // Cached: mcp_call needs the tool's _meta before every invocation, which
+    // would otherwise be a second stdio round-trip per tool call. The catch is
+    // outside the cached function so a transient failure evicts the entry
+    // instead of pinning an empty tool list for the whole TTL.
     try {
-      const result = await this._rpc<{ tools: Array<{ name: string; description?: string; inputSchema?: unknown }> }>('tools/list')
-      return result?.tools ?? []
+      return await cachedListTools(`stdio:${this._serverName}`, async () => {
+        const result = await this._rpc<{ tools: McpToolDefinition[] }>('tools/list')
+        return result?.tools ?? []
+      })
     } catch { return [] }
   }
 
-  async callTool(toolName: string, toolInput: Record<string, unknown>): Promise<{ content: Array<{ type: string; text?: string }> }> {
-    const result = await this._rpc<{ content: Array<{ type: string; text?: string }> }>(
+  async callTool(toolName: string, toolInput: Record<string, unknown>): Promise<McpToolResult> {
+    const result = await this._rpc<McpToolResult>(
       'tools/call',
       { name: toolName, arguments: toolInput },
     )
-    return result ?? { content: [] }
+    return result ? { ...result, content: Array.isArray(result.content) ? result.content : [] } : { content: [] }
+  }
+
+  async listResources(): Promise<McpResource[]> {
+    // Bounded — see collectPaginated. A stdio server that returns a constant
+    // nextCursor would otherwise spin this loop forever.
+    return collectPaginated<McpResource>(this._serverName, 'resources/list', async cursor => {
+      const result = await this._rpc<{ resources?: McpResource[]; nextCursor?: string }>(
+        'resources/list',
+        cursor ? { cursor } : undefined,
+      )
+      return {
+        items: result?.resources ?? [],
+        ...(result?.nextCursor ? { nextCursor: result.nextCursor } : {}),
+      }
+    })
+  }
+
+  async readResource(uri: string): Promise<McpReadResourceResult> {
+    const result = await this._rpc<McpReadResourceResult>('resources/read', { uri })
+    return result ?? { contents: [] }
   }
 }
 
@@ -564,7 +604,7 @@ export async function buildMcpServerInstructions(): Promise<import('../../core/d
 
   const results = await Promise.allSettled(
     [...mcpClients.entries()].map(async ([name, client]) => {
-      const tools = await client.listTools()
+      const tools = (await client.listTools()).filter(tool => isMcpToolVisibleTo(tool, 'model'))
 
       let toolsBlock: string
       if (tools.length === 0) {

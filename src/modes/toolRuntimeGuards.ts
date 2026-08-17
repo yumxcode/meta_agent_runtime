@@ -1,19 +1,25 @@
 import type { AutonomyProfile, MetaAgentTool, ToolCallContext } from '../core/types.js'
 import { getGlobalWriteMutex } from '../core/fs/WriteMutex.js'
 import { createSandboxExecutor } from '../sandbox/index.js'
+import { applySandboxPolicy, resolveSandboxPolicy, type ResolvedSandboxPolicy } from '../sandbox/sandboxPolicyConfig.js'
 import type { SandboxConfig, SandboxHandle } from '../sandbox/types.js'
 
 export interface ToolRuntimeGuardsOptions {
   projectDir?: string
   autonomy?: AutonomyProfile
   /**
-   * Extra absolute host paths the OS sandbox should mount WRITABLE for every
-   * sandboxed tool (bash). Sourced from config.json `sandbox.writeAllowPaths`.
-   * Use for host-local stores the agent legitimately needs to read/write but
-   * that live outside the workspace — e.g. an external CLI state directory
-   * or a shared credential store. Callers should expand
-   * `~` and drop non-existent paths before passing them (bwrap fails if a bind
-   * source is missing).
+   * Operator sandbox policy from config.json `sandbox.*` — external read/write
+   * grants, deny lists, network and credential protection.
+   *
+   * Resolved once per session and merged into EVERY sandboxed tool's declared
+   * policy (see applySandboxPolicy). When omitted it is resolved lazily from
+   * `projectDir`, so an embedder that forgets to pass it still gets the
+   * operator's configuration rather than silently losing their grants.
+   */
+  sandboxPolicy?: ResolvedSandboxPolicy
+  /**
+   * @deprecated Use `sandboxPolicy` / config.json `sandbox.writeAllowPaths`.
+   * Retained so existing embedders keep compiling; unioned into the policy.
    */
   extraWriteAllowPaths?: string[]
 }
@@ -44,10 +50,25 @@ export class ToolRuntimeGuards {
   private readonly sandboxHandles = new Map<string, Promise<SandboxHandle>>()
   private readonly options: ToolRuntimeGuardsOptions
   private readonly writeMutex: ReturnType<typeof getGlobalWriteMutex> | undefined
+  private readonly policy: ResolvedSandboxPolicy
 
   constructor(options: ToolRuntimeGuardsOptions = {}) {
     this.options = options
     this.writeMutex = options.autonomy ? getGlobalWriteMutex() : undefined
+    const base = options.sandboxPolicy ?? resolveSandboxPolicy(options.projectDir)
+    const legacy = options.extraWriteAllowPaths ?? []
+    this.policy = legacy.length
+      ? {
+          ...base,
+          writeAllowPaths: [...new Set([...base.writeAllowPaths, ...legacy])],
+          allowedRoots: [...new Set([...base.allowedRoots, ...legacy])],
+        }
+      : base
+  }
+
+  /** The effective operator policy — the same grants the permission jail must widen by. */
+  get sandboxPolicy(): ResolvedSandboxPolicy {
+    return this.policy
   }
 
   wrapTool(tool: MetaAgentTool): MetaAgentTool {
@@ -87,15 +108,17 @@ export class ToolRuntimeGuards {
 
   private getOrCreateSandboxHandle(policy: true | SandboxConfig): Promise<SandboxHandle> {
     const baseConfig: SandboxConfig = policy === true ? {} : policy
-    // Merge operator-configured extra writable paths (config.json
-    // sandbox.writeAllowPaths) into the policy's own writeAllowPaths.
-    const extra = this.options.extraWriteAllowPaths ?? []
-    const withExtra: SandboxConfig = extra.length
-      ? { ...baseConfig, writeAllowPaths: [...(baseConfig.writeAllowPaths ?? []), ...extra] }
-      : baseConfig
+    // Merge the operator's config.json `sandbox.*` policy into the tool's own
+    // declaration: external read/write grants, deny lists, network, credential
+    // protection. Allow lists union, deny lists union, `network: 'none'` is
+    // sticky — see applySandboxPolicy.
+    const withPolicy = applySandboxPolicy(baseConfig, this.policy)
+    // lockWorkspace (auto modes) is the one setting the operator may NOT relax:
+    // an unattended run must fail closed rather than silently degrade to plain
+    // `bash -c` on a host with no sandbox backend.
     const config: SandboxConfig = this.options.autonomy?.lockWorkspace
-      ? { ...withExtra, allowUnsandboxedFallback: false }
-      : withExtra
+      ? { ...withPolicy, allowUnsandboxedFallback: false }
+      : withPolicy
     // Cache by the FULLY-resolved config so the merged paths participate in the key.
     const cacheKey = JSON.stringify(config)
     const cached = this.sandboxHandles.get(cacheKey)

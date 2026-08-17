@@ -110,10 +110,17 @@ export async function runTools(
   batchLoop: for (const batch of batches) {
     if (batch.isConcurrencySafe) {
       // ── Parallel batch ─────────────────────────────────────────────────────
-      // Limit concurrency
+      // Limit concurrency.
+      //
+      // Snapshot the limit once. It used to be read twice per iteration (once
+      // for the step, once for the slice end); the getter is lazy by design, so
+      // a config change landing between those two reads would produce chunks
+      // that overlap or skip requests outright. Laziness is still honoured — the
+      // value is re-read for the next batch.
+      const limit = getConcurrencyLimit()
       const chunks: ToolCallRequest[][] = []
-      for (let i = 0; i < batch.requests.length; i += getConcurrencyLimit()) {
-        chunks.push(batch.requests.slice(i, i + getConcurrencyLimit()))
+      for (let i = 0; i < batch.requests.length; i += limit) {
+        chunks.push(batch.requests.slice(i, i + limit))
       }
 
       for (const chunk of chunks) {

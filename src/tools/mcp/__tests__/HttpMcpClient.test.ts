@@ -23,6 +23,7 @@ import { describe, expect, it, beforeEach, afterEach } from 'vitest'
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http'
 import { AddressInfo } from 'node:net'
 import { HttpMcpClient } from '../HttpMcpClient.js'
+import { invalidateToolListCache } from '../registry.js'
 
 interface Recorded { method: string; headers: IncomingMessage['headers']; body: unknown }
 
@@ -34,6 +35,9 @@ let handler: (req: IncomingMessage, res: ServerResponse, body: Record<string, un
 
 beforeEach(async () => {
   recorded = []
+  // tools/list is memoised per server URL. The loopback port is reused across
+  // tests often enough that a stale entry would leak between them.
+  invalidateToolListCache()
   handler = (_req, res, body) => jsonRpc(res, body['id'] as number, { ok: true })
   server = createServer((req, res) => {
     const chunks: Buffer[] = []
@@ -104,10 +108,26 @@ describe('initialize handshake', () => {
     )
     const client = new HttpMcpClient(url, 'k')
     await client.listTools()
+    // A second listTools() is served from the tool-list cache (mcp_call needs a
+    // tool's _meta before every invocation, so an uncached lookup meant a second
+    // HTTP round-trip per tool call). Invalidate to force a real request and
+    // assert the session header is echoed on BOTH.
+    invalidateToolListCache()
     await client.listTools()
     const calls = recorded.filter(r => r.method === 'tools/list')
     expect(calls).toHaveLength(2)
     for (const c of calls) expect(c.headers['mcp-session-id']).toBe('sess-42')
+  })
+
+  it('caches tools/list so repeat lookups do not re-hit the server', () => {
+    return (async () => {
+      handler = afterHandshake((_r, res, body) => jsonRpc(res, body['id'] as number, { tools: [{ name: 't' }] }))
+      const client = new HttpMcpClient(url, 'k')
+      await client.listTools()
+      await client.listTools()
+      await client.listTools()
+      expect(recorded.filter(r => r.method === 'tools/list')).toHaveLength(1)
+    })()
   })
 
   it('adopts the protocol version the server negotiated', async () => {
@@ -289,6 +309,36 @@ describe('JSON-RPC payloads', () => {
 
   it('tolerates a result with no content array', async () => {
     handler = afterHandshake((_r, res, body) => jsonRpc(res, body['id'] as number, {}))
-    expect(await new HttpMcpClient(url, 'k').callTool('t', {})).toEqual({ content: undefined })
+    expect(await new HttpMcpClient(url, 'k').callTool('t', {})).toEqual({ content: [] })
+  })
+
+  it('lists paginated resources and reads an MCP App resource', async () => {
+    handler = afterHandshake((_r, res, body) => {
+      const params = body['params'] as Record<string, unknown> | undefined
+      if (body['method'] === 'resources/list') {
+        if (!params?.['cursor']) {
+          jsonRpc(res, body['id'] as number, {
+            resources: [{ uri: 'ui://one', mimeType: 'text/html;profile=mcp-app' }],
+            nextCursor: 'page-2',
+          })
+        } else {
+          jsonRpc(res, body['id'] as number, { resources: [{ uri: 'ui://two' }] })
+        }
+        return
+      }
+      if (body['method'] === 'resources/read') {
+        jsonRpc(res, body['id'] as number, {
+          contents: [{ uri: params?.['uri'], mimeType: 'text/html;profile=mcp-app', text: '<html />' }],
+        })
+      }
+    })
+    const client = new HttpMcpClient(url, 'k')
+    expect(await client.listResources()).toHaveLength(2)
+    expect(await client.readResource('ui://one')).toEqual({
+      contents: [{ uri: 'ui://one', mimeType: 'text/html;profile=mcp-app', text: '<html />' }],
+    })
+    const resourceCalls = recorded.filter(r => r.method === 'resources/list')
+    expect(resourceCalls).toHaveLength(2)
+    expect((resourceCalls[1]!.body as Record<string, unknown>)['params']).toEqual({ cursor: 'page-2' })
   })
 })

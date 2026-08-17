@@ -60,6 +60,24 @@ export interface ToolPermissionDeclaration {
   pathFields?: string[]
   /** Input field that contains a working directory, usually bash.cwd. */
   cwdField?: string
+  /**
+   * Input field holding a raw SHELL COMMAND STRING.
+   *
+   * Declaring this is what subscribes a tool to the kernel's command-level
+   * guards: the absolute-path workspace scan, the `~`/`$HOME`/`../`/`/` escape
+   * scan, and sensitive-command detection (`rm -rf`, `sudo`, `curl | sh`, …).
+   *
+   * Those guards used to be gated on `tool.name === 'bash' || 'powershell'`.
+   * That is why `cron_create` — which also takes a command string and also runs
+   * it through `bash -c` — silently received NONE of them, and why any tool an
+   * embedder registers under a different name would have had the same hole. A
+   * security control keyed on a literal name only protects the names someone
+   * remembered to list; keying it on the declaration means new execute tools
+   * are covered by construction.
+   *
+   * Any tool that passes model-supplied text to a shell MUST declare this.
+   */
+  commandField?: string
   /** Whether path/cwd fields are constrained to the workspace. Default: true for path-aware tools. */
   requiresWorkspace?: boolean
   /** Whether calls should go through interactive confirmation when available. */

@@ -105,25 +105,67 @@ function fieldMatches(value: number, spec: FieldSpec): boolean {
 }
 
 /**
- * Milliseconds until the next wall-clock instant matching `spec`, strictly
- * after `fromMs`.  Scans second-by-second (bounded at 25 h — every supported
- * expression recurs at least daily, so a match always exists in that window).
+ * First instant on `day`'s calendar date that matches `spec` and is at or after
+ * `day`'s own time-of-day. Returns null when the rest of that day has no match.
+ *
+ * Iterates over the FIELD DOMAINS (24 hours × 60 minutes × 60 seconds, each
+ * with an early `continue`), not over every second on the clock. A matching
+ * hour is normally found within a few steps and the minute/second loops exit on
+ * their first match, so a typical call examines on the order of a hundred
+ * values.
  */
-export function nextRunDelayMs(spec: CronSpec, fromMs = Date.now()): number {
-  const start = Math.floor(fromMs / 1000) * 1000 + 1000  // next whole second
-  const limit = start + 25 * 3600 * 1000
-  for (let t = start; t <= limit; t += 1000) {
-    const d = new Date(t)
-    if (
-      fieldMatches(d.getSeconds(), spec.sec) &&
-      fieldMatches(d.getMinutes(), spec.min) &&
-      fieldMatches(d.getHours(), spec.hour)
-    ) {
-      return t - fromMs
+function firstMatchOnDay(day: Date, spec: CronSpec): number | null {
+  const fromH = day.getHours()
+  const fromM = day.getMinutes()
+  const fromS = day.getSeconds()
+  for (let h = fromH; h <= 23; h++) {
+    if (!fieldMatches(h, spec.hour)) continue
+    for (let m = h === fromH ? fromM : 0; m <= 59; m++) {
+      if (!fieldMatches(m, spec.min)) continue
+      for (let s = h === fromH && m === fromM ? fromS : 0; s <= 59; s++) {
+        if (!fieldMatches(s, spec.sec)) continue
+        const hit = new Date(day)
+        hit.setHours(h, m, s, 0)
+        return hit.getTime()
+      }
     }
   }
-  // Unreachable for validated specs — defensive fallback.
-  throw new Error('cron: no matching instant within 25 h')
+  return null
+}
+
+/**
+ * Milliseconds until the next wall-clock instant matching `spec`, strictly
+ * after `fromMs`.
+ *
+ * The previous implementation stepped one second at a time across a 25 h
+ * horizon, so arming a DAILY job allocated ~86,400 `Date` objects and blocked
+ * the event loop for the whole walk — on every re-arm, i.e. after every run.
+ *
+ * Local time, deliberately: someone writing `0 0 9 * * *` means 09:00 where
+ * they are. A consequence is that DST transitions make a daily job fire 23 or
+ * 25 hours after the previous one, which is standard cron behaviour.
+ */
+export function nextRunDelayMs(spec: CronSpec, fromMs = Date.now()): number {
+  // Strictly after `fromMs`: begin at the next whole second.
+  const start = new Date(Math.floor(fromMs / 1000) * 1000 + 1000)
+
+  // Today (from `start` onward), then the two following days from midnight.
+  // Every supported expression recurs at least daily, so a match always exists
+  // within that window; the third day is slack for a DST-shifted boundary.
+  for (let offset = 0; offset < 3; offset++) {
+    const day = new Date(start)
+    if (offset > 0) {
+      day.setDate(day.getDate() + offset)
+      day.setHours(0, 0, 0, 0)
+    }
+    const hit = firstMatchOnDay(day, spec)
+    if (hit !== null && hit > fromMs) return hit - fromMs
+  }
+
+  // Unreachable for validated specs. Re-check in a second rather than throwing
+  // and killing the job: a scheduler that stops silently is worse than one that
+  // is briefly imprecise.
+  return 1000
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

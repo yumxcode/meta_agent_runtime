@@ -63,21 +63,40 @@ export function buildBwrapArgs(
     args.push('--bind', workspaceRoot, workspaceRoot)
   }
 
-  // Extra write-allow paths from config
+  // Extra write-allow paths from config (operator-granted external roots).
+  //
+  // `--bind-try`, not `--bind`: bwrap aborts the ENTIRE command when a `--bind`
+  // source is missing, so a single stale entry in `sandbox.writeAllowPaths`
+  // (a scratch dir that got cleaned up) turned every shell call in the session
+  // into an opaque bwrap error. The write-deny loop below already used the
+  // -try form; there was no reason for the two to differ.
   for (const p of config.writeAllowPaths ?? []) {
-    args.push('--bind', p, p)
+    args.push('--bind-try', p, p)
   }
 
-  // Write-deny approximation: ro-bind the denied path over the writable
-  // workspace bind (later mounts shadow earlier ones). The source path must
-  // exist on the host — callers pre-create it (see SandboxConfig docs).
+  // Read-allow paths need no mount of their own — `--ro-bind / /` above already
+  // exposes the whole host filesystem read-only. They are re-applied AFTER the
+  // read-deny tmpfs loop below only when they would otherwise be shadowed; see
+  // the reconciliation there.
+
+  // Write-deny: ro-bind the denied path over the writable workspace bind
+  // (later mounts shadow earlier ones). The source path must exist on the
+  // host — callers pre-create it (see SandboxConfig docs).
   for (const p of config.writeDenyPaths ?? []) {
     args.push('--ro-bind-try', p, p)
   }
 
-  // ── Read-deny approximation ───────────────────────────────────────────────
+  // ── Read-deny ─────────────────────────────────────────────────────────────
   // Mount a fresh tmpfs over each denied path, making it appear empty.
+  //
+  // A path that is BOTH read-denied and explicitly read-granted is skipped: the
+  // operator's explicit grant wins. resolveSandboxPolicy() normally removes such
+  // overlaps before we get here, but a caller may hand-build a SandboxConfig, and
+  // silently shadowing a directory the caller just asked for would be worse than
+  // either honouring or rejecting it.
+  const readAllow = config.readAllowPaths ?? []
   for (const p of config.readDenyPaths ?? []) {
+    if (readAllow.some(granted => granted === p || p.startsWith(`${granted}/`))) continue
     args.push('--tmpfs', p)
   }
 

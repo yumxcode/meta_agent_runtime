@@ -230,6 +230,8 @@ export {
   createShellTools, createBashTool, createPowerShellTool,
   createNetworkTools, createWebFetchTool, createWebSearchTool,
   createMcpTools, registerMcpClient, unregisterMcpClient, getRegisteredMcpServers,
+  setMcpAppPresenter, getMcpAppPresenter, getMcpAppResourceUri, isMcpToolVisibleTo,
+  MCP_APPS_EXTENSION_ID, MCP_APP_HTML_MIME_TYPE,
   createMcpCallTool, createListMcpResourcesTool, createReadMcpResourceTool,
   createUiTools, createAutoUiTools, createAskUserTool, createTodoWriteTool, getTodosForSession, deleteTodosForSession, createSendMessageTool, createProgressNoteTool, getProgressNoteForSession, deleteProgressNoteForSession, createArtifactsRegisterTool, getArtifactsForSession, deleteArtifactsForSession,
   createSystemTools, createSleepTool,
@@ -241,7 +243,10 @@ export {
   createStandardTools,
 } from './tools/index.js'
 export type {
-  McpClient, NetworkToolsOptions, WebSearchToolOptions, TodoItem,
+  McpClient, McpContentBlock, McpToolDefinition, McpToolResult,
+  McpResource, McpResourceContent, McpReadResourceResult,
+  McpAppPresenter, McpAppPresentation,
+  NetworkToolsOptions, WebSearchToolOptions, TodoItem,
   StandardToolsOptions, SystemToolsOptions, CronJob,
 } from './tools/index.js'
 

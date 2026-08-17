@@ -1,5 +1,13 @@
-export { registerMcpClient, unregisterMcpClient, getRegisteredMcpServers, disposeMcpClients } from './registry.js'
-export type { McpClient } from './registry.js'
+export {
+  registerMcpClient, unregisterMcpClient, getRegisteredMcpServers, disposeMcpClients,
+  setMcpAppPresenter, getMcpAppPresenter, getMcpAppResourceUri, isMcpToolVisibleTo,
+  MCP_APPS_EXTENSION_ID, MCP_APP_HTML_MIME_TYPE,
+} from './registry.js'
+export type {
+  McpClient, McpContentBlock, McpToolDefinition, McpToolResult,
+  McpResource, McpResourceContent, McpReadResourceResult,
+  McpAppPresenter, McpAppPresentation,
+} from './registry.js'
 export { HttpMcpClient } from './HttpMcpClient.js'
 export { loadMcpConfig, MCP_CONFIG_PATH, buildMcpServerInstructions } from './mcpConfigFile.js'
 export { createMcpCallTool } from './mcp_call/index.js'
