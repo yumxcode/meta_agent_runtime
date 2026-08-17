@@ -87,6 +87,8 @@ ${bold('AUTO SCHEDULER (plain auto self_timer)')}
       --poll-ms <n> --max-concurrent <n> [--once]
       --idle-exit-ms <n>    ${dim('Exit once the workspace has NO wakes left (default 60s; 0 = stay up)')}
       --stale-wake-ms <n>   ${dim('Retire a wake left unexecuted this long past due (default 7d; 0 = never)')}
+  meta-agent tasks [list|show <id>]        See every long-running Auto task
+      --all --json --workspace <dir>  ${dim('Alive? parked? ORPHANED? No API key needed.')}
   meta-agent -w <dir> --mode auto --attached "goal"
       Keep the original terminal attached across repeated self_timer wakes.
   By default self_timer persists state and exits; --attached instead keeps
@@ -234,7 +236,10 @@ export interface CliOptions {
   mcpAppsPort: number             // 0 asks the OS for an available loopback port
   mcpAppsOpen: boolean            // open the sidecar URL in the default browser
   /** Durable runtime subcommands. Args pass through verbatim. */
-  loopCommand: { name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer'; args: string[] } | null
+  loopCommand: {
+    name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks'
+    args: string[]
+  } | null
 }
 
 export function parseCliArgs(): CliOptions {
@@ -246,10 +251,11 @@ export function parseCliArgs(): CliOptions {
   // `steer` rides the same passthrough path: its payload is free-form user text
   // that the strict global parser would try to interpret as flags.
   const loopIdx = rawArgs.findIndex(a =>
-    a === 'loop' || a === 'loop-scheduler' || a === 'auto-scheduler' || a === 'steer')
+    a === 'loop' || a === 'loop-scheduler' || a === 'auto-scheduler' ||
+    a === 'steer' || a === 'tasks')
   if (loopIdx !== -1) {
     return buildLoopCliOptions(
-      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer',
+      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks',
       rawArgs.slice(0, loopIdx),
       rawArgs.slice(loopIdx + 1),
     )
@@ -418,7 +424,7 @@ export function parseCliArgs(): CliOptions {
  * `loop` token is handed verbatim to runLoopCli, which does its own flag parsing.
  */
 export function buildLoopCliOptions(
-  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer',
+  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks',
   globalArgs: string[],
   loopArgs: string[],
 ): CliOptions {

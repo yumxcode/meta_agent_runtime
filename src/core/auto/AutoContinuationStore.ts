@@ -71,6 +71,20 @@ export interface AutoContinuationRuntime {
   maxTurns?: number
   maxBudgetUsd?: number
   sessionDir?: string
+  /**
+   * `$META_AGENT_CONFIG_FILE` at park time — which PROVIDER PROFILE this
+   * session belongs to.
+   *
+   * Everything else here is only set when the operator passed an explicit CLI
+   * flag; a session that selects its provider through a config file (which is
+   * the normal way) records `runtime: {}` and, on resume, silently inherits
+   * whatever profile the resuming process happens to have. So a wake armed by
+   * `meta-agent-glm` and resumed by plain `meta-agent` continues the SAME
+   * session on a different account and model, with nothing in any log to say
+   * so. Recording the profile makes the wake self-describing, which is the
+   * precondition for any UI offering a "run this now" button.
+   */
+  configFile?: string
 }
 
 export interface AutoContinuationRecord {
@@ -313,6 +327,53 @@ export class AutoContinuationStore {
         updatedAt: Date.now(),
       })
       return true
+    })
+  }
+
+  /**
+   * Make a pending wake due immediately. This is how a UI says "run it now".
+   *
+   * The UI must never start a turn itself: that would be a second execution
+   * path next to the scheduler, duplicating the claim/lease protocol, and it
+   * would have to know which provider profile the session belongs to. Moving
+   * `fireAt` instead keeps execution in exactly one place — the running
+   * scheduler picks the wake up within one poll — and needs no API key.
+   *
+   * Only `pending` records qualify. A claimed wake is already executing, so
+   * "run it now" is a no-op rather than an error the caller must special-case;
+   * an already-due wake likewise returns true without a pointless write.
+   */
+  async fireNow(wakeId: string, now = Date.now()): Promise<boolean> {
+    return withFileLock(this.lockPath(), async () => {
+      const record = await readJsonFile<AutoContinuationRecord>(this.pathFor(wakeId))
+      if (!record || record.status !== 'pending') return false
+      if (record.fireAt <= now) return true
+      await atomicWriteJson(this.pathFor(wakeId), {
+        ...record,
+        fireAt: now,
+        updatedAt: now,
+      } satisfies AutoContinuationRecord)
+      return true
+    })
+  }
+
+  /**
+   * Physically delete every wake record for a session, terminal ones included.
+   *
+   * Distinct from `cancelSession`, which MARKS records so the audit trail
+   * survives. This is for an operator saying "remove this task entirely"; the
+   * audit trail is part of what they are removing.
+   */
+  async purgeSession(sessionId: string): Promise<number> {
+    await ensureDir(this.dir)
+    return withFileLock(this.lockPath(), async () => {
+      let removed = 0
+      for (const record of await this.listUnlocked()) {
+        if (record.sessionId !== sessionId) continue
+        await deleteJsonFile(this.pathFor(record.wakeId))
+        removed++
+      }
+      return removed
     })
   }
 

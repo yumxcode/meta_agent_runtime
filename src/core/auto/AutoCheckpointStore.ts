@@ -14,7 +14,7 @@
  * embedded sessionId matches the requested session.
  */
 import { existsSync, readFileSync } from 'fs'
-import { readFile } from 'fs/promises'
+import { readFile, readdir, rm } from 'fs/promises'
 import { join, resolve } from 'path'
 import { atomicWriteJson } from '../../infra/persist/index.js'
 
@@ -190,6 +190,49 @@ export function readAutoCheckpoint(workspaceRoot: string, sessionId: string): Au
   } catch {
     return null
   }
+}
+
+/**
+ * Every session that has a checkpoint in this workspace.
+ *
+ * Needed because a finished or ORPHANED task has no wake record left to find it
+ * by — the checkpoint is the only remaining trace. Filenames are
+ * `encodeURIComponent(sessionId)`, so they are decoded back rather than used
+ * verbatim. Missing directory (a workspace that never ran auto) is not an
+ * error: it simply has no tasks.
+ */
+export async function listAutoCheckpointSessionIds(workspaceRoot: string): Promise<string[]> {
+  const dir = join(resolve(workspaceRoot), '.meta-agent', 'auto', 'checkpoints')
+  try {
+    const entries = await readdir(dir)
+    const ids: string[] = []
+    for (const entry of entries) {
+      if (!entry.endsWith('.json') || entry.endsWith('.tmp')) continue
+      try {
+        ids.push(decodeURIComponent(entry.slice(0, -5)))
+      } catch {
+        // A filename that is not valid percent-encoding cannot have been
+        // written by us; skip rather than abort the whole listing.
+      }
+    }
+    return ids
+  } catch {
+    return []
+  }
+}
+
+/**
+ * Delete a session's checkpoint. Best-effort: a missing file is success.
+ *
+ * The checkpoint is what makes a task VISIBLE — nothing else survives long
+ * enough to list it — so removing it is what "delete this task" means. It does
+ * not touch the conversation history, which lives outside the workspace.
+ */
+export async function deleteAutoCheckpoint(
+  workspaceRoot: string,
+  sessionId: string,
+): Promise<void> {
+  await rm(autoCheckpointPath(workspaceRoot, sessionId), { force: true })
 }
 
 async function readAutoCheckpointAsync(workspaceRoot: string, sessionId: string): Promise<AutoCheckpoint | null> {

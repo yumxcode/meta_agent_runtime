@@ -219,6 +219,10 @@ export async function armAutoContinuation(input: {
         maxTurns: Number.isFinite(input.opts.maxTurns) ? input.opts.maxTurns : undefined,
         maxBudgetUsd: input.opts.maxBudgetUsd,
         sessionDir: input.opts.sessionDir,
+        // Every field above is undefined unless an explicit flag was passed, so
+        // without this a config-file-selected provider left no trace at all.
+        // See AutoContinuationRuntime.configFile.
+        configFile: process.env['META_AGENT_CONFIG_FILE']?.trim() || undefined,
       },
     },
     input.claimOwner ? { claimOwner: input.claimOwner } : undefined,

@@ -44,6 +44,7 @@ import { getMissingBwrapWarning } from './bwrapCheck.js'
 import { ensureMcpServerInstructions } from './mcpInstructions.js'
 import { runLoopCommand } from './commands/loop.js'
 import { runSteerCommand } from './commands/steer.js'
+import { runTasksCommand } from './commands/tasks.js'
 import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
 import { McpAppsBrowserHost } from './mcpAppsHost.js'
@@ -68,6 +69,13 @@ async function main(): Promise<void> {
     // burning tokens elsewhere, often from a second terminal.
     if (opts.loopCommand.name === 'steer') {
       await runSteerCommand(opts)
+      return
+    }
+    // `tasks` is read-only and must work with no provider key configured — it
+    // is the thing you reach for when something has gone wrong, and demanding
+    // credentials to LOOK at task state would be exactly backwards.
+    if (opts.loopCommand.name === 'tasks') {
+      await runTasksCommand(opts)
       return
     }
     if (opts.loopCommand.name === 'auto-scheduler') {

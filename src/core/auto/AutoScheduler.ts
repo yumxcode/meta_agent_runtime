@@ -20,6 +20,19 @@ export interface AutoSchedulerOptions {
    * for no reason.
    */
   idleExitMs?: number
+  /**
+   * Called once per poll iteration of `run()`.
+   *
+   * Used for the scheduler's liveness heartbeat. Deliberately driven by the
+   * poll tick rather than its own timer: a wedged or blocked loop then STOPS
+   * beating, which is exactly the condition a monitor needs to see. An
+   * independent `setInterval` would keep reporting health while nothing was
+   * being scheduled.
+   *
+   * Failures are swallowed — a monitoring side-channel must never take the
+   * scheduler down with it.
+   */
+  onTick?: (now: number) => void | Promise<void>
 }
 
 /** Why `run()` returned. */
@@ -135,6 +148,11 @@ export class AutoScheduler {
     let emptySince: number | null = null
 
     while (!signal.aborted) {
+      try {
+        await this.options.onTick?.(Date.now())
+      } catch {
+        // See onTick's contract: monitoring never breaks scheduling.
+      }
       // dispatchDue, NOT tickOnce: the polling loop must stay responsive to
       // newly-due wakes while earlier ones are still running.
       await this.dispatchDue(Date.now(), signal)

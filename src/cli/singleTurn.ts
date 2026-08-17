@@ -24,6 +24,7 @@ import {
 import { readAutoCheckpoint } from '../core/auto/AutoCheckpointStore.js'
 import { drainSteer, pruneSteer } from '../core/auto/SteerChannel.js'
 import { AutoScheduler } from '../core/auto/AutoScheduler.js'
+import { SchedulerRegistration } from '../core/auto/SchedulerRegistry.js'
 import { AttachedAutoScheduler } from '../core/auto/AttachedAutoScheduler.js'
 import { formatLocalClock, formatLocalTimestamp } from '../loop/localTime.js'
 import { bold, cyan, dim, gray, green, red, yellow, isTTY, terminalText, safeStdoutWrite } from './term.js'
@@ -356,6 +357,26 @@ async function resumeAutoContinuation(
     return { outcome: 'cancelled', reason: 'top-level goal changed since the wake was armed' }
   }
 
+  // Provider-profile drift. `runtime.model` / `baseUrl` are undefined whenever
+  // the provider came from a config file, so those fields fall through to THIS
+  // process's configuration — a session armed by `meta-agent-glm` and resumed
+  // by plain `meta-agent` quietly continues on another account and model.
+  //
+  // Warn, never fence: a rejection here is terminal, and killing a live session
+  // over a renamed config file would be exactly the class of bug that cost a
+  // 40-minute run on 2026-08-17. The operator gets a loud line and a working
+  // session, and decides for themselves.
+  const armedProfile = record.runtime?.configFile
+  const currentProfile = process.env['META_AGENT_CONFIG_FILE']?.trim() || undefined
+  if (armedProfile !== currentProfile) {
+    process.stderr.write(
+      `${yellow('[auto-scheduler]')} provider profile differs from the one that armed this wake: ` +
+      `armed with ${armedProfile ?? '(default config)'}, resuming with ${currentProfile ?? '(default config)'}. ` +
+      `The turn will run on the RESUMING profile's account and model. ` +
+      `Start the scheduler with the matching binary to avoid this.\n`,
+    )
+  }
+
   const resumedOpts: CliOptions = {
     ...opts,
     mode: 'auto',
@@ -462,6 +483,18 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
     else process.stderr.write(`${message}\n`)
   }
 
+  // Registered before the loop starts so `meta-agent tasks` can see this
+  // workspace even during a long first poll, and so a crash leaves a record
+  // whose lastSeen pins the moment this process stopped beating. A registry
+  // that cannot be written must never stop the scheduler — the task view
+  // simply will not know about this workspace.
+  let registration: SchedulerRegistration | undefined
+  try {
+    registration = await SchedulerRegistration.register({
+      workspace: projectDir, pollIntervalMs, maxConcurrent,
+    })
+  } catch { /* monitoring is best-effort */ }
+
   const scheduler = new AutoScheduler(
     store,
     async (record, signal) => {
@@ -482,6 +515,7 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
       maxConcurrent,
       idleExitMs,
       onEvent: emit,
+      onTick: now => registration?.beat(now),
     },
   )
 
@@ -534,6 +568,10 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
       }
     }
   } finally {
+    // Mark, don't delete: the record doubles as this workspace's registration,
+    // and dropping it would make the workspace disappear from the global task
+    // view at exactly the moment its scheduler went away.
+    await registration?.markStopped()
     process.removeListener('SIGINT', stop)
     process.removeListener('SIGTERM', stop)
   }
