@@ -223,6 +223,12 @@ async function collectWorkspaceTasks(
     const pending = own.find(w => w.status === 'pending')
     const claimed = own.find(w => w.status === 'claimed')
     const checkpoint = readAutoCheckpoint(workspace, sessionId)
+    // The id came from a FILENAME. If that file turned out to be unreadable
+    // (corrupt, truncated, hand-edited, or simply not ours) and no wake record
+    // corroborates it, we know nothing about this session — emitting a row
+    // would invent a task out of a bad file, offer actions on it, and dilute
+    // the signal the view exists to carry.
+    if (!checkpoint && own.length === 0) continue
     const status = deriveTaskStatus({
       now,
       ...(pending ? { pending } : {}),

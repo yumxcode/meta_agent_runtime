@@ -26,6 +26,23 @@ import { dynamicDescription } from '../../util.js'
 export const RESEARCH_MAX_DURATION_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS
 const POLL_INTERVAL_MS = 2_000
 const DEFAULT_MAX_TURNS = 60
+
+/**
+ * Cost ceiling for one research run.
+ *
+ * MUST be set explicitly. `DEFAULT_SUB_AGENT_CONFIG.maxBudgetUsd` is $0.50 —
+ * sized for a small helper task, and it was silently inherited here for every
+ * research run. `maxTurns` (60) and `maxDurationMs` (30 min) had both been
+ * raised for research; the budget was the one limit nobody raised, so it became
+ * the binding constraint on an agent whose whole job is to "read the relevant
+ * sources IN FULL". Runs died mid-read, never reached return_result, and the
+ * saved report degraded to whatever narration was in the last message.
+ *
+ * Reading a handful of papers in full costs multiples of $0.50; $4 buys a real
+ * literature pass while still being a circuit breaker rather than a blank
+ * cheque. Callers can override per dispatch with `max_budget_usd`.
+ */
+const DEFAULT_MAX_BUDGET_USD = 4
 const CONCLUSION_HANDLE_MAX = 300
 
 const RESEARCH_AGENT_SYSTEM = `\
@@ -127,6 +144,12 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
           type: 'number',
           description: `Max sub-agent turns (default ${DEFAULT_MAX_TURNS}).`,
         },
+        max_budget_usd: {
+          type: 'number',
+          description:
+            `Cost ceiling in USD (default ${DEFAULT_MAX_BUDGET_USD}). Raise it for a broad ` +
+            'survey that must read many papers in full; the run is hard-stopped at this limit.',
+        },
       },
     },
     async call(input, ctx): Promise<ToolResult> {
@@ -135,6 +158,10 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
       const extractionSpec = input['extraction_spec'] as string | undefined
       const scope = input['scope'] as string | undefined
       const maxTurns = (input['max_turns'] as number | undefined) ?? DEFAULT_MAX_TURNS
+      const rawBudget = input['max_budget_usd'] as number | undefined
+      const maxBudgetUsd = Number.isFinite(rawBudget) && (rawBudget as number) > 0
+        ? rawBudget as number
+        : DEFAULT_MAX_BUDGET_USD
 
       const taskDescription = [
         '# Research Task',
@@ -156,6 +183,7 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
               ...(opts.extraAllowedTools ?? []),
             ],
             maxTurns,
+            maxBudgetUsd,
             maxDurationMs: RESEARCH_MAX_DURATION_MS,
           },
           abortSignal: ctx.abortSignal,
@@ -186,12 +214,31 @@ export function createResearchDispatchTool(opts: ResearchDispatchOptions): MetaA
           }
         }
 
+        // A partial report must SAY it is partial, in the file itself. The tool
+        // result carries that fact, but the report outlives it: it is read back
+        // sessions later, after compaction, by a model that has no memory of
+        // this call. Without the banner, a report that was cut off mid-read is
+        // indistinguishable from a thin-but-finished one, and the reader has no
+        // way to know the missing sections were never written rather than
+        // never existing.
+        const reportForDisk = completed
+          ? reportMarkdown
+          : [
+              `> ⚠️ **INCOMPLETE — this research run was stopped before it finished.**`,
+              `> Reason: ${final?.result?.error ?? final?.status ?? 'unknown'}`,
+              `> Everything below is what had been gathered at that point. Sections the`,
+              `> plan called for may be missing entirely rather than empty. Re-dispatch a`,
+              `> research task scoped to the gaps rather than trusting this as complete.`,
+              '',
+              reportMarkdown,
+            ].join('\n')
+
         const entry = await store.saveResult({
           taskId: record.taskId,
           question,
           status: completed ? 'success' : 'partial',
           conclusion: data.conclusion || clipLine(summaryText || reportMarkdown, CONCLUSION_HANDLE_MAX),
-          reportMarkdown,
+          reportMarkdown: reportForDisk,
           sourcesMarkdown: data.sources_markdown,
           papersCovered: data.papers_covered,
           sessionId: opts.sessionId,

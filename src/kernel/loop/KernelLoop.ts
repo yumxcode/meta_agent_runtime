@@ -11,7 +11,8 @@ import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
 import {
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
   AUTO_RECURRING_ERROR_LIMIT, RECURRING_ERROR_WINDOW,
-  SELF_EVAL_PROMPT, allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
+  SELF_EVAL_PROMPT, BUDGET_WARNING_FRACTION, BUDGET_WARNING_PROMPT,
+  allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
   collectTurnErrors, uniqueTurnErrors, countTurnsWithErrorSignature,
   buildRecurringErrorReflection,
 } from './AutoStallGuard.js'
@@ -682,6 +683,11 @@ export async function* runKernelLoop(
   const budgetExceeded = (): boolean =>
     config.maxBudgetUsd !== undefined &&
     totalCost + additionalBudgetUsd() >= config.maxBudgetUsd
+  /** Nearly out of money — see BUDGET_WARNING_FRACTION. */
+  const budgetNearlyExhausted = (): boolean =>
+    config.maxBudgetUsd !== undefined &&
+    totalCost + additionalBudgetUsd() >= config.maxBudgetUsd * BUDGET_WARNING_FRACTION
+  let budgetWarningInjected = false
   reportMainCost()
   let repeatedToolRequestCount = 0
   let pollingRepeatCount = 0
@@ -1913,6 +1919,20 @@ export async function* runKernelLoop(
     // ── Budget check ─────────────────────────────────────────────────────────
     if (budgetExceeded()) {
       return done('max_budget_usd')
+    }
+
+    // Budget WARNING — the last chance the model gets to deliver something.
+    // Placed after the hard check (so an already-doomed turn is not nudged) and
+    // on the tool path only: a run that finished without tool calls has already
+    // said its piece. One-shot; the next crossing is the hard stop.
+    if (!budgetWarningInjected && budgetNearlyExhausted()) {
+      budgetWarningInjected = true
+      append(makeTextUserMessage(BUDGET_WARNING_PROMPT, { isMeta: true }))
+      yield {
+        type: 'text_delta',
+        delta: `\n[budget] 已用约 ${Math.round(BUDGET_WARNING_FRACTION * 100)}% 预算，提示收尾…\n`,
+        sessionId,
+      }
     }
 
     // ── Step 19: continue ────────────────────────────────────────────────────

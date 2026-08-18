@@ -56,24 +56,40 @@ function paint(status: TaskStatus, text: string): string {
   }
 }
 
+/** Lines this layout always spends: header, its rule, and the footer. */
+const FIXED_CHROME_LINES = 3
+const MAX_DETAIL_LINES = 6
+
+/**
+ * Assemble the frame so that it NEVER exceeds `rows` and the footer is always
+ * the last line.
+ *
+ * The footer is not decoration: it carries the destructive-action confirmation
+ * ("Delete … AND its conversation history? [y/n]"). An earlier version built a
+ * fixed-height frame and let the caller truncate, so on a terminal shorter than
+ * nine rows the prompt was cut off — the operator sat in confirm mode with no
+ * sign of it, and the next `y` they typed for any reason deleted a session's
+ * history. Space is therefore taken from the detail panel first, then the list,
+ * and never from the footer.
+ */
 export function buildFrame(input: FrameInput): string[] {
   const width = Math.max(40, input.columns)
-  const lines: string[] = []
+  const rows = Math.max(FIXED_CHROME_LINES, input.rows)
+  const rule = dim('─'.repeat(width))
+  const body = rows - FIXED_CHROME_LINES
 
-  lines.push(header(input, width))
-  lines.push(dim('─'.repeat(width)))
+  // The detail panel needs its own rule, so it costs `detailHeight + 1`. It is
+  // only worth showing if at least one list row survives.
+  const detailBudget = input.tasks.length > 0 && body >= 3
+    ? Math.min(MAX_DETAIL_LINES, body - 2)
+    : 0
+  const detailLines = detailBudget > 0
+    ? detail(input.tasks[input.selected], width, detailBudget)
+    : []
+  const listBudget = Math.max(0, body - (detailLines.length > 0 ? detailLines.length + 1 : 0))
 
-  // Reserve: header 2 + separator 1 + detail 8 + status 1 + keys 1.
-  const detailHeight = input.tasks.length > 0 ? 8 : 0
-  const listHeight = Math.max(3, input.rows - 2 - detailHeight - 3)
-  lines.push(...list(input, width, listHeight))
-
-  if (input.tasks.length > 0) {
-    lines.push(dim('─'.repeat(width)))
-    lines.push(...detail(input.tasks[input.selected], width, detailHeight - 1))
-  }
-
-  lines.push(dim('─'.repeat(width)))
+  const lines = [header(input, width), rule, ...list(input, width, listBudget).slice(0, listBudget)]
+  if (detailLines.length > 0) lines.push(rule, ...detailLines)
   lines.push(footer(input, width))
   return lines
 }

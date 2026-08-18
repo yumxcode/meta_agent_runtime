@@ -9,7 +9,7 @@
  * describes the incident rather than the code.
  */
 import { describe, expect, it, afterEach } from 'vitest'
-import { mkdtemp, rm } from 'node:fs/promises'
+import { mkdir, mkdtemp, rm, writeFile } from 'node:fs/promises'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { AutoContinuationStore } from '../AutoContinuationStore.js'
@@ -196,6 +196,29 @@ describe('workspace scanning', () => {
 
   it('returns nothing for a workspace that never ran auto', async () => {
     expect(await collectTasks({ workspaces: [await workspace()] })).toEqual([])
+  })
+
+  it('does not invent a task from an unreadable checkpoint file', async () => {
+    // Session ids come from filenames. A corrupt, truncated, hand-edited or
+    // foreign file would otherwise become a phantom row with actions on it,
+    // diluting the signal this view exists to carry.
+    const ws = await workspace()
+    await mkdir(join(ws, '.meta-agent', 'auto', 'checkpoints'), { recursive: true })
+    await writeFile(join(ws, '.meta-agent', 'auto', 'checkpoints', 'broken.json'), '{ not json')
+    await writeFile(join(ws, '.meta-agent', 'auto', 'checkpoints', '%zz.json'), '{}')
+    expect(await collectTasks({ workspaces: [ws] })).toEqual([])
+  })
+
+  it('still lists a session whose checkpoint is unreadable but has a live wake', async () => {
+    // Here the wake corroborates the session, so hiding it would conceal real
+    // scheduled work.
+    const ws = await workspace()
+    await new AutoContinuationStore(ws).schedule({
+      sessionId: 'wake-only', fireAt: Date.now() + 60_000, reason: 'r', historyMessageCount: 1,
+    })
+    const tasks = await collectTasks({ workspaces: [ws] })
+    expect(tasks.map(t => t.sessionId)).toEqual(['wake-only'])
+    expect(tasks[0]!.status).toBe('parked')
   })
 
   it('reports the scheduler as down when none is registered', async () => {

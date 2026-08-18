@@ -99,16 +99,70 @@ async function callTavilySearch(
 
 // ── Provider: GLM web-search-prime MCP ────────────────────────────────────────
 
+/**
+ * Deadline for the GLM MCP round trip.
+ *
+ * `McpClient.callTool` takes no AbortSignal, so this provider used to be barred
+ * from autonomous runs outright ("non-abortable"): a hung MCP server could wedge
+ * an unattended session forever. Disabling it fixed the hang by removing the
+ * capability — and for a GLM-only install that left auto mode with NO search
+ * provider at all, reported as the misleading "no web search provider
+ * configured".
+ *
+ * Bounding the WAIT restores abortability where it matters. We cannot cancel the
+ * request itself, but we stop waiting on it, so the loop can never be held
+ * hostage by an unresponsive server. The orphaned promise is neutralised so a
+ * late rejection cannot surface as an unhandled rejection (which the CLI treats
+ * as fatal).
+ */
+const GLM_SEARCH_TIMEOUT_MS = 30_000
+
+async function withDeadline<T>(
+  work: Promise<T>,
+  timeoutMs: number,
+  signal: AbortSignal | undefined,
+  label: string,
+): Promise<T> {
+  work.catch(() => undefined)   // the loser of the race must not go unhandled
+  let timer: NodeJS.Timeout | undefined
+  let onAbort: (() => void) | undefined
+  try {
+    return await Promise.race([
+      work,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs}ms`)), timeoutMs)
+        timer.unref?.()
+        if (signal) {
+          onAbort = () => reject(new Error(`${label} aborted`))
+          if (signal.aborted) onAbort()
+          else signal.addEventListener('abort', onAbort, { once: true })
+        }
+      }),
+    ])
+  } finally {
+    if (timer) clearTimeout(timer)
+    if (onAbort && signal) signal.removeEventListener('abort', onAbort)
+  }
+}
+
 /** Returns null when the web-search-prime MCP server is not registered. */
-async function callGlmSearch(query: string): Promise<ToolResult | null> {
+async function callGlmSearch(
+  query: string,
+  signal: AbortSignal | undefined,
+): Promise<ToolResult | null> {
   const client = mcpClients.get(GLM_MCP_SERVER)
   if (!client) return null
   try {
-    const result = await client.callTool(GLM_MCP_TOOL, {
-      search_query: query,
-      content_size: 'medium',
-      location: 'us',
-    })
+    const result = await withDeadline(
+      client.callTool(GLM_MCP_TOOL, {
+        search_query: query,
+        content_size: 'medium',
+        location: 'us',
+      }),
+      GLM_SEARCH_TIMEOUT_MS,
+      signal,
+      'GLM MCP search',
+    )
     const text = result.content.filter(c => c.type === 'text' && c.text).map(c => c.text!).join('\n')
     return { content: text || 'No results found', isError: false }
   } catch (err) {
@@ -193,13 +247,7 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
         return callTavilySearch(query, tavilyKey, allowedDomains, blockedDomains, ctx.abortSignal)
       }
       if (pinned === 'glm') {
-        if (ctx.autonomousMode) {
-          return {
-            content: 'Error: GLM MCP web search is non-abortable and disabled in auto mode.',
-            isError: true,
-          }
-        }
-        const glm = await callGlmSearch(query)
+        const glm = await callGlmSearch(query, ctx.abortSignal)
         return glm ?? { content: 'Error: META_AGENT_SEARCH_PROVIDER=glm but the web-search-prime MCP is not registered (set ZHIPU_API_KEY / mcp.json).', isError: true }
       }
       if (pinned === 'anthropic') {
@@ -209,32 +257,47 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
 
       // ── Default chain: Tavily → GLM MCP → Anthropic ───────────────────────
       const failures: string[] = []
+      /** Providers that were not even attempted, and why. Reported on failure. */
+      const skipped: string[] = []
 
       if (tavilyKey) {
         const tavily = await callTavilySearch(query, tavilyKey, allowedDomains, blockedDomains, ctx.abortSignal)
         if (!tavily.isError) return tavily
         failures.push(tavily.content)
+      } else {
+        skipped.push('tavily: TAVILY_API_KEY not set (env or ~/.meta-agent/config.json)')
       }
 
-      if (!ctx.autonomousMode) {
-        const glm = await callGlmSearch(query)
-        if (glm && !glm.isError) return glm
-        if (glm) failures.push(glm.content)
-      }
+      // No autonomous-mode gate here any more: the wait is bounded (see
+      // GLM_SEARCH_TIMEOUT_MS), so an unresponsive server can no longer wedge an
+      // unattended run — which was the only reason to bar it. Barring it left a
+      // GLM-only install with zero providers in auto mode.
+      const glm = await callGlmSearch(query, ctx.abortSignal)
+      if (glm && !glm.isError) return glm
+      if (glm) failures.push(glm.content)
+      else skipped.push(`glm: MCP server "${GLM_MCP_SERVER}" is not registered (set ZHIPU_API_KEY / mcp.json)`)
 
       if (anthropicKey) {
         const anthropic = await callAnthropicSearch(query, anthropicKey, model, input, ctx.abortSignal)
         if (!anthropic.isError) return anthropic
         failures.push(anthropic.content)
+      } else {
+        skipped.push('anthropic: ANTHROPIC_API_KEY not set')
       }
 
-      if (failures.length > 0) {
-        return { content: `web_search failed across all providers:\n- ${failures.join('\n- ')}`, isError: true }
-      }
+      // Name what happened to EVERY provider. The old message reported only
+      // "no web search provider configured" whenever nothing had been tried,
+      // which sent operators looking for a missing key while the real cause was
+      // a provider that had been skipped for an entirely different reason.
+      const detail = [
+        ...failures.map(f => `- failed → ${f}`),
+        ...skipped.map(s => `- skipped → ${s}`),
+      ].join('\n')
       return {
-        content:
-          'Error: no web search provider configured. Set TAVILY_API_KEY (recommended), ' +
-          'or ZHIPU_API_KEY (GLM web-search-prime MCP), or ANTHROPIC_API_KEY.',
+        content: failures.length > 0
+          ? `web_search failed across all providers:\n${detail}`
+          : `Error: no usable web search provider.\n${detail}\n` +
+            'Set TAVILY_API_KEY (recommended), or ZHIPU_API_KEY (GLM web-search-prime MCP), or ANTHROPIC_API_KEY.',
         isError: true,
       }
     },

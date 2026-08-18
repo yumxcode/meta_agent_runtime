@@ -50,6 +50,30 @@ export const SELF_EVAL_PROMPT =
   '(3) 给出下一步**最小可行动作**。不要重复刚才失败的做法。'
 
 /**
+ * Fraction of `maxBudgetUsd` at which the run is warned it is nearly out.
+ *
+ * The budget circuit is a HARD stop taken at a turn boundary: the loop simply
+ * returns `max_budget_usd` and the model is never asked again. Every prompt that
+ * says "if you are running low, wrap up and deliver what you have" was therefore
+ * unactionable — nothing ever told the model it was running low, and cost is the
+ * one limit it cannot observe for itself (unlike turns, which it can count).
+ *
+ * A research sub-agent instructed to read sources IN FULL is the worst case: it
+ * hit the cap mid-read, never called return_result, and its report degraded to
+ * whatever narration happened to be in the last message.
+ *
+ * 0.8 leaves a real turn or two of room to summarise at typical per-turn costs.
+ */
+export const BUDGET_WARNING_FRACTION = 0.8
+
+/** Injected once, when spend first crosses BUDGET_WARNING_FRACTION. */
+export const BUDGET_WARNING_PROMPT =
+  '[系统·预算预警] 本次运行已用掉约 80% 的成本预算，达到上限会被**硬性中断**，' +
+  '届时你没有任何机会再补交结果。请立刻收尾：停止继续检索/读取新材料，' +
+  '用现有材料给出交付物（若你是子代理，现在就调用 return_result），' +
+  '并在交付物中明确写出哪些部分尚未完成、缺什么。宁可交一份标注了缺口的成果，也不要被截断成半句话。'
+
+/**
  * True when this turn produced at least one tool result AND every tool result
  * was an error. A turn with no tool results, or with any successful result,
  * returns false (and the caller resets its counter).

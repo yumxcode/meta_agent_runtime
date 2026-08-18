@@ -14,7 +14,7 @@ const NOW = 1_700_000_000_000
 function task(over: Partial<TaskView> = {}): TaskView {
   return {
     workspace: '/home/u/X1_29_AMP',
-    sessionId: '9bf2297f-800e-47fc-bde8-a6266593909c',
+    sessionId: 'abcdef12-800e-47fc-bde8-a6266593909c',
     status: 'parked',
     progress: { completedSteps: [], pendingTodos: [] },
     health: {},
@@ -109,9 +109,9 @@ describe('the unhealthy hint routes to the recovery command without inlining it'
   it('points at tasks show rather than a command that cannot fit', () => {
     const advice = hint(task({ status: 'orphaned' }))
     expect(advice).toContain('never resume')
-    expect(advice).toContain('tasks show 9bf2297f')
+    expect(advice).toContain('tasks show abcdef12')
     // A truncated command looks copy-pasteable and is not — worse than none.
-    expect(advice).not.toContain('--resume 9bf2297f-800e')
+    expect(advice).not.toContain('--resume abcdef12-800e')
   })
 
   it('keeps an orphaned row inside the terminal width', () => {
@@ -143,6 +143,38 @@ describe('input modes take over the footer', () => {
     }))
     expect(out).toContain('Interrupt the running turn')
     expect(out).toContain('[y/n]')
+  })
+})
+
+describe('the footer survives every terminal size', () => {
+  // The footer carries the destructive confirmation. A frame that overflows and
+  // gets truncated by the caller leaves the operator in confirm mode with no
+  // sign of it — and the next `y` they type deletes a session's history.
+  const prompt = 'Delete abcdef12 AND its conversation history?'
+
+  for (const rows of [3, 4, 6, 8, 10, 16, 24, 60]) {
+    it(`keeps the confirm prompt visible at ${rows} rows`, () => {
+      const lines = buildFrame({
+        tasks: [task(), task({ sessionId: 'other' })],
+        selected: 0,
+        mode: { kind: 'confirm', prompt },
+        showFinished: false,
+        now: NOW,
+        rows,
+        columns: 80,
+      })
+      expect(lines.length).toBeLessThanOrEqual(Math.max(3, rows))
+      expect(plain(lines[lines.length - 1]!)).toContain(prompt)
+    })
+  }
+
+  it('keeps at least one task row rather than an empty list', () => {
+    const lines = buildFrame({
+      tasks: [task(), task({ sessionId: 'other' })],
+      selected: 0, mode: { kind: 'browse' }, showFinished: false,
+      now: NOW, rows: 6, columns: 80,
+    })
+    expect(plain(lines.join('\n'))).toContain('abcdef12')
   })
 })
 

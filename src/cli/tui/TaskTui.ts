@@ -64,6 +64,8 @@ export class TaskTui {
   private refreshing = false
   private running = false
   private pendingAction: TaskActionKind | undefined
+  /** The task an in-progress confirm/steer prompt refers to. See startAction. */
+  private pendingTask: TaskView | undefined
   private readonly refreshMs: number
   private timer: NodeJS.Timeout | undefined
   private resolveExit: (() => void) | undefined
@@ -238,6 +240,7 @@ export class TaskTui {
 
     if (key.name === 'escape') {
       if (kind === 'filter') { this.activeQuery = ''; this.applyFilter(); this.clampSelection() }
+      else this.pendingTask = undefined
       this.mode = { kind: 'browse' }
       return
     }
@@ -263,8 +266,12 @@ export class TaskTui {
     const action = this.pendingAction
     this.mode = { kind: 'browse' }
     this.pendingAction = undefined
-    if (key.ch === 'y' && action) void this.commitAction(action)
-    else this.status = { ok: false, text: 'cancelled' }
+    if (key.ch === 'y' && action) {
+      void this.commitAction(action)
+    } else {
+      this.pendingTask = undefined
+      this.status = { ok: false, text: 'cancelled' }
+    }
   }
 
   private startAction(kind: TaskActionKind): void {
@@ -275,6 +282,11 @@ export class TaskTui {
       this.status = { ok: false, text: `${kind}: ${gate.reason}` }
       return
     }
+    // Bind the TARGET now, not when the key is finally confirmed. Typing a
+    // correction or reading a confirmation takes seconds, and the 1s refresh
+    // re-sorts the list underneath — an action that re-reads the cursor could
+    // land on a different task than the one the prompt named.
+    this.pendingTask = task
     if (kind === 'steer') { this.mode = { kind: 'steer', text: '' }; return }
     if (gate.destructive) {
       this.pendingAction = kind
@@ -285,7 +297,8 @@ export class TaskTui {
   }
 
   private async commitAction(kind: TaskActionKind, text?: string): Promise<void> {
-    const task = this.filtered[this.selected]
+    const task = this.pendingTask ?? this.filtered[this.selected]
+    this.pendingTask = undefined
     if (!task) return
     try {
       const result = await applyTaskAction(task, kind, text)
