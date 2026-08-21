@@ -481,7 +481,7 @@ export class HostSchedulerCoordinator {
   private async readRecords<T>(dir: string): Promise<T[]> {
     const names = await readdir(dir).catch(() => [])
     const values = await Promise.all(names.filter(name => name.endsWith('.json'))
-      .map(name => readJsonFile<T>(join(dir, name))))
+      .map(name => readJsonFile<T>(join(dir, name), { tolerateUnreadable: true })))
     return values.filter(value => value !== null) as T[]
   }
 

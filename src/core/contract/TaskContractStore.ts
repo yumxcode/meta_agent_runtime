@@ -15,7 +15,7 @@ import { readdir } from 'fs/promises'
 import { join } from 'path'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../metaAgentHome.js'
-import { atomicWriteJson, readJsonFile, deleteJsonFile } from '../persist/index.js'
+import { atomicWriteJson, readJsonFile, deleteJsonFile } from '../../infra/persist/index.js'
 import type { TaskContract } from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────

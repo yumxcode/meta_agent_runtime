@@ -16,7 +16,7 @@
 import { appendFile, mkdir, readFile, writeFile } from 'fs/promises'
 import { createHash } from 'crypto'
 import { join } from 'path'
-import { atomicWriteFile } from '../persist/index.js'
+import { atomicWriteFile } from '../../infra/persist/index.js'
 import { ensureMemoryDirExists } from './memdir.js'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
 import { MEMORY_TYPES, type MemoryType } from './types.js'

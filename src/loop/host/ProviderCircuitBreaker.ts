@@ -156,7 +156,7 @@ export class ProviderCircuitBreaker {
   async snapshot(): Promise<ProviderCircuitRecord[]> {
     await this.ensureLayout()
     const names = (await readdir(this.circuitsDir())).filter(name => name.endsWith('.json'))
-    const records = await Promise.all(names.map(name => readJsonFile<ProviderCircuitRecord>(join(this.circuitsDir(), name))))
+    const records = await Promise.all(names.map(name => readJsonFile<ProviderCircuitRecord>(join(this.circuitsDir(), name), { tolerateUnreadable: true })))
     return records.filter((record): record is ProviderCircuitRecord => record !== null)
       .sort((a, b) => a.providerId.localeCompare(b.providerId))
   }

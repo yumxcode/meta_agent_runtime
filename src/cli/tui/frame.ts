@@ -219,7 +219,7 @@ function footer(input: FrameInput, width: number): string {
   // and truncate a line that actually fits.
   const keys = [
     '↑↓ select', 'r run-now', 'c cancel', 'K kill', 'D delete',
-    's steer', 'a all', '/ filter', 'q quit',
+    's steer', input.showFinished ? 'a hide done' : 'a show done', '/ filter', 'q quit',
   ].join(' · ')
   return ` ${dim(fit(keys, width - 2))}`
 }

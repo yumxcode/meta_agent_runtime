@@ -16,7 +16,7 @@ function task(over: Partial<TaskView> = {}): TaskView {
     workspace: '/home/u/X1_29_AMP',
     sessionId: 'abcdef12-800e-47fc-bde8-a6266593909c',
     status: 'parked',
-    progress: { completedSteps: [], pendingTodos: [] },
+    progress: { completedSteps: [], pendingTodos: [], artifacts: [] },
     health: {},
     scheduler: { alive: true, pid: 64918 },
     pendingSteerCount: 0,

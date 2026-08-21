@@ -24,7 +24,7 @@
  * `bridgeRef` set immediately after the bridge is created — so a gate invoked
  * many turns later always sees the live bridge.
  */
-import { MetaAgentSession } from '../core/MetaAgentSession.js'
+import { MetaAgentSession } from '../modes/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import type { AutonomyProfile } from '../core/types.js'
 import type { AgentMode } from '../core/dynamicPrompt.js'

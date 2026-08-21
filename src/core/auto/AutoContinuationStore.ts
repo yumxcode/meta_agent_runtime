@@ -519,8 +519,11 @@ export class AutoContinuationStore {
 
   private async listUnlocked(): Promise<AutoContinuationRecord[]> {
     const ids = await listJsonIds(this.dir)
+    // Enumeration: one unreadable record must not fail the whole listing —
+    // the scheduler would then service nothing at all. Single-record reads in
+    // this store deliberately keep the throwing default (B1).
     const values = await Promise.all(ids.map(id =>
-      readJsonFile<AutoContinuationRecord>(join(this.dir, `${id}.json`))))
+      readJsonFile<AutoContinuationRecord>(join(this.dir, `${id}.json`), { tolerateUnreadable: true })))
     return values
       .filter(isAutoContinuationRecord)
       .sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)

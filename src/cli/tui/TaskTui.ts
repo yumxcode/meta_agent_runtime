@@ -51,6 +51,7 @@ export function confirmPrompt(kind: TaskActionKind, sessionId: string): string {
 export interface TaskTuiOptions {
   workspaces?: readonly string[]
   refreshMs?: number
+  /** Defaults to true — see the header of cli/commands/tasks.ts. */
   showFinished?: boolean
 }
 
@@ -75,7 +76,7 @@ export class TaskTui {
 
   constructor(private readonly options: TaskTuiOptions = {}) {
     this.refreshMs = Math.max(200, options.refreshMs ?? 1_000)
-    this.showFinished = options.showFinished ?? false
+    this.showFinished = options.showFinished ?? true
   }
 
   async run(): Promise<void> {

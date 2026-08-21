@@ -14,7 +14,7 @@
  * Status progression: queued → running → completed | failed | cancelled
  */
 
-import { MetaAgentSession } from '../core/MetaAgentSession.js'
+import { MetaAgentSession } from '../modes/MetaAgentSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import type { ConversationMessage, MetaAgentTool } from '../core/types.js'
 import { SessionStore } from '../core/SessionStore.js'

@@ -30,38 +30,38 @@ import { randomUUID } from 'crypto'
 import { writeFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { buildAnthropicAuth } from '../kernel/api/AnthropicClient.js'
-import { META_AGENT_HOME } from './metaAgentHome.js'
+import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import {
   resolveConfig,
   DEFAULT_SYSTEM_PROMPT,
   type MetaAgentConfig,
   type ResolvedConfig,
-} from './config.js'
+} from '../core/config.js'
 import type { SubAgentBridge } from '../subagent/SubAgentBridge.js'
 import type {
   ConversationMessage,
   MetaAgentEvent,
   MetaAgentTool,
   TokenUsage,
-} from './types.js'
-import { SectionRegistry } from './systemPromptSections.js'
-import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, type StaticPromptMode } from './staticPrompt.js'
-import { MODE_PROFILES, isAutonomousMode } from './modes.js'
+} from '../core/types.js'
+import { SectionRegistry } from '../core/systemPromptSections.js'
+import { buildStaticSystemPrompt, SYSTEM_PROMPT_DYNAMIC_BOUNDARY, type StaticPromptMode } from '../core/staticPrompt.js'
+import { MODE_PROFILES, isAutonomousMode } from '../core/modes.js'
 import {
   buildDynamicSections,
   buildVolatileContextSections,
   formatVolatileContext,
   type AgentMode,
-} from './dynamicPrompt.js'
-import type { TaskContract } from './contract/types.js'
+} from '../core/dynamicPrompt.js'
+import type { TaskContract } from '../core/contract/types.js'
 import type { SubAgentRecord } from '../subagent/types.js'
 import {
   buildAgenticCompactInstructions,
   buildAgenticDeterministicAnchors,
   buildAutoModeAnchors,
-} from './compact/agenticCompactAnchors.js'
+} from '../core/compact/agenticCompactAnchors.js'
 import { buildResearchArtifactAnchors } from '../research/ResearchStore.js'
-import { AgenticSession } from '../modes/AgenticSession.js'
+import { AgenticSession } from './AgenticSession.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // MetaAgentSession

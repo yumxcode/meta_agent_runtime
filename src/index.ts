@@ -2,7 +2,7 @@
  * @meta-agent/runtime — public API
  */
 
-export { MetaAgentSession } from './core/MetaAgentSession.js'
+export { MetaAgentSession } from './modes/MetaAgentSession.js'
 export { CampaignSession } from './modes/CampaignSession.js'
 /** @deprecated Use CampaignSession instead */
 export { CampaignSession as KernelBridge } from './modes/CampaignSession.js'

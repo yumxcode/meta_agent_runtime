@@ -27,7 +27,7 @@ import {
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../core/persist/index.js'
+import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../infra/persist/index.js'
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 import type {
   CampaignContextCapsule,

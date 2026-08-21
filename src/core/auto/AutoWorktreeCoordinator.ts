@@ -5,7 +5,6 @@
  * live under `.git/meta-agent/auto-worktrees.json`, outside the working tree,
  * so main-tree stash/merge transactions cannot hide or modify the registry.
  */
-import { execFile, execFileSync } from 'child_process'
 import {
   existsSync,
   mkdirSync,
@@ -14,12 +13,22 @@ import {
   rmSync,
 } from 'fs'
 import { dirname, join, resolve } from 'path'
-import { promisify } from 'util'
+import { runGit, runGitSync } from '../../infra/exec/runGit.js'
 import { GitWorkspaceManager } from '../../infra/git/GitWorkspaceManager.js'
 import { atomicWriteJson } from '../../infra/persist/index.js'
 import type { SubAgentTaskId } from '../../subagent/types.js'
 
-const execFileAsync = promisify(execFile)
+/**
+ * C3: every child process in this file is `git`. Routed through the hardened
+ * entry point so the credential-filtered env and output redaction cannot be
+ * forgotten; the literal `'git'` parameter type makes running anything else
+ * from here a compile error.
+ */
+const execFileAsync = (
+  _file: 'git',
+  args: readonly string[],
+  opts: { cwd?: string; timeout?: number; maxBuffer?: number; raw?: boolean } = {},
+) => runGit(args, opts)
 const REGISTRY_SCHEMA_VERSION = '1.0'
 const GIT_TIMEOUT_MS = 60_000
 const MAX_REGISTRY_TASKS = 500
@@ -117,11 +126,10 @@ export class AutoWorktreeCoordinator {
     this.worktreeBase = opts?.worktreeBase ?? join(this.projectDir, '.meta-agent', 'auto', 'worktrees')
     let gitCommonDir = join(this.projectDir, '.git')
     try {
-      const raw = execFileSync('git', ['rev-parse', '--git-common-dir'], {
+      const raw = runGitSync(['rev-parse', '--git-common-dir'], {
         cwd: this.projectDir,
-        encoding: 'utf-8',
-        stdio: ['ignore', 'pipe', 'ignore'],
         timeout: GIT_TIMEOUT_MS,
+        raw: true,   // a filesystem path, parsed positionally
       }).trim()
       gitCommonDir = resolve(this.projectDir, raw)
     } catch { /* non-git workspace; enabled remains false */ }

@@ -163,7 +163,7 @@ describe('presentation invariants', () => {
   it('puts broken tasks first — a view you must scroll has failed', () => {
     const make = (status: TaskView['status']): TaskView => ({
       workspace: '/w', sessionId: status, status,
-      progress: { completedSteps: [], pendingTodos: [] },
+      progress: { completedSteps: [], pendingTodos: [], artifacts: [] },
       health: {}, scheduler: { alive: true }, pendingSteerCount: 0,
     })
     const order = sortTasks([

@@ -19,13 +19,12 @@
  *     owner; steal() is the explicit escape hatch (records an audit attempt).
  */
 
-import { execFile } from 'node:child_process'
+import { runGit } from '../../infra/exec/runGit.js'
 import { hostname } from 'node:os'
 import { basename, join } from 'node:path'
-import { promisify } from 'node:util'
 import { mkdir, readFile } from 'node:fs/promises'
-import { atomicWriteFile, atomicWriteJson, withFileLock } from '../../core/persist/index.js'
-import { migrateTeamState } from '../../core/persist/schemas.js'
+import { atomicWriteFile, atomicWriteJson, withFileLock } from '../../infra/persist/index.js'
+import { migrateTeamState } from '../../infra/persist/schemas.js'
 import {
   STALE_CLAIM_MS,
   TASK_KIND_LABELS,
@@ -47,7 +46,22 @@ import {
   renderReadme,
 } from './render.js'
 
-const execFileAsync = promisify(execFile)
+/**
+ * C3: every child process in this file is `git`, and every one of them used to
+ * inherit the full `process.env` (all provider keys, GITHUB_TOKEN, AWS_*) and
+ * return unredacted stdout straight into the model context. Both are now
+ * applied by construction in infra/exec/runGit.ts.
+ *
+ * The adapter keeps the original `(file, args, opts)` call shape so the call
+ * sites below are unchanged, and the literal `'git'` parameter type turns "run
+ * something else from here" into a compile error rather than a silent bypass.
+ */
+const execFileAsync = (
+  _file: 'git',
+  args: readonly string[],
+  opts: { cwd?: string; timeout?: number; maxBuffer?: number; raw?: boolean } = {},
+) => runGit(args, opts)
+
 
 export {
   STALE_CLAIM_MS,
@@ -818,7 +832,7 @@ export class TeamStore {
   async detectMergeConflicts(): Promise<MergeConflictReport> {
     let conflictedPaths: string[] = []
     try {
-      const { stdout } = await execFileAsync('git', ['ls-files', '-u', '-z'], { cwd: this.projectDir, timeout: 5_000 })
+      const { stdout } = await execFileAsync('git', ['ls-files', '-u', '-z'], { cwd: this.projectDir, timeout: 5_000, raw: true })
       const entries = stdout.split('\0').map(e => e.trim()).filter(Boolean)
       const seen = new Set<string>()
       for (const entry of entries) {

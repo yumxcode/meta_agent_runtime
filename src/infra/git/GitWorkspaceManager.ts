@@ -1,12 +1,26 @@
-import { execFile, execFileSync } from 'child_process'
-import { promisify } from 'util'
+import { runGit, runGitSync } from '../exec/runGit.js'
 import { stat, mkdir } from 'fs/promises'
 import { homedir } from 'os'
 import { join } from 'path'
 import type { WorktreeRole, GitWorkspaceState } from './types.js'
 import type { SubAgentTaskId } from '../../subagent/types.js'
 
-const execFileAsync = promisify(execFile)
+/**
+ * C3: every child process in this file is `git`, and every one of them used to
+ * inherit the full `process.env` (all provider keys, GITHUB_TOKEN, AWS_*) and
+ * return unredacted stdout straight into the model context. Both are now
+ * applied by construction in infra/exec/runGit.ts.
+ *
+ * The adapter keeps the original `(file, args, opts)` call shape so the call
+ * sites below are unchanged, and the literal `'git'` parameter type turns "run
+ * something else from here" into a compile error rather than a silent bypass.
+ */
+const execFileAsync = (
+  _file: 'git',
+  args: readonly string[],
+  opts: { cwd?: string; timeout?: number; maxBuffer?: number; raw?: boolean } = {},
+) => runGit(args, opts)
+
 const WORKTREE_BASE = join(homedir(), '.cache', 'meta-agent', 'worktrees')
 const GIT_TIMEOUT_MS = 60_000
 
@@ -53,10 +67,9 @@ export class GitWorkspaceManager {
   get enabled(): boolean {
     if (this._enabled !== undefined) return this._enabled
     try {
-      const out = execFileSync(
-        'git',
+      const out = runGitSync(
         ['-C', this.projectDir, 'rev-parse', '--is-inside-work-tree'],
-        { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS },
+        { timeout: GIT_TIMEOUT_MS, raw: true },
       ).trim()
       this._enabled = out === 'true'
     } catch {

@@ -67,6 +67,51 @@ export interface ToolPermissionOverride extends ToolPermissionDeclaration {
   enabled?: boolean
 }
 
+/** Tool names already warned about, so the notice is printed once per process. */
+const _inertJailWarned = new Set<string>()
+
+/** @internal test hook */
+export function _resetInertJailWarnings(): void {
+  _inertJailWarned.clear()
+}
+
+/**
+ * C1: make a silently-inert workspace jail loud.
+ *
+ * `findWorkspaceViolation` checks exactly three things, and each is subscribed
+ * to by an explicit field name: `cwdField`, `commandField`, and the
+ * `pathFields` list. A tool that declares a mutating category but names NONE of
+ * them reaches the scan and the scan finds nothing to look at — `jailActive` is
+ * true, zero paths are examined, and `sensitive` defaults to false so no
+ * approval prompt fires either. From the outside that is indistinguishable from
+ * "checked and allowed".
+ *
+ * This is the same shape as the v0.8.16 P0-2 bug (guards keyed on
+ * `tool.name === 'bash'`, so anything not called bash was exempt): the control
+ * is subscribed by enumeration, and forgetting to enumerate is silent. That one
+ * was found by reading the code. This warning means the next one announces
+ * itself instead.
+ *
+ * A warning rather than a denial, deliberately: several legitimate tools are
+ * write-category but take no path at all (they write to a fixed store
+ * directory under a sanitised id). Denying them would break working setups to
+ * fix a latent risk. The paired test in
+ * `kernel/__tests__/PermissionDeclarations.test.ts` is the enforcing half.
+ */
+function warnIfJailIsInert(toolName: string, permission: ToolPermissionOverride): void {
+  const mutating = permission.category === 'write' || permission.category === 'execute'
+  if (!mutating) return
+  if (permission.cwdField || permission.commandField || permission.pathFields?.length) return
+  if (_inertJailWarned.has(toolName)) return
+  _inertJailWarned.add(toolName)
+  process.stderr.write(
+    `[meta-agent] ⚠ tool "${toolName}" declares category='${permission.category}' but names no ` +
+    'cwdField / commandField / pathFields, so the workspace jail scans nothing for it. ' +
+    'If it takes a path or a command, declare the field; if it genuinely takes neither, ' +
+    'add it to the allowlist in PermissionDeclarations.test.ts to record that as intentional.\n',
+  )
+}
+
 /**
  * Fallback declarations for tools that ship without their own `permission`
  * block. A tool's own declaration and then permissions.json override these.
@@ -483,6 +528,7 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
       mergePermissionDeclaration(DEFAULT_TOOL_PERMISSIONS[tool.name], tool.permission),
       permissionConfig.tools?.[tool.name],
     )
+    warnIfJailIsInert(tool.name, permission)
 
     if (permission.enabled === false) {
       return { behavior: 'deny', reason: `Tool "${tool.name}" is disabled by permissions config.` }

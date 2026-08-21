@@ -14,7 +14,7 @@
 import { readFile, rm } from 'fs/promises'
 import { join } from 'path'
 import { META_AGENT_HOME } from '../metaAgentHome.js'
-import { atomicWriteJson } from '../persist/index.js'
+import { atomicWriteJson } from '../../infra/persist/index.js'
 
 export type DeletionMechanism = 'memory' | 'experience' | 'principle' | 'anchor'
 

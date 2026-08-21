@@ -9,9 +9,9 @@
  */
 
 import { join } from 'path'
-import { atomicWriteJson, readJsonFile, listJsonIds, deleteJsonFile } from '../core/persist/index.js'
+import { atomicWriteJson, readJsonFile, listJsonIds, deleteJsonFile } from '../infra/persist/index.js'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
-import { EngineeringJobSchema, parseOrNull } from '../core/persist/schemas.js'
+import { EngineeringJobSchema, parseOrNull } from '../infra/persist/schemas.js'
 import type { EngineeringJob, JobId } from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -61,7 +61,7 @@ export class JobStore {
     const dir = sessionDir(this.sessionId)
     const ids = await listJsonIds(dir)
     const results = await Promise.allSettled(
-      ids.map(id => readJsonFile<unknown>(jobPath(this.sessionId, id as JobId))),
+      ids.map(id => readJsonFile<unknown>(jobPath(this.sessionId, id as JobId), { tolerateUnreadable: true })),
     )
     return results
       .filter((r): r is PromiseFulfilledResult<unknown> => r.status === 'fulfilled')

@@ -190,8 +190,8 @@ interface TaskView {
 L2 命令面：
 
 ```
-meta-agent tasks list  [--json] [--all] [--workspace <dir>]
-meta-agent tasks show  <sessionId> [--json]
+meta-agent tasks list  [--json] [--active] [--workspace <dir>]
+meta-agent tasks show  <sessionId> [--json]   # 含 completedSteps 计数与 artifacts 路径
 meta-agent tasks run-now <sessionId>
 meta-agent tasks cancel  <sessionId>       # 取消 pending wake（安全）
 meta-agent tasks kill    <sessionId>       # 终止运行中的 turn（破坏性）
@@ -199,6 +199,8 @@ meta-agent tasks steer   <sessionId> "..." # 复用现有 steer 通道
 ```
 
 `tasks list --json` 是整个方案的对外契约，先于 TUI 完成并单独验证。
+
+已完成任务（`finished`）**默认列出**。早期版本把它们藏在 `--all` 后面，理由是本视图只为暴露异常；但真实用法恰好相反——scheduler 排空队列打印 "no wakes left — exiting" 之后，它驱动了两天的那次运行会直接从 `tasks` 里消失，而目标、已完成步骤、产出路径与最终成本其实一直都在 checkpoint 里。`--active` 保留旧过滤，供盯活跃队列时使用；`--all` 仍被接受且优先级高于 `--active`。
 
 ## 7. 新增存储原语
 

@@ -24,13 +24,11 @@
  * the live tree (read-only tools only) — correctness is preserved, isolation is
  * just weaker, which we surface to the judge.
  */
-import { execFile, execFileSync } from 'child_process'
-import { promisify } from 'util'
+import { runGit, runGitSync } from '../../../infra/exec/runGit.js'
 import { mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join, resolve } from 'path'
 
-const execFileAsync = promisify(execFile)
 
 const GIT_TIMEOUT_MS = 60_000
 
@@ -56,10 +54,13 @@ export interface SnapshotDiff {
 }
 
 async function git(projectDir: string, args: string[], extraEnv?: NodeJS.ProcessEnv): Promise<string> {
-  const { stdout } = await execFileAsync('git', ['-C', projectDir, ...args], {
+  // C3: runGit applies the credential-filtered env and redacts stdout.
+  // `extraEnv` is layered on top as an explicit, per-call grant — the same
+  // shape mcp.json uses to hand one specific secret to one specific child.
+  const { stdout } = await runGit(['-C', projectDir, ...args], {
     timeout: GIT_TIMEOUT_MS,
     maxBuffer: 32 * 1024 * 1024,
-    env: extraEnv ? { ...process.env, ...extraEnv } : process.env,
+    ...(extraEnv ? { extraEnv } : {}),
   })
   return stdout.trim()
 }
@@ -72,10 +73,9 @@ function isGitRepo(projectDir: string): boolean {
   // snapshot isolation and made the verify judge inspect the LIVE tree. This
   // detection matches AutoWorktreeCoordinator's `--git-common-dir` approach.
   try {
-    const out = execFileSync(
-      'git',
+    const out = runGitSync(
       ['-C', projectDir, 'rev-parse', '--is-inside-work-tree'],
-      { encoding: 'utf-8', stdio: ['ignore', 'pipe', 'ignore'], timeout: GIT_TIMEOUT_MS },
+      { timeout: GIT_TIMEOUT_MS, raw: true },
     ).trim()
     return out === 'true'
   } catch {

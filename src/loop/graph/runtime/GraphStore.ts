@@ -1,3 +1,4 @@
+import { AsyncLocalStorage } from 'node:async_hooks'
 import { randomUUID } from 'node:crypto'
 import { access, mkdir, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
@@ -113,10 +114,40 @@ export class GraphStore {
    * write amplification from every snapshot.
    */
   private repairedThrough = 0
-  /** Highest journal sequence this process has already pruned (memo only). */
-  private journalPrunedThrough = 0
+  /**
+   * Highest journal sequence known to be deleted. Seeded from the checkpoint's
+   * durable `prunedThrough` (or the journal directory) on first use — see
+   * GraphCheckpoint.prunedThrough for why an in-memory-only cursor silently
+   * disabled pruning.  `undefined` = not yet resolved.
+   */
+  private journalPrunedThrough: number | undefined
   /** Next time settled commit-intent files are swept (throttle). */
   private nextIntentPruneAt = 0
+  /** Cursor into intentsDir so successive sweeps do not re-read the same prefix. */
+  private intentSweepCursor = 0
+  /**
+   * The frozen spec is immutable for the life of an instance (graphHash is its
+   * identity), so re-reading it on every checkpoint was pure overhead.
+   */
+  private specCache: FrozenLoopGraphSpec | null | undefined
+  /**
+   * Transaction locks held by the CURRENT async context (B6).
+   *
+   * withFileLock is not reentrant: a transaction whose `fn` opens another
+   * transaction on the same store blocks on a lock this very call stack holds,
+   * waits out the full 60s timeout, and then reports a timeout that reads like
+   * contention from another process. The `*Locked` method-name convention is
+   * the only thing preventing that, and conventions are not checked.
+   *
+   * A plain depth counter cannot express this: GraphKernel.tick runs claimed
+   * activations through `Promise.allSettled`, so several transactions on the
+   * same store are legitimately in flight at once. Those are PARALLEL, not
+   * nested — they queue on the lock file and each makes progress. Only a call
+   * inside another's dynamic extent is a deadlock, and async context is exactly
+   * what distinguishes the two: siblings branch from a context that does not
+   * hold the lock, a nested call inherits one that does.
+   */
+  private static readonly txScope = new AsyncLocalStorage<ReadonlySet<string>>()
 
   constructor(readonly projectDir: string, readonly instanceId: string) {
     if (!/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(instanceId)) {
@@ -432,7 +463,7 @@ export class GraphStore {
 
   async listPreparedIntents(): Promise<ActivationCommitIntent[]> {
     const ids = await listJsonIds(this.paths.intentsDir)
-    const intents = await Promise.all(ids.map(id => readJsonFile<ActivationCommitIntent>(join(this.paths.intentsDir, `${id}.json`))))
+    const intents = await Promise.all(ids.map(id => readJsonFile<ActivationCommitIntent>(join(this.paths.intentsDir, `${id}.json`), { tolerateUnreadable: true })))
     return intents
       .filter((intent): intent is ActivationCommitIntent => intent?.status === 'prepared')
       .sort((a, b) => a.createdAt - b.createdAt || a.commitKey.localeCompare(b.commitKey))
@@ -583,8 +614,22 @@ export class GraphStore {
   }
 
   async withTransaction<T>(fn: () => Promise<T>): Promise<T> {
+    // B6: reentrancy is a deadlock, not contention. Surface it as such.
+    const key = this.paths.transactionLock
+    const held = GraphStore.txScope.getStore()
+    if (held?.has(key)) {
+      throw new Error(
+        `GraphStore.withTransaction is not reentrant (instance '${this.instanceId}'). ` +
+        'This call is inside a transaction already held for the same instance and would ' +
+        'deadlock on its own lock; use the *Locked variant instead of opening a nested ' +
+        'transaction.',
+      )
+    }
     await this.ensureLayout()
-    return withFileLock(this.paths.transactionLock, fn, { staleMs: 15 * 60_000, timeoutMs: 60_000 })
+    const nested = new Set(held ?? [])
+    nested.add(key)
+    return GraphStore.txScope.run(nested, () =>
+      withFileLock(key, fn, { staleMs: 15 * 60_000, timeoutMs: 60_000 }))
   }
 
   /** Caller must hold withTransaction. Journal is written before projections. */
@@ -749,16 +794,31 @@ export class GraphStore {
     }
     const snapshot = { instance, state, activations, lastSequence, commitKeys, externalEvents }
     const repairFrom = this.repairedThrough
+    let repaired = 0
     for (const record of journal) {
       if (record.sequence <= repairFrom) continue
       await this.repairEventProjectionLocked(record)
+      repaired++
     }
-    const [diskState, diskInstance] = await Promise.all([
-      readJsonFile<GraphStateSnapshot>(this.paths.stateJson),
-      readJsonFile<GraphInstanceRecord>(this.paths.instanceJson),
-    ])
-    if (JSON.stringify(diskState) !== JSON.stringify(state)) await atomicWriteJson(this.paths.stateJson, state)
-    if (JSON.stringify(diskInstance) !== JSON.stringify(instance)) await atomicWriteJson(this.paths.instanceJson, instance)
+    // B5: the projection reconcile only has work to do when this call actually
+    // replayed something. `snapshot()` is called several times per tick
+    // (GraphKernel.tick alone calls it 4+ times) and most of those calls replay
+    // zero events — yet each one used to serialise the entire State snapshot
+    // twice to discover there was nothing to write.
+    //
+    // The comparison is also key-order sensitive: it is a string compare of
+    // JSON.stringify output, so a future refactor that rebuilds these objects
+    // with `{...a, ...b}` would silently make it always-unequal and turn every
+    // snapshot into two full writes, with no test failing. Gating on `repaired`
+    // bounds that blast radius to calls that replayed events.
+    if (repaired > 0) {
+      const [diskState, diskInstance] = await Promise.all([
+        readJsonFile<GraphStateSnapshot>(this.paths.stateJson),
+        readJsonFile<GraphInstanceRecord>(this.paths.instanceJson),
+      ])
+      if (JSON.stringify(diskState) !== JSON.stringify(state)) await atomicWriteJson(this.paths.stateJson, state)
+      if (JSON.stringify(diskInstance) !== JSON.stringify(instance)) await atomicWriteJson(this.paths.instanceJson, instance)
+    }
     if (!usableCheckpoint || lastSequence - usableCheckpoint.lastSequence >= CHECKPOINT_INTERVAL) {
       await this.writeCheckpointLocked(snapshot)
     }
@@ -866,7 +926,7 @@ export class GraphStore {
     // snapshot rebuilt on EVERY snapshot() call) grows linearly with the total
     // number of Activations ever created — unbounded for a long-lived loop.
     // Retention is deliberately conservative; see retainActivationInCheckpoint.
-    const spec = await readJsonFile<FrozenLoopGraphSpec>(this.paths.specJson)
+    const spec = await this.readSpecCachedLocked()
     const activations = [...snapshot.activations.values()]
       .filter(activation => retainActivationInCheckpoint(activation, spec, now))
     const externalEvents = [...snapshot.externalEvents.values()]
@@ -881,6 +941,22 @@ export class GraphStore {
     // dereference a deleted journal file anyway, and a same-commitKey replay
     // that old is impossible while the Activation itself is compacted.
     const pruneThrough = Math.min(previous?.lastSequence ?? 0, snapshot.lastSequence)
+    // B2: resolve the durable prune cursor BEFORE writing the checkpoint, so
+    // the value we persist reflects the work this call is about to do.
+    const prunedBefore = await this.resolvePrunedThroughLocked(previous)
+    // Bounded batch per checkpoint keeps the transaction short; the backlog
+    // drains across successive checkpoints.
+    let prunedNow = prunedBefore
+    if (pruneThrough > prunedBefore) {
+      let deleted = 0
+      for (let sequence = prunedBefore + 1; sequence <= pruneThrough && deleted < HOUSEKEEPING_BATCH; sequence++) {
+        await deleteJsonFile(this.journalPath(sequence)).catch(() => undefined)
+        prunedNow = sequence
+        deleted++
+      }
+    }
+    this.journalPrunedThrough = prunedNow
+
     const checkpoint: GraphCheckpoint = {
       schemaVersion: 'graph-checkpoint-2.0',
       lastSequence: snapshot.lastSequence,
@@ -889,22 +965,51 @@ export class GraphStore {
       activations,
       commitKeys: [...snapshot.commitKeys.entries()].filter(([, sequence]) => sequence > pruneThrough),
       externalEvents,
+      prunedThrough: prunedNow,
     }
     if (previous && previous.lastSequence < checkpoint.lastSequence) {
       await atomicWriteJson(this.paths.checkpointPrevJson, previous)
     }
     await atomicWriteJson(this.paths.checkpointJson, checkpoint)
-    // Bounded batch per checkpoint keeps the transaction short; the backlog
-    // drains across successive checkpoints.
-    if (pruneThrough > this.journalPrunedThrough) {
-      let deleted = 0
-      for (let sequence = this.journalPrunedThrough + 1; sequence <= pruneThrough && deleted < HOUSEKEEPING_BATCH; sequence++) {
-        await deleteJsonFile(this.journalPath(sequence)).catch(() => undefined)
-        this.journalPrunedThrough = sequence
-        deleted++
-      }
-    }
     await this.pruneSettledIntentsLocked(now)
+  }
+
+  /**
+   * The frozen spec never changes for an instance, so read it once. Cached as
+   * `null` too — a missing spec.json is a legitimate state for instances
+   * created before the spec projection existed, and re-reading it every
+   * checkpoint to rediscover that costs an open() per checkpoint forever.
+   */
+  private async readSpecCachedLocked(): Promise<FrozenLoopGraphSpec | null> {
+    if (this.specCache === undefined) {
+      this.specCache = await readJsonFile<FrozenLoopGraphSpec>(this.paths.specJson)
+    }
+    return this.specCache
+  }
+
+  /**
+   * Durable journal-prune cursor. Preference order:
+   *   1. this process's memo (already resolved);
+   *   2. the checkpoint's persisted `prunedThrough`;
+   *   3. derivation from the journal directory — the lowest surviving sequence
+   *      minus one — for checkpoints written before the field existed.
+   *
+   * (3) is exact rather than conservative: journal files are deleted strictly
+   * in ascending order, so everything below the smallest surviving file is
+   * gone. Falling back to 0 instead would reintroduce the very stall this
+   * cursor exists to remove.
+   */
+  private async resolvePrunedThroughLocked(previous: GraphCheckpoint | null): Promise<number> {
+    if (this.journalPrunedThrough !== undefined) return this.journalPrunedThrough
+    if (typeof previous?.prunedThrough === 'number' && previous.prunedThrough >= 0) {
+      this.journalPrunedThrough = previous.prunedThrough
+      return this.journalPrunedThrough
+    }
+    const ids = (await listJsonIds(this.paths.journalDir)).filter(id => /^\d{12}$/.test(id)).sort()
+    // No journal files at all: everything up to the checkpoint has been pruned.
+    const derived = ids.length ? Number(ids[0]) - 1 : (previous?.lastSequence ?? 0)
+    this.journalPrunedThrough = Math.max(0, derived)
+    return this.journalPrunedThrough
   }
 
   /**
@@ -917,17 +1022,37 @@ export class GraphStore {
   private async pruneSettledIntentsLocked(now: number): Promise<void> {
     if (now < this.nextIntentPruneAt) return
     this.nextIntentPruneAt = now + HOUSEKEEPING_INTERVAL_MS
-    const ids = await listJsonIds(this.paths.intentsDir)
-    let deleted = 0
-    for (const id of ids) {
-      if (deleted >= HOUSEKEEPING_BATCH) break
+    const ids = (await listJsonIds(this.paths.intentsDir)).sort()
+    if (ids.length === 0) return
+
+    // B3: budget INSPECTIONS, not deletions.
+    //
+    // The old loop broke on `deleted >= HOUSEKEEPING_BATCH`, but nothing is
+    // deletable until INTENT_RETENTION_MS (7 days) has elapsed — so for the
+    // first week of an instance's life `deleted` stayed 0, the break never
+    // fired, and every sweep read EVERY intent file in the directory. Inside
+    // the global transaction lock, no less: the exact linear degradation this
+    // function was added to remove.
+    //
+    // A rotating cursor over the sorted id list bounds the work per sweep and
+    // still visits every entry across successive sweeps. It is a plain offset
+    // rather than a remembered id because entries are deleted underneath it;
+    // overshooting simply wraps and re-examines from the top, which is cheap
+    // and self-correcting.
+    let cursor = this.intentSweepCursor % ids.length
+    let inspected = 0
+    while (inspected < HOUSEKEEPING_BATCH && inspected < ids.length) {
+      const id = ids[cursor]!
+      cursor = (cursor + 1) % ids.length
+      inspected++
       const path = join(this.paths.intentsDir, `${id}.json`)
-      const intent = await readJsonFile<ActivationCommitIntent>(path)
+      // Enumeration: an unreadable intent must not abort housekeeping.
+      const intent = await readJsonFile<ActivationCommitIntent>(path, { tolerateUnreadable: true })
       if (!intent || intent.status === 'prepared') continue
       if (now - intent.createdAt < INTENT_RETENTION_MS) continue
       await deleteJsonFile(path).catch(() => undefined)
-      deleted++
     }
+    this.intentSweepCursor = cursor
   }
 
   /** True when this instance has any durable history (journal tail or checkpoint). */
@@ -981,6 +1106,22 @@ interface GraphCheckpoint {
   activations: ActivationRecord[]
   commitKeys: Array<[string, number]>
   externalEvents: GraphExternalEventRecord[]
+  /**
+   * B2: highest journal sequence whose file has been deleted. Durable, because
+   * the in-memory-only cursor it replaces reset to 0 in every new process.
+   *
+   * `deleteJsonFile` swallows ENOENT, so re-walking an already-pruned prefix
+   * still consumed the per-checkpoint budget. Each CLI invocation is a fresh
+   * process, so the cursor restarted at 1 every time and could only advance
+   * HOUSEKEEPING_BATCH per checkpoint — with CHECKPOINT_INTERVAL=50 that is
+   * 10 new events per 1 sequence of catch-up. An instance with N historical
+   * events needed ~N/10 new events before pruning resumed; past a few thousand
+   * events the journal directory effectively stopped being pruned at all.
+   *
+   * Optional so checkpoints written by older builds still load (they simply
+   * fall back to deriving the cursor from the journal directory).
+   */
+  prunedThrough?: number
 }
 
 function activationId(): string {

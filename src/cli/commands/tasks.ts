@@ -2,8 +2,16 @@
  * cli/commands/tasks — what long-running Auto tasks exist, and are they alive.
  *
  *   meta-agent tasks                      One-shot list (TUI lands in P1)
- *   meta-agent tasks list [--json] [--all]
+ *   meta-agent tasks list [--json] [--active]
  *   meta-agent tasks show <sessionId> [--json]
+ *
+ * Finished tasks are listed BY DEFAULT. They used to be hidden behind `--all`,
+ * on the theory that the view exists to surface what is broken. That was wrong
+ * for the case this tool is actually used in: a scheduler drains its queue,
+ * prints "no wakes left — exiting", and the multi-day run it was driving simply
+ * vanishes from `meta-agent tasks`. The goal, the completed steps, the artifact
+ * paths and the final cost are all still on disk; nothing would show them.
+ * `--active` restores the old filter for anyone watching a live queue.
  *
  * Read-only and API-key-free on purpose: this must work in a workspace with no
  * credentials configured, and it must never be the thing that starts a turn.
@@ -37,8 +45,8 @@ function usage(): string {
     `${bold('meta-agent tasks')} — long-running Auto tasks and whether they are alive`,
     '',
     `  ${cyan('meta-agent tasks list')}                 List tasks in every known workspace`,
-    `  ${cyan('meta-agent tasks list --all')}           Include finished tasks`,
-    `  ${cyan('meta-agent tasks show <sessionId>')}     Full detail for one task`,
+    `  ${cyan('meta-agent tasks list --active')}        Hide finished tasks (live queue only)`,
+    `  ${cyan('meta-agent tasks show <sessionId>')}     Full detail, incl. artifact paths`,
     '',
     `  ${cyan('meta-agent tasks run-now <sessionId>')}  Bring a parked wake forward to now`,
     `  ${cyan('meta-agent tasks cancel  <sessionId>')}  Drop a pending wake (session stops waking)`,
@@ -47,6 +55,9 @@ function usage(): string {
     `  ${cyan('meta-agent tasks rm      <sessionId>')}  ${red('Delete the task AND its history')} (needs --yes)`,
     '',
     dim('  --json                  Machine-readable output (stable contract)'),
+    dim('  --active                List only tasks that are still live'),
+    dim('  --all                   Accepted for compatibility; finished tasks'),
+    dim('                          are shown by default and --all overrides --active'),
     dim('  --workspace <dir>       Restrict to one workspace'),
     dim('  --yes                   Confirm a destructive action'),
     '',
@@ -57,6 +68,13 @@ function usage(): string {
     dim('  to inspect it anyway.'),
   ].join('\n')
 }
+
+/**
+ * Artifact paths shown by `tasks show` before it defers to `--json`. A long run
+ * can record dozens; past ~20 the terminal scrollback becomes the report and
+ * the fields above it scroll away.
+ */
+const ARTIFACT_LIST_LIMIT = 20
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
   running: 'running',
@@ -87,7 +105,12 @@ export async function runTasksCommand(opts: CliOptions): Promise<void> {
   }
 
   const json = opts.json || takeFlag(args, '--json')
+  // Finished tasks are the default. `--all` predates that and is still honoured
+  // (scripts and muscle memory both exist); it wins over `--active` so the two
+  // together mean the same thing `--all` always meant.
   const all = takeFlag(args, '--all')
+  const activeOnly = takeFlag(args, '--active') && !all
+  const showFinished = !activeOnly
   const yes = takeFlag(args, '--yes') || takeFlag(args, '-y')
   const workspace = takeOption(args, '--workspace') ?? takeOption(args, '-w') ?? opts.workspace
 
@@ -101,13 +124,13 @@ export async function runTasksCommand(opts: CliOptions): Promise<void> {
   if (sub === '' && isTTY && process.stdin.isTTY && !json && !noTui) {
     await new TaskTui({
       ...(workspaces ? { workspaces } : {}),
-      showFinished: all,
+      showFinished,
     }).run()
     return
   }
 
   if (sub === '' || sub === 'list') {
-    await listTasks({ ...(workspaces ? { workspaces } : {}), json, all })
+    await listTasks({ ...(workspaces ? { workspaces } : {}), json, showFinished })
     return
   }
   if (sub === 'show') {
@@ -213,10 +236,10 @@ async function runAction(input: {
 async function listTasks(input: {
   workspaces?: string[]
   json: boolean
-  all: boolean
+  showFinished: boolean
 }): Promise<void> {
   const tasks = await collectTasks(input.workspaces ? { workspaces: input.workspaces } : {})
-  const shown = input.all ? tasks : tasks.filter(t => t.status !== 'finished')
+  const shown = input.showFinished ? tasks : tasks.filter(t => t.status !== 'finished')
 
   if (input.json) {
     console.log(JSON.stringify({ tasks: shown, summary: summarize(tasks) }, null, 2))
@@ -234,8 +257,8 @@ async function listTasks(input: {
   console.log(summaryLine(tasks))
   console.log(dim('─'.repeat(78)))
   for (const task of shown) console.log(renderRow(task))
-  if (!input.all && shown.length < tasks.length) {
-    console.log(dim(`  … ${tasks.length - shown.length} finished task(s) hidden; --all to show`))
+  if (!input.showFinished && shown.length < tasks.length) {
+    console.log(dim(`  … ${tasks.length - shown.length} finished task(s) hidden by --active`))
   }
 
   const broken = tasks.filter(t => isUnhealthy(t.status))
@@ -373,6 +396,7 @@ async function showTask(input: {
     task.progress.estimatedCostUsd !== undefined ? `$${task.progress.estimatedCostUsd.toFixed(2)}` : null,
     `${task.progress.completedSteps.length} done`,
     `${task.progress.pendingTodos.length} todo`,
+    `${task.progress.artifacts.length} artifacts`,
   ].filter(Boolean).join(' · '))
   line('health', [
     `compactions ${task.health.compactions ?? 0}`,
@@ -389,6 +413,17 @@ async function showTask(input: {
     for (const todo of task.progress.pendingTodos.slice(0, 10)) {
       console.log(`    · ${terminalText(clip(todo, 70))}`)
     }
+  }
+  // Artifacts print in FULL — `clip` would make a path that no longer opens
+  // anything, which is the one thing a reader will try to do with this list.
+  // Only control characters are stripped.
+  if (task.progress.artifacts.length > 0) {
+    console.log(`\n  ${dim('产出')}`)
+    for (const path of task.progress.artifacts.slice(0, ARTIFACT_LIST_LIMIT)) {
+      console.log(`    · ${terminalText(path)}`)
+    }
+    const rest = task.progress.artifacts.length - ARTIFACT_LIST_LIMIT
+    if (rest > 0) console.log(dim(`    … +${rest} more (--json for the full list)`))
   }
   const tip = advice(task)
   if (tip) console.log(`\n${tip}`)

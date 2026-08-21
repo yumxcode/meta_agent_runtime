@@ -87,8 +87,9 @@ ${bold('AUTO SCHEDULER (plain auto self_timer)')}
       --poll-ms <n> --max-concurrent <n> [--once]
       --idle-exit-ms <n>    ${dim('Exit once the workspace has NO wakes left (default 60s; 0 = stay up)')}
       --stale-wake-ms <n>   ${dim('Retire a wake left unexecuted this long past due (default 7d; 0 = never)')}
-  meta-agent tasks [list|show <id>]        See every long-running Auto task
-      --all --json --workspace <dir>  ${dim('Alive? parked? ORPHANED? No API key needed.')}
+  meta-agent tasks [list|show <id>]        See every Auto task, finished included
+      --active --json --workspace <dir>  ${dim('Alive? parked? ORPHANED? No API key needed.')}
+      ${dim('`show <id>` also lists the run\'s artifact paths; --active hides finished tasks.')}
   meta-agent -w <dir> --mode auto --attached "goal"
       Keep the original terminal attached across repeated self_timer wakes.
   By default self_timer persists state and exits; --attached instead keeps

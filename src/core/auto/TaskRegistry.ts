@@ -88,6 +88,14 @@ export interface TaskView {
     estimatedCostUsd?: number
     completedSteps: string[]
     pendingTodos: string[]
+    /**
+     * Key files the run produced, as recorded in the checkpoint. Paths only —
+     * verbatim, unclipped, and never stat'd. A finished task's whole value is
+     * its output, and a truncated or existence-annotated path is worse than a
+     * plain one: it looks copy-pasteable when it is not, and it turns a
+     * read-only view into something that touches a workspace it does not own.
+     */
+    artifacts: string[]
   }
   health: {
     compactions?: number
@@ -344,6 +352,7 @@ function toProgress(cp: AutoCheckpoint | null): TaskView['progress'] {
     ...(cp?.estimatedCostUsd !== undefined ? { estimatedCostUsd: cp.estimatedCostUsd } : {}),
     completedSteps: cp?.completedSteps ?? [],
     pendingTodos: cp?.pendingTodos ?? [],
+    artifacts: cp?.artifacts ?? [],
   }
 }
 

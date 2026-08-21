@@ -8,7 +8,7 @@
  */
 
 import { readdir, readFile, rm, writeFile } from 'fs/promises'
-import { join } from 'path'
+import { basename, join } from 'path'
 import { MEMORY_DIR, MEMORY_ENTRYPOINT_NAME } from './paths.js'
 
 export interface MemoryEntrySummary {
@@ -69,9 +69,25 @@ export type DeleteMemoryResult =
  * line(s) from MEMORY.md (lines linking to `](filename)`).
  */
 export async function deleteMemoryEntry(
-  filename: string,
+  rawFilename: string,
   memoryDir: string = MEMORY_DIR,
 ): Promise<DeleteMemoryResult> {
+  // C1: confine the target to `memoryDir` HERE, not only at the caller.
+  //
+  // Today the only path in is the deletion-review flow, and `deleteToolFactory`
+  // refuses to queue an id that `listMemoryEntries()` does not already contain
+  // — so a traversal string never reaches this function. But that makes the
+  // safety of an `rm()` a property of a validation step in a different module,
+  // which any new caller (a CLI flag, a batch cleanup, a future tool) would
+  // have no way to know about. The guard belongs on the operation being
+  // guarded.
+  //
+  // `basename` also collapses `a/../../b`, so this is total rather than a
+  // pattern blocklist.
+  const filename = basename(rawFilename)
+  if (!filename || filename === '.' || filename === '..') {
+    return { ok: false, reason: 'not_found', detail: rawFilename }
+  }
   const target = join(memoryDir, filename)
   let existed = true
   try {

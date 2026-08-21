@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { AgenticSession } from '../AgenticSession.js'
-import { MetaAgentSession } from '../../core/MetaAgentSession.js'
+import { MetaAgentSession } from '../MetaAgentSession.js'
 import type { MetaAgentTool } from '../../core/types.js'
 
 const sandboxMock = vi.hoisted(() => {

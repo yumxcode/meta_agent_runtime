@@ -29,7 +29,7 @@ const mockState = vi.hoisted(() => ({
   registeredToolNames: [] as string[],
 }))
 
-vi.mock('../../core/MetaAgentSession.js', () => ({
+vi.mock('../../modes/MetaAgentSession.js', () => ({
   MetaAgentSession: class {
     constructor(config: Record<string, unknown>) {
       mockState.configs.push(config)

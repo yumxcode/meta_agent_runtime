@@ -18,8 +18,8 @@
  */
 
 import { readFile, appendFile, mkdir, open, stat, rm, readdir } from 'node:fs/promises'
-import { atomicWriteFile, atomicWriteJson, withFileLock } from './persist/index.js'
-import { SessionMetaSchema, parseArrayFiltered } from './persist/schemas.js'
+import { atomicWriteFile, atomicWriteJson, withFileLock } from '../infra/persist/index.js'
+import { SessionMetaSchema, parseArrayFiltered } from '../infra/persist/schemas.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
 import type { ConversationMessage } from './types.js'

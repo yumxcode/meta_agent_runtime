@@ -22,7 +22,7 @@ import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import path from 'node:path'
 import os from 'node:os'
 
-import { atomicWriteJson } from '../core/persist/index.js'
+import { atomicWriteJson } from '../infra/persist/index.js'
 import type { ICampaignStore, GenericPersistedState } from './types.js'
 import { GENERIC_SCHEMA_VERSION } from './types.js'
 import { campaignRegistry } from './registry.js'

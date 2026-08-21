@@ -2,7 +2,7 @@ import { rm } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile, withFileLock } from '../core/persist/index.js'
+import { atomicWriteJson, ensureDir, listJsonIds, readJsonFile, withFileLock } from '../infra/persist/index.js'
 import type {
   KnowledgeConfidenceTier,
   PrincipleEntry,

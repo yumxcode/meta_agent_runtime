@@ -153,7 +153,7 @@ export class WakeStore {
 
   private async listUnlocked(): Promise<WakeRecord[]> {
     const ids = await listJsonIds(this.dir)
-    const records = await Promise.all(ids.map(id => readJsonFile<WakeRecord>(this.pathFor(id))))
+    const records = await Promise.all(ids.map(id => readJsonFile<WakeRecord>(this.pathFor(id), { tolerateUnreadable: true })))
     return records
       .filter((r): r is WakeRecord => r !== null)
       .sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)

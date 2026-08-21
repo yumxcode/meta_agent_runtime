@@ -17,7 +17,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { PrincipleStore } from '../PrincipleStore.js'
 import { PhysicalAnchorStore } from '../PhysicalAnchorStore.js'
-import { atomicWriteJson } from '../../core/persist/index.js'
+import { atomicWriteJson } from '../../infra/persist/index.js'
 
 let dir: string
 beforeEach(async () => { dir = await mkdtemp(join(tmpdir(), 'kmc-')) })

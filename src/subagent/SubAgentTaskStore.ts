@@ -18,7 +18,7 @@ import { unlink } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson, readJsonFile, ensureDir } from '../core/persist/index.js'
+import { atomicWriteJson, readJsonFile, ensureDir } from '../infra/persist/index.js'
 import { TERMINAL_STATUSES, type SubAgentRecord, type SubAgentTaskId } from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────

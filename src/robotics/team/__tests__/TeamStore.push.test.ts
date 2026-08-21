@@ -10,7 +10,7 @@ import { promisify } from 'node:util'
 import { afterEach, describe, expect, it } from 'vitest'
 import { TeamStore } from '../TeamStore.js'
 import { renderBoard } from '../render.js'
-import { migrateTeamState } from '../../../core/persist/schemas.js'
+import { migrateTeamState } from '../../../infra/persist/schemas.js'
 
 const execFileAsync = promisify(execFile)
 

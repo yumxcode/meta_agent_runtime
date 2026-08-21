@@ -3,7 +3,7 @@ import { join } from 'path'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
 import { appendFile, readdir, rm } from 'fs/promises'
-import { atomicWriteJson, readJsonFile } from '../../core/persist/index.js'
+import { atomicWriteJson, readJsonFile } from '../../infra/persist/index.js'
 import { withFileLock } from '../../infra/persist/index.js'
 import type { RoboticsProjectState, RoboticsProjectSummary, ActiveSubAgentRecord, RoboticsGitState } from '../types.js'
 
@@ -62,7 +62,7 @@ export class RoboticsProjectStore {
 
     const states = await Promise.all(
       sessionDirs.map(async sid => {
-        const state = await readJsonFile<RoboticsProjectState>(join(bucket, sid, 'state.json'))
+        const state = await readJsonFile<RoboticsProjectState>(join(bucket, sid, 'state.json'), { tolerateUnreadable: true })
         if (!state || state.schemaVersion !== '1.0') return null
         if (Date.now() - state.lastActiveAt > RESUME_WINDOW_MS) return null
         return state
@@ -224,7 +224,7 @@ export class RoboticsProjectStore {
         await Promise.all(
           sessionDirs.map(async sid => {
             const state = await readJsonFile<RoboticsProjectState>(
-              join(bucketPath, sid, 'state.json'),
+              join(bucketPath, sid, 'state.json'), { tolerateUnreadable: true },
             )
             if (!state || state.schemaVersion !== '1.0') return
             const idleDays = Math.floor((Date.now() - state.lastActiveAt) / 86_400_000)
@@ -321,7 +321,7 @@ export class RoboticsProjectStore {
           sessionDirs.map(async sid => {
             const sessionDir = join(bucketPath, sid)
             const state = await readJsonFile<RoboticsProjectState>(
-              join(sessionDir, 'state.json'),
+              join(sessionDir, 'state.json'), { tolerateUnreadable: true },
             )
             if (!state || state.schemaVersion !== '1.0') return
             if (state.starred) return                              // ← starred: exempt

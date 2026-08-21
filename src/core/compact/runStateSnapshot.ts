@@ -19,7 +19,7 @@
  */
 
 import { readFile, unlink } from 'fs/promises'
-import { atomicWriteJson } from '../persist/index.js'
+import { atomicWriteJson } from '../../infra/persist/index.js'
 import { join } from 'path'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../metaAgentHome.js'

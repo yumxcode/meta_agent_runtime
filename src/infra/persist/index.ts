@@ -37,7 +37,7 @@ export async function ensureDir(dir: string): Promise<void> {
  * Read and parse a JSON file.
  *
  * Returns `null` when the file does not exist (ENOENT) or cannot be
- * parsed as JSON.  Never throws.
+ * parsed as JSON.
  *
  * L1: a *missing* file is normal and stays silent, but a file that exists
  * yet fails to parse signals on-disk corruption.  Silently returning null
@@ -45,17 +45,46 @@ export async function ensureDir(dir: string): Promise<void> {
  * failure we (a) log a warning so the loss is discoverable, and (b) preserve
  * the bad bytes by renaming them to `<filePath>.corrupt` before returning
  * null — letting callers recover/inspect rather than overwriting blindly.
+ *
+ * B1: "does not exist" and "exists but could not be read" are NO LONGER the
+ * same answer. The old `catch { return null }` reported EACCES, EIO, EMFILE
+ * and EISDIR as "no record", which is wrong in two different ways:
+ *
+ *   - load-modify-write callers see an empty store and write a fresh one over
+ *     data that was merely unreadable for a moment — silent data loss;
+ *   - GraphStore's event-sourced recovery degrades catastrophically. A single
+ *     transient EMFILE on `checkpoint.json` makes `reconcileLocked` believe
+ *     there is no checkpoint, so it replays the journal from sequence 1 — but
+ *     the journal prefix behind a checkpoint is pruned, so it throws
+ *     `graph journal sequence gap at 1`. Intact data, reported as corrupt.
+ *
+ * ENOENT still returns null (it is genuinely "no record"). Everything else
+ * throws, so the caller sees a real error at the point it happens. Callers
+ * that enumerate a directory and legitimately want to SKIP an unreadable entry
+ * — rather than fail the whole listing — opt in with `tolerateUnreadable`.
+ * This mirrors the ENOENT-vs-everything-else split `withFileLock` already
+ * makes for `stat` (see the M4-fix note there); the read path just never got
+ * the same treatment.
  */
 export async function readJsonFile<T = unknown>(
   filePath: string,
-  opts: { quarantineCorrupt?: boolean } = {},
+  opts: { quarantineCorrupt?: boolean; tolerateUnreadable?: boolean } = {},
 ): Promise<T | null> {
   let raw: string
   try {
     raw = await readFile(filePath, 'utf-8')
-  } catch {
-    // ENOENT / unreadable — treat as "no record". Expected, stay silent.
-    return null
+  } catch (err) {
+    // A missing file is normal and stays silent.
+    if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null
+    // Anything else is a real fault. Enumeration callers may opt out.
+    if (opts.tolerateUnreadable) {
+      console.error(
+        `[meta-agent] unreadable JSON at ${filePath}:`,
+        err instanceof Error ? err.message : String(err),
+      )
+      return null
+    }
+    throw err
   }
   try {
     return JSON.parse(raw) as T
@@ -282,10 +311,37 @@ export async function withFileLock<T>(
   // headroom before another process is entitled to reclaim. The timer is
   // unref'd so it can never keep the process alive on its own, and the write is
   // best-effort: a transient utimes failure just means one skipped beat.
+  //
+  // B4: the beat must verify OWNERSHIP first. The release path already does
+  // (read token → compare → unlink); the heartbeat did not, and touched
+  // `lockPath` unconditionally. If this process was stalled long enough to be
+  // declared stale — SIGSTOP, a long GC pause, a hung NFS write — another
+  // holder reclaims the path, and then our timer starts refreshing THEIR lock.
+  // Mutual exclusion was already lost at reclamation time; the damage from the
+  // blind beat is that it hides the aftermath: the new holder's lock is kept
+  // alive by a process that has no idea it lost, so if the new holder dies
+  // nobody can ever declare ITS lock stale. GraphStore runs with
+  // staleMs = 15min / beat = 5min, so a 10-minute stall is enough.
+  //
+  // One extra small read per beat (once per staleMs/3) is not a meaningful cost
+  // next to the critical sections this guards.
   const heartbeatMs = Math.max(50, Math.floor(staleMs / 3))
   const keepAlive = setInterval(() => {
-    const now = new Date()
-    void utimes(lockPath, now, now).catch(() => {})
+    void (async () => {
+      try {
+        const current = await readFile(lockPath, 'utf-8')
+        if (!current.startsWith(ownerToken)) {
+          // We no longer hold this lock. Stop beating; the release path will
+          // see the same thing and correctly decline to unlink.
+          clearInterval(keepAlive)
+          return
+        }
+        const now = new Date()
+        await utimes(lockPath, now, now)
+      } catch {
+        // Lock gone or transiently unreadable — skip this beat.
+      }
+    })()
   }, heartbeatMs)
   keepAlive.unref?.()
 

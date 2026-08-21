@@ -277,7 +277,7 @@ export class ExperienceStore {
     const ids = await listJsonIds(this.searchIndexDir)
     return loadWithConcurrency(
       ids,
-      id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id)),
+      id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id), { tolerateUnreadable: true }),
     )
   }
 
@@ -345,7 +345,7 @@ export class ExperienceStore {
       const entries = indexedIds.length > 0
         ? await loadWithConcurrency(
             indexedIds,
-            id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id)),
+            id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id), { tolerateUnreadable: true }),
           )
         : isExperienceManifest(legacy)
           ? legacy.entries
@@ -362,7 +362,7 @@ export class ExperienceStore {
     const ids = await listJsonIds(this.searchIndexDir)
     const entries = await loadWithConcurrency(
       ids,
-      id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id)),
+      id => readJsonFile<ExperienceSearchEntry>(this._searchEntryPath(id), { tolerateUnreadable: true }),
     )
     await this._writeSummaryAndMarkdown(entries)
   }

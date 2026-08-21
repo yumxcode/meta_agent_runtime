@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.19` · Node.js `>= 18`
+> 当前版本:`0.8.20` · Node.js `>= 18`
 
 ---
 
@@ -509,8 +509,9 @@ meta-agent ui --ui-port 43100 --no-open
 docs/             # 架构、设计、报告与评审文档
 src/
 ├── kernel/       # 流式模型调用、工具循环、compact、权限、成本统计
-├── core/         # 高层 Session、配置、系统提示、记忆、任务契约、auto checkpoint/verify/drift
-├── modes/        # agentic / campaign 后端适配与消息桥接
+├── core/         # 配置、系统提示、记忆、任务契约、auto checkpoint/verify/drift
+├── modes/        # MetaAgentSession 门面 + agentic / campaign 后端适配与消息桥接
+├── loop/         # 长周期图循环:图规范/冻结、事件溯源运行时、蒸馏、宿主调度
 ├── routing/      # 显式模式选择与 SessionRouter
 ├── providers/    # 多提供商注册表(协议/计费/能力/探测)
 ├── tools/        # 内置工具(fs/shell/network/mcp/ui/system/agent/provenance/research)
@@ -558,4 +559,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.19`。
+当前包版本:`0.8.20`。

@@ -1,5 +1,5 @@
 import { join } from 'path'
-import { atomicWriteJson, readJsonFile } from '../core/persist/index.js'
+import { atomicWriteJson, readJsonFile } from '../infra/persist/index.js'
 import type { WorkflowDefinition, WorkflowPhase, WorkflowState, GateCheckResult } from './types.js'
 
 export class WorkflowStateStore {
