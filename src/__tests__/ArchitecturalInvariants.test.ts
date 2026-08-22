@@ -184,6 +184,14 @@ describe('architectural invariants', () => {
     const ALLOWED = new Map<string, string>([
       ['infra/exec/runShellCommand.ts', 'the hardened shell entry point itself'],
       ['infra/exec/runGit.ts', 'the hardened git entry point itself'],
+      // The persistent-session counterpart of runShellCommand. It cannot route
+      // THROUGH runShellCommand — that function spawns, waits for close, and
+      // returns, which is exactly the lifecycle a session must not have — so it
+      // is a second hardened entry point rather than a caller of the first. It
+      // applies the same five protections at its own spawn site (cwd jail via
+      // resolveJailedCwd, buildChildEnv, sandbox wrapExec, own process group,
+      // redactSecrets on every read); ShellSessionStore.test.ts asserts each.
+      ['infra/exec/ShellSessionStore.ts', 'the hardened persistent-shell entry point itself'],
       ['tools/mcp/mcpConfigFile.ts', 'stdio MCP servers; uses buildChildEnv("filtered")'],
       ['tools/fs/grep/index.ts', 'fixed argv (rg); no shell, no model-controlled argv'],
       ['cli/mcpAppsHost.ts', 'MCP Apps host process; config-controlled argv'],
@@ -282,6 +290,26 @@ describe('architectural invariants', () => {
       'skill',           // skill name resolved against a registry
       'exit_plan_mode',
       'enter_plan_mode',
+
+      // apply_patch: its paths live INSIDE the patch document, not in a
+      // declarable field. `pathFields: ['patch']` would hand the jail a whole
+      // multi-file diff to interpret as one path; `commandField: 'patch'` would
+      // run sensitive-command detection over patch CONTENT, so patching any
+      // shell script containing `rm -rf build/` would prompt. Instead the tool
+      // resolves every add/update/delete/move target through
+      // resolveInsideWorkspace itself, BEFORE planning any write, and refuses
+      // the whole patch on the first escape. ApplyPatchTool.test.ts covers both
+      // the file path and the move target.
+      'apply_patch',
+
+      // write_stdin / close_session: the jail applies when a SESSION is opened
+      // (exec_session declares both cwdField and commandField). These two
+      // address an already-jailed, already-sandboxed session by id. write_stdin
+      // deliberately carries no commandField because its payload is arbitrary
+      // stdin — a REPL expression, a password, a keypress — and scanning that
+      // as a shell command produces false positives without adding protection.
+      'write_stdin',
+      'close_session',
     ])
 
     const inert: string[] = []

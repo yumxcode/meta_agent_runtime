@@ -70,6 +70,13 @@ const BUILTIN_BOUNDED_TOOLS = new Set([
   'experience_search', 'experience_write', 'find_duplicate_computation', 'glob',
   'grep', 'get_computation_lineage', 'get_provenance',
   'get_sub_agent_intermediate', 'get_sub_agent_status', 'hardware_profile_read',
+  // `list_dir` was missing from this list while every one of its siblings
+  // (glob, grep, read_file) was present — a single bounded readdir that auto
+  // mode would nonetheless have rejected as an undeclared tool. Found by the
+  // fs-tool abort-contract test rather than by anything going wrong at runtime,
+  // which is the point of asserting the property over the whole set instead of
+  // tool by tool.
+  'list_dir',
   'hardware_profile_write', 'list_recent_results', 'list_sub_agents',
   'memory_delete', 'memory_write', 'notebook_edit', 'physical_anchor_load',
   'physical_anchor_search', 'physical_anchor_write', 'principle_delete',
@@ -150,6 +157,9 @@ function toToolCallContext(
     onMessage:          ext['onMessage'] as ToolCallContext['onMessage'],
     planMode:           ctx.planMode,
     autonomousMode:     ctx.autonomousMode,
+    // Rides the extensions channel like the other host-injected services, so
+    // the kernel does not have to know that turn diffing exists.
+    turnDiff:           ext['turnDiff'] as ToolCallContext['turnDiff'],
   }
 }
 
@@ -182,6 +192,8 @@ export function toKernelTool(
 
     permission: tool.permission,
     abortSupport: resolveToolAbortSupport(tool),
+    ...(tool.namespace !== undefined ? { namespace: tool.namespace } : {}),
+    ...(tool.deferLoading !== undefined ? { deferLoading: tool.deferLoading } : {}),
 
     async call(input: unknown, ctx: KernelToolContext): Promise<KernelToolResult> {
       const callCtx = toToolCallContext(ctx, extraExtensions)

@@ -22,6 +22,8 @@ import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGat
 import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../../subagent/verdictChannel.js'
 import { timeout } from '../../timeouts.js'
 import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
+import type { TurnDiffTracker } from '../../../infra/fs/TurnDiffTracker.js'
+import { renderTurnDiffSection, pathsInGitStat } from '../turnDiffSection.js'
 
 export interface AutoVerifyGateDeps {
   /** Spawns the isolated judge sub-agent. */
@@ -30,6 +32,16 @@ export interface AutoVerifyGateDeps {
   projectDir: string
   /** Lazily reads the pure frozen goal (SessionRouter._autoGoal). */
   getGoal: () => string | null
+  /**
+   * Tool-level change tracker, when the session runs one.
+   *
+   * Supplements — never replaces — the git snapshot diff, covering the two
+   * things git cannot show: a non-git workspace, and paths excluded by
+   * `.gitignore` (`git add -A` honours it, so an executor that spent the round
+   * editing under `build/` or `install/` looks idle to the judge). See
+   * core/auto/turnDiffSection.ts.
+   */
+  getTurnDiff?: () => TurnDiffTracker | undefined
 }
 
 /**
@@ -135,7 +147,12 @@ done=true 时 unfinished 必须为空数组。`
 }
 
 /** Build the judge's task: pure goal + where to inspect + pre-computed round diff. */
-function buildJudgeTask(goal: string, snapshotPath: string | null, diff: SnapshotDiff | null): string {
+function buildJudgeTask(
+  goal: string,
+  snapshotPath: string | null,
+  diff: SnapshotDiff | null,
+  turnDiffSection: string | null,
+): string {
   const location = snapshotPath
     ? `待审核的代码位于这个只读快照目录（请只在此目录内取证）：\n  ${snapshotPath}`
     : `（无法创建 git 快照，请直接在工作区只读查证，切勿修改任何文件。）`
@@ -159,12 +176,20 @@ function buildJudgeTask(goal: string, snapshotPath: string | null, diff: Snapsho
       '',
       diff.stat.trim(),
     )
-  } else if (diff) {
+  } else if (diff && !turnDiffSection) {
+    // Only assert "nothing changed" when the TOOL tracker agrees. git alone
+    // cannot support that claim: `git add -A` honours .gitignore, so a round
+    // spent editing under build/ or install/ produces an empty git diff. Telling
+    // the judge "没有任何文件改动——这本身即是重要证据" in that case actively
+    // points it at the wrong conclusion.
     lines.push(
       '',
       '【本轮改动】',
       '本轮相对上一轮基线没有任何文件改动（git diff 为空）——若目标要求有产出/改动，这本身即是重要证据。',
     )
+  }
+  if (turnDiffSection) {
+    lines.push('', turnDiffSection)
   }
   lines.push(
     '',
@@ -284,7 +309,21 @@ export function makeAutoVerifyGate(deps: AutoVerifyGateDeps): VerifyGateFn {
     try {
       // Isolated read-only snapshot + LLM judge. No typecheck/test/lint are run.
       const verdict = await withReadonlySnapshot(deps.projectDir, async (snapshotPath, diff) => {
-        const task = buildJudgeTask(goal, snapshotPath, diff)
+        // Supplement the git view with whatever git could not see. When git DID
+        // produce a diff we subtract the files it already listed, so this block
+        // carries only new information; with no git diff at all, it is the
+        // judge's only delta.
+        const tracker = deps.getTurnDiff?.()
+        const turnDiffSection = tracker
+          ? await renderTurnDiffSection(tracker, {
+              workspaceRoot: deps.projectDir,
+              ...(diff?.stat ? { coveredPaths: pathsInGitStat(diff.stat) } : {}),
+              // With no git diff the judge has nothing else to go on, so pay for
+              // the patch; otherwise a stat block is enough to point read_file.
+              includePatch: !diff,
+            })
+          : null
+        const task = buildJudgeTask(goal, snapshotPath, diff, turnDiffSection)
         return runJudge(deps, task, signal, snapshotPath)
       })
 

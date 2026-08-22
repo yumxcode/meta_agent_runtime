@@ -195,6 +195,19 @@ export interface ToolCallContext {
    * file. Undefined for non-auto sessions (tools then write without locking).
    */
   writeMutex?: import('./fs/WriteMutex.js').PathWriteMutex
+
+  // ── Turn diff ──────────────────────────────────────────────────────────────
+  /**
+   * Per-turn change tracker injected by the host (RuntimeContext /
+   * MetaAgentSession) when turn-level diffs are enabled.
+   *
+   * Every tool that MUTATES a file must call `await ctx.turnDiff?.capture(path)`
+   * immediately before writing — the tracker snapshots the old bytes lazily and
+   * has no other way to learn them. Undefined when diff tracking is off, which
+   * is why the call site is always optional-chained: a tool must behave
+   * identically with and without a tracker.
+   */
+  turnDiff?: import('../infra/fs/TurnDiffTracker.js').TurnDiffTracker
 }
 
 export interface ToolResult {
@@ -306,6 +319,27 @@ export interface MetaAgentTool {
    * Default: false (safe — unknown tools are treated as having side effects).
    */
   isConcurrencySafe?: boolean
+  /**
+   * Grouping label used by `tool_search` when this tool's schema is deferred.
+   *
+   * Namespaces are what the model sees INSTEAD of the hidden schemas ("mcp:
+   * 23 tools"), so they should name a capability area a reader could decide
+   * about without reading the tools themselves. Defaults to 'core'.
+   */
+  namespace?: string
+  /**
+   * Withhold this tool's schema from the request until `tool_search` reveals it.
+   *
+   * Set this on tools that are numerous, situational, or both — MCP servers,
+   * domain toolkits. Do NOT set it on tools the model needs in order to make
+   * any progress at all (fs, shell, the UI tools): a deferred tool costs an
+   * extra round-trip the first time it is used, which is the right trade only
+   * when the tool is usually NOT needed.
+   *
+   * Hiding a schema is a context-budget optimisation, never a permission
+   * boundary — a deferred tool remains executable if called by name.
+   */
+  deferLoading?: boolean
   /** Maximum characters to keep from this tool's result. Undefined uses runtime default. */
   maxResultSizeChars?: number
   /**

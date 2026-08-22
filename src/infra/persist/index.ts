@@ -190,6 +190,33 @@ const DEFAULT_LOCK_STALE_MS = 30_000
 const DEFAULT_LOCK_TIMEOUT_MS = 10_000
 const LOCK_POLL_MS = 25
 
+/**
+ * Slowest the heartbeat may run, so a short-lived lock does not turn into a
+ * `utimes` storm on a network filesystem.
+ */
+const MIN_HEARTBEAT_MS = 50
+
+/**
+ * Smallest `staleMs` this lock will honour, derived from MIN_HEARTBEAT_MS.
+ *
+ * The heartbeat is defined as `staleMs / 3` — "another process may declare me
+ * dead only after I have missed three beats". That headroom is the entire
+ * reason stale reclamation is safe, and it was being silently voided: the beat
+ * interval used to be `max(50, staleMs/3)`, so any `staleMs` below 150ms got a
+ * 50ms beat against a shorter deadline. At `staleMs = 60` that left 10ms of
+ * margin — less than one `readFile` + `utimes` pair on a busy host — and a
+ * waiter would reclaim a lock whose holder was alive and inside the critical
+ * section. Measured at ~1 in 40 acquisitions on an idle machine.
+ *
+ * The fix clamps the INPUT rather than the derived interval, because the two
+ * quantities are not equally negotiable: `staleMs` is a promise to OTHER
+ * processes about how patient they must be before declaring us dead, whereas
+ * the beat is merely how we keep that promise. When they cannot both be met,
+ * the safe direction is to be more patient about declaring others dead — never
+ * to beat more slowly than we told everyone we would.
+ */
+export const MIN_LOCK_STALE_MS = MIN_HEARTBEAT_MS * 3
+
 function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms))
 }
@@ -207,7 +234,8 @@ function sleep(ms: number): Promise<void> {
  * other (lost update).
  *
  *   - staleMs: a lock whose file is older than this is presumed orphaned by a
- *     crashed holder and forcibly reclaimed.
+ *     crashed holder and forcibly reclaimed. Clamped up to MIN_LOCK_STALE_MS,
+ *     below which the heartbeat could not keep the promise the value makes.
  *   - timeoutMs: how long to wait for the lock before throwing.
  *
  * The lock file is always removed in a finally block, even if `fn` throws.
@@ -244,7 +272,10 @@ export async function withFileLock<T>(
   opts: { staleMs?: number; timeoutMs?: number } = {},
 ): Promise<T> {
   const lockPath = `${targetPath}.lock`
-  const staleMs = opts.staleMs ?? DEFAULT_LOCK_STALE_MS
+  // Clamped, not just defaulted — see MIN_LOCK_STALE_MS. A caller asking for a
+  // deadline shorter than three heartbeats gets the shortest deadline this lock
+  // can actually honour, rather than a deadline it would quietly miss.
+  const staleMs = Math.max(MIN_LOCK_STALE_MS, opts.staleMs ?? DEFAULT_LOCK_STALE_MS)
   const timeoutMs = opts.timeoutMs ?? DEFAULT_LOCK_TIMEOUT_MS
   await ensureParentDir(targetPath)
 
@@ -325,7 +356,11 @@ export async function withFileLock<T>(
   //
   // One extra small read per beat (once per staleMs/3) is not a meaningful cost
   // next to the critical sections this guards.
-  const heartbeatMs = Math.max(50, Math.floor(staleMs / 3))
+  // No floor here: `staleMs` was already clamped so that this division cannot
+  // fall below MIN_HEARTBEAT_MS. Re-flooring it would reintroduce the exact
+  // inversion described at MIN_LOCK_STALE_MS — a beat slower than the deadline
+  // it exists to defend.
+  const heartbeatMs = Math.floor(staleMs / 3)
   const keepAlive = setInterval(() => {
     void (async () => {
       try {

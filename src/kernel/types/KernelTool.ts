@@ -111,6 +111,20 @@ export interface KernelTool {
   readonly abortSupport?: 'cooperative' | 'bounded' | 'non_cooperative'
 
   /**
+   * Grouping label for deferred-schema tools. Defaults to 'core'.
+   * See tools/registry/ToolVisibility.ts.
+   */
+  readonly namespace?: string
+  /**
+   * When true, this tool's SCHEMA is withheld from the model until a
+   * `tool_search` call reveals it. The tool stays executable throughout — the
+   * kernel filters what it SENDS, never what it will run, because permission
+   * decisions belong to the permission layer and not to a context-budget
+   * optimisation.
+   */
+  readonly deferLoading?: boolean
+
+  /**
    * Execute the tool.
    * The kernel guarantees input has already been validated via inputSchema.safeParse.
    */

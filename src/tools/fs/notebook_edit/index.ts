@@ -89,6 +89,7 @@ export async function createNotebookEditTool(): Promise<MetaAgentTool> {
             delete cell.execution_count
           }
         }
+        await _ctx.turnDiff?.capture(notebookPath)
         await writeFile(notebookPath, JSON.stringify(nb, null, 1), 'utf-8')
         return { content: `Cell ${n} ${mode}d in ${notebookPath}`, isError: false }
       } catch (err) { return { content: `Error: ${err instanceof Error ? err.message : String(err)}`, isError: true } }

@@ -34,6 +34,7 @@ import { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
 import { createSelfTimerTool } from '../core/auto/SelfTimerTool.js'
 import { FlashClient } from '../core/flash/FlashClient.js'
 import { defaultRoleCatalog } from '../core/roles/index.js'
+import { TurnDiffTracker } from '../infra/fs/TurnDiffTracker.js'
 import {
   createAutoExperienceStore,
   renderRecentExperiences,
@@ -122,7 +123,24 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
   // are obtained through it so every auto caller uses one role definition.
   const roleCatalog = defaultRoleCatalog()
   let sessionIdForRoles = resumeSessionId
-  const roleCtx = { dispatcher: lazyDispatcher, projectDir, getGoal, getSessionId: () => sessionIdForRoles }
+  // Per-run file-change tracker, wired ONLY for full auto (`wantsGates`).
+  //
+  // The cost is one read of the previous bytes at each path's first mutation,
+  // which is why it is not on for every session: an interactive run has a human
+  // watching and no gate to feed. An unattended run has neither, and the gates
+  // are precisely what needs to know which files moved — including the ones git
+  // cannot see (`git add -A` honours .gitignore, and the workspace may not be a
+  // repo at all).
+  const turnDiffTracker = wantsGates ? new TurnDiffTracker() : null
+  turnDiffTracker?.beginTurn('auto-run')
+
+  const roleCtx = {
+    dispatcher: lazyDispatcher,
+    projectDir,
+    getGoal,
+    getSessionId: () => sessionIdForRoles,
+    ...(turnDiffTracker ? { getTurnDiff: () => turnDiffTracker } : {}),
+  }
   const verifyGate = wantsGates ? roleCatalog.buildVerifyGate(roleCtx) : undefined
 
   // Auto Learn: one experience store powers both recall (main prompt) and the
@@ -211,6 +229,8 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     sessionId: resumeSessionId,
     promptMode: overrides?.promptMode,
     autonomy: overrides?.autonomy,
+    // The write tools populate this through ToolCallContext; the gates read it.
+    ...(turnDiffTracker ? { turnDiff: turnDiffTracker } : {}),
     verifyGate,
     driftGate,
     getExperienceRecallBlock,

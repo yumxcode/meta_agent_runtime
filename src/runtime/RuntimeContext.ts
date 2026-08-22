@@ -21,6 +21,7 @@ import { LocalExecutor } from '../jobs/JobExecutor.js'
 import { VVHookChain } from '../validation/VVHookChain.js'
 import { createDefaultVVChain } from '../validation/index.js'
 import { ProvenanceTracker } from '../provenance/ProvenanceTracker.js'
+import { TurnDiffTracker } from '../infra/fs/TurnDiffTracker.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // RuntimeContext interface
@@ -34,6 +35,16 @@ export interface RuntimeContext {
   readonly sessionId: string
   /** Agent ID (defaults to sessionId) */
   readonly agentId: string
+  /**
+   * Per-turn file change tracker, when enabled.
+   *
+   * Optional rather than always-on because tracking costs a read of the old
+   * bytes on every first mutation of a path, and a host that never surfaces a
+   * turn diff would pay that for nothing. Hosts that DO want it call
+   * `turnDiff.beginTurn()` at each turn boundary; the write tools populate it
+   * on their own.
+   */
+  readonly turnDiff?: TurnDiffTracker
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -59,6 +70,13 @@ export interface RuntimeContextOptions {
    * Custom ProvenanceTracker.  If omitted, creates a new one for sessionId.
    */
   provenanceTracker?: ProvenanceTracker
+  /**
+   * Track file changes per turn so `turn_diff` can render (and revert) them.
+   *
+   * Default: false. Pass `true` for the default tracker, or an instance to
+   * share one across contexts.
+   */
+  turnDiff?: boolean | TurnDiffTracker
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -84,6 +102,13 @@ export function createRuntimeContext(opts: RuntimeContextOptions): RuntimeContex
 
   const vvChain = opts.vvChain ?? createDefaultVVChain()
   const provenanceTracker = opts.provenanceTracker ?? new ProvenanceTracker(sessionId)
+  const turnDiff =
+    opts.turnDiff === true ? new TurnDiffTracker()
+      : opts.turnDiff instanceof TurnDiffTracker ? opts.turnDiff
+      : undefined
 
-  return { jobManager, vvChain, provenanceTracker, sessionId, agentId }
+  return {
+    jobManager, vvChain, provenanceTracker, sessionId, agentId,
+    ...(turnDiff ? { turnDiff } : {}),
+  }
 }

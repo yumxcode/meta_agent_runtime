@@ -98,6 +98,15 @@ export interface TimeoutConfig {
   jobMs: number
   /** Wall-clock cap for one auto-mode verify judge. */
   verifyMaxDurationMs: number
+  /**
+   * Wall-clock cap for one auto-mode drift judge.
+   *
+   * Must be a real, KNOWN value rather than an implicit sub-agent default: the
+   * drift gate derives its own polling ceiling from it, and the two silently
+   * disagreeing is what let a slow-but-healthy judge be recorded as
+   * "unavailable" (see DriftAgent.resolveDriftLimits).
+   */
+  driftMaxDurationMs: number
 }
 
 export const TIMEOUT_DEFAULTS: Readonly<TimeoutConfig> = Object.freeze({
@@ -111,6 +120,7 @@ export const TIMEOUT_DEFAULTS: Readonly<TimeoutConfig> = Object.freeze({
   mcpStdioMs:          60_000,
   jobMs:            1_800_000,
   verifyMaxDurationMs: 1_800_000,
+  driftMaxDurationMs:  1_800_000,
 })
 
 /** Env var backing each field, plus its accepted range. */
@@ -129,6 +139,7 @@ const FIELD_SPECS: Readonly<Record<keyof TimeoutConfig, {
   mcpStdioMs:          { env: 'META_AGENT_MCP_STDIO_TIMEOUT_MS',       min: 100,   max: 600_000 },
   jobMs:               { env: 'META_AGENT_JOB_TIMEOUT_MS',             min: 0,     max: 86_400_000 },
   verifyMaxDurationMs: { env: 'META_AGENT_VERIFY_MAX_DURATION_MS',     min: 10_000, max: 3_600_000 },
+  driftMaxDurationMs:  { env: 'META_AGENT_DRIFT_MAX_DURATION_MS',      min: 10_000, max: 3_600_000 },
 })
 
 export const TIMEOUT_FIELD_NAMES = Object.keys(TIMEOUT_DEFAULTS) as (keyof TimeoutConfig)[]

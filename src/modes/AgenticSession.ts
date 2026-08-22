@@ -208,7 +208,14 @@ export class AgenticSession {
       extensions['jobManager'] = rtx.jobManager
       extensions['vvChain'] = rtx.vvChain
       extensions['provenanceTracker'] = rtx.provenanceTracker
+      // Absent unless the host opted into turn diffing — the write tools
+      // optional-chain on it, so absence simply means no tracking.
+      if (rtx.turnDiff) extensions['turnDiff'] = rtx.turnDiff
     }
+    // The dedicated config slot wins over runtimeContext.turnDiff: it is the
+    // more specific declaration, and it is how auto mode gets tracking without
+    // dragging in a full RuntimeContext it has no use for.
+    if (this._config.turnDiff) extensions['turnDiff'] = this._config.turnDiff
 
     this._engine.upsertTool(toKernelTool(wrapped, extensions, () => ({
       tools: this._registeredTools,

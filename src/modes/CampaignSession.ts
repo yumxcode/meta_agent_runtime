@@ -128,6 +128,7 @@ export class CampaignSession {
       extensions['jobManager'] = rtx.jobManager
       extensions['vvChain'] = rtx.vvChain
       extensions['provenanceTracker'] = rtx.provenanceTracker
+      if (rtx.turnDiff) extensions['turnDiff'] = rtx.turnDiff
     }
     // Thread the snapshot fire-and-forget through onMessage extension
     extensions['onSnapshotFireAndForget'] = async () => {

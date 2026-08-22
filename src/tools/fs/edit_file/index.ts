@@ -89,6 +89,11 @@ export async function createEditFileTool(): Promise<MetaAgentTool> {
         const updated = replaceAll
           ? pieces.join(newStr)
           : pieces[0] + newStr + pieces.slice(1).join(oldStr)
+        // Snapshot the OLD bytes for the turn diff. Placed after the match
+        // checks so a no-op edit (old_string not found) never registers the
+        // file as touched — the turn diff must describe what CHANGED, not what
+        // was attempted.
+        await ctx.turnDiff?.capture(filePath)
         await writeFile(filePath, updated, 'utf-8')
         // Refresh the FileStateCache so subsequent edits in the same turn don't
         // trip the TOCTOU guard on the bytes we just wrote ourselves.

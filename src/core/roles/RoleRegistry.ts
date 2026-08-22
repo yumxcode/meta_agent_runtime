@@ -30,6 +30,14 @@ export interface RoleContext {
   projectDir: string
   getGoal: () => string | null
   getSessionId?: () => string | undefined
+  /**
+   * Tool-level file-change tracker for the run, when the session keeps one.
+   *
+   * Passed straight through to verify/drift, which use it to see changes git
+   * cannot report (non-git workspace, `.gitignore`d paths). Absent = the gates
+   * fall back to the git snapshot diff alone, which is their previous behaviour.
+   */
+  getTurnDiff?: () => import('../../infra/fs/TurnDiffTracker.js').TurnDiffTracker | undefined
 }
 
 /** Input to a node-level role handler (the node's criteria + abort signal). */

@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.8.20` · Node.js `>= 18`
+> 当前版本:`0.9.0` · Node.js `>= 18`
 
 ---
 
@@ -13,6 +13,9 @@
 - **多提供商自动选择**:按环境变量优先级自动落到 Zhipu/GLM(默认)、DeepSeek、Qwen、Anthropic;统一封装 thinking/reasoning、计费、betas、消息规范化等差异。
 - **主 LLM 扩展思考(默认开启)**:默认 `thinkingConfig: { type: 'adaptive' }`;可关闭或自定义预算;回退模型自动切到更保守的 thinking 配置。
 - **多轮工具循环 + 自动上下文压缩**:模型可连续调用文件 / Shell / 网络 / MCP / 自定义工具直至任务完成;接近上下文上限时自动压缩历史,保留任务目标与关键状态锚点。
+- **持久 Shell 会话**:`exec_session` / `write_stdin` / `close_session` 让进程跨工具调用存活——REPL 交互、`cd`/`export`/`source` 状态保持、长构建的增量观察。守卫栈与一次性 `bash` 完全一致(工作区监狱、凭据过滤、OS 沙箱、进程组回收、输出脱敏)。
+- **原子多文件补丁 + 轮级 Diff**:`apply_patch` 在一次调用里完成新增/修改/删除/重命名,全部校验通过才落盘,写入中途失败自动回滚;`turn_diff` 把本轮所有改动聚合成统一 diff,并可整轮回退。
+- **工具懒加载**:工具可声明 `namespace` + `deferLoading`,schema 不进每轮请求,由 `tool_search` 按需载入——挂载大量 MCP 工具时不再挤占上下文预算。隐藏的只是 schema,不是权限。
 - **并发子代理**:`run_agent`(同步阻塞)与 `spawn_sub_agent`(异步并行扇出)两条委派路径,隔离上下文、断路器(轮数/预算/时长)、事件驱动完成通知、读默认只读 / 写强制 git 分支隔离。
 - **auto 自治模式**:工作区硬监狱(fail-closed 沙箱)、独立的 verify(完成校验)与 drift(目标漂移)关卡子代理、断路器、可中断/可 `--resume` 的 durable checkpoint、失败自动重试、收紧的并发与预算上限。
 - **权限与沙箱**:工作目录限制、计划模式只读、敏感命令交互确认、`beforeToolCall` 拦截、OS 级 sandbox(Linux bwrap / macOS sandbox-exec)、工具结果预算截断。
@@ -288,8 +291,8 @@ meta-agent -w /path/to/workspace loop disk <instanceId>
 
 | 类别 | 工具 |
 | --- | --- |
-| 文件系统 | `read_file`、`write_file`、`append_file`、`edit_file`、`glob`、`list_dir`、`grep`、`notebook_edit` |
-| Shell | `bash`、`powershell` |
+| 文件系统 | `read_file`、`write_file`、`append_file`、`edit_file`、`apply_patch`、`turn_diff`、`glob`、`list_dir`、`grep`、`notebook_edit` |
+| Shell | `bash`、`powershell`、`exec_session`、`write_stdin`、`close_session` |
 | 网络 | `web_fetch`、`web_search` |
 | MCP | `mcp_call`、`list_mcp_resources`、`read_mcp_resource` |
 | UI | `ask_user`、`send_message`、`todo_write`、`progress_note`、`artifacts_register` |
@@ -302,6 +305,87 @@ meta-agent -w /path/to/workspace loop disk <instanceId>
 判断"某个目录/文件在不在"请用 `list_dir` 而不是 `glob`:前者一次 `readdir` 给出确定答案,并区分**不存在**、**存在但为空**、**存在且有内容** —— 这三者是模式搜索表达不了的。`glob` 是遍历匹配,会跳过 vendored 依赖树(`node_modules`、`site-packages`、`pylibs`、`vendor` 等,但 pattern 里字面点名时照搜),并在扫描被截断时**明确标注 TRUNCATED**;那句话的意思是"没扫完",不是"不存在",不可据此断言缺失。
 
 > 在 `SessionRouter` 下,子代理委派工具与 research_dispatch 会按模式自动注册;auto 模式还会装配工作区监狱、worktree 隔离与合并工具。`createAutoUiTools()` 为无人值守场景排除 `ask_user`/`send_message`。
+
+### 持久 Shell 会话
+
+`bash` 一次性执行:spawn → 等待退出 → 返回。这个形状对"跑个命令看输出"是对的,也仍然是默认选择;但它做不到三件事——REPL 交互(下一步输入取决于上一步输出)、shell 状态保持(`cd` / `export` / `source venv/bin/activate`)、长任务的中途观察。
+
+```bash
+exec_session   { command: "python3 -u -i", yield_time_ms: 2000 }   # → session_id
+write_stdin    { session_id, input: "import numpy; numpy.__version__" }
+write_stdin    { session_id, input: "" }        # 空输入 = 继续读,不发送任何东西
+close_session  { session_id }                    # 省略 session_id 则列出全部会话
+```
+
+几点值得注意:
+
+- **守卫栈与 `bash` 逐条对齐**:cwd 监狱、凭据过滤 env、OS 沙箱包裹、独立进程组、输出脱敏。会话不是绕开任何一层的路径——若两者策略不同,选工具就成了选更弱的策略。
+- **隔离按 `agentId`,不是 `sessionId`**:子代理跑在父进程里共享同一个 store,用会话 id 做键会让它写进主代理的 REPL。跨 owner 访问返回的错误与"会话不存在"完全一致,否则消息本身就成了探测他人会话 id 的信道。
+- **管道,不是 PTY**:真 PTY 需要原生依赖(node-pty),而本运行时刻意只保留三个纯 JS 运行时依赖。代价是:块缓冲的程序需要显式无缓冲标志(`python3 -u`、`stdbuf -oL`),全屏 TTY 程序(`top`/`vim`)不可用。
+- **读窗口在程序安静后提前返回**,所以快命令不会烧满 `yield_time_ms`;但**完全不输出的命令**(`cd`、`export`)没有"安静下来"可言,只能等满窗口——对这类命令传个小值。
+- `close_session` 杀整个进程组。要让程序活过会话,用 `nohup`/`setsid` 并重定向到文件。
+
+### 原子补丁与轮级 Diff
+
+`edit_file` 是单文件单次精确替换,适合外科手术式改动,保持不变。但重构不是那个形状:"六个文件里重命名一个符号、删掉只为它存在的文件、加上替代品"——这些改动只有**一起生效**才是正确的。六次串行 `edit_file` 在调用之间让代码树处于损坏状态,而第四次失败时前三次已经落盘。
+
+```
+*** Begin Patch
+*** Add File: src/new_module.ts
++export function hello() { return 'world' }
+*** Update File: src/index.ts
+@@ export function main
+ import { existing } from './existing.js'
++import { hello } from './new_module.js'
+*** Update File: src/old_name.ts
+*** Move to: src/new_name.ts
+@@
+-const NAME = 'old'
++const NAME = 'new'
+*** Delete File: src/obsolete.ts
+*** End Patch
+```
+
+`apply_patch` 分三阶段:**校验全部路径 → 在内存里算出所有最终内容 → 才开始写盘**,写入中途失败按逆序回滚。格式刻意不带行号:那是模型唯一算不准的部分(需要数行),而上下文行携带同样的定位信息,并且它已经看着这些行了。多个 hunk 按顺序向前搜索,所以重复出现的 `}` 或 `import` 行也能确定性地定位。
+
+`turn_diff` 回答的是"这一轮到底改了什么"——一轮里对同一文件的多次编辑会折叠成一个改动,这是逐条编辑结果表达不了的:
+
+```
+turn_diff { }                    # 统一 diff
+turn_diff { action: "stat" }     # 仅每文件增删行数
+turn_diff { action: "revert" }   # 整轮回退到轮初状态
+```
+
+基线是**惰性**捕获的——在每个路径本轮首次被修改前的那一刻。这个时序是设计核心:轮初捕获意味着要读遍"可能"被碰的文件(不可知),写完再捕获则信息已经丢了。启用方式:
+
+```ts
+const rtx = createRuntimeContext({ sessionId: 'sess-1', turnDiff: true })
+rtx.turnDiff?.beginTurn()   // 在每个轮边界调用
+```
+
+`revert` 是**轮粒度撤销**,不是版本控制替代品:只恢复本轮被追踪到的文件,shell 命令造成的改动追踪不到;本轮新建的文件会被删除;且不可再撤销。
+
+### 工具懒加载(tool_search)
+
+每个已注册工具的完整 JSON Schema 会进入**每一轮**请求。内置工具集下这没问题,但接入 MCP 服务器后就不是了:三个服务器加起来暴露六十个工具,工具块本身可能比对话还重,而且这份开销每轮都付,无论模型是否用得上。**工具数量——而非上下文长度或模型能力——成了"能接多少东西"的真正约束**,而且配置越有用它越糟。
+
+```ts
+const tools = await createStandardTools({ include: ['fs', 'mcp'], defer: ['mcp'] })
+// mcp 类别的 schema 不进请求;tool_search 被自动注册(有东西可搜才注册)
+```
+
+工具也可以自己声明:
+
+```ts
+const tool: MetaAgentTool = { name: 'db_query', namespace: 'mcp', deferLoading: true, /* … */ }
+```
+
+模型看到的是 `tool_search` 的描述里的**命名空间清单**("mcp: 23 个工具未载入"),搜索命中后 schema 在本会话内一直可见。两个刻意的选择:
+
+- **揭示对整个会话粘滞**。撤销能省更多 token,但会在撤销的那一轮作废 prompt cache,并逼模型重新搜索它已经找到过的工具——付两次省一次。
+- **被隐藏的工具仍可执行**。藏 schema 是上下文预算优化,不是权限边界;权限边界是权限层。模型若猜对名字并正确调用,以"你该先搜索"为由拒绝纯属仪式,还会把预算决策放到安全路径上。
+
+默认**不 defer 任何类别**。对模型"必须有才能起步"的工具(fs / shell / ui)做延迟是有害的:看不到怎么读文件时,它不会去搜索一个文件读取器,它会放弃或瞎猜。排障时 `META_AGENT_TOOLS_EAGER=1` 恢复全量发送。
 
 ### 注册自定义工具
 
@@ -508,7 +592,7 @@ meta-agent ui --ui-port 43100 --no-open
 ```text
 docs/             # 架构、设计、报告与评审文档
 src/
-├── kernel/       # 流式模型调用、工具循环、compact、权限、成本统计
+├── kernel/       # 流式模型调用、工具循环、compact、权限、工具可见性、成本统计
 ├── core/         # 配置、系统提示、记忆、任务契约、auto checkpoint/verify/drift
 ├── modes/        # MetaAgentSession 门面 + agentic / campaign 后端适配与消息桥接
 ├── loop/         # 长周期图循环:图规范/冻结、事件溯源运行时、蒸馏、宿主调度
@@ -525,7 +609,7 @@ src/
 ├── units/        # 单位与量纲系统
 ├── jobs/         # 后台任务系统
 ├── sandbox/      # OS 级沙箱(bwrap / sandbox-exec)
-├── infra/        # 共享基础设施(git 工作树、知识存储、持久化)
+├── infra/        # 共享基础设施(git 工作树、知识存储、持久化、持久 shell 会话、diff/补丁)
 ├── context/      # 上下文分页与知识源
 ├── research/     # research_dispatch 结果存储
 └── cli/          # 命令行入口
@@ -559,4 +643,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.8.20`。
+当前包版本:`0.9.0`。

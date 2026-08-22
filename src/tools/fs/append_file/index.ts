@@ -29,6 +29,7 @@ export async function createAppendFileTool(): Promise<MetaAgentTool> {
       if (!resolved.ok) return { content: resolved.error, isError: true }
       const release = ctx.writeMutex ? await ctx.writeMutex.acquire(resolved.path) : null
       try {
+        await ctx.turnDiff?.capture(resolved.path)
         await mkdir(dirname(resolved.path), { recursive: true })
         await appendFile(resolved.path, content, 'utf8')
         return { content: `Successfully appended ${Buffer.byteLength(content, 'utf8')} bytes to ${resolved.path}`, isError: false }

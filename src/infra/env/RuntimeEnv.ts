@@ -310,6 +310,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_VERIFY_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto verify judge.' },
   { name: 'META_AGENT_VERIFY_MAX_BUDGET_USD', type: 'float', default: '1', description: 'Maximum USD spend for one auto verify judge.' },
   { name: 'META_AGENT_DRIFT_MAX_BUDGET_USD', type: 'float', default: '0.5', description: 'Maximum USD spend for one auto drift judge.' },
+  { name: 'META_AGENT_DRIFT_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto drift judge.' },
   // ── Timeouts (all overridable by config.json → "timeouts") ────────────────
   { name: 'META_AGENT_LLM_FIRST_TOKEN_TIMEOUT_MS', type: 'int', default: '90000', description: 'Streaming LLM call: budget to the FIRST stream event. Range [1000,3600000]. Config key: timeouts.llmFirstTokenMs.' },
   { name: 'META_AGENT_LLM_IDLE_TIMEOUT_MS', type: 'int', default: '60000', description: 'Streaming LLM call: max silence BETWEEN stream events. There is deliberately no total cap. Range [1000,3600000]. Config key: timeouts.llmIdleMs.' },
@@ -321,6 +322,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_MCP_STDIO_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one stdio MCP RPC. Range [100,600000]. Config key: timeouts.mcpStdioMs.' },
   { name: 'META_AGENT_JOB_TIMEOUT_MS', type: 'int', default: '1800000', description: 'LocalExecutor watchdog budget per job (ms). 0 disables. Config key: timeouts.jobMs.' },
   { name: 'META_AGENT_VERIFY_MAX_DURATION_MS', type: 'int', default: '1800000', description: 'Wall-clock limit for one auto verify judge. Range [10000,3600000]. Config key: timeouts.verifyMaxDurationMs.' },
+  { name: 'META_AGENT_DRIFT_MAX_DURATION_MS', type: 'int', default: '1800000', description: 'Wall-clock limit for one auto drift judge. Range [10000,3600000]. Config key: timeouts.driftMaxDurationMs.' },
   // ── /Timeouts ─────────────────────────────────────────────────────────────
   { name: 'META_AGENT_HOME', type: 'string', default: '~/.meta-agent', description: 'Root directory for all persisted meta-agent state.' },
   { name: 'META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS', type: 'int', default: '3', description: 'Auto-mode circuit cap on timed-out-but-running tools.' },

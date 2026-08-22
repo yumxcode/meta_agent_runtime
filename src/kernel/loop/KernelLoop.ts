@@ -26,6 +26,7 @@ import type { TokenUsage } from '../types/TokenUsage.js'
 import { emptyUsage, addUsage } from '../types/TokenUsage.js'
 import { initialLoopState, type LoopState } from './LoopState.js'
 import { applyToolResultBudget } from '../tools/ToolResultBudget.js'
+import { visibleToolsForApi } from '../tools/ToolVisibility.js'
 import { autoCompactIfNeeded, shouldAutoCompact, type AutoCompactTrackingState } from '../compact/AutoCompact.js'
 import { streamMessages } from '../api/AnthropicClient.js'
 import { streamDeepSeekMessages } from '../api/DeepSeekClient.js'
@@ -1006,6 +1007,14 @@ export async function* runKernelLoop(
       ? stripThinkingBlocksFromMessages(currentMessagesForQuery)
       : currentMessagesForQuery
 
+    // Which tool SCHEMAS go on the wire this turn. Deferred tools are withheld
+    // until `tool_search` reveals them; `config.tools` is left untouched, so a
+    // withheld tool is still executed normally if the model calls it by name.
+    // Filtering the request rather than the registry keeps this a context-
+    // budget decision and prevents it from becoming an accidental permission
+    // boundary. `visibleToolsForApi` is identity when nothing is deferred.
+    const toolsForApi = visibleToolsForApi(config.tools, sessionId)
+
     const assistantMessages: KernelMessage[] = []
     const acc = newAccumulator()
     let streamError: unknown = null
@@ -1033,7 +1042,7 @@ export async function* runKernelLoop(
                 messagesForApi,
                 systemPrompt || undefined,
               ),
-              tools: config.tools,
+              tools: toolsForApi,
               thinkingConfig: state.fallbackTriggered
                 ? (config.fallbackThinkingConfig ?? { type: 'disabled' })
                 : config.thinkingConfig,
@@ -1049,7 +1058,7 @@ export async function* runKernelLoop(
               sessionId,
               messages: normalizeMessagesForAPI(messagesForApi),
               systemPrompt: systemPrompt || undefined,
-              tools: config.tools,
+              tools: toolsForApi,
               thinkingConfig: state.fallbackTriggered
                 ? (config.fallbackThinkingConfig ?? { type: 'disabled' })
                 : config.thinkingConfig,

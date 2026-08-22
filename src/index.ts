@@ -226,8 +226,15 @@ export type { FidelityLevel, RegistryEntry } from './tools/index.js'
 export {
   createFsTools,
   createReadFileTool, createWriteFileTool, createAppendFileTool, createEditFileTool,
+  createApplyPatchTool, createTurnDiffTool,
   createGlobTool, createGrepTool, createNotebookEditTool,
   createShellTools, createBashTool, createPowerShellTool,
+  createExecSessionTool, createWriteStdinTool, createCloseSessionTool,
+  // Deferred tool schemas — see kernel/tools/ToolVisibility.ts.
+  createToolSearchTool,
+  toolVisibility, resetToolVisibility, visibleToolsForApi,
+  searchTools, namespaceOf, isDeferred, eagerToolsForced, DEFAULT_NAMESPACE,
+  ToolVisibilityRegistry,
   createNetworkTools, createWebFetchTool, createWebSearchTool,
   createMcpTools, registerMcpClient, unregisterMcpClient, getRegisteredMcpServers,
   setMcpAppPresenter, getMcpAppPresenter, getMcpAppResourceUri, isMcpToolVisibleTo,
@@ -248,7 +255,28 @@ export type {
   McpAppPresenter, McpAppPresentation,
   NetworkToolsOptions, WebSearchToolOptions, TodoItem,
   StandardToolsOptions, SystemToolsOptions, CronJob,
+  ToolCategory, FsToolsOptions, ShellToolsOptions, ShellSessionToolOptions,
+  ToolSearchOptions, VisibilityTool, NamespaceSummary, ToolSearchHit,
 } from './tools/index.js'
+
+// ── Persistent shell sessions ─────────────────────────────────────────────────
+export {
+  ShellSessionStore, shellSessionStore, resetShellSessionStore,
+  ShellSessionNotFound, ShellSessionExited, SHELL_SESSION_DEFAULTS,
+} from './infra/exec/ShellSessionStore.js'
+export type {
+  OpenShellSessionOptions, ShellSessionInfo, ShellReadResult,
+} from './infra/exec/ShellSessionStore.js'
+
+// ── Patch format and turn-level diffs ─────────────────────────────────────────
+export {
+  parsePatch, applyHunks, describeOperations, PatchParseError, PatchApplyError,
+} from './infra/fs/patchFormat.js'
+export type { PatchOperation, PatchHunk, PatchHunkLine } from './infra/fs/patchFormat.js'
+export { unifiedDiff, diffLines, diffStat, splitLines } from './infra/fs/unifiedDiff.js'
+export type { DiffOptions, EditOp } from './infra/fs/unifiedDiff.js'
+export { TurnDiffTracker, TURN_DIFF_LIMITS } from './infra/fs/TurnDiffTracker.js'
+export type { TurnDiffEntry, TurnDiffSummary, RevertOutcome } from './infra/fs/TurnDiffTracker.js'
 
 // ── Workflow system ───────────────────────────────────────────────────────────
 export { WorkflowLoader } from './workflow/WorkflowLoader.js'

@@ -325,6 +325,18 @@ export interface MetaAgentConfig {
    */
   runtimeContext?: RuntimeContext
 
+  /**
+   * Per-run file-change tracker injected into every write tool's
+   * ToolCallContext.
+   *
+   * Separate from `runtimeContext.turnDiff` so a caller can have change
+   * tracking without also opting into V&V, provenance and the job manager —
+   * auto mode wants exactly that: the verify/drift gates need to know which
+   * files moved, and nothing else in RuntimeContext is relevant to them.
+   * When both are present this one wins, being the more specific declaration.
+   */
+  turnDiff?: import('../infra/fs/TurnDiffTracker.js').TurnDiffTracker
+
   // ── Tool execution guard ──────────────────────────────────────────────────
   /**
    * Optional async hook called before every tool execution.
@@ -467,6 +479,7 @@ export type ResolvedConfig = Required<
   Omit<MetaAgentConfig,
     | 'sessionId'
     | 'runtimeContext'
+    | 'turnDiff'
     | 'language'
     | 'outputStyle'
     | 'mcpServers'
@@ -508,6 +521,7 @@ export type ResolvedConfig = Required<
   getAdditionalBudgetUsd?: MetaAgentConfig['getAdditionalBudgetUsd']
   compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
+  turnDiff?: MetaAgentConfig['turnDiff']
   language?: string
   outputStyle?: OutputStyle
   mcpServers?: import('./dynamicPrompt.js').McpServerInstruction[]
@@ -641,6 +655,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     verbose: config.verbose ?? false,
     // Optional — pass through as-is; undefined = feature disabled
     runtimeContext:  config.runtimeContext,
+    turnDiff:        config.turnDiff,
     language:        config.language,
     outputStyle:     config.outputStyle,
     mcpServers:      config.mcpServers,

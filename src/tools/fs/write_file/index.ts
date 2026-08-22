@@ -41,6 +41,10 @@ export async function createWriteFileTool(): Promise<MetaAgentTool> {
       const release = _ctx.writeMutex ? await _ctx.writeMutex.acquire(filePath) : null
       let temporary: string | undefined
       try {
+        // Snapshot the OLD bytes for the turn diff before they are gone. Inside
+        // the lock so a concurrent writer cannot slip between capture and write
+        // and make the baseline describe a state that never existed.
+        await _ctx.turnDiff?.capture(filePath)
         await mkdir(dirname(filePath), { recursive: true })
         temporary = join(dirname(filePath), `.${randomUUID()}.write`)
         await writeFile(temporary, content, 'utf-8')
