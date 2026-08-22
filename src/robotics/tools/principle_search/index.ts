@@ -35,7 +35,11 @@ export function createPrincipleSearchTool(store: PrincipleStore): MetaAgentTool 
         limit: input['limit'] as number | undefined,
       })
       if (results.length === 0) {
-        return { content: 'No reviewed principles found matching the query.', isError: false }
+        return {
+          content: 'No reviewed principles found matching the query.',
+          isError: false,
+          trajectoryItems: [{ type: 'knowledge', kind: 'principle', action: 'recalled', entryIds: [], query: JSON.stringify(input), operation: 'recall' }],
+        }
       }
       const lines = results.map(p => [
         `### [${p.id}] ${p.title}`,
@@ -47,7 +51,14 @@ export function createPrincipleSearchTool(store: PrincipleStore): MetaAgentTool 
         p.nonApplicableWhen.length ? `**Not applicable when**: ${p.nonApplicableWhen.join('; ')}` : '',
         `> Use \`principle_load id="${p.id}"\` for full boundaries and evidence.`,
       ].filter(Boolean).join('\n')).join('\n\n')
-      return { content: `Found ${results.length} principle(s):\n\n${lines}`, isError: false }
+      return {
+        content: `Found ${results.length} principle(s):\n\n${lines}`,
+        isError: false,
+        trajectoryItems: [{
+          type: 'knowledge', kind: 'principle', action: 'recalled',
+          entryIds: results.map(result => result.id), query: JSON.stringify(input), operation: 'recall',
+        }],
+      }
     },
   }
 }

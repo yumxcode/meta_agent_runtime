@@ -42,7 +42,11 @@ export function createPhysicalAnchorSearchTool(store: PhysicalAnchorStore): Meta
           limit: input['limit'] as number | undefined,
         })
         if (anchors.length === 0) {
-          return { content: 'No physical anchors found matching the query.', isError: false }
+          return {
+            content: 'No physical anchors found matching the query.',
+            isError: false,
+            trajectoryItems: [{ type: 'knowledge', kind: 'anchor', action: 'recalled', entryIds: [], query: JSON.stringify(input), operation: 'recall' }],
+          }
         }
         const lines = anchors.map(anchor => [
           `### [${anchor.id}] ${anchor.title}`,
@@ -56,7 +60,14 @@ export function createPhysicalAnchorSearchTool(store: PhysicalAnchorStore): Meta
           `> Use \`physical_anchor_load id="${anchor.id}"\` for the full anchor.`,
           '',
         ].join('\n'))
-        return { content: `Found ${anchors.length} physical anchor(s):\n\n${lines.join('\n')}`, isError: false }
+        return {
+          content: `Found ${anchors.length} physical anchor(s):\n\n${lines.join('\n')}`,
+          isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'anchor', action: 'recalled',
+            entryIds: anchors.map(anchor => anchor.id), query: JSON.stringify(input), operation: 'recall',
+          }],
+        }
       } catch (err) {
         return { content: `physical_anchor_search failed: ${String(err)}`, isError: true }
       }

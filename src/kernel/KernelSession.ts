@@ -35,6 +35,10 @@ import { resolveProvider } from '../providers/registry.js'
 
 import { stripVolatileContextPrefix } from './utils/VolatileContext.js'
 import { createTelemetryRecorder } from './telemetry/recorder.js'
+import { openTrajectory, closeTrajectory } from '../trajectory/hub.js'
+import { sha256, summarizeOutput } from '../trajectory/privacy.js'
+import type { TrajectoryRecorder } from '../trajectory/recorder.js'
+import type { RecordContext, TrajectoryItem, TrajectorySubject } from '../trajectory/types.js'
 
 /** Result of a manual (user-initiated) compaction. */
 export interface ManualCompactResult {
@@ -201,6 +205,9 @@ export class KernelSession {
    * (greeting/context first, actual task in message 2-3).
    */
   private _originalUserGoalParts: string[] = []
+  private _trajectoryPromise: Promise<TrajectoryRecorder | null> | undefined
+  private _trajectoryRecorder: TrajectoryRecorder | null = null
+  private _trajectoryPersistenceDegraded = false
 
   constructor(config: KernelConfig) {
     this._config = { ...config }
@@ -245,6 +252,80 @@ export class KernelSession {
     // before the model has even seen this submit's prompt.
     this._steerQueue.length = 0
 
+    const runId = crypto.randomUUID()
+    const turnId = crypto.randomUUID()
+    const runStartedAt = Date.now()
+    const runStartedCostUsd = this._totalCostUsd
+    const trajectory = await this._getTrajectoryRecorder()
+    let trajectoryRecordChain: Promise<void> = Promise.resolve()
+    const record = (item: TrajectoryItem, context: RecordContext = {}): void => {
+      if (!trajectory) return
+      trajectoryRecordChain = trajectoryRecordChain
+        .then(() => trajectory.record(item, { runId, turnId, ...context }))
+        .catch(error => {
+          this._markTrajectoryDegraded(trajectory, error)
+        })
+    }
+    const flushCheckpoint = this._config.onCheckpointBoundary
+      ? async (event: Parameters<NonNullable<KernelConfig['onCheckpointBoundary']>>[0]) => {
+          const result = await this._config.onCheckpointBoundary!(event)
+          if (result.updated && result.checkpoint) {
+            record({
+              type: 'state_checkpoint',
+              mode: result.checkpoint.mode,
+              stateSchemaVersion: result.checkpoint.stateSchemaVersion,
+              revision: result.revision,
+              contentHash: result.checkpoint.contentHash,
+              storeRef: result.checkpoint.storeRef,
+            })
+          }
+          return result
+        }
+      : undefined
+    let runResultRecorded = false
+
+    if (trajectory) {
+      try {
+        await trajectory.record({
+          type: 'run_started',
+          reason: this._config.querySource ?? 'submit',
+          budget: {
+            maxTurns: finiteOrNull(this._config.maxTurns),
+            maxBudgetUsd: finiteOrNull(this._config.maxBudgetUsd),
+            maxOutputTokens: finiteOrNull(this._config.maxOutputTokens),
+          },
+        }, { runId, turnId })
+        const provider = resolveProvider({
+          apiKey: this._config.apiKey,
+          baseURL: this._config.baseURL,
+          model: this._config.model,
+        }).provider
+        await trajectory.record({
+          type: 'turn_context',
+          model: this._config.model,
+          provider,
+          approvalPolicy: this._config.canUseTool ? 'configured' : 'allow_all',
+          sandboxMode: this._config.autonomousMode ? 'autonomous_workspace_jail' : 'configured',
+          tools: this._config.tools.map(tool => ({
+            name: tool.name,
+            schemaHash: sha256(stableJson(tool.inputJSONSchema)),
+          })),
+          budgetRemaining: {
+            costUsd: finiteOrNull(
+              (this._config.maxBudgetUsd ?? Infinity) - this._totalCostUsd,
+            ),
+          },
+          policyVersion: sha256(stableJson({
+            systemPrompt: this._config.systemPrompt ?? '',
+            appendSystemPrompt: this._config.appendSystemPrompt ?? '',
+            querySource: this._config.querySource ?? 'main',
+          })),
+        }, { runId, turnId })
+      } catch (error) {
+        this._markTrajectoryDegraded(trajectory, error)
+      }
+    }
+
     // One recorder per submitMessage() call: `runId` scopes a single
     // request→result cycle, which is the unit the summary counters describe.
     // Null when telemetry is disabled, which is the default.
@@ -266,6 +347,7 @@ export class KernelSession {
             }
 
       this._messages.push(userMessage)
+      record({ type: 'message', message: userMessage as unknown as Record<string, unknown> })
       if (this._originalUserGoalParts.length < ORIGINAL_GOAL_MESSAGE_COUNT) {
         const maxChars = this._originalUserGoalParts.length === 0
           ? ORIGINAL_GOAL_MAX_CHARS
@@ -282,7 +364,9 @@ export class KernelSession {
 
       try {
         const gen = runKernelLoop({
-          config: this._config,
+          config: flushCheckpoint
+            ? { ...this._config, onCheckpointBoundary: flushCheckpoint }
+            : this._config,
           mutableMessages: this._messages,
           abortController: this._abortController,
           fileCache: this._fileCache,
@@ -296,6 +380,25 @@ export class KernelSession {
           initialLastDriftCheckpointRevision: this._lastDriftCheckpointRevision,
           drainSteering: () => this._steerQueue.splice(0),
           originalUserGoal: formatOriginalUserGoal(this._originalUserGoalParts) ?? undefined,
+          onMessagesAppended: messages => {
+            for (const message of messages) {
+              record({
+                type: 'message',
+                message: message as unknown as Record<string, unknown>,
+              })
+            }
+          },
+          onCompaction: event => {
+            record({
+              type: 'compaction',
+              previousTokens: event.previousTokens,
+              summaryTokens: event.summaryTokens,
+              replacementHistory: event.replacementHistory as unknown as Array<Record<string, unknown>>,
+            })
+          },
+          onTrajectoryItems: items => {
+            for (const item of items) record(item)
+          },
         })
 
         let step = await gen.next()
@@ -305,6 +408,37 @@ export class KernelSession {
           // terminal render, a network push) or throw, and the record of what
           // the kernel emitted must not depend on what the consumer did with it.
           telemetry?.observe(event)
+          if (event.type === 'tool_result') {
+            if (event.permissionDecision) {
+              record({
+                type: 'approval',
+                toolUseId: event.id,
+                toolName: event.toolName,
+                decision: event.permissionDecision.decision,
+                decidedBy: event.permissionDecision.decidedBy,
+                reason: event.permissionDecision.reason,
+              })
+            }
+            const output = summarizeOutput(event.content)
+            record({
+              type: 'tool_outcome',
+              toolUseId: event.id,
+              toolName: event.toolName,
+              input: event.input,
+              durationMs: event.durationMs ?? 0,
+              isError: event.isError,
+              ...output,
+              command: event.execution?.command,
+              cwd: event.execution?.cwd,
+              exitCode: event.execution?.exitCode,
+              signal: event.execution?.signal,
+              timedOut: event.execution?.timedOut,
+              aborted: event.execution?.aborted,
+              ...(event.execution?.shellSessionId
+                ? { shellSessionId: event.execution.shellSessionId }
+                : {}),
+            })
+          }
           yield event
           step = await gen.next()
         }
@@ -317,9 +451,9 @@ export class KernelSession {
       // Every natural loop exit is a hard checkpoint boundary. This runs before
       // the result event is emitted so a consumer observing completion can rely
       // on the durable state already being updated.
-      if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
+      if (this._config.autonomousMode && flushCheckpoint) {
         try {
-          const boundary = await this._config.onCheckpointBoundary({
+          const boundary = await flushCheckpoint({
             type: 'termination',
             sessionId: this._sessionId,
             toolBatchCount: loopResult?.toolBatchCount ?? this._toolBatchCount,
@@ -340,6 +474,32 @@ export class KernelSession {
       // The result carries the counters the summary reports (cost, turns,
       // usage, denials), so it must be folded in before `finish()` builds it.
       telemetry?.observe(resultEvent)
+
+      await trajectoryRecordChain
+      await this._recordTurnDiff(trajectory, runId, turnId)
+      if (trajectory) {
+        try {
+          await trajectory.record({
+            type: 'run_result',
+            outcome: resultEvent.subtype,
+            isError: resultEvent.subtype !== 'success' && resultEvent.subtype !== 'parked',
+            stopReason: resultEvent.stopReason,
+            usage: {
+              inputTokens: loopResult?.totalUsage.inputTokens ?? 0,
+              outputTokens: loopResult?.totalUsage.outputTokens ?? 0,
+              cacheReadTokens: loopResult?.totalUsage.cacheReadTokens ?? 0,
+              cacheWriteTokens: loopResult?.totalUsage.cacheWriteTokens ?? 0,
+            },
+            costUsd: Math.max(0, resultEvent.costUsd - runStartedCostUsd),
+            durationMs: Math.max(0, Date.now() - runStartedAt),
+            resultSummary: summarizeOutput(resultEvent.resultText).outputSummary,
+          }, { runId, turnId })
+          runResultRecorded = true
+          await trajectory.barrier('run_result')
+        } catch (error) {
+          this._markTrajectoryDegraded(trajectory, error)
+        }
+      }
 
       // Emit terminal result event
       yield resultEvent
@@ -365,11 +525,35 @@ export class KernelSession {
       }
     } finally {
       this._submitInFlight = false
+      // Async generators can be abandoned by their consumer before the normal
+      // result path. Close the run explicitly so the trajectory never contains
+      // a permanently ambiguous half-run after the generator's finally runs.
+      if (trajectory && !runResultRecorded) {
+        try {
+          await trajectoryRecordChain
+          await trajectory.record({
+            type: 'run_result',
+            outcome: this._abortController.signal.aborted ? 'interrupted' : 'abandoned',
+            isError: true,
+            stopReason: this._abortController.signal.aborted ? 'interrupted' : 'consumer_abandoned',
+            usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+            costUsd: Math.max(0, this._totalCostUsd - runStartedCostUsd),
+            durationMs: Math.max(0, Date.now() - runStartedAt),
+          }, { runId, turnId })
+          runResultRecorded = true
+          await trajectory.barrier('abandoned_run_result')
+        } catch (error) {
+          this._markTrajectoryDegraded(trajectory, error)
+        }
+      }
       // In `finally` so a run that threw, was aborted, or was abandoned by a
       // consumer that stopped iterating still writes its summary. A telemetry
       // record that only exists for clean runs would be missing exactly the
       // runs worth investigating.
       await telemetry?.finish()
+      if (trajectory && this._trajectoryPersistenceDegraded) {
+        await trajectory.barrier('persistence_degraded_retry').catch(() => undefined)
+      }
     }
   }
 
@@ -472,6 +656,20 @@ export class KernelSession {
         consecutiveFailures: 0,
       }
       this._config.onMessagesUpdate?.(this._messages)
+      const trajectory = await this._getTrajectoryRecorder()
+      if (trajectory) {
+        try {
+          await trajectory.record({
+            type: 'compaction',
+            previousTokens,
+            summaryTokens: result.summaryTokenEstimate ?? 0,
+            replacementHistory: result.postCompactMessages as unknown as Array<Record<string, unknown>>,
+          })
+          await trajectory.barrier('manual_compaction')
+        } catch (error) {
+          this._markTrajectoryDegraded(trajectory, error)
+        }
+      }
       if (this._config.autonomousMode && this._config.onCheckpointBoundary) {
         try {
           const boundary = await this._config.onCheckpointBoundary({
@@ -560,6 +758,23 @@ export class KernelSession {
     return this._permissionDenials
   }
 
+  isTrajectoryPersistenceDegraded(): boolean {
+    return this._trajectoryPersistenceDegraded ||
+      this._trajectoryRecorder?.isCanonicalDegraded() === true ||
+      this._trajectoryRecorder?.isProjectionDegraded() === true
+  }
+
+  /**
+   * A canonical write the session could not complete. The in-memory flag serves
+   * this process; pushing it into the recorder puts the same fact in
+   * `health.json`, which is what survives a crash and what `sessions list` and
+   * the resume picker actually read. Two views, one truth.
+   */
+  private _markTrajectoryDegraded(recorder: TrajectoryRecorder | null, error?: unknown): void {
+    this._trajectoryPersistenceDegraded = true
+    recorder?.markExternalCanonicalFailure(error ?? new Error('trajectory write failed'))
+  }
+
   /**
    * S1: Release all per-session state so the GC can reclaim the message buffer,
    * file-state cache, tool list and config closures.  Idempotent and safe to
@@ -592,9 +807,73 @@ export class KernelSession {
     }
     this._autoCompactTracking = undefined
     clearTimedOutRunningTools(this._sessionId)
+    void closeTrajectory(this._trajectorySubject(), this._trajectoryOptions()).catch(() => undefined)
   }
 
   // ── Private helpers ────────────────────────────────────────────────────────
+
+  private _trajectorySubject(): TrajectorySubject {
+    return this._config.trajectory?.subject ?? { kind: 'session', sessionId: this._sessionId }
+  }
+
+  private _trajectoryOptions(): { enabled?: boolean; rootDir?: string } {
+    return {
+      enabled: this._config.trajectory?.enabled,
+      rootDir: this._config.trajectory?.rootDir,
+    }
+  }
+
+  private _getTrajectoryRecorder(): Promise<TrajectoryRecorder | null> {
+    if (!this._trajectoryPromise) {
+      const resolvedProvider = resolveProvider({
+        apiKey: this._config.apiKey,
+        baseURL: this._config.baseURL,
+        model: this._config.model,
+      })
+      this._trajectoryPromise = openTrajectory({
+        subject: this._trajectorySubject(),
+        mode: this._config.trajectory?.mode ?? (this._config.autonomousMode ? 'auto' : 'agentic'),
+        rootTrajectoryId: this._config.trajectory?.rootTrajectoryId,
+        parentTrajectoryId: this._config.trajectory?.parentTrajectoryId,
+        workspace: this._cwd,
+        workspaceId: this._config.trajectory?.workspaceId,
+        provider: resolvedProvider.provider,
+        source: this._config.trajectory?.source ?? 'kernel_session',
+      }, this._trajectoryOptions()).then(recorder => {
+        this._trajectoryRecorder = recorder
+        return recorder
+      })
+    }
+    return this._trajectoryPromise
+  }
+
+  private async _recordTurnDiff(
+    recorder: TrajectoryRecorder | null,
+    runId: string,
+    turnId: string,
+  ): Promise<void> {
+    if (!recorder || !this._config.turnDiff) return
+    try {
+      const summary = await this._config.turnDiff.summary()
+      await recorder.record({
+        type: 'turn_diff',
+        filesChanged: summary.filesChanged,
+        linesAdded: summary.linesAdded,
+        linesRemoved: summary.linesRemoved,
+        files: summary.entries
+          .filter(entry => entry.status !== 'unchanged')
+          .map(entry => ({
+            path: entry.path,
+            status: entry.status,
+            added: entry.added,
+            removed: entry.removed,
+            contentHash: entry.after === null ? undefined : sha256(entry.after),
+          })),
+      }, { runId, turnId })
+    } catch (error) {
+      this._markTrajectoryDegraded(recorder, error)
+    }
+  }
 
   private _buildResultEvent(
     loopResult: LoopResult | undefined,
@@ -679,4 +958,15 @@ export class KernelSession {
       failure,
     }
   }
+}
+
+function finiteOrNull(value: number | undefined): number {
+  return Number.isFinite(value) ? value! : -1
+}
+
+function stableJson(value: unknown): string {
+  if (value === null || typeof value !== 'object') return JSON.stringify(value) ?? String(value)
+  if (Array.isArray(value)) return `[${value.map(stableJson).join(',')}]`
+  const record = value as Record<string, unknown>
+  return `{${Object.keys(record).sort().map(key => `${JSON.stringify(key)}:${stableJson(record[key])}`).join(',')}}`
 }

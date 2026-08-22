@@ -2,7 +2,7 @@
  * ToolExecution — execute a single tool call and produce a tool_result message.
  * Mirrors CC's toolExecution.ts.
  */
-import type { KernelTool, KernelToolContext, KernelToolControl } from '../types/KernelTool.js'
+import type { KernelTool, KernelToolContext, KernelToolControl, KernelToolExecutionMetadata } from '../types/KernelTool.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
@@ -80,6 +80,22 @@ export interface ToolCallResult {
   permissionDenial?: PermissionDenial
   contextModifier?: (ctx: KernelToolContext) => KernelToolContext
   control?: KernelToolControl
+  outcome: ToolExecutionOutcome
+}
+
+export interface ToolExecutionOutcome {
+  toolUseId: string
+  toolName: string
+  input: unknown
+  durationMs: number
+  isError: boolean
+  permissionDecision?: {
+    decision: 'allow' | 'deny' | 'redirect'
+    decidedBy: 'policy' | 'unknown'
+    reason?: string
+  }
+  execution?: KernelToolExecutionMetadata
+  trajectoryItems?: import('../../trajectory/types.js').TrajectoryItem[]
 }
 
 /**
@@ -93,6 +109,18 @@ export async function executeToolCall(
   canUseTool: CanUseToolFn,
 ): Promise<ToolCallResult> {
   const { toolUseId, toolName, input, assistantMessageUuid } = request
+  const startedAt = Date.now()
+  const outcome = (
+    isError: boolean,
+    extra: Partial<Omit<ToolExecutionOutcome, 'toolUseId' | 'toolName' | 'input' | 'durationMs' | 'isError'>> = {},
+  ): ToolExecutionOutcome => ({
+    toolUseId,
+    toolName,
+    input,
+    durationMs: Math.max(0, Date.now() - startedAt),
+    isError,
+    ...extra,
+  })
 
   // ── Tool not found ────────────────────────────────────────────────────────
   if (!tool) {
@@ -102,6 +130,7 @@ export async function executeToolCall(
       toolName,
       resultMessage: makeToolResultMessage(toolUseId, errorMsg, true, assistantMessageUuid),
       extraMessages: [],
+      outcome: outcome(true),
     }
   }
 
@@ -121,6 +150,9 @@ export async function executeToolCall(
       resultMessage: makeToolResultMessage(toolUseId, denyMsg, true, assistantMessageUuid),
       extraMessages: [],
       permissionDenial: denial,
+      outcome: outcome(true, {
+        permissionDecision: { decision: 'deny', decidedBy: 'policy', reason: permResult.reason },
+      }),
     }
   }
   if (permResult.behavior === 'redirect') {
@@ -129,6 +161,9 @@ export async function executeToolCall(
       toolName,
       resultMessage: makeToolResultMessage(toolUseId, permResult.message, false, assistantMessageUuid),
       extraMessages: [],
+      outcome: outcome(false, {
+        permissionDecision: { decision: 'redirect', decidedBy: 'policy', reason: permResult.message },
+      }),
     }
   }
 
@@ -148,6 +183,7 @@ export async function executeToolCall(
         assistantMessageUuid,
       ),
       extraMessages: [],
+      outcome: outcome(true),
     }
   }
   const parsedInput = parseResult.data
@@ -167,6 +203,7 @@ export async function executeToolCall(
         assistantMessageUuid,
       ),
       extraMessages: [],
+      outcome: outcome(true),
     }
   }
 
@@ -184,6 +221,7 @@ export async function executeToolCall(
         assistantMessageUuid,
       ),
       extraMessages: [],
+      outcome: outcome(true),
     }
   }
 
@@ -195,7 +233,7 @@ export async function executeToolCall(
   const useTimeout = Number.isFinite(effectiveTimeoutMs) && effectiveTimeoutMs > 0
 
   let timer: ReturnType<typeof setTimeout> | undefined
-  let callContext = context
+  let callContext: KernelToolContext = { ...context, toolUseId }
   let onParentAbort: (() => void) | undefined
   let timeoutController: AbortController | undefined
   let registeredAsTimedOutRunning = false
@@ -212,7 +250,7 @@ export async function executeToolCall(
       onParentAbort = () => timeoutController!.abort()
       context.abortSignal.addEventListener('abort', onParentAbort, { once: true })
     }
-    callContext = { ...context, abortSignal: timeoutController.signal }
+    callContext = { ...context, toolUseId, abortSignal: timeoutController.signal }
   }
 
   try {
@@ -275,6 +313,11 @@ export async function executeToolCall(
       extraMessages: result.newMessages ?? [],
       contextModifier: result.contextModifier,
       control: result.control,
+      outcome: outcome(result.isError ?? false, {
+        permissionDecision: { decision: 'allow', decidedBy: 'policy' },
+        execution: result.execution,
+        trajectoryItems: result.trajectoryItems,
+      }),
     }
   } catch (error: unknown) {
     const errorMsg =
@@ -289,6 +332,19 @@ export async function executeToolCall(
         assistantMessageUuid,
       ),
       extraMessages: [],
+      outcome: outcome(true, {
+        permissionDecision: { decision: 'allow', decidedBy: 'policy' },
+        execution: {
+          command: typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>)['command'] === 'string'
+            ? (input as Record<string, unknown>)['command'] as string
+            : undefined,
+          cwd: typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>)['cwd'] === 'string'
+            ? (input as Record<string, unknown>)['cwd'] as string
+            : undefined,
+          timedOut: errorMsg.includes('timed out'),
+          aborted: context.abortSignal.aborted,
+        },
+      }),
     }
   } finally {
     if (timer) clearTimeout(timer)

@@ -146,6 +146,7 @@ function toToolCallContext(
   const ext = { ...ctx.extensions, ...extraExtensions }
   return {
     sessionId: ctx.sessionId,
+    toolUseId: ctx.toolUseId,
     agentId: ctx.agentId ?? ctx.sessionId,
     abortSignal: ctx.abortSignal,
     workspaceRoot:       ctx.workspaceRoot,
@@ -202,6 +203,8 @@ export function toKernelTool(
         data: result.content,
         isError: result.isError,
         control: result.control,
+        execution: result.execution,
+        trajectoryItems: result.trajectoryItems,
       }
     },
 

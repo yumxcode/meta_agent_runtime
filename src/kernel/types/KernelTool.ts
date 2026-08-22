@@ -28,6 +28,8 @@ export interface ToolPermissionContext {
 
 export interface KernelToolContext {
   sessionId: string
+  /** Current tool invocation id, injected immediately before call(). */
+  toolUseId?: string
   agentId?: string                                  // non-null in subagent calls
   abortSignal: AbortSignal
   readFileState: FileStateCache
@@ -47,12 +49,26 @@ export interface KernelToolResult {
   /** The result content. String is used as tool_result text content. */
   data: string | ContentBlockLike[]
   isError?: boolean
+  /** Structured execution evidence forwarded into KernelEvent/trajectory. */
+  execution?: KernelToolExecutionMetadata
+  /** Structured domain facts; forwarded without kernel interpretation. */
+  trajectoryItems?: import('../../trajectory/types.js').TrajectoryItem[]
   /** Optional additional messages to inject after the tool result */
   newMessages?: KernelMessage[]
   /** Optional context modifier applied after this tool runs */
   contextModifier?: (ctx: KernelToolContext) => KernelToolContext
   /** Optional control-flow request consumed mechanically by KernelLoop. */
   control?: KernelToolControl
+}
+
+export interface KernelToolExecutionMetadata {
+  command?: string
+  cwd?: string
+  exitCode?: number | null
+  signal?: string | null
+  timedOut?: boolean
+  aborted?: boolean
+  shellSessionId?: string
 }
 
 export interface KernelParkControl {

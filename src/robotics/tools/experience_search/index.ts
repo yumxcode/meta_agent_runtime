@@ -60,7 +60,11 @@ export function createExperienceSearchTool(store: ExperienceStore): MetaAgentToo
           limit:  input['limit'] as number | undefined,
         })
         if (results.length === 0) {
-          return { content: 'No experiences found matching the query. This appears to be unexplored territory.', isError: false }
+          return {
+            content: 'No experiences found matching the query. This appears to be unexplored territory.',
+            isError: false,
+            trajectoryItems: [{ type: 'knowledge', kind: 'experience', action: 'recalled', entryIds: [], query: JSON.stringify(input), operation: 'recall' }],
+          }
         }
         const lines = results.map(e => {
           const status = e.outcome.success ? '✓' : '✗'
@@ -87,6 +91,10 @@ export function createExperienceSearchTool(store: ExperienceStore): MetaAgentToo
         return {
           content: `Found ${results.length} experience(s):\n\n${lines.join('\n')}`,
           isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'experience', action: 'recalled',
+            entryIds: results.map(entry => entry.id), query: JSON.stringify(input), operation: 'recall',
+          }],
         }
       } catch (err) {
         return { content: `experience_search failed: ${String(err)}`, isError: true }

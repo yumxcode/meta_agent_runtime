@@ -11,7 +11,7 @@ import type { KernelTool, KernelToolContext, KernelToolControl } from '../types/
 import type { KernelMessage } from '../types/KernelMessage.js'
 import type { CanUseToolFn } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
-import { executeToolCall, type ToolCallRequest, type ToolCallResult } from './ToolExecution.js'
+import { executeToolCall, type ToolCallRequest, type ToolCallResult, type ToolExecutionOutcome } from './ToolExecution.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 
 /**
@@ -78,6 +78,7 @@ export interface RunToolsResult {
   toolResultMessages: KernelMessage[]
   extraMessages: KernelMessage[]
   permissionDenials: PermissionDenial[]
+  outcomes: ToolExecutionOutcome[]
   finalContext: KernelToolContext
   control?: KernelToolControl
 }
@@ -93,7 +94,7 @@ export async function runTools(
   canUseTool: CanUseToolFn,
 ): Promise<RunToolsResult> {
   if (requests.length === 0) {
-    return { toolResultMessages: [], extraMessages: [], permissionDenials: [], finalContext: context }
+    return { toolResultMessages: [], extraMessages: [], permissionDenials: [], outcomes: [], finalContext: context }
   }
 
   const batches = partitionToolCalls(requests, tools)
@@ -190,6 +191,13 @@ export async function runTools(
           req.assistantMessageUuid,
         ),
         extraMessages: [],
+        outcome: {
+          toolUseId: req.toolUseId,
+          toolName: req.toolName,
+          input: req.input,
+          durationMs: 0,
+          isError: true,
+        },
       })
     }
   }
@@ -197,12 +205,14 @@ export async function runTools(
   // Reconstruct results in original request order
   const toolResultMessages: KernelMessage[] = []
   const extraMessages: KernelMessage[] = []
+  const outcomes: ToolExecutionOutcome[] = []
 
   for (const req of requests) {
     const result = orderedResults.get(req.toolUseId)
     if (result) {
       toolResultMessages.push(result.resultMessage)
       extraMessages.push(...result.extraMessages)
+      outcomes.push(result.outcome)
     }
   }
 
@@ -210,6 +220,7 @@ export async function runTools(
     toolResultMessages,
     extraMessages,
     permissionDenials,
+    outcomes,
     finalContext: currentContext,
     ...(control ? { control } : {}),
   }

@@ -43,7 +43,14 @@ export function createPhysicalAnchorLoadTool(store: PhysicalAnchorStore): MetaAg
           ...(anchor.invalidates?.length ? ['## Invalidates', ...anchor.invalidates.map(item => `- ${item}`), ''] : []),
           ...(anchor.principleIds?.length ? ['## Depended-on by Principles', ...anchor.principleIds.map(id => `- ${id}`), ''] : []),
         ]
-        return { content: lines.join('\n'), isError: false }
+        return {
+          content: lines.join('\n'),
+          isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'anchor', action: 'recalled',
+            entryIds: [anchor.id], operation: 'recall',
+          }],
+        }
       } catch (err) {
         return { content: `physical_anchor_load failed: ${String(err)}`, isError: true }
       }

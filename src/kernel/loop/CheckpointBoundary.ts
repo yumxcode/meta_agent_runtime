@@ -42,6 +42,13 @@ export interface CheckpointBoundaryResult {
   updated: boolean
   /** Latest durable revision after handling this boundary. */
   revision: number
+  /** Optional A3 audit reference to the state that was actually persisted. */
+  checkpoint?: {
+    mode: string
+    stateSchemaVersion: string
+    contentHash: string
+    storeRef: string
+  }
 }
 
 export type CheckpointBoundaryFn = (

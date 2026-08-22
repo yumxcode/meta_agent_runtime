@@ -144,6 +144,8 @@ export type MetaAgentEvent =
  */
 export interface ToolCallContext {
   sessionId: string
+  /** Current tool invocation id; stable join key for spawned async jobs. */
+  toolUseId?: string
   agentId: string
   abortSignal: AbortSignal
   workspaceRoot?: string
@@ -214,11 +216,34 @@ export interface ToolResult {
   content: string
   isError: boolean
   /**
+   * Structured execution evidence for trajectory/audit consumers. Optional so
+   * every existing third-party tool remains source-compatible. Shell tools
+   * populate this from the process/session layer; callers must never recover
+   * these facts by parsing the human-readable `content` string.
+   */
+  execution?: ToolExecutionMetadata
+  /**
+   * Structured domain facts emitted by the domain tool that committed them.
+   * The kernel forwards these generically and never infers them from tool names
+   * or human-readable result strings.
+   */
+  trajectoryItems?: import('../trajectory/types.js').TrajectoryItem[]
+  /**
    * Optional host control signal. A successful park is a durable suspension,
    * not task completion: the kernel commits this tool result, stops the current
    * run, and lets the host persist/arm the continuation before exiting.
    */
   control?: ToolControl
+}
+
+export interface ToolExecutionMetadata {
+  command?: string
+  cwd?: string
+  exitCode?: number | null
+  signal?: string | null
+  timedOut?: boolean
+  aborted?: boolean
+  shellSessionId?: string
 }
 
 export interface ToolParkControl {

@@ -29,6 +29,8 @@ import {
   sessionPromptPreview, formatAge, firstPromptFromMessage, findSessionPreviewMessage,
 } from './transcript.js'
 import type { CliOptions } from './args.js'
+import { findTrajectoryBySessionId } from '../trajectory/indexStore.js'
+import { readTrajectoryHealth } from '../trajectory/health.js'
 
 /** Picker display: prefer the generated title; fall back to the prompt preview. */
 export function sessionDisplayTitle(s: SessionMeta, previewLimit: number): string {
@@ -75,7 +77,36 @@ export async function runSessionPicker(
     return null
   }
   console.log(green(`✓ 已加载 ${messages.length} 条历史消息，继续上次 ${selected.mode} 模式会话。\n`))
+  await warnIfTrajectoryDegraded(selected.sessionId)
   return { sessionId: selected.sessionId, messages, mode: selected.mode }
+}
+
+/**
+ * Resume reads `history.jsonl`, so a damaged trajectory cannot corrupt what is
+ * loaded here today. It can still mislead: the session is about to be presented
+ * as a complete, resumable thing while its audit record is known to have holes.
+ * Say so at the moment of resume rather than only in `sessions list`, and say
+ * plainly that the conversation itself is unaffected — an unqualified warning
+ * would send people looking for damage that is not there.
+ */
+async function warnIfTrajectoryDegraded(sessionId: string): Promise<void> {
+  try {
+    const entry = await findTrajectoryBySessionId(sessionId)
+    if (!entry) return
+    const health = await readTrajectoryHealth(entry.trajectoryId)
+    if (!health.canonicalDegraded && !health.projectionDegraded) return
+    const scope = health.canonicalDegraded
+      ? '轨迹记录不完整（canonical degraded）'
+      : '轨迹索引不完整（projection degraded）'
+    console.log(yellow(`⚠  ${scope}：${entry.trajectoryId.slice(0, 12)}`))
+    if (health.lastError) console.log(dim(`   最后一次错误：${sanitizeTerminalText(health.lastError)}`))
+    console.log(dim(health.canonicalDegraded
+      ? '   对话历史来自 history.jsonl，不受影响；审计与遥测会缺页，无法用 trajectory verify 修复。'
+      : '   canonical 轨迹完好，可用 meta-agent trajectory reindex 重建索引。'))
+    console.log()
+  } catch {
+    // Health is advisory. Never let it block resuming a session.
+  }
 }
 
 interface PersistSessionSnapshotOptions {

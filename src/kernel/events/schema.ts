@@ -47,7 +47,7 @@ import { z } from 'zod'
  * Version of the event contract. See the compatibility rule above before
  * changing it — and change it in the same commit as the shape it describes.
  */
-export const EVENT_SCHEMA_VERSION = '1.0.0'
+export const EVENT_SCHEMA_VERSION = '1.1.0'
 
 // ── Shared fragments ──────────────────────────────────────────────────────────
 
@@ -131,6 +131,22 @@ export const toolResultEventSchema = z.object({
   content: z.string(),
   isError: z.boolean(),
   sessionId,
+  durationMs: z.number().nonnegative().optional(),
+  input: z.unknown().optional(),
+  permissionDecision: z.object({
+    decision: z.enum(['allow', 'deny', 'redirect']),
+    decidedBy: z.enum(['policy', 'unknown']),
+    reason: z.string().optional(),
+  }).optional(),
+  execution: z.object({
+    command: z.string().optional(),
+    cwd: z.string().optional(),
+    exitCode: z.number().int().nullable().optional(),
+    signal: z.string().nullable().optional(),
+    timedOut: z.boolean().optional(),
+    aborted: z.boolean().optional(),
+    shellSessionId: z.string().optional(),
+  }).optional(),
 })
 
 export const compactStartEventSchema = z.object({

@@ -337,6 +337,18 @@ export interface MetaAgentConfig {
    */
   turnDiff?: import('../infra/fs/TurnDiffTracker.js').TurnDiffTracker
 
+  /** Optional A3 trajectory override; enabled by default outside tests. */
+  trajectory?: {
+    enabled?: boolean
+    mode?: string
+    subject?: import('../trajectory/types.js').TrajectorySubject
+    rootTrajectoryId?: string
+    parentTrajectoryId?: string
+    workspaceId?: string
+    rootDir?: string
+    source?: string
+  }
+
   // ── Tool execution guard ──────────────────────────────────────────────────
   /**
    * Optional async hook called before every tool execution.
@@ -480,6 +492,7 @@ export type ResolvedConfig = Required<
     | 'sessionId'
     | 'runtimeContext'
     | 'turnDiff'
+    | 'trajectory'
     | 'language'
     | 'outputStyle'
     | 'mcpServers'
@@ -522,6 +535,7 @@ export type ResolvedConfig = Required<
   compact?: MetaAgentConfig['compact']
   runtimeContext?: RuntimeContext
   turnDiff?: MetaAgentConfig['turnDiff']
+  trajectory?: MetaAgentConfig['trajectory']
   language?: string
   outputStyle?: OutputStyle
   mcpServers?: import('./dynamicPrompt.js').McpServerInstruction[]
@@ -656,6 +670,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     // Optional — pass through as-is; undefined = feature disabled
     runtimeContext:  config.runtimeContext,
     turnDiff:        config.turnDiff,
+    trajectory:      config.trajectory,
     language:        config.language,
     outputStyle:     config.outputStyle,
     mcpServers:      config.mcpServers,

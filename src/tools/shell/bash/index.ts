@@ -285,21 +285,54 @@ export async function createBashTool(opts: BashToolOptions = {}): Promise<MetaAg
           ]
           if (res.stdout) parts.push(trunc(res.stdout))
           if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
-          return { content: parts.join('\n'), isError: true }
+          return {
+            content: parts.join('\n'),
+            isError: true,
+            execution: {
+              command,
+              cwd: res.cwd,
+              exitCode: res.code,
+              signal: res.signal,
+              timedOut: res.timedOut,
+              aborted: res.aborted,
+            },
+          }
         }
 
         if (res.code === 0) {
           const parts: string[] = []
           if (res.stdout) parts.push(trunc(res.stdout))
           if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
-          return { content: parts.join('\n') || '(no output)', isError: false }
+          return {
+            content: parts.join('\n') || '(no output)',
+            isError: false,
+            execution: {
+              command,
+              cwd: res.cwd,
+              exitCode: res.code,
+              signal: res.signal,
+              timedOut: false,
+              aborted: false,
+            },
+          }
         }
 
         const parts: string[] = []
         if (res.stdout) parts.push(trunc(res.stdout))
         if (res.stderr) parts.push(`STDERR:\n${trunc(res.stderr)}`)
         parts.push(`Exit code: ${res.code ?? 'unknown'}`)
-        return { content: parts.join('\n'), isError: true }
+        return {
+          content: parts.join('\n'),
+          isError: true,
+          execution: {
+            command,
+            cwd: res.cwd,
+            exitCode: res.code,
+            signal: res.signal,
+            timedOut: false,
+            aborted: false,
+          },
+        }
       } catch (err: unknown) {
         if (err instanceof ShellCommandRefused) {
           return { content: `Error: ${err.message}`, isError: true }

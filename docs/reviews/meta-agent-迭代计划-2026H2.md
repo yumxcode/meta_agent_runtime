@@ -188,7 +188,7 @@ interface TrajectoryLine {
 }
 ```
 
-`trajectoryId`、`runId`、`turnId` 解决三种不同粒度：一个交互 session 会有多个 run，因此 `result` 不能“每会话仅一次”；它应改成每个 `runId` 一个 `run_result`。`session_closed` 是另一种可选 item，不把进程退出误写成任务完成。
+`trajectoryId`、`runId`、`turnId` 解决三种不同粒度：一个交互 session 会有多个 run，因此 `result` 不能“每会话仅一次”；它应改成每个 `runId` 一个 `run_result`。item schema v1.1 不定义 `session_closed`：`dispose()` 只是释放进程资源，不等于用户任务已经终止；在有可靠的领域终态来源前，不能为了 GC 伪造生命周期事实。
 
 `TrajectoryItem` 的成员，对照 codex `RolloutItem`（`SessionMeta | ResponseItem | TurnContext | WorldState | Compacted | EventMsg | InterAgentCommunication | SecurityRiskScore`）按我们的模式集合调整：
 
@@ -207,6 +207,7 @@ interface TrajectoryLine {
 | `job` | created / progress / completed / failed、jobId、关联 toolUseId | jobs 层 | 异步 job 与发起轮次建立因果关系 |
 | `knowledge` | experience / anchor / principle 的召回与写入 | 知识层 | B1.4 可解释性的前提 |
 | `state_checkpoint` | mode、状态 schema、checkpoint revision、内容 hash、原存储引用 | 模式层 | 迁移期对账；不等于把 checkpoint 内容复制进轨迹 |
+| `evaluation` | evaluator、verdict、score / metrics、证据 ordinal、artifact hash | 评测层 | 让后续 agent 自进化引用可验证判定，不把评测正文复制进轨迹 |
 
 六条契约级约束：
 
@@ -215,7 +216,7 @@ interface TrajectoryLine {
 3. **落盘策略集中**：`shouldPersist(item, persistencePolicy) → boolean`。模式决定“产生哪些 item”，不决定“同一种 item 是否落盘”，避免形成模式方言。流式 delta 不落盘。
 4. **轨迹记录事实，不夸大事实。** exit code 是“某条被选择命令的可信执行结果”，不是任务已完成的不可伪造证明；B3 还必须检查命令、cwd、发生在最后一次相关 diff 之后，以及是否覆盖约定的验证范围。
 5. **schema 治理沿用 A2.1**：zod + JSON Schema + fixture + 指纹；envelope 与 item payload 分别版本化。reader 对未知 optional 字段前向兼容，对未知 major item 保留原始行但不参与恢复投影。
-6. **审计投影与模型上下文投影分开。** 失败 attempt、rollback、compact 前历史仍留在审计轨迹；resume projector 只选择已提交 segment，并应用 compaction / rollback 规则。
+6. **审计投影与模型上下文投影分开。** 失败 attempt、rollback、compact 前历史仍留在审计轨迹；interactive projector 应用 compaction 和 legacy safe-resume 规则。Graph Lane 的 committed / rollback segment 选择继续属于 graph 语义层，在标准 marker 定义前不写成通用恢复能力。
 
 #### A3.2 轨迹存在哪里，是否需要数据库
 
@@ -224,6 +225,8 @@ interface TrajectoryLine {
 ```text
 ~/.meta-agent/trajectories/<trajectoryId>/
   trajectory.jsonl       # 唯一真相源，append-only
+  health.json            # canonical / projection degradation 状态
+  writer.lock            # 仅 writer 存活期间存在，带 heartbeat
 ```
 
 目录名使用 opaque UUID，不把 workspace path、sessionId、taskId 直接编码进路径。真实 subject、workspaceId、parent/root 关系只存在于首条 `trajectory_meta` 中。集中放在 `META_AGENT_HOME` 而不是 workspace，原因有三点：会话历史不应随工作树清理而丢失；跨 workspace 查询只需扫描一个根；权限与保留策略可以统一。graph 的执行 journal 仍留在 `<workspace>/.loop/`，轨迹只记录其审计摘要和 journal sequence 引用。
@@ -234,11 +237,12 @@ Q3 的投影布局：
 
 ```text
 ~/.meta-agent/index/
-  trajectories.json      # subject、mode、title、时间、workspace、最后 ordinal
-  projection-state.json  # 每条 trajectory 已折叠到的 ordinal
+  trajectories.json          # metadata 投影，entry 自带 lastOrdinal 游标
+  trajectory-telemetry.json  # 历史遥测汇总 + 每轨迹 ordinal cursor
+  trajectory-parity.json     # trajectory / legacy 双读对账证据
 ```
 
-两个文件都是缓存：`meta-agent trajectory reindex --clean` 删除并从所有 `trajectory.jsonl` 重建。全文搜索可以先显式走较慢的文件扫描，不为一个尚未出现的性能问题提前引入数据库。
+`index/` 下都是可重建投影，不是真相源。metadata 不再另写一个无人消费的 `projection-state.json`，而是由每条 index entry 的 `lastOrdinal` 做幂等增量折叠；`trajectory reindex --clean` 重建 metadata，`trajectory telemetry --clean` 重建历史聚合，`trajectory parity --clean` 重置对账观察。全文搜索可以先显式走较慢的文件扫描，不为一个尚未出现的性能问题提前引入数据库。
 
 SQLite 只在以下任一条件被真实触发后加入，并且仍然只是投影：
 
@@ -248,7 +252,7 @@ SQLite 只在以下任一条件被真实触发后加入，并且仍然只是投�
 
 届时数据库可放在 `~/.meta-agent/index.db`，删除后必须完全可重建。**知识库不属于这个可重建索引**：`knowledge` item 只记录召回、提议、批准和条目 ID，Experience/Principle/Anchor 的内容仍由它们自己的受审存储负责；否则一次人工编辑或历史导入无法从会话轨迹恢复，会破坏“数据库只是投影”的定义。
 
-存储生命周期同样属于契约：Q3 不自动删除 canonical trajectory；active / paused / 被父轨迹引用的 child trajectory 尤其不能按年龄清理。先提供 `meta-agent trajectory disk` 和默认 dry-run 的 `trajectory gc`，只允许显式 `--apply` 删除已终止、无引用的轨迹。自动 TTL、压缩归档和配额驱逐必须在引用完整性与 resume 回归测试之后单独决策，不能沿用当前“索引只留 50 条”而顺手删除真相源。
+存储生命周期同样属于契约：Q3 不自动删除 canonical trajectory；active / paused / 被父轨迹引用的 child trajectory 尤其不能按年龄清理。当前提供 `meta-agent trajectory disk` 和只读 dry-run 的 `trajectory gc`；由于 v1.1 尚无可信 `session_closed` 与完整引用终态，`gc --apply` 明确拒绝执行。自动 TTL、压缩归档、显式删除和配额驱逐必须在引用完整性与 resume 回归测试之后单独决策，不能沿用当前“索引只留 50 条”而顺手删除真相源。
 
 #### A3.3 记录器与写入语义
 
@@ -302,13 +306,16 @@ Q3 查询面：
 - `meta-agent trajectory tail <id> [--after <ordinal>]`：断点读取；
 - `meta-agent trajectory verify <id>`：schema、ordinal、父子引用和 torn-tail 检查；
 - `meta-agent trajectory reindex [--clean]`：重建全部查询投影；
+- `meta-agent trajectory telemetry [--clean]`：按持久 ordinal cursor 增量折叠跨模式历史遥测；
+- `meta-agent trajectory parity [--clean]`：对账最新 session trajectory 与 legacy resume，只持久化数量、hash 和连续观察证据；
+- `meta-agent trajectory disk` / `gc`：容量统计与保守保留审计，Q3 不执行删除；
 - `meta-agent sessions --search <text>`：Q3 只承诺 title / first prompt / mode / workspace metadata 搜索。
 
 #### A3.6 恢复边界：先统一模型历史，不承诺统一执行器
 
 恢复拆成两类：
 
-1. **模型上下文恢复**：`message + compaction + turn_context + committed/rollback marker` 由一份公共 projector 重建。这一层可供 interactive、auto、robotics、Lane 和 subagent 复用。
+1. **模型上下文恢复**：M5 首阶段由公共 projector 折叠 `message + compaction + turn_context`，并复用 legacy resume 的安全边界与消息上限规则；先供 interactive 做切读。Lane 的 committed / rollback segment 选择仍由 graph 语义层决定，不能在没有标准 marker 前宣称通用 projector 已覆盖。
 2. **模式执行恢复**：由模式自己的 reducer / journal 决定。auto 需要 pending wake、revision、健康计数等完整领域事件；robotics 需要 definition hash、gate completion 与 phase history；graph 继续只从 GraphStore 恢复。
 
 因此 A3 不再宣称“恢复只有一套实现”。正确的不变式是：**对话恢复只有一份 projector；执行恢复可以有多份 reducer，但它们引用同一套轨迹证据与 ID。**
@@ -339,8 +346,17 @@ auto / robotics 快照只有满足以下条件后才能降级为缓存：
 | **A3-M1** | envelope / item schema、opaque identity、writer lease、bounded queue、barrier、reverse scanner、verify CLI | 不接 SQLite，不切换 resume |
 | **A3-M2** | KernelSession 双写；message / turn_context / approval / tool_outcome / turn_diff / compaction | 不删除 history.jsonl |
 | **A3-M3** | graph root + Lane/subagent 父子关系、robotics phase、job / knowledge 生命周期；workflow per-session 修复 | 不替换任何领域执行状态 |
-| **A3-M4** | metadata index、reindex、trajectory telemetry projector、inspect/tail/search CLI | 不做全文 FTS |
+| **A3-M4** | 增量 metadata index、锁外 reindex、持久历史 telemetry projector、inspect/tail/search/health/disk/gc CLI、双读 parity 证据入口 | 不做全文 FTS；GC 只 dry-run |
 | **A3-M5（Q4 条件项）** | 双写稳定一个发布周期后，公共 model-context projector 让 interactive 先切读；auto/robotics 只做 replay parity 实验 | graph journal 永不迁移；未达稳定门槛不切读 |
+
+> **实施状态（2026-08-22，审查整改后）**：A3-M1～M4 的技术交付已按兼容双写落地；审查发现的 compaction 空洞、断点跳页、伪反向读取、字符串嗅探、投影耦合、unknown item、超限背压、graph flush、索引重建和历史遥测接线问题均已修复并有回归覆盖。现有 `history.jsonl`、auto checkpoint、workflow state、job record 与 graph journal 的读取/执行职责均未切换。canonical trajectory 位于 `META_AGENT_HOME/trajectories/`，JSON 投影位于 `META_AGENT_HOME/index/`，当前无需数据库。
+>
+> 当前状态是 **M5 技术准入就绪、观察期尚未完成**：`trajectory parity` 已能积累 hash-only 双读证据，但 2026-08-22 当天不能制造“连续一个发布周期”的时间证据。因此现在不得打开 interactive trajectory 切读，也不得停止 legacy 双写。
+
+进入 M5 的门槛拆成两组，避免把“代码已修好”误写成“迁移风险已被真实运行证明”：
+
+1. **技术门槛（当前已满足）**：schema / fixture / 指纹全绿；ordinal、torn-tail、中段损坏、未知 item、oversize/backpressure、writer lease/heartbeat 有回归；`tail --after` 返回紧邻 cursor 的 page；反向 projector 与全量 projector 在安全 compaction、turn context、异常未闭合 run 上一致；canonical barrier 不等待可重建投影；graph 可显式等待 append + fsync + metadata；领域 item 由领域层结构化发出；health、reindex、telemetry 和 parity 有实际消费入口。
+2. **运行证据门槛（当前未满足）**：至少跨一个真实发布周期周期性运行 `meta-agent trajectory parity`，所有可比较 session 均为 `match`，无持续 canonical/projection degraded、无无法解释的 missing legacy / error；发生 mismatch 时连续匹配窗口重新计时。该门槛是时间与真实样本约束，不能用重复跑单测替代。
 
 核心验收：
 
@@ -352,6 +368,7 @@ auto / robotics 快照只有满足以下条件后才能降级为缓存：
 - `meta-agent trajectory reindex --clean` 前后 metadata 查询一致；
 - 1000 条 trajectory 的 metadata 搜索 P95 <100 ms；达不到再触发 SQLite 决策；
 - 默认落盘不含 thinking、原始二进制、完整工具 schema 和已识别凭据。
+- `trajectory parity` 的匹配结果不落消息正文，只落数量、hash、ordinal 与观察窗口；真实发布周期证据满足前不得切读。
 
 #### A3.9 A3 的边界：什么不在里面
 
@@ -488,7 +505,7 @@ Q3  ├─ A3-M1 契约 + 身份 + writer/reader/verify CLI       ← 本季度�
 Q4  ├─ A4.1 协议层 + SDK（视前端需求，可整体推迟）
     ├─ A4.2 包拆分 + 领域插件化（ESLint 边界规则可提前到 Q3）
     ├─ A4.3 Windows fail-closed
-    ├─ A3-M5 model-context projector + interactive 切读（双写稳定后才启动）
+    ├─ A3-M5 interactive trajectory 切读（projector 已技术就绪；双写稳定后才打开）
     ├─ B1.3 robotics 阶段 ↔ 知识层打通     ← 依赖 A3-M3 的 phase item
     ├─ B1.4 知识检索可解释性               ← 依赖 A3-M3 的 knowledge item
     ├─ B2.2 蒸馏质量度量

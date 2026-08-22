@@ -70,6 +70,10 @@ export function createPhysicalAnchorWriteTool(pendingStore: PhysicalAnchorPendin
             `Confidence: ${normalized.value.confidenceTier}\n\n` +
             `Run /anchor review to approve, edit externally, or discard it.`,
           isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'anchor', action: 'proposed',
+            entryIds: [], pendingId, operation: 'write',
+          }],
         }
       } catch (err) {
         return { content: `physical_anchor_write failed: ${String(err)}`, isError: true }

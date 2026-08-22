@@ -262,7 +262,14 @@ function trimToSafeResumeBoundary(messages: readonly ConversationMessage[]): Con
   return messages.slice(start)
 }
 
-function buildResumedHistory(parsed: readonly ConversationMessage[]): ConversationMessage[] {
+/**
+ * Apply the exact boundary/cap policy used by legacy history resume. Exported
+ * so the trajectory projector and dual-read parity check share one semantic
+ * normalization instead of slowly drifting apart.
+ */
+export function normalizeResumedHistory(
+  parsed: readonly ConversationMessage[],
+): ConversationMessage[] {
   // Default: unlimited → replay the FULL history verbatim. Only when an explicit
   // META_AGENT_MAX_RESUME_MESSAGES cap is set (and exceeded) do we fold older
   // history into a single local summary.
@@ -337,7 +344,7 @@ async function loadHistoryUnlocked(
   if (dropped > 0) {
     console.warn(`[SessionStore] Skipped ${dropped} corrupt history line(s) for session ${sessionId}`)
   }
-  return buildResumedHistory(parsed)
+  return normalizeResumedHistory(parsed)
 }
 
 // ── SessionStore ──────────────────────────────────────────────────────────────

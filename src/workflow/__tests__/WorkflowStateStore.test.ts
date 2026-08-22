@@ -4,6 +4,9 @@ import { tmpdir } from 'os'
 import { afterEach, describe, expect, it } from 'vitest'
 import { WorkflowStateStore } from '../WorkflowStateStore.js'
 import type { WorkflowDefinition } from '../types.js'
+import { createWorkflowAdvanceTool } from '../tools/workflow_advance/index.js'
+import { createWorkflowCompleteGateTool } from '../tools/workflow_complete_gate/index.js'
+import type { ToolCallContext } from '../../core/types.js'
 
 const tempDirs: string[] = []
 
@@ -52,7 +55,39 @@ function makeDefinition(overrides: Partial<WorkflowDefinition> = {}): WorkflowDe
   }
 }
 
+function toolContext(toolUseId: string): ToolCallContext {
+  return {
+    sessionId: 'session-a',
+    toolUseId,
+    agentId: 'agent-a',
+    abortSignal: new AbortController().signal,
+  }
+}
+
 describe('WorkflowStateStore compatibility', () => {
+  it('isolates concurrent robotics workflow state by session', async () => {
+    const project = await tempProject()
+    const definition = makeDefinition()
+    await Promise.all([
+      WorkflowStateStore.initialize(project, definition, 'session-a'),
+      WorkflowStateStore.initialize(project, definition, 'session-b'),
+    ])
+    await WorkflowStateStore.completeCurrentPhaseGateItem(
+      project, definition, 'phase_one_gate_0', 'session-a',
+    )
+    await WorkflowStateStore.advancePhase(project, definition, 'agent', 'session-a')
+
+    await expect(WorkflowStateStore.read(project, 'session-a')).resolves.toMatchObject({
+      currentPhaseId: 'phase_two',
+    })
+    await expect(WorkflowStateStore.read(project, 'session-b')).resolves.toMatchObject({
+      currentPhaseId: 'phase_one',
+      completedGateItems: [],
+    })
+    expect(WorkflowStateStore.stateFile(project, 'session-a'))
+      .not.toBe(WorkflowStateStore.stateFile(project, 'session-b'))
+  })
+
   it('reuses state only when it matches the active workflow definition', async () => {
     const project = await tempProject()
     const definition = makeDefinition({
@@ -99,6 +134,36 @@ describe('WorkflowStateStore compatibility', () => {
 
     await expect(WorkflowStateStore.advancePhase(project, changed, 'agent'))
       .rejects.toThrow(/not compatible/)
+  })
+
+  it('emits structured phase facts from the domain tools', async () => {
+    const project = await tempProject()
+    const definition = makeDefinition({
+      workflowBlockHash: 'block-hash',
+      workflowDefinitionHash: 'definition-hash',
+    })
+    let latest = await WorkflowStateStore.initialize(project, definition, 'session-a')
+    const complete = createWorkflowCompleteGateTool(
+      project, definition, state => { latest = state }, 'session-a',
+    )
+    const completed = await complete.call(
+      { gate_id: 'phase_one_gate_0', evidence: 'unit test' },
+      toolContext('tool-gate'),
+    )
+    expect(completed.trajectoryItems).toEqual([expect.objectContaining({
+      type: 'phase', domain: 'robotics', action: 'gate_completed', phaseId: 'phase_one',
+      details: expect.objectContaining({ toolUseId: 'tool-gate', gateId: 'phase_one_gate_0' }),
+    })])
+
+    const advance = createWorkflowAdvanceTool(
+      project, definition, state => { latest = state }, 'session-a',
+    )
+    const advanced = await advance.call({ confirmed: true }, toolContext('tool-advance'))
+    expect(advanced.trajectoryItems).toEqual([expect.objectContaining({
+      type: 'phase', domain: 'robotics', action: 'phase_advanced', phaseId: 'phase_two',
+      details: expect.objectContaining({ toolUseId: 'tool-advance' }),
+    })])
+    expect(latest.currentPhaseId).toBe('phase_two')
   })
 })
 

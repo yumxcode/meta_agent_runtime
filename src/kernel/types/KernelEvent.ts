@@ -36,6 +36,14 @@ export interface ToolResultEvent {
   content: string
   isError: boolean
   sessionId: string
+  durationMs?: number
+  input?: unknown
+  permissionDecision?: {
+    decision: 'allow' | 'deny' | 'redirect'
+    decidedBy: 'policy' | 'unknown'
+    reason?: string
+  }
+  execution?: import('./KernelTool.js').KernelToolExecutionMetadata
 }
 
 /**

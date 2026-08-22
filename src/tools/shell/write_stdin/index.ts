@@ -91,7 +91,17 @@ export async function createWriteStdinTool(): Promise<MetaAgentTool> {
                 yieldTimeMs,
                 ...(ctx.abortSignal ? { signal: ctx.abortSignal } : {}),
               })
-        return { content: renderReadResult(sessionId, result), isError: false }
+        return {
+          content: renderReadResult(sessionId, result),
+          isError: false,
+          execution: {
+            command: text || undefined,
+            exitCode: result.exitCode,
+            timedOut: false,
+            aborted: ctx.abortSignal.aborted,
+            shellSessionId: sessionId,
+          },
+        }
       } catch (err) {
         return toToolError(err)
       }

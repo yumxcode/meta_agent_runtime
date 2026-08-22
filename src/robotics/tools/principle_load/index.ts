@@ -46,7 +46,14 @@ export function createPrincipleLoadTool(store: PrincipleStore): MetaAgentTool {
         ...(principle.counterExamples.length ? ['## Counterexamples', ...principle.counterExamples.map(item => `- ${item}`), ''] : []),
         ...(principle.evidenceRefs.length ? ['## Evidence References', ...principle.evidenceRefs.map(ref => `- ${ref}`), ''] : []),
       ]
-      return { content: lines.join('\n'), isError: false }
+      return {
+        content: lines.join('\n'),
+        isError: false,
+        trajectoryItems: [{
+          type: 'knowledge', kind: 'principle', action: 'recalled',
+          entryIds: [principle.id], operation: 'recall',
+        }],
+      }
     },
   }
 }

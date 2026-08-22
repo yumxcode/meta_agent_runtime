@@ -222,6 +222,10 @@ export function createExperienceWriteTool(
             `请在对话结束后运行 /experience review 进行审核，` +
             `由你决定是否提交、编辑或丢弃。`,
           isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'experience', action: 'proposed',
+            entryIds: [], pendingId, operation: 'write',
+          }],
         }
       } catch (err) {
         return { content: `experience_write failed: ${String(err)}`, isError: true }

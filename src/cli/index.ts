@@ -45,6 +45,7 @@ import { ensureMcpServerInstructions } from './mcpInstructions.js'
 import { runLoopCommand } from './commands/loop.js'
 import { runSteerCommand } from './commands/steer.js'
 import { runTasksCommand } from './commands/tasks.js'
+import { runSessionsCommand, runTrajectoryCommand } from './commands/trajectory.js'
 import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
 import { McpAppsBrowserHost } from './mcpAppsHost.js'
@@ -76,6 +77,14 @@ async function main(): Promise<void> {
     // credentials to LOOK at task state would be exactly backwards.
     if (opts.loopCommand.name === 'tasks') {
       await runTasksCommand(opts)
+      return
+    }
+    if (opts.loopCommand.name === 'trajectory') {
+      await runTrajectoryCommand(opts)
+      return
+    }
+    if (opts.loopCommand.name === 'sessions') {
+      await runSessionsCommand(opts)
       return
     }
     if (opts.loopCommand.name === 'auto-scheduler') {

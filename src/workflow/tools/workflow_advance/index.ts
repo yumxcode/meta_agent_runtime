@@ -6,6 +6,7 @@ export function createWorkflowAdvanceTool(
   projectDir: string,
   definition: WorkflowDefinition,
   onStateChange: (s: WorkflowState) => void,
+  sessionId?: string,
 ): MetaAgentTool {
   return {
     name: 'workflow_advance',
@@ -17,7 +18,7 @@ export function createWorkflowAdvanceTool(
       },
     },
     async call(input: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolResult> {
-      const state = await WorkflowStateStore.read(projectDir)
+      const state = await WorkflowStateStore.read(projectDir, sessionId)
       if (!state) return { content: 'No workflow state. Initialise workflow first.', isError: true }
       const check = WorkflowStateStore.checkGates(definition, state)
       if (!check.canAdvance) {
@@ -35,15 +36,27 @@ export function createWorkflowAdvanceTool(
           if (!answer.includes('Yes')) return { content: 'Advance cancelled by user.', isError: false }
           // Mark approval gates as completed
           for (const g of check.needsApproval) {
-            await WorkflowStateStore.completeCurrentPhaseGateItem(projectDir, definition, g.id)
+            await WorkflowStateStore.completeCurrentPhaseGateItem(projectDir, definition, g.id, sessionId)
           }
         }
       }
-      const { newPhase, state: newState } = await WorkflowStateStore.advancePhase(projectDir, definition, 'agent')
+      const { newPhase, state: newState } = await WorkflowStateStore.advancePhase(projectDir, definition, 'agent', sessionId)
       onStateChange(newState)
       return {
         content: `✅ Advanced to Phase ${newPhase.index + 1}/${definition.phases.length}: ${newPhase.chineseName} (${newPhase.englishName})\n\n${newPhase.content.split('\n').slice(0, 20).join('\n')}`,
         isError: false,
+        trajectoryItems: [{
+          type: 'phase',
+          domain: 'robotics',
+          action: 'phase_advanced',
+          phaseId: newPhase.id,
+          details: {
+            toolUseId: ctx.toolUseId,
+            workflowBlockHash: definition.workflowBlockHash,
+            workflowDefinitionHash: definition.workflowDefinitionHash,
+            workflowSourceFile: definition.sourceFile,
+          },
+        }],
       }
     },
   }

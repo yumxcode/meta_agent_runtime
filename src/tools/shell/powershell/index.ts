@@ -84,11 +84,41 @@ export async function createPowerShellTool(): Promise<MetaAgentTool> {
           return {
             content: [res.timedOut ? `Command timed out after ${timeoutMs}ms` : 'Command aborted', ...parts].join('\n'),
             isError: true,
+            execution: {
+              command,
+              cwd: res.cwd,
+              exitCode: res.code,
+              signal: res.signal,
+              timedOut: res.timedOut,
+              aborted: res.aborted,
+            },
           }
         }
-        if (res.code === 0) return { content: parts.join('\n') || '(no output)', isError: false }
+        if (res.code === 0) return {
+          content: parts.join('\n') || '(no output)',
+          isError: false,
+          execution: {
+            command,
+            cwd: res.cwd,
+            exitCode: res.code,
+            signal: res.signal,
+            timedOut: false,
+            aborted: false,
+          },
+        }
         parts.push(`Exit code: ${res.code ?? 'unknown'}`)
-        return { content: parts.join('\n'), isError: true }
+        return {
+          content: parts.join('\n'),
+          isError: true,
+          execution: {
+            command,
+            cwd: res.cwd,
+            exitCode: res.code,
+            signal: res.signal,
+            timedOut: false,
+            aborted: false,
+          },
+        }
       } catch (err: unknown) {
         if (err instanceof ShellCommandRefused) {
           return { content: `Error: ${err.message}`, isError: true }

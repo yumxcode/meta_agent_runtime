@@ -28,6 +28,8 @@ import type {
 import { verifyFrozenGraphIntegrity } from '../spec/GraphValidate.js'
 import { evaluateBindings } from './GraphExpression.js'
 import { emptyUsage } from './UsageMath.js'
+import { recordTrajectoryItem, trajectoryEnabled } from '../../../trajectory/hub.js'
+import { sha256 } from '../../../trajectory/privacy.js'
 
 export interface GraphPaths {
   root: string
@@ -107,6 +109,14 @@ export interface CreateGraphRecoveryForkInput {
 
 export class GraphStore {
   readonly paths: GraphPaths
+  /** Audit projection is deliberately outside the graph commit protocol. */
+  private trajectoryProjection: Promise<void> = Promise.resolve()
+  private trajectoryPersistenceDegraded = false
+  private trajectoryWarningEmitted = false
+  private lastJournalSequence = 0
+  private lastProjectedSequence = 0
+  private auditLagExceeded = false
+  private auditLagWarningEmitted = false
   /**
    * Highest journal sequence whose projections this process has already
    * repaired. Repair is idempotent, so doing it once per event per process
@@ -641,7 +651,116 @@ export class GraphStore {
     }
     await atomicWriteJson(this.journalPath(sequence), record)
     await atomicWriteJson(this.paths.journalSequenceJson, { schemaVersion: '1.0', lastSequence: sequence })
+    // The graph journal above is authoritative. Serialize its trajectory
+    // projection in the background so an audit/index failure cannot roll back,
+    // delay, or otherwise alter graph execution.
+    this.lastJournalSequence = Math.max(this.lastJournalSequence, sequence)
+    this.trajectoryProjection = this.trajectoryProjection
+      .then(() => this.recordTrajectoryProjection(record))
+      .then(() => {
+        this.lastProjectedSequence = Math.max(this.lastProjectedSequence, record.sequence)
+      })
+      .catch(error => {
+        this.trajectoryPersistenceDegraded = true
+        if (!this.trajectoryWarningEmitted) {
+          this.trajectoryWarningEmitted = true
+          console.warn(
+            `[GraphStore:${this.instanceId}] trajectory projection degraded:`,
+            error instanceof Error ? error.message : String(error),
+          )
+        }
+      })
+    this.observeAuditLag()
     return record
+  }
+
+  /** Graph correctness never depends on this flag; hosts may surface it. */
+  isTrajectoryPersistenceDegraded(): boolean {
+    return this.trajectoryPersistenceDegraded
+  }
+
+  /**
+   * Journal events written but not yet projected into the audit trajectory.
+   *
+   * Each projection does a full canonical barrier (`fsync`) plus a metadata
+   * write, which is what makes `flushTrajectoryProjection()` a real durability
+   * guarantee — and also what makes the audit side the slower of the two. The
+   * lag is therefore expected to be non-zero under load; it is only a problem
+   * when it grows without bound, because shutdown has to drain all of it.
+   * Execution never waits on this number.
+   */
+  trajectoryAuditLag(): number {
+    return Math.max(0, this.lastJournalSequence - this.lastProjectedSequence)
+  }
+
+  /** True once the audit backlog has passed its soft cap at least once. */
+  isTrajectoryAuditLagExceeded(): boolean {
+    return this.auditLagExceeded
+  }
+
+  private observeAuditLag(): void {
+    if (this.trajectoryAuditLag() <= MAX_TRAJECTORY_AUDIT_LAG) return
+    this.auditLagExceeded = true
+    if (this.auditLagWarningEmitted) return
+    this.auditLagWarningEmitted = true
+    console.warn(
+      `[GraphStore:${this.instanceId}] trajectory audit lag ${this.trajectoryAuditLag()} ` +
+      `exceeds ${MAX_TRAJECTORY_AUDIT_LAG} journal events; shutdown will have to drain the backlog. ` +
+      'Graph execution is unaffected.',
+    )
+  }
+
+  /** Test/shutdown hook for callers that need the audit projection durable. */
+  async flushTrajectoryProjection(): Promise<void> {
+    await this.trajectoryProjection
+  }
+
+  private async recordTrajectoryProjection(record: SequencedGraphJournalEvent): Promise<void> {
+    if (!trajectoryEnabled()) return
+    const event = record.event
+    const instance = 'instance' in event
+      ? event.instance
+      : await readJsonFile<GraphInstanceRecord>(this.paths.instanceJson)
+    if (!instance) throw new Error('graph instance projection is unavailable')
+    const activation = 'activation' in event ? event.activation : undefined
+    const details: Record<string, JsonValue> = { eventId: record.eventId }
+    if ('reason' in event) details['reason'] = event.reason
+    if ('transitionId' in event && event.transitionId) details['transitionId'] = event.transitionId
+    if (event.type === 'graph_status_changed') details['status'] = event.instance.status
+    const descriptor = {
+      subject: {
+        kind: 'graph_instance' as const,
+        workspaceId: instance.workspaceId,
+        instanceId: this.instanceId,
+      },
+      mode: 'loop_graph',
+      workspace: this.projectDir,
+      workspaceId: instance.workspaceId,
+      source: 'graph_journal_projection',
+    }
+    const trajectoryId = await recordTrajectoryItem(descriptor, {
+      type: 'phase',
+      domain: 'loop_graph',
+      action: event.type,
+      nodeId: activation?.nodeId,
+      activationId: activation?.id,
+      journalSequence: record.sequence,
+      details,
+    }, {}, { durability: 'projected' })
+    if (!trajectoryId) throw new Error('graph phase projection was not recorded')
+
+    if ('state' in event) {
+      const statePayload = JSON.stringify({ state: event.state, instance })
+      const checkpointId = await recordTrajectoryItem(descriptor, {
+        type: 'state_checkpoint',
+        mode: 'loop_graph',
+        stateSchemaVersion: event.state.schemaVersion,
+        revision: event.state.version,
+        contentHash: sha256(statePayload),
+        storeRef: `${this.journalPath(record.sequence)}#state`,
+      }, {}, { durability: 'projected' })
+      if (!checkpointId) throw new Error('graph checkpoint projection was not recorded')
+    }
   }
 
   async readJournal(): Promise<SequencedGraphJournalEvent[]> {
@@ -1073,6 +1192,12 @@ const EXTERNAL_EVENT_RETENTION_MS = 7 * 24 * 60 * 60_000
 const INTENT_RETENTION_MS = 7 * 24 * 60 * 60_000
 const HOUSEKEEPING_BATCH = 500
 const HOUSEKEEPING_INTERVAL_MS = 10 * 60_000
+/**
+ * Soft cap on journal events awaiting audit projection. Crossing it never slows
+ * or fails graph execution — it only marks the instance so the backlog is
+ * visible before shutdown has to drain it.
+ */
+const MAX_TRAJECTORY_AUDIT_LAG = 256
 
 /**
  * Conservative checkpoint retention. An Activation is dropped ONLY when every

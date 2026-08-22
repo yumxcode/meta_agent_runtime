@@ -97,6 +97,18 @@ ${bold('AUTO SCHEDULER (plain auto self_timer)')}
   meta-agent -w <dir> steer <sessionId> "<text>"
       Inject a correction into a running unattended session (see STEERING below).
 
+${bold('TRAJECTORIES (A3 audit store)')}
+  meta-agent trajectory inspect <id>       Show an ordinal causal timeline
+  meta-agent trajectory tail <id>          Read a suffix (--after N --limit N)
+  meta-agent trajectory verify <id>        Verify schema, ordinals and references
+  meta-agent trajectory reindex --clean    Rebuild disposable metadata projections
+  meta-agent trajectory list [--search Q]  Search title/prompt/mode/workspace metadata
+  meta-agent trajectory disk               Show canonical/index disk usage
+  meta-agent trajectory telemetry          Incrementally project historical telemetry (--clean rebuilds)
+  meta-agent trajectory parity             Compare canonical resume with legacy history (--clean resets evidence)
+  meta-agent trajectory gc                 Safe dry-run retention audit (apply disabled until lifecycle proof)
+  meta-agent sessions --search <text>       Search trajectory-backed session metadata
+
 ${bold('INTERACTIVE COMMANDS')}
   /mode                 Show current session mode
   /workspace            Show current workspace directory
@@ -238,7 +250,7 @@ export interface CliOptions {
   mcpAppsOpen: boolean            // open the sidecar URL in the default browser
   /** Durable runtime subcommands. Args pass through verbatim. */
   loopCommand: {
-    name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks'
+    name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions'
     args: string[]
   } | null
 }
@@ -253,10 +265,10 @@ export function parseCliArgs(): CliOptions {
   // that the strict global parser would try to interpret as flags.
   const loopIdx = rawArgs.findIndex(a =>
     a === 'loop' || a === 'loop-scheduler' || a === 'auto-scheduler' ||
-    a === 'steer' || a === 'tasks')
+    a === 'steer' || a === 'tasks' || a === 'trajectory' || a === 'sessions')
   if (loopIdx !== -1) {
     return buildLoopCliOptions(
-      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks',
+      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions',
       rawArgs.slice(0, loopIdx),
       rawArgs.slice(loopIdx + 1),
     )
@@ -425,7 +437,7 @@ export function parseCliArgs(): CliOptions {
  * `loop` token is handed verbatim to runLoopCli, which does its own flag parsing.
  */
 export function buildLoopCliOptions(
-  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks',
+  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions',
   globalArgs: string[],
   loopArgs: string[],
 ): CliOptions {

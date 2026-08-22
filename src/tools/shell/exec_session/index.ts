@@ -136,6 +136,14 @@ export async function createExecSessionTool(
         return {
           content: renderReadResult(info.id, read, { includeHeader: true }),
           isError: false,
+          execution: {
+            command,
+            cwd: info.cwd,
+            exitCode: read.exitCode,
+            timedOut: false,
+            aborted: ctx.abortSignal.aborted,
+            shellSessionId: info.id,
+          },
         }
       } catch (err) {
         // A session that was opened but then failed mid-read must not be left

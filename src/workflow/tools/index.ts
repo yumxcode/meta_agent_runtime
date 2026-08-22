@@ -15,11 +15,12 @@ export function createWorkflowTools(
   definition: WorkflowDefinition,
   getState: () => WorkflowState | null,
   onStateChange: (s: WorkflowState) => void,
+  sessionId?: string,
 ): MetaAgentTool[] {
   return [
     createWorkflowStatusTool(definition, getState),
-    createWorkflowCompleteGateTool(projectDir, definition, onStateChange),
-    createWorkflowAdvanceTool(projectDir, definition, onStateChange),
+    createWorkflowCompleteGateTool(projectDir, definition, onStateChange, sessionId),
+    createWorkflowAdvanceTool(projectDir, definition, onStateChange, sessionId),
     createWorkflowListPhasesTool(definition, getState),
   ]
 }

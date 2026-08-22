@@ -81,6 +81,18 @@ export function createDeleteTool(cfg: DeleteToolConfig): MetaAgentTool {
             `目标: ${label} (${targetId})\n` +
             `\n该条目不会被自动删除。请运行 ${cfg.reviewCommand}，由用户确认后才会真正删除。`,
           isError: false,
+          ...(cfg.mechanism === 'memory'
+            ? {}
+            : {
+                trajectoryItems: [{
+                  type: 'knowledge' as const,
+                  kind: cfg.mechanism === 'anchor' ? 'anchor' as const : cfg.mechanism,
+                  action: 'proposed' as const,
+                  entryIds: [targetId],
+                  pendingId,
+                  operation: 'delete' as const,
+                }],
+              }),
         }
       } catch (err) {
         return { content: `${cfg.name} failed: ${String(err)}`, isError: true }

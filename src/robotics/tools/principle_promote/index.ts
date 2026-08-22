@@ -59,6 +59,10 @@ export function createPrinciplePromoteTool(
           `Score: ${result.score ?? 'n/a'}\n\n` +
           `Run /principle review to approve, edit externally, or discard it.`,
         isError: false,
+        trajectoryItems: [{
+          type: 'knowledge', kind: 'principle', action: 'proposed',
+          entryIds: [], pendingId: result.pendingId, operation: 'promote',
+        }],
       }
     },
   }

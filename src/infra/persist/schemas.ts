@@ -245,6 +245,7 @@ export const JobArtifactSchema = z.object({
 
 export const EngineeringJobSchema = z.object({
   jobId:         z.string(),
+  toolUseId:     z.string().optional(),
   toolName:      z.string(),
   domain:        z.string(),
   fidelityLevel: z.number(),

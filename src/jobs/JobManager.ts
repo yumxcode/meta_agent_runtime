@@ -43,6 +43,8 @@ import { JobStore } from './JobStore.js'
 import { LocalExecutor } from './JobExecutor.js'
 import type { Executor, ExecutorCallbacks } from './JobExecutor.js'
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
+import { findTrajectoryBySessionId } from '../trajectory/indexStore.js'
+import { recordTrajectoryItem } from '../trajectory/hub.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Submit options
@@ -52,6 +54,8 @@ export interface SubmitOptions {
   domain?: string
   fidelityLevel?: number
   agentId?: string
+  /** Current ToolCallContext.toolUseId, for trajectory causality. */
+  toolUseId?: string
   /**
    * Per-job wall-clock budget (ms) forwarded to the executor watchdog. Omit to
    * use the executor default; `0` disables the watchdog for this job. See
@@ -78,6 +82,8 @@ export class JobManager {
   private readonly executor: Executor
   private readonly sessionId: string
   private readonly jobs = new Map<JobId, RuntimeJob>()
+  /** Preserves lifecycle order across fire-and-forget trajectory projections. */
+  private trajectoryProjection: Promise<void> = Promise.resolve()
   /**
    * S2: LRU cap on terminal jobs held in memory.  Active (queued / running)
    * jobs are NEVER evicted regardless of this cap — only completed / failed /
@@ -174,6 +180,7 @@ export class JobManager {
 
     const job: EngineeringJob = {
       jobId,
+      toolUseId: opts.toolUseId,
       toolName,
       domain: opts.domain ?? 'generic',
       fidelityLevel: opts.fidelityLevel ?? 0,
@@ -192,6 +199,7 @@ export class JobManager {
 
     this.jobs.set(jobId, rt)
     await this.store.save(job)
+    void this._recordJob('created', job)
 
     const callbacks: ExecutorCallbacks = {
       onQueued: (id) => this._transition(id, 'queued'),
@@ -206,6 +214,10 @@ export class JobManager {
         const rj = this.jobs.get(p.jobId)
         if (rj) {
           for (const listener of rj.progressListeners) listener(p)
+          void this._recordJob('progress', rj.job, {
+            progress: p.percent,
+            summary: p.currentStep,
+          })
         }
       },
       onCompleted: async (id, partial) => {
@@ -440,6 +452,9 @@ export class JobManager {
     const rt = this.jobs.get(jobId)
     if (!rt) return false
     rt.job.status = status
+    void this._recordJob(statusToTrajectoryAction(status), rt.job, {
+      summary: rt.result?.summary ?? rt.job.error,
+    })
     // Fire-and-forget persist with exponential back-off.
     // Active transitions remain non-blocking; terminal transitions are awaited
     // by their callbacks before resolving/rejecting awaitJob() callers.
@@ -458,6 +473,44 @@ export class JobManager {
     }
     void persistPromise
     return true
+  }
+
+  private _recordJob(
+    action: 'created' | 'queued' | 'running' | 'progress' | 'completed' | 'failed' | 'cancelled',
+    job: EngineeringJob,
+    extra: { progress?: number; summary?: string } = {},
+  ): Promise<void> {
+    const projection = this.trajectoryProjection.then(() => this._writeJobTrajectory(action, job, extra))
+    this.trajectoryProjection = projection.catch(() => undefined)
+    return projection
+  }
+
+  private async _writeJobTrajectory(
+    action: 'created' | 'queued' | 'running' | 'progress' | 'completed' | 'failed' | 'cancelled',
+    job: EngineeringJob,
+    extra: { progress?: number; summary?: string },
+  ): Promise<void> {
+    const trajectory = await findTrajectoryBySessionId(this.sessionId).catch(() => null)
+    if (!trajectory) return
+    await recordTrajectoryItem({
+      subject: trajectory.subject,
+      mode: trajectory.mode,
+      workspace: trajectory.workspace,
+      workspaceId: trajectory.workspaceId,
+      rootTrajectoryId: trajectory.rootTrajectoryId,
+      parentTrajectoryId: trajectory.parentTrajectoryId,
+      source: 'job_manager',
+    }, {
+      type: 'job',
+      action,
+      jobId: job.jobId,
+      toolUseId: job.toolUseId,
+      progress: extra.progress,
+      summary: extra.summary,
+      toolName: job.toolName,
+      domain: job.domain,
+      agentId: job.agentId,
+    })
   }
 
   /** S2: drop oldest terminal jobs until size ≤ _terminalJobCap. */
@@ -529,4 +582,10 @@ export class JobManager {
       return false
     }
   }
+}
+
+function statusToTrajectoryAction(
+  status: JobStatus,
+): 'created' | 'queued' | 'running' | 'progress' | 'completed' | 'failed' | 'cancelled' {
+  return status === 'submitted' ? 'created' : status
 }

@@ -67,6 +67,7 @@ export interface ShellCommandResult {
   stdout: string
   stderr: string
   code: number | null
+  signal: NodeJS.Signals | null
   timedOut: boolean
   aborted: boolean
   /** The canonical absolute cwd the command actually ran in. */
@@ -207,7 +208,7 @@ function runProcessGroup(
     }
 
     child.on('error', err => finish(() => reject(err)))
-    child.on('close', code =>
+    child.on('close', (code, signal) =>
       finish(() => {
         // Flush any bytes the decoders held back at a chunk boundary.
         const outTail = outDecoder.end()
@@ -218,7 +219,7 @@ function runProcessGroup(
         if (errTail && stderr.length < opts.captureLimit) {
           stderr += errTail.slice(0, opts.captureLimit - stderr.length)
         }
-        resolve({ stdout, stderr, code, timedOut, aborted })
+        resolve({ stdout, stderr, code, signal, timedOut, aborted })
       }),
     )
   })

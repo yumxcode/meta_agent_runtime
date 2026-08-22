@@ -70,6 +70,7 @@ import type {
   CheckpointBoundaryEvent,
   CheckpointBoundaryResult,
 } from './CheckpointBoundary.js'
+import type { TrajectoryItem } from '../../trajectory/types.js'
 
 // ── Return type ───────────────────────────────────────────────────────────────
 
@@ -144,6 +145,19 @@ export interface KernelLoopContext {
    * deterministic goal anchor survives nested compactions.
    */
   originalUserGoal?: string
+  /** Additive audit hook. Failures are isolated by KernelSession. */
+  onMessagesAppended?: (messages: readonly KernelMessage[]) => void
+  /** Full replacement history emitted at a successful compact boundary. */
+  onCompaction?: (event: {
+    previousTokens: number
+    summaryTokens: number
+    replacementHistory: readonly KernelMessage[]
+  }) => void
+  /** Domain tools emit already-structured facts; the kernel only forwards. */
+  onTrajectoryItems?: (
+    items: readonly TrajectoryItem[],
+    context: { toolUseId: string; toolName: string },
+  ) => void
 }
 
 function isRealUserMessage(message: KernelMessage): boolean {
@@ -798,6 +812,7 @@ export async function* runKernelLoop(
     if (state.messages !== mutableMessages) {
       state = { ...state, messages: mutableMessages }
     }
+    try { ctx.onMessagesAppended?.(msgs) } catch { /* audit is fail-open */ }
   }
 
   let parkRequest: KernelParkControl | undefined
@@ -969,6 +984,13 @@ export async function* runKernelLoop(
         },
         sessionId,
       }
+      try {
+        ctx.onCompaction?.({
+          summaryTokens: compactResult.summaryTokenEstimate ?? 0,
+          previousTokens: tokenCountWithEstimation(messagesForQuery),
+          replacementHistory: compactMsgs,
+        })
+      } catch { /* audit is fail-open */ }
     } else {
       currentMessagesForQuery = messagesForQuery
     }
@@ -1225,6 +1247,13 @@ export async function* runKernelLoop(
               },
               sessionId,
             }
+            try {
+              ctx.onCompaction?.({
+                summaryTokens: reactiveCompactResult.summaryTokenEstimate ?? 0,
+                previousTokens: tokenCountWithEstimation(currentMessagesForQuery),
+                replacementHistory: reactiveCompactResult.postCompactMessages,
+              })
+            } catch { /* audit is fail-open */ }
             continue
           }
         }
@@ -1625,6 +1654,15 @@ export async function* runKernelLoop(
 
     const toolsResult = await runTools(toolUseRequests, config.tools, toolCtx, canUseTool)
     const toolNameByUseId = new Map(toolUseRequests.map(req => [req.toolUseId, req.toolName]))
+    const outcomeByUseId = new Map(toolsResult.outcomes.map(outcome => [outcome.toolUseId, outcome]))
+    for (const outcome of toolsResult.outcomes) {
+      if (outcome.trajectoryItems?.length) {
+        ctx.onTrajectoryItems?.(outcome.trajectoryItems, {
+          toolUseId: outcome.toolUseId,
+          toolName: outcome.toolName,
+        })
+      }
+    }
 
     // Feed the no-progress guard above: it runs before tools execute, so it can
     // only ever see whether the *previous* identical request returned something
@@ -1642,6 +1680,7 @@ export async function* runKernelLoop(
     for (const resultMsg of toolsResult.toolResultMessages) {
       for (const block of resultMsg.content) {
         if (block.type === 'tool_result') {
+          const outcome = outcomeByUseId.get(block.tool_use_id)
           const content =
             typeof block.content === 'string'
               ? block.content
@@ -1653,6 +1692,10 @@ export async function* runKernelLoop(
             content,
             isError: block.is_error ?? false,
             sessionId,
+            durationMs: outcome?.durationMs,
+            input: outcome?.input,
+            permissionDecision: outcome?.permissionDecision,
+            execution: outcome?.execution,
           }
         }
       }

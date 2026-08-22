@@ -83,6 +83,8 @@ export interface JobMetrics {
 
 export interface EngineeringJob {
   jobId: JobId
+  /** Tool invocation that created this async job, when submitted from a tool. */
+  toolUseId?: string
   toolName: string          // name of the tool that spawned this job
   domain: string            // engineering domain (e.g. 'battery', 'mechanical')
   fidelityLevel: number     // 0-4 per FidelityLevel enum (defined in Phase 3)

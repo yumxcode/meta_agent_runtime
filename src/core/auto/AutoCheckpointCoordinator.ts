@@ -9,7 +9,8 @@ import type {
   CheckpointBoundaryEvent,
   CheckpointBoundaryResult,
 } from '../../kernel/loop/CheckpointBoundary.js'
-import { updateAutoCheckpointWithStatus } from './AutoCheckpointStore.js'
+import { createHash } from 'node:crypto'
+import { autoCheckpointPath, updateAutoCheckpointWithStatus } from './AutoCheckpointStore.js'
 
 export interface AutoCheckpointSnapshot {
   goal?: string
@@ -57,6 +58,7 @@ export class AutoCheckpointCoordinator {
   private revision: number
   private toolBatchCount: number
   private estimatedCostUsd = 0
+  private latestCheckpointRef: NonNullable<CheckpointBoundaryResult['checkpoint']> | undefined
 
   // ── FS-only edit-digest accumulation ────────────────────────────────────────
   /** Consecutive FS-only checkpoints since the last digest or state update. */
@@ -126,7 +128,18 @@ export class AutoCheckpointCoordinator {
       // Checkpoint persistence is best-effort and must never replace the real
       // execution result. Keep the previous durable revision on failure.
     }
-    return { updated: this.revision > before, revision: this.revision }
+    const updated = this.revision > before
+    const result: CheckpointBoundaryResult = { updated, revision: this.revision }
+    if (updated && this.latestCheckpointRef) {
+      // Keep the established enumerable result shape ({updated, revision}) for
+      // embedders that compare/serialize it, while exposing additive A3 metadata
+      // to KernelSession through normal property access.
+      Object.defineProperty(result, 'checkpoint', {
+        value: this.latestCheckpointRef,
+        enumerable: false,
+      })
+    }
+    return result
   }
 
   /** Force the confirmed dispose boundary using the latest observed counters. */
@@ -264,6 +277,12 @@ export class AutoCheckpointCoordinator {
         if (!writeResult.written) continue
         const cp = writeResult.checkpoint
         this.revision = cp.revision ?? this.revision + 1
+        this.latestCheckpointRef = {
+          mode: 'auto',
+          stateSchemaVersion: cp.schemaVersion,
+          contentHash: createHash('sha256').update(JSON.stringify(cp)).digest('hex'),
+          storeRef: autoCheckpointPath(this.deps.projectDir, event.sessionId),
+        }
         // Clear only after a successful write so a failed write retries the digest.
         if (this.pendingEditSummary) this.pendingEditSummary = null
       }

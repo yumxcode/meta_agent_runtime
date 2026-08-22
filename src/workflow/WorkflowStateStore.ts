@@ -1,15 +1,22 @@
 import { join } from 'path'
+import { createHash } from 'node:crypto'
 import { atomicWriteJson, readJsonFile } from '../infra/persist/index.js'
 import type { WorkflowDefinition, WorkflowPhase, WorkflowState, GateCheckResult } from './types.js'
 
 export class WorkflowStateStore {
-  static stateFile(projectDir: string): string {
-    return join(projectDir, '.meta-agent', 'workflow-state.json')
+  static stateFile(projectDir: string, sessionId?: string): string {
+    if (!sessionId) return join(projectDir, '.meta-agent', 'workflow-state.json')
+    return join(projectDir, '.meta-agent', 'workflows', safeSessionFileName(sessionId) + '.json')
   }
 
-  static async read(projectDir: string): Promise<WorkflowState | null> {
-    const s = await readJsonFile<WorkflowState>(WorkflowStateStore.stateFile(projectDir))
-    return s?.schemaVersion === '1.0' ? s : null
+  static async read(projectDir: string, sessionId?: string): Promise<WorkflowState | null> {
+    const current = await readJsonFile<WorkflowState>(WorkflowStateStore.stateFile(projectDir, sessionId))
+    if (current?.schemaVersion === '1.0') return current
+    if (!sessionId) return null
+    // One-release compatibility fallback. A compatible caller migrates this
+    // snapshot into its own session file in readCompatible().
+    const legacy = await readJsonFile<WorkflowState>(WorkflowStateStore.stateFile(projectDir))
+    return legacy?.schemaVersion === '1.0' ? legacy : null
   }
 
   static isCompatible(definition: WorkflowDefinition, state: WorkflowState): boolean {
@@ -21,16 +28,30 @@ export class WorkflowStateStore {
     return definition.phases.some(p => p.id === state.currentPhaseId)
   }
 
-  static async readCompatible(projectDir: string, definition: WorkflowDefinition): Promise<WorkflowState | null> {
-    const state = await WorkflowStateStore.read(projectDir)
-    return state && WorkflowStateStore.isCompatible(definition, state) ? state : null
+  static async readCompatible(
+    projectDir: string,
+    definition: WorkflowDefinition,
+    sessionId?: string,
+  ): Promise<WorkflowState | null> {
+    const state = await WorkflowStateStore.read(projectDir, sessionId)
+    if (!state || !WorkflowStateStore.isCompatible(definition, state)) return null
+    if (sessionId) {
+      const sessionFile = WorkflowStateStore.stateFile(projectDir, sessionId)
+      const alreadyMigrated = await readJsonFile<WorkflowState>(sessionFile)
+      if (!alreadyMigrated) await atomicWriteJson(sessionFile, state)
+    }
+    return state
   }
 
-  static async write(projectDir: string, state: WorkflowState): Promise<void> {
-    await atomicWriteJson(WorkflowStateStore.stateFile(projectDir), state)
+  static async write(projectDir: string, state: WorkflowState, sessionId?: string): Promise<void> {
+    await atomicWriteJson(WorkflowStateStore.stateFile(projectDir, sessionId), state)
   }
 
-  static async initialize(projectDir: string, definition: WorkflowDefinition): Promise<WorkflowState> {
+  static async initialize(
+    projectDir: string,
+    definition: WorkflowDefinition,
+    sessionId?: string,
+  ): Promise<WorkflowState> {
     const firstPhase = definition.phases[0]
     if (!firstPhase) throw new Error('Workflow has no phases')
     const state: WorkflowState = {
@@ -45,16 +66,16 @@ export class WorkflowStateStore {
       completedGateItems: [],
       phaseHistory: [{ phaseId: firstPhase.id, enteredAt: Date.now(), advancedBy: 'agent' }],
     }
-    await WorkflowStateStore.write(projectDir, state)
+    await WorkflowStateStore.write(projectDir, state, sessionId)
     return state
   }
 
-  static async completeGateItem(projectDir: string, gateItemId: string): Promise<WorkflowState> {
-    const state = await WorkflowStateStore.read(projectDir)
+  static async completeGateItem(projectDir: string, gateItemId: string, sessionId?: string): Promise<WorkflowState> {
+    const state = await WorkflowStateStore.read(projectDir, sessionId)
     if (!state) throw new Error('Workflow state not initialised')
     if (!state.completedGateItems.includes(gateItemId)) {
       state.completedGateItems.push(gateItemId)
-      await WorkflowStateStore.write(projectDir, state)
+      await WorkflowStateStore.write(projectDir, state, sessionId)
     }
     return state
   }
@@ -63,8 +84,9 @@ export class WorkflowStateStore {
     projectDir: string,
     definition: WorkflowDefinition,
     gateItemId: string,
+    sessionId?: string,
   ): Promise<WorkflowState> {
-    const state = await WorkflowStateStore.readCompatible(projectDir, definition)
+    const state = await WorkflowStateStore.readCompatible(projectDir, definition, sessionId)
     if (!state) throw new Error('Workflow state is not compatible with current definition')
     const phase = definition.phases.find(p => p.id === state.currentPhaseId)
     if (!phase) throw new Error(`Unknown workflow phase: ${state.currentPhaseId}`)
@@ -73,7 +95,7 @@ export class WorkflowStateStore {
     }
     if (!state.completedGateItems.includes(gateItemId)) {
       state.completedGateItems.push(gateItemId)
-      await WorkflowStateStore.write(projectDir, state)
+      await WorkflowStateStore.write(projectDir, state, sessionId)
     }
     return state
   }
@@ -82,8 +104,9 @@ export class WorkflowStateStore {
     projectDir: string,
     definition: WorkflowDefinition,
     advancedBy: 'agent' | 'user',
+    sessionId?: string,
   ): Promise<{ newPhase: WorkflowPhase; state: WorkflowState }> {
-    const state = await WorkflowStateStore.readCompatible(projectDir, definition)
+    const state = await WorkflowStateStore.readCompatible(projectDir, definition, sessionId)
     if (!state) throw new Error('Workflow state is not compatible with current definition')
     const currentIdx = definition.phases.findIndex(p => p.id === state.currentPhaseId)
     if (currentIdx < 0) throw new Error(`Unknown workflow phase: ${state.currentPhaseId}`)
@@ -95,7 +118,7 @@ export class WorkflowStateStore {
     state.currentPhaseId = nextPhase.id
     state.currentPhaseEnteredAt = now
     state.phaseHistory.push({ phaseId: nextPhase.id, enteredAt: now, advancedBy })
-    await WorkflowStateStore.write(projectDir, state)
+    await WorkflowStateStore.write(projectDir, state, sessionId)
     return { newPhase: nextPhase, state }
   }
 
@@ -118,4 +141,9 @@ export class WorkflowStateStore {
       suggested: gates.filter(g => g.type === 'SUGGESTED' && !g.completed),
     }
   }
+}
+
+function safeSessionFileName(sessionId: string): string {
+  if (/^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$/.test(sessionId)) return sessionId
+  return createHash('sha256').update(sessionId).digest('hex')
 }

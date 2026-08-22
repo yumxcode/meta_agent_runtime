@@ -43,6 +43,8 @@ import { isAbsolute, relative, resolve } from 'path'
 import { tmpdir } from 'os'
 import { canonicalizeForGuard, pathIsUnder } from '../tools/fs/workspaceGuard.js'
 import { dirname } from 'path'
+import { findIndexedTrajectory, findTrajectoryBySessionId } from '../trajectory/indexStore.js'
+import { openTrajectory, recordTrajectoryItem } from '../trajectory/hub.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -160,6 +162,9 @@ export class SubAgentRunner {
   private _returnedResult?: ReturnedResult
   /** Set when a self-park tool (via cfg.parkSignal) ended the segment — terminal 'completed' with {label:'wait'}. */
   private _parked = false
+  private _trajectorySessionId: string | undefined
+  /** Serialize parent lifecycle projection so terminal cannot overtake start. */
+  private _trajectoryProjection: Promise<void> = Promise.resolve()
 
   constructor(
     record: SubAgentRecord,
@@ -251,7 +256,6 @@ export class SubAgentRunner {
     this.record.startedAt = Date.now()
     await writeTask(this.record)
     this._emitRuntime({ type: 'runner_started', taskId: this.taskId })
-
     const cfg = this.record.config
     const startMs = Date.now()
     let lastText = ''
@@ -370,6 +374,13 @@ export class SubAgentRunner {
     const scopedSessionId = cfg.lineageSessionId ?? (cfg.workspaceId
       ? `loop-seat-${cfg.workspaceId}-${this.taskId}`
       : undefined)
+    // Keep the trajectory subject aligned with KernelSession's actual session
+    // id. In particular, graph seats use the stable lineage id while ordinary
+    // sub-agents without an explicit session fall back to their task id.
+    const childSessionId = scopedSessionId ?? this.taskId
+    this._trajectorySessionId = childSessionId
+    const parentTrajectory = await this._findParentTrajectory()
+    void this._recordParentTrajectory('started')
     if (scopedSessionId && cfg.workspaceId) {
       unregisterModelScope = registerModelCallScope(scopedSessionId, {
         workspaceId: cfg.workspaceId,
@@ -404,6 +415,14 @@ export class SubAgentRunner {
       ...(cfg.externalPromptAssembly ? { externalPromptAssembly: true } : {}),
       ...(scopedSessionId ? { sessionId: scopedSessionId } : {}),
       ...(priorMessages.length ? { initialMessages: priorMessages } : {}),
+      trajectory: {
+        mode: cfg.loopInstanceId ? 'inner_orch_worker' : 'subagent',
+        subject: { kind: 'subagent', taskId: this.taskId, sessionId: childSessionId },
+        parentTrajectoryId: parentTrajectory?.trajectoryId,
+        rootTrajectoryId: parentTrajectory?.rootTrajectoryId ?? parentTrajectory?.trajectoryId,
+        workspaceId: cfg.workspaceId,
+        source: 'subagent_runner',
+      },
       // G5: an explicit structural-truncate requirement from the spawner beats
       // the `autonomy !== undefined` derivation downstream.
       ...(cfg.compactStructuralFallback !== undefined
@@ -847,6 +866,8 @@ export class SubAgentRunner {
     }
     if (written === null) return
 
+    void this._recordParentTrajectory(status)
+
     // Publish event
     if (status === 'completed') {
       CampaignEventBus.emit('subagent:completed', {
@@ -861,6 +882,81 @@ export class SubAgentRunner {
         error:           result.error ?? status,
       })
     }
+  }
+
+  private _recordParentTrajectory(
+    action: 'started' | 'completed' | 'failed' | 'cancelled',
+  ): Promise<void> {
+    const projection = this._trajectoryProjection.then(() => this._writeParentTrajectory(action))
+    this._trajectoryProjection = projection.catch(() => undefined)
+    return projection
+  }
+
+  private async _writeParentTrajectory(
+    action: 'started' | 'completed' | 'failed' | 'cancelled',
+  ): Promise<void> {
+    const parent = await this._findParentTrajectory()
+    if (!parent) return
+    const child = this._trajectorySessionId
+      ? await findIndexedTrajectory({
+          kind: 'subagent',
+          taskId: this.taskId,
+          sessionId: this._trajectorySessionId,
+        }).catch(() => null)
+      : null
+    await recordTrajectoryItem({
+      subject: parent.subject,
+      mode: parent.mode,
+      workspace: parent.workspace,
+      workspaceId: parent.workspaceId,
+      rootTrajectoryId: parent.rootTrajectoryId,
+      parentTrajectoryId: parent.parentTrajectoryId,
+      source: 'subagent_runner',
+    }, {
+      type: 'subagent',
+      action,
+      taskId: this.taskId,
+      childTrajectoryId: child?.trajectoryId,
+      worktree: this.record.config.projectDir,
+      usage: this.record.result
+        ? {
+            inputTokens: this.record.result.inputTokens,
+            outputTokens: this.record.result.outputTokens,
+            costUsd: this.record.result.costUsd,
+          }
+        : undefined,
+    })
+  }
+
+  /**
+   * Ordinary sub-agents attach to their parent KernelSession. Graph seats are
+   * dispatched by a host bridge whose session is not the graph identity, so
+   * they attach directly to the graph-instance root trajectory instead.
+   */
+  private async _findParentTrajectory() {
+    const cfg = this.record.config
+    if (cfg.workspaceId && cfg.loopInstanceId) {
+      const subject = {
+        kind: 'graph_instance',
+        workspaceId: cfg.workspaceId,
+        instanceId: cfg.loopInstanceId,
+      } as const
+      let graphParent = await findIndexedTrajectory(subject).catch(() => null)
+      if (graphParent) return graphParent
+      // A scheduler can dispatch the first lane immediately after graph creation,
+      // before the GraphStore's asynchronous audit projection has opened the root
+      // trajectory. Opening by the same subject is idempotent and closes that race.
+      await openTrajectory({
+        subject,
+        mode: 'loop_graph',
+        workspace: cfg.projectDir,
+        workspaceId: cfg.workspaceId,
+        source: 'subagent_parent_link',
+      }).catch(() => null)
+      graphParent = await findIndexedTrajectory(subject).catch(() => null)
+      if (graphParent) return graphParent
+    }
+    return findTrajectoryBySessionId(this.record.parentSessionId).catch(() => null)
   }
 
   /**

@@ -142,6 +142,13 @@ export const RuntimeEnv = {
     const n = readIntEnv('META_AGENT_KEEP_TERMINAL_JOBS', { min: 0 })
     return n ?? fallback
   },
+  /** Explicit A3 trajectory override; undefined keeps the environment default. */
+  trajectoryEnabledOverride(): boolean | undefined {
+    const value = readStringEnv('META_AGENT_TRAJECTORY')
+    if (value === '1' || value === 'true') return true
+    if (value === '0' || value === 'false') return false
+    return undefined
+  },
 
   // ── MCP ─────────────────────────────────────────────────────────────────
   /**
@@ -294,6 +301,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'DISABLE_COMPACT', type: 'flag', default: 'off', description: 'Disable auto-compaction entirely.' },
   { name: 'DISABLE_AUTO_COMPACT', type: 'flag', default: 'off', description: 'Alias of DISABLE_COMPACT.' },
   { name: 'META_AGENT_KEEP_TERMINAL_JOBS', type: 'int', default: '200', description: 'Max terminal jobs retained in memory (LRU).' },
+  { name: 'META_AGENT_TRAJECTORY', type: 'flag', default: 'on outside tests', description: 'Set 0 to disable A3 trajectory recording or 1 to force-enable it in test/embedded runtimes.' },
   { name: 'META_AGENT_MCP_STDIO_MAX_RESPONSE_BYTES', type: 'int', default: '10485760', description: 'Maximum stdout bytes retained from one stdio MCP RPC.' },
   { name: 'META_AGENT_IGNORE_USER_PERMISSIONS', type: 'flag', default: 'off', description: 'Ignore on-disk permission configs (hermetic mode).' },
   { name: 'META_AGENT_DISABLE_RIPGREP', type: 'flag', default: 'off', description: 'Force the grep tool onto its portable Node fallback even when ripgrep is installed.' },

@@ -416,6 +416,11 @@ export class RoboticsSession implements RoboticsCapabilities {
       projectDir:     this.projectDir,
       agentMode:      undefined,
       runtimeContext: rtxResult.runtimeContext,     // ← wire VV pipeline (HardwareSafety + FailurePattern + OOM + Physics)
+      trajectory: {
+        ...config.trajectory,
+        mode: 'robotics',
+        source: config.trajectory?.source ?? 'robotics_session',
+      },
       // Route robotics compact guidance to the compaction side-call as a lazy
       // thunk. Resolved only when auto-compact fires (inside compactConversation),
       // so it lands at the front of the compact prompt ahead of the conversation
@@ -573,9 +578,9 @@ export class RoboticsSession implements RoboticsCapabilities {
     )
     if (wfDef) {
       this._workflowDef = wfDef
-      const existingWfState = await WorkflowStateStore.readCompatible(this.projectDir, wfDef)
+      const existingWfState = await WorkflowStateStore.readCompatible(this.projectDir, wfDef, this._storeSessionId)
       this._workflowState = existingWfState
-        ?? await WorkflowStateStore.initialize(this.projectDir, wfDef)
+        ?? await WorkflowStateStore.initialize(this.projectDir, wfDef, this._storeSessionId)
     }
 
     // ── 3. Register robotics tools ────────────────────────────────────────
@@ -683,6 +688,7 @@ export class RoboticsSession implements RoboticsCapabilities {
           // Invalidate W1 section so next turn reflects updated phase/gates
           this.sectionRegistry.invalidate('workflow_phase')
         },
+        this._storeSessionId,
       )
       for (const tool of wfTools) {
         this._registerRuntimeTool(tool)

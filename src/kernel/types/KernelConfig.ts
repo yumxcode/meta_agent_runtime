@@ -9,6 +9,7 @@ import type { VerifyGateFn } from '../loop/VerifyGate.js'
 import type { DriftGateFn } from '../loop/DriftGate.js'
 import type { CheckpointBoundaryFn } from '../loop/CheckpointBoundary.js'
 import type { PhaseHookFn } from '../loop/PhaseHooks.js'
+import type { TrajectorySubject } from '../../trajectory/types.js'
 
 export type ThinkingConfig =
   | { type: 'disabled' }
@@ -140,6 +141,24 @@ export interface KernelConfig {
 
   /** Optional message history to preload when resuming a session. */
   initialMessages?: KernelMessage[]
+
+  /**
+   * Additive A3 trajectory recording. Existing history/checkpoint stores remain
+   * authoritative; failures here must never alter execution or resume results.
+   */
+  trajectory?: {
+    enabled?: boolean
+    mode: string
+    subject?: TrajectorySubject
+    rootTrajectoryId?: string
+    parentTrajectoryId?: string
+    workspaceId?: string
+    rootDir?: string
+    source?: string
+  }
+
+  /** Optional file-change tracker projected at each run result. */
+  turnDiff?: import('../../infra/fs/TurnDiffTracker.js').TurnDiffTracker
 
   /**
    * Static system prompt text.

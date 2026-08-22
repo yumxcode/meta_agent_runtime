@@ -65,6 +65,12 @@ export class CampaignSession {
       systemPrompt: resolved.systemPrompt,
       appendSystemPrompt: resolved.appendSystemPrompt,
       initialMessages: toKernelMessages(resolved.initialMessages),
+      trajectory: {
+        ...config.trajectory,
+        mode: config.trajectory?.mode ?? 'campaign',
+        source: config.trajectory?.source ?? 'kernel_session',
+      },
+      turnDiff: config.turnDiff ?? resolved.runtimeContext?.turnDiff,
       tools: [],
       canUseTool: createPermissionPolicy({
         workspaceRoot: resolved.projectDir ?? process.cwd(),

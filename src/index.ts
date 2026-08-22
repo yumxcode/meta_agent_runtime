@@ -31,6 +31,11 @@ export type {
   HookEventName, HookDefinition, HookDecision, HookPayload, HookOutcome, HooksConfig,
   CommandRule, CommandRuleAction, CommandRulesConfig, CompiledCommandRules,
 } from './kernel/index.js'
+
+// ── Standard agent trajectories (A3) ───────────────────────────────────────
+// Canonical append-only facts plus disposable/rebuildable projections. Existing
+// SessionStore/checkpoint/graph-journal APIs remain authoritative for resume.
+export * from './trajectory/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,

@@ -60,7 +60,14 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
           ...(entry.sourceTaskId ? [`**Source task**: ${entry.sourceTaskId}`, ''] : []),
           ...(entry.fullReport ? ['---', '## Full Report', entry.fullReport] : []),
         ]
-        return { content: lines.join('\n'), isError: false }
+        return {
+          content: lines.join('\n'),
+          isError: false,
+          trajectoryItems: [{
+            type: 'knowledge', kind: 'experience', action: 'recalled',
+            entryIds: [entry.id], operation: 'recall',
+          }],
+        }
       } catch (err) {
         return { content: `experience_load failed: ${String(err)}`, isError: true }
       }
