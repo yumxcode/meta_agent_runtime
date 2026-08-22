@@ -34,6 +34,7 @@ import {
 import { resolveProvider } from '../providers/registry.js'
 
 import { stripVolatileContextPrefix } from './utils/VolatileContext.js'
+import { createTelemetryRecorder } from './telemetry/recorder.js'
 
 /** Result of a manual (user-initiated) compaction. */
 export interface ManualCompactResult {
@@ -244,6 +245,11 @@ export class KernelSession {
     // before the model has even seen this submit's prompt.
     this._steerQueue.length = 0
 
+    // One recorder per submitMessage() call: `runId` scopes a single
+    // request→result cycle, which is the unit the summary counters describe.
+    // Null when telemetry is disabled, which is the default.
+    const telemetry = createTelemetryRecorder(this._sessionId, this._config.telemetry)
+
     try {
       // Fresh abort controller for this submitMessage call
       this._abortController = new AbortController()
@@ -294,7 +300,12 @@ export class KernelSession {
 
         let step = await gen.next()
         while (!step.done) {
-          yield step.value as KernelEvent
+          const event = step.value as KernelEvent
+          // Observe BEFORE yielding: the consumer may take arbitrarily long (a
+          // terminal render, a network push) or throw, and the record of what
+          // the kernel emitted must not depend on what the consumer did with it.
+          telemetry?.observe(event)
+          yield event
           step = await gen.next()
         }
         // The generator's return value is the LoopResult
@@ -326,6 +337,10 @@ export class KernelSession {
       stripVolatileContextFromMessages(this._messages)
       stripThinkingBlocksFromMutableMessages(this._messages)
 
+      // The result carries the counters the summary reports (cost, turns,
+      // usage, denials), so it must be folded in before `finish()` builds it.
+      telemetry?.observe(resultEvent)
+
       // Emit terminal result event
       yield resultEvent
 
@@ -350,6 +365,11 @@ export class KernelSession {
       }
     } finally {
       this._submitInFlight = false
+      // In `finally` so a run that threw, was aborted, or was abandoned by a
+      // consumer that stopped iterating still writes its summary. A telemetry
+      // record that only exists for clean runs would be missing exactly the
+      // runs worth investigating.
+      await telemetry?.finish()
     }
   }
 

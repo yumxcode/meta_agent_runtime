@@ -2,7 +2,7 @@
 
 面向工程智能体的 TypeScript 运行时。它把流式模型调用、多轮工具循环、会话状态与恢复、权限与沙箱、上下文压缩、自治执行、并发子代理、实验流程和知识沉淀封装成统一接口,适合构建可长期运行、可追踪、可恢复的 AI 工程代理。既是一个 npm 库,也是一个开箱即用的 CLI。
 
-> 当前版本:`0.9.0` · Node.js `>= 18`
+> 当前版本:`0.9.1` · Node.js `>= 18`
 
 ---
 
@@ -16,6 +16,10 @@
 - **持久 Shell 会话**:`exec_session` / `write_stdin` / `close_session` 让进程跨工具调用存活——REPL 交互、`cd`/`export`/`source` 状态保持、长构建的增量观察。守卫栈与一次性 `bash` 完全一致(工作区监狱、凭据过滤、OS 沙箱、进程组回收、输出脱敏)。
 - **原子多文件补丁 + 轮级 Diff**:`apply_patch` 在一次调用里完成新增/修改/删除/重命名,全部校验通过才落盘,写入中途失败自动回滚;`turn_diff` 把本轮所有改动聚合成统一 diff,并可整轮回退。
 - **工具懒加载**:工具可声明 `namespace` + `deferLoading`,schema 不进每轮请求,由 `tool_search` 按需载入——挂载大量 MCP 工具时不再挤占上下文预算。隐藏的只是 schema,不是权限。
+- **版本化事件契约**:`KernelEvent` 冻结为带版本的 schema,可导出 JSON Schema、运行时校验,并由 fixture + 指纹双重回归拦截破坏性变更。跨进程消费(遥测、hook、未来的前端协议)都以它为准。
+- **结构化遥测(默认关闭)**:按运行落地 JSONL(可选 OTLP),聚合每个工具的调用/失败数、compaction 频次与压缩比、按状态分桶的 API 重试、按工具的权限拒绝;`rollupSummaries` 一次回答"上周 N 次运行里哪类工具最常失败"。
+- **外部生命周期 Hook**:9 个事件(session/prompt/tool/permission/compact/stop),JSON 契约走 stdin/stdout,外部命令即可扩展,无需改代码。**Hook 只能否决、永远不能授权**——类型上就没有 `allow`。
+- **声明式审批规则**:敏感命令从硬编码正则改为可分层的规则文件(内置 + 全局 + 项目),支持按 id 覆盖/禁用,以及 `allow` 规则压制询问。仍是尽力而为的提示层,不是安全边界——真正的 containment 在工作区监狱与 OS 沙箱。
 - **并发子代理**:`run_agent`(同步阻塞)与 `spawn_sub_agent`(异步并行扇出)两条委派路径,隔离上下文、断路器(轮数/预算/时长)、事件驱动完成通知、读默认只读 / 写强制 git 分支隔离。
 - **auto 自治模式**:工作区硬监狱(fail-closed 沙箱)、独立的 verify(完成校验)与 drift(目标漂移)关卡子代理、断路器、可中断/可 `--resume` 的 durable checkpoint、失败自动重试、收紧的并发与预算上限。
 - **权限与沙箱**:工作目录限制、计划模式只读、敏感命令交互确认、`beforeToolCall` 拦截、OS 级 sandbox(Linux bwrap / macOS sandbox-exec)、工具结果预算截断。
@@ -592,7 +596,7 @@ meta-agent ui --ui-port 43100 --no-open
 ```text
 docs/             # 架构、设计、报告与评审文档
 src/
-├── kernel/       # 流式模型调用、工具循环、compact、权限、工具可见性、成本统计
+├── kernel/       # 流式模型调用、工具循环、compact、权限、工具可见性、事件契约、遥测、hook
 ├── core/         # 配置、系统提示、记忆、任务契约、auto checkpoint/verify/drift
 ├── modes/        # MetaAgentSession 门面 + agentic / campaign 后端适配与消息桥接
 ├── loop/         # 长周期图循环:图规范/冻结、事件溯源运行时、蒸馏、宿主调度
@@ -643,4 +647,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.9.0`。
+当前包版本:`0.9.1`。

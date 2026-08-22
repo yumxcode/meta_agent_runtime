@@ -67,6 +67,33 @@ const PUBLIC_VALUES: Record<string, readonly string[]> = {
     'eagerToolsForced',
     'DEFAULT_NAMESPACE',
   ],
+  'event schema freeze (A2.1)': [
+    'EVENT_SCHEMA_VERSION',
+    'KERNEL_EVENT_TYPES',
+    'kernelEventJsonSchema',
+    'kernelEventSchemaFingerprint',
+    'validateKernelEvent',
+  ],
+  'telemetry (A2.2)': [
+    'TelemetryRecorder',
+    'createTelemetryRecorder',
+    'TelemetryAggregator',
+    'rollupSummaries',
+    'JsonlTelemetrySink',
+    'OtlpTelemetrySink',
+  ],
+  'external hooks (A2.3)': [
+    'HookRunner',
+    'createHookRunner',
+    'HOOK_EVENT_NAMES',
+    'parseHookDecision',
+  ],
+  'declarative command rules (A2.4)': [
+    'builtinCommandRules',
+    'mergeCommandRules',
+    'compileCommandRules',
+    'loadCommandRules',
+  ],
   'pre-existing core surface': [
     'SessionRouter',
     'MetaAgentSession',

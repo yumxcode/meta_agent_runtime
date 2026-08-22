@@ -10,6 +10,27 @@ export type { MetaAgentConfig, ResolvedConfig } from './core/config.js'
 // Re-export ThinkingConfig so callers can write `thinkingConfig: { type: 'disabled' }`
 // without reaching into the kernel subpath.
 export type { ThinkingConfig } from './kernel/index.js'
+
+// ── Observability & extensibility (A2) ───────────────────────────────────────
+// The event contract, the telemetry that rides on it, the external hook system,
+// and the declarative command rules. All four are inert unless configured.
+export {
+  EVENT_SCHEMA_VERSION, KERNEL_EVENT_TYPES,
+  kernelEventSchema, kernelEventJsonSchema, kernelEventSchemaFingerprint,
+  validateKernelEvent, validateEventOfType,
+  TelemetryRecorder, createTelemetryRecorder, defaultTelemetryDir,
+  TelemetryAggregator, rollupSummaries,
+  JsonlTelemetrySink, OtlpTelemetrySink, MultiSink,
+  HookRunner, createHookRunner, hookMatchesTool, parseHookDecision,
+  HOOK_EVENT_NAMES, DECIDING_HOOK_EVENTS, INJECTING_HOOK_EVENTS,
+  builtinCommandRules, mergeCommandRules, compileCommandRules, loadCommandRules,
+} from './kernel/index.js'
+export type {
+  KernelEventType, EventValidationResult, KernelEventJsonSchema,
+  TelemetryConfig, TelemetryRecord, TelemetrySummary, TelemetrySink, TelemetryRollup,
+  HookEventName, HookDefinition, HookDecision, HookPayload, HookOutcome, HooksConfig,
+  CommandRule, CommandRuleAction, CommandRulesConfig, CompiledCommandRules,
+} from './kernel/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,

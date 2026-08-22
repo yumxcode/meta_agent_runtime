@@ -35,6 +35,64 @@ export type {
   PermissionDenial,
 } from './types/KernelEvent.js'
 
+// ── Event schema (the frozen wire contract) ──────────────────────────────────
+export {
+  EVENT_SCHEMA_VERSION,
+  KERNEL_EVENT_TYPES,
+  kernelEventSchema,
+  kernelEventJsonSchema,
+  kernelEventSchemaFingerprint,
+  validateKernelEvent,
+  validateEventOfType,
+} from './events/schema.js'
+export type {
+  KernelEventType,
+  EventValidationResult,
+  KernelEventJsonSchema,
+} from './events/schema.js'
+
+// ── Telemetry ─────────────────────────────────────────────────────────────────
+export {
+  TelemetryRecorder,
+  createTelemetryRecorder,
+  defaultTelemetryDir,
+} from './telemetry/recorder.js'
+export { TelemetryAggregator, rollupSummaries } from './telemetry/aggregate.js'
+export { JsonlTelemetrySink, OtlpTelemetrySink, MultiSink } from './telemetry/sinks.js'
+export type {
+  TelemetryConfig,
+  TelemetryRecord,
+  TelemetrySummary,
+  TelemetrySink,
+} from './telemetry/types.js'
+export type { TelemetryRollup } from './telemetry/aggregate.js'
+
+// ── External lifecycle hooks ─────────────────────────────────────────────────
+export { HookRunner, createHookRunner, hookMatchesTool, parseHookDecision } from './hooks/HookRunner.js'
+export { HOOK_EVENT_NAMES, DECIDING_HOOK_EVENTS, INJECTING_HOOK_EVENTS } from './hooks/types.js'
+export type {
+  HookEventName,
+  HookDefinition,
+  HookDecision,
+  HookPayload,
+  HookOutcome,
+  HooksConfig,
+} from './hooks/types.js'
+
+// ── Declarative command rules ────────────────────────────────────────────────
+export {
+  builtinCommandRules,
+  mergeCommandRules,
+  compileCommandRules,
+  loadCommandRules,
+} from './permissions/CommandRules.js'
+export type {
+  CommandRule,
+  CommandRuleAction,
+  CommandRulesConfig,
+  CompiledCommandRules,
+} from './permissions/CommandRules.js'
+
 // ── Tool interface ────────────────────────────────────────────────────────────
 export type {
   KernelTool,

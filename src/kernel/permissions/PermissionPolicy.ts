@@ -6,6 +6,11 @@ import type { KernelTool } from '../types/KernelTool.js'
 import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
 import type { AutonomyProfile, ToolPermissionDeclaration } from '../types/Permissions.js'
 import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
+import {
+  compileCommandRules,
+  loadCommandRules,
+  type CompiledCommandRules,
+} from './CommandRules.js'
 import { isInsideWorkspace } from '../../tools/fs/workspaceGuard.js'
 
 type BeforeToolCallResult =
@@ -37,6 +42,24 @@ export interface PermissionPolicyOptions {
    * runner can enable it process-wide without threading the flag everywhere.
    */
   ignoreUserConfig?: boolean
+  /**
+   * External lifecycle hooks, when configured.
+   *
+   * Consulted at the very END of the policy, after every built-in check has
+   * already said "allow". A hook may turn that into a deny; it can never turn a
+   * deny into an allow, because it is never asked about one. See
+   * kernel/hooks/types.ts for why the veto direction is the only safe one.
+   */
+  hookRunner?: import('../hooks/HookRunner.js').HookRunner | null
+  /**
+   * Declarative sensitive-command rules.
+   *
+   * When supplied, replaces the on-disk lookup entirely (tests, embedders).
+   * When absent, rules are layered global → project from `command-rules.json`,
+   * falling back to the built-in list. See CommandRules.ts for why making this
+   * configurable does not weaken any containment guarantee.
+   */
+  commandRules?: import('./CommandRules.js').CommandRulesConfig
   /**
    * Absolute host paths OUTSIDE the workspace that the operator granted via
    * config.json `sandbox.writeAllowPaths` / `sandbox.readAllowPaths`.
@@ -383,11 +406,21 @@ function findWorkspaceViolation(
   return null
 }
 
+/**
+ * Flag a command worth asking about.
+ *
+ * Routed through the compiled rule set when one is available (the normal path)
+ * and through the legacy hard-coded list otherwise, so an embedder that
+ * constructs a policy without rules keeps the exact previous behaviour.
+ */
 function detectSensitiveCommand(
   input: Record<string, unknown>,
   commandField: string,
+  rules: CompiledCommandRules | null,
 ): string | null {
-  return detectSensitiveShellCommand(String(input[commandField] ?? ''))
+  const command = String(input[commandField] ?? '')
+  if (rules) return rules.evaluate(command)?.label ?? null
+  return detectSensitiveShellCommand(command)
 }
 
 /**
@@ -512,6 +545,11 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
   // Canonicalised once: the containment test runs per path per command, and
   // realpath()ing the grant list on every call would be pure waste.
   const allowedRoots = (options.externalAllowedRoots ?? []).map(root => resolve(root))
+  // Compiled once per policy: a shell-heavy turn evaluates this list on every
+  // call, and rebuilding thirty regexes per command is pure waste.
+  const compiledRules = compileCommandRules(
+    loadCommandRules(workspaceRoot, options.commandRules, options.ignoreUserConfig),
+  )
 
   return async (
     tool: KernelTool,
@@ -574,7 +612,9 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     }
 
     const commandField = permission.commandField
-    const sensitiveLabel = commandField ? detectSensitiveCommand(record, commandField) : null
+    const sensitiveLabel = commandField
+      ? detectSensitiveCommand(record, commandField, compiledRules)
+      : null
 
     // Resolve whether this call needs an approval gate.
     //
@@ -646,6 +686,34 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
         }
       } else {
         return { behavior: 'deny', reason: `[Plan Mode] Tool "${tool.name}" requires approval.` }
+      }
+    }
+
+    // ── External hook veto ───────────────────────────────────────────────────
+    // Last, and only on the allow path. Everything above has already decided
+    // this call is permitted; a `pre_tool_use` hook gets the final say on
+    // whether it actually happens.
+    //
+    // Placing it here — rather than earlier, where it could also see denials —
+    // is what makes the "veto only, never grant" rule structural instead of a
+    // convention: a hook is never consulted about an operation the policy
+    // rejected, so there is no code path in which its answer could revive one.
+    if (options.hookRunner?.has('pre_tool_use', tool.name)) {
+      const outcome = await options.hookRunner.run(
+        'pre_tool_use',
+        {
+          sessionId: context.sessionId ?? '',
+          ...(workspaceRoot ? { workspaceRoot } : {}),
+          toolName: tool.name,
+          toolInput: record,
+        },
+        context.abortSignal ?? new AbortController().signal,
+      )
+      if (outcome.denied) {
+        return {
+          behavior: 'deny',
+          reason: outcome.reason ?? `Tool "${tool.name}" was denied by a pre_tool_use hook.`,
+        }
       }
     }
 

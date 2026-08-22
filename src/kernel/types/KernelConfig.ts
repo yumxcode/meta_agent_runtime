@@ -290,6 +290,16 @@ export interface KernelConfig {
    */
   onCheckpointBoundary?: CheckpointBoundaryFn
 
+  /**
+   * Structured telemetry for the run.
+   *
+   * Absent or `enabled: false` = nothing is recorded and no file is touched;
+   * the recorder is not even constructed, so the disabled path costs a nullish
+   * check per event and nothing else. See kernel/telemetry/types.ts for why the
+   * default sink is a local JSONL file rather than an OTLP endpoint.
+   */
+  telemetry?: import('../telemetry/types.js').TelemetryConfig
+
   /** Resume seed for the session-lifetime completed tool-batch counter. */
   initialToolBatchCount?: number
 
