@@ -179,7 +179,7 @@ export function makeRouter(
   }
 
   if (opts.yes) {
-    cfg.beforeToolCall = async () => ({ action: 'allow' })
+    cfg.beforeToolCall = async () => ({ action: 'allow', decidedBy: 'policy' })
   }
 
   // Register interactive tool guard — only in interactive TTY sessions.
@@ -233,4 +233,3 @@ export function makeRouter(
 
   return new SessionRouter(cfg)
 }
-

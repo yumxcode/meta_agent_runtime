@@ -4,7 +4,7 @@
  */
 import type { KernelTool, KernelToolContext, KernelToolControl, KernelToolExecutionMetadata } from '../types/KernelTool.js'
 import type { KernelMessage } from '../types/KernelMessage.js'
-import type { CanUseToolFn } from '../types/KernelConfig.js'
+import type { CanUseToolFn, PermissionDecisionSource } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
 import { makeToolResultMessage } from '../messages/MessageFactory.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
@@ -91,7 +91,7 @@ export interface ToolExecutionOutcome {
   isError: boolean
   permissionDecision?: {
     decision: 'allow' | 'deny' | 'redirect'
-    decidedBy: 'policy' | 'unknown'
+    decidedBy: PermissionDecisionSource
     reason?: string
   }
   execution?: KernelToolExecutionMetadata
@@ -151,7 +151,11 @@ export async function executeToolCall(
       extraMessages: [],
       permissionDenial: denial,
       outcome: outcome(true, {
-        permissionDecision: { decision: 'deny', decidedBy: 'policy', reason: permResult.reason },
+        permissionDecision: {
+          decision: 'deny',
+          decidedBy: permResult.decidedBy ?? 'policy',
+          reason: permResult.reason,
+        },
       }),
     }
   }
@@ -162,7 +166,11 @@ export async function executeToolCall(
       resultMessage: makeToolResultMessage(toolUseId, permResult.message, false, assistantMessageUuid),
       extraMessages: [],
       outcome: outcome(false, {
-        permissionDecision: { decision: 'redirect', decidedBy: 'policy', reason: permResult.message },
+        permissionDecision: {
+          decision: 'redirect',
+          decidedBy: permResult.decidedBy ?? 'policy',
+          reason: permResult.message,
+        },
       }),
     }
   }
@@ -314,7 +322,7 @@ export async function executeToolCall(
       contextModifier: result.contextModifier,
       control: result.control,
       outcome: outcome(result.isError ?? false, {
-        permissionDecision: { decision: 'allow', decidedBy: 'policy' },
+        permissionDecision: { decision: 'allow', decidedBy: permResult.decidedBy ?? 'policy' },
         execution: result.execution,
         trajectoryItems: result.trajectoryItems,
       }),
@@ -333,7 +341,7 @@ export async function executeToolCall(
       ),
       extraMessages: [],
       outcome: outcome(true, {
-        permissionDecision: { decision: 'allow', decidedBy: 'policy' },
+        permissionDecision: { decision: 'allow', decidedBy: permResult.decidedBy ?? 'policy' },
         execution: {
           command: typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>)['command'] === 'string'
             ? (input as Record<string, unknown>)['command'] as string

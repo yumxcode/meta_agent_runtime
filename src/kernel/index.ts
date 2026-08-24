@@ -18,6 +18,7 @@ export type {
   AutoGateFailurePolicy,
   CanUseToolFn,
   CanUseToolResult,
+  PermissionDecisionSource,
 } from './types/KernelConfig.js'
 
 // ── Event types ───────────────────────────────────────────────────────────────

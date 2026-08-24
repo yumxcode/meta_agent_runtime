@@ -46,6 +46,7 @@ import { runLoopCommand } from './commands/loop.js'
 import { runSteerCommand } from './commands/steer.js'
 import { runTasksCommand } from './commands/tasks.js'
 import { runSessionsCommand, runTrajectoryCommand } from './commands/trajectory.js'
+import { runReviewerCommand } from './commands/reviewer.js'
 import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
 import { McpAppsBrowserHost } from './mcpAppsHost.js'
@@ -85,6 +86,10 @@ async function main(): Promise<void> {
     }
     if (opts.loopCommand.name === 'sessions') {
       await runSessionsCommand(opts)
+      return
+    }
+    if (opts.loopCommand.name === 'reviewer') {
+      await runReviewerCommand(opts)
       return
     }
     if (opts.loopCommand.name === 'auto-scheduler') {

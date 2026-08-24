@@ -11,8 +11,15 @@
  *  - System prompt: appendSystemPrompt concatenated correctly
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
+import { mkdtemp, rm } from 'node:fs/promises'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { KernelSession } from '../KernelSession.js'
 import type { KernelTool } from '../types/KernelTool.js'
+import { findTrajectoryBySessionId } from '../../trajectory/indexStore.js'
+import { readTrajectoryPreservingUnknown } from '../../trajectory/reader.js'
+import { trajectoryFile } from '../../trajectory/paths.js'
+import { closeTrajectory, clearTrajectoryHubForTests } from '../../trajectory/hub.js'
 
 // ── Mock streamMessages so no real API calls are made ─────────────────────────
 
@@ -579,6 +586,44 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
       type: 'termination',
       stopReason: 'auto_verify_unavailable',
     }))
+  })
+
+  it('records Auto Verify verdicts as evaluation trajectory items', async () => {
+    const root = await mkdtemp(join(tmpdir(), 'kernel-verify-trajectory-'))
+    const sessionId = '00000000-0000-4000-8000-000000000777'
+    let verifyCalls = 0
+    mockStream.mockImplementation(() => textStream('done'))
+    const session = new KernelSession(makeConfig({
+      sessionId,
+      autonomousMode: true,
+      trajectory: { enabled: true, mode: 'auto', rootDir: root },
+      verifyGate: vi.fn(async () => {
+        verifyCalls++
+        return verifyCalls === 1
+          ? { done: false, unfinished: ['补充失败路径测试'], evidence: ['test output missing'] }
+          : { done: true, unfinished: [], evidence: ['tests pass'] }
+      }),
+    }))
+
+    try {
+      await collectEvents(session, 'run')
+      const entry = await findTrajectoryBySessionId(sessionId, { rootDir: root })
+      expect(entry).not.toBeNull()
+      const lines = await readTrajectoryPreservingUnknown(trajectoryFile(entry!.trajectoryId, { rootDir: root }))
+      const evaluations = lines
+        .filter(line => line.knownItem && line.item.type === 'evaluation')
+        .map(line => line.item)
+      expect(evaluations).toMatchObject([
+        { evaluator: 'auto_verify', verdict: 'fail', score: 0 },
+        { evaluator: 'auto_verify', verdict: 'pass', score: 1 },
+      ])
+      expect(evaluations[0]!['details']).toMatchObject({ round: 1, unfinished: ['补充失败路径测试'] })
+    } finally {
+      await closeTrajectory({ kind: 'session', sessionId }, { rootDir: root })
+      session.dispose()
+      clearTrajectoryHubForTests()
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it('does not consult verify gates outside auto mode', async () => {

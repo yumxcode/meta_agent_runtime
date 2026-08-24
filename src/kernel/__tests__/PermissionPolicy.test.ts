@@ -86,6 +86,21 @@ describe('createPermissionPolicy', () => {
     expect(result.behavior).toBe('allow')
   })
 
+  it('preserves the source of an explicit human approval decision', async () => {
+    const canUseTool = createPermissionPolicy({
+      workspaceRoot: process.cwd(),
+      beforeToolCall: async () => ({ action: 'allow', decidedBy: 'human' }),
+    })
+    const result = await canUseTool(
+      bashTool(),
+      { command: 'rm -rf /tmp/reviewer-provenance-test' },
+      'a',
+      't',
+      context(),
+    )
+    expect(result).toMatchObject({ behavior: 'allow', decidedBy: 'human' })
+  })
+
   it('denies sensitive write tools when no approval channel is available', async () => {
     const canUseTool = createPermissionPolicy({ workspaceRoot: process.cwd() })
     const result = await canUseTool(writeTool(), { file_path: 'tmp.txt' }, 'a', 't', context())

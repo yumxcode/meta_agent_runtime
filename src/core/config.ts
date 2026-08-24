@@ -87,9 +87,11 @@ export function isAnthropicProvider(baseURL?: string): boolean {
  * before a tool is executed.
  */
 export type BeforeToolCallResult =
-  | { action: 'allow' }
-  | { action: 'deny'; reason?: string }
-  | { action: 'redirect'; instructions: string }
+  | { action: 'allow'; decidedBy?: PermissionDecisionSource }
+  | { action: 'deny'; reason?: string; decidedBy?: PermissionDecisionSource }
+  | { action: 'redirect'; instructions: string; decidedBy?: PermissionDecisionSource }
+
+export type PermissionDecisionSource = 'builtin_rule' | 'hook' | 'human' | 'policy' | 'unknown'
 
 // ─────────────────────────────────────────────────────────────────────────────
 

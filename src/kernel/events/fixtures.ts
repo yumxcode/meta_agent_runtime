@@ -112,6 +112,23 @@ export const EVENT_FIXTURES: readonly EventFixture[] = [
     },
   },
   {
+    name: 'tool_result_human_permission_decision',
+    capturedIn: '1.2.0',
+    event: {
+      type: 'tool_result',
+      id: 'toolu_05',
+      toolName: 'bash',
+      content: 'Permission denied: user declined the operation.',
+      isError: true,
+      sessionId: 'sess-1',
+      permissionDecision: {
+        decision: 'deny',
+        decidedBy: 'human',
+        reason: 'user declined the operation',
+      },
+    },
+  },
+  {
     name: 'compact_start',
     capturedIn: '1.0.0',
     event: { type: 'compact_start', sessionId: 'sess-1' },

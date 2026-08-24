@@ -36,6 +36,11 @@ export type {
 // Canonical append-only facts plus disposable/rebuildable projections. Existing
 // SessionStore/checkpoint/graph-journal APIs remain authoritative for resume.
 export * from './trajectory/index.js'
+
+// ── Manual trajectory reviewer ───────────────────────────────────────────────
+// Isolated learning-proposal pipeline. It never mutates an active session or
+// the existing robotics ExperienceStore; only human approval creates a candidate.
+export * from './reviewer/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,

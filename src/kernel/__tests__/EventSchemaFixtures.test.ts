@@ -38,7 +38,7 @@ import { EVENT_FIXTURES, RESULT_SUBTYPES_IN_FIXTURES } from '../events/fixtures.
  * A fingerprint that moved whenever a fixture was added would flap, and a
  * flapping check is one everybody learns to overwrite.
  */
-const FROZEN_FINGERPRINT_V1 = '6063a11591e20dab'
+const FROZEN_FINGERPRINT_V1 = '65c348629782782b'
 
 describe('event fixtures still validate', () => {
   for (const fixture of EVENT_FIXTURES) {

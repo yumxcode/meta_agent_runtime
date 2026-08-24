@@ -3,7 +3,11 @@ import { join, resolve } from 'path'
 import { metaAgentPath } from '../../infra/metaAgentHome.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 import type { KernelTool } from '../types/KernelTool.js'
-import type { CanUseToolFn, CanUseToolResult } from '../types/KernelConfig.js'
+import type {
+  CanUseToolFn,
+  CanUseToolResult,
+  PermissionDecisionSource,
+} from '../types/KernelConfig.js'
 import type { AutonomyProfile, ToolPermissionDeclaration } from '../types/Permissions.js'
 import { detectSensitiveShellCommand } from './SensitiveCommandPatterns.js'
 import {
@@ -14,9 +18,9 @@ import {
 import { isInsideWorkspace } from '../../tools/fs/workspaceGuard.js'
 
 type BeforeToolCallResult =
-  | { action: 'allow' }
-  | { action: 'deny'; reason?: string }
-  | { action: 'redirect'; instructions: string }
+  | { action: 'allow'; decidedBy?: PermissionDecisionSource }
+  | { action: 'deny'; reason?: string; decidedBy?: PermissionDecisionSource }
+  | { action: 'redirect'; instructions: string; decidedBy?: PermissionDecisionSource }
 
 export interface PermissionPolicyOptions {
   workspaceRoot?: string
@@ -502,15 +506,20 @@ async function applyBeforeToolGuard(
   if (options.beforeToolCall) {
     const guard = await options.beforeToolCall(toolName, input)
     if (guard.action === 'deny') {
-      return { behavior: 'deny', reason: guard.reason ?? 'User denied this operation.' }
+      return {
+        behavior: 'deny',
+        reason: guard.reason ?? 'User denied this operation.',
+        ...(guard.decidedBy ? { decidedBy: guard.decidedBy } : {}),
+      }
     }
     if (guard.action === 'redirect') {
       return {
         behavior: 'redirect',
         message: `[用户提供替代指导]\n${guard.instructions}\n\n请完全按照上述指导重新规划并执行。`,
+        ...(guard.decidedBy ? { decidedBy: guard.decidedBy } : {}),
       }
     }
-    return { behavior: 'allow' }
+    return { behavior: 'allow', ...(guard.decidedBy ? { decidedBy: guard.decidedBy } : {}) }
   }
 
   const askUser = options.askUser ?? context.askUser
@@ -518,8 +527,8 @@ async function applyBeforeToolGuard(
     const inputStr = JSON.stringify(input, null, 2).slice(0, 400)
     const answer = await askUser(`${fallbackReason}\n${inputStr}`, ['yes', 'no'])
     return answer.toLowerCase().startsWith('y')
-      ? { behavior: 'allow' }
-      : { behavior: 'deny', reason: `${toolName} was not approved by user.` }
+      ? { behavior: 'allow', decidedBy: 'human' }
+      : { behavior: 'deny', reason: `${toolName} was not approved by user.`, decidedBy: 'human' }
   }
 
   return { behavior: 'deny', reason: `${fallbackReason} No approval channel is available.` }
@@ -559,6 +568,7 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     context,
   ): Promise<CanUseToolResult> => {
     const record = asRecord(input)
+    let approvalDecidedBy: PermissionDecisionSource | undefined
     // Precedence (low → high): DEFAULT_TOOL_PERMISSIONS < tool's own declaration
     // < user permissions.json. The user config file is the highest authority so
     // an operator can flip any tool's gates (e.g. sensitive) without code changes.
@@ -661,6 +671,7 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
             : `Tool "${tool.name}" requires approval.`,
         )
         if (guard.behavior !== 'allow') return guard
+        approvalDecidedBy = guard.decidedBy
       }
     }
 
@@ -673,7 +684,9 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
     })()
     if (options.planModeRef?.active ?? context.planMode ?? false) {
       const planMode = permission.planMode ?? (isSafe ? 'allow' : 'ask')
-      if (planMode === 'allow') return { behavior: 'allow' }
+      if (planMode === 'allow') {
+        return { behavior: 'allow', ...(approvalDecidedBy ? { decidedBy: approvalDecidedBy } : {}) }
+      }
       if (planMode === 'deny') {
         return { behavior: 'deny', reason: `[Plan Mode] Tool "${tool.name}" is denied by permissions config.` }
       }
@@ -682,8 +695,13 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
         const inputStr = JSON.stringify(input, null, 2).slice(0, 400)
         const answer = await askUser(`[Plan Mode] Allow tool "${tool.name}"?\n${inputStr}`, ['yes', 'no'])
         if (!answer.toLowerCase().startsWith('y')) {
-          return { behavior: 'deny', reason: `[Plan Mode] Tool "${tool.name}" was not approved by user.` }
+          return {
+            behavior: 'deny',
+            reason: `[Plan Mode] Tool "${tool.name}" was not approved by user.`,
+            decidedBy: 'human',
+          }
         }
+        approvalDecidedBy = 'human'
       } else {
         return { behavior: 'deny', reason: `[Plan Mode] Tool "${tool.name}" requires approval.` }
       }
@@ -713,10 +731,11 @@ export function createPermissionPolicy(options: PermissionPolicyOptions = {}): C
         return {
           behavior: 'deny',
           reason: outcome.reason ?? `Tool "${tool.name}" was denied by a pre_tool_use hook.`,
+          decidedBy: 'hook',
         }
       }
     }
 
-    return { behavior: 'allow' }
+    return { behavior: 'allow', ...(approvalDecidedBy ? { decidedBy: approvalDecidedBy } : {}) }
   }
 }

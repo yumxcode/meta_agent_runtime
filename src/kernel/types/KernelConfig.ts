@@ -73,9 +73,11 @@ export type CanUseToolFn = (
 ) => Promise<CanUseToolResult>
 
 export type CanUseToolResult =
-  | { behavior: 'allow' }
-  | { behavior: 'deny'; reason: string }
-  | { behavior: 'redirect'; message: string }
+  | { behavior: 'allow'; decidedBy?: PermissionDecisionSource }
+  | { behavior: 'deny'; reason: string; decidedBy?: PermissionDecisionSource }
+  | { behavior: 'redirect'; message: string; decidedBy?: PermissionDecisionSource }
+
+export type PermissionDecisionSource = 'builtin_rule' | 'hook' | 'human' | 'policy' | 'unknown'
 
 export type AutoGateFailurePolicy =
   /**

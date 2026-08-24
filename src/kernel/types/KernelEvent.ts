@@ -40,7 +40,7 @@ export interface ToolResultEvent {
   input?: unknown
   permissionDecision?: {
     decision: 'allow' | 'deny' | 'redirect'
-    decidedBy: 'policy' | 'unknown'
+    decidedBy: 'builtin_rule' | 'hook' | 'human' | 'policy' | 'unknown'
     reason?: string
   }
   execution?: import('./KernelTool.js').KernelToolExecutionMetadata

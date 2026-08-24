@@ -138,7 +138,7 @@ export async function confirmToolCall(
 
   if (choice.trim() === '2') {
     process.stdout.write(`${dim('已拒绝。AI 将尝试其他方式。')}\n`)
-    return { action: 'deny', reason: '用户手动拒绝了此操作。' }
+    return { action: 'deny', reason: '用户手动拒绝了此操作。', decidedBy: 'human' }
   }
 
   if (choice.trim() === '3') {
@@ -150,14 +150,13 @@ export async function confirmToolCall(
     const instructions = await askQuestion(rl, `你的指导 > `)
     if (instructions.trim()) {
       process.stdout.write(`\n${dim('已记录。AI 将按你的指导重新规划。')}\n`)
-      return { action: 'redirect', instructions: instructions.trim() }
+      return { action: 'redirect', instructions: instructions.trim(), decidedBy: 'human' }
     }
     // Empty → fall through to allow
     process.stdout.write(`${dim('指导为空，视为允许。')}\n`)
   }
 
   process.stdout.write(`${dim('已允许执行。')}\n`)
-  return { action: 'allow' }
+  return { action: 'allow', decidedBy: 'human' }
 }
-
 

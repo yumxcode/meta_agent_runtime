@@ -1537,6 +1537,23 @@ export async function* runKernelLoop(
             return done('auto_verify_unavailable')
           }
         }
+        if (verdict) {
+          ctx.onTrajectoryItems?.([{
+            type: 'evaluation',
+            evaluator: 'auto_verify',
+            verdict: verdict.done ? 'pass' : 'fail',
+            score: verdict.done ? 1 : 0,
+            details: {
+              round: verifyRounds,
+              unfinished: verdict.unfinished,
+              evidence: verdict.evidence,
+              ...(verdict.note ? { note: verdict.note } : {}),
+            },
+          }], {
+            toolUseId: `auto-verify-${verifyRounds}`,
+            toolName: 'auto_verify',
+          })
+        }
         if (verdict && !verdict.done) {
           append(makeTextUserMessage(buildVerifyRejectionPrompt(verdict, verifyRounds), { isMeta: true }))
           await checkpoint({ type: 'verify_rejected' })

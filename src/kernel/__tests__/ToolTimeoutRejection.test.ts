@@ -72,6 +72,27 @@ describe('executeToolCall timeout race', () => {
     }
   })
 
+  it('copies a human permission decision into the tool outcome', async () => {
+    const tool: KernelTool = {
+      name: 'guarded',
+      description: 'guarded operation',
+      inputSchema: z.object({}),
+      inputJSONSchema: { type: 'object' },
+      isConcurrencySafe: () => true,
+      call: async () => ({ data: 'not reached' }),
+    }
+    const result = await executeToolCall(
+      { toolUseId: 'human-deny', toolName: 'guarded', input: {}, assistantMessageUuid: 'a1' },
+      tool,
+      makeContext(),
+      async () => ({ behavior: 'deny', reason: 'use read-only mode', decidedBy: 'human' }),
+    )
+    expect(result.outcome.permissionDecision).toMatchObject({
+      decision: 'deny',
+      decidedBy: 'human',
+    })
+  })
+
   it('opens the auto circuit when timed-out calls remain alive', async () => {
     process.env['META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS'] = '2'
     const releases: Array<() => void> = []
