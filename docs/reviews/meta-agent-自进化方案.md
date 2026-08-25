@@ -1,12 +1,16 @@
 # meta-agent 自进化方案
 
-> 状态：最新机制版（v2，待冻结）
+> 状态：机制版 v3（治理与门槛部分待冻结）
 >
-> 日期：2026-08-22
+> 日期：2026-08-24（v2：2026-08-22）
 >
-> 依赖：A3-M1～M4 标准轨迹、A3-M5 可信切读与 replay parity
+> 依赖：A3-M1～M4 标准轨迹、A3-M5 可信切读与 replay parity、Reviewer 模式的 TaskCase / TaskReview
 >
 > 参考：*Next-Generation Agentic Reinforcement Learning Systems Enable Self-Evolving Agents*（arXiv:2607.01120）及 2024～2026 年自进化 Agent 一手工作
+>
+> **分工声明**：本文是**治理主文档**，负责评测独立性、风险分级、晋升与回滚门槛、数据契约。
+> 「优化对象如何分层、选什么算法、reward 怎么设计、先做哪一步」以
+> [轨迹数据利用与进化算法选型](../知识系统/轨迹数据利用与进化算法选型.md) 为准；两文冲突时以该文为准。
 
 ## 0. 执行摘要
 
@@ -34,10 +38,12 @@ shadow → canary → promotion / rollback
 
 1. **A3-M5 保持现有语义**：它解决可信读取、回放和兼容迁移，不直接承诺自动进化。
 2. **自进化是 M5 之上的独立 evolution track**，共用 A3 的身份、ordinal、父子关系、证据和隐私契约。
-3. **进化的主对象是可靠性机制**：优先顺序为 Task Contract / Evidence Verifier / Task State / Context Compiler / Progress & Recovery → orchestration / model adaptation → Skill / Memory / Prompt 产物 → agent architecture / model weights。
+3. **进化的主对象是可靠性机制**：优先顺序为 Task Contract / Evidence Verifier / Task State / Context Compiler / Progress & Recovery → orchestration / model adaptation → Skill / Memory / Prompt 产物 → agent architecture / model weights。这是"改哪个机制"的排序；"用什么手段改"是另一条正交的轴（L0–L4），两者的对应关系见 §4.1。
 4. **Skill 和 Memory 是可替换载体，不是终极目标**：应当优化何时生成、写入、召回、验证、过期和淘汰它们的机制。
 5. **进化不能绕过评测独立性**：被评 Agent 不得修改 evaluator、held-out 数据、权限策略和晋升规则；false success 应是核心可靠性指标。
-6. **当前 A3 是审计级轨迹，还不是完整的学习级轨迹**：生产链路尚无真实 `evaluation` 发射，也缺延迟 reward、数据资格、精确 replay envelope 和机制版本注册。
+6. **A3 已从纯审计级迈入准学习级**：0.9.3 起生产链路已发射真实 `evaluation`（auto_verify 逐轮 pass/fail）、贯通 `decidedBy='human'` 的人工审批来源、可识别 `isSteering` 纠偏，并由 Reviewer 模式产出以 TaskCase 为边界的 TaskReview。仍缺的是延迟 reward 回流、精确 replay envelope、机制版本注册、**离线回放评测集**与**经验注入 provenance**（见 §6.2 缺口 G / H）。
+7. **权重级 RL 在当前架构下没有落点**：meta-agent 是 API 客户端，模型参数与 rollout 基础设施都不在我们手里。可优化对象必须先分层，L0～L2（参数阈值 / 上下文 playbook / workflow 归纳）不涉及任何训练且应先做完；权重训练需要引入 open-weight 底座，属于最后一步。分层定义见[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §2。
+8. **自评分数不得作为优化目标**：`TaskReview.assessment` 的四维评分是本系统自产的 LLM 自评，只能用于人工审核排序与失败聚类，禁止用作 reward（见 §8.5）。
 
 ## 1. 范围与边界
 
@@ -162,6 +168,26 @@ meta-agent 的 A3 已经覆盖第一层的主体骨架；M5 之后的工作重�
 | **Evaluator / Guardrail** | rubric、安全策略、审批规则、held-out 数据 | 独立安全审计 | 只允许独立治理流程升级 | 信任根 |
 
 Skill / Memory / Prompt 不被删除，而是从“自进化的中心”降为“可靠性机制所管理的外置产物”。需要进化的是何时产生、何时使用、如何验证、如何过期与如何淘汰它们的策略，而不是产物数量。
+
+### 4.1 与优化对象分层（L0–L4）的关系
+
+本表的优先级与[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §2 的 L0–L4 是**两条正交的轴**，不要互相套用：
+
+- **本表的 P0/P1/P2/P3 回答"该建设 / 改进哪个机制"**，排序依据是对可靠性的因果杠杆。
+- **L0–L4 回答"用什么手段去改，代价和风险多大"**，排序依据是实施成本与不可回滚程度。
+
+两者的对应关系：
+
+| 本表机制 | 落在哪一层 | 说明 |
+| --- | --- | --- |
+| Progress / Drift / Recovery 的阈值 | L0 | 轮数、退避、门限可直接由轨迹统计确定 |
+| Task Contract / Evidence Planner / Context Compiler | L1 | 本质是结构化的提示与上下文产物，用反射式演化（GEPA / ACE）优化 |
+| Task State Ledger 的 reducer 与保留策略 | L0 + L1 | 字段取舍靠消融统计，表述靠 L1 |
+| Planning / Orchestration、Model Capability Adapter、Tool Grounding | L3 | 受约束 bandit + 离线反事实评估 |
+| Skill / Memory / Prompt 产物的生成与召回策略 | L1 + L2 | 与 AWM 式 workflow 归纳同层 |
+| Model weights | L4 | 需要引入 open-weight 底座才成立 |
+
+因此"P0 机制优先"与"L0～L2 优先"并不冲突：**先按本表选择要改进哪个机制，再按 L0–L4 选择改进它的手段，并且永远从该机制所能落到的最低层开始。**
 
 ## 5. 核心可靠性机制设计
 
@@ -364,19 +390,33 @@ A3-M1～M4 已提供：
 - thinking 删除、凭据脱敏、二进制省略、文本截断和 hash；
 - 不切换 graph journal、auto checkpoint 等执行真相源的兼容边界。
 
+此外，0.9.3 的 Reviewer 模式已补齐：
+
+- `evaluation` 的真实发射者（KernelLoop 把 auto_verify 每轮判定写成 `evaluator=auto_verify` 的 pass/fail + round）；
+- 人工决策来源贯通（`decidedBy` 从交互守卫经权限策略、工具执行直到事件契约 1.2.0，`human` / `hook` / `policy` 不再被压平）；
+- `isSteering` 用户纠偏可被识别为人工纠正信号；
+- `TaskCase`（root + child + 多 run 的任务证据边界）与 `TaskReview`（结果判定、逐条成功标准、四维评估、方法论 Finding）；
+- 只读、case 封闭的证据工具与 `mode=reviewer` 自审排除。
+
 这些能力足以支持 E1 Shadow Mechanism Learner 的数据读取和证据引用。
 
 ### 6.2 从审计级到学习级的缺口
 
-#### 缺口 A｜没有真实 reward / critique 链路
+#### 缺口 A｜真实 reward / critique 链路（**已部分关闭**）
 
-`TrajectoryItemSchema` 已定义 `evaluation`，但生产代码目前没有发射者，历史 telemetry 也未折叠 evaluation。当前真实 auto 轨迹已含大量工具、审批和 checkpoint 事件，但 evaluation 仍为 0。
+原状：`TrajectoryItemSchema` 已定义 `evaluation`，但生产代码没有发射者，真实 auto 轨迹的 evaluation 恒为 0。
 
-后果：可以回答“发生了什么”，但还不能稳定回答“哪个决策导致成功 / 失败”。
+现状：0.9.3 起 auto_verify 的逐轮判定已写入 `evaluation`，人工 deny / redirect / steering 也可稳定识别。
 
-#### 缺口 B｜因果单元不够明确
+仍缺：**延迟反馈回流**（后续 CI、工件回退、任务重开、部署后故障尚未追加为事后 evaluation），以及 §7.2 定义的 `EvaluationAnnotation` 完整字段（evaluator 版本、rubric hash、failureAttributions、independentEvaluator）。
 
-runId / turnId 可以确定大范围，toolUseId 可以联系工具调用，但尚无通用 `decisionId / actionId`，也没有把 observation、候选决策、所选 action、outcome 与延迟 feedback 形成一个可引用的学习单元。
+#### 缺口 B｜因果单元（**已部分关闭**）
+
+原状：runId / turnId / toolUseId 只能圈定范围，缺少可引用的学习单元。
+
+现状：**TaskCase 已经是任务级因果单元**——它把同一 root 下的子代理与多次 run 聚成一个证据边界，TaskReview 在其上给出结果判定、逐条成功标准状态与决策链重建，Finding 与 LearningProposal 都强制引用 `trajectoryId + ordinal`。
+
+仍缺：turn / decision 级的细粒度单元。这一层在做 L3 路由 bandit 之前才必要，不必提前建设。
 
 #### 缺口 C｜版本 hash 不等于可回放版本
 
@@ -404,15 +444,36 @@ runId / turnId 可以确定大范围，toolUseId 可以联系工具调用，但�
 
 如果未来接 AReaL2.0 / OpenClaw-RL 类权重训练，还需 model checkpoint、token IDs、sampling parameters、logprobs、reward attribution 与 staleness 信息。这些不应在没有明确权重训练路线前强行塞入 A3 canonical schema。
 
+补充：这个缺口**短期内不必填**。meta-agent 作为 API 客户端无法对主模型做权重训练，权重级 RL 只有在为某个窄任务引入 open-weight 底座时才成立，属于 L4（见[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §2）。在 L0～L3 跑通之前投入 token 级数据采集是过早优化。
+
+#### 缺口 G｜没有经验注入 provenance（**新增，阻塞归因**）
+
+一旦 Reviewer 产出的经验开始进入 prompt，后续轨迹即被污染：效果究竟来自注入的经验，还是任务本身更简单，无法分辨。当前轨迹**没有记录本次运行注入了哪些经验 / playbook / workflow 及其版本**。
+
+后果：`ExperienceCandidate` 的"到底有没有用"永远无法回答，所有 A/B 归因不成立，§9 的候选比较失去前提。
+
+建议：复用 `knowledge` item，在注入时追加 `action=inject` 记录 `entryIds` 与版本、选择原因；TaskReview 同时带上"本次注入集合"的引用。
+
+注意这与 `mode=reviewer` 自审排除是两件事：后者只挡住"Reviewer 审自己"，没有挡住"Reviewer 的产出改变了被审对象"。
+
+#### 缺口 H｜没有离线回放评测集（**新增，阻塞一切优化**）
+
+没有 held-out 评测集就没有 fitness function，§8.2 的评测矩阵无法实例化，任何候选都无法证伪。
+
+这是**当前最紧迫的一项**，且优先级高于选择任何算法。最小可行形态与切分规则见[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §4：从已有轨迹中挑选结果判定明确、具备确定性验证证据的 TaskCase 冻结为回放集，20～50 个证据完整的用例即可起步。
+
 ## 7. 学习数据契约
 
 ### 7.1 Episode Builder
 
 训练和进化消费者不应直接把整条 `trajectory.jsonl` 当作一个样本。Episode Builder 负责在不修改 canonical 的前提下构建派生数据：
 
+> **实现状态**：task episode 这一档**已经由 `TaskCase` 实现**——它按 root / parent 关系聚合同一任务的全部 trajectory 与多次 run，产出稳定 `caseId`、`inputHash` 与只读证据视图，且排除 `mode=reviewer` 自审轨迹。下列其余粒度仍是待建设项，**不要重新发明 task 级切分**。
+
+- ~~task episode~~：已由 `TaskCase` 承担，`caseId = hash(rootTrajectoryId)`；
 - session episode：面向长期对话、用户偏好和 memory 更新；
 - run episode：面向一次 submit / auto wake 的结果与成本；
-- turn / decision episode：面向工具路由、过程 reward 和错误恢复；
+- turn / decision episode：面向工具路由、过程 reward 和错误恢复（**做 L3 路由 bandit 之前不必建设**）；
 - graph activation episode：面向节点、Lane、subagent 和分支结构评估；
 - task family cohort：面向相似任务上的重复失败、技能迁移和分布漂移。
 
@@ -557,6 +618,21 @@ J(candidate) = {
 - `parked` 只表示持久化挂起边界，不是正奖励也不是失败；
 - exit code 0 只证明所选命令成功，不证明验证范围足够；
 - 工具出错不必然是坏轨迹；若 Agent 快速识别并恢复，可能是有价值的过程样本。
+
+### 8.5 自评分数不是 reward（硬性禁令）
+
+> **禁止把 `TaskReview.assessment` 的四维评分（effectiveness / reliability / stability / efficiency）用作任何优化目标、reward 或晋升阈值。**
+
+理由有二：
+
+1. 它是**本系统自产的 LLM 自评**。用自己的评分训练自己，是自训练崩溃（policy collapse）的标准配方；近期工作已反复证明，用自监督代理信号完全替代可验证反馈，会在长期训练下出现严重失效。
+2. TaskReview 的经验晋升门槛中，`candidateEligible`、`significance`、`abstractionLevel` 三项**全部由模型自述**，宿主唯一的客观校验只有"提案证据与 Finding 证据存在交集"。这些字段可以守住人工审核队列的信噪比，但不具备作为目标函数的抗 gaming 能力。
+
+四维评分的正确用途：**人工审核时的排序与导航**，以及**失败模式聚类的特征**。
+
+同理，`LearningProposal` 的 `impact` 三档等级也是模型自述，不得直接进入 §8.1 的多目标向量。真实 reward 只能来自 §8.3 第 1～5 层的信号；第 6 层 LLM / PRM judge 只做 tie-break 与过滤，且必须运行在独立上下文中——auto_verify 当前的隔离上下文设计需要保持。
+
+未来若要给 `abstractionLevel` 这类自述字段提供客观校验，可行路径是跨任务聚类：统计同一 `findingId` 在多少条**独立 TaskCase** 中被重复推导出来，用复现次数把自述变成可对账的证据。
 
 ## 9. Evolution Control Plane
 
@@ -793,14 +869,17 @@ META_AGENT_HOME/
 ## 15. 建议的实施顺序
 
 1. 先完成当前 A3-M5 发布周期观察，不将自进化与切读绑为一次发布。
-2. 补 production `evaluation` 发射与延迟 feedback API，先接确定性测试 / CI / graph / robotics 验收信号。
-3. 冻结可靠性指标、failure taxonomy、Task Contract / Evidence / Task State 数据契约和跨模型评测矩阵。
-4. 实现 Episode Builder、artifact registry 和 training eligibility，所有投影可从 canonical 重建。
-5. 实现只读 Shadow Mechanism Learner，用真实轨迹验证它能否稳定完成失败归因，不允许改生产机制。
-6. 先做 Task Contract Compiler 实验，建立“先定义通过、再执行、独立验证”的最小闭环。
-7. 再做 Long-horizon State / Context Compiler 实验，验证 park / wake、compaction、模型切换和月级任务恢复。
-8. 两个 P0 实验稳定后，扩展 Progress / Drift / Recovery Controller 与 Model Capability Adapter；随后才考虑 planning、tool grounding、Skill / Memory / prompt 产物候选。
-9. 只有当缺陷在 Task Contract、State、Context、Verifier、Recovery、Tool、Skill 等机制层都无法解决，并且跨 task / workspace / model 持续存在，才评估架构或模型权重进化。
+2. ~~补 production `evaluation` 发射~~（0.9.3 已完成）；继续补**延迟 feedback API**，先接确定性测试 / CI / graph / robotics 验收信号。
+3. **建离线回放评测集**（缺口 H）与**经验注入 provenance**（缺口 G）。这两项优先于选择任何优化算法——前者提供 fitness function，后者提供归因前提。
+4. 冻结可靠性指标、failure taxonomy、Task Contract / Evidence / Task State 数据契约和跨模型评测矩阵。
+5. 先做 **L0 参数与阈值**的统计调优（verify 轮数、compaction 触发点、重试退避），它同时是数据质量的试金石；再实现 Episode Builder 其余粒度、artifact registry 和 training eligibility，所有投影可从 canonical 重建。
+6. 实现只读 Shadow Mechanism Learner，用真实轨迹验证它能否稳定完成失败归因，不允许改生产机制。（Reviewer 模式已提供其证据读取与 Finding 归因的基础。）
+7. 先做 Task Contract Compiler 实验，建立“先定义通过、再执行、独立验证”的最小闭环。
+8. 再做 Long-horizon State / Context Compiler 实验，验证 park / wake、compaction、模型切换和月级任务恢复。
+9. 两个 P0 实验稳定后，扩展 Progress / Drift / Recovery Controller 与 Model Capability Adapter；随后才考虑 planning、tool grounding、Skill / Memory / prompt 产物候选。
+10. 只有当缺陷在 Task Contract、State、Context、Verifier、Recovery、Tool、Skill 等机制层都无法解决，并且跨 task / workspace / model 持续存在，才评估架构或模型权重进化——并且必须先接受"这需要引入 open-weight 底座"这一前提。
+
+第 3 步与第 5 步对应[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §7 的阶段 1～2；第 7～9 步的机制候选属于该文的 L1（上下文 / playbook）与 L2（workflow 归纳），其优化器选择（GEPA 式反射演化 / ACE 式增量 playbook）以该文为准。
 
 ## 16. 待冻结的关键决策
 

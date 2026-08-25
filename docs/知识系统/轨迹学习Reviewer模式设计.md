@@ -785,6 +785,11 @@ Graph journal 继续是 Graph 执行正确性的真相源；Reviewer 只通过 t
 
 后续不论经验被注入 Agent prompt、工具召回、persistent Lane 还是 Loop Graph，都不应反向迫使 Reviewer 放宽证据和质量门槛。
 
+**两条必须在注入设计之初就成立的约束**（详见[轨迹数据利用与进化算法选型](./轨迹数据利用与进化算法选型.md)）：
+
+1. **注入必须带 provenance**。轨迹要记录本次运行注入了哪些经验条目及其版本。一旦经验进入 prompt 却没有这条记录，后续轨迹就被污染——效果来自经验还是来自任务本身更简单，将无法分辨，`ExperienceCandidate` 的实际价值永远无法回答。`mode=reviewer` 的自审排除只挡住了"Reviewer 审自己"，没有挡住"Reviewer 的产出改变了被审对象"，这是两件不同的事。
+2. **TaskReview 的四维评估与 Proposal 的三维 impact 不得成为优化目标**。它们是模型自评（连同 `candidateEligible` / `significance` / `abstractionLevel` 三项晋升字段也是自述），只能用于人工审核排序与失败聚类。任何后续的自动优化只能以确定性验证信号为主 reward。
+
 ## 13. 待实践回答的问题
 
 以下问题保留给实现和真实轨迹样本，不在纸面上预先固定：
