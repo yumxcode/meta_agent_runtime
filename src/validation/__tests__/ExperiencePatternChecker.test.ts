@@ -12,6 +12,7 @@ import type { VVContext } from '../types.js'
 function makeExperience(overrides: Partial<ExperienceMatch> = {}): ExperienceMatch {
   return {
     id:               'exp-001',
+    contentHash:      'a'.repeat(64),
     title:            'OOM in point cloud voxelisation',
     domain:           'perception',
     outcome:          'failure',

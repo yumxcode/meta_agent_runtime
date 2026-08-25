@@ -1,6 +1,8 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { RoboticsDomain, PrincipleAbstractionLevel } from '../../types.js'
 import type { PrincipleStore } from '../../PrincipleStore.js'
+import { principleContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createPrincipleSearchTool(store: PrincipleStore): MetaAgentTool {
   return {
@@ -51,13 +53,27 @@ export function createPrincipleSearchTool(store: PrincipleStore): MetaAgentTool 
         p.nonApplicableWhen.length ? `**Not applicable when**: ${p.nonApplicableWhen.join('; ')}` : '',
         `> Use \`principle_load id="${p.id}"\` for full boundaries and evidence.`,
       ].filter(Boolean).join('\n')).join('\n\n')
+      const content = `Found ${results.length} principle(s):\n\n${lines}`
       return {
-        content: `Found ${results.length} principle(s):\n\n${lines}`,
+        content,
         isError: false,
-        trajectoryItems: [{
-          type: 'knowledge', kind: 'principle', action: 'recalled',
-          entryIds: results.map(result => result.id), query: JSON.stringify(input), operation: 'recall',
-        }],
+        trajectoryItems: [
+          {
+            type: 'knowledge', kind: 'principle', action: 'recalled',
+            entryIds: results.map(result => result.id), query: JSON.stringify(input), operation: 'recall',
+          },
+          // Statement, mechanism, support and bounds are all printed per hit.
+          ...buildExplicitToolInjectionItems({
+            kind: 'principle',
+            tool: 'principle_search',
+            toolInput: input,
+            entries: results.map(result => ({
+              entryId: result.id,
+              contentHash: principleContentHash(result),
+            })),
+            content,
+          }),
+        ],
       }
     },
   }

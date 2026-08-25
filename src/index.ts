@@ -41,6 +41,11 @@ export * from './trajectory/index.js'
 // Isolated learning-proposal pipeline. It never mutates an active session or
 // the existing robotics ExperienceStore; only human approval creates a candidate.
 export * from './reviewer/index.js'
+
+// ── Evolution contracts (G0) ─────────────────────────────────────────────────
+// Pure contracts with no runtime wiring: evaluator trust tiers and data
+// eligibility. They gate future consumers; nothing depends on them yet.
+export * from './evolution/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,

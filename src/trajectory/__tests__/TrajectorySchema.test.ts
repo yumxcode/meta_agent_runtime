@@ -34,7 +34,8 @@ describe('trajectory schema governance', () => {
   })
 
   it('matches the frozen schema fingerprint', () => {
+    // Moved for item schema 1.2.0 (additive knowledge injection provenance).
     const hash = createHash('sha256').update(trajectorySchemaFingerprint()).digest('hex').slice(0, 16)
-    expect(hash).toBe('746a79a491706bec')
+    expect(hash).toBe('5e60f8d1ad1ed430')
   })
 })

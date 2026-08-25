@@ -100,6 +100,7 @@ docs/
 
 ### 2026-08
 
+- [meta-agent 自进化方案审查（2026-08-25）](reviews/meta-agent-自进化方案审查-2026-08-25.md) — 仅批准 E0；评测、因果归因与实施顺序的阻断项
 - [代码审查：逻辑 bug、资源管理、健壮性（2026-08-12）](reviews/code-review-2026-08-12.md)
 - [终端 / 显示层审查（2026-08-12）](reviews/code-review-terminal-2026-08-12.md)
 - [Windows 部署问题清单（2026-08-12）](reviews/windows-porting-review-2026-08-12.md)

@@ -1,8 +1,10 @@
 # meta-agent 自进化方案
 
-> 状态：机制版 v3（治理与门槛部分待冻结）
+> 状态：机制版 v3（审查后待修订；当前仅批准 E0 测量与信任底座）
 >
 > 日期：2026-08-24（v2：2026-08-22）
+>
+> 审查闸门：见 [meta-agent 自进化方案审查（2026-08-25）](./meta-agent-自进化方案审查-2026-08-25.md)。在下一版修订前，审查文档对阶段顺序、数据切分、因果归因、评测隔离与 bandit 前置条件的结论优先。
 >
 > 依赖：A3-M1～M4 标准轨迹、A3-M5 可信切读与 replay parity、Reviewer 模式的 TaskCase / TaskReview
 >
@@ -410,13 +412,18 @@ A3-M1～M4 已提供：
 
 仍缺：**延迟反馈回流**（后续 CI、工件回退、任务重开、部署后故障尚未追加为事后 evaluation），以及 §7.2 定义的 `EvaluationAnnotation` 完整字段（evaluator 版本、rubric hash、failureAttributions、independentEvaluator）。
 
-#### 缺口 B｜因果单元（**已部分关闭**）
+#### 缺口 B｜证据边界与因果归因（**证据边界已关闭，因果归因未关闭**）
 
 原状：runId / turnId / toolUseId 只能圈定范围，缺少可引用的学习单元。
 
-现状：**TaskCase 已经是任务级因果单元**——它把同一 root 下的子代理与多次 run 聚成一个证据边界，TaskReview 在其上给出结果判定、逐条成功标准状态与决策链重建，Finding 与 LearningProposal 都强制引用 `trajectoryId + ordinal`。
+现状：**TaskCase 是任务级证据边界与评测单元**——它把同一 root 下的子代理与多次 run 聚成稳定范围，TaskReview 在其上给出结果判定、逐条成功标准状态与决策链重建，Finding 与 LearningProposal 都强制引用 `trajectoryId + ordinal`。
 
-仍缺：turn / decision 级的细粒度单元。这一层在做 L3 路由 bandit 之前才必要，不必提前建设。
+**但 TaskCase 不是因果单元。** 它没有 treatment assignment、没有对照组、没有反事实。2026-08-25 审查已更正此表述：证据边界解决"能引用什么"，不解决"什么导致了什么"。
+
+仍缺：
+
+- **因果归因手段**：任何"某改动带来了收益"的结论必须来自预注册的随机开关、配对消融、factorial 或 switchback 实验；仅有暴露记录（含注入 provenance）不足以支持因果宣称；
+- turn / decision 级的细粒度单元。这一层在做 L3 路由 bandit 之前才必要，且其前置是**受约束的随机 logging policy**（见审查文档 P1-6），不是先建数据结构。
 
 #### 缺口 C｜版本 hash 不等于可回放版本
 
@@ -452,15 +459,25 @@ A3-M1～M4 已提供：
 
 后果：`ExperienceCandidate` 的"到底有没有用"永远无法回答，所有 A/B 归因不成立，§9 的候选比较失去前提。
 
-建议：复用 `knowledge` item，在注入时追加 `action=inject` 记录 `entryIds` 与版本、选择原因；TaskReview 同时带上"本次注入集合"的引用。
+建议：复用 `knowledge` item，但**五个状态必须分开**——`recalled`（检索命中）/ `eligible`（通过适用性过滤）/ `selected`（选择器选中）/ `rendered`（渲染进候选上下文）/ `injected`（确实进入发给模型的 context）。同时记录 entry id、content hash、版本链、来源 TaskCase、selector version、query hash、eligible set、分配概率、排除原因码、注入顺序 / slot / 目标 turn、token 数与最终 context hash。未选候选只记 id / hash / reason code，不复制正文。
 
 注意这与 `mode=reviewer` 自审排除是两件事：后者只挡住"Reviewer 审自己"，没有挡住"Reviewer 的产出改变了被审对象"。
 
-#### 缺口 H｜没有离线回放评测集（**新增，阻塞一切优化**）
+**并且 provenance 是必要条件而非充分条件**：它证明的是暴露关系。多条经验同时注入、选择器按任务难度挑条目、条目来自同源任务，都会让暴露与因果脱钩。因果结论必须另有受控分配或消融设计。
 
-没有 held-out 评测集就没有 fitness function，§8.2 的评测矩阵无法实例化，任何候选都无法证伪。
+**注入通道同时是信任边界。** Candidate 提炼自被 Reviewer 视为不可信的轨迹内容，却将以可信系统上下文的身份进入拥有写工具的 Worker；人工批准审的是有用性，不是"文本里有没有藏指令"。注入必须只渲染结构化字段、拒绝自由文本透传与角色标记。
 
-这是**当前最紧迫的一项**，且优先级高于选择任何算法。最小可行形态与切分规则见[算法选型文档](../知识系统/轨迹数据利用与进化算法选型.md) §4：从已有轨迹中挑选结果判定明确、具备确定性验证证据的 TaskCase 冻结为回放集，20～50 个证据完整的用例即可起步。
+#### 缺口 H｜没有受控重执行评测底座（**新增，阻塞一切优化**）
+
+没有评测底座就没有 fitness function，§8.2 的评测矩阵无法实例化，任何候选都无法证伪。优先级高于选择任何算法。
+
+三点必须说清楚（2026-08-25 审查更正）：
+
+1. **称谓**：第一版是 **controlled re-execution（受控重执行）**，不是 replay。`replayClass` 只描述动作可重放性，不能替代环境复现等级。
+2. **起点**：必须能恢复**任务开始前**的环境。当前做不到——`TaskCase.inputHash` 是任务结束后全部轨迹行的摘要，`firstPrompt` 只留前 240 字，`gitBase` 字段存在但全仓库无赋值点。用任务完成后的 working tree 当起点，用例会在答案已存在的状态上直接通过。
+3. **切分**：不是单一 held-out，而是 support / validation / **sealed test** / canary 四层，可见性与使用次数分别约束；反复根据同一集合结果选新假设会对该集合过拟合，"定期换血"不能消除已发生的适应性泄漏。
+
+规模上，20～50 个用例只够验证评测管线与初步方向，**不足以支撑多维晋升结论**——不得把"有统计可辨差异"写成固定承诺。详见[实施计划](../知识系统/自进化实施计划.md) G1 与审查文档 P0-2 / P0-3 / P1-3。
 
 ## 7. 学习数据契约
 

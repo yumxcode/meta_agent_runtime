@@ -22,7 +22,15 @@
  *   - RoboticsSession.submit() calls tick() after each turn completes
  */
 
-import type { PageSlot, ContextPagerOptions, SlotPriority } from './types.js'
+import { createHash } from 'crypto'
+import type {
+  PageSlot,
+  ContextPagerOptions,
+  SlotPriority,
+  PagerRenderTrace,
+  SlotDropRecord,
+  SlotDropReason,
+} from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -31,6 +39,17 @@ import type { PageSlot, ContextPagerOptions, SlotPriority } from './types.js'
 const DEFAULT_MAX_BUDGET = 1500   // tokens reserved for checked-out slots
 const EVICTION_ORDER: SlotPriority[] = ['low', 'medium', 'high']  // sticky excluded
 
+/**
+ * Cap on undrained drop records.
+ *
+ * Drops are drained once per turn by the provenance emitter. The cap exists so
+ * that a caller which never drains (any pager built without provenance wiring,
+ * including every existing test) cannot grow this list without bound. Oldest
+ * records are discarded first: a drop that was never drained for many turns has
+ * already lost the turn context that made it meaningful.
+ */
+const MAX_UNDRAINED_DROPS = 64
+
 // ─────────────────────────────────────────────────────────────────────────────
 // ContextPager
 // ─────────────────────────────────────────────────────────────────────────────
@@ -38,9 +57,46 @@ const EVICTION_ORDER: SlotPriority[] = ['low', 'medium', 'high']  // sticky excl
 export class ContextPager {
   private readonly slots = new Map<string, PageSlot>()
   private readonly maxBudget: number
+  private _lastRenderTrace: PagerRenderTrace | null = null
+  private _drops: SlotDropRecord[] = []
 
   constructor(opts: ContextPagerOptions = {}) {
     this.maxBudget = opts.maxBudget ?? DEFAULT_MAX_BUDGET
+  }
+
+  // ── Injection provenance (G0-2) ───────────────────────────────────────────
+
+  /**
+   * What the last renderForTurn() actually emitted, or null if it has not run.
+   *
+   * Read by the provenance emitter after the turn's context is assembled. Pure
+   * observation: nothing in the pager's behaviour depends on it.
+   */
+  get lastRenderTrace(): PagerRenderTrace | null {
+    return this._lastRenderTrace
+  }
+
+  /**
+   * Take the drop records accumulated since the last drain.
+   *
+   * Draining rather than reading, because a drop belongs to exactly one turn's
+   * provenance — reporting it twice would double-count an exclusion.
+   */
+  drainDrops(): SlotDropRecord[] {
+    const drained = this._drops
+    this._drops = []
+    return drained
+  }
+
+  private _recordDrop(slot: Pick<PageSlot, 'id' | 'provenance' | 'source'>, reason: SlotDropReason): void {
+    if (this._drops.length >= MAX_UNDRAINED_DROPS) this._drops.shift()
+    this._drops.push({
+      slotId: slot.id,
+      provenance: slot.provenance,
+      source: slot.source,
+      reason,
+      at: Date.now(),
+    })
   }
 
   // ── Checkout / Checkin ────────────────────────────────────────────────────
@@ -58,7 +114,15 @@ export class ContextPager {
 
     if (slot.priority !== 'sticky') {
       const nonStickyCapacity = this.maxBudget - this._stickyTokens(slot.id)
-      if (slot.tokenEst > nonStickyCapacity) return false
+      if (slot.tokenEst > nonStickyCapacity) {
+        // Pre-existing silent drop: ExperienceWorkingSet._refreshSlots() calls
+        // checkout() as a bare statement and never reads this `false`, so an
+        // over-budget experience disappears without a trace. G0-2 makes it
+        // traceable; changing the drop itself is out of scope for a gate whose
+        // contract is "no behaviour change".
+        this._recordDrop({ ...slot }, 'oversized')
+        return false
+      }
     }
 
     if (existing) this.slots.delete(slot.id)
@@ -121,7 +185,14 @@ export class ContextPager {
    * Low-priority slots are always rendered (they expire after this turn anyway).
    */
   renderForTurn(): string {
-    if (this.slots.size === 0) return ''
+    if (this.slots.size === 0) {
+      // An empty pager is not an injection event. Recording a trace here would
+      // make the emitter produce a knowledge item on every turn of every
+      // session that never touched experience — the "no noise item when nothing
+      // was injected" acceptance criterion.
+      this._lastRenderTrace = null
+      return ''
+    }
 
     const ordered = [...this.slots.values()].sort((a, b) => {
       const order: Record<SlotPriority, number> = { sticky: 0, high: 1, medium: 2, low: 3 }
@@ -129,17 +200,42 @@ export class ContextPager {
     })
 
     const parts: string[] = []
+    const rendered: PagerRenderTrace['rendered'] = []
+    const skippedForBudget: PagerRenderTrace['skippedForBudget'] = []
     let usedTokens = 0
 
     for (const slot of ordered) {
       if (usedTokens + slot.tokenEst > this.maxBudget && slot.priority !== 'sticky') {
+        skippedForBudget.push({ slotId: slot.id, provenance: slot.provenance, tokenEst: slot.tokenEst })
         continue  // skip non-sticky slots that would bust the budget
       }
+      rendered.push({
+        slotId: slot.id,
+        provenance: slot.provenance,
+        source: slot.source,
+        priority: slot.priority,
+        tokenEst: slot.tokenEst,
+        order: rendered.length,
+        // ttlTurns - remainingTurns: how many tick()s this slot has already
+        // survived. Non-zero means it is being injected again without having
+        // been re-selected this turn.
+        turnsSurvived: Math.max(0, slot.ttlTurns - slot.remainingTurns),
+      })
       parts.push(slot.content)
       usedTokens += slot.tokenEst
     }
 
-    return parts.join('\n\n---\n\n')
+    const output = parts.join('\n\n---\n\n')
+    this._lastRenderTrace = {
+      renderedAt: Date.now(),
+      rendered,
+      skippedForBudget,
+      tokens: usedTokens,
+      // Hash of the exact bytes handed back, so the emitted contextHash can be
+      // reconciled against what the section builder assembled.
+      contentHash: createHash('sha256').update(output).digest('hex'),
+    }
+    return output
   }
 
   // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -214,6 +310,9 @@ export class ContextPager {
       for (const slot of candidates) {
         if (this.usedTokens + needed <= this.maxBudget) break
         this.slots.delete(slot.id)
+        // Experiences all check out at 'medium', so this is also how one
+        // experience displaces another within a single _refreshSlots() loop.
+        this._recordDrop(slot, 'evicted_for_room')
       }
     }
   }

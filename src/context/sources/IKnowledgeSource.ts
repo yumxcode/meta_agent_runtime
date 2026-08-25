@@ -21,6 +21,16 @@
 export interface ExperienceMatch {
   /** Stable identifier */
   id: string
+  /**
+   * 64-hex hash of the entry's content, from `experienceContentHash()`.
+   *
+   * Required, not optional: this is what injection provenance records as
+   * `contentHash`, and an entry that reached the model without one is an entry
+   * whose version can never be recovered afterwards. Making it optional would
+   * push that failure to runtime at the emit site, where the information no
+   * longer exists — so it is enforced here, where every match is built.
+   */
+  contentHash: string
   /** Short title (≤ 80 chars) */
   title: string
   /** Domain classification */

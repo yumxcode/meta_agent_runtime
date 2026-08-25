@@ -1,5 +1,7 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import { isPrincipleId, type PrincipleStore } from '../../PrincipleStore.js'
+import { principleContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createPrincipleLoadTool(store: PrincipleStore): MetaAgentTool {
   return {
@@ -46,13 +48,18 @@ export function createPrincipleLoadTool(store: PrincipleStore): MetaAgentTool {
         ...(principle.counterExamples.length ? ['## Counterexamples', ...principle.counterExamples.map(item => `- ${item}`), ''] : []),
         ...(principle.evidenceRefs.length ? ['## Evidence References', ...principle.evidenceRefs.map(ref => `- ${ref}`), ''] : []),
       ]
+      const content = lines.join('\n')
       return {
-        content: lines.join('\n'),
+        content,
         isError: false,
-        trajectoryItems: [{
-          type: 'knowledge', kind: 'principle', action: 'recalled',
-          entryIds: [principle.id], operation: 'recall',
-        }],
+        // See experience_load: a load is an injection, not a retrieval.
+        trajectoryItems: buildExplicitToolInjectionItems({
+          kind: 'principle',
+          tool: 'principle_load',
+          toolInput: input,
+          entries: [{ entryId: principle.id, contentHash: principleContentHash(principle) }],
+          content,
+        }),
       }
     },
   }

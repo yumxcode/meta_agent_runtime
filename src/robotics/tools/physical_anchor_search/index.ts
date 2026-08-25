@@ -1,6 +1,8 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { PhysicalAnchorStore } from '../../PhysicalAnchorStore.js'
 import type { RoboticsDomain } from '../../types.js'
+import { physicalAnchorContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createPhysicalAnchorSearchTool(store: PhysicalAnchorStore): MetaAgentTool {
   return {
@@ -60,13 +62,27 @@ export function createPhysicalAnchorSearchTool(store: PhysicalAnchorStore): Meta
           `> Use \`physical_anchor_load id="${anchor.id}"\` for the full anchor.`,
           '',
         ].join('\n'))
+        const content = `Found ${anchors.length} physical anchor(s):\n\n${lines.join('\n')}`
         return {
-          content: `Found ${anchors.length} physical anchor(s):\n\n${lines.join('\n')}`,
+          content,
           isError: false,
-          trajectoryItems: [{
-            type: 'knowledge', kind: 'anchor', action: 'recalled',
-            entryIds: anchors.map(anchor => anchor.id), query: JSON.stringify(input), operation: 'recall',
-          }],
+          trajectoryItems: [
+            {
+              type: 'knowledge', kind: 'anchor', action: 'recalled',
+              entryIds: anchors.map(anchor => anchor.id), query: JSON.stringify(input), operation: 'recall',
+            },
+            // Fact, mechanism and implication are printed in full per hit.
+            ...buildExplicitToolInjectionItems({
+              kind: 'anchor',
+              tool: 'physical_anchor_search',
+              toolInput: input,
+              entries: anchors.map(anchor => ({
+                entryId: anchor.id,
+                contentHash: physicalAnchorContentHash(anchor),
+              })),
+              content,
+            }),
+          ],
         }
       } catch (err) {
         return { content: `physical_anchor_search failed: ${String(err)}`, isError: true }

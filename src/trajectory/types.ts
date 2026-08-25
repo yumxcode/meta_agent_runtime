@@ -1,8 +1,13 @@
 import { z } from 'zod'
 
 export const TRAJECTORY_LINE_SCHEMA_VERSION = 'trajectory-line-1.0' as const
-/** Semver for the tagged item payload union, governed independently of the envelope. */
-export const TRAJECTORY_ITEM_SCHEMA_VERSION = '1.1.0' as const
+/**
+ * Semver for the tagged item payload union, governed independently of the envelope.
+ *
+ * 1.2.0 — additive: knowledge items gained the five retrieval/injection states
+ * and injection provenance fields. Existing producers stay valid.
+ */
+export const TRAJECTORY_ITEM_SCHEMA_VERSION = '1.2.0' as const
 
 export const TrajectorySubjectSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session'), sessionId: z.string().min(1) }),
@@ -147,14 +152,68 @@ export const JobItemSchema = itemBase.extend({
   summary: z.string().optional(),
 }).passthrough()
 
+/**
+ * One entry that actually reached the model's context.
+ *
+ * Injection provenance exists so a later analysis can ask "was this run exposed
+ * to that entry, at which version" — it records EXPOSURE, never causation. A
+ * causal claim ("this entry helped") additionally needs randomised assignment
+ * or ablation, because several entries are injected together and the selector
+ * itself picks by task difficulty.
+ */
+export const InjectedKnowledgeEntrySchema = z.object({
+  entryId: z.string().min(1),
+  /** Content hash of the rendered entry, so a later rewrite is distinguishable. */
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+  versionChain: z.array(z.string().min(1)).max(8).default([]),
+  /** Origin TaskCase, used to keep evaluation splits free of lineage leakage. */
+  sourceCaseId: z.string().min(1).optional(),
+  selectorVersion: z.string().min(1),
+  queryHash: z.string().min(1),
+  /** Present only when the selector assigned probabilistically (A/B, bandit). */
+  assignmentProbability: z.number().min(0).max(1).optional(),
+  slot: z.number().int().nonnegative().default(0),
+  order: z.number().int().nonnegative().default(0),
+  targetRunId: z.string().min(1).optional(),
+  targetTurnId: z.string().min(1).optional(),
+}).strict()
+
+/**
+ * A candidate that was recalled but did not make it into the context.
+ *
+ * Only id/hash/reason code — never the body. These rows exist to support
+ * counterfactual ablation, not to duplicate knowledge content into trajectories.
+ */
+export const ExcludedKnowledgeCandidateSchema = z.object({
+  entryId: z.string().min(1),
+  contentHash: z.string().regex(/^[a-f0-9]{64}$/),
+  reasonCode: z.string().min(1).max(64),
+}).strict()
+
 export const KnowledgeItemSchema = itemBase.extend({
   type: z.literal('knowledge'),
   kind: z.enum(['experience', 'principle', 'anchor']),
-  action: z.enum(['recalled', 'proposed', 'approved', 'rejected', 'written', 'deleted']),
+  /**
+   * Retrieval and injection are five distinct states, not one. Collapsing them
+   * into `recalled` loses exactly the distinction attribution needs: recalling
+   * ten entries and injecting three is not the same event.
+   *
+   *   recalled → eligible → selected → rendered → injected
+   */
+  action: z.enum([
+    'recalled', 'proposed', 'approved', 'rejected', 'written', 'deleted',
+    'eligible', 'selected', 'rendered', 'injected',
+  ]),
   entryIds: z.array(z.string()).default([]),
   query: z.string().optional(),
   pendingId: z.string().optional(),
-  operation: z.enum(['recall', 'write', 'delete', 'promote']).optional(),
+  operation: z.enum(['recall', 'write', 'delete', 'promote', 'inject']).optional(),
+  /** Populated on `injected`; the authoritative record of what the model saw. */
+  injected: z.array(InjectedKnowledgeEntrySchema).max(32).optional(),
+  excludedCandidates: z.array(ExcludedKnowledgeCandidateSchema).max(64).optional(),
+  /** Hash of the assembled context, so injection can be reconciled after the fact. */
+  contextHash: z.string().min(1).optional(),
+  tokenCost: z.number().int().nonnegative().optional(),
 }).passthrough()
 
 export const StateCheckpointItemSchema = itemBase.extend({

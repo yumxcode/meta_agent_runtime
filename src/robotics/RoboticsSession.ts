@@ -61,6 +61,9 @@ import { HardwareProfile } from './HardwareProfile.js'
 import { GitWorkspaceManager } from '../infra/git/GitWorkspaceManager.js'
 import { RoboticsProjectStore } from './persistence/RoboticsProjectStore.js'
 import { ContextPager } from '../context/ContextPager.js'
+import { recordTrajectoryItem } from '../trajectory/hub.js'
+import type { TrajectoryDescriptor, TrajectoryItem, TrajectorySubject } from '../trajectory/types.js'
+import { buildInjectionProvenanceItems } from '../evolution/InjectionProvenance.js'
 import { estimateTokens } from '../context/TokenEstimator.js'
 import { ExperienceSource } from '../context/sources/ExperienceSource.js'
 import { createRoboticsRuntimeContext } from './runtimeContext.js'
@@ -340,12 +343,46 @@ export class RoboticsSession implements RoboticsCapabilities {
    */
   private _storeSessionId: string = ''
 
+  /**
+   * Injection provenance for the turn being assembled, awaiting a trajectory
+   * to write into (G0-2).
+   *
+   * Context is assembled before `inner.submit()` runs, so at build time the
+   * kernel has not yet opened the trajectory for this turn. Flushing on the
+   * first yielded event instead means the records land inside the run's ordinal
+   * range rather than ahead of `run_started`, which is what lets a reader
+   * associate them with the turn they fed.
+   */
+  private _pendingInjectionItems: TrajectoryItem[] = []
+  private readonly _trajectorySubject: TrajectorySubject
+  private readonly _trajectoryOptions: { enabled?: boolean; rootDir?: string }
+  private readonly _trajectoryDescriptorBase: Omit<TrajectoryDescriptor, 'subject'>
+
   constructor(config: RoboticsSessionOptions = {}) {
     // When resuming, reuse the original session ID so SessionStore.append()
     // upserts the existing record instead of creating a new one.
     this.sessionId = config.resumeSessionId ?? randomUUID()
     this.robot = config.robot
     this.projectDir = config.projectDir ?? process.cwd()
+
+    // Mirrors KernelSession._trajectorySubject()/_trajectoryOptions() exactly.
+    // The hub keys open recorders by subject, so matching it is what makes the
+    // provenance records land in the same trajectory the kernel is writing —
+    // a divergence here would silently start a second trajectory instead.
+    this._trajectorySubject = config.trajectory?.subject
+      ?? { kind: 'session', sessionId: this.sessionId }
+    this._trajectoryOptions = {
+      enabled: config.trajectory?.enabled,
+      rootDir: config.trajectory?.rootDir,
+    }
+    this._trajectoryDescriptorBase = {
+      mode: 'robotics',
+      rootTrajectoryId:   config.trajectory?.rootTrajectoryId,
+      parentTrajectoryId: config.trajectory?.parentTrajectoryId,
+      workspace:          this.projectDir,
+      workspaceId:        config.trajectory?.workspaceId,
+      source:             config.trajectory?.source ?? 'robotics_session',
+    }
     this._domain = config.domain
     this._userAppendPrompt = config.appendSystemPrompt ?? ''
     this._explicitResume = config.explicitResume ?? false
@@ -1058,6 +1095,9 @@ export class RoboticsSession implements RoboticsCapabilities {
       )
     }
     this._submitInFlight = true
+    // Marks the boundary a render trace must be newer than to belong to this
+    // turn. See _captureInjectionProvenance().
+    const turnStartedAt = Date.now()
 
     try {
       // ── First submit only: classify agent mode ────────────────────────────────
@@ -1151,7 +1191,18 @@ export class RoboticsSession implements RoboticsCapabilities {
         ? `${volatilePrefix}\n\n---\n\n${prompt}`
         : prompt
 
+      // The context for this turn is now fixed, so what was injected is known.
+      this._captureInjectionProvenance(turnStartedAt)
+
+      let provenanceFlushed = false
       for await (const ev of this.inner.submit(effectivePrompt)) {
+        if (!provenanceFlushed) {
+          // First event means the kernel has recorded run_started and the hub
+          // holds an open recorder, so these items land inside the run rather
+          // than creating a trajectory of their own ahead of it.
+          provenanceFlushed = true
+          await this._flushInjectionProvenance()
+        }
         // Compaction is a session-start moment for R4 + R5: refresh both
         // snapshots so the post-compact system prompt reflects current state.
         // The refreshed snapshots are applied on the next submit's stable prompt
@@ -1175,12 +1226,76 @@ export class RoboticsSession implements RoboticsCapabilities {
       await RoboticsProjectStore.touch(this.projectDir, this._storeSessionId).catch(() => undefined)
     } finally {
       this._submitInFlight = false
+      // Safety net for a turn that yielded no events (aborted before the first
+      // yield): the records must not leak into the next turn's trajectory,
+      // where they would describe a context that turn never assembled.
+      // _flushInjectionProvenance() clears the queue, so this is a no-op when
+      // the loop above already flushed.
+      await this._flushInjectionProvenance().catch(() => undefined)
       // Age TTL counters and evict expired context slots after each completed turn
       try {
         this.contextPager.tick(extractReferencedExperienceSlotIds(this.getMessages()))
       } catch {
         // Best-effort cleanup must not mask the submit failure that triggered finally.
       }
+    }
+  }
+
+  /**
+   * Turn this turn's retrieval and render traces into pending knowledge items.
+   *
+   * Must run after the volatile sections resolve, because that is when
+   * buildR2Section calls pager.renderForTurn() and the render trace appears.
+   *
+   * `turnStartedAt` guards against a stale trace: if section assembly failed
+   * before reaching renderForTurn, the pager still holds the previous turn's
+   * trace, and recording that would report an injection this turn never made.
+   */
+  private _captureInjectionProvenance(turnStartedAt: number): void {
+    try {
+      const preload = this.experienceWorkingSet.lastPreloadTrace
+      const renderTrace = this.contextPager.lastRenderTrace
+      const render = renderTrace && renderTrace.renderedAt >= turnStartedAt ? renderTrace : null
+
+      this._pendingInjectionItems = buildInjectionProvenanceItems({
+        selection: preload
+          ? {
+              queryHash:       preload.queryHash,
+              selectorVersion: preload.selectorVersion,
+              candidateSource: preload.candidateSource,
+              // Only these two routes produced an actual judgement. Every other
+              // path fell back to local ranking without one.
+              judgementObtained: preload.selectionPath === 'flash_selected'
+                || preload.selectionPath === 'flash_empty',
+              pool:              preload.pool,
+              selectedEntryIds:  preload.injectedIds,
+              checkoutRejected:  preload.checkoutRejected,
+            }
+          : null,
+        render,
+        drops: this.contextPager.drainDrops(),
+      })
+    } catch {
+      // Provenance is an observation of the turn, never a precondition for it.
+      this._pendingInjectionItems = []
+    }
+  }
+
+  /** Write the pending records into the trajectory the kernel just opened. */
+  private async _flushInjectionProvenance(): Promise<void> {
+    const items = this._pendingInjectionItems
+    this._pendingInjectionItems = []
+    if (items.length === 0) return
+    for (const item of items) {
+      // recordTrajectoryItem swallows its own failures and returns null; the
+      // catch is for the descriptor/hub path itself. Either way a failure to
+      // record must not surface into the user's turn.
+      await recordTrajectoryItem(
+        { subject: this._trajectorySubject, ...this._trajectoryDescriptorBase },
+        item,
+        {},
+        this._trajectoryOptions,
+      ).catch(() => null)
     }
   }
 

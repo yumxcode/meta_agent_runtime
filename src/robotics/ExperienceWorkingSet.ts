@@ -24,6 +24,16 @@ const EXPERIENCE_TASK_SWITCH_RE = /\b(new task|switch task|different task|anothe
 const EXPERIENCE_INJECTION_LIMIT = 4
 const EXPERIENCE_CANDIDATE_LIMIT = 18
 const EXPERIENCE_STRONG_APPLICABILITY_SCORE = 100
+
+/**
+ * Identity of the selection algorithm, recorded with every injection.
+ *
+ * Bump when the ranking, the thresholds, the candidate limit or the relevance
+ * prompt change — anything that would make two runs' selections incomparable.
+ * Which of the two code paths ran on a given turn is recorded separately as
+ * `selectionPath`, because that varies per turn rather than per version.
+ */
+export const EXPERIENCE_SELECTOR_VERSION = 'working-set-v1'
 /**
  * Soft cap on how long preload() waits for the LLM relevance judgement.
  *
@@ -54,13 +64,73 @@ export interface SelectedExperience {
   hasApplicabilitySignal: boolean
 }
 
+/**
+ * Which route produced this turn's selection.
+ *
+ * Everything except `flash_selected` yields the locally-ranked fallback — the
+ * behaviour is identical, which is exactly why the distinction has to be
+ * recorded explicitly rather than inferred from the result.
+ */
+export type ExperienceSelectionPath =
+  /** Nothing in the candidate pool; no selection was attempted. */
+  | 'no_candidates'
+  /** No API key, so the relevance pass never existed. Local ranking only. */
+  | 'no_flash_client'
+  /** The relevance call lost the wait budget. No judgement was obtained. */
+  | 'flash_timeout'
+  /** It answered in a shape we could not read. No judgement was obtained. */
+  | 'flash_unparseable'
+  /** It named ids, none of which exist. No usable judgement. */
+  | 'flash_invalid_ids'
+  /** It explicitly judged that none apply — a real negative, not a failure. */
+  | 'flash_empty'
+  /** It selected at least one entry. */
+  | 'flash_selected'
+  /**
+   * preload() threw (store read failed, etc). The pool is unknown, not empty —
+   * distinct from `no_candidates`, which asserts the store had nothing to say.
+   */
+  | 'preload_error'
+
+/** A candidate as it stood when the selector looked at it. */
+export interface ExperienceCandidateRecord {
+  entryId: string
+  contentHash: string
+  localScore: number
+  hasApplicabilitySignal: boolean
+  /**
+   * Whether it clears the local threshold.
+   *
+   * Recorded per candidate rather than pre-filtered because the two selection
+   * paths disagree about what "eligible" means: the local path treats this flag
+   * as the eligibility gate, while the flash path sends the whole pool and
+   * ignores the threshold entirely. Storing the raw verdict alongside the
+   * chosen path keeps both definitions recoverable instead of freezing one of
+   * them into the record.
+   */
+  eligibleByThreshold: boolean
+}
+
 interface ExperiencePreloadTrace {
   queryHash: string
   domains: string[]
   keywords: string[]
   candidateSource: 'store' | 'cache' | 'none'
   candidateCount: number
+  /**
+   * Ids selected for this turn.
+   *
+   * Named `injectedIds` historically; it never meant "injected". Selection is
+   * upstream of checkout and of rendering, and slots outlive their selection,
+   * so this set is neither a subset nor a superset of what actually reached the
+   * model. The pager's render trace is the authority on injection.
+   */
   injectedIds: string[]
+  selectorVersion: string
+  selectionPath: ExperienceSelectionPath
+  pool: ExperienceCandidateRecord[]
+  /** Slots this turn's checkout refused outright (see ContextPager 'oversized'). */
+  checkoutRejected: ExperienceCandidateRecord[]
 }
 
 function normalizeExperienceKeyword(keyword: string): string | null {
@@ -85,18 +155,55 @@ function formatExperienceCandidate(e: ExperienceMatch): string {
   ].join('\n')
 }
 
-function parseApplicableExperienceIds(raw: string, candidates: ExperienceMatch[]): Set<string> {
+/**
+ * Outcome of reading the relevance model's answer.
+ *
+ * Previously this returned a bare `Set`, which collapsed three different
+ * situations into one empty set: the model said "none apply", the model
+ * answered in a shape we could not read, and the model named only ids that do
+ * not exist. All three then hit the same `return localFallback`, so nothing
+ * downstream could tell an informative negative judgement apart from a
+ * malfunction. For provenance those are opposite facts — "no experience
+ * applied here" is evidence, "we failed to ask" is an absence of evidence.
+ */
+type ApplicableIdsOutcome =
+  | { kind: 'parsed'; ids: Set<string>; namedCount: number }
+  | { kind: 'unparseable' }
+
+function parseApplicableExperienceIds(
+  raw: string,
+  candidates: ExperienceMatch[],
+): ApplicableIdsOutcome {
   try {
     const jsonMatch = raw.match(/\{[\s\S]*\}/)
-    if (!jsonMatch) return new Set()
+    if (!jsonMatch) return { kind: 'unparseable' }
     const parsed = JSON.parse(jsonMatch[0]) as Record<string, unknown>
+    const named = parsed['applicable']
+    if (!Array.isArray(named)) return { kind: 'unparseable' }
     const validIds = new Set(candidates.map(c => c.id))
-    const ids = Array.isArray(parsed['applicable'])
-      ? parsed['applicable'].filter((id): id is string => typeof id === 'string' && validIds.has(id))
-      : []
-    return new Set(ids.slice(0, EXPERIENCE_INJECTION_LIMIT))
+    const ids = named.filter((id): id is string => typeof id === 'string' && validIds.has(id))
+    return {
+      kind: 'parsed',
+      ids: new Set(ids.slice(0, EXPERIENCE_INJECTION_LIMIT)),
+      // How many the model named before validity filtering: a non-zero
+      // namedCount with an empty id set means it invented ids, which is a
+      // different failure from it deliberately returning an empty list.
+      namedCount: named.length,
+    }
   } catch {
-    return new Set()
+    return { kind: 'unparseable' }
+  }
+}
+
+function toCandidateRecord(selection: SelectedExperience): ExperienceCandidateRecord {
+  return {
+    entryId: selection.experience.id,
+    contentHash: selection.experience.contentHash,
+    localScore: selection.localScore,
+    hasApplicabilitySignal: selection.hasApplicabilitySignal,
+    eligibleByThreshold:
+      selection.hasApplicabilitySignal &&
+      selection.localScore >= EXPERIENCE_STRONG_APPLICABILITY_SCORE,
   }
 }
 
@@ -165,6 +272,10 @@ export class ExperienceWorkingSetManager {
         candidateSource: 'none',
         candidateCount: 0,
         injectedIds: [],
+        selectorVersion: EXPERIENCE_SELECTOR_VERSION,
+        selectionPath: 'no_candidates',
+        pool: [],
+        checkoutRejected: [],
       }
       return
     }
@@ -195,16 +306,21 @@ export class ExperienceWorkingSetManager {
         candidateSource = 'store'
       }
 
-      const selected = await this._selectApplicable(prompt, intent, candidates)
+      const { selected, path, ranked } = await this._selectApplicable(prompt, intent, candidates)
       this._workingSet = selected
-      this._refreshSlots(selected)
+      const queryHash = this._queryHash(prompt)
+      const checkoutRejected = this._refreshSlots(selected, queryHash, path)
       this._lastPreloadTrace = {
-        queryHash: this._queryHash(prompt),
+        queryHash,
         domains,
         keywords,
         candidateSource,
         candidateCount: candidates.length,
         injectedIds: selected.map(s => s.experience.id),
+        selectorVersion: EXPERIENCE_SELECTOR_VERSION,
+        selectionPath: path,
+        pool: ranked.map(toCandidateRecord),
+        checkoutRejected: checkoutRejected.map(toCandidateRecord),
       }
     } catch {
       this._lastPreloadTrace = {
@@ -214,6 +330,12 @@ export class ExperienceWorkingSetManager {
         candidateSource: 'none',
         candidateCount: 0,
         injectedIds: [],
+        selectorVersion: EXPERIENCE_SELECTOR_VERSION,
+        // A thrown preload is not a judgement that nothing applied; the pool is
+        // simply unknown. 'no_candidates' would misreport it as an empty pool.
+        selectionPath: 'preload_error',
+        pool: [],
+        checkoutRejected: [],
       }
       // Experience preload is mandatory in shape but opportunistic in effect;
       // failures must not block the user turn.
@@ -248,8 +370,10 @@ export class ExperienceWorkingSetManager {
     prompt: string,
     intent: QueryIntent,
     candidates: ExperienceMatch[],
-  ): Promise<SelectedExperience[]> {
-    if (candidates.length === 0) return []
+  ): Promise<{ selected: SelectedExperience[]; path: ExperienceSelectionPath; ranked: SelectedExperience[] }> {
+    if (candidates.length === 0) {
+      return { selected: [], path: 'no_candidates', ranked: [] }
+    }
 
     const locallyRanked = this._rankCandidates(prompt, intent, candidates)
     const localFallback = locallyRanked
@@ -257,7 +381,7 @@ export class ExperienceWorkingSetManager {
       .slice(0, EXPERIENCE_INJECTION_LIMIT)
 
     if (!this.flashClient) {
-      return localFallback
+      return { selected: localFallback, path: 'no_flash_client', ranked: locallyRanked }
     }
 
     // Soft deadline, same shape as QueryAnalyzer's.
@@ -300,15 +424,28 @@ export class ExperienceWorkingSetManager {
       label: 'experience-working-set',
     }))
 
-    if (!raw) return localFallback
-    const ids = parseApplicableExperienceIds(raw, candidates)
-    if (ids.size === 0) return localFallback
+    // Every branch below returns the same `localFallback` the original code
+    // returned; only the recorded reason differs.
+    if (!raw) return { selected: localFallback, path: 'flash_timeout', ranked: locallyRanked }
+
+    const outcome = parseApplicableExperienceIds(raw, candidates)
+    if (outcome.kind === 'unparseable') {
+      return { selected: localFallback, path: 'flash_unparseable', ranked: locallyRanked }
+    }
+    if (outcome.ids.size === 0) {
+      return {
+        selected: localFallback,
+        path: outcome.namedCount > 0 ? 'flash_invalid_ids' : 'flash_empty',
+        ranked: locallyRanked,
+      }
+    }
 
     const byId = new Map(locallyRanked.map(s => [s.experience.id, s]))
-    return [...ids]
+    const selected = [...outcome.ids]
       .map(id => byId.get(id))
       .filter((s): s is SelectedExperience => Boolean(s))
       .slice(0, EXPERIENCE_INJECTION_LIMIT)
+    return { selected, path: 'flash_selected', ranked: locallyRanked }
   }
 
   /**
@@ -404,7 +541,26 @@ export class ExperienceWorkingSetManager {
     }).sort((a, b) => b.localScore - a.localScore)
   }
 
-  private _refreshSlots(selections: SelectedExperience[]): void {
+  /**
+   * Check the selected experiences into the pager.
+   *
+   * Returns the selections the pager refused. `checkout()` has always returned
+   * a boolean and this method has always ignored it, so an experience larger
+   * than the whole non-sticky budget vanished with no record anywhere — the
+   * model never saw it and nothing said so. The return value is now captured so
+   * provenance can report the exclusion.
+   *
+   * The drop itself is unchanged on purpose: G0's contract is that it does not
+   * alter Agent behaviour, and truncating the content to make it fit would
+   * change what the model reads. Fixing it is a separate decision, and one that
+   * should be made after the data says how often it actually happens.
+   */
+  private _refreshSlots(
+    selections: SelectedExperience[],
+    queryHash: string,
+    selectionPath: ExperienceSelectionPath,
+  ): SelectedExperience[] {
+    const rejected: SelectedExperience[] = []
     for (const selection of selections) {
       const e = selection.experience
       const icon = e.outcome === 'success' ? '✓' : '⚠️'
@@ -418,7 +574,7 @@ export class ExperienceWorkingSetManager {
         ...(e.workarounds?.length ? [`**Workarounds:** ${e.workarounds.join(' / ')}`] : []),
       ]
       const content = lines.join('\n')
-      this.contextPager.checkout({
+      const accepted = this.contextPager.checkout({
         id:       `experience:${e.id}`,
         tag:      `${icon} [EXP] ${e.title.slice(0, 40)}`,
         content,
@@ -426,8 +582,24 @@ export class ExperienceWorkingSetManager {
         priority: 'medium',
         ttlTurns: 4,
         source:   'experience',
+        // Identity travels with the slot: by the time this slot is rendered the
+        // working set may have moved on, and the pager has no way back to the
+        // selection that produced it. queryHash in particular is stamped here,
+        // so a slot still being injected three turns later still points at the
+        // query that actually retrieved it.
+        provenance: {
+          entryId:         e.id,
+          contentHash:     e.contentHash,
+          queryHash,
+          // The route is part of the effective selector: a turn where the judge
+          // chose and a turn where it timed out and local ranking chose are two
+          // different selectors, even though the version constant is the same.
+          selectorVersion: `${EXPERIENCE_SELECTOR_VERSION}/${selectionPath}`,
+        },
       })
+      if (!accepted) rejected.push(selection)
     }
+    return rejected
   }
 
   private _queryHash(prompt: string): string {

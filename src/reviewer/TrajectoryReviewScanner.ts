@@ -327,13 +327,65 @@ function renderKnownItem(item: TrajectoryItem): string {
     case 'job':
       return `job ${item.action} id=${item.jobId} summary=${item.summary ?? ''}`
     case 'knowledge':
-      return `knowledge ${item.kind}/${item.action} entries=${item.entryIds.join(',')}`
+      return `knowledge ${item.kind}/${item.action} entries=${item.entryIds.join(',')}` +
+        renderInjectionProvenance(item)
     case 'state_checkpoint':
       return `checkpoint ${item.mode} revision=${String(item.revision ?? '')} hash=${item.contentHash}`
     case 'evaluation':
       return `evaluation by=${item.evaluator} verdict=${item.verdict} score=${String(item.score ?? '')} ` +
         `evidence=${(item.evidenceOrdinals ?? []).join(',')} details=${JSON.stringify(item['details'] ?? {})}`
   }
+}
+
+const MAX_RENDERED_INJECTIONS = 6
+const MAX_RENDERED_REASON_CODES = 4
+
+/**
+ * Injection provenance, summarised for the Reviewer.
+ *
+ * The Reviewer is the read side of attribution: it is what will eventually be
+ * asked "did this injected experience change anything". Rendering only
+ * `entries=exp-1` would tell it an entry was present but not which version,
+ * which selector chose it, or what it cost — the parts attribution needs.
+ *
+ * Appends nothing when the item carries no provenance, so every knowledge line
+ * written before injection existed renders byte-identically and no existing
+ * TaskCase window identity moves.
+ *
+ * Entry bodies are never rendered; only ids, truncated content hashes, selector
+ * identity and reason codes, all of which the host already constrains.
+ */
+function renderInjectionProvenance(item: Extract<TrajectoryItem, { type: 'knowledge' }>): string {
+  const parts: string[] = []
+
+  const injected = item.injected ?? []
+  if (injected.length > 0) {
+    const shown = injected.slice(0, MAX_RENDERED_INJECTIONS)
+    const rendered = shown.map(entry => `${entry.entryId}@${entry.contentHash.slice(0, 8)}`).join(',')
+    const overflow = injected.length > shown.length ? `,+${injected.length - shown.length}` : ''
+    parts.push(`injected=${injected.length}[${rendered}${overflow}]`)
+
+    const selectors = [...new Set(shown.map(entry => entry.selectorVersion))]
+    if (selectors.length > 0) parts.push(`selector=${selectors.join('|')}`)
+
+    // Only surfaced when the selector actually assigned probabilistically —
+    // its absence is meaningful and must not read as a default.
+    const probabilistic = shown.filter(entry => entry.assignmentProbability !== undefined)
+    if (probabilistic.length > 0) {
+      parts.push(`propensity=${probabilistic.map(entry => entry.assignmentProbability!.toFixed(3)).join(',')}`)
+    }
+  }
+
+  const excluded = item.excludedCandidates ?? []
+  if (excluded.length > 0) {
+    const codes = [...new Set(excluded.map(candidate => candidate.reasonCode))].slice(0, MAX_RENDERED_REASON_CODES)
+    parts.push(`excluded=${excluded.length}(${codes.join(',')})`)
+  }
+
+  if (item.tokenCost !== undefined) parts.push(`tokens=${item.tokenCost}`)
+  if (item.contextHash) parts.push(`context=${item.contextHash.slice(0, 8)}`)
+
+  return parts.length > 0 ? ` ${parts.join(' ')}` : ''
 }
 
 function failureSignature(item: Extract<TrajectoryItem, { type: 'tool_outcome' }>): string {

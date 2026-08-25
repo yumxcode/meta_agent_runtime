@@ -58,6 +58,16 @@ Rules:
 // ─────────────────────────────────────────────────────────────────────────────
 
 /** Simple djb2-style hash for cache keys. */
+/**
+ * Selector identity for injections originating from this hook.
+ *
+ * Deliberately distinct from the working set's: this path is triggered by a
+ * planned operation rather than a user query, checks out at 'high' priority,
+ * and can therefore displace working-set slots. Attribution that could not tell
+ * the two apart would credit the wrong selector for whatever followed.
+ */
+const VV_EXPERIENCE_SELECTOR_VERSION = 'vv-failure-pattern-v1'
+
 function hashish(text: string): string {
   let h = 5381
   for (let i = 0; i < Math.min(text.length, 400); i++) {
@@ -219,6 +229,16 @@ export class ExperiencePatternChecker implements VVHook {
           priority: 'high',
           ttlTurns: 3,
           source: 'vv_hook',
+          // This hook is a second, independent producer feeding the same pager
+          // at a higher priority than the working set. Without identity on the
+          // slot its injections would be invisible to provenance, or worse,
+          // misattributed to the selector that never chose them.
+          provenance: {
+            entryId:         e.id,
+            contentHash:     e.contentHash,
+            queryHash:       hashish(text),
+            selectorVersion: VV_EXPERIENCE_SELECTOR_VERSION,
+          },
         })
       }
     }

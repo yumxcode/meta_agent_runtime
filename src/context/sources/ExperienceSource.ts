@@ -10,6 +10,7 @@ import type { ExperienceStore } from '../../robotics/ExperienceStore.js'
 import { experienceRetrievalScore } from '../../robotics/ExperienceStore.js'
 import type { IKnowledgeSource, ExperienceMatch, ExperienceListOpts } from './IKnowledgeSource.js'
 import type { ExperienceEntry } from '../../robotics/types.js'
+import { experienceContentHash } from '../../infra/knowledge/contentHash.js'
 
 const MAX_CANDIDATE_POOL = 60
 
@@ -41,6 +42,11 @@ function keywordHitCount(entry: ExperienceEntry, keywords: string[]): number {
 function toMatch(e: ExperienceEntry): ExperienceMatch {
   return {
     id: e.id,
+    // Computed from the entry as it was retrieved. `search()` hands back
+    // fullReport-stripped copies, which is exactly why fullReport is outside
+    // the hash — see contentHash.ts. Without that exclusion the same entry
+    // would hash differently here than it does after `load()`.
+    contentHash: experienceContentHash(e),
     title: e.title,
     domain: e.domain,
     outcome: e.outcome.success ? 'success' : 'failure',

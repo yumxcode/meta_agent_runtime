@@ -1,5 +1,7 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import { isPhysicalAnchorId, type PhysicalAnchorStore } from '../../PhysicalAnchorStore.js'
+import { physicalAnchorContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createPhysicalAnchorLoadTool(store: PhysicalAnchorStore): MetaAgentTool {
   return {
@@ -43,13 +45,18 @@ export function createPhysicalAnchorLoadTool(store: PhysicalAnchorStore): MetaAg
           ...(anchor.invalidates?.length ? ['## Invalidates', ...anchor.invalidates.map(item => `- ${item}`), ''] : []),
           ...(anchor.principleIds?.length ? ['## Depended-on by Principles', ...anchor.principleIds.map(id => `- ${id}`), ''] : []),
         ]
+        const content = lines.join('\n')
         return {
-          content: lines.join('\n'),
+          content,
           isError: false,
-          trajectoryItems: [{
-            type: 'knowledge', kind: 'anchor', action: 'recalled',
-            entryIds: [anchor.id], operation: 'recall',
-          }],
+          // See experience_load: a load is an injection, not a retrieval.
+          trajectoryItems: buildExplicitToolInjectionItems({
+            kind: 'anchor',
+            tool: 'physical_anchor_load',
+            toolInput: input,
+            entries: [{ entryId: anchor.id, contentHash: physicalAnchorContentHash(anchor) }],
+            content,
+          }),
         }
       } catch (err) {
         return { content: `physical_anchor_load failed: ${String(err)}`, isError: true }

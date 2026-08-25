@@ -1,5 +1,7 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import { isExperienceId, type ExperienceStore } from '../../ExperienceStore.js'
+import { experienceContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool {
   return {
@@ -60,13 +62,21 @@ export function createExperienceLoadTool(store: ExperienceStore): MetaAgentTool 
           ...(entry.sourceTaskId ? [`**Source task**: ${entry.sourceTaskId}`, ''] : []),
           ...(entry.fullReport ? ['---', '## Full Report', entry.fullReport] : []),
         ]
+        const content = lines.join('\n')
         return {
-          content: lines.join('\n'),
+          content,
           isError: false,
-          trajectoryItems: [{
-            type: 'knowledge', kind: 'experience', action: 'recalled',
-            entryIds: [entry.id], operation: 'recall',
-          }],
+          // `injected`, not `recalled`: nothing was retrieved here — the model
+          // already had the id and this call put the whole entry, full report
+          // included, into its context. Recording it as a recall is what made
+          // the model-initiated channel invisible to attribution.
+          trajectoryItems: buildExplicitToolInjectionItems({
+            kind: 'experience',
+            tool: 'experience_load',
+            toolInput: input,
+            entries: [{ entryId: entry.id, contentHash: experienceContentHash(entry) }],
+            content,
+          }),
         }
       } catch (err) {
         return { content: `experience_load failed: ${String(err)}`, isError: true }

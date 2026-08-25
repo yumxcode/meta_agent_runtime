@@ -57,6 +57,28 @@ export const TRAJECTORY_ITEM_FIXTURES: readonly TrajectoryItem[] = [
     entryIds: ['exp-1'], query: 'controller', operation: 'recall',
   },
   {
+    type: 'knowledge', kind: 'experience', action: 'injected',
+    entryIds: ['exp-1'], operation: 'inject',
+    injected: [{
+      entryId: 'exp-1',
+      contentHash: 'a'.repeat(64),
+      versionChain: ['exp-1@1'],
+      sourceCaseId: 'case_0123456789abcdef01234567',
+      selectorVersion: 'cue-match-v1',
+      queryHash: 'b'.repeat(64),
+      slot: 0,
+      order: 0,
+      targetRunId: '00000000-0000-4000-8000-0000000000a1',
+    }],
+    excludedCandidates: [{
+      entryId: 'exp-2',
+      contentHash: 'c'.repeat(64),
+      reasonCode: 'excluded_boundary',
+    }],
+    contextHash: 'd'.repeat(64),
+    tokenCost: 420,
+  },
+  {
     type: 'state_checkpoint', mode: 'auto', stateSchemaVersion: '1.1', revision: 2,
     contentHash: 'abc', storeRef: '/workspace/checkpoint.json',
   },

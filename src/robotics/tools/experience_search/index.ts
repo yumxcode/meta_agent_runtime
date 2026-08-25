@@ -1,6 +1,8 @@
 import type { MetaAgentTool, ToolResult } from '../../../core/types.js'
 import type { ExperienceStore } from '../../ExperienceStore.js'
 import type { RoboticsDomain } from '../../types.js'
+import { experienceContentHash } from '../../../infra/knowledge/contentHash.js'
+import { buildExplicitToolInjectionItems } from '../../../evolution/InjectionProvenance.js'
 
 export function createExperienceSearchTool(store: ExperienceStore): MetaAgentTool {
   return {
@@ -88,13 +90,30 @@ export function createExperienceSearchTool(store: ExperienceStore): MetaAgentToo
             '',
           ].join('\n')
         })
+        const content = `Found ${results.length} experience(s):\n\n${lines.join('\n')}`
         return {
-          content: `Found ${results.length} experience(s):\n\n${lines.join('\n')}`,
+          content,
           isError: false,
-          trajectoryItems: [{
-            type: 'knowledge', kind: 'experience', action: 'recalled',
-            entryIds: results.map(entry => entry.id), query: JSON.stringify(input), operation: 'recall',
-          }],
+          trajectoryItems: [
+            // Unchanged: a query really did run, and this is the record of it.
+            {
+              type: 'knowledge', kind: 'experience', action: 'recalled',
+              entryIds: results.map(entry => entry.id), query: JSON.stringify(input), operation: 'recall',
+            },
+            // Added: this tool is not an index. It prints problem, solution,
+            // failure reason and workarounds for every hit, so the bodies
+            // entered context and that is a separate fact from the query.
+            ...buildExplicitToolInjectionItems({
+              kind: 'experience',
+              tool: 'experience_search',
+              toolInput: input,
+              entries: results.map(entry => ({
+                entryId: entry.id,
+                contentHash: experienceContentHash(entry),
+              })),
+              content,
+            }),
+          ],
         }
       } catch (err) {
         return { content: `experience_search failed: ${String(err)}`, isError: true }
