@@ -34,8 +34,11 @@ describe('trajectory schema governance', () => {
   })
 
   it('matches the frozen schema fingerprint', () => {
-    // Moved for item schema 1.2.0 (additive knowledge injection provenance).
+    // Moved for item schema 1.3.0: run_started gained an optional `gitBase`
+    // (G1-1). Additive, and only ever present on lines written after it — the
+    // field is what finally makes a run's starting point recoverable, which
+    // every EvalCase depends on.
     const hash = createHash('sha256').update(trajectorySchemaFingerprint()).digest('hex').slice(0, 16)
-    expect(hash).toBe('5e60f8d1ad1ed430')
+    expect(hash).toBe('55adba39f62b05fa')
   })
 })

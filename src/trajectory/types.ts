@@ -7,7 +7,7 @@ export const TRAJECTORY_LINE_SCHEMA_VERSION = 'trajectory-line-1.0' as const
  * 1.2.0 — additive: knowledge items gained the five retrieval/injection states
  * and injection provenance fields. Existing producers stay valid.
  */
-export const TRAJECTORY_ITEM_SCHEMA_VERSION = '1.2.0' as const
+export const TRAJECTORY_ITEM_SCHEMA_VERSION = '1.3.0' as const
 
 export const TrajectorySubjectSchema = z.discriminatedUnion('kind', [
   z.object({ kind: z.literal('session'), sessionId: z.string().min(1) }),
@@ -42,10 +42,35 @@ export const TrajectoryMetaItemSchema = itemBase.extend({
   source: z.string().optional(),
 }).passthrough()
 
+/**
+ * The workspace's git starting point for one run (G1-1).
+ *
+ * Recorded per run rather than per trajectory because a long session commits as
+ * it goes: a session-level base only describes the start of the first run, and
+ * every later run would need the whole history replayed to reach its own
+ * starting point.
+ *
+ * `dirty` and `untracked` are the honesty fields. A bare commit sha claims the
+ * commit describes the starting state; when either flag is set it does not, and
+ * a restore from that sha alone would begin somewhere the run never was.
+ */
+export const GitBaseSchema = z.object({
+  commit: z.string().regex(/^[0-9a-f]{40}$/),
+  branch: z.string().min(1).optional(),
+  dirty: z.boolean(),
+  untracked: z.boolean(),
+}).strict()
+
 export const RunStartedItemSchema = itemBase.extend({
   type: z.literal('run_started'),
   reason: z.string(),
   budget: z.record(z.string(), z.unknown()).optional(),
+  /**
+   * Absent when the workspace is not a git repository, or when the probe failed
+   * — an absent base honestly means "unknown starting point". It is never
+   * partially filled, because a half-filled base reads as usable.
+   */
+  gitBase: GitBaseSchema.optional(),
 }).passthrough()
 
 export const RunResultItemSchema = itemBase.extend({

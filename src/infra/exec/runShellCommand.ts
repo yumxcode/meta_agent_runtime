@@ -52,6 +52,16 @@ export interface RunShellCommandOptions {
   signal: AbortSignal
   /** Credential-hygiene policy for the child's env. Default: 'filtered'. */
   envPolicy?: ChildEnvPolicy
+  /**
+   * Variables applied AFTER filtering, so they survive any policy.
+   *
+   * This is how a caller hands one specific value to one specific child on
+   * purpose — the eval runner uses it to tell a verifier which workspace to
+   * inspect without putting the path in the command string, where quoting would
+   * be the candidate's problem to exploit. `buildChildEnv` already supports
+   * overrides; only the pass-through was missing.
+   */
+  envOverrides?: Record<string, string>
   /** OS sandbox handle. When present, the command is wrapped via wrapExec(). */
   sandboxHandle?: SandboxHandle
   /** Max characters retained per stream. Output past this is dropped. */
@@ -250,7 +260,7 @@ export async function runShellCommand(
   const res = await runProcessGroup(spec.file, spec.args, {
     timeoutMs: opts.timeoutMs,
     cwd,
-    env: buildChildEnv(opts.envPolicy ?? 'filtered'),
+    env: buildChildEnv(opts.envPolicy ?? 'filtered', opts.envOverrides),
     signal: opts.signal,
     captureLimit: opts.captureLimit,
   })

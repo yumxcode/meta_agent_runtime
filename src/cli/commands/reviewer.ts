@@ -4,11 +4,18 @@ import { loadModelConfig } from '../../core/config/ConfigService.js'
 import { readTrajectoryPreservingUnknown } from '../../trajectory/reader.js'
 import { trajectoryFile } from '../../trajectory/paths.js'
 import {
+  ACCEPTANCE_VERDICTS,
   KernelTaskCaseReviewer,
   ReviewerStore,
+  listTaskCaseDescriptors,
+  loadTaskCase,
   reduceTrajectoryLine,
   runTaskReviews,
+  summariseAcceptance,
+  type AcceptanceStatus,
+  type AcceptanceVerdict,
   type LearningProposal,
+  type TaskCase,
   type TaskReview,
   type TaskReviewerProgressEvent,
 } from '../../reviewer/index.js'
@@ -154,6 +161,33 @@ export async function runReviewerCommand(opts: CliOptions): Promise<void> {
         rl.close()
       }
       console.log(`审核结束：${approved} 条批准，${rejected} 条拒绝。`)
+      return
+    }
+    case 'rate': {
+      await runRateCommand(store, parsed)
+      return
+    }
+    case 'ratings': {
+      const statuses = await loadAcceptanceStatuses(store)
+      if (parsed.json) {
+        console.log(JSON.stringify({
+          summary: summariseAcceptance(statuses),
+          ratings: statuses,
+        }, null, 2))
+        return
+      }
+      const summary = summariseAcceptance(statuses)
+      if (summary.rated === 0) {
+        console.log(dim('尚无人工验收记录。运行 `meta-agent reviewer rate` 开始标注。'))
+        return
+      }
+      console.log(`${bold('人工验收 (T3)')}  已标注 ${summary.rated} 条，可用作 ground truth ${summary.usable} 条`)
+      for (const verdict of ACCEPTANCE_VERDICTS) {
+        console.log(`  ${verdict.padEnd(24)}${summary.byVerdict[verdict]}`)
+      }
+      if (summary.stale > 0) {
+        console.log(yellow(`  ${summary.stale} 条已过期：case 在标注后又有新内容，标签不再描述当前 case`))
+      }
       return
     }
     case 'approve': {
@@ -321,6 +355,135 @@ async function printProposal(proposal: LearningProposal, store?: ReviewerStore):
   console.log(`${'─'.repeat(72)}\n`)
 }
 
+// ── Human acceptance (T3) ────────────────────────────────────────────────────
+
+/** Single keystroke → verdict. `u` is offered as prominently as the rest. */
+const VERDICT_KEYS: Record<string, AcceptanceVerdict> = {
+  y: 'completed',
+  c: 'completed_with_concerns',
+  n: 'not_completed',
+  u: 'unclear',
+}
+
+async function loadAcceptanceStatuses(store: ReviewerStore): Promise<AcceptanceStatus[]> {
+  const recorded = await store.acceptance.list()
+  if (recorded.length === 0) return []
+
+  // Staleness is decided against the case as it stands now, so a label made on
+  // a shorter case is not silently counted as describing the longer one.
+  const descriptors = await listTaskCaseDescriptors({ all: true })
+  const byCaseId = new Map(descriptors.map(descriptor => [descriptor.caseId, descriptor]))
+
+  const statuses: AcceptanceStatus[] = []
+  for (const acceptance of recorded) {
+    const descriptor = byCaseId.get(acceptance.caseId)
+    if (!descriptor) {
+      // The trajectory is gone. The judgement stood at the time, but nothing
+      // can confirm it still applies.
+      statuses.push({ acceptance, stale: true })
+      continue
+    }
+    const loaded = await loadTaskCase(descriptor)
+    const current = 'inputHash' in loaded ? loaded.inputHash : undefined
+    statuses.push({ acceptance, stale: current === undefined || current !== acceptance.ratedInputHash })
+  }
+  return statuses
+}
+
+/**
+ * Walk unrated TaskCases and record one coarse verdict each.
+ *
+ * Deliberately shows only what the rater needs to answer "did this do what I
+ * asked?" — the task summary and how each run ended. Showing the full
+ * trajectory would invite them to reconstruct criteria from what happened,
+ * which is the retrospective-fitting failure this label exists to avoid.
+ */
+async function runRateCommand(store: ReviewerStore, parsed: ParsedReviewerArgs): Promise<void> {
+  if (!process.stdin.isTTY || !process.stdout.isTTY || parsed.json) {
+    throw new Error('reviewer rate requires an interactive terminal')
+  }
+
+  const rated = await store.acceptance.ratedCaseIds()
+  const descriptors = (await listTaskCaseDescriptors({ all: parsed.all, limit: parsed.limit }))
+    .filter(descriptor => parsed.force || !rated.has(descriptor.caseId))
+
+  if (descriptors.length === 0) {
+    console.log(dim(rated.size > 0
+      ? '所有 TaskCase 均已标注。加 --force 可重新标注。'
+      : '没有可标注的 TaskCase。'))
+    return
+  }
+
+  const rl = createInterface({ input: process.stdin, output: process.stdout, terminal: true })
+  let recorded = 0
+  try {
+    console.log(`${bold('人工验收标注')} ${dim(`(${descriptors.length} 条待标注)`)}`)
+    console.log(dim('只需回答「这件事有没有按我的要求做完」。判断不了就选 u —— 猜测会污染 ground truth。\n'))
+
+    for (const descriptor of descriptors) {
+      const loaded = await loadTaskCase(descriptor)
+      if (!('inputHash' in loaded)) {
+        console.log(dim(`跳过 ${descriptor.caseId}：${loaded.reason}\n`))
+        continue
+      }
+
+      printCaseForRating(loaded)
+      const answer = (await askQuestion(rl,
+        '判定 [y=完成 / c=完成但有保留 / n=未完成 / u=说不好 / s=跳过 / q=退出]: ')).trim().toLowerCase()
+      if (answer === 'q') break
+      if (answer === 's' || answer === '') {
+        console.log(dim('已跳过。\n'))
+        continue
+      }
+      const verdict = VERDICT_KEYS[answer]
+      if (!verdict) {
+        console.log(yellow('无法识别的输入，已跳过。\n'))
+        continue
+      }
+
+      const note = verdict === 'completed_with_concerns' || verdict === 'not_completed'
+        ? (await askQuestion(rl, '备注（可留空）: ')).trim()
+        : ''
+
+      await store.acceptance.record({
+        schemaVersion: 'human-acceptance-1.0',
+        caseId: loaded.id,
+        rootTrajectoryId: loaded.rootTrajectoryId,
+        verdict,
+        ratedInputHash: loaded.inputHash,
+        ratedAt: Date.now(),
+        ...(note ? { note } : {}),
+        agentClaimedSuccess: caseClaimedSuccess(loaded),
+      })
+      recorded += 1
+      console.log(green(`✓ 已记录 ${verdict}\n`))
+    }
+  } finally {
+    rl.close()
+  }
+  console.log(`标注结束：本次记录 ${recorded} 条。`)
+}
+
+function printCaseForRating(taskCase: TaskCase): void {
+  console.log(`${cyan(taskCase.id)}  ${dim(new Date(taskCase.lastActivity).toISOString())}`)
+  console.log(`  ${bold('任务')}: ${taskCase.taskSummary.slice(0, 400)}`)
+  console.log(`  ${dim('规模')}: ${taskCase.metrics.runs} runs · ${taskCase.metrics.toolCalls} 工具调用 · ` +
+    `${taskCase.metrics.toolErrors} 错误 · $${taskCase.metrics.totalCostUsd.toFixed(2)}`)
+  const outcomes = taskCase.members
+    .flatMap(member => member.entry.lastOutcome ? [member.entry.lastOutcome] : [])
+  if (outcomes.length > 0) console.log(`  ${dim('结束状态')}: ${outcomes.join(', ')}`)
+}
+
+/**
+ * Whether the agent itself claimed the task finished.
+ *
+ * This is `executor_self_report`, T0 — recorded here only so the human verdict
+ * has something to be compared against when false-success is computed.
+ */
+function caseClaimedSuccess(taskCase: TaskCase): boolean {
+  return taskCase.members.some(member => member.entry.lastOutcome === 'success')
+}
+
 function printTaskReviewList(reviews: readonly TaskReview[]): void {
   if (reviews.length === 0) {
     console.log(dim('暂无 TaskReview。'))
@@ -458,6 +621,9 @@ function reviewerUsage(): string {
     '  meta-agent reviewer approve <proposalId> [--note text]',
     '  meta-agent reviewer reject <proposalId> [--reason text]',
     '  meta-agent reviewer candidates [--limit N] [--json]',
+    '  meta-agent reviewer rate [--all] [--limit N] [--force]',
+    '    label whether each task was actually completed (human acceptance, T3)',
+    '  meta-agent reviewer ratings [--json]',
   ].join('\n')
 }
 

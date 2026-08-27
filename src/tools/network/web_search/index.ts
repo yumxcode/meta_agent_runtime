@@ -4,6 +4,8 @@ import { loadToolPrompt } from '../../util.js'
 import { mcpClients } from '../../mcp/registry.js'
 import { loadModelConfig } from '../../../core/config/ConfigService.js'
 import { RuntimeEnv } from '../../../infra/env/RuntimeEnv.js'
+import { PROVIDERS } from '../../../providers/registry.js'
+import { withAbortableTimeout } from '../../../core/utils/withTimeout.js'
 
 export interface WebSearchToolOptions {
   /** Anthropic API key (last-resort provider). */
@@ -14,18 +16,40 @@ export interface WebSearchToolOptions {
   tavilyApiKey?: string
 }
 
-export const DEFAULT_WEB_SEARCH_MODEL = 'claude-sonnet-4-6'
+/**
+ * Model for the Anthropic side-call, taken from the provider registry rather
+ * than written out here.
+ *
+ * A hardcoded model string in a leaf tool is a silent expiry date: when the
+ * registry moves on, this one keeps naming a model the API may no longer
+ * accept, and the failure surfaces at the very bottom of the fallback chain as
+ * a generic "all providers failed". Sourcing it from PROVIDERS means the search
+ * side-call ages with everything else. `fallback` (not `default`) is the right
+ * tier — this is a one-shot summarisation call, not the main loop.
+ */
+export const DEFAULT_WEB_SEARCH_MODEL =
+  PROVIDERS.anthropic.models.fallback ?? PROVIDERS.anthropic.models.default
 
 /**
- * Provider chain (cheapest / most purpose-built first):
- *   1. tavily    — direct REST call to api.tavily.com (no MCP, just fetch)
- *   2. glm       — Zhipu web-search-prime MCP (when registered)
- *   3. anthropic — claude side-call with the native web_search server tool
- *                  (a full Claude API request per search — most expensive)
+ * THE provider order: Tavily → GLM → Anthropic. Cheapest and most purpose-built
+ * first, a full Claude API request last.
+ *
+ * This array is the single source of that order. It used to be implied twice —
+ * once by the sequence of `if (pinned === …)` branches and once by the sequence
+ * of fallback blocks — so the two could drift apart without anything failing,
+ * and neither one stated the order as a fact you could read off. Both the pinned
+ * path and the fallback chain now iterate this list.
  *
  * Pin a single provider (no fallback) with META_AGENT_SEARCH_PROVIDER=
  * tavily | glm | anthropic — useful for cost control and debugging.
  */
+export const SEARCH_PROVIDER_ORDER = ['tavily', 'glm', 'anthropic'] as const
+export type SearchProviderId = (typeof SEARCH_PROVIDER_ORDER)[number]
+
+function isSearchProviderId(value: string): value is SearchProviderId {
+  return (SEARCH_PROVIDER_ORDER as readonly string[]).includes(value)
+}
+
 /** First argument that is a non-empty (after trim) string, else undefined. */
 function firstNonEmpty(...values: Array<string | undefined>): string | undefined {
   for (const v of values) {
@@ -42,6 +66,20 @@ const TAVILY_SNIPPET_CHARS = 600
 const GLM_MCP_SERVER = 'web-search-prime'
 const GLM_MCP_TOOL   = 'web_search_prime'
 
+// ── Deadlines ─────────────────────────────────────────────────────────────────
+//
+// Every provider is bounded. GLM got a deadline first, because its MCP client
+// takes no AbortSignal and a hung server could wedge an unattended run — but
+// Tavily and the Anthropic side-call were left leaning entirely on the caller's
+// signal, which is the kernel's whole-tool budget. One unresponsive endpoint
+// therefore consumed the time the NEXT provider in the chain needed, turning a
+// clean fallback into a timeout. Bounding each hop keeps the chain a chain.
+
+const TAVILY_SEARCH_TIMEOUT_MS    = 20_000
+const GLM_SEARCH_TIMEOUT_MS       = 30_000
+/** Higher: this is a full model turn that itself performs searches. */
+const ANTHROPIC_SEARCH_TIMEOUT_MS = 60_000
+
 // ── Provider: Tavily (direct REST — deliberately NOT an MCP server) ──────────
 
 async function callTavilySearch(
@@ -52,22 +90,26 @@ async function callTavilySearch(
   signal: AbortSignal | undefined,
 ): Promise<ToolResult> {
   try {
-    const res = await fetch(TAVILY_ENDPOINT, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${apiKey}`,
-      },
-      body: JSON.stringify({
-        query,
-        max_results: TAVILY_MAX_RESULTS,
-        search_depth: 'basic',
-        include_answer: true,
-        ...(allowedDomains?.length ? { include_domains: allowedDomains } : {}),
-        ...(blockedDomains?.length ? { exclude_domains: blockedDomains } : {}),
+    const res = await withAbortableTimeout(
+      deadline => fetch(TAVILY_ENDPOINT, {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${apiKey}`,
+        },
+        body: JSON.stringify({
+          query,
+          max_results: TAVILY_MAX_RESULTS,
+          search_depth: 'basic',
+          include_answer: true,
+          ...(allowedDomains?.length ? { include_domains: allowedDomains } : {}),
+          ...(blockedDomains?.length ? { exclude_domains: blockedDomains } : {}),
+        }),
+        signal: deadline,
       }),
-      ...(signal ? { signal } : {}),
-    })
+      TAVILY_SEARCH_TIMEOUT_MS,
+      signal,
+    )
     if (!res.ok) {
       const body = await res.text().catch(() => '')
       return { content: `Tavily search error: HTTP ${res.status} ${body.slice(0, 200)}`, isError: true }
@@ -100,7 +142,7 @@ async function callTavilySearch(
 // ── Provider: GLM web-search-prime MCP ────────────────────────────────────────
 
 /**
- * Deadline for the GLM MCP round trip.
+ * Bound a wait that cannot be cancelled.
  *
  * `McpClient.callTool` takes no AbortSignal, so this provider used to be barred
  * from autonomous runs outright ("non-abortable"): a hung MCP server could wedge
@@ -115,8 +157,6 @@ async function callTavilySearch(
  * late rejection cannot surface as an unhandled rejection (which the CLI treats
  * as fatal).
  */
-const GLM_SEARCH_TIMEOUT_MS = 30_000
-
 async function withDeadline<T>(
   work: Promise<T>,
   timeoutMs: number,
@@ -145,13 +185,16 @@ async function withDeadline<T>(
   }
 }
 
-/** Returns null when the web-search-prime MCP server is not registered. */
 async function callGlmSearch(
   query: string,
   signal: AbortSignal | undefined,
-): Promise<ToolResult | null> {
+): Promise<ToolResult> {
   const client = mcpClients.get(GLM_MCP_SERVER)
-  if (!client) return null
+  if (!client) {
+    // Availability is decided before dispatch (see resolveProviders), so this is
+    // a defensive path only — the server cannot vanish between the two.
+    return { content: `GLM search error: MCP server "${GLM_MCP_SERVER}" is not registered`, isError: true }
+  }
   try {
     const result = await withDeadline(
       client.callTool(GLM_MCP_TOOL, {
@@ -180,24 +223,77 @@ async function callAnthropicSearch(
   signal: AbortSignal | undefined,
 ): Promise<ToolResult> {
   try {
-    const client = new Anthropic({ apiKey, baseURL: 'https://api.anthropic.com' })
+    const client = new Anthropic({ apiKey, baseURL: PROVIDERS.anthropic.defaultBaseURL })
     const webSearchTool = {
       type: 'web_search_20250305',
       name: 'web_search',
       ...(input['allowed_domains'] ? { allowed_domains: input['allowed_domains'] } : {}),
       ...(input['blocked_domains'] ? { blocked_domains: input['blocked_domains'] } : {}),
     }
-    const response = await (client.messages as unknown as { create: (p: unknown, o: unknown) => Promise<{ content: Array<{ type: string; text?: string }> }> }).create({
-      model,
-      max_tokens: 1024,
-      tools: [webSearchTool],
-      messages: [{ role: 'user', content: `Search: ${query}. Provide a concise summary with sources.` }],
-    }, { signal })
+    const response = await withAbortableTimeout(
+      deadline => (client.messages as unknown as { create: (p: unknown, o: unknown) => Promise<{ content: Array<{ type: string; text?: string }> }> }).create({
+        model,
+        max_tokens: 1024,
+        tools: [webSearchTool],
+        messages: [{ role: 'user', content: `Search: ${query}. Provide a concise summary with sources.` }],
+      }, { signal: deadline }),
+      ANTHROPIC_SEARCH_TIMEOUT_MS,
+      signal,
+    )
     const text = response.content.filter(b => b.type === 'text' && b.text).map(b => b.text!).join('\n')
     return { content: text || 'No results found', isError: false }
   } catch (err) {
     return { content: `Anthropic search error: ${err instanceof Error ? err.message : String(err)}`, isError: true }
   }
+}
+
+// ── Chain assembly ────────────────────────────────────────────────────────────
+
+/**
+ * One provider, resolved against the current credentials and MCP registry.
+ *
+ * `unavailable` is a REASON, not a boolean: the same sentence is what the
+ * fallback chain reports as "skipped" and what a failed pin reports as the
+ * cause. Keeping one string means the two can never explain the same condition
+ * differently.
+ */
+interface ResolvedProvider {
+  id: SearchProviderId
+  unavailable: string | null
+  run: () => Promise<ToolResult>
+}
+
+function resolveProviders(
+  query: string,
+  input: Record<string, unknown>,
+  creds: { tavilyKey: string; anthropicKey: string; model: string },
+  signal: AbortSignal | undefined,
+): ResolvedProvider[] {
+  const allowedDomains = input['allowed_domains'] as string[] | undefined
+  const blockedDomains = input['blocked_domains'] as string[] | undefined
+
+  const byId: Record<SearchProviderId, ResolvedProvider> = {
+    tavily: {
+      id: 'tavily',
+      unavailable: creds.tavilyKey
+        ? null
+        : 'TAVILY_API_KEY not set (env or ~/.meta-agent/config.json)',
+      run: () => callTavilySearch(query, creds.tavilyKey, allowedDomains, blockedDomains, signal),
+    },
+    glm: {
+      id: 'glm',
+      unavailable: mcpClients.get(GLM_MCP_SERVER)
+        ? null
+        : `MCP server "${GLM_MCP_SERVER}" is not registered (set ZHIPU_API_KEY / mcp.json)`,
+      run: () => callGlmSearch(query, signal),
+    },
+    anthropic: {
+      id: 'anthropic',
+      unavailable: creds.anthropicKey ? null : 'ANTHROPIC_API_KEY not set',
+      run: () => callAnthropicSearch(query, creds.anthropicKey, creds.model, input, signal),
+    },
+  }
+  return SEARCH_PROVIDER_ORDER.map(id => byId[id])
 }
 
 // ── Tool ──────────────────────────────────────────────────────────────────────
@@ -209,6 +305,7 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
     abortSupport: 'cooperative',
     description,
     isConcurrencySafe: true,
+    permission: { category: 'network', planMode: 'allow' },
     inputSchema: {
       type: 'object',
       properties: {
@@ -222,8 +319,6 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
       const query = input['query'] as string
       if (!query || query.length < 2) return { content: 'Error: query must be ≥ 2 characters', isError: true }
 
-      const allowedDomains = input['allowed_domains'] as string[] | undefined
-      const blockedDomains = input['blocked_domains'] as string[] | undefined
       // Resolution: explicit option → env var → ~/.meta-agent/config.json
       // ("tavilyApiKey"). The config-file path is what most users actually
       // configure; without it the chain silently fell through to GLM MCP even
@@ -239,50 +334,44 @@ export async function createWebSearchTool(options: WebSearchToolOptions = {}): P
       // provider), not plain config — left at its source per RuntimeEnv's scope.
       const anthropicKey = options.apiKey ?? process.env['ANTHROPIC_API_KEY'] ?? ''
       const model = options.model ?? DEFAULT_WEB_SEARCH_MODEL
-      const pinned = RuntimeEnv.searchProviderPin()
+      const providers = resolveProviders(
+        query, input, { tavilyKey, anthropicKey, model }, ctx.abortSignal,
+      )
 
       // ── Pinned provider: exactly one attempt, no fallback ─────────────────
-      if (pinned === 'tavily') {
-        if (!tavilyKey) return { content: 'Error: META_AGENT_SEARCH_PROVIDER=tavily but TAVILY_API_KEY is not set.', isError: true }
-        return callTavilySearch(query, tavilyKey, allowedDomains, blockedDomains, ctx.abortSignal)
-      }
-      if (pinned === 'glm') {
-        const glm = await callGlmSearch(query, ctx.abortSignal)
-        return glm ?? { content: 'Error: META_AGENT_SEARCH_PROVIDER=glm but the web-search-prime MCP is not registered (set ZHIPU_API_KEY / mcp.json).', isError: true }
-      }
-      if (pinned === 'anthropic') {
-        if (!anthropicKey) return { content: 'Error: META_AGENT_SEARCH_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set.', isError: true }
-        return callAnthropicSearch(query, anthropicKey, model, input, ctx.abortSignal)
+      const pin = RuntimeEnv.searchProviderPin()
+      if (pin) {
+        if (!isSearchProviderId(pin)) {
+          return {
+            content:
+              `Error: META_AGENT_SEARCH_PROVIDER="${pin}" is not a known provider. ` +
+              `Valid values: ${SEARCH_PROVIDER_ORDER.join(' | ')}.`,
+            isError: true,
+          }
+        }
+        const provider = providers.find(p => p.id === pin)!
+        if (provider.unavailable) {
+          return {
+            content: `Error: META_AGENT_SEARCH_PROVIDER=${pin} but ${provider.unavailable}.`,
+            isError: true,
+          }
+        }
+        return provider.run()
       }
 
-      // ── Default chain: Tavily → GLM MCP → Anthropic ───────────────────────
+      // ── Default chain: Tavily → GLM → Anthropic ───────────────────────────
       const failures: string[] = []
       /** Providers that were not even attempted, and why. Reported on failure. */
       const skipped: string[] = []
 
-      if (tavilyKey) {
-        const tavily = await callTavilySearch(query, tavilyKey, allowedDomains, blockedDomains, ctx.abortSignal)
-        if (!tavily.isError) return tavily
-        failures.push(tavily.content)
-      } else {
-        skipped.push('tavily: TAVILY_API_KEY not set (env or ~/.meta-agent/config.json)')
-      }
-
-      // No autonomous-mode gate here any more: the wait is bounded (see
-      // GLM_SEARCH_TIMEOUT_MS), so an unresponsive server can no longer wedge an
-      // unattended run — which was the only reason to bar it. Barring it left a
-      // GLM-only install with zero providers in auto mode.
-      const glm = await callGlmSearch(query, ctx.abortSignal)
-      if (glm && !glm.isError) return glm
-      if (glm) failures.push(glm.content)
-      else skipped.push(`glm: MCP server "${GLM_MCP_SERVER}" is not registered (set ZHIPU_API_KEY / mcp.json)`)
-
-      if (anthropicKey) {
-        const anthropic = await callAnthropicSearch(query, anthropicKey, model, input, ctx.abortSignal)
-        if (!anthropic.isError) return anthropic
-        failures.push(anthropic.content)
-      } else {
-        skipped.push('anthropic: ANTHROPIC_API_KEY not set')
+      for (const provider of providers) {
+        if (provider.unavailable) {
+          skipped.push(`${provider.id}: ${provider.unavailable}`)
+          continue
+        }
+        const result = await provider.run()
+        if (!result.isError) return result
+        failures.push(result.content)
       }
 
       // Name what happened to EVERY provider. The old message reported only

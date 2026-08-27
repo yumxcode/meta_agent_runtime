@@ -46,6 +46,7 @@ import { runLoopCommand } from './commands/loop.js'
 import { runSteerCommand } from './commands/steer.js'
 import { runTasksCommand } from './commands/tasks.js'
 import { runSessionsCommand, runTrajectoryCommand } from './commands/trajectory.js'
+import { runEvalsetCommand } from './commands/evalset.js'
 import { runReviewerCommand } from './commands/reviewer.js'
 import { runRepl } from './repl.js'
 import { runSingleTurn, runAttachedAuto, runAutoSchedulerCommand } from './singleTurn.js'
@@ -90,6 +91,12 @@ async function main(): Promise<void> {
     }
     if (opts.loopCommand.name === 'reviewer') {
       await runReviewerCommand(opts)
+      return
+    }
+    // Read-only over the trajectory store and the eval-set store; like `tasks`
+    // and `trajectory`, it needs no API key.
+    if (opts.loopCommand.name === 'evalset') {
+      await runEvalsetCommand(opts)
       return
     }
     if (opts.loopCommand.name === 'auto-scheduler') {

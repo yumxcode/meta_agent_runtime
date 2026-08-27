@@ -106,8 +106,16 @@ ${bold('TRAJECTORIES (A3 audit store)')}
   meta-agent trajectory disk               Show canonical/index disk usage
   meta-agent trajectory telemetry          Incrementally project historical telemetry (--clean rebuilds)
   meta-agent trajectory parity             Compare canonical resume with legacy history (--clean resets evidence)
+  meta-agent trajectory corpus             Survey how many runs could become re-executable eval cases
   meta-agent trajectory gc                 Safe dry-run retention audit (apply disabled until lifecycle proof)
   meta-agent sessions --search <text>       Search trajectory-backed session metadata
+
+${bold('EVAL SETS (G1 controlled re-execution)')}
+  meta-agent evalset extract [--limit N]   Read-only: recover case candidates from task chains
+                                           ${dim('Reports what each draft is still missing; writes nothing.')}
+  meta-agent evalset list                  List eval sets
+  meta-agent evalset show <id>             Cases, split counts, and leakage check
+  meta-agent evalset freeze <id>           Freeze a set (refuses if any split leaks)
 
 ${bold('TRAJECTORY REVIEWER (manual, isolated)')}
   meta-agent reviewer run [--all|--limit N] [--max-cases N]
@@ -120,6 +128,9 @@ ${bold('TRAJECTORY REVIEWER (manual, isolated)')}
   meta-agent reviewer review                Interactively approve/reject pending proposals
   meta-agent reviewer approve|reject <id>   Record an explicit human decision
   meta-agent reviewer candidates            List human-approved ExperienceCandidate records
+  meta-agent reviewer rate [--all|--limit N] Label whether each task was actually completed
+                                            ${dim('Human acceptance = the only T3 evidence in the system.')}
+  meta-agent reviewer ratings [--json]      Acceptance counts, including stale labels
 
 ${bold('INTERACTIVE COMMANDS')}
   /mode                 Show current session mode
@@ -262,7 +273,7 @@ export interface CliOptions {
   mcpAppsOpen: boolean            // open the sidecar URL in the default browser
   /** Durable runtime subcommands. Args pass through verbatim. */
   loopCommand: {
-    name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer'
+    name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer' | 'evalset'
     args: string[]
   } | null
 }
@@ -277,10 +288,11 @@ export function parseCliArgs(): CliOptions {
   // that the strict global parser would try to interpret as flags.
   const loopIdx = rawArgs.findIndex(a =>
     a === 'loop' || a === 'loop-scheduler' || a === 'auto-scheduler' ||
-    a === 'steer' || a === 'tasks' || a === 'trajectory' || a === 'sessions' || a === 'reviewer')
+    a === 'steer' || a === 'tasks' || a === 'trajectory' || a === 'sessions' || a === 'reviewer' ||
+    a === 'evalset')
   if (loopIdx !== -1) {
     return buildLoopCliOptions(
-      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer',
+      rawArgs[loopIdx] as 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer' | 'evalset',
       rawArgs.slice(0, loopIdx),
       rawArgs.slice(loopIdx + 1),
     )
@@ -449,7 +461,7 @@ export function parseCliArgs(): CliOptions {
  * `loop` token is handed verbatim to runLoopCli, which does its own flag parsing.
  */
 export function buildLoopCliOptions(
-  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer',
+  name: 'loop' | 'loop-scheduler' | 'auto-scheduler' | 'steer' | 'tasks' | 'trajectory' | 'sessions' | 'reviewer' | 'evalset',
   globalArgs: string[],
   loopArgs: string[],
 ): CliOptions {

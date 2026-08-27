@@ -25,6 +25,9 @@ function buildRequestHeaders(): Record<string, string> {
     'User-Agent': RuntimeEnv.webFetchUserAgent(DEFAULT_USER_AGENT),
     Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,application/json;q=0.9,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
+    // Identity only. We decode nothing, so a server that honours this header
+    // cannot hand us a gzip stream that we would then decode as UTF-8 garbage.
+    'Accept-Encoding': 'identity',
   }
 }
 
@@ -32,7 +35,41 @@ function buildRequestHeaders(): Record<string, string> {
 const CACHE_MAX = 50
 /** Max redirects we follow manually. */
 const MAX_REDIRECTS = 5
-const cache = new Map<string, { content: string; expiresAt: number }>()
+
+/**
+ * Idle-socket deadline for ONE request hop, and the ceiling for the whole call
+ * (validation + every redirect hop + every address retry).
+ *
+ * web_fetch used to carry no deadline of its own: it passed the caller's signal
+ * (the kernel's per-tool timeout) straight through, so a server that trickled
+ * bytes below the size cap held the socket for the entire tool budget. "Slow"
+ * and "hung" were indistinguishable and both cost the maximum. The per-hop
+ * timeout also lets address failover move on quickly instead of waiting out a
+ * blackholed IP.
+ */
+const HOP_IDLE_TIMEOUT_MS = 20_000
+const TOTAL_TIMEOUT_MS = 45_000
+
+/** How many of the validated addresses to try before giving up. */
+const MAX_ADDRESS_ATTEMPTS = 3
+
+/**
+ * One cached page.
+ *
+ * The BODY is cached, not the rendered result. Caching the rendered string meant
+ * caching the `Prompt:` line baked into it, so a second fetch of the same URL
+ * with a different extraction goal replayed the FIRST call's prompt back to the
+ * model — a stale instruction presented as if it were the current one.
+ */
+export interface CachedPage {
+  finalUrl: string
+  text: string
+  /** Advisory prepended to the body (e.g. the SPA-shell warning). */
+  note?: string
+  expiresAt: number
+}
+
+const cache = new Map<string, CachedPage>()
 
 /** Evict all expired entries.  O(n) but cache is bounded at CACHE_MAX. */
 function evictExpired(): void {
@@ -51,6 +88,23 @@ export function clearWebFetchCache(): void {
   cache.clear()
 }
 
+/**
+ * @internal Seed the cache directly.
+ *
+ * Exists for tests: the SSRF guard refuses loopback, so a test cannot stand up a
+ * local server to populate the cache the normal way, and the prompt-vs-body
+ * caching rule is exactly the kind of thing that silently regresses.
+ */
+export function primeWebFetchCache(url: string, page: CachedPage): void {
+  cache.set(url, page)
+}
+
+/** Compose the tool result. The prompt is applied HERE, never cached. */
+export function renderPage(page: Pick<CachedPage, 'finalUrl' | 'text' | 'note'>, prompt: string): string {
+  const header = `URL: ${page.finalUrl}\nPrompt: ${prompt}\n\n---\n\n`
+  return `${header}${page.note ? `${page.note}\n\n` : ''}${page.text}`.trim()
+}
+
 function stripHtml(html: string): string {
   return html
     .replace(/<script[\s\S]*?<\/script>/gi, '')
@@ -58,6 +112,43 @@ function stripHtml(html: string): string {
     .replace(/<[^>]+>/g, ' ')
     .replace(/&amp;/g, '&').replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&nbsp;/g, ' ').replace(/&quot;/g, '"')
     .replace(/[ \t]{2,}/g, ' ').replace(/\n{3,}/g, '\n\n').trim()
+}
+
+// ── Content-type gate ─────────────────────────────────────────────────────────
+//
+// web_fetch returns TEXT. Everything that reached this tool used to be decoded
+// as UTF-8 regardless of what it was, so fetching a PDF, an image or a tarball
+// spent up to 100 KB of context on mojibake — and the model, seeing a non-error
+// result, would try to read meaning out of it. Refusing with a named reason is
+// both cheaper and actionable.
+
+type BodyKind = 'html' | 'json' | 'text' | 'binary'
+
+/** `application/…` subtypes that are text despite not living under `text/`. */
+const TEXTUAL_APPLICATION_SUBTYPE =
+  /^(?:json|xml|yaml|x-yaml|csv|javascript|ecmascript|x-ndjson|graphql|x-www-form-urlencoded|rss\+xml|atom\+xml)$/
+
+/** A NUL byte in the first KB is the classic "this is not text" tell. */
+function looksBinary(body: Buffer): boolean {
+  return body.subarray(0, 1024).includes(0)
+}
+
+function mimeOf(contentType: string): string {
+  return (contentType.split(';')[0] ?? '').trim().toLowerCase()
+}
+
+/** @internal exported for tests. */
+export function classifyBody(contentType: string, body: Buffer): BodyKind {
+  const mime = mimeOf(contentType)
+  // No declared type: sniff rather than guess, so a plain-text endpoint that
+  // omits the header keeps working.
+  if (!mime) return looksBinary(body) ? 'binary' : 'text'
+  if (mime === 'text/html' || mime === 'application/xhtml+xml') return 'html'
+  if (mime === 'application/json' || mime.endsWith('+json')) return 'json'
+  if (mime.startsWith('text/')) return 'text'
+  const [type, subtype = ''] = mime.split('/')
+  if (type === 'application' && TEXTUAL_APPLICATION_SUBTYPE.test(subtype)) return 'text'
+  return 'binary'
 }
 
 /**
@@ -85,8 +176,8 @@ function nonOkHint(url: string, status: number): string {
 }
 
 /** Heuristic: did an HTML page strip down to almost nothing (likely a SPA shell)? */
-function looksLikeEmptySpa(stripped: string, contentType: string): boolean {
-  return contentType.includes('html') && stripped.replace(/\s+/g, ' ').trim().length < 200
+function looksLikeEmptySpa(stripped: string, kind: BodyKind): boolean {
+  return kind === 'html' && stripped.replace(/\s+/g, ' ').trim().length < 200
 }
 
 // ── H1: SSRF defence ──────────────────────────────────────────────────────────
@@ -214,7 +305,7 @@ interface PinnedResponse {
   status: number
   statusText: string
   headers: Map<string, string>
-  text(): Promise<string>
+  bytes(): Buffer
 }
 
 type PinnedLookupCallback = (
@@ -248,7 +339,7 @@ export function createPinnedLookup(pinned: LookupAddress) {
 }
 
 /**
- * Perform a single HTTP(S) request PINNED to a set of pre-validated IPs.
+ * Perform a single HTTP(S) request PINNED to one pre-validated IP.
  *
  * The custom `lookup` short-circuits Node's DNS so the socket connects to an
  * address that already passed classifyIp() — there is no second, independent
@@ -258,12 +349,12 @@ export function createPinnedLookup(pinned: LookupAddress) {
  */
 function requestPinned(
   target: ValidatedTarget,
+  pinned: LookupAddress,
   signal: AbortSignal,
 ): Promise<PinnedResponse> {
   return new Promise<PinnedResponse>((resolvePromise, reject) => {
     const isHttps = target.url.protocol === 'https:'
     const requestFn = isHttps ? httpsRequest : httpRequest
-    const pinned = target.addresses[0]!
 
     // Custom lookup: ignore the queried hostname and return a validated IP.
     const pinnedLookup = createPinnedLookup(pinned)
@@ -295,7 +386,7 @@ function requestPinned(
             status,
             statusText: res.statusMessage ?? '',
             headers,
-            text: async () => '',
+            bytes: () => Buffer.alloc(0),
           })
           return
         }
@@ -314,28 +405,77 @@ function requestPinned(
           // and hold the connection/bandwidth until the tool timeout. Resolving
           // first makes the destroy-triggered 'error' a no-op (promise already
           // settled).
+          const body = Buffer.concat(chunks)
           resolvePromise({
             status,
             statusText: res.statusMessage ?? '',
             headers,
-            text: async () => Buffer.concat(chunks).toString('utf-8'),
+            bytes: () => body,
           })
           res.destroy()
         })
         res.on('end', () => {
+          const body = Buffer.concat(chunks)
           resolvePromise({
             status,
             statusText: res.statusMessage ?? '',
             headers,
-            text: async () => Buffer.concat(chunks).toString('utf-8'),
+            bytes: () => body,
           })
         })
         res.on('error', reject)
       },
     )
+    // Idle-socket deadline for THIS hop. Independent of the overall budget so a
+    // blackholed address is abandoned promptly and the next one gets a turn.
+    req.setTimeout(HOP_IDLE_TIMEOUT_MS, () => {
+      req.destroy(new Error(`no data for ${HOP_IDLE_TIMEOUT_MS}ms`))
+    })
     req.on('error', reject)
     req.end()
   })
+}
+
+/**
+ * Try the validated addresses in turn until one answers.
+ *
+ * Pinning previously used `addresses[0]` and nothing else, so a host whose first
+ * A record was down or blackholed failed outright even though the remaining
+ * records had passed the same validation and were sitting right there. Every
+ * candidate here is already classifyIp()-approved, so failover widens
+ * availability without widening the SSRF surface.
+ */
+export async function tryAddresses<T>(
+  addresses: readonly LookupAddress[],
+  signal: AbortSignal,
+  attempt: (address: LookupAddress) => Promise<T>,
+  label = 'host',
+): Promise<T> {
+  const candidates = addresses.slice(0, MAX_ADDRESS_ATTEMPTS)
+  let lastError: unknown
+  for (const address of candidates) {
+    try {
+      return await attempt(address)
+    } catch (err) {
+      // A caller-side abort (or the overall deadline) is final — retrying the
+      // next address would ignore the cancellation and burn the budget twice.
+      if (signal.aborted) throw err
+      lastError = err
+    }
+  }
+  throw lastError ?? new Error(`no usable address for ${label}`)
+}
+
+function requestWithFailover(
+  target: ValidatedTarget,
+  signal: AbortSignal,
+): Promise<PinnedResponse> {
+  return tryAddresses(
+    target.addresses,
+    signal,
+    address => requestPinned(target, address, signal),
+    target.resolvedHost,
+  )
 }
 
 async function fetchWithSafeRedirects(
@@ -346,7 +486,7 @@ async function fetchWithSafeRedirects(
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
     const check = await validateUrl(currentUrl)
     if (!check.ok) return { ok: false, reason: check.reason }
-    const res = await requestPinned(check.value, signal)
+    const res = await requestWithFailover(check.value, signal)
     // Treat 3xx with Location as a redirect we control — every hop is
     // re-validated AND re-pinned by the next loop iteration.
     if (res.status >= 300 && res.status < 400 && res.headers.get('location')) {
@@ -356,6 +496,36 @@ async function fetchWithSafeRedirects(
     return { ok: true, res, finalUrl: currentUrl }
   }
   return { ok: false, reason: `too many redirects (>${MAX_REDIRECTS})` }
+}
+
+/**
+ * A signal that aborts when the caller aborts OR when `ms` elapses, whichever
+ * comes first. `expired` distinguishes the two so the error message can say
+ * which one fired.
+ */
+export function callDeadline(parent: AbortSignal | undefined, ms: number): {
+  signal: AbortSignal
+  expired: () => boolean
+  dispose: () => void
+} {
+  const ctrl = new AbortController()
+  let expired = false
+  const onParentAbort = (): void => ctrl.abort(parent?.reason ?? new Error('aborted'))
+  const timer = setTimeout(() => {
+    expired = true
+    ctrl.abort(new Error(`web_fetch timed out after ${ms}ms`))
+  }, ms)
+  timer.unref?.()
+  if (parent?.aborted) onParentAbort()
+  else parent?.addEventListener('abort', onParentAbort, { once: true })
+  return {
+    signal: ctrl.signal,
+    expired: () => expired,
+    dispose: () => {
+      clearTimeout(timer)
+      parent?.removeEventListener('abort', onParentAbort)
+    },
+  }
 }
 
 export interface WebFetchToolOptions {
@@ -410,12 +580,14 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
         // moves this key to the most-recently-used end of the Map.
         cache.delete(url)
         cache.set(url, cached)
-        return { content: cached.content, isError: false }
+        // Rendered with THIS call's prompt — the cache holds the body only.
+        return { content: renderPage(cached, prompt), isError: false }
       }
       if (cached) cache.delete(url)  // expired entry found on direct lookup — remove it
 
+      const deadline = callDeadline(ctx.abortSignal, TOTAL_TIMEOUT_MS)
       try {
-        const fetchOutcome = await fetchWithSafeRedirects(url, ctx.abortSignal)
+        const fetchOutcome = await fetchWithSafeRedirects(url, deadline.signal)
         if (!fetchOutcome.ok) {
           return { content: `Refused: ${fetchOutcome.reason}`, isError: true }
         }
@@ -428,28 +600,47 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
         }
 
         const ct = res.headers.get('content-type') ?? ''
-        const raw = await res.text()
+        const body = res.bytes()
+        const kind = classifyBody(ct, body)
+        if (kind === 'binary') {
+          // Refuse rather than hand the model 100 KB of decoded noise it will
+          // try to interpret. Naming the type is what makes this recoverable.
+          return {
+            content:
+              `Refused: ${finalUrl} returned ${mimeOf(ct) || 'binary content'} ` +
+              `(${body.length} bytes). web_fetch reads text only — HTML, JSON, ` +
+              `plain text, XML/CSV/YAML. Hint: look for a text or JSON ` +
+              `representation of this resource (many sites expose one via an API), ` +
+              `or process the file with a dedicated tool instead of fetching it here.`,
+            isError: true,
+          }
+        }
+
+        const raw = body.toString('utf-8')
         let text: string
-        if (ct.includes('application/json')) {
+        if (kind === 'json') {
           try { text = JSON.stringify(JSON.parse(raw), null, 2) } catch { text = raw }
         } else {
-          text = ct.includes('html') ? stripHtml(raw) : raw
+          text = kind === 'html' ? stripHtml(raw) : raw
         }
         // Near-empty HTML almost always means a JavaScript-rendered (SPA) page —
         // tell the model so it doesn't treat the empty shell as "no results".
-        if (looksLikeEmptySpa(text, ct)) {
-          return {
-            content: `URL: ${finalUrl}\nPrompt: ${prompt}\n\n---\n\n` +
-              `[This page returned almost no text after HTML stripping — it is ` +
-              `likely client-rendered (SPA) and cannot be read by a raw fetch. ` +
-              `Try an API endpoint for this site, or a different source.]\n\n${text}`.trim(),
-            isError: false,
-          }
+        const note = looksLikeEmptySpa(text, kind)
+          ? '[This page returned almost no text after HTML stripping — it is ' +
+            'likely client-rendered (SPA) and cannot be read by a raw fetch. ' +
+            'Try an API endpoint for this site, or a different source.]'
+          : undefined
+        if (text.length > MAX_CONTENT) {
+          text = text.slice(0, MAX_CONTENT) + `\n[Truncated — ${text.length} chars total]`
         }
-        if (text.length > MAX_CONTENT) text = text.slice(0, MAX_CONTENT) + `\n[Truncated — ${text.length} chars total]`
 
-        const result = `URL: ${finalUrl}\nPrompt: ${prompt}\n\n---\n\n${text}`
-        cache.set(url, { content: result, expiresAt: Date.now() + 15 * 60 * 1000 })
+        const page: CachedPage = {
+          finalUrl,
+          text,
+          ...(note ? { note } : {}),
+          expiresAt: Date.now() + 15 * 60 * 1000,
+        }
+        cache.set(url, page)
         // Hard cap: if still over limit after TTL eviction, drop oldest entries.
         if (cache.size > CACHE_MAX) {
           evictExpired()
@@ -459,9 +650,19 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
             cache.delete(k)
           }
         }
-        return { content: result, isError: false }
+        return { content: renderPage(page, prompt), isError: false }
       } catch (err) {
+        if (deadline.expired()) {
+          return {
+            content:
+              `Fetch error: no response within ${TOTAL_TIMEOUT_MS}ms. ` +
+              'Hint: the host is slow or unreachable — try a different source.',
+            isError: true,
+          }
+        }
         return { content: `Fetch error: ${err instanceof Error ? err.message : String(err)}`, isError: true }
+      } finally {
+        deadline.dispose()
       }
     },
   }

@@ -70,6 +70,20 @@ export const EVALUATOR_REGISTRY: readonly EvaluatorProfile[] = [
       'does not run typecheck/test/lint, and it shares the executor\'s provider and ' +
       'runtime management plane. Usable as critique and a weak process signal.',
   },
+  {
+    id: 'human_acceptance',
+    tier: 'T3',
+    // A person judging their own task shares nothing with the executor: not the
+    // context, not the process, not the artifacts, not the identity, and the
+    // decision is theirs to govern.
+    independence: { context: true, process: true, artifact: true, identity: true, governance: true },
+    rationale:
+      'A person\'s coarse verdict on whether the task they asked for was actually done, ' +
+      'recorded through the Reviewer against a specific TaskCase (see reviewer/HumanAcceptance.ts). ' +
+      'The first T3 evidence in this system and therefore the only thing that can currently ' +
+      'anchor a promotion decision. It is ground truth for false-success measurement, NOT a ' +
+      'replayable success criterion — it cannot admit a case to sealed_test.',
+  },
 ] as const
 
 const BY_ID = new Map(EVALUATOR_REGISTRY.map(profile => [profile.id, profile]));

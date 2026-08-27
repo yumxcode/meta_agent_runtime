@@ -35,7 +35,8 @@ import { resolveProvider } from '../providers/registry.js'
 
 import { stripVolatileContextPrefix } from './utils/VolatileContext.js'
 import { createTelemetryRecorder } from './telemetry/recorder.js'
-import { openTrajectory, closeTrajectory } from '../trajectory/hub.js'
+import { openTrajectory, closeTrajectory, trajectoryEnabled } from '../trajectory/hub.js'
+import { captureGitBase, formatGitBase, type GitBase } from '../infra/git/gitBase.js'
 import { sha256, summarizeOutput } from '../trajectory/privacy.js'
 import type { TrajectoryRecorder } from '../trajectory/recorder.js'
 import type { RecordContext, TrajectoryItem, TrajectorySubject } from '../trajectory/types.js'
@@ -256,7 +257,17 @@ export class KernelSession {
     const turnId = crypto.randomUUID()
     const runStartedAt = Date.now()
     const runStartedCostUsd = this._totalCostUsd
-    const trajectory = await this._getTrajectoryRecorder()
+    // Probed once per run and reused for both the descriptor (first run only)
+    // and this run's run_started item, so a turn never pays for two git probes.
+    //
+    // Skipped entirely when trajectory recording is off: the probe spawns git,
+    // and paying that on every turn to produce a value nothing will record is
+    // pure cost. It also keeps the pre-run await window — during which an
+    // interrupt() has no controller to cancel — no wider than it already was.
+    const gitBase = trajectoryEnabled(this._config.trajectory?.enabled)
+      ? await captureGitBase(this._cwd)
+      : undefined
+    const trajectory = await this._getTrajectoryRecorder(gitBase)
     let trajectoryRecordChain: Promise<void> = Promise.resolve()
     const record = (item: TrajectoryItem, context: RecordContext = {}): void => {
       if (!trajectory) return
@@ -294,6 +305,7 @@ export class KernelSession {
             maxBudgetUsd: finiteOrNull(this._config.maxBudgetUsd),
             maxOutputTokens: finiteOrNull(this._config.maxOutputTokens),
           },
+          ...(gitBase ? { gitBase } : {}),
         }, { runId, turnId })
         const provider = resolveProvider({
           apiKey: this._config.apiKey,
@@ -823,7 +835,14 @@ export class KernelSession {
     }
   }
 
-  private _getTrajectoryRecorder(): Promise<TrajectoryRecorder | null> {
+  /**
+   * @param gitBase Starting point of the run that is opening this trajectory.
+   *   Only consumed when the trajectory is created, which is the first run —
+   *   the descriptor field describes where the whole trajectory began. Later
+   *   runs record their own base on `run_started`, which is the granularity a
+   *   replay actually needs.
+   */
+  private _getTrajectoryRecorder(gitBase?: GitBase): Promise<TrajectoryRecorder | null> {
     if (!this._trajectoryPromise) {
       const resolvedProvider = resolveProvider({
         apiKey: this._config.apiKey,
@@ -838,6 +857,10 @@ export class KernelSession {
         workspace: this._cwd,
         workspaceId: this._config.trajectory?.workspaceId,
         provider: resolvedProvider.provider,
+        // The field has existed since A3 with no assignment anywhere in the
+        // repository; this is it. Encoded as a string because the descriptor
+        // type predates the structured form.
+        gitBase: formatGitBase(gitBase),
         source: this._config.trajectory?.source ?? 'kernel_session',
       }, this._trajectoryOptions()).then(recorder => {
         this._trajectoryRecorder = recorder

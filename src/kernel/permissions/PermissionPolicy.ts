@@ -452,48 +452,172 @@ function detectSensitiveCommand(
  *   - a bare `/`   (e.g. `rm -rf /`, `cd /`)
  *   - a root glob  (e.g. `rm -rf /*`, `chmod -R 777 /*`)
  * Both clearly operate outside the workspace, so under the jail they are denied.
+ *
+ * The check is ARGUMENT-WISE, not substring-wise (see shellSplit). A pattern-
+ * match against the raw command string cannot tell an argument apart from text
+ * that merely contains the character, so every `~`, `..` and `/` inside a quoted
+ * literal read as an escape:
+ *   git commit -m "fix stance / swing gains"   → "targets filesystem root"
+ *   grep -n "/" log.txt                        → "targets filesystem root"
+ *   echo "loading .. done"                     → "references parent path"
+ * A commit message is the common case, and the denial named a path the command
+ * never touches. Splitting first and comparing whole arguments removes the
+ * ambiguity: `rm -rf /` has an argument that IS `/`; a commit message merely
+ * contains one.
  */
 function findBashRelativeEscape(
   input: Record<string, unknown>,
   commandField: string,
 ): string | null {
   const command = String(input[commandField] ?? '')
-  // `~` / `..` are only treated as PATHS when what follows them looks like a
-  // path or ends the argument: a `/`, a quote, end-of-command, or optional
-  // whitespace followed by a shell separator (`&&`, `||`, `;`, `|`, `)`, `>`).
-  //
-  // The trailing alternative used to be a bare `\s`, i.e. "anything followed by
-  // a space". That made `~` and `..` un-typable in their far more common
-  // NON-path roles and denied ordinary commands with a message pointing at the
-  // wrong thing entirely:
-  //   awk '$1 ~ /x/'   → "references home (~) — outside workspace"
-  //   echo "a .. b"    → "references parent path (..)"
-  // `~` is awk's regex-match operator and appears in nearly every awk one-liner,
-  // so the jail was rejecting a staple of shell work.
-  //
-  // Real escapes are still caught, because a path-shaped `~`/`..` always ends
-  // the argument or is followed by `/`:
-  //   cat ~/.ssh/id_rsa · rm -rf ~ · cd ~ && ls · rm -rf "~"
-  //   cat ../../etc/passwd · cd .. · cd .. ; ls
-  const PATH_TAIL = String.raw`(?:\/|['"]|$|\s*(?:$|[;&|)]|>{1,2}))`
-  const homeRe   = new RegExp(String.raw`(?:^|[\s'"=:(])~${PATH_TAIL}`)
-  const parentRe = new RegExp(String.raw`(?:^|[\s'"=:(])\.\.${PATH_TAIL}`)
-  if (homeRe.test(command)) {
-    return 'bash command references home (~) — outside workspace'
-  }
+  // $HOME is checked against the raw string: it expands inside double quotes
+  // too, so quoting does not make it inert the way it does for `~`.
   if (/\$\{?HOME\b/.test(command)) {
     return 'bash command references $HOME — outside workspace'
   }
-  if (parentRe.test(command)) {
-    return 'bash command references parent path (..) — may escape workspace'
-  }
-  // Filesystem root as a target: `/` or `/*` (optionally quoted). The leading
-  // boundary excludes in-workspace absolute paths like `/repo/src` (the char
-  // after `/` would be a letter, not `*`/space/end/quote).
-  if (/(?:^|[\s'"=:(])\/(?:\*|\s|$|['"])/.test(command)) {
-    return 'bash command targets filesystem root (/ or /*) — outside workspace'
+  for (const segment of shellSegments(command)) {
+    // A bare `/` is a root TARGET for a command that acts on paths, and a
+    // PATTERN for a command that matches text — `grep -n "/" log.txt` and
+    // `awk -F '/' …` name no path at all. Judging the token alone cannot tell
+    // those apart, so the root rule consults the segment's verb; `~` and `..`
+    // need no such carve-out (they are never pattern arguments once quoted
+    // text has been grouped into a single token).
+    const verbTreatsRootAsPattern = TEXT_PATTERN_TOOLS.has(segmentVerb(segment))
+    let afterRedirectOp = false
+    for (const token of segment) {
+      // A redirect TARGET is a write whatever the verb is, so `echo x >/` gets
+      // no pattern exemption. The operator may be glued to the path (`>/`) or
+      // stand alone (`> /`), hence the carry-over flag.
+      const isRedirectTarget = afterRedirectOp || REDIRECT_OP.test(token)
+      afterRedirectOp = new RegExp(`^${REDIRECT_OP.source}$`).test(token)
+      const rootIsAPattern = verbTreatsRootAsPattern && !isRedirectTarget
+      for (const candidate of escapeCandidates(token)) {
+        if (candidate === '~' || candidate.startsWith('~/')) {
+          return 'bash command references home (~) — outside workspace'
+        }
+        if (candidate === '..' || candidate.startsWith('../')) {
+          return 'bash command references parent path (..) — may escape workspace'
+        }
+        if (!rootIsAPattern && (candidate === '/' || /^\/\*+$/.test(candidate))) {
+          return 'bash command targets filesystem root (/ or /*) — outside workspace'
+        }
+      }
+    }
   }
   return null
+}
+
+/**
+ * Commands whose bare `/` argument is a separator or a pattern, never a target.
+ *
+ * Deliberately read-only text processors: none of them can damage the path they
+ * are handed, so exempting them costs the jail nothing. `find` and `tar` are
+ * absent on purpose — they DO act on the path they are given.
+ */
+const TEXT_PATTERN_TOOLS = new Set([
+  'grep', 'egrep', 'fgrep', 'rg', 'ag', 'ack',
+  'awk', 'gawk', 'mawk', 'nawk', 'sed', 'perl',
+  'echo', 'printf', 'tr', 'cut', 'paste', 'expr',
+  'basename', 'dirname', 'test',
+])
+
+/** Split a token list into pipeline/list segments on `;`, `&&`, `||`, `|`, `&`. */
+function shellSegments(command: string): string[][] {
+  const segments: string[][] = []
+  let current: string[] = []
+  for (const raw of shellSplit(command)) {
+    // A separator may stand alone (`a && b`) or be glued to the previous word
+    // (`a; b`, `a|b` when unspaced — the latter stays one token, which simply
+    // means the segment is judged under the first verb; harmless here).
+    const trimmed = raw.replace(/[;&|]+$/, '')
+    if (trimmed !== raw && trimmed) current.push(trimmed)
+    if (trimmed === '' || trimmed !== raw) {
+      if (current.length) segments.push(current)
+      current = []
+      continue
+    }
+    current.push(raw)
+  }
+  if (current.length) segments.push(current)
+  return segments
+}
+
+/**
+ * The command word of a segment, without its directory or leading `VAR=value`
+ * assignments: `/usr/bin/env` → `env`, `LC_ALL=C grep` → `grep`.
+ */
+function segmentVerb(segment: readonly string[]): string {
+  for (const token of segment) {
+    if (/^[A-Za-z_][A-Za-z0-9_]*=/.test(token)) continue   // env assignment prefix
+    const base = token.slice(token.lastIndexOf('/') + 1)
+    return base === 'sudo' || base === 'env' || base === 'command' || base === 'time'
+      ? ''   // wrapper: the real verb follows, so make no exemption claim
+      : base
+  }
+  return ''
+}
+
+/**
+ * Split a command into shell-ish arguments: whitespace separates, quotes group,
+ * and the quote characters themselves are removed so `"~"` yields `~`.
+ *
+ * Not a shell parser — it does not expand variables, split on `;`/`|`, or honour
+ * heredocs, and it does not need to. Its only job is to answer "is this whole
+ * argument a workspace escape?" without the quoted-literal false positives that
+ * a raw substring scan produces. Operators and separators survive as their own
+ * tokens (`&&`, `;`), which is harmless: none of them match an escape shape.
+ */
+function shellSplit(command: string): string[] {
+  const tokens: string[] = []
+  let current = ''
+  let open = false          // a token is in progress (may be an empty "" arg)
+  let quote: '"' | "'" | null = null
+  for (let i = 0; i < command.length; i++) {
+    const ch = command[i]!
+    if (quote) {
+      if (ch === quote) { quote = null; continue }
+      // Backslash escapes only apply inside double quotes (and unquoted).
+      if (quote === '"' && ch === '\\' && i + 1 < command.length) { current += command[++i]; continue }
+      current += ch
+      continue
+    }
+    if (ch === '"' || ch === "'") { quote = ch; open = true; continue }
+    if (ch === '\\' && i + 1 < command.length) { current += command[++i]; open = true; continue }
+    if (/\s/.test(ch)) {
+      if (open) { tokens.push(current); current = ''; open = false }
+      continue
+    }
+    current += ch
+    open = true
+  }
+  if (open) tokens.push(current)
+  return tokens
+}
+
+/**
+ * The path-shaped parts of one argument.
+ *
+ * Usually just the argument itself. Two adjustments:
+ *   - a leading redirect operator is dropped, so `2>/dev/null` is judged as
+ *     `/dev/null` rather than as a token starting with a digit;
+ *   - an OPTION of the form `--flag=value` also contributes `value`, which is
+ *     how `--exclude=/` or `--prefix=~` reach the check.
+ * The `=` split is restricted to arguments that start with `-`. Applying it to
+ * every argument re-broke bash's `=~` operator: `[[ $x =~ ^foo ]]` yielded the
+ * candidate `~` and was denied as a home-directory escape.
+ */
+/** A leading redirect operator, optionally prefixed by an fd number (`2>`). */
+const REDIRECT_OP = /^\d*(?:>>|>|<<<|<<|<)/
+
+function escapeCandidates(token: string): string[] {
+  const stripped = token.replace(REDIRECT_OP, '')
+  if (!stripped) return []
+  const candidates = [stripped]
+  if (stripped.startsWith('-')) {
+    const eq = stripped.indexOf('=')
+    if (eq >= 0 && eq + 1 < stripped.length) candidates.push(stripped.slice(eq + 1))
+  }
+  return candidates
 }
 
 async function applyBeforeToolGuard(

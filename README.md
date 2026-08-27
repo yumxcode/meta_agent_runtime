@@ -2,7 +2,7 @@
 
 面向工程与机器人算法开发的 TypeScript 智能体运行时。把流式模型调用、多轮工具循环、会话恢复、权限与沙箱、上下文压缩、无人值守自治、并发子代理、长周期图循环与知识沉淀封装成统一接口。既是 npm 库,也是开箱即用的 CLI。
 
-> 当前版本:`0.9.3` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
+> 当前版本:`0.9.4` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
 
 ---
 
@@ -303,7 +303,10 @@ const router = new SessionRouter({
 | --- | --- | --- |
 | 轨迹记录(A3) | **已交付**(v0.9.2) | 统一 JSONL 轨迹,默认开启 |
 | Reviewer 复盘 | **已交付**(v0.9.3) | 核心闭环可用,跨任务聚类与矛盾分析待实现 |
-| 自进化 | **契约先行,实施中** | 仅 G0 放行,不改变生产行为 |
+| 人工验收(T3) | **已交付**(v0.9.4) | `reviewer rate`,系统内第一个可锚定晋升的证据 |
+| 自进化 G0 信任契约 | **已交付**(v0.9.4) | 注入 provenance 可归因、注入渲染器已建(未接线) |
+| 自进化 G1 评测底座 | **已交付**(v0.9.4) | 隔离 runner + 合成 fixture 端到端;首批真实用例待人工策展 |
+| 自进化 G2 及之后 | **未放行** | 需先有真实评测集,见实施计划 |
 
 **轨迹记录**:每次运行按 `subject` 落一条带 schemaVersion 的 canonical JSONL(`~/.meta-agent/trajectories/<id>/trajectory.jsonl`),条目按 ordinal 可定位,写入前过脱敏。默认开启(测试环境除外),`META_AGENT_TRAJECTORY=0` 关闭。
 
@@ -450,4 +453,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.9.3`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。
+当前包版本:`0.9.4`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。

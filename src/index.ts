@@ -46,6 +46,7 @@ export * from './reviewer/index.js'
 // Pure contracts with no runtime wiring: evaluator trust tiers and data
 // eligibility. They gate future consumers; nothing depends on them yet.
 export * from './evolution/index.js'
+export * from './evaluation/index.js'
 export type {
   MetaAgentEvent,
   MetaAgentTextEvent,

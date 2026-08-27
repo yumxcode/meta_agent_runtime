@@ -123,6 +123,8 @@ const CLAUDE_SONNET: ModelPricing = { input: 3.0,  output: 15.0, cacheRead: 0.3,
 const CLAUDE_HAIKU:  ModelPricing = { input: 0.8,  output: 4.0,  cacheRead: 0.08, cacheWrite: 1.0 }
 
 const GLM_STD: ModelPricing = { input: 0.43, output: 1.74, cacheRead: 0.043, cacheWrite: 0.43 }
+/** Family-rule pricing for unpinned DeepSeek versions; matches deepseek-v4-flash. */
+const DEEPSEEK_STD: ModelPricing = { input: 0.1389, output: 0.2778, cacheRead: 0.00278, cacheWrite: 0.1389 }
 const GLM_AIR: ModelPricing = { input: 0.11, output: 0.28, cacheRead: 0.011, cacheWrite: 0.11 }
 
 export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
@@ -168,6 +170,7 @@ export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
       // -air entries MUST precede their bare prefixes; longest-match guards this
       // regardless, but keep the order readable.
       'glm-4.5-air': { contextWindow: 128_000, maxOutput: 131_072, pricing: GLM_AIR },
+      'glm-5.3':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5.2':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5.1':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5-turbo': { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_AIR },
@@ -248,20 +251,125 @@ function specOf(id: ProviderId): ProviderSpec {
   return id === 'unknown' ? PROVIDERS.anthropic : PROVIDERS[id]
 }
 
-/** Look up the most specific ModelSpec for a model name (longest prefix wins). */
-export function findModelSpec(model: string | undefined): ModelSpec | undefined {
-  if (!model) return undefined
+/**
+ * Canonical form for lookup: lower-cased, vendor prefix removed.
+ *
+ * Both normalisations fix silent misses that were indistinguishable from a
+ * real match, because the fallback window happened to equal a real model's:
+ * `GLM-4.6` and `zhipu/glm-5.2` both missed every table key and landed on the
+ * 200k default.
+ */
+export function normalizeModelName(model: string): string {
+  const withoutVendor = model.includes('/') ? model.slice(model.lastIndexOf('/') + 1) : model
+  return withoutVendor.trim().toLowerCase()
+}
+
+/**
+ * Version-aware family rules, consulted when the exact table misses.
+ *
+ * An enumerated table cannot keep up with releases: every new version silently
+ * became "unknown" and inherited a 200k window and Claude pricing. `glm-5.3`
+ * was 1M in reality, 200k here, and it compacted at 117k while its cost was
+ * tracked at roughly 7× the true rate — a wrong budget as well as a wrong
+ * window, both invisible.
+ *
+ * Rules key off the family and the MAJOR/MINOR version, so a future `glm-5.9`
+ * or `glm-6` resolves correctly without a code change. They are deliberately
+ * only used when nothing more specific matched, so a pinned table entry always
+ * wins over a rule.
+ */
+interface ModelFamilyRule {
+  /** Stable id, reported as the resolution source for diagnostics. */
+  id: string
+  /** Must capture the version as groups 1 (major) and optionally 2 (minor). */
+  test: RegExp
+  resolve: (major: number, minor: number) => ModelSpec
+}
+
+const MODEL_FAMILY_RULES: ModelFamilyRule[] = [
+  {
+    id: 'glm',
+    test: /^glm-(\d+)(?:\.(\d+))?/,
+    resolve: (major, minor) => ({
+      // 5.x and later ship a 1M window; 4.6/4.7 were 200k; earlier 4.x were 128k.
+      contextWindow: major >= 5 ? 1_000_000 : minor >= 6 ? 200_000 : 128_000,
+      maxOutput: 131_072,
+      pricing: GLM_STD,
+    }),
+  },
+  {
+    id: 'deepseek',
+    test: /^deepseek[-.]?(\d+)?/,
+    // The whole current DeepSeek line is 1M.
+    resolve: () => ({ contextWindow: 1_000_000, maxOutput: 131_072, pricing: DEEPSEEK_STD }),
+  },
+  {
+    id: 'claude',
+    test: /^claude-(\d+)?/,
+    // Anthropic's published default remains 200k; a longer window is opt-in per
+    // deployment, so it is not assumed here.
+    resolve: () => ({ contextWindow: 200_000, maxOutput: 65_536, pricing: CLAUDE_SONNET }),
+  },
+]
+
+/** How a model's spec was resolved. Reported so a fallback is never silent. */
+export type ModelSpecSource = 'exact' | 'family' | 'default'
+
+export interface ResolvedModelSpec {
+  spec: ModelSpec
+  source: ModelSpecSource
+  /** Table key or family rule id that produced it; absent for 'default'. */
+  matchedBy?: string
+}
+
+/**
+ * Resolve a model's spec, saying how it got there.
+ *
+ * Order: exact table (longest prefix) → family rule → default. The `source` is
+ * what makes a misconfigured model name diagnosable: a 200k window from
+ * `source: 'default'` means "we do not know this model", which used to be
+ * indistinguishable from a genuine 200k match.
+ */
+export function resolveModelSpec(model: string | undefined): ResolvedModelSpec {
+  if (!model) return { spec: { contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutput: 32_768, pricing: DEFAULT_PRICING }, source: 'default' }
+
+  const normalized = normalizeModelName(model)
+
   let best: ModelSpec | undefined
-  let bestLen = -1
-  for (const spec of PROVIDER_LIST) {
-    for (const [key, ms] of Object.entries(spec.modelTable)) {
-      if (model.startsWith(key) && key.length > bestLen) {
+  let bestKey = ''
+  for (const provider of PROVIDER_LIST) {
+    for (const [key, ms] of Object.entries(provider.modelTable)) {
+      if (normalized.startsWith(key) && key.length > bestKey.length) {
         best = ms
-        bestLen = key.length
+        bestKey = key
       }
     }
   }
-  return best
+  if (best) return { spec: best, source: 'exact', matchedBy: bestKey }
+
+  for (const rule of MODEL_FAMILY_RULES) {
+    const match = normalized.match(rule.test)
+    if (!match) continue
+    const major = Number(match[1] ?? 0)
+    const minor = Number(match[2] ?? 0)
+    return {
+      spec: rule.resolve(Number.isFinite(major) ? major : 0, Number.isFinite(minor) ? minor : 0),
+      source: 'family',
+      matchedBy: rule.id,
+    }
+  }
+
+  return {
+    spec: { contextWindow: DEFAULT_CONTEXT_WINDOW, maxOutput: 32_768, pricing: DEFAULT_PRICING },
+    source: 'default',
+  }
+}
+
+/** Look up the most specific ModelSpec for a model name. */
+export function findModelSpec(model: string | undefined): ModelSpec | undefined {
+  if (!model) return undefined
+  const resolved = resolveModelSpec(model)
+  return resolved.source === 'default' ? undefined : resolved.spec
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -287,8 +395,27 @@ export function getModelPricing(model: string): ModelPricing {
 }
 
 /** Per-model context window, falling back to 200K. */
+const warnedUnknownModels = new Set<string>()
+
 export function getModelContextWindow(model: string): number {
-  return findModelSpec(model)?.contextWindow ?? DEFAULT_CONTEXT_WINDOW
+  const resolved = resolveModelSpec(model)
+  if (resolved.source === 'default' && model && !warnedUnknownModels.has(model)) {
+    warnedUnknownModels.add(model)
+    // Said out loud, once per model. The previous silence was the actual
+    // problem: an unrecognised name inherited a 200k window that looked exactly
+    // like a real 200k model, so a mistyped or newly released model compacted
+    // at 117k with nothing anywhere reporting why.
+    console.warn(
+      `[meta-agent] unknown model '${model}': assuming a ${DEFAULT_CONTEXT_WINDOW / 1000}k context window ` +
+      `and default pricing. Set META_AGENT_AUTO_COMPACT_WINDOW to override the window if this is wrong.`,
+    )
+  }
+  return resolved.spec.contextWindow
+}
+
+/** Reset the once-per-model warning. Tests only. */
+export function clearUnknownModelWarningsForTests(): void {
+  warnedUnknownModels.clear()
 }
 
 /**

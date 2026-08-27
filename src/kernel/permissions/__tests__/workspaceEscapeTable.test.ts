@@ -61,6 +61,12 @@ describe('workspace jail — commands that MUST be denied', () => {
     ['parent before separator',         'cd .. ; ls'],
     ['filesystem root',                 'rm -rf /'],
     ['root glob',                       'chmod -R 777 /*'],
+    // The argument-wise rewrite must not soften these: a bare `/` argument is
+    // still a root target however it is quoted or glued to an option.
+    ['quoted filesystem root',          'rm -rf "/"'],
+    ['root as a redirect target',       'echo x >/'],
+    ['option-glued root',               'tar --exclude=/ -cf a.tar .'],
+    ['root at end of a chain',          'cd src && rm -rf /'],
     // Regression: /dev/ used to be exempt WHOLESALE, so block-device writes
     // sailed past the scan — and dd/mkfs are not in SENSITIVE_SHELL_PATTERNS
     // either, so auto mode's auto-approve had nothing left to stop them.
@@ -96,6 +102,18 @@ describe('workspace jail — commands that MUST be allowed', () => {
     ['ellipsis inside a string',       'echo "loading .. done"'],
     ['git commit range',               'git log v1.0..v2.0 --oneline'],
     ['relative path with inner ..',    'cat src/a/../b/file.ts'],
+    // Regression: the root check was a substring scan, so ANY lone `/` between
+    // spaces or quotes read as "targets filesystem root" — including one inside
+    // a commit message, which is where it bit hardest. The whole point of the
+    // rule is a bare `/` ARGUMENT; text that merely contains a slash is not one.
+    ['slash inside a commit message',  'git commit -m "x1: fix stance / swing gains"'],
+    ['slash as a grep pattern',        'grep -n "/" log.txt'],
+    ['slash as an awk field sep',      "awk -F '/' '{print $1}' paths.txt"],
+    ['slash inside an echo string',    'echo "cfg / docs updated"'],
+    ['compile then commit',            'python3 -m py_compile a/b.py && git add -A && git commit -m "sync cfg / docs"'],
+    // `..` and `~` inside quoted text are the same class of false positive.
+    ['parent-looking commit message',  'git commit -m "wip .. more to come"'],
+    ['tilde inside a commit message',  'git commit -m "approx ~ 3x faster"'],
   ]
 
   for (const [label, command] of allowed) {

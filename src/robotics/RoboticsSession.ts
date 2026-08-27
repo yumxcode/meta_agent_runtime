@@ -684,10 +684,9 @@ export class RoboticsSession implements RoboticsCapabilities {
     this._registerRuntimeTool(await createWebFetchTool({ maxResultSizeChars: MAIN_AGENT_WEB_FETCH_MAX_CHARS }))
     // web_search gives the agent a real discovery path so it stops guessing
     // search-page URLs (e.g. github.com/search) that 404. It self-selects a
-    // backend at call time — Anthropic web-search when ANTHROPIC_API_KEY is
-    // set, else the GLM web-search-prime MCP (ZHIPU_API_KEY) — and returns a
-    // clear "configure a backend" error if neither is available, which is
-    // still strictly better than fabricating dead URLs.
+    // provider at call time, strictly in the order Tavily → GLM → Anthropic
+    // (see SEARCH_PROVIDER_ORDER), and when none is configured it returns a
+    // message naming what to set — still better than fabricating dead URLs.
     this._registerRuntimeTool(await createWebSearchTool())
 
     // MCP tools — mcp_call / list_mcp_resources / read_mcp_resource. These talk

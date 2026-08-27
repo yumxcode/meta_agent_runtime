@@ -16,6 +16,7 @@ import {
 import { projectHistoricalTrajectoryTelemetry } from '../../trajectory/telemetryStore.js'
 import { projectTrajectoryResumeParity } from '../../trajectory/parityStore.js'
 import { readTrajectoryHealth } from '../../trajectory/health.js'
+import { surveyCorpus, formatCorpusSurvey } from '../../evaluation/CorpusSurvey.js'
 import {
   trajectoriesRoot,
   trajectoryFile,
@@ -160,6 +161,16 @@ export async function runTrajectoryCommand(opts: CliOptions): Promise<void> {
         }
         console.log('Release-cycle duration remains a time-based gate; this command only records evidence.')
       }
+      return
+    }
+    case 'corpus': {
+      // §10.3: how much of the corpus could support a re-executable EvalCase.
+      // Reported from G0 onward rather than discovered at G2, because if the
+      // answer is small the statistical design has to be redone for small
+      // samples before the machinery that assumes otherwise gets built.
+      const report = await surveyCorpus()
+      if (parsed.json) console.log(JSON.stringify(report, null, 2))
+      else console.log(formatCorpusSurvey(report))
       return
     }
     case 'gc': {

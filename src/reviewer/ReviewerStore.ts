@@ -23,6 +23,7 @@ import {
   type TaskReviewerRunManifest,
   type ExperienceDraft,
 } from './types.js'
+import { HumanAcceptanceStore } from './HumanAcceptance.js'
 
 export interface ReviewerPaths {
   root: string
@@ -63,9 +64,19 @@ export interface RecoverableTaskReviewResponse {
 
 export class ReviewerStore {
   readonly paths: ReviewerPaths
+  /**
+   * Human acceptance verdicts (T3).
+   *
+   * A sibling store rather than a field on TaskReview: rating is a separate act
+   * from reviewing, it happens at a different time, and keeping it out of the
+   * review record means recording a verdict cannot disturb TaskReview identity
+   * or the incremental-skip bookkeeping built on it.
+   */
+  readonly acceptance: HumanAcceptanceStore
 
   constructor(root = metaAgentPath('reviewer')) {
     const normalized = resolve(root)
+    this.acceptance = new HumanAcceptanceStore(normalized)
     this.paths = {
       root: normalized,
       proposals: join(normalized, 'proposals'),
@@ -83,6 +94,7 @@ export class ReviewerStore {
       this.paths.candidates,
       this.paths.taskReviews,
       this.paths.runs,
+      this.acceptance.path,
     ]) {
       await mkdir(dir, { recursive: true, mode: 0o700 })
       await chmod(dir, 0o700).catch(() => undefined)
