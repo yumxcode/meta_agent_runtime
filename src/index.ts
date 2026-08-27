@@ -100,6 +100,10 @@ export {
   makeJobId, TERMINAL_STATUSES, ACTIVE_STATUSES,
   JobStore, LocalExecutor, JobManager,
 } from './jobs/index.js'
+// Exported alongside the stores because embedders that mint their own session
+// or job ids need the same rule the stores enforce, and `StoreIdError` is a
+// documented failure mode of every public store entry point.
+export { validateStoreId, isValidStoreId, resolveWithinRoot, StoreIdError } from './infra/persist/storeId.js'
 export type { Executor, ExecutorCallbacks, SubmitOptions } from './jobs/index.js'
 
 // ── V&V (Validation & Verification) ──────────────────────────────────────────

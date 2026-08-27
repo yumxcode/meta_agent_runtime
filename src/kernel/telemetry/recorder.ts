@@ -47,6 +47,19 @@ export class TelemetryRecorder {
   private finished = false
   /** Schema violations seen this run, reported once each. */
   private readonly reportedViolations = new Set<string>()
+  /**
+   * P2-7 (review 2026-08-27): the fire-and-forget writes started by `observe()`
+   * were completely untracked, so `finish()` wrote the summary and closed the
+   * sink while an unknown number of record writes were still in flight — losing
+   * the tail of every run on a slow sink. This counts them so `finish()` can
+   * drain first.
+   *
+   * A counter plus a barrier promise rather than a Set of promises: `observe()`
+   * runs per event on a hot path, and this must not allocate a retained object
+   * per event (which was the other half of the unbounded-growth complaint).
+   */
+  private inFlightRecords = 0
+  private idleWaiters: Array<() => void> = []
 
   constructor(private readonly options: RecorderOptions) {
     this.runId = randomUUID()
@@ -80,10 +93,43 @@ export class TelemetryRecorder {
         event,
       }
       // Fire-and-forget: awaiting a disk write per event would put I/O latency
-      // on the path between the model and the user's terminal.
-      void this.sink.record(record).catch(err => this.report(err))
+      // on the path between the model and the user's terminal. Tracked, though,
+      // so finish() can drain what is still in flight (P2-7).
+      this.inFlightRecords++
+      void this.sink.record(record)
+        .catch(err => this.report(err))
+        .finally(() => this.settleRecord())
     } catch (err) {
       this.report(err)
+    }
+  }
+
+  private settleRecord(): void {
+    this.inFlightRecords--
+    if (this.inFlightRecords > 0) return
+    const waiters = this.idleWaiters
+    this.idleWaiters = []
+    for (const resolve of waiters) resolve()
+  }
+
+  /**
+   * Resolve once every record write started so far has settled.
+   *
+   * Bounded: a sink wedged forever must not stop the process from exiting, and
+   * telemetry is never worth blocking shutdown over.
+   */
+  private async drainRecords(timeoutMs = 5_000): Promise<void> {
+    if (this.inFlightRecords === 0) return
+    const idle = new Promise<void>(resolve => this.idleWaiters.push(resolve))
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const deadline = new Promise<void>(resolve => {
+      timer = setTimeout(resolve, timeoutMs)
+      timer.unref?.()
+    })
+    try {
+      await Promise.race([idle, deadline])
+    } finally {
+      if (timer) clearTimeout(timer)
     }
   }
 
@@ -110,6 +156,14 @@ export class TelemetryRecorder {
   async finish(): Promise<void> {
     if (this.finished) return
     this.finished = true
+    // P2-7: drain the record writes observe() started before writing the
+    // summary, so the summary is not ordered ahead of the events it summarises
+    // and the sink is not closed out from under them.
+    try {
+      await this.drainRecords()
+    } catch (err) {
+      this.report(err)
+    }
     try {
       await this.sink.summary(this.aggregator.build(this.now()))
     } catch (err) {

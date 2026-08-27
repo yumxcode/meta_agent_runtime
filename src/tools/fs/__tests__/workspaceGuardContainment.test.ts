@@ -7,8 +7,7 @@
  * module's own docstring records two call sites that grew private copies and
  * one of them ("/home/u/proj-backup" treated as inside "/home/u/proj") shipped.
  */
-import { mkdtempSync, mkdirSync, rmSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { mkdirSync, rmSync } from 'node:fs'
 import { join } from 'node:path'
 import { afterAll, describe, expect, it } from 'vitest'
 import {
@@ -16,8 +15,13 @@ import {
   pathIsUnder,
   resolveInsideWorkspace,
 } from '../workspaceGuard.js'
+import { makeTempDirSync } from '../../../__tests__/tempDir.js'
 
-const root = mkdtempSync(join(tmpdir(), 'workspace-guard-'))
+// §8.1: fully-resolved, because the guard under test canonicalises with
+// realpathSync() before comparing. On macOS a lexical `/var/folders/…` root
+// would be compared against the guard's `/private/var/folders/…` and every
+// containment assertion below would fail for the wrong reason.
+const root = makeTempDirSync('workspace-guard-')
 const workspace = join(root, 'proj')
 const sibling = join(root, 'proj-backup')
 mkdirSync(workspace, { recursive: true })

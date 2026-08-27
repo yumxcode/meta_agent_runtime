@@ -204,6 +204,23 @@ const DEFAULT_STDIO_MAX_RESPONSE_BYTES = 10 * 1024 * 1024
 /** Bound on a single unterminated stdout line, so a server that never emits a newline can't grow the buffer forever. */
 const MAX_PENDING_LINE_BYTES = 64 * 1024 * 1024
 
+/**
+ * Bound on a single unterminated STDERR line (P2-5, review 2026-08-27).
+ *
+ * stdout had both a response-byte cap and an unterminated-line cap; stderr had
+ * neither and simply did `stderrLine += chunk`. A server that logs continuously
+ * without ever emitting a newline — a progress spinner writing `\r`, or a
+ * runaway loop — grew that string until the process died of OOM.
+ *
+ * Much smaller than the stdout cap on purpose: stdout carries protocol payloads
+ * that are legitimately large, stderr carries human-readable log lines. 1 MiB
+ * of unbroken diagnostic text is already pathological.
+ */
+const MAX_STDERR_LINE_BYTES = 1024 * 1024
+
+/** Per-line print cap; the rest of an over-long line is summarised, not echoed. */
+const MAX_STDERR_ECHO_CHARS = 8 * 1024
+
 interface PendingRpc {
   resolve: (value: unknown) => void
   reject: (err: Error) => void
@@ -345,14 +362,43 @@ export class StdioMcpClient implements McpClient {
 
     // stderr is PIPED (not inherited) and prefixed, so server logs are
     // attributable and cannot corrupt the CLI's terminal rendering.
+    //
+    // P2-5: bounded on both axes. The accumulator is capped so an unterminated
+    // line cannot grow without limit (OOM), and each echoed line is truncated
+    // so one enormous log entry cannot flood the user's terminal. Neither cap
+    // tears down the server — stderr is diagnostics, and losing log text is a
+    // far better outcome than killing a working MCP connection over it.
     child.stderr?.setEncoding('utf8')
     let stderrLine = ''
+    let stderrOverflowed = false
     child.stderr?.on('data', (chunk: string) => {
+      if (this._child !== child) return          // stale generation
       stderrLine += chunk
       const lines = stderrLine.split('\n')
       stderrLine = lines.pop() ?? ''
+
+      if (stderrLine.length > MAX_STDERR_LINE_BYTES) {
+        // Drop the unterminated remainder and keep draining. Announce once per
+        // overflow episode so the truncation is visible but not itself spammy.
+        if (!stderrOverflowed) {
+          stderrOverflowed = true
+          process.stderr.write(
+            `[mcp:${this._serverName}] stderr line exceeded ${MAX_STDERR_LINE_BYTES} bytes; ` +
+            'discarding until the next newline\n',
+          )
+        }
+        stderrLine = ''
+      } else if (stderrLine.length === 0) {
+        stderrOverflowed = false
+      }
+
       for (const line of lines) {
-        if (line.trim()) process.stderr.write(`[mcp:${this._serverName}] ${line.trim()}\n`)
+        const trimmed = line.trim()
+        if (!trimmed) continue
+        const echo = trimmed.length > MAX_STDERR_ECHO_CHARS
+          ? `${trimmed.slice(0, MAX_STDERR_ECHO_CHARS)}… [truncated ${trimmed.length - MAX_STDERR_ECHO_CHARS} chars]`
+          : trimmed
+        process.stderr.write(`[mcp:${this._serverName}] ${echo}\n`)
       }
     })
 
@@ -569,12 +615,13 @@ export function loadMcpConfig(configPath: string = MCP_CONFIG_PATH): string[] {
 
   const registered: string[] = []
   for (const [name, cfg] of Object.entries(servers)) {
-    if (mcpClients.has(name)) {
-      // Already registered (e.g. auto-registered from env) — config file wins, replace it.
-      mcpClients.delete(name)
-    }
     const client = buildClient(name, cfg)
     if (!client) continue
+    // P2-6: replacement is registerMcpClient's job now. The old `delete()` here
+    // dropped the map entry without closing the displaced client (leaking its
+    // child process) and without invalidating its cached tool list — and it ran
+    // *before* buildClient, so a config entry that failed to build tore down a
+    // working server and put nothing in its place.
     registerMcpClient(name, client)
     registered.push(name)
   }

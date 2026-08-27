@@ -552,12 +552,42 @@ export class ShellSessionStore {
  */
 let _globalStore: ShellSessionStore | null = null
 
+/**
+ * P3-1 (review 2026-08-27): a NAMED, install-once exit handler.
+ *
+ * This used to be an inline `process.once('exit', () => _globalStore?.…)`
+ * registered inside the lazy initialiser, and `resetShellSessionStore()` only
+ * nulled the store — so every reset/recreate cycle added another listener that
+ * was never removed. The full test suite reliably tripped Node's warning:
+ *
+ *   MaxListenersExceededWarning: 11 exit listeners added to [process]
+ *
+ * Each stale closure also still referenced the module-level `_globalStore`, so
+ * on exit the CURRENT store got `destroyAll()` called once per accumulated
+ * listener. Idempotent in practice, but only by luck.
+ *
+ * Being a named function is what makes it removable and, since Node dedupes
+ * nothing for us, `_exitHandlerInstalled` is what makes it install-once.
+ */
+function destroyGlobalStoreOnExit(): void {
+  _globalStore?.destroyAll()
+}
+
+let _exitHandlerInstalled = false
+
 export function shellSessionStore(): ShellSessionStore {
   if (!_globalStore) {
     _globalStore = new ShellSessionStore()
     // Best-effort: do not leave orphaned process groups behind when the host
     // exits normally. `exit` only runs sync code, and kill() is sync.
-    process.once('exit', () => _globalStore?.destroyAll())
+    //
+    // Registered ONCE for the process lifetime, not once per store. The
+    // handler reads the live `_globalStore` binding, so a store created after
+    // a reset is still covered without a second registration.
+    if (!_exitHandlerInstalled) {
+      _exitHandlerInstalled = true
+      process.on('exit', destroyGlobalStoreOnExit)
+    }
   }
   return _globalStore
 }
@@ -566,6 +596,14 @@ export function shellSessionStore(): ShellSessionStore {
 export function resetShellSessionStore(): void {
   _globalStore?.destroyAll()
   _globalStore = null
+  // Symmetric with the install above: leaving the handler registered across a
+  // reset would be harmless (it reads the live binding), but removing it keeps
+  // the process listener count at zero when no store exists, which is what
+  // makes "repeated reset does not grow listeners" assertable.
+  if (_exitHandlerInstalled) {
+    process.removeListener('exit', destroyGlobalStoreOnExit)
+    _exitHandlerInstalled = false
+  }
 }
 
 // ── helpers ───────────────────────────────────────────────────────────────────

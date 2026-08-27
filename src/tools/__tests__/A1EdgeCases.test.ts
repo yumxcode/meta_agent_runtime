@@ -6,9 +6,12 @@
  * appear when something is already going wrong.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync, readFileSync } from 'node:fs'
 import { join } from 'node:path'
+// §8.1: fully-resolved workspace root — apply_patch canonicalises the paths it
+// hands to the write mutex, so a lexical macOS `/var/folders/…` fixture would
+// never match what the tool actually acquired.
+import { makeTempDirSync } from '../../__tests__/tempDir.js'
 import type { MetaAgentTool, ToolCallContext } from '../../core/types.js'
 import {
   resolveSessionSandboxPolicy,
@@ -42,7 +45,7 @@ function ctx(o: Partial<ToolCallContext> = {}): ToolCallContext {
   }
 }
 
-beforeEach(() => { ws = mkdtempSync(join(tmpdir(), 'a1-edge-')) })
+beforeEach(() => { ws = makeTempDirSync('a1-edge-') })
 afterEach(() => {
   resetShellSessionStore()
   resetSessionGrantCache()

@@ -8,9 +8,10 @@
  * own behaviour.
  */
 import { describe, it, expect, beforeEach, afterEach } from 'vitest'
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
-import { tmpdir } from 'node:os'
+import { rmSync, writeFileSync, readFileSync, existsSync, mkdirSync, chmodSync } from 'node:fs'
 import { join } from 'node:path'
+// §8.1: fully-resolved temp roots — apply_patch reports canonicalised paths.
+import { makeTempDirSync } from '../../__tests__/tempDir.js'
 import type { MetaAgentTool, ToolCallContext } from '../../core/types.js'
 import { createApplyPatchTool } from '../fs/apply_patch/index.js'
 import { createTurnDiffTool } from '../fs/turn_diff/index.js'
@@ -40,7 +41,7 @@ function ctx(overrides: Partial<ToolCallContext> = {}): ToolCallContext {
 }
 
 beforeEach(async () => {
-  ws = mkdtempSync(join(tmpdir(), 'apply-patch-'))
+  ws = makeTempDirSync('apply-patch-')
   tracker = new TurnDiffTracker()
   tracker.beginTurn('t1')
   ;[applyPatch, turnDiff] = await Promise.all([createApplyPatchTool(), createTurnDiffTool()])

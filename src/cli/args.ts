@@ -14,6 +14,7 @@ import type { AutoWorktreeCleanupStrategy } from '../core/auto/AutoWorktreeCoord
 import { CLI_VERSION } from './version.js'
 import { bold, cyan, dim, gray, red, terminalText } from './term.js'
 import { printEnvTable } from './env.js'
+import { parseStrictInt, parseStrictFloat } from '../infra/env/strictNumber.js'
 
 export const VERSION = CLI_VERSION
 
@@ -394,33 +395,40 @@ export function parseCliArgs(): CliOptions {
     console.error(red(`Error: --auto-worktree-cleanup must be preserve, safe, or aggressive (got "${rawCleanup}")`))
     process.exit(1)
   }
+  // P2-3 (review 2026-08-27): these used bare parseInt/parseFloat, which read a
+  // valid prefix and discard the rest — `--max-turns=3junk` was accepted as 3
+  // and `--max-budget-usd=1oops` as 1. A budget cap the user did not type is
+  // exactly the kind of thing that should stop the run, not be guessed at.
   let maxTurns: number | undefined
   if (rawMaxTurns) {
     if (rawMaxTurns.toLowerCase() === 'infinity' || rawMaxTurns === '∞') {
       maxTurns = Infinity
     } else {
-      maxTurns = parseInt(rawMaxTurns, 10)
-      if (isNaN(maxTurns) || maxTurns < 1) {
+      const parsedTurns = parseStrictInt(rawMaxTurns)
+      if (parsedTurns === undefined || parsedTurns < 1) {
         console.error(red(`Error: --max-turns must be a positive integer or "infinity" (got "${rawMaxTurns}")`))
         process.exit(1)
       }
+      maxTurns = parsedTurns
     }
   }
   let maxBudgetUsd: number | undefined
   if (rawMaxBudgetUsd) {
-    maxBudgetUsd = Number.parseFloat(rawMaxBudgetUsd)
-    if (!Number.isFinite(maxBudgetUsd) || maxBudgetUsd <= 0) {
+    const parsedBudget = parseStrictFloat(rawMaxBudgetUsd)
+    if (parsedBudget === undefined || parsedBudget <= 0) {
       console.error(red(`Error: --max-budget-usd must be a positive number (got "${rawMaxBudgetUsd}")`))
       process.exit(1)
     }
+    maxBudgetUsd = parsedBudget
   }
   let mcpAppsPort = 0
   if (rawUiPort !== undefined) {
-    mcpAppsPort = Number.parseInt(rawUiPort, 10)
-    if (!/^\d+$/.test(rawUiPort) || mcpAppsPort < 0 || mcpAppsPort > 65_535) {
+    const parsedPort = parseStrictInt(rawUiPort)
+    if (parsedPort === undefined || parsedPort < 0 || parsedPort > 65_535) {
       console.error(red(`Error: --ui-port must be an integer in [0, 65535] (got "${rawUiPort}")`))
       process.exit(1)
     }
+    mcpAppsPort = parsedPort
   }
   if (!mcpApps && (rawUiPort !== undefined || parsed.values['no-open'] === true)) {
     console.error(red('Error: --ui-port and --no-open require the `meta-agent ui` command.'))

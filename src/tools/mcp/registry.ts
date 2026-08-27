@@ -231,13 +231,39 @@ export function invalidateToolListCache(key?: string): void {
   else _toolListCache.delete(key)
 }
 
+/**
+ * Register a client under `serverName`, replacing any existing one.
+ *
+ * P2-6 (review 2026-08-27): this was a bare `mcpClients.set()`, and the config
+ * loader replaced entries with a bare `mcpClients.delete()` followed by a
+ * register. Neither closed the client being displaced, so a stdio server's
+ * child process — plus its ports, file locks and pipes — outlived the
+ * registration that owned it, and neither invalidated the tool-list cache, so
+ * `mcp_call` could keep resolving tools against the OLD server's definitions
+ * for up to TOOL_LIST_TTL_MS after the swap.
+ *
+ * Replacement is now a single ordered operation: close the old client, drop its
+ * cached tool list, then install the new one. Every replacement path goes
+ * through here so the two halves cannot drift apart again.
+ */
 export function registerMcpClient(serverName: string, client: McpClient): void {
+  const previous = mcpClients.get(serverName)
+  if (previous === client) return
+
   mcpClients.set(serverName, client)
+
+  if (previous !== undefined) {
+    // Close AFTER the swap: a close handler that re-enters the registry must
+    // see the new client, not a half-removed old one.
+    closeClient(previous)
+    invalidateToolListCache(serverName)
+  }
 }
 
 export function unregisterMcpClient(serverName: string): void {
   const client = mcpClients.get(serverName)
   mcpClients.delete(serverName)
+  invalidateToolListCache(serverName)
   closeClient(client)
 }
 
@@ -252,6 +278,8 @@ export function unregisterMcpClient(serverName: string): void {
 export function disposeMcpClients(): void {
   const clients = [...mcpClients.values()]
   mcpClients.clear()
+  // Cached tool lists describe servers that no longer exist.
+  invalidateToolListCache()
   for (const client of clients) closeClient(client)
 }
 

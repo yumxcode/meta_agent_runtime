@@ -95,6 +95,19 @@ export interface EngineeringJob {
   sessionId: string
   /** Error message if status === 'failed' */
   error?: string
+  /**
+   * Monotonic write counter, bumped on every status transition (P1-1).
+   *
+   * Atomic rename guarantees a persisted record is never half-written; it says
+   * nothing about *which* record wins when two writes for the same job are in
+   * flight. A slow `running` write landing after a fast `completed` write used
+   * to leave a finished job persisted as running, so a restart resurrected it.
+   *
+   * JobManager serialises writes per job and additionally refuses to persist a
+   * snapshot whose revision is below the last one it wrote. Optional because
+   * records written by older versions do not carry it; absent is read as 0.
+   */
+  revision?: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

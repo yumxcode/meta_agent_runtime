@@ -110,15 +110,55 @@ export class OtlpTelemetrySink implements TelemetrySink {
   readonly name = 'otlp'
   private buffer: unknown[] = []
   private reportedError = false
+  /**
+   * P2-7 (review 2026-08-27): single-flight write chain.
+   *
+   * `flush()` used to `await fetch()` with no coordination, and the Recorder
+   * calls `record()` fire-and-forget. Against a wedged collector — one that
+   * accepts the connection and never responds — every batch threshold started
+   * ANOTHER request that never settled. Requests, their payload strings and
+   * their closures accumulated for the life of the process, and `finish()`
+   * could block forever waiting on the summary flush.
+   *
+   * All writes now queue behind this chain: at most one request is ever in
+   * flight, and `close()` has one thing to await.
+   */
+  private inFlight: Promise<void> = Promise.resolve()
+  /** Batches waiting for the chain; bounded by `maxPendingBatches`. */
+  private pending: unknown[][] = []
+  private droppedBatches = 0
 
   constructor(
     private readonly endpoint: string,
     private readonly headers: Record<string, string> = {},
-    private readonly options: SinkOptions & { batchSize?: number } = {},
+    private readonly options: SinkOptions & {
+      batchSize?: number
+      /** Per-request wall-clock budget. A collector that never answers must not pin us. */
+      requestTimeoutMs?: number
+      /** How many batches may wait behind a slow collector before we shed load. */
+      maxPendingBatches?: number
+    } = {},
   ) {}
 
   private get batchSize(): number {
     return this.options.batchSize ?? 64
+  }
+
+  /**
+   * 10s: long enough for a loaded collector on a slow link, short enough that a
+   * wedged one cannot hold a request open across a whole session.
+   */
+  private get requestTimeoutMs(): number {
+    return this.options.requestTimeoutMs ?? 10_000
+  }
+
+  /**
+   * Telemetry is not worth unbounded memory. Past this many queued batches the
+   * OLDEST are dropped — with a slow collector the recent events are the ones
+   * describing what is currently going wrong.
+   */
+  private get maxPendingBatches(): number {
+    return this.options.maxPendingBatches ?? 32
   }
 
   async record(record: TelemetryRecord): Promise<void> {
@@ -145,10 +185,47 @@ export class OtlpTelemetrySink implements TelemetrySink {
     }
   }
 
+  /**
+   * Hand the current buffer to the write chain and wait for the queue to drain.
+   *
+   * Awaiting the chain (rather than just this batch) is what makes `close()`
+   * and `summary()` correct: when they return, nothing is still queued.
+   */
   async flush(): Promise<void> {
-    if (this.buffer.length === 0) return
-    const batch = this.buffer
-    this.buffer = []
+    if (this.buffer.length > 0) {
+      this.enqueue(this.buffer)
+      this.buffer = []
+    }
+    await this.inFlight
+  }
+
+  /** Queue a batch, shedding the oldest if the collector has fallen behind. */
+  private enqueue(batch: unknown[]): void {
+    this.pending.push(batch)
+    while (this.pending.length > this.maxPendingBatches) {
+      this.pending.shift()
+      this.droppedBatches++
+    }
+    this.inFlight = this.inFlight.then(() => this.drain())
+  }
+
+  /** Send whatever is queued, one request at a time. */
+  private async drain(): Promise<void> {
+    while (this.pending.length > 0) {
+      const batch = this.pending.shift()!
+      await this.send(batch)
+    }
+    if (this.droppedBatches > 0) {
+      const dropped = this.droppedBatches
+      this.droppedBatches = 0
+      this.report(new Error(
+        `OTLP exporter dropped ${dropped} batch(es): collector could not keep up ` +
+        `(max ${this.maxPendingBatches} batches queued)`,
+      ))
+    }
+  }
+
+  private async send(batch: unknown[]): Promise<void> {
     const payload = {
       resourceLogs: [{
         resource: {
@@ -159,15 +236,30 @@ export class OtlpTelemetrySink implements TelemetrySink {
         scopeLogs: [{ logRecords: batch }],
       }],
     }
+    // P2-7: `fetch()` had no AbortSignal, so a collector that accepted the
+    // connection and went silent held the request open indefinitely.
+    const ctrl = new AbortController()
+    const timer = setTimeout(() => ctrl.abort(), this.requestTimeoutMs)
+    timer.unref?.()
     try {
       const res = await fetch(this.endpoint, {
         method: 'POST',
         headers: { 'content-type': 'application/json', ...this.headers },
         body: JSON.stringify(payload),
+        signal: ctrl.signal,
       })
       if (!res.ok) this.report(new Error(`OTLP endpoint returned ${res.status}`))
+      // Drain the body even on success: an undrained response body keeps the
+      // socket (and its buffers) alive under keep-alive.
+      await res.arrayBuffer().catch(() => undefined)
     } catch (err) {
-      this.report(err)
+      if (ctrl.signal.aborted) {
+        this.report(new Error(`OTLP request exceeded ${this.requestTimeoutMs}ms and was aborted`))
+      } else {
+        this.report(err)
+      }
+    } finally {
+      clearTimeout(timer)
     }
   }
 

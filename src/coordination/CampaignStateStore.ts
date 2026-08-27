@@ -28,6 +28,7 @@ import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, ensureDir, readJsonFile, withFileLock } from '../infra/persist/index.js'
+import { validateStoreId, isValidStoreId, resolveWithinRoot } from '../infra/persist/storeId.js'
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 import type {
   CampaignContextCapsule,
@@ -60,8 +61,12 @@ const ZOMBIE_CHECKPOINT_MS  = 7 * 24 * 60 * 60 * 1_000    // 7 days
 export const META_AGENT_ROOT = join(META_AGENT_HOME)
 export const CAMPAIGNS_ROOT = join(META_AGENT_ROOT, 'campaigns')
 
+/**
+ * @throws {StoreIdError} if `id` is not a safe path segment. Same class of bug
+ *   as P0-1 in JobStore/SessionStore: campaign ids reach `rm(..., recursive)`.
+ */
 function campaignDir(id: string): string {
-  return join(CAMPAIGNS_ROOT, id)
+  return resolveWithinRoot(CAMPAIGNS_ROOT, validateStoreId(id, 'campaignId'))
 }
 
 /** Slugify projectName for use in directory name */
@@ -373,7 +378,10 @@ export class CampaignStateStore {
     }
 
     const stores: CampaignStateStore[] = []
-    for (const entry of entries) {
+    // Filter before load(): an unsafe directory name is not a campaign, and
+    // letting it reach load() would rely on the catch below to distinguish
+    // "not a campaign" from "corrupt campaign".
+    for (const entry of entries.filter(isValidStoreId)) {
       try {
         stores.push(await CampaignStateStore.load(entry))
       } catch {

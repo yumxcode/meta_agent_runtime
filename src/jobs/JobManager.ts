@@ -19,7 +19,15 @@
  *   fire-and-forget (with retry), so a job killed between running →
  *   completed may be persisted as 'running'.  Hosts MUST call loadSession()
  *   or reattach() after a restart — both normalise interrupted jobs to
- *   'failed' — before trusting list()/poll() results.
+ *   'failed' via _normaliseInterruptedJob() — before trusting list()/poll()
+ *   results.  The two paths share that helper deliberately: they had drifted
+ *   apart once (P1-2, review 2026-08-27), leaving loadSession() to register
+ *   ownerless 'running' jobs that hung every awaitJob() caller forever.
+ *
+ *   Writes for a single job are serialised through a per-job promise chain and
+ *   carry a monotonic `revision`, so the persisted status can never move
+ *   backwards through the state machine even when an earlier write is delayed
+ *   by retry back-off (P1-1, same review).
  *
  * Progress subscriptions:
  *   await() accepts an optional onProgress callback that is called
@@ -38,7 +46,7 @@ import type {
   DimensionalRecord,
   JobFilter,
 } from './types.js'
-import { makeJobId, TERMINAL_STATUSES } from './types.js'
+import { makeJobId, TERMINAL_STATUSES, ACTIVE_STATUSES } from './types.js'
 import { JobStore } from './JobStore.js'
 import { LocalExecutor } from './JobExecutor.js'
 import type { Executor, ExecutorCallbacks } from './JobExecutor.js'
@@ -73,6 +81,17 @@ interface RuntimeJob {
   result?: JobResult
   progressListeners: Array<(p: JobProgress) => void>
   completionResolvers: Array<{ resolve: (r: JobResult) => void; reject: (e: Error) => void }>
+  /**
+   * P1-1: serialises this job's disk writes. Every `_transition()` chains onto
+   * the previous write instead of racing it, so the on-disk status can never
+   * move backwards through the state machine. Per job, not global — one slow
+   * job's I/O must not stall another job's terminal write.
+   */
+  persistChain: Promise<boolean>
+  /** Monotonic counter assigned to each snapshot handed to the chain. */
+  revision: number
+  /** Highest revision already durably written; guards out-of-band writes. */
+  lastPersistedRevision: number
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -195,9 +214,15 @@ export class JobManager {
       job,
       progressListeners: [],
       completionResolvers: [],
+      persistChain: Promise.resolve(true),
+      revision: 0,
+      lastPersistedRevision: 0,
     }
 
     this.jobs.set(jobId, rt)
+    // The creation write is awaited, so it is ordered before anything the
+    // executor callbacks enqueue. It seeds revision 0.
+    job.revision = 0
     await this.store.save(job)
     void this._recordJob('created', job)
 
@@ -213,7 +238,23 @@ export class JobManager {
       onProgress: (p) => {
         const rj = this.jobs.get(p.jobId)
         if (rj) {
-          for (const listener of rj.progressListeners) listener(p)
+          // P2-1 (review 2026-08-27): listeners are caller-supplied observers.
+          // Calling them unguarded let an exception propagate out of
+          // reportProgress(), back into the job handler, and out to the
+          // executor — which read it as handler failure and marked an
+          // otherwise-successful job 'failed'. An observer must be able to
+          // fail without changing the business outcome it is observing, so
+          // each is isolated and its error goes to diagnostics only.
+          for (const listener of rj.progressListeners) {
+            try {
+              listener(p)
+            } catch (err) {
+              console.warn(
+                `[JobManager] Progress listener for job ${p.jobId} threw; ` +
+                'job outcome is unaffected:', err,
+              )
+            }
+          }
           void this._recordJob('progress', rj.job, {
             progress: p.percent,
             summary: p.currentStep,
@@ -403,22 +444,8 @@ export class JobManager {
     const persisted = await this.store.load(jobId)
     if (!persisted) return null
 
-    // If interrupted mid-run, mark as failed
-    if (persisted.status === 'running' || persisted.status === 'queued' || persisted.status === 'submitted') {
-      persisted.status = 'failed'
-      persisted.error  = 'Process terminated before job completed'
-      await this.store.save(persisted)
-    }
-
-    // Register in memory so poll() and list() work
-    if (!this.jobs.has(jobId)) {
-      this.jobs.set(jobId, {
-        job: persisted,
-        progressListeners: [],
-        completionResolvers: [],
-      })
-    }
-
+    await this._normaliseInterruptedJob(persisted)
+    this._registerRecovered(persisted)
     return persisted
   }
 
@@ -426,28 +453,94 @@ export class JobManager {
 
   /**
    * Load all persisted jobs for this session into memory (e.g. on restart).
+   *
+   * P1-2 (review 2026-08-27): this used to register `submitted`/`queued`/
+   * `running` records verbatim, contradicting the crash-consistency contract at
+   * the top of this file. Those jobs have no executor behind them after a
+   * restart, so nothing could ever move them to a terminal status —
+   * `awaitJob()` registered a resolver that was never called and the caller
+   * hung forever, while the active-job count grew without bound. Both recovery
+   * entry points now run the same normalisation.
    */
   async loadSession(): Promise<EngineeringJob[]> {
     const all = await this.store.loadAll()
     for (const job of all) {
-      if (!this.jobs.has(job.jobId)) {
-        this.jobs.set(job.jobId, {
-          job,
-          progressListeners: [],
-          completionResolvers: [],
-        })
-        if (TERMINAL_STATUSES.has(job.status)) {
-          this._dropFromTerminalOrder(job.jobId)
-          this._terminalOrder.push(job.jobId)
-        }
-      }
+      if (this.jobs.has(job.jobId)) continue
+      // Normalise BEFORE the job is visible in the Map, so no concurrent
+      // poll()/awaitJob() can observe the interrupted-but-unowned state.
+      await this._normaliseInterruptedJob(job)
+      this._registerRecovered(job)
     }
     this._evictTerminalIfOverCap()
     return all
   }
 
+  /**
+   * Turn a job that was active when the process died into a terminal failure,
+   * persisting the correction before the caller can observe it.
+   *
+   * Shared by `reattach()` and `loadSession()` — they had drifted, which is
+   * exactly the failure P1-2 describes. Mutates `job` in place so the caller's
+   * reference reflects the normalised record.
+   */
+  private async _normaliseInterruptedJob(job: EngineeringJob): Promise<void> {
+    if (!ACTIVE_STATUSES.has(job.status)) return
+
+    const now = Date.now()
+    job.status = 'failed'
+    job.error = 'Process terminated before job completed'
+    job.metrics.completedAt = now
+    // Wall time measured against submission, matching the live failure path.
+    job.metrics.wallTimeMs = now - job.metrics.submittedAt
+    job.revision = (job.revision ?? 0) + 1
+
+    // Persist before registering. If the write fails we still register the
+    // normalised in-memory record — a caller waiting on awaitJob() getting a
+    // deterministic rejection matters more than the disk copy being current,
+    // and the next recovery pass will normalise it again.
+    try {
+      await this.store.save(job)
+    } catch (err) {
+      console.warn(`[JobManager] Could not persist interrupted-job normalisation for ${job.jobId}:`, err)
+    }
+  }
+
+  /** Register a recovered record in memory with a fresh, empty runtime state. */
+  private _registerRecovered(job: EngineeringJob): void {
+    if (this.jobs.has(job.jobId)) return
+    this.jobs.set(job.jobId, {
+      job,
+      progressListeners: [],
+      completionResolvers: [],
+      persistChain: Promise.resolve(true),
+      revision: job.revision ?? 0,
+      lastPersistedRevision: job.revision ?? 0,
+    })
+    if (TERMINAL_STATUSES.has(job.status)) {
+      this._dropFromTerminalOrder(job.jobId)
+      this._terminalOrder.push(job.jobId)
+    }
+  }
+
   // ── internal helpers ───────────────────────────────────────────────────────
 
+  /**
+   * Move a job to `status` and persist it.
+   *
+   * P1-1 (review 2026-08-27): this used to start an independent
+   * `_persistWithRetry()` per transition and only await the terminal one. Two
+   * writes for the same job could therefore land out of order — a `running`
+   * write delayed by a retry back-off would overwrite an already-persisted
+   * `completed`, and the caller had already been told the job succeeded.
+   * Atomic rename does not help here: each individual write was intact, they
+   * simply arrived in the wrong order.
+   *
+   * Now every write for a job is appended to that job's `persistChain`, so
+   * writes land in transition order. Non-terminal transitions still return
+   * immediately (the model→terminal path must not pay disk latency); terminal
+   * transitions await the whole chain, which — because the chain is FIFO —
+   * also drains every earlier write before the caller is told the job is done.
+   */
   private async _transition(jobId: JobId, status: JobStatus): Promise<boolean> {
     const rt = this.jobs.get(jobId)
     if (!rt) return false
@@ -455,10 +548,17 @@ export class JobManager {
     void this._recordJob(statusToTrajectoryAction(status), rt.job, {
       summary: rt.result?.summary ?? rt.job.error,
     })
-    // Fire-and-forget persist with exponential back-off.
-    // Active transitions remain non-blocking; terminal transitions are awaited
-    // by their callbacks before resolving/rejecting awaitJob() callers.
-    const persistPromise = this._persistWithRetry(jobId, { ...rt.job })
+
+    const revision = ++rt.revision
+    rt.job.revision = revision
+    const snapshot: EngineeringJob = { ...rt.job }
+
+    // Chain, don't race. `.then` on the previous link means the next write does
+    // not start until this one has fully settled, retries included.
+    const persistPromise = rt.persistChain.then(() => this._persistSnapshot(jobId, snapshot))
+    // Keep the chain alive across a failed link so one persist error does not
+    // wedge every subsequent write for this job.
+    rt.persistChain = persistPromise.catch(() => false)
 
     // S2: When a job enters a terminal status, drop progress / completion
     // closures (they're already drained by the executor callback) and put the
@@ -473,6 +573,28 @@ export class JobManager {
     }
     void persistPromise
     return true
+  }
+
+  /**
+   * Write one snapshot, refusing to regress the durable revision.
+   *
+   * The chain already orders writes, so this guard only matters for writes that
+   * bypass it — `_persistWithRetry`'s best-effort tail write, and any future
+   * caller that persists directly. Belt and braces, at the cost of one integer
+   * compare.
+   */
+  private async _persistSnapshot(jobId: JobId, snapshot: EngineeringJob): Promise<boolean> {
+    const rt = this.jobs.get(jobId)
+    const revision = snapshot.revision ?? 0
+    // Strictly-less: a job evicted from the Map (rt === undefined) still gets
+    // its write, since there is no newer in-memory revision to compare against.
+    if (rt && revision < rt.lastPersistedRevision) return true
+
+    const ok = await this._persistWithRetry(jobId, snapshot)
+    if (ok && rt && revision > rt.lastPersistedRevision) {
+      rt.lastPersistedRevision = revision
+    }
+    return ok
   }
 
   private _recordJob(
@@ -572,8 +694,13 @@ export class JobManager {
       if (rt && !TERMINAL_STATUSES.has(rt.job.status)) {
         rt.job.status = 'failed'
         rt.job.error  = `Persist failure: ${err instanceof Error ? err.message : String(err)}`
+        // P1-1: this write bypasses the persist chain (we are *inside* a chain
+        // link and must not deadlock on it), so it takes a fresh revision to
+        // stay ahead of anything already queued behind us.
+        rt.job.revision = ++rt.revision
+        rt.lastPersistedRevision = rt.job.revision
         // best-effort final write — don't recurse
-        this.store.save(rt.job).catch(() => {})
+        this.store.save({ ...rt.job }).catch(() => {})
         // Reject any callers waiting on awaitJob()
         const persistErr = new Error(`Job ${jobId} persist failed after ${MAX_RETRIES} retries`)
         for (const { reject } of rt.completionResolvers) reject(persistErr)

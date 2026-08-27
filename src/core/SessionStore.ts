@@ -19,6 +19,7 @@
 
 import { readFile, appendFile, mkdir, open, stat, rm, readdir } from 'node:fs/promises'
 import { atomicWriteFile, atomicWriteJson, withFileLock } from '../infra/persist/index.js'
+import { validateStoreId, isValidStoreId, resolveWithinRoot } from '../infra/persist/storeId.js'
 import { SessionMetaSchema, parseArrayFiltered } from '../infra/persist/schemas.js'
 import { existsSync } from 'node:fs'
 import { join } from 'node:path'
@@ -97,12 +98,22 @@ function indexFile(options: SessionStoreOptions = {}): string {
   return join(sessionsRoot(options), 'index.json')
 }
 
+/**
+ * Resolve a session's directory, refusing ids that would escape the root.
+ *
+ * P0-1 (review 2026-08-27): this used a bare `join()`, and `deleteSession()`
+ * feeds the result straight into a recursive `rm()`. A `sessionId` of `..`
+ * therefore reached one level above the sessions root. Validated on the way in
+ * and containment-checked on the way out.
+ *
+ * @throws {StoreIdError} if `sessionId` is not a safe path segment.
+ */
 function sessionDir(sessionId: string, options: SessionStoreOptions = {}): string {
-  return join(sessionsRoot(options), sessionId)
+  return resolveWithinRoot(sessionsRoot(options), validateStoreId(sessionId, 'sessionId'))
 }
 
 function historyPath(sessionId: string, options: SessionStoreOptions = {}): string {
-  return join(sessionDir(sessionId, options), 'history.jsonl')
+  return resolveWithinRoot(sessionDir(sessionId, options), 'history.jsonl')
 }
 
 async function ensureDir(dir: string): Promise<void> {
@@ -367,38 +378,71 @@ export class SessionStore {
     options: SessionStoreOptions = {},
   ): Promise<void> {
     if (messages.length === 0 || appendFrom >= messages.length) return
-    // Lock ordering is always index → history. Holding the index lock across
-    // both writes makes history+metadata one file-system transaction from the
-    // perspective of other SessionStore processes and prevents index eviction
-    // from deleting a session between its history write and upsert.
-    await withSessionLock(indexFile(options), async () => {
+    await ensureDir(sessionDir(sessionId, options))
+
+    // ── Phase 1: history, under the PER-SESSION lock only ────────────────────
+    //
+    // P3-2 (review 2026-08-27): this whole method used to run inside the GLOBAL
+    // index.json lock. History serialisation and a full rewrite — up to the
+    // 64 MiB resume guard — therefore blocked every OTHER session's persist,
+    // so one large session hitting divergence or compaction stalled the entire
+    // host. The expensive work is inherently per-session, so it belongs under
+    // the per-session lock.
+    //
+    // Divergence detection moves in here with it. Reading index.json without
+    // its lock is safe (it is only ever written via atomicWriteJson → rename,
+    // so a reader sees one complete version or another, never a torn one), and
+    // checking it under the SAME lock that guards the subsequent write is
+    // strictly more coherent than the old arrangement: two processes appending
+    // to one session now serialise on the check-then-write pair.
+    await withSessionLock(historyPath(sessionId, options), async () => {
       const current = (await readIndex(options)).find(entry => entry.sessionId === sessionId)
-      // Divergence detection. The index count and appendFrom legitimately drift
-      // apart (resume-boundary trimming, byte-guard truncation, corrupt-line
-      // drops, summary folding, thinking-only messages filtered at write time),
-      // and two processes resuming the same session diverge too. Throwing here
-      // would make callers silently stop persisting for the rest of the session
-      // — the worst failure mode. Instead, self-heal: the caller's in-memory
-      // transcript is authoritative, so atomically REPLACE the whole history.
-      // Concurrent writers degrade to last-coherent-writer-wins with a warning,
-      // never to a torn file or a silent persistence stall.
+      // The index count and appendFrom legitimately drift apart (resume-boundary
+      // trimming, byte-guard truncation, corrupt-line drops, summary folding,
+      // thinking-only messages filtered at write time), and two processes
+      // resuming the same session diverge too. Throwing here would make callers
+      // silently stop persisting for the rest of the session — the worst
+      // failure mode. Instead, self-heal: the caller's in-memory transcript is
+      // authoritative, so atomically REPLACE the whole history. Concurrent
+      // writers degrade to last-coherent-writer-wins with a warning, never to a
+      // torn file or a silent persistence stall.
       const conflicted = current !== undefined && current.messageCount !== appendFrom
       if (conflicted) {
         console.warn(
           `[SessionStore] History divergence for ${sessionId}: index has ${current.messageCount} ` +
           `messages, caller expected ${appendFrom}. Rewriting full history from memory.`,
         )
+        await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
+      } else {
+        const lines = serializeMessages(messages.slice(appendFrom))
+        await appendFile(historyPath(sessionId, options), lines, 'utf-8')
       }
-      await ensureDir(sessionDir(sessionId, options))
-      await withSessionLock(historyPath(sessionId, options), async () => {
-        if (conflicted) {
-          await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
-        } else {
-          const lines = serializeMessages(messages.slice(appendFrom))
-          await appendFile(historyPath(sessionId, options), lines, 'utf-8')
-        }
-      })
-      const evicted = await SessionStore._upsertIndexUnlocked({ sessionId, ...meta }, options)
+    })
+
+    // ── Phase 2: index, under the GLOBAL lock, briefly ───────────────────────
+    //
+    // What the old arrangement bought by holding the index lock across both
+    // phases was "eviction cannot delete this session between its history write
+    // and its upsert". That is still covered, by two independent guards:
+    //
+    //   - eviction only deletes a directory idle longer than the grace window
+    //     (24 h by default), and we just wrote to this one;
+    //   - deleteSession() takes this session's history lock before its rm(),
+    //     so it cannot interleave with phase 1 at all.
+    //
+    // Note the two phases never hold both locks at once, so this method cannot
+    // participate in a lock cycle with loadHistory()/deleteSession(), which do
+    // nest index → history.
+    await SessionStore._commitIndex({ sessionId, ...meta }, options)
+  }
+
+  /** Short critical section: upsert the index entry and reap what it evicted. */
+  private static async _commitIndex(
+    meta: SessionMeta,
+    options: SessionStoreOptions,
+  ): Promise<void> {
+    await withSessionLock(indexFile(options), async () => {
+      const evicted = await SessionStore._upsertIndexUnlocked(meta, options)
       await SessionStore._removeEvicted(evicted, options)
     })
   }
@@ -414,7 +458,13 @@ export class SessionStore {
     messages: readonly ConversationMessage[],
     options: SessionStoreOptions = {},
   ): Promise<void> {
-    await withSessionLock(indexFile(options), async () => {
+    await ensureDir(sessionDir(sessionId, options))
+
+    // Same two-phase split as append() (P3-2). replace() is the worst offender
+    // for head-of-line blocking: it is called after compaction, so it always
+    // serialises and rewrites the FULL transcript — previously with every other
+    // session's persist queued behind it on the global index lock.
+    await withSessionLock(historyPath(sessionId, options), async () => {
       const current = (await readIndex(options)).find(entry => entry.sessionId === sessionId)
       if (
         options.expectedMessageCount !== undefined &&
@@ -430,15 +480,12 @@ export class SessionStore {
           `messages, caller expected ${options.expectedMessageCount}. Proceeding with full replace.`,
         )
       }
-      await ensureDir(sessionDir(sessionId, options))
-      await withSessionLock(historyPath(sessionId, options), async () => {
-        // Atomic rename: a crash leaves either the old complete transcript or
-        // the new complete transcript, never a truncated history.jsonl.
-        await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
-      })
-      const evicted = await SessionStore._upsertIndexUnlocked({ sessionId, ...meta }, options)
-      await SessionStore._removeEvicted(evicted, options)
+      // Atomic rename: a crash leaves either the old complete transcript or
+      // the new complete transcript, never a truncated history.jsonl.
+      await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
     })
+
+    await SessionStore._commitIndex({ sessionId, ...meta }, options)
   }
 
   /**
@@ -489,6 +536,9 @@ export class SessionStore {
    * Check whether a session directory exists (quick existence check).
    */
   static sessionExists(sessionId: string, options: SessionStoreOptions = {}): boolean {
+    // A predicate answers "no", it does not throw. An unsafe id cannot name an
+    // existing session by construction, so `false` is both true and safe.
+    if (!isValidStoreId(sessionId)) return false
     return existsSync(historyPath(sessionId, options))
   }
 
@@ -505,7 +555,15 @@ export class SessionStore {
         const entries = await readIndex(options)
         const filtered = entries.filter(e => e.sessionId !== sessionId)
         await writeIndex(filtered, options)
-        await rm(sessionDir(sessionId, options), { recursive: true, force: true })
+        // P3-2: take the session's own lock before removing its directory.
+        // append()/replace() no longer run under the index lock, so this is
+        // what keeps a delete from landing in the middle of a history write.
+        // Order is index → history here, matching loadHistory(); append() holds
+        // the two locks in separate phases and never both at once, so no cycle
+        // exists between the three.
+        await withSessionLock(historyPath(sessionId, options), async () => {
+          await rm(sessionDir(sessionId, options), { recursive: true, force: true })
+        })
       })
     } catch {
       // Best-effort
@@ -527,13 +585,18 @@ export class SessionStore {
   ): Promise<void> {
     if (sessionIds.length === 0) return
     const ids = new Set(sessionIds)
+    // Split before the lock: an id that cannot name a directory is still
+    // removed from the index (harmless, and it should not linger there), but it
+    // never reaches `rm()`. Filtering rather than throwing keeps one bad id in a
+    // bulk delete from aborting every other deletion in the batch.
+    const deletable = [...ids].filter(isValidStoreId)
     try {
       await withSessionLock(indexFile(options), async () => {
         const entries = await readIndex(options)
         const filtered = entries.filter(e => !ids.has(e.sessionId))
         await writeIndex(filtered, options)
         await Promise.all(
-          [...ids].map(id => rm(sessionDir(id, options), { recursive: true, force: true })),
+          deletable.map(id => rm(sessionDir(id, options), { recursive: true, force: true })),
         )
       })
     } catch {
@@ -553,7 +616,10 @@ export class SessionStore {
         await writeIndex([], options)
         await Promise.all(entries
           .filter(entry => entry.isDirectory())
-          .map(entry => rm(join(sessionsRoot(options), entry.name), { recursive: true, force: true })))
+          // Names come from readdir so they cannot contain separators, but the
+          // containment check is what makes that an invariant rather than an
+          // assumption — and it costs one resolve() per entry.
+          .map(entry => rm(resolveWithinRoot(sessionsRoot(options), entry.name), { recursive: true, force: true })))
       })
     } catch {
       // Best-effort
@@ -638,7 +704,7 @@ export class SessionStore {
     if (evicted.length === 0) return
     const cutoff = Date.now() - evictionGraceMs()
     await Promise.all(evicted
-      .filter(entry => entry.lastActivity <= cutoff)
+      .filter(entry => entry.lastActivity <= cutoff && isValidStoreId(entry.sessionId))
       .map(entry => rm(sessionDir(entry.sessionId, options), { recursive: true, force: true })))
     await SessionStore._sweepStaleOrphans(options)
   }
@@ -658,7 +724,7 @@ export class SessionStore {
       await Promise.all(entries
         .filter(entry => entry.isDirectory() && !indexed.has(entry.name))
         .map(async entry => {
-          const dir = join(sessionsRoot(options), entry.name)
+          const dir = resolveWithinRoot(sessionsRoot(options), entry.name)
           const mtime = await stat(join(dir, 'history.jsonl'))
             .then(s => s.mtimeMs)
             .catch(() => stat(dir).then(s => s.mtimeMs).catch(() => Number.POSITIVE_INFINITY))

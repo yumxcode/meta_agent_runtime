@@ -102,6 +102,34 @@ function buildToolUseStream(toolName: string, toolInput: object): string {
   return out
 }
 
+/**
+ * Flatten an Anthropic message `content` field to plain text.
+ *
+ * §8.3 (review 2026-08-27): the server only recognised the calculator scenario
+ * when `content` was a bare string. The runtime legitimately sends structured
+ * content blocks — `[{ type: 'text', text: '…' }]` — so the check silently
+ * missed, the server answered with ordinary text instead of a `tool_use`, and
+ * the smoke test reported "tool calling is broken" when what had actually
+ * broken was this fixture's assumption about the wire format.
+ *
+ * Both shapes are part of the real API, so both are handled here rather than
+ * pinning the runtime to the older one.
+ */
+function messageText(content: unknown): string {
+  if (typeof content === 'string') return content
+  if (!Array.isArray(content)) return ''
+  return content
+    .map(block => {
+      if (typeof block === 'string') return block
+      if (block && typeof block === 'object' && 'text' in block) {
+        const text = (block as { text?: unknown }).text
+        return typeof text === 'string' ? text : ''
+      }
+      return ''
+    })
+    .join(' ')
+}
+
 function startMockServer(): Promise<{ server: http.Server; baseURL: string }> {
   let callCount = 0
 
@@ -131,9 +159,9 @@ function startMockServer(): Promise<{ server: http.Server; baseURL: string }> {
         // Second turn: model acknowledges the tool result
         res.write(buildTextStream('The result of 2+2 is 4.'))
       } else {
-        const firstContent = payload.messages[0]?.content
-        const isToolTest = typeof firstContent === 'string' &&
-          firstContent.toLowerCase().includes('calculator')
+        const isToolTest = messageText(payload.messages[0]?.content)
+          .toLowerCase()
+          .includes('calculator')
 
         if (isToolTest) {
           res.write(buildToolUseStream('calculator', { expression: '2 + 2' }))

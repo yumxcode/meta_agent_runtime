@@ -12,9 +12,12 @@
  * thin wrappers over fs, and mocking fs would test the wrapper against itself.
  */
 import { describe, expect, it, beforeEach, afterEach } from 'vitest'
-import { mkdtemp, rm, readFile, writeFile, mkdir, stat, symlink, readdir } from 'node:fs/promises'
-import { tmpdir } from 'node:os'
+import { rm, readFile, writeFile, mkdir, stat, symlink, readdir } from 'node:fs/promises'
 import { join, resolve } from 'node:path'
+// §8.1: fully-resolved temp roots. The fs tools canonicalise every path
+// through workspaceGuard before comparing it to the workspace, so a lexical
+// macOS `/var/folders/…` fixture is not the path the tool reports back.
+import { makeTempDir } from '../../../__tests__/tempDir.js'
 import { createReadFileTool } from '../read_file/index.js'
 import { createWriteFileTool } from '../write_file/index.js'
 import { createAppendFileTool } from '../append_file/index.js'
@@ -28,7 +31,7 @@ let workspace: string
 const dirs: string[] = []
 
 beforeEach(async () => {
-  workspace = await mkdtemp(join(tmpdir(), 'fs-tools-'))
+  workspace = await makeTempDir('fs-tools-')
   dirs.push(workspace)
 })
 afterEach(async () => {
@@ -138,7 +141,7 @@ describe('read_file', () => {
   })
 
   it('denies a path outside the workspace', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'outside-'))
+    const outside = await makeTempDir('outside-')
     dirs.push(outside)
     await writeFile(join(outside, 'secret.txt'), 'nope')
     const tool = await createReadFileTool()
@@ -149,7 +152,7 @@ describe('read_file', () => {
 
   it('denies a symlink that points outside the workspace', async () => {
     // The guard canonicalises before comparing; a prefix check would pass this.
-    const outside = await mkdtemp(join(tmpdir(), 'outside-'))
+    const outside = await makeTempDir('outside-')
     dirs.push(outside)
     await writeFile(join(outside, 'secret.txt'), 'nope')
     await symlink(join(outside, 'secret.txt'), join(workspace, 'link.txt'))
@@ -211,7 +214,7 @@ describe('write_file', () => {
   })
 
   it('denies a write outside the workspace', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'outside-'))
+    const outside = await makeTempDir('outside-')
     dirs.push(outside)
     const tool = await createWriteFileTool()
     const { isError } = await call(tool, { file_path: join(outside, 'x.txt'), content: 'nope' })
@@ -297,7 +300,7 @@ describe('append_file', () => {
   })
 
   it('denies a path outside the workspace', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'outside-'))
+    const outside = await makeTempDir('outside-')
     dirs.push(outside)
     const tool = await createAppendFileTool()
     expect((await call(tool, { file_path: join(outside, 'x'), content: 'y' })).isError).toBe(true)
@@ -431,7 +434,7 @@ describe('edit_file', () => {
   })
 
   it('denies an edit outside the workspace', async () => {
-    const outside = await mkdtemp(join(tmpdir(), 'outside-'))
+    const outside = await makeTempDir('outside-')
     dirs.push(outside)
     await writeFile(join(outside, 'x.txt'), 'secret')
     const tool = await createEditFileTool()
@@ -486,7 +489,7 @@ describe('fs tools workspace defaults', () => {
   }
 
   async function tempProject(): Promise<string> {
-    const dir = await mkdtemp(join(tmpdir(), 'meta-agent-fs-'))
+    const dir = await makeTempDir('meta-agent-fs-')
     dirs.push(dir)
     return dir
   }

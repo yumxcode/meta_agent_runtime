@@ -91,6 +91,40 @@ interface PendingJob {
 // 30 min) so it is settable from the config file as well as
 // META_AGENT_JOB_TIMEOUT_MS.
 
+/** Thrown when an executor is constructed with a limit it cannot honour. */
+export class ExecutorConfigError extends Error {
+  readonly code = 'ERR_INVALID_EXECUTOR_CONFIG'
+  constructor(message: string) {
+    super(message)
+    this.name = 'ExecutorConfigError'
+  }
+}
+
+function requireInt(value: number, name: string, min: number): number {
+  if (typeof value !== 'number' || !Number.isFinite(value)) {
+    throw new ExecutorConfigError(
+      `${name} must be a finite number, received ${describeNumber(value)}`,
+    )
+  }
+  if (!Number.isInteger(value)) {
+    throw new ExecutorConfigError(`${name} must be an integer, received ${value}`)
+  }
+  if (value < min) {
+    throw new ExecutorConfigError(`${name} must be >= ${min}, received ${value}`)
+  }
+  return value
+}
+
+const requirePositiveInt = (v: number, n: string): number => requireInt(v, n, 1)
+const requireNonNegativeInt = (v: number, n: string): number => requireInt(v, n, 0)
+
+/** `String(NaN)` is "NaN", which reads like a typo rather than a diagnosis. */
+function describeNumber(value: unknown): string {
+  if (typeof value !== 'number') return `${typeof value} (${String(value)})`
+  if (Number.isNaN(value)) return 'NaN (check the parse that produced it)'
+  return String(value)
+}
+
 export class LocalExecutor implements Executor {
   private readonly maxConcurrent: number
   private readonly maxQueued: number
@@ -106,9 +140,18 @@ export class LocalExecutor implements Executor {
    *   `0` disables the watchdog by default (a per-job `timeoutMs` can still
    *   re-enable it). Negative / non-finite inputs are ignored.
    */
-  constructor(maxConcurrent = 4, defaultTimeoutMs?: number, maxQueued = Math.max(1, maxConcurrent) * 16) {
-    this.maxConcurrent = Math.max(1, Math.floor(maxConcurrent))
-    this.maxQueued = Math.max(0, Math.floor(maxQueued))
+  constructor(maxConcurrent = 4, defaultTimeoutMs?: number, maxQueued?: number) {
+    // P2-2 (review 2026-08-27): `Math.max(1, Math.floor(NaN))` is NaN, and
+    // every comparison against NaN is false. That silently disabled BOTH
+    // limits at once — `running < maxConcurrent` never admitted a job, so
+    // everything queued forever, while `queue.length >= maxQueued` never
+    // tripped, so the queue grew without bound. A misconfigured pool that
+    // accepts work and never runs it is worse than one that refuses to start,
+    // so these throw instead of being clamped into something plausible.
+    this.maxConcurrent = requirePositiveInt(maxConcurrent, 'maxConcurrent')
+    this.maxQueued = maxQueued === undefined
+      ? this.maxConcurrent * 16
+      : requireNonNegativeInt(maxQueued, 'maxQueued')
     this.defaultTimeoutMs =
       defaultTimeoutMs !== undefined && Number.isFinite(defaultTimeoutMs) && defaultTimeoutMs >= 0
         ? defaultTimeoutMs
@@ -174,12 +217,29 @@ export class LocalExecutor implements Executor {
     this.abortControllers.set(jobId, ctrl)
     this.running++
 
-    callbacks.onStarted(jobId)
+    // P2-1: `onStarted` runs after `this.running++`, so letting it throw would
+    // escape `_run()` into `submit()` and permanently leak the slot we just
+    // took. Notification failure must not corrupt the executor's accounting.
+    try {
+      callbacks.onStarted(jobId)
+    } catch (err) {
+      console.warn(`[LocalExecutor] onStarted callback for job ${jobId} threw:`, err)
+    }
 
     const fullContext: JobContext = { ...context, abortSignal: ctrl.signal }
 
     const reporter: ProgressReporter = (progress) => {
-      callbacks.onProgress({ jobId, ...progress })
+      // P2-1 (review 2026-08-27): `reportProgress()` is called from inside the
+      // handler, so an exception here surfaced as a handler rejection and
+      // turned a successful job into a failed one. Progress reporting is an
+      // observation channel — it can go wrong without the work going wrong.
+      // JobManager isolates individual listeners too; this is the second layer,
+      // covering any other ExecutorCallbacks implementation.
+      try {
+        callbacks.onProgress({ jobId, ...progress })
+      } catch (err) {
+        console.warn(`[LocalExecutor] onProgress callback for job ${jobId} threw:`, err)
+      }
     }
 
     // Reporting and resource settlement are deliberately separate. The

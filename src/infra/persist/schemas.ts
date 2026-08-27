@@ -256,6 +256,9 @@ export const EngineeringJobSchema = z.object({
   sessionId:     z.string(),
   error:         z.string().optional(),
   artifacts:     z.array(JobArtifactSchema).optional(),
+  // P1-1: monotonic write counter. Optional so records written before this
+  // field existed still validate — a missing revision reads as 0.
+  revision:      z.number().optional(),
 })
 
 export type EngineeringJobValidated = z.infer<typeof EngineeringJobSchema>

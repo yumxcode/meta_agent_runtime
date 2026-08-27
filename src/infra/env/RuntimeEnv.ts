@@ -29,6 +29,39 @@
  * and they participate in provider auto-detection rather than plain config.
  */
 
+import { parseStrictInt, parseStrictFloat } from './strictNumber.js'
+
+// ── Invalid-value reporting ──────────────────────────────────────────────────
+//
+// P2-3 (review 2026-08-27): numeric env vars were read with `parseInt` /
+// `parseFloat`, which accept a valid prefix followed by garbage. A typo did not
+// fail — it silently selected a different, usually weaker, setting:
+//
+//   META_AGENT_JOB_TIMEOUT_MS=0oops   → 0  → job watchdog DISABLED
+//
+// Parsing is now whole-string (see ./strictNumber.js) and a rejected value is
+// announced rather than absorbed, so a misconfiguration is visible instead of
+// merely effective.
+
+/** One warning per env var per process — accessors are called on hot paths. */
+const warnedInvalidEnv = new Set<string>()
+
+function warnInvalidEnv(name: string, raw: string, expected: string): void {
+  if (warnedInvalidEnv.has(name)) return
+  warnedInvalidEnv.add(name)
+  console.warn(
+    `[RuntimeEnv] Ignoring ${name}=${JSON.stringify(raw)}: expected ${expected}. ` +
+    'Using the built-in default instead.',
+  )
+}
+
+/** Tests only: forget which variables have already been warned about. */
+export function _resetEnvWarningsForTest(): void {
+  warnedInvalidEnv.clear()
+}
+
+export { parseStrictInt, parseStrictFloat }
+
 // ── Generic typed parsers (live process.env) ─────────────────────────────────
 
 /** Raw string, trimmed; undefined when unset or empty after trim. */
@@ -61,10 +94,22 @@ export function readIntEnv(
 ): number | undefined {
   const raw = process.env[name]
   if (raw === undefined || raw.trim() === '') return undefined
-  const n = Number.parseInt(raw, 10)
-  if (!Number.isFinite(n)) return undefined
-  if (opts.min !== undefined && n < opts.min) return undefined
-  if (opts.max !== undefined && n > opts.max) return undefined
+  const n = parseStrictInt(raw)
+  if (n === undefined) {
+    warnInvalidEnv(name, raw, 'an integer')
+    return undefined
+  }
+  // Out-of-range is a distinct, quieter case: the value parsed fine, it just
+  // falls outside what this setting accepts. Still warn — a clamped-away limit
+  // is as surprising as an unparsed one.
+  if (opts.min !== undefined && n < opts.min) {
+    warnInvalidEnv(name, raw, `an integer >= ${opts.min}`)
+    return undefined
+  }
+  if (opts.max !== undefined && n > opts.max) {
+    warnInvalidEnv(name, raw, `an integer <= ${opts.max}`)
+    return undefined
+  }
   return n
 }
 
@@ -81,8 +126,11 @@ export function readIntEnvOr(
 ): number {
   const raw = process.env[name]
   if (raw === undefined || raw.trim() === '') return fallback
-  const n = Number.parseInt(raw, 10)
-  if (!Number.isFinite(n)) return fallback
+  const n = parseStrictInt(raw)
+  if (n === undefined) {
+    warnInvalidEnv(name, raw, 'an integer')
+    return fallback
+  }
   return Math.min(max, Math.max(min, n))
 }
 
@@ -93,12 +141,27 @@ export function readFloatEnv(
 ): number | undefined {
   const raw = process.env[name]
   if (raw === undefined || raw.trim() === '') return undefined
-  const n = Number.parseFloat(raw)
-  if (!Number.isFinite(n)) return undefined
-  if (opts.gt !== undefined && !(n > opts.gt)) return undefined
-  if (opts.lte !== undefined && !(n <= opts.lte)) return undefined
-  if (opts.min !== undefined && n < opts.min) return undefined
-  if (opts.max !== undefined && n > opts.max) return undefined
+  const n = parseStrictFloat(raw)
+  if (n === undefined) {
+    warnInvalidEnv(name, raw, 'a number')
+    return undefined
+  }
+  if (opts.gt !== undefined && !(n > opts.gt)) {
+    warnInvalidEnv(name, raw, `a number > ${opts.gt}`)
+    return undefined
+  }
+  if (opts.lte !== undefined && !(n <= opts.lte)) {
+    warnInvalidEnv(name, raw, `a number <= ${opts.lte}`)
+    return undefined
+  }
+  if (opts.min !== undefined && n < opts.min) {
+    warnInvalidEnv(name, raw, `a number >= ${opts.min}`)
+    return undefined
+  }
+  if (opts.max !== undefined && n > opts.max) {
+    warnInvalidEnv(name, raw, `a number <= ${opts.max}`)
+    return undefined
+  }
   return n
 }
 

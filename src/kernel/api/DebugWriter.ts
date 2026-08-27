@@ -27,6 +27,7 @@ import { join } from 'path'
 import { mkdir, open, readdir, rm, stat } from 'fs/promises'
 import type { FileHandle } from 'fs/promises'
 import { META_AGENT_HOME } from '../../core/metaAgentHome.js'
+import { isValidStoreId, resolveWithinRoot } from '../../infra/persist/storeId.js'
 
 const DEBUG_ROOT = join(META_AGENT_HOME, 'debug')
 const DEFAULT_DEBUG_TTL_MS = 14 * 24 * 60 * 60 * 1000   // 14 days
@@ -312,7 +313,16 @@ export class DebugWriter {
   ): Promise<DebugWriter | null> {
     if (!debug || !sessionId) return null
 
-    const dir = join(rootDir ?? DEBUG_ROOT, sessionId)
+    // Same containment rule as the other id-keyed stores (P0-1): the debug
+    // directory is created and written to, so an unchecked sessionId would let
+    // debug output land anywhere on disk.
+    //
+    // Declining rather than throwing, unlike the stores: this sits on the model
+    // call path (AnthropicClient opens it before the first request), so a throw
+    // here would turn "debug logging is misconfigured" into "the API call
+    // fails". Not writing debug output is the correct outcome either way.
+    if (!isValidStoreId(sessionId)) return null
+    const dir = resolveWithinRoot(rootDir ?? DEBUG_ROOT, sessionId)
     await mkdir(dir, { recursive: true })
 
     const ts = isoNow().replace(/[:.]/g, '-')

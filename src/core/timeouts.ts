@@ -54,6 +54,11 @@
 // reader lives), so routing config-file precedence through it would invert the
 // layering. Instead the env names live here in FIELD_SPECS, and ENV_REGISTRY
 // (infra/env/RuntimeEnv.ts) documents them for `--help` / the docs.
+//
+// `strictNumber` is the one exception, and not really one: it is a pure string
+// parser with no env or config knowledge, shared so that this table and
+// RuntimeEnv cannot drift into two different definitions of "a valid integer".
+import { parseStrictInt } from '../infra/env/strictNumber.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Schema
@@ -278,15 +283,37 @@ export function resetTimeoutsForTest(): void {
   _fileOverrides = {}
   _loader = null
   _loaderProjectDir = undefined
+  warnedTimeoutEnv.clear()
 }
 
+/**
+ * P2-3 (review 2026-08-27): `parseInt` made `META_AGENT_JOB_TIMEOUT_MS=0oops`
+ * parse as `0`, and `0` means "disable this watchdog". A typo therefore
+ * disarmed a safety limit silently. Whole-string parsing only, and an invalid
+ * value is announced rather than absorbed.
+ */
 function envValue(field: keyof TimeoutConfig): number | undefined {
   const spec = FIELD_SPECS[field]
   const raw = process.env[spec.env]
   if (raw === undefined || raw.trim() === '') return undefined
-  const n = Number.parseInt(raw, 10)
-  if (!Number.isFinite(n) || n < spec.min || n > spec.max) return undefined
+  const n = parseStrictInt(raw)
+  if (n === undefined || n < spec.min || n > spec.max) {
+    warnInvalidTimeoutEnv(spec.env, raw, spec.min, spec.max)
+    return undefined
+  }
   return n
+}
+
+/** One warning per variable per process; resolveTimeouts() runs on hot paths. */
+const warnedTimeoutEnv = new Set<string>()
+
+function warnInvalidTimeoutEnv(name: string, raw: string, min: number, max: number): void {
+  if (warnedTimeoutEnv.has(name)) return
+  warnedTimeoutEnv.add(name)
+  console.warn(
+    `[timeouts] Ignoring ${name}=${JSON.stringify(raw)}: expected an integer in [${min}, ${max}]. ` +
+    'Using the built-in default instead.',
+  )
 }
 
 /**

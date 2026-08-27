@@ -184,6 +184,62 @@ export async function listJsonIds(dir: string): Promise<string[]> {
   }
 }
 
+// ── Bounded concurrency ───────────────────────────────────────────────────────
+
+/**
+ * Default fan-out for directory-wide file reads.
+ *
+ * Chosen against the file-descriptor budget, not throughput: the default
+ * `ulimit -n` is 256 on macOS and 1024 on many Linux distros, and a store
+ * recovery runs alongside the host's own descriptors (sockets, MCP stdio pipes,
+ * log files). 16 concurrent reads saturate an SSD queue while leaving that
+ * budget essentially untouched.
+ */
+export const DEFAULT_READ_CONCURRENCY = 16
+
+/**
+ * `Promise.allSettled(items.map(fn))` with a ceiling on in-flight work.
+ *
+ * Why not just `allSettled` (P2-4, review 2026-08-27): job and session stores
+ * had no disk-level cap on record count — the terminal-record LRU bounds the
+ * in-memory Map but never unlinks files. A long-lived session therefore opened
+ * every historical record at once on restart, which is an `EMFILE` on a default
+ * ulimit and, short of that, materialises every file's bytes, string and parsed
+ * object simultaneously.
+ *
+ * Results keep input order, so callers can zip them back against `items`.
+ * Rejections are captured per item rather than failing the batch, matching
+ * `allSettled` semantics.
+ */
+export async function mapWithConcurrency<T, R>(
+  items: readonly T[],
+  limit: number,
+  fn: (item: T, index: number) => Promise<R>,
+): Promise<PromiseSettledResult<R>[]> {
+  const results = new Array<PromiseSettledResult<R>>(items.length)
+  if (items.length === 0) return results
+
+  const effectiveLimit = Number.isFinite(limit) ? Math.max(1, Math.floor(limit)) : DEFAULT_READ_CONCURRENCY
+  let cursor = 0
+
+  // Each worker pulls the next index off a shared cursor. `cursor++` is atomic
+  // here because JS has no preemption between the read and the increment.
+  const worker = async (): Promise<void> => {
+    while (cursor < items.length) {
+      const index = cursor++
+      try {
+        results[index] = { status: 'fulfilled', value: await fn(items[index] as T, index) }
+      } catch (reason) {
+        results[index] = { status: 'rejected', reason }
+      }
+    }
+  }
+
+  const workerCount = Math.min(effectiveLimit, items.length)
+  await Promise.all(Array.from({ length: workerCount }, () => worker()))
+  return results
+}
+
 // ── Cross-process file lock ────────────────────────────────────────────────────
 
 const DEFAULT_LOCK_STALE_MS = 30_000
@@ -290,9 +346,36 @@ export async function withFileLock<T>(
   let acquired = false
   while (!acquired) {
     try {
+      // P2-8 (review 2026-08-27): the three steps below used to run bare. An
+      // ENOSPC/EIO on writeFile() or close() left BOTH the open descriptor and
+      // the freshly-created sentinel behind — so the caller saw an error, the
+      // descriptor leaked for the process lifetime, and every later attempt on
+      // this target blocked on a lock file whose owner had never existed, until
+      // staleMs elapsed. The nested try/finally makes creation atomic in the
+      // sense that matters: either we own a written lock, or nothing remains.
       const handle = await open(lockPath, 'wx')
-      await handle.writeFile(`${ownerToken} ${new Date().toISOString()}`)
-      await handle.close()
+      let initialised = false
+      try {
+        await handle.writeFile(`${ownerToken} ${new Date().toISOString()}`)
+        initialised = true
+      } finally {
+        // close() failing after a successful write does not invalidate the
+        // lock — the bytes are in the page cache and the mtime is set — so it
+        // must not un-acquire it. It does still need reporting, hence the
+        // separate handling rather than a blanket catch.
+        try {
+          await handle.close()
+        } catch (closeErr) {
+          if (initialised) {
+            console.warn(`[persist] Lock handle for ${lockPath} failed to close:`, closeErr)
+          }
+        }
+        if (!initialised) {
+          // Remove only the sentinel WE just created. `wx` guarantees it was
+          // ours: the open would have failed with EEXIST otherwise.
+          await unlink(lockPath).catch(() => {})
+        }
+      }
       acquired = true
     } catch (err) {
       if ((err as NodeJS.ErrnoException)?.code !== 'EEXIST') throw err
