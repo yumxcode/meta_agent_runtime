@@ -22,27 +22,27 @@ import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { ResearchStore } from '../../../research/ResearchStore.js'
 import { dynamicDescription } from '../../util.js'
+import { DEFAULT_RESEARCH_BUDGET_USD, DEFAULT_RESEARCH_MAX_TURNS } from '../../../infra/budgets.js'
 
 export const RESEARCH_MAX_DURATION_MS = DEFAULT_SUB_AGENT_MAX_DURATION_MS
 const POLL_INTERVAL_MS = 2_000
-const DEFAULT_MAX_TURNS = 60
+const DEFAULT_MAX_TURNS = DEFAULT_RESEARCH_MAX_TURNS
 
 /**
  * Cost ceiling for one research run.
  *
- * MUST be set explicitly. `DEFAULT_SUB_AGENT_CONFIG.maxBudgetUsd` is $0.50 —
- * sized for a small helper task, and it was silently inherited here for every
- * research run. `maxTurns` (60) and `maxDurationMs` (30 min) had both been
- * raised for research; the budget was the one limit nobody raised, so it became
- * the binding constraint on an agent whose whole job is to "read the relevant
- * sources IN FULL". Runs died mid-read, never reached return_result, and the
- * saved report degraded to whatever narration was in the last message.
+ * Set EXPLICITLY rather than inheriting `DEFAULT_SUB_AGENT_CONFIG.maxBudgetUsd`,
+ * which is sized for a small helper task. `maxTurns` (60) and `maxDurationMs`
+ * (30 min) were both raised for research; the budget was the one limit nobody
+ * raised, so it became the binding constraint on an agent whose whole job is to
+ * "read the relevant sources IN FULL". Runs died mid-read, never reached
+ * return_result, and the saved report degraded to whatever narration happened to
+ * be in the last message.
  *
- * Reading a handful of papers in full costs multiples of $0.50; $4 buys a real
- * literature pass while still being a circuit breaker rather than a blank
- * cheque. Callers can override per dispatch with `max_budget_usd`.
+ * The value comes from the shared ladder (infra/budgets.ts) so it moves with the
+ * rest of the tiers. Callers can override per dispatch with `max_budget_usd`.
  */
-const DEFAULT_MAX_BUDGET_USD = 4
+const DEFAULT_MAX_BUDGET_USD = DEFAULT_RESEARCH_BUDGET_USD
 const CONCLUSION_HANDLE_MAX = 300
 
 const RESEARCH_AGENT_SYSTEM = `\

@@ -193,3 +193,83 @@ describe('simple_auto backend wiring', () => {
     expect(matched.config['initialCostUsd']).toBe(4.25)
   })
 })
+
+/**
+ * The session budget is CUMULATIVE ACROSS RESUME — the ledger is seeded from the
+ * checkpoint's `estimatedCostUsd`.
+ *
+ * A session that legitimately spent past its ceiling could therefore be resumed,
+ * burn a couple of model calls, and only then stop with a message whose advice
+ * ("拆分为更小的子任务") is wrong for this cause: the task size is irrelevant, the
+ * ledger was over the line before the first turn. Observed 2026-08-27 —
+ * $23.73 recorded against a $20 ceiling, dead after two tool calls.
+ */
+describe('resume past the budget ceiling is announced up front', () => {
+  let warnings: string[]
+  let restore: () => void
+
+  beforeEach(() => {
+    warnings = []
+    const original = process.stderr.write.bind(process.stderr)
+    const spy = vi.spyOn(process.stderr, 'write').mockImplementation(((chunk: string | Uint8Array) => {
+      warnings.push(String(chunk))
+      return true
+    }) as typeof process.stderr.write)
+    restore = () => { spy.mockRestore(); void original }
+  })
+
+  afterEach(() => restore())
+
+  async function resumeWithRecordedCost(costUsd: number, budgetUsd: number) {
+    const projectDir = tmpProjectDir()
+    await writeAutoCheckpoint(projectDir, {
+      schemaVersion: AUTO_CHECKPOINT_SCHEMA_VERSION,
+      sessionId: 'over-budget-session',
+      updatedAt: Date.now(),
+      revision: 3,
+      turnCount: 20,
+      estimatedCostUsd: costUsd,
+    })
+    const baseConfig = resolveConfig({ projectDir, maxBudgetUsd: budgetUsd })
+    await createAgenticBackend({
+      baseConfig,
+      projectDir,
+      explicitResume: true,
+      resumeSessionId: 'over-budget-session',
+      overrides: MODE_PROFILES['auto'].agenticOverrides,
+      getGoal: () => null,
+    })
+    return warnings.join('')
+  }
+
+  it('warns before the run when recorded spend already meets the ceiling', async () => {
+    const out = await resumeWithRecordedCost(23.73, 20)
+    expect(out).toMatch(/\[budget\]/)
+    expect(out).toMatch(/23\.73/)
+    expect(out).toMatch(/20\.00/)
+  })
+
+  it('names the lever that actually applies', async () => {
+    // Not "split the task" — that does nothing when the ledger starts over.
+    const out = await resumeWithRecordedCost(23.73, 20)
+    expect(out).toMatch(/--max-budget-usd/)
+    expect(out).toMatch(/META_AGENT_AUTO_MAX_BUDGET_USD/)
+    expect(out).toMatch(/cumulative/)
+  })
+
+  it('stays quiet when the resumed session is comfortably inside its ceiling', async () => {
+    const out = await resumeWithRecordedCost(23.73, 300)
+    expect(out).not.toMatch(/\[budget\]/)
+  })
+
+  it('warns at exactly the ceiling, not only past it', async () => {
+    // `>=`: a session sitting exactly on its limit has no headroom either.
+    const out = await resumeWithRecordedCost(20, 20)
+    expect(out).toMatch(/\[budget\]/)
+  })
+
+  it('does not fire for a fresh (non-resumed) session', async () => {
+    await buildBackend('auto')
+    expect(warnings.join('')).not.toMatch(/\[budget\]/)
+  })
+})

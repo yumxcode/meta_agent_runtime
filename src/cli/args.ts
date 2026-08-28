@@ -15,6 +15,7 @@ import { CLI_VERSION } from './version.js'
 import { bold, cyan, dim, gray, red, terminalText } from './term.js'
 import { printEnvTable } from './env.js'
 import { parseStrictInt, parseStrictFloat } from '../infra/env/strictNumber.js'
+import { DEFAULT_AUTO_SESSION_BUDGET_USD } from '../infra/budgets.js'
 
 export const VERSION = CLI_VERSION
 
@@ -46,9 +47,11 @@ ${bold('OPTIONS')}
   -b, --base-url <url>    API base URL (default: auto-detected from key)
       --model <model>   Model override (default: deepseek-v4-flash)
       --fallback-model <model>  Model to retry with when primary lacks a feature
+      --image <path|url>    Attach an image (repeatable). Interactively, write @path.png inline instead.
   -s, --system <text>   Custom system prompt
   -t, --max-turns <n>   Max agentic turns per message (default: 100; use "infinity" for no cap)
-      --max-budget-usd <n>  Whole-session USD budget (auto/simple_auto default: 20)
+      --max-budget-usd <n>  Whole-session USD budget, cumulative across resume
+                            (auto/simple_auto default: ${DEFAULT_AUTO_SESSION_BUDGET_USD})
   -r, --resume <id>     Resume a previous session by ID (or "last" for most recent)
       --session-dir <dir>  Persist one-shot session history under this folder
       --attached         In one-shot auto, wait and resume self_timer in this terminal
@@ -257,6 +260,8 @@ export interface CliOptions {
   baseUrl: string | undefined
   model: string | undefined
   fallbackModel: string | undefined
+  /** `--image` occurrences, in order. Paths or http(s) URLs. */
+  images: string[]
   system: string | undefined
   json: boolean
   debug: boolean                  // --debug: log full prompts + responses to stderr
@@ -311,6 +316,9 @@ export function parseCliArgs(): CliOptions {
         'base-url':   { type: 'string',  short: 'b' },
         model:        { type: 'string' },
         'fallback-model': { type: 'string' },
+        // Repeatable: `--image a.png --image b.png`. The `@path` syntax covers
+        // the interactive case; this is the scriptable one.
+        image:        { type: 'string',  multiple: true },
         system:       { type: 'string',  short: 's' },
         'max-turns':  { type: 'string',  short: 't' },
         'max-budget-usd': { type: 'string' },
@@ -444,6 +452,7 @@ export function parseCliArgs(): CliOptions {
     baseUrl:    parsed.values['base-url'] as string | undefined,
     model:      parsed.values['model']    as string | undefined,
     fallbackModel: parsed.values['fallback-model'] as string | undefined,
+    images:     (parsed.values['image'] as string[] | undefined) ?? [],
     system:     parsed.values['system']   as string | undefined,
     json:       parsed.values['json']     as boolean,
     debug:      parsed.values['debug']    as boolean,
@@ -523,6 +532,9 @@ export function buildLoopCliOptions(
     baseUrl: g.values['base-url'] as string | undefined,
     model:   g.values['model']    as string | undefined,
     fallbackModel: undefined,
+    // Loop seats are unattended: their prompt is assembled by the runtime, not
+    // typed, so there is nothing for --image to attach to.
+    images: [],
     system: undefined,
     json:   g.values['json'] as boolean,
     debug: (g.values['debug'] as boolean) || hoistedDebug.present,

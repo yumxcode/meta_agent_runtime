@@ -10,6 +10,7 @@
  */
 import * as readline from 'node:readline'
 import { SessionRouter } from '../routing/SessionRouter.js'
+import { promptTextOf, type PromptInput } from '../core/promptInput.js'
 import { RuntimeEnv } from '../infra/env/RuntimeEnv.js'
 import { ThinkingMeter } from './thinkingMeter.js'
 import { TerminalSanitizer, sanitizeTerminalPreview, sanitizeTerminalText } from './terminalSanitizer.js'
@@ -62,7 +63,7 @@ export interface SteerHooks {
 }
 
 interface StreamPromptSession {
-  submit(prompt: string): AsyncGenerator<MetaAgentEvent>
+  submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent>
   steer(text: string): boolean
   interrupt?(): void
   getEstimatedCost(): number
@@ -79,7 +80,7 @@ export interface StreamPromptResult {
 
 export async function streamPrompt(
   router: StreamPromptSession,
-  prompt: string,
+  prompt: PromptInput,
   jsonMode: boolean,
   showThinking = false,
   steerHooks?: SteerHooks,
@@ -252,7 +253,7 @@ export async function streamPrompt(
           isAutonomousMode(router.mode)
         ) {
           const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
-            goal: prompt, subtype: event.subtype,
+            goal: promptTextOf(prompt), subtype: event.subtype,
             recentText: recentAgentText, toolTrail: recentToolTrail,
           }) : null
           if (analysis) {
@@ -362,9 +363,15 @@ export async function streamPrompt(
               `${dim('继续输入以接着分析，或用 --max-turns <n> 提高上限。')}\n`,
             )
           } else if (event.subtype === 'error_max_budget') {
+            // The old wording said "token 预算" (it is a USD ceiling) and advised
+            // splitting the task — which is the wrong lever for the common case:
+            // the budget is CUMULATIVE ACROSS RESUME, so a long-running session
+            // can exhaust it before the current turn does any work at all, and
+            // no amount of splitting helps. Name the ceiling and the flag.
             await safeStdoutWrite(
-              `\n${yellow('⚠')}  ${yellow('已超出 token 预算上限。')} ` +
-              `${dim('任务已提前终止。可继续输入或拆分为更小的子任务。')}\n`,
+              `\n${yellow('⚠')}  ${yellow('已达到会话费用上限（USD）。')} ` +
+              `${dim('该上限跨 resume 累计，长会话会逐次逼近它。')}\n` +
+              `${dim('   用 --max-budget-usd <n> 提高本次上限，或设置 META_AGENT_AUTO_MAX_BUDGET_USD。')}\n`,
             )
           } else if (event.subtype === 'error_max_output_tokens') {
             await safeStdoutWrite(
@@ -391,7 +398,7 @@ export async function streamPrompt(
           // LLM diagnosis (what happened / root cause / what's needed next).
           if (event.isError && isAutonomousMode(router.mode)) {
             const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
-              goal: prompt, subtype: event.subtype,
+              goal: promptTextOf(prompt), subtype: event.subtype,
               recentText: recentAgentText, toolTrail: recentToolTrail,
             }) : null
             if (analysis) {

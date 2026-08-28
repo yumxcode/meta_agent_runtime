@@ -5,6 +5,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import type { SubAgentRecord, SubAgentTaskId } from '../types.js'
 import type { MetaAgentTool } from '../../core/types.js'
+import { DEFAULT_SUB_AGENT_POOL_BUDGET_USD } from '../../infra/budgets.js'
 
 const mockState = vi.hoisted(() => {
   const tasks = new Map<string, SubAgentRecord>()
@@ -322,19 +323,25 @@ describe('SubAgentBridge scheduler', () => {
     ).rejects.toThrow(/budget exceeded/)
   })
 
-  it('uses a $10 total budget for conservative auto defaults', async () => {
+  it('caps the sub-agent pool at the shared ladder value', async () => {
+    // Expressed relative to the ladder rather than a literal: the numbers move
+    // as a group (infra/budgets.ts) and a hard-coded $10 here just re-breaks
+    // every time they do. What must hold is the BEHAVIOUR — the pool total is
+    // enforced, and the error names the ceiling.
+    const pool = DEFAULT_SUB_AGENT_POOL_BUDGET_USD
     const bridge = new SubAgentBridge(crypto.randomUUID(), {
       conservativeAutoDefaults: true,
       startDelayMs: 0,
     })
 
+    const almostAll = pool * 0.6
     await expect(
-      bridge.spawnSubAgent({ config: { taskDescription: 'expensive research', maxBudgetUsd: 6 } }),
-    ).resolves.toMatchObject({ config: { maxBudgetUsd: 6 } })
+      bridge.spawnSubAgent({ config: { taskDescription: 'expensive research', maxBudgetUsd: almostAll } }),
+    ).resolves.toMatchObject({ config: { maxBudgetUsd: almostAll } })
 
     await expect(
-      bridge.spawnSubAgent({ config: { taskDescription: 'too much', maxBudgetUsd: 5 } }),
-    ).rejects.toThrow(/limit \$10\.0000/)
+      bridge.spawnSubAgent({ config: { taskDescription: 'too much', maxBudgetUsd: pool * 0.5 } }),
+    ).rejects.toThrow(new RegExp(`limit \\$${pool.toFixed(4)}`))
   })
 
   it('keeps conservative auto scheduling without a default total cap when a durable caller owns budget', async () => {

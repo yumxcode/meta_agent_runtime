@@ -4,6 +4,7 @@
  * Mirrors CC's Tool interface, but slimmed to what the kernel actually needs.
  * UI-only methods (renderToolResultMessage, etc.) are omitted.
  */
+import type { SupportedImageMediaType } from '../messages/imageBlocks.js'
 import type { KernelMessage } from './KernelMessage.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 import type { ToolPermissionDeclaration } from './Permissions.js'
@@ -80,9 +81,17 @@ export interface KernelParkControl {
 
 export type KernelToolControl = KernelParkControl
 
+/**
+ * What a tool may return as structured content.
+ *
+ * `media_type` is the narrow four-format union rather than `string`: it is what
+ * both the Anthropic wire type and the provider registry accept, and a wider
+ * type here would let a tool build a block that only fails at the API.
+ */
 export type ContentBlockLike =
   | { type: 'text'; text: string }
-  | { type: 'image'; source: { type: 'base64'; media_type: string; data: string } }
+  | { type: 'image'; source: { type: 'base64'; media_type: SupportedImageMediaType; data: string } }
+  | { type: 'image'; source: { type: 'url'; url: string } }
 
 // ── Zod-compatible schema (subset we need) ────────────────────────────────────
 

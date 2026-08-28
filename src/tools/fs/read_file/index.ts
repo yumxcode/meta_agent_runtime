@@ -3,6 +3,10 @@ import { extname } from 'path'
 import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/types.js'
 import { dynamicDescription } from '../../util.js'
 import { resolveInsideWorkspace } from '../workspaceGuard.js'
+import {
+  hasImageExtension, makeImageBlockFromBytes, readImageDimensions,
+  sniffImageMediaType, SUPPORTED_IMAGE_MEDIA_TYPES,
+} from '../../../kernel/messages/imageBlocks.js'
 
 const MAX_LINES = 2000
 const MAX_READ_BYTES = 5 * 1024 * 1024
@@ -52,6 +56,35 @@ export async function createReadFileTool(): Promise<MetaAgentTool> {
         }
 
         const ext = extname(filePath).toLowerCase()
+
+        // Images. Previously these fell through to the utf-8 read below and came
+        // back as replacement-character mojibake — a silent wrong answer, since
+        // nothing in the result said "this is binary". The bytes decide the
+        // format, not the extension, so a mislabelled file is reported rather
+        // than mis-declared.
+        if (hasImageExtension(filePath)) {
+          const bytes = await readFile(filePath)
+          const view = new Uint8Array(bytes.buffer, bytes.byteOffset, bytes.byteLength)
+          const mediaType = sniffImageMediaType(view)
+          if (!mediaType) {
+            return {
+              content: `Error: ${filePath} has an image extension but its contents are not a supported image ` +
+                `(${SUPPORTED_IMAGE_MEDIA_TYPES.join(', ')}).`,
+              isError: true,
+            }
+          }
+          _ctx.readFileState?.record(filePath, fileStat.size, fileStat.mtimeMs)
+          const block = makeImageBlockFromBytes(view, filePath)
+          const dims = readImageDimensions(view)
+          const shape = dims ? `, ${dims.width}×${dims.height}` : ''
+          return {
+            // The text fallback is what compaction, the trajectory record and
+            // the debug transcript will show — none of them can render an image.
+            content: `[image: ${filePath} (${mediaType}${shape}, ${fileStat.size} bytes)]`,
+            blocks: [{ type: 'text', text: `Image file: ${filePath}` }, block],
+            isError: false,
+          }
+        }
 
         // Jupyter notebooks
         if (ext === '.ipynb') {

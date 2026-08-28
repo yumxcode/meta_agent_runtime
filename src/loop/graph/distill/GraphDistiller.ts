@@ -58,6 +58,7 @@ import {
   mergeIntakePreconditions,
   type LoopIntakeRecord,
 } from './DistillIntake.js'
+import { DEFAULT_DISTILL_STAGE_BUDGET_USD } from '../../../infra/budgets.js'
 
 export interface DistillGraphResult {
   constraints: LoopConstraintLedger
@@ -296,18 +297,18 @@ export const GRAPH_DISTILL_PHASE_POLICY: Record<GraphDistillPhase, {
   // needs a much larger turn allowance than the batch phases.
   intake: {
     thinkingBudgetTokens: 8_000, maxOutputTokens: 32_768,
-    maxWallTimeMs: 3_600_000, maxTurns: 60, maxBudgetUsd: 10,
+    maxWallTimeMs: 3_600_000, maxTurns: 60, maxBudgetUsd: DEFAULT_DISTILL_STAGE_BUDGET_USD,
   },
   architect: {
     thinkingBudgetTokens: 12_000, maxOutputTokens: 32_768,
-    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10,
+    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: DEFAULT_DISTILL_STAGE_BUDGET_USD,
   },
   // Lowering is schema-directed and has graph_reference/graph_validate as its
   // observable scratchpad. Extended thinking encouraged provider-dependent,
   // unreviewable over-design in real Distill runs, so keep it off here.
   compiler: {
     thinkingBudgetTokens: 0, maxOutputTokens: 49_152,
-    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10,
+    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: DEFAULT_DISTILL_STAGE_BUDGET_USD,
   },
   // Review is an evidence-directed acceptance gate, not another design pass.
   // Extended thinking repeatedly consumed the entire wall window without a
@@ -319,7 +320,7 @@ export const GRAPH_DISTILL_PHASE_POLICY: Record<GraphDistillPhase, {
   // usable verdict twice in a row and burned the attempt.
   semantic_review: {
     thinkingBudgetTokens: 0, maxOutputTokens: 32_768,
-    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: 10,
+    maxWallTimeMs: 1_200_000, maxTurns: 30, maxBudgetUsd: DEFAULT_DISTILL_STAGE_BUDGET_USD,
   },
 }
 

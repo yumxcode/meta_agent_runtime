@@ -11,7 +11,7 @@ import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
 import {
   AUTO_STALL_FAILURE_LIMIT, AUTO_STALL_SOFT_LIMIT, AUTO_NO_FS_PROGRESS_LIMIT,
   AUTO_RECURRING_ERROR_LIMIT, RECURRING_ERROR_WINDOW,
-  SELF_EVAL_PROMPT, BUDGET_WARNING_FRACTION, BUDGET_WARNING_PROMPT,
+  SELF_EVAL_PROMPT, budgetWarningThresholdUsd, BUDGET_WARNING_PROMPT,
   allToolResultsErrored, turnMutatedFs, FS_MUTATING_TOOLS,
   collectTurnErrors, uniqueTurnErrors, countTurnsWithErrorSignature,
   buildRecurringErrorReflection,
@@ -34,6 +34,8 @@ import {
   normalizeMessagesForAPI,
   getMessagesAfterCompactBoundary,
   stripThinkingBlocksFromMessages,
+  downgradeImagesForModel,
+  applyImageRetention,
 } from '../messages/MessageNormalizer.js'
 import { normalizeMessagesForDeepSeek } from '../messages/DeepSeekMessageNormalizer.js'
 import {
@@ -61,7 +63,7 @@ import {
 } from '../api/Errors.js'
 import { calcCostUsd } from '../utils/CostTracker.js'
 import { parseCacheUsage } from '../utils/parseCacheUsage.js'
-import { getModelProtocol } from '../../providers/registry.js'
+import { getModelProtocol, modelSupportsVision } from '../../providers/registry.js'
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
@@ -219,6 +221,16 @@ function cloneLastRealUserTextMessage(messages: readonly KernelMessage[]): Kerne
  * re-trigger an immediate compaction (infinite-loop guard).
  */
 const CURRENT_TURN_TAIL_TOKEN_BUDGET = 40_000
+
+/**
+ * How many of the most recent images survive at full fidelity.
+ *
+ * Four covers the shapes that actually need the pixels — a before/after pair,
+ * a screenshot plus the reference it is compared against, one multi-image
+ * question — while capping the standing cost a long session carries in
+ * attachments nobody is reading any more. Override with META_AGENT_IMAGE_RETAIN.
+ */
+const DEFAULT_IMAGE_RETAIN = 4
 
 /** Per-message rough token estimate. Mirrors TokenCount.roughTokenCount. */
 function estimateMessageTokens(message: KernelMessage): number {
@@ -698,10 +710,10 @@ export async function* runKernelLoop(
   const budgetExceeded = (): boolean =>
     config.maxBudgetUsd !== undefined &&
     totalCost + additionalBudgetUsd() >= config.maxBudgetUsd
-  /** Nearly out of money — see BUDGET_WARNING_FRACTION. */
+  /** Nearly out of money — see budgetWarningThresholdUsd. */
   const budgetNearlyExhausted = (): boolean =>
     config.maxBudgetUsd !== undefined &&
-    totalCost + additionalBudgetUsd() >= config.maxBudgetUsd * BUDGET_WARNING_FRACTION
+    totalCost + additionalBudgetUsd() >= budgetWarningThresholdUsd(config.maxBudgetUsd)
   let budgetWarningInjected = false
   reportMainCost()
   let repeatedToolRequestCount = 0
@@ -1025,9 +1037,20 @@ export async function* runKernelLoop(
 
     // ── Steps 7+8: stream API + accumulate messages ───────────────────────────
     const systemPrompt = effectiveSystemPrompt
-    const messagesForApi = state.fallbackTriggered
+    const afterThinkingStrip = state.fallbackTriggered
       ? stripThinkingBlocksFromMessages(currentMessagesForQuery)
       : currentMessagesForQuery
+    // Applied once here, before the protocol fork, so both wire formats inherit
+    // it. The model can differ from the one the attachments were accepted for —
+    // `/model`, availability fallback — and images in the transcript would then
+    // be a hard 400 rather than a degradation.
+    const messagesForApi = applyImageRetention(
+      downgradeImagesForModel(
+        afterThinkingStrip,
+        modelSupportsVision(state.currentModel, config.baseURL),
+      ),
+      RuntimeEnv.imageRetainCount(DEFAULT_IMAGE_RETAIN),
+    )
 
     // Which tool SCHEMAS go on the wire this turn. Deferred tools are withheld
     // until `tool_search` reveals them; `config.tools` is left untouched, so a
@@ -1999,7 +2022,10 @@ export async function* runKernelLoop(
       append(makeTextUserMessage(BUDGET_WARNING_PROMPT, { isMeta: true }))
       yield {
         type: 'text_delta',
-        delta: `\n[budget] 已用约 ${Math.round(BUDGET_WARNING_FRACTION * 100)}% 预算，提示收尾…\n`,
+        // Report the real figures rather than a fixed percentage — the trigger
+        // is now "little absolute headroom left", so a hard-coded 80% would be
+        // wrong on any large budget.
+        delta: `\n[budget] 已用 $${totalCost.toFixed(2)} / 上限 $${(config.maxBudgetUsd ?? 0).toFixed(2)}，提示收尾…\n`,
         sessionId,
       }
     }

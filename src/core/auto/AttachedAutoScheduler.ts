@@ -1,5 +1,6 @@
 import {
   AutoContinuationStore,
+  AutoWakeConsumedError,
   type AutoContinuationRecord,
 } from './AutoContinuationStore.js'
 import type { AutoResumeOutcome } from './AutoScheduler.js'
@@ -145,6 +146,25 @@ export class AttachedAutoScheduler {
         if (result.outcome !== 'done' || !result.next) return 'completed'
         record = result.next
       } catch (error) {
+        // A CONSUMED wake must be retired, not re-queued. The attached path
+        // shares `resumeAutoContinuation` with the detached scheduler, so it
+        // receives the same AutoWakeConsumedError — but releasing it back to
+        // 'pending' with its original (already-past) fireAt hands a wake with a
+        // dead fence to whichever scheduler picks it up next, which then
+        // cancels the session. Same failure as the detached path, one hop
+        // later. See AutoScheduler.runClaim for the incident this comes from.
+        if (error instanceof AutoWakeConsumedError && !signal.aborted) {
+          await this.store.release(current.wakeId, token, 'done')
+          this.options.onEvent?.(
+            `[auto-attached] wake consumed for ${current.sessionId} (${current.wakeId}) but the ` +
+            `turn failed afterwards — retiring it instead of re-queuing (a re-queue would ` +
+            `cancel the session). ` +
+            `Cause: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}. ` +
+            `Session history is persisted; resume it with: ` +
+            `meta-agent --mode auto --resume ${current.sessionId} "继续"`,
+          )
+          throw error
+        }
         const cancelled = signal.aborted && this.shouldCancelActiveAbort(signal.reason)
         await this.store.release(
           current.wakeId,

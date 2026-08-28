@@ -14,6 +14,7 @@
  */
 import type { MetaAgentTool } from '../core/types.js'
 import type { ExecutionFailure } from '../infra/failures/ExecutionFailure.js'
+import { DEFAULT_SUB_AGENT_BUDGET_USD, DEFAULT_SUB_AGENT_MAX_TURNS } from '../infra/budgets.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Task ID
@@ -133,9 +134,9 @@ export interface SubAgentConfig {
   parkSignal?: { requested: boolean }
 
   // ── Circuit breakers ──────────────────────────────────────────────────────
-  /** Maximum conversation turns before the sub-agent is force-stopped.  Default: 10 */
+  /** Maximum conversation turns before the sub-agent is force-stopped. See infra/budgets.ts. */
   maxTurns: number
-  /** Maximum cost in USD before the sub-agent is force-stopped.  Default: 0.5 */
+  /** Maximum cost in USD before the sub-agent is force-stopped. See infra/budgets.ts. */
   maxBudgetUsd: number
   /**
    * Maximum wall-clock duration in ms before the sub-agent is force-stopped.
@@ -284,8 +285,10 @@ export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> =
   systemPrompt:            undefined,
   allowedTools:            undefined,
   resultSchema:            undefined,
-  maxTurns:                10,
-  maxBudgetUsd:            0.5,
+  maxTurns:                DEFAULT_SUB_AGENT_MAX_TURNS,
+  // Reserved IN FULL against the session ledger before the child starts, so
+  // this doubles as the concurrency divisor — see infra/budgets.ts.
+  maxBudgetUsd:            DEFAULT_SUB_AGENT_BUDGET_USD,
   maxDurationMs:           DEFAULT_SUB_AGENT_MAX_DURATION_MS,
   useEventDriven:          true,
   pollIntervalMs:          1_800_000,

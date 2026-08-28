@@ -8,6 +8,7 @@ import {
   type EffectProvider, type GraphAgentExecutionRequest, type LoopGraphSpec,
 } from '../index.js'
 import { prepareAndClaim, runClaimedWake } from '../../runner.js'
+import { DEFAULT_GRAPH_SEGMENT_BUDGET_USD } from '../../../infra/budgets.js'
 
 const roots: string[] = []
 afterEach(async () => Promise.all(roots.splice(0).map(root => rm(root, { recursive: true, force: true }))))
@@ -104,7 +105,7 @@ describe('durable-graph-v2 runtime', () => {
     expect(request?.workspace.writeAllowPaths).toEqual([join(projectDir, 'state')])
     expect(request?.workspace.writeDenyPaths).toContain(join(projectDir, '.git'))
     expect(request?.prompt.user).toContain('append_only')
-    expect(request?.limits).toEqual({ turns: 30, usd: 10 })
+    expect(request?.limits).toEqual({ turns: 30, usd: DEFAULT_GRAPH_SEGMENT_BUDGET_USD })
     expect(store.paths).not.toHaveProperty('artifactsDir')
     expect((await kernel.tick()).instance.status).toBe('done')
   })

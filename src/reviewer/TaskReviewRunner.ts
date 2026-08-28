@@ -33,11 +33,12 @@ import {
   type TaskReview,
   type TaskReviewerRunManifest,
 } from './types.js'
+import { DEFAULT_REVIEW_BUDGET_USD } from '../infra/budgets.js'
 
 const DEFAULT_CASE_LIMIT = 20
 const DEFAULT_MAX_CASES = 20
 const DEFAULT_MAX_TURNS_PER_CASE = 12
-const DEFAULT_MAX_BUDGET_USD = 5
+const DEFAULT_MAX_BUDGET_USD = DEFAULT_REVIEW_BUDGET_USD
 
 export interface TaskReviewerScope extends TaskCaseScope {
   maxCases?: number

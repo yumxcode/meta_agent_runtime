@@ -40,6 +40,7 @@ import type { MetaAgentConfig, ResolvedConfig } from '../core/config.js'
 import { resolveConfig, isAnthropicProvider } from '../core/config.js'
 import type { AutonomyProfile, ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
 import { EMPTY_USAGE } from '../core/types.js'
+import { promptTextOf, withPromptPrefix, type PromptInput } from '../core/promptInput.js'
 import { MetaAgentSession } from '../modes/MetaAgentSession.js'
 import { CampaignSession } from '../modes/CampaignSession.js'
 import { runPostSessionMemoryWriter } from '../core/memory/memoryWriter.js'
@@ -73,7 +74,7 @@ export type { RoboticsCapabilities, RoboticsTeamController }
 // ── Minimal interface shared by all backends ──────────────────────────────────
 
 interface SessionImpl {
-  submit(prompt: string): AsyncGenerator<MetaAgentEvent>
+  submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent>
   registerTool(tool: MetaAgentTool): void
   interrupt(): void
   steer?(text: string): boolean
@@ -304,30 +305,36 @@ export class SessionRouter {
    * Submit a prompt. On the first call, the selected backend is created.
    * Subsequent calls reuse the same backend.
    */
-  async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
+  async *submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent> {
+    // Everything in this method that REASONS about the prompt — memory recall,
+    // mode selection, goal anchoring, continuation detection — works on the
+    // text alone. Attachments travel separately and rejoin at the delegation
+    // below, so widening the parameter changes no routing behaviour.
+    const promptText = promptTextOf(prompt)
+
     // P0-1: start the per-query memory recall NOW so it overlaps backend
     // initialisation instead of running serially after it. Single-flight +
     // consume-once + compatibility-checked inside
     // findRelevantMemories — when anything mismatches, the prompt build simply
     // recomputes fresh, so correctness never depends on this call.
     prefetchRelevantMemories({
-      query:       prompt,
+      query:       promptText,
       client:      this._recallClient ?? undefined,
       sessionMode: this._currentMode ?? undefined,
       domainScope: this._cfg.domain,
       flashModel:  this._cfg.flashModel,
     })
-    await this._ensureImpl(prompt)
+    await this._ensureImpl(promptText)
 
     // Auto mode, first turn: remember the durable goal anchor, and — when this is
     // an explicit --resume — re-inject the prior checkpoint (goal / done /
     // pending / artifacts / in-flight sub-agents) into the model's context so the
     // resumed run continues instead of restarting. The CLI banner is shown only
     // to the human; this preamble is what the model actually sees.
-    let effectivePrompt = prompt
+    let effectivePrompt: PromptInput = prompt
     if (isAutonomousMode(this._currentMode)) {
       const isFirstTurn = this._autoGoal === null
-      const isContinuation = isAutoContinuationPrompt(prompt)
+      const isContinuation = isAutoContinuationPrompt(promptText)
 
       if (isFirstTurn && this._explicitResume && isContinuation && this._autoCheckpointCoordinator) {
         // Resumed to CONTINUE: the user gave no new requirement (empty or a
@@ -353,11 +360,15 @@ export class SessionRouter {
             ].join('\n')
           : null
         if (preamble || wakePreamble) {
-          effectivePrompt = `${[preamble, wakePreamble].filter(Boolean).join('\n\n')}\n\n[本次用户输入]\n${prompt}`
+          effectivePrompt = withPromptPrefix(
+            prompt,
+            `${[preamble, wakePreamble].filter(Boolean).join('\n\n')}\n\n[本次用户输入]`,
+            '\n',
+          )
           this._autoGoal = cp?.goal ?? null
         }
         this._scheduledAutoWake = null
-        if (this._autoGoal === null) this._autoGoal = prompt
+        if (this._autoGoal === null) this._autoGoal = promptText
       } else if (isFirstTurn) {
         // Fresh session OR resumed-with-a-NEW-requirement: the user's input is
         // the goal — NOT the old checkpoint's. On resume we additionally clear
@@ -366,9 +377,9 @@ export class SessionRouter {
         // for context, so we deliberately skip the "continue the old goal"
         // preamble that would otherwise mis-anchor the gates.
         if (this._explicitResume) {
-          await this._reanchorAutoGoal(prompt)
+          await this._reanchorAutoGoal(promptText)
         } else {
-          this._autoGoal = prompt
+          this._autoGoal = promptText
         }
       } else if (!isContinuation) {
         // NEW task in an already-running session. One submit() drives the auto
@@ -377,7 +388,7 @@ export class SessionRouter {
         // (which read the goal lazily via getGoal) keep judging against the
         // FIRST task's goal. We also clear the run-scoped state they consult so
         // the new task does not inherit the previous one's progress record.
-        await this._reanchorAutoGoal(prompt)
+        await this._reanchorAutoGoal(promptText)
       }
       // else: an in-session "继续"/"continue" prompt — keep the current goal and
       // run state untouched so the model carries on the same task.

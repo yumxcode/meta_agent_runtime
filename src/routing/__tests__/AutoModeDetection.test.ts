@@ -2,6 +2,7 @@ import { describe, it, expect } from 'vitest'
 import type { SessionMode } from '../../core/modes.js'
 import { SessionRouter } from '../SessionRouter.js'
 import { MODE_WEIGHT } from '../types.js'
+import { DEFAULT_AUTO_SESSION_BUDGET_USD } from '../../infra/budgets.js'
 
 describe('SessionRouter — explicit mode selection', () => {
   it('defaults to agentic instead of detecting robotics/campaign from prompt text', async () => {
@@ -23,7 +24,8 @@ describe('SessionRouter — explicit mode selection', () => {
   it('applies a finite default whole-session budget to autonomous modes', () => {
     const router = new SessionRouter({ mode: 'auto' })
     const config = router as unknown as { _cfg: { maxBudgetUsd: number } }
-    expect(config._cfg.maxBudgetUsd).toBe(20)
+    expect(config._cfg.maxBudgetUsd).toBe(DEFAULT_AUTO_SESSION_BUDGET_USD)
+    expect(Number.isFinite(config._cfg.maxBudgetUsd)).toBe(true)
   })
 })
 

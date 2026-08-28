@@ -1,3 +1,4 @@
+import type { PromptInput } from '../../../core/promptInput.js'
 import type { MetaAgentEvent } from '../../../core/types.js'
 import type { LoopGraphSpec } from '../spec/GraphTypes.js'
 
@@ -43,7 +44,11 @@ export interface GraphDistillExecutor {
 }
 
 export interface ForegroundDistillSession {
-  submit(prompt: string): AsyncGenerator<MetaAgentEvent>
+  // Widened alongside the rest of the session layers. Distill itself never
+  // attaches images — `taskDescription` is a string — but the CLI adapter in
+  // cli/commands/loop.ts hands this straight to streamPrompt, so a narrower
+  // type here would force a lossy string coercion at that seam.
+  submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent>
   interrupt(): void
   steer(text: string): boolean
   getEstimatedCost(): number

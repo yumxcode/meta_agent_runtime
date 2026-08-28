@@ -38,6 +38,8 @@ import { askQuestion, isNativeQuestionActive, confirmWorkspace } from './prompts
 import { selectHardwareProfile, buildHardwareSystemPrompt } from './hardware.js'
 import { makeRouter } from './router.js'
 import { streamPrompt, getCliMaxVisibleChars, type SteerHooks } from './stream.js'
+import { buildPromptInput, AttachmentError } from './attachments.js'
+import type { PromptInput } from '../core/promptInput.js'
 import {
   sessionDisplayTitle, runSessionPicker, persistSessionSnapshot, armAutoContinuation,
   persistedResumeMessageCount,
@@ -1618,6 +1620,27 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     // ── Normal prompt ──
     interrupted = false
 
+    // Resolve `@shot.png` references into image blocks before anything else.
+    // Failures are reported and the turn is abandoned rather than silently
+    // sending the reference as literal text — a user who attached an image and
+    // got an answer that ignored it has no way to tell that it never arrived.
+    let turnPrompt: PromptInput
+    try {
+      const providerCfg = router.getProviderConfig()
+      turnPrompt = await buildPromptInput({
+        line: input,
+        cwd: opts.workspace ?? process.cwd(),
+        target: { model: providerCfg.model, baseURL: providerCfg.baseURL },
+      })
+    } catch (err) {
+      if (err instanceof AttachmentError) {
+        console.error(`\n${red('附件错误:')} ${terminalText(err.message)}\n`)
+        rl.prompt()
+        continue
+      }
+      throw err
+    }
+
     // Snapshot pending counts before this turn so we can detect new additions
     const pendingCountBefore = router.getPendingExperiences()?.count ?? 0
     const anchorCountBefore = router.getPendingPhysicalAnchors()?.count ?? 0
@@ -1632,7 +1655,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     let turnStream: StreamPromptResult | undefined
     try {
       turnStream = await streamPrompt(
-        router, input, opts.json, opts.showThinking,
+        router, turnPrompt, opts.json, opts.showThinking,
         _steerEnabled ? steerHooks : undefined,
       )
     } catch (err) {

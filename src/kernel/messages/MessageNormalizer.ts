@@ -68,6 +68,142 @@ export function normalizeMessagesForAPI(messages: readonly KernelMessage[]): API
   return merged
 }
 
+/**
+ * Keep only the most recent `retain` images at full fidelity.
+ *
+ * Images are pure input cost. They are not covered by prefix caching, they are
+ * never elided by the text-oriented truncation in StructuralTruncate, and they
+ * carry a flat per-image token charge that does not shrink with age — so a long
+ * session accumulates a floor of cost from screenshots nobody is looking at any
+ * more. The placeholder keeps the fact that an image WAS there, which is what
+ * later turns actually reference ("the error in that screenshot").
+ *
+ * Counted in images rather than turns because the charge is per image: N turns
+ * could mean one attachment or thirty.
+ *
+ * Identity when nothing would be dropped, so short sessions pay nothing.
+ */
+export function applyImageRetention(
+  messages: readonly KernelMessage[],
+  retain: number,
+): readonly KernelMessage[] {
+  if (retain < 0) return messages
+
+  let total = 0
+  for (const msg of messages) total += countImages(msg.content)
+  if (total <= retain) return messages
+
+  // Walk backwards so "most recent" is decided before anything is rewritten.
+  let budget = retain
+  const rewritten: KernelMessage[] = new Array(messages.length)
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const msg = messages[i]!
+    const count = countImages(msg.content)
+    if (count === 0) {
+      rewritten[i] = msg
+      continue
+    }
+    if (count <= budget) {
+      budget -= count
+      rewritten[i] = msg
+      continue
+    }
+    const keepInThisMessage = budget
+    budget = 0
+    rewritten[i] = { ...msg, content: retainWithin(msg.content, keepInThisMessage) }
+  }
+  return rewritten
+}
+
+function countImages(content: readonly ContentBlock[]): number {
+  let n = 0
+  for (const block of content) {
+    if (block.type === 'image') n++
+    else if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      n += countImages(block.content as ContentBlock[])
+    }
+  }
+  return n
+}
+
+/**
+ * Keep the LAST `keep` images within one message, aging out the rest.
+ * Applied back-to-front for the same reason as the outer walk.
+ */
+function retainWithin(content: readonly ContentBlock[], keep: number): ContentBlock[] {
+  let budget = keep
+  const out: ContentBlock[] = new Array(content.length)
+  for (let i = content.length - 1; i >= 0; i--) {
+    const block = content[i]!
+    if (block.type === 'image') {
+      if (budget > 0) {
+        budget--
+        out[i] = block
+      } else {
+        out[i] = { type: 'text', text: '[image aged out of context]' }
+      }
+      continue
+    }
+    if (block.type === 'tool_result' && Array.isArray(block.content)) {
+      const inner = block.content as ContentBlock[]
+      const innerCount = countImages(inner)
+      if (innerCount === 0) { out[i] = block; continue }
+      const keepInner = Math.min(budget, innerCount)
+      budget -= keepInner
+      out[i] = { ...block, content: retainWithin(inner, keepInner) } as ContentBlock
+      continue
+    }
+    out[i] = block
+  }
+  return out
+}
+
+/**
+ * Replace image blocks with text placeholders when the target model has no
+ * vision capability.
+ *
+ * This is a second line of defence, not the primary gate — attachments are
+ * rejected at the entry point with a message naming the model. It exists
+ * because the model can change MID-SESSION (`/model`, availability fallback,
+ * the flash side-call path) while the transcript keeps every image that earlier
+ * turns attached. Without this, one `/model` to a text-only model turns every
+ * subsequent turn of that session into a 400 whose text blames the request in
+ * flight rather than the switch that caused it.
+ *
+ * Identity when `supportsVision` is true, so the vision path pays nothing.
+ */
+export function downgradeImagesForModel(
+  messages: readonly KernelMessage[],
+  supportsVision: boolean,
+): readonly KernelMessage[] {
+  if (supportsVision) return messages
+  if (!messages.some(hasImageContent)) return messages
+  return messages.map(msg =>
+    hasImageContent(msg) ? { ...msg, content: msg.content.map(downgradeBlock) } : msg,
+  )
+}
+
+function hasImageContent(message: KernelMessage): boolean {
+  return message.content.some(block =>
+    block.type === 'image' ||
+    (block.type === 'tool_result' && Array.isArray(block.content) &&
+      (block.content as ContentBlock[]).some(inner => inner.type === 'image')),
+  )
+}
+
+function downgradeBlock(block: ContentBlock): ContentBlock {
+  if (block.type === 'image') {
+    return { type: 'text', text: '[image omitted — the active model has no vision support]' }
+  }
+  if (block.type === 'tool_result' && Array.isArray(block.content)) {
+    return {
+      ...block,
+      content: (block.content as ContentBlock[]).map(downgradeBlock),
+    } as ContentBlock
+  }
+  return block
+}
+
 /** Remove provider/model-bound thinking blocks before cross-model fallback. */
 export function stripThinkingBlocksFromMessages(messages: readonly KernelMessage[]): KernelMessage[] {
   return messages.map(msg => ({

@@ -1,0 +1,197 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1920" height="1080" viewBox="0 0 1920 1080">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#F8FAFF"/>
+      <stop offset="0.55" stop-color="#FFFFFF"/>
+      <stop offset="1" stop-color="#F4F7FF"/>
+    </linearGradient>
+    <linearGradient id="blue" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#2F6BFF"/>
+      <stop offset="1" stop-color="#7259FF"/>
+    </linearGradient>
+    <linearGradient id="cyan" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00A9D8"/>
+      <stop offset="1" stop-color="#1879E8"/>
+    </linearGradient>
+    <linearGradient id="mint" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#00B98B"/>
+      <stop offset="1" stop-color="#00D1B0"/>
+    </linearGradient>
+    <linearGradient id="violet" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#7357FF"/>
+      <stop offset="1" stop-color="#A24DFF"/>
+    </linearGradient>
+    <linearGradient id="orange" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#FF8A35"/>
+      <stop offset="1" stop-color="#FF5E45"/>
+    </linearGradient>
+    <pattern id="grid" width="48" height="48" patternUnits="userSpaceOnUse">
+      <path d="M 48 0 L 0 0 0 48" fill="none" stroke="#C9D5EE" stroke-width="1" opacity="0.28"/>
+    </pattern>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="12" stdDeviation="16" flood-color="#20366F" flood-opacity="0.13"/>
+    </filter>
+    <filter id="soft" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur stdDeviation="22"/>
+    </filter>
+    <marker id="arrowBlue" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#4168ED"/>
+    </marker>
+    <marker id="arrowViolet" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#7657F4"/>
+    </marker>
+    <marker id="arrowGreen" markerWidth="12" markerHeight="12" refX="10" refY="6" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L12,6 L0,12 Z" fill="#00A884"/>
+    </marker>
+    <style>
+      text { font-family: "SF Pro Display", "PingFang SC", "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; }
+      .title { font-size: 68px; font-weight: 800; fill: #0C1B3A; letter-spacing: -1px; }
+      .subtitle { font-size: 31px; font-weight: 500; fill: #53627E; }
+      .kicker { font-size: 22px; font-weight: 750; fill: #3166F5; letter-spacing: 2px; }
+      .card-title { font-size: 30px; font-weight: 760; fill: #102044; }
+      .card-copy { font-size: 22px; font-weight: 500; fill: #5C6982; }
+      .small { font-size: 19px; font-weight: 560; fill: #64718B; }
+      .pill { font-size: 20px; font-weight: 700; }
+      .section { font-size: 24px; font-weight: 780; }
+    </style>
+  </defs>
+
+  <rect width="1920" height="1080" fill="url(#bg)"/>
+  <rect width="1920" height="1080" fill="url(#grid)"/>
+  <circle cx="1550" cy="140" r="250" fill="#EAE9FF" opacity="0.5" filter="url(#soft)"/>
+  <circle cx="240" cy="860" r="260" fill="#E3F9F3" opacity="0.55" filter="url(#soft)"/>
+
+  <text x="96" y="78" class="kicker">META-AGENT · AUTO MODE / CONTROL LOOP</text>
+  <text x="96" y="158" class="title">把“一次执行”变成可验证的闭环控制</text>
+  <text x="98" y="210" class="subtitle">目标不漂移，状态可观测；中途能纠偏，结束前必须过证据门</text>
+
+  <!-- main flow -->
+  <rect x="78" y="286" width="1764" height="384" rx="38" fill="#FFFFFF" stroke="#DDE5F6" stroke-width="2" filter="url(#shadow)"/>
+  <text x="118" y="332" class="section" fill="#3D4D70">主执行回路 · KernelLoop</text>
+
+  <!-- goal anchor -->
+  <g transform="translate(116 374)">
+    <rect width="248" height="190" rx="28" fill="#F2F6FF" stroke="#9EB7FF" stroke-width="2"/>
+    <circle cx="48" cy="46" r="26" fill="url(#blue)"/>
+    <circle cx="48" cy="46" r="12" fill="none" stroke="white" stroke-width="4"/>
+    <circle cx="48" cy="46" r="4" fill="white"/>
+    <path d="M48 46 L65 30" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <text x="84" y="54" class="card-title">目标锚点</text>
+    <text x="28" y="105" class="card-copy">首轮冻结原始 Goal</text>
+    <text x="28" y="141" class="card-copy">压缩 / 续跑后仍存活</text>
+    <rect x="28" y="157" width="148" height="24" rx="12" fill="#DCE6FF"/>
+    <text x="102" y="175" text-anchor="middle" class="small" fill="#315EDC">Reference</text>
+  </g>
+
+  <path d="M364 469 L434 469" stroke="#4168ED" stroke-width="6" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+
+  <!-- query -->
+  <g transform="translate(448 374)">
+    <rect width="260" height="190" rx="28" fill="#F6F3FF" stroke="#B8A8FF" stroke-width="2"/>
+    <circle cx="48" cy="46" r="26" fill="url(#violet)"/>
+    <path d="M36 46 C36 35 44 30 52 33 C63 36 65 51 56 57 C50 62 41 59 38 53" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <circle cx="39" cy="43" r="3" fill="white"/><circle cx="51" cy="40" r="3" fill="white"/><circle cx="54" cy="51" r="3" fill="white"/>
+    <text x="84" y="54" class="card-title">推理与决策</text>
+    <text x="28" y="105" class="card-copy">读取 Goal + 当前状态</text>
+    <text x="28" y="141" class="card-copy">选择下一批工具动作</text>
+    <rect x="28" y="157" width="156" height="24" rx="12" fill="#E8E1FF"/>
+    <text x="106" y="175" text-anchor="middle" class="small" fill="#6847D5">Controller</text>
+  </g>
+
+  <path d="M708 469 L778 469" stroke="#4168ED" stroke-width="6" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+
+  <!-- tools -->
+  <g transform="translate(792 374)">
+    <rect width="276" height="190" rx="28" fill="#EFFBFF" stroke="#89D4EB" stroke-width="2"/>
+    <circle cx="48" cy="46" r="26" fill="url(#cyan)"/>
+    <path d="M34 36 H61 M34 46 H61 M34 56 H52" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <text x="84" y="54" class="card-title">执行工具批次</text>
+    <text x="28" y="105" class="card-copy">文件 / Shell / 子代理</text>
+    <text x="28" y="141" class="card-copy">结果回写会话状态</text>
+    <rect x="28" y="157" width="196" height="24" rx="12" fill="#D7F3FA"/>
+    <text x="126" y="175" text-anchor="middle" class="small" fill="#087DA4">workspace jail 内</text>
+  </g>
+
+  <path d="M1068 469 L1138 469" stroke="#4168ED" stroke-width="6" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+
+  <!-- checkpoint -->
+  <g transform="translate(1152 374)">
+    <rect width="280" height="190" rx="28" fill="#F0FCF8" stroke="#7DD9C0" stroke-width="2"/>
+    <circle cx="48" cy="46" r="26" fill="url(#mint)"/>
+    <path d="M36 35 H60 V58 H36 Z M41 35 V45 H55 V35 M42 52 H54" fill="none" stroke="white" stroke-width="3.5" stroke-linejoin="round"/>
+    <text x="84" y="54" class="card-title">持久化观测</text>
+    <text x="28" y="105" class="card-copy">Goal / Todo / Artifact</text>
+    <text x="28" y="141" class="card-copy">成本 / 轮次 / 运行健康</text>
+    <rect x="28" y="157" width="180" height="24" rx="12" fill="#D8F5EC"/>
+    <text x="118" y="175" text-anchor="middle" class="small" fill="#078568">atomic revision</text>
+  </g>
+
+  <path d="M1432 469 L1502 469" stroke="#4168ED" stroke-width="6" stroke-linecap="round" marker-end="url(#arrowBlue)"/>
+
+  <!-- decision -->
+  <g transform="translate(1518 374)">
+    <rect width="254" height="190" rx="28" fill="#FFF7F0" stroke="#FFBE91" stroke-width="2"/>
+    <circle cx="48" cy="46" r="26" fill="url(#orange)"/>
+    <path d="M48 31 V48 L60 55" fill="none" stroke="white" stroke-width="4" stroke-linecap="round"/>
+    <text x="84" y="54" class="card-title">边界判定</text>
+    <text x="28" y="105" class="card-copy">继续推进 / 中途审查</text>
+    <text x="28" y="141" class="card-copy">或进入完成度审核</text>
+    <rect x="28" y="157" width="168" height="24" rx="12" fill="#FFE5D1"/>
+    <text x="112" y="175" text-anchor="middle" class="small" fill="#C95C1C">Feedback router</text>
+  </g>
+
+  <!-- simple continue path -->
+  <path d="M1642 564 C1642 642 1360 636 1240 636 C950 636 676 654 578 594 L578 568" fill="none" stroke="#4168ED" stroke-width="5" stroke-linecap="round" stroke-dasharray="13 12" marker-end="url(#arrowBlue)"/>
+  <rect x="974" y="616" width="208" height="40" rx="20" fill="#EEF3FF" stroke="#B7C7F5"/>
+  <text x="1078" y="643" text-anchor="middle" class="pill" fill="#365BC9">正常推进 → 下一轮</text>
+
+  <!-- drift gate -->
+  <g transform="translate(92 724)">
+    <rect width="806" height="246" rx="32" fill="#FFFFFF" stroke="#B9A9FF" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="0" y="0" width="12" height="246" rx="6" fill="url(#violet)"/>
+    <text x="40" y="49" class="kicker" fill="#6B4FE0">MID-FLIGHT · DRIFT / LEARN</text>
+    <text x="40" y="92" class="card-title">中途航向检查：是否仍在朝原始目标收敛？</text>
+    <rect x="40" y="120" width="312" height="42" rx="21" fill="#F0ECFF"/>
+    <text x="196" y="148" text-anchor="middle" class="pill" fill="#6445D5">Checkpoint 有新 revision</text>
+    <text x="372" y="149" class="pill" fill="#7A6C9E">＋</text>
+    <rect x="408" y="120" width="326" height="42" rx="21" fill="#F0ECFF"/>
+    <text x="571" y="148" text-anchor="middle" class="pill" fill="#6445D5">距上次 ≥ 30 个工具批次</text>
+    <text x="40" y="198" class="card-copy">独立 Drift Agent 只看 Goal、Checkpoint、文件变更与既有经验</text>
+    <text x="40" y="230" class="card-copy">偏离 → 注入校正；有确凿证据 → 写入经验，供后续轮次召回</text>
+  </g>
+
+  <path d="M488 724 C500 686 560 672 654 660" fill="none" stroke="#7657F4" stroke-width="5" marker-end="url(#arrowViolet)"/>
+
+  <!-- verify gate -->
+  <g transform="translate(936 724)">
+    <rect width="892" height="246" rx="32" fill="#FFFFFF" stroke="#7FD9C1" stroke-width="2" filter="url(#shadow)"/>
+    <rect x="0" y="0" width="12" height="246" rx="6" fill="url(#mint)"/>
+    <text x="40" y="49" class="kicker" fill="#008F70">DONE CANDIDATE · VERIFY</text>
+    <text x="40" y="92" class="card-title">完成门禁：停止调用工具 ≠ 任务真的完成</text>
+    <text x="40" y="135" class="card-copy">独立 Verify Agent 对照冻结 Goal + 只读快照 + 实际 diff 取证</text>
+    <rect x="40" y="162" width="208" height="48" rx="24" fill="#DCF7EE"/>
+    <text x="144" y="194" text-anchor="middle" class="pill" fill="#007B60">PASS → success</text>
+    <rect x="274" y="162" width="370" height="48" rx="24" fill="#FFF0E7"/>
+    <text x="459" y="194" text-anchor="middle" class="pill" fill="#C45C23">FAIL → 注回 unfinished，继续修复</text>
+    <rect x="670" y="162" width="178" height="48" rx="24" fill="#F0ECFF"/>
+    <text x="759" y="194" text-anchor="middle" class="pill" fill="#6649CB">最多 5 轮</text>
+    <text x="40" y="232" class="small">门禁不可用默认不会伪装成功；短暂重试后暂停 / 明确终止</text>
+  </g>
+
+  <path d="M1390 724 C1406 678 1480 660 1600 654" fill="none" stroke="#00A884" stroke-width="5" marker-end="url(#arrowGreen)"/>
+
+  <!-- top rails -->
+  <rect x="1068" y="298" width="326" height="58" rx="21" fill="#FFFFFF" stroke="#C8D5F3" filter="url(#shadow)"/>
+  <circle cx="1102" cy="327" r="17" fill="#EDF2FF"/>
+  <path d="M1094 328 L1100 334 L1111 316" fill="none" stroke="#4168ED" stroke-width="3.5" stroke-linecap="round" stroke-linejoin="round"/>
+  <text x="1130" y="322" class="pill" fill="#263B6F">目标始终可重锚</text>
+  <text x="1130" y="345" class="small">compact / resume 不丢 Goal</text>
+
+  <rect x="1414" y="298" width="388" height="58" rx="21" fill="#FFFFFF" stroke="#C8D5F3" filter="url(#shadow)"/>
+  <circle cx="1448" cy="327" r="17" fill="#E8FAF4"/>
+  <path d="M1440 327 H1456 M1448 319 V335" stroke="#00A884" stroke-width="3.5" stroke-linecap="round"/>
+  <text x="1476" y="322" class="pill" fill="#263B6F">每个关键边界都可恢复</text>
+  <text x="1476" y="345" class="small">atomic checkpoint + continuation</text>
+
+  <text x="96" y="1035" class="small" fill="#8490A8">实现依据：KernelLoop · AutoCheckpointCoordinator · DriftGate / DriftAgent · VerifyGate / VerifyJudge</text>
+</svg>

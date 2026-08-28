@@ -31,8 +31,9 @@ import {
   serializeExecutionError,
   type ExecutionFailure,
 } from '../../../infra/failures/ExecutionFailure.js'
+import { DEFAULT_GRAPH_SEGMENT_BUDGET_USD } from '../../../infra/budgets.js'
 
-export const DEFAULT_AGENT_SEGMENT_BUDGET_USD = 10
+export const DEFAULT_AGENT_SEGMENT_BUDGET_USD = DEFAULT_GRAPH_SEGMENT_BUDGET_USD
 
 export type NodeExecutionResult =
   | { kind: 'completed'; outcome: string; output: JsonValue; summary?: string; usage?: ActivationUsage }

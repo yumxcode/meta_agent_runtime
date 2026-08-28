@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest'
 import { AutoCostLedger } from '../AutoCostLedger.js'
 import { resolveConfig } from '../../config.js'
+import { DEFAULT_AUTO_SESSION_BUDGET_USD } from '../../../infra/budgets.js'
 
 describe('AutoCostLedger', () => {
   it('shares one cap between main spend and child reservations', () => {
@@ -45,7 +46,12 @@ describe('AutoCostLedger', () => {
   })
 
   it('gives direct autonomous-session construction the same finite default', () => {
-    expect(resolveConfig({ apiKey: 'test', promptMode: 'auto' }).maxBudgetUsd).toBe(20)
+    // Against the ladder, not a literal — see infra/budgets.ts. What matters is
+    // that auto gets a FINITE default at all (an unbounded unattended run is
+    // the failure this guards) and that an explicit value still wins.
+    expect(resolveConfig({ apiKey: 'test', promptMode: 'auto' }).maxBudgetUsd)
+      .toBe(DEFAULT_AUTO_SESSION_BUDGET_USD)
+    expect(Number.isFinite(resolveConfig({ apiKey: 'test', promptMode: 'auto' }).maxBudgetUsd)).toBe(true)
     expect(resolveConfig({ apiKey: 'test', promptMode: 'auto', maxBudgetUsd: 7 }).maxBudgetUsd).toBe(7)
   })
 })

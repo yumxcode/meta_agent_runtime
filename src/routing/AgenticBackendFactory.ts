@@ -110,6 +110,26 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
     ? new AutoCostLedger(autoBudgetUsd, resumedCostUsd)
     : null
 
+  // Say so BEFORE the run starts, not two tool calls in.
+  //
+  // The session budget is cumulative across resume — the ledger is seeded from
+  // the checkpoint above — so a session that legitimately spent more than its
+  // ceiling can be resumed, burn a couple of model calls, and only then stop
+  // with "已超出 token 预算上限", whose stock advice ("拆分为更小的子任务") is
+  // wrong for this cause: the task size is irrelevant, the ledger was already
+  // over the line before the first turn. Reporting it up front costs nothing
+  // and names the actual fix. Not fatal — the caller may have raised the
+  // ceiling on this invocation, and only the ledger knows the real answer.
+  if (costLedger && resumedCostUsd >= (autoBudgetUsd as number)) {
+    process.stderr.write(
+      `[budget] This session has already recorded $${resumedCostUsd.toFixed(2)} of spend, ` +
+      `at or above its $${(autoBudgetUsd as number).toFixed(2)} ceiling — the budget is cumulative ` +
+      `across resume, so it will stop almost immediately.\n` +
+      `[budget] Raise it for this run with --max-budget-usd <n>, ` +
+      `or set META_AGENT_AUTO_MAX_BUDGET_USD.\n`,
+    )
+  }
+
   // Lazy dispatcher facade — the bridge is created after the session below, so
   // the gates read this local ref at invocation time (deep in a later turn).
   let bridgeRef: SubAgentBridge | null = null

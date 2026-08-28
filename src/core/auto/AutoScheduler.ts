@@ -33,6 +33,28 @@ export interface AutoSchedulerOptions {
    * scheduler down with it.
    */
   onTick?: (now: number) => void | Promise<void>
+  /**
+   * Would `record` still pass its resume fences if it ran right now?
+   *
+   * Consulted ONLY before a retry, as a second opinion on "was this wake
+   * consumed?". The primary signal is `AutoWakeConsumedError`, which the resume
+   * handler raises for anything that fails at or after the turn. This probe
+   * exists because that signal is a classification the resume path has to get
+   * right every time, and it got it wrong once (2026-08-27): a post-turn
+   * failure escaped as a plain Error, the scheduler retried, and the
+   * history-count fence turned a recoverable stop into a permanently cancelled
+   * session. A `false` here means the retry is guaranteed to be rejected by the
+   * fence anyway, so the only thing it can accomplish is that cancellation.
+   *
+   * The scheduler cannot answer this itself — the fences live in the CLI layer
+   * alongside SessionStore — so the host injects it. When absent, retry
+   * behaviour is unchanged.
+   *
+   * Failures are swallowed and treated as "cannot tell", which falls back to
+   * retrying: refusing to retry on a probe glitch would strand recoverable
+   * wakes, which is the harm this whole mechanism exists to avoid.
+   */
+  isWakeStillRunnable?: (record: AutoContinuationRecord) => Promise<boolean>
 }
 
 /** Why `run()` returned. */
@@ -119,6 +141,25 @@ export class AutoScheduler {
       this.active.add(task)
     }
     return records.length
+  }
+
+  /**
+   * True only when the probe is available AND positively says the record can no
+   * longer run.
+   *
+   * "Cannot tell" — no probe injected, or the probe threw — deliberately maps
+   * to `false` (retry). This is a safety net over the primary classification,
+   * not a gate: a probe that is merely unavailable must not start suppressing
+   * legitimate retries of wakes that never ran.
+   */
+  private async wakeIsProvablyConsumed(record: AutoContinuationRecord): Promise<boolean> {
+    const probe = this.options.isWakeStillRunnable
+    if (!probe) return false
+    try {
+      return (await probe(record)) === false
+    } catch {
+      return false
+    }
   }
 
   /** Wait for every in-flight claim to settle. */
@@ -221,6 +262,24 @@ export class AutoScheduler {
           `[auto-scheduler] wake consumed for ${record.sessionId} (${record.wakeId}) but the ` +
           `turn failed afterwards — NOT retrying (a retry would cancel the session). ` +
           `Cause: ${error.cause instanceof Error ? error.cause.message : String(error.cause)}. ` +
+          `Session history is persisted; resume it with: ` +
+          `meta-agent --mode auto --resume ${record.sessionId} "继续"`,
+        )
+        return
+      }
+
+      // Second opinion before retrying. The classification above is the primary
+      // signal, but it is a judgement the resume path must make correctly every
+      // time, and a missed case costs a whole session rather than one wake. If
+      // the record can no longer pass its fences, the turn demonstrably ran —
+      // whatever the error type claims — and retrying could only convert this
+      // into a terminal `cancelled`.
+      if (await this.wakeIsProvablyConsumed(record)) {
+        await this.store.release(record.wakeId, token, 'done')
+        this.options.onEvent?.(
+          `[auto-scheduler] ${record.sessionId} (${record.wakeId}) failed with an untagged error, ` +
+          `but its resume fences no longer pass — the turn had already run. NOT retrying. ` +
+          `Cause: ${error instanceof Error ? error.message : String(error)}. ` +
           `Session history is persisted; resume it with: ` +
           `meta-agent --mode auto --resume ${record.sessionId} "继续"`,
         )

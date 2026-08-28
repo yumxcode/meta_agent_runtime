@@ -12,6 +12,7 @@
  */
 import { KernelSession } from '../kernel/index.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
+import type { PromptInput } from '../core/promptInput.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import { resolveConfig } from '../core/config.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
@@ -244,7 +245,7 @@ export class AgenticSession {
 
   // ── Submission ────────────────────────────────────────────────────────────
 
-  async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
+  async *submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent> {
     const state: TranslationState = {
       sessionId: this._sessionId,
       startMs: Date.now(),

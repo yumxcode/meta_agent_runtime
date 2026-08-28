@@ -200,7 +200,9 @@ export function toKernelTool(
       const callCtx = toToolCallContext(ctx, extraExtensions)
       const result = await tool.call(input as Record<string, unknown>, callCtx)
       return {
-        data: result.content,
+        // `blocks` wins when present; `content` remains the text fallback that
+        // compaction, the trajectory record and the debug transcript read.
+        data: result.blocks && result.blocks.length > 0 ? result.blocks : result.content,
         isError: result.isError,
         control: result.control,
         execution: result.execution,

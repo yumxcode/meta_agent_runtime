@@ -631,7 +631,7 @@ export class KernelSession {
       return { compacted: false, reason: '当前上下文过短，没有可压缩的内容。' }
     }
 
-    const previousTokens = tokenCountWithEstimation(messagesForQuery)
+    const previousTokens = tokenCountWithEstimation(messagesForQuery, this._config.model)
     const effectiveSystemPrompt =
       assembleSystemPrompt(this._config.systemPrompt, this._config.appendSystemPrompt) ?? ''
 
@@ -697,7 +697,7 @@ export class KernelSession {
       return {
         compacted: true,
         previousTokens,
-        postTokens: tokenCountWithEstimation(getMessagesAfterCompactBoundary(this._messages)),
+        postTokens: tokenCountWithEstimation(getMessagesAfterCompactBoundary(this._messages), this._config.model),
       }
     } catch (err) {
       if (this._config.autonomousMode && this._config.onCheckpointBoundary) {

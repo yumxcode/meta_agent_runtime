@@ -30,6 +30,8 @@ import { formatLocalClock, formatLocalTimestamp } from '../loop/localTime.js'
 import { bold, cyan, dim, gray, green, red, yellow, isTTY, terminalText, safeStdoutWrite } from './term.js'
 import { makeRouter } from './router.js'
 import { streamPrompt, type SteerHooks } from './stream.js'
+import { buildPromptInput, AttachmentError } from './attachments.js'
+import type { PromptInput } from '../core/promptInput.js'
 import { createAttachedSteerHooks } from './attachedSteer.js'
 import {
   persistSessionSnapshot,
@@ -168,6 +170,28 @@ export async function runSingleTurn(
     }
   }
 
+  // Resolve attachments — `@shot.png` inside the prompt text and every
+  // `--image` occurrence — before the turn starts. A one-shot run has no way to
+  // recover from a bad reference mid-flight, so this fails loudly and exits
+  // rather than quietly sending the reference as literal text.
+  let turnPrompt: PromptInput
+  try {
+    const providerCfg = router.getProviderConfig()
+    turnPrompt = await buildPromptInput({
+      line: opts.prompt!,
+      extraRefs: opts.images,
+      cwd: opts.workspace ?? process.cwd(),
+      target: { model: providerCfg.model, baseURL: providerCfg.baseURL },
+    })
+  } catch (err) {
+    if (err instanceof AttachmentError) {
+      console.error(red(`Error: ${terminalText(err.message)}`))
+      process.exitCode = 1
+      return {}
+    }
+    throw err
+  }
+
   let streamed: StreamPromptResult | undefined
   let parkedHistoryCount: number | null = null
   let parkedSessionId: string | null = null
@@ -207,7 +231,7 @@ export async function runSingleTurn(
   try {
     streamed = await streamPrompt(
       router,
-      opts.prompt!,
+      turnPrompt,
       opts.json,
       opts.showThinking,
       runOptions.steerHooks,
@@ -305,33 +329,34 @@ interface AutoResumeResult {
   next?: AutoContinuationRecord
 }
 
-async function resumeAutoContinuation(
-  opts: CliOptions,
+/**
+ * Evaluate every resume fence for `record`, without running anything.
+ *
+ * Extracted so the scheduler's pre-retry probe asks the SAME question the real
+ * resume asks. A second, parallel implementation of these checks would be free
+ * to drift, and a probe that disagrees with the fence is worse than no probe:
+ * it would either suppress retries that were safe or bless retries that are
+ * about to cancel a session.
+ *
+ * Returns `null` when every fence passes; otherwise the reason the wake is dead.
+ */
+export async function checkResumeFences(
   projectDir: string,
   record: AutoContinuationRecord,
-  signal: AbortSignal,
-  claimOwner?: string,
-  steerHooks?: SteerHooks,
-): Promise<AutoResumeResult> {
+): Promise<string | null> {
   const storeOptions = record.runtime?.sessionDir
     ? { rootDir: record.runtime.sessionDir }
     : undefined
   const meta = await SessionStore.getSession(record.sessionId, storeOptions)
-  // Every fence below returns a REASON. A bare `cancelled` renders in the log
-  // exactly like a successful `done`, so a wrongly-rejected wake looked like a
-  // clean finish and the scheduler's subsequent idle exit looked correct.
-  if (!meta) {
-    return { outcome: 'cancelled', reason: 'session metadata is gone from the index' }
-  }
-  if (meta.mode !== 'auto') {
-    return { outcome: 'cancelled', reason: `session mode is "${meta.mode}", not auto` }
-  }
+  // Every fence returns a REASON. A bare `cancelled` renders in the log exactly
+  // like a successful `done`, so a wrongly-rejected wake looked like a clean
+  // finish and the scheduler's subsequent idle exit looked correct.
+  if (!meta) return 'session metadata is gone from the index'
+  if (meta.mode !== 'auto') return `session mode is "${meta.mode}", not auto`
   if (meta.workspace && resolve(meta.workspace) !== projectDir) {
-    return {
-      outcome: 'cancelled',
-      reason: `session workspace ${resolve(meta.workspace)} != scheduler workspace ${projectDir}`,
-    }
+    return `session workspace ${resolve(meta.workspace)} != scheduler workspace ${projectDir}`
   }
+
   const history = await SessionStore.loadHistory(record.sessionId, storeOptions)
   // Exact history count is the session-generation fence. Any manual resume
   // after this wake was armed makes the old timer stale, even if the goal
@@ -341,20 +366,29 @@ async function resumeAutoContinuation(
   // (persistedResumeMessageCount); comparing against an in-memory count made
   // this fence reject wakes it was never meant to touch.
   if (history.length !== record.historyMessageCount) {
-    return {
-      outcome: 'cancelled',
-      reason:
-        `history moved on: loaded ${history.length} messages, wake was armed at ` +
-        `${record.historyMessageCount}`,
-    }
+    return `history moved on: loaded ${history.length} messages, wake was armed at ` +
+      `${record.historyMessageCount}`
   }
 
   const cp = readAutoCheckpoint(projectDir, record.sessionId)
-  if (!cp) {
-    return { outcome: 'cancelled', reason: 'auto checkpoint is missing' }
-  }
+  if (!cp) return 'auto checkpoint is missing'
   if (record.goal !== undefined && cp.goal !== record.goal) {
-    return { outcome: 'cancelled', reason: 'top-level goal changed since the wake was armed' }
+    return 'top-level goal changed since the wake was armed'
+  }
+  return null
+}
+
+async function resumeAutoContinuation(
+  opts: CliOptions,
+  projectDir: string,
+  record: AutoContinuationRecord,
+  signal: AbortSignal,
+  claimOwner?: string,
+  steerHooks?: SteerHooks,
+): Promise<AutoResumeResult> {
+  const fenceFailure = await checkResumeFences(projectDir, record)
+  if (fenceFailure !== null) {
+    return { outcome: 'cancelled', reason: fenceFailure }
   }
 
   // Provider-profile drift. `runtime.model` / `baseUrl` are undefined whenever
@@ -397,33 +431,68 @@ async function resumeAutoContinuation(
   // servers only after a due wake has passed all stale-history fences.
   await ensureMcpServerInstructions()
 
-  // Everything from here on runs AFTER the wake has been consumed: the turn
+  // ── Consumption boundary ───────────────────────────────────────────────────
+  //
+  // Everything below this line runs AFTER the wake has been consumed: the turn
   // executes and persists new history, which invalidates this record's
   // `historyMessageCount` fence. A failure past this point must therefore never
   // be retried against the same record — the retry would fail that fence and
-  // cancel the session for good. Wrapping in AutoWakeConsumedError tells the
-  // scheduler to stop rather than "helpfully" trying again.
-  let turn: SingleTurnRunResult
-  try {
-    turn = await runSingleTurn(resumedOpts, record, {
+  // cancel the session for good.
+  //
+  // The whole region is wrapped, not just the `runSingleTurn` call. It used to
+  // be only that call, which left every post-turn throw escaping as a plain
+  // Error — and AutoScheduler reads a plain Error as "failed BEFORE the turn
+  // ran, safe to retry". That is exactly how the 2026-08-27 run died: the turn
+  // finished with `auto_verify_unavailable` (mapped to
+  // `error_during_execution`), the check below threw a bare Error, the
+  // scheduler retried, and the fence — 826 loaded vs 818 armed — cancelled a
+  // live session permanently. The failure sequence the AutoWakeConsumedError
+  // docstring predicts, arriving through the one path its guard did not cover.
+  //
+  // Wrapping the region rather than each throw site is deliberate: a future
+  // post-turn failure gets the correct treatment without anyone remembering to
+  // classify it.
+  return await withConsumedWakeGuard(record.sessionId, async () => {
+    const turn = await runSingleTurn(resumedOpts, record, {
       claimOwner, signal, ...(steerHooks ? { steerHooks } : {}),
     })
+    const result = turn.result
+    if (!result) throw new Error('resumed Auto session produced no terminal result')
+    if (result.subtype === 'error_during_execution') {
+      throw new Error(result.errors?.join('; ') || result.result || result.stopReason || 'Auto resume failed')
+    }
+    if (result.subtype !== 'parked') {
+      await updateAutoCheckpointWithStatus(projectDir, record.sessionId, {
+        pendingWake: null,
+      })
+    }
+    return {
+      outcome: 'done' as const,
+      ...(turn.armedWake ? { next: turn.armedWake } : {}),
+    }
+  })
+}
+
+/**
+ * Run the post-consumption region, tagging ANY failure as a consumed wake.
+ *
+ * `AutoWakeConsumedError` is the scheduler's signal for "the turn already ran;
+ * do not retry this record". Anything thrown inside `fn` happened at or after
+ * the turn, so it always carries that meaning — including error RESULTS the
+ * turn returned normally, which is the case the previous narrower guard missed.
+ *
+ * An already-tagged error passes through unchanged so the original cause is not
+ * buried under a second wrapper.
+ */
+export async function withConsumedWakeGuard<T>(
+  sessionId: string,
+  fn: () => Promise<T>,
+): Promise<T> {
+  try {
+    return await fn()
   } catch (error) {
-    throw new AutoWakeConsumedError(record.sessionId, error)
-  }
-  const result = turn.result
-  if (!result) throw new Error('resumed Auto session produced no terminal result')
-  if (result.subtype === 'error_during_execution') {
-    throw new Error(result.errors?.join('; ') || result.result || result.stopReason || 'Auto resume failed')
-  }
-  if (result.subtype !== 'parked') {
-    await updateAutoCheckpointWithStatus(projectDir, record.sessionId, {
-      pendingWake: null,
-    })
-  }
-  return {
-    outcome: 'done',
-    ...(turn.armedWake ? { next: turn.armedWake } : {}),
+    if (error instanceof AutoWakeConsumedError) throw error
+    throw new AutoWakeConsumedError(sessionId, error)
   }
 }
 
@@ -516,6 +585,11 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
       idleExitMs,
       onEvent: emit,
       onTick: now => registration?.beat(now),
+      // Pre-retry safety net. If the fences no longer pass, the turn already
+      // ran and a retry could only end in a terminal `cancelled` — see the
+      // option's docstring for the run this cost.
+      isWakeStillRunnable: async record =>
+        (await checkResumeFences(projectDir, record)) === null,
     },
   )
 

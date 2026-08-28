@@ -2,6 +2,7 @@ import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../../core/t
 import { loadToolPrompt } from '../../util.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
+import { DEFAULT_SUB_AGENT_BUDGET_USD, DEFAULT_SUB_AGENT_MAX_TURNS } from '../../../infra/budgets.js'
 import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
 import { loopTaskScopeFromSessionId } from '../../../subagent/loopScope.js'
 
@@ -27,8 +28,8 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
         task_description: { type: 'string', description: 'Full description of the sub-task. Include all context needed — the sub-agent starts with an empty conversation.' },
         system_prompt: { type: 'string', description: '(Optional) System prompt for the sub-agent.' },
         allowed_tools: { type: 'array', items: { type: 'string' }, description: '(Optional) Tools the sub-agent may use.' },
-        max_turns: { type: 'number', description: 'Max turns before force-stop. Default: 10.' },
-        max_budget_usd: { type: 'number', description: 'Max cost in USD. Default: 0.5.' },
+        max_turns: { type: 'number', description: `Max turns before force-stop. Default: ${DEFAULT_SUB_AGENT_MAX_TURNS}.` },
+        max_budget_usd: { type: 'number', description: `Max cost in USD. Default: ${DEFAULT_SUB_AGENT_BUDGET_USD}.` },
         workspace_mode: {
           type: 'string',
           enum: ['shared_readonly', 'shared_write', 'isolated_write'],
@@ -41,8 +42,12 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
     async call(input: Record<string, unknown>, ctx: ToolCallContext): Promise<ToolResult> {
       const taskDescription = String(input['task_description'] ?? '').trim()
       if (!taskDescription) return { content: 'Error: task_description is required', isError: true }
-      const maxTurns = typeof input['max_turns'] === 'number' ? input['max_turns'] : 10
-      const maxBudgetUsd = typeof input['max_budget_usd'] === 'number' ? input['max_budget_usd'] : 0.5
+      // These fell back to hard-coded 10 / $0.5 while the schema above told the
+      // model the defaults were something else — so a caller that omitted the
+      // fields got limits it was never shown. Both now read the same ladder the
+      // description is generated from, so the advertised default IS the default.
+      const maxTurns = typeof input['max_turns'] === 'number' ? input['max_turns'] : DEFAULT_SUB_AGENT_MAX_TURNS
+      const maxBudgetUsd = typeof input['max_budget_usd'] === 'number' ? input['max_budget_usd'] : DEFAULT_SUB_AGENT_BUDGET_USD
       const workspaceMode =
         input['workspace_mode'] === 'isolated_write'
           ? 'isolated_write'

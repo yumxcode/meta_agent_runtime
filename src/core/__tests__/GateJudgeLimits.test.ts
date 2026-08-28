@@ -23,6 +23,7 @@ import { resolveDriftLimits, DRIFT_AGENT_DEFAULT_MAX_TURNS } from '../auto/learn
 import { resolveJudgeLimits, VERIFY_JUDGE_DEFAULTS } from '../auto/verify/VerifyJudge.js'
 import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../subagent/types.js'
 import { setTimeoutOverrides, resetTimeoutsForTest, TIMEOUT_DEFAULTS } from '../timeouts.js'
+import { DEFAULT_DRIFT_BUDGET_USD } from '../../infra/budgets.js'
 
 /** The margin both gates leave between the judge's cap and their own ceiling. */
 const POLL_MARGIN_MS = 60_000
@@ -62,7 +63,7 @@ describe('drift judge limits', () => {
   it('uses the documented defaults', () => {
     const limits = resolveDriftLimits()
     expect(limits.maxTurns).toBe(DRIFT_AGENT_DEFAULT_MAX_TURNS)
-    expect(limits.maxBudgetUsd).toBe(0.5)
+    expect(limits.maxBudgetUsd).toBe(DEFAULT_DRIFT_BUDGET_USD)
     expect(limits.maxDurationMs).toBe(TIMEOUT_DEFAULTS.driftMaxDurationMs)
   })
 
@@ -87,7 +88,7 @@ describe('drift judge limits', () => {
     process.env['META_AGENT_DRIFT_MAX_TURNS'] = 'not-a-number'
     process.env['META_AGENT_DRIFT_MAX_BUDGET_USD'] = 'free'
     expect(resolveDriftLimits().maxTurns).toBe(DRIFT_AGENT_DEFAULT_MAX_TURNS)
-    expect(resolveDriftLimits().maxBudgetUsd).toBe(0.5)
+    expect(resolveDriftLimits().maxBudgetUsd).toBe(DEFAULT_DRIFT_BUDGET_USD)
   })
 
   it('clamps an absurd turn count', () => {

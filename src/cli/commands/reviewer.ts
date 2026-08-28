@@ -23,6 +23,7 @@ import type { CliOptions } from '../args.js'
 import { assertApiKeyConfigured } from '../keys.js'
 import { askQuestion } from '../prompts.js'
 import { bold, cyan, dim, green, red, yellow } from '../term.js'
+import { DEFAULT_REVIEW_BUDGET_USD } from '../../infra/budgets.js'
 
 type ProposalStatus = LearningProposal['status']
 
@@ -225,7 +226,7 @@ function parseReviewerArgs(args: string[], inheritedJson: boolean): ParsedReview
       limit: { type: 'string', default: '20' },
       'max-cases': { type: 'string', default: '20' },
       'max-turns-per-case': { type: 'string', default: '12' },
-      'max-budget-usd': { type: 'string', default: '5' },
+      'max-budget-usd': { type: 'string', default: String(DEFAULT_REVIEW_BUDGET_USD) },
       // Accepted during migration; it now caps TaskCases rather than side-call windows.
       'max-windows': { type: 'string' },
       force: { type: 'boolean', default: false },

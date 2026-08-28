@@ -11,6 +11,41 @@ export type { MetaAgentConfig, ResolvedConfig } from './core/config.js'
 // without reaching into the kernel subpath.
 export type { ThinkingConfig } from './kernel/index.js'
 
+// ── Multimodal prompts ───────────────────────────────────────────────────────
+//
+// `MetaAgentSession.query()` takes a `PromptInput`, which may carry images.
+// Without these exports that signature is unusable from the published package:
+// a consumer could neither name the type nor build a valid image part, and
+// would have to hand-write the object literal against no contract at all.
+// This is the same barrel-export gap PublicEntrySurface.test.ts was written
+// for after v0.9.0 — see its docstring.
+export type {
+  PromptInput, PromptPart, PromptTextPart, PromptImagePart, PromptImageSource,
+} from './core/promptInput.js'
+export {
+  promptTextOf, promptImagesOf, promptHasImages,
+  withPromptPrefix, withPromptText, promptToContentBlocks,
+} from './core/promptInput.js'
+// Constructors and inspection for image content. `makeImageBlockFromBytes` is
+// the supported way to build an attachment: it sniffs the format from the bytes
+// rather than trusting a filename, which is what keeps a mislabelled file from
+// becoming an opaque provider 400.
+export {
+  SUPPORTED_IMAGE_MEDIA_TYPES,
+  makeImageBlockFromBytes, makeImageBlockFromFile, makeImageBlockFromUrl,
+  sniffImageMediaType, readImageDimensions, hasImageExtension,
+  isImageBlock, imageBlockByteLength, imageBlockBytes,
+  imageBlockToDataUrl, imageBlockMediaType, downgradeImageBlock,
+  UnsupportedImageError,
+} from './kernel/messages/imageBlocks.js'
+export type {
+  SupportedImageMediaType, Base64ImageBlock, UrlImageBlock, ImageDimensions,
+} from './kernel/messages/imageBlocks.js'
+// Vision capability and per-model limits, so an embedder can check whether the
+// model it is about to call accepts images before paying to upload them.
+export { modelSupportsVision, getVisionLimits, effectiveEdgePixels } from './providers/registry.js'
+export type { VisionLimits } from './providers/registry.js'
+
 // ── Observability & extensibility (A2) ───────────────────────────────────────
 // The event contract, the telemetry that rides on it, the external hook system,
 // and the declarative command rules. All four are inert unless configured.

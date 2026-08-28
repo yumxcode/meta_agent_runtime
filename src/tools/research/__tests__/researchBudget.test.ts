@@ -16,6 +16,7 @@ import { join } from 'node:path'
 import { createResearchDispatchTool } from '../research_dispatch/index.js'
 import type { ISubAgentDispatcher } from '../../../subagent/ISubAgentDispatcher.js'
 import type { ToolCallContext } from '../../../core/types.js'
+import { DEFAULT_RESEARCH_BUDGET_USD, DEFAULT_RESEARCH_MAX_TURNS } from '../../../infra/budgets.js'
 
 const dirs: string[] = []
 afterEach(async () => {
@@ -49,7 +50,7 @@ function fakeDispatcher(terminal: Record<string, unknown>): {
 const ctx = {} as ToolCallContext
 
 describe('the research run gets a budget sized for research', () => {
-  it('never inherits the $0.50 generic sub-agent default', async () => {
+  it('never inherits the generic sub-agent default', async () => {
     const { dispatcher, spawned } = fakeDispatcher({
       status: 'completed',
       result: { summary: 'done', output: { report_markdown: '# Report', conclusion: 'c' } },
@@ -59,9 +60,10 @@ describe('the research run gets a budget sized for research', () => {
     })
 
     await tool.call({ question: 'what reward terms do bipedal walkers use?' }, ctx)
-    expect(spawned[0]!['maxBudgetUsd']).toBe(4)
-    // The limits that were already research-sized must not have regressed.
-    expect(spawned[0]!['maxTurns']).toBe(60)
+    expect(spawned[0]!['maxBudgetUsd']).toBe(DEFAULT_RESEARCH_BUDGET_USD)
+    // Turns move with the budget — see infra/budgets.ts. Research gets the
+    // most of any tier because it reads sources in full.
+    expect(spawned[0]!['maxTurns']).toBe(DEFAULT_RESEARCH_MAX_TURNS)
   })
 
   it('honours an explicit ceiling for a broad survey', async () => {
@@ -87,7 +89,7 @@ describe('the research run gets a budget sized for research', () => {
     })
 
     await tool.call({ question: 'q', max_budget_usd: 0 }, ctx)
-    expect(spawned[0]!['maxBudgetUsd']).toBe(4)
+    expect(spawned[0]!['maxBudgetUsd']).toBe(DEFAULT_RESEARCH_BUDGET_USD)
   })
 })
 

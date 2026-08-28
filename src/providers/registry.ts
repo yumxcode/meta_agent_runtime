@@ -33,6 +33,16 @@ export interface Capabilities {
   anthropicThinkingParam: boolean
   /** OpenAI-style `reasoning_effort` (DeepSeek and friends). */
   reasoningEffort: boolean
+  /**
+   * Accepts image content blocks on user messages.
+   *
+   * Gated per MODEL, not per provider, because vision is not a provider-wide
+   * property anywhere: DeepSeek exposes it on exactly one experimental model and
+   * returns `400 This model does not support image` on every other one, and the
+   * GLM line only became natively multimodal at 5.3. A provider-level default of
+   * `true` would turn a routine model switch into a hard API failure.
+   */
+  vision: boolean
   // NOTE: a `promptCache` flag used to live here. It was declared and set per
   // provider but never read anywhere in the codebase — a dead capability bit
   // that implied behaviour the runtime does not have (nothing emits
@@ -56,6 +66,35 @@ export interface ModelPricing {
   cacheWrite: number
 }
 
+/**
+ * Hard limits a vision model imposes on image inputs.
+ *
+ * Every field here is enforced at the ENTRY point rather than left to the API,
+ * because an over-limit request fails only after the whole payload — tens of
+ * megabytes of base64 — has been uploaded, and the resulting 400 says nothing
+ * about which image was at fault.
+ */
+export interface VisionLimits {
+  maxImagesPerRequest: number
+  /** Per image, decoded bytes. */
+  maxImageBytes: number
+  /** Sum over all images in one request, decoded bytes. */
+  maxRequestImageBytes: number
+  /** Longest side, in pixels. */
+  maxEdgePixels: number
+  /**
+   * Image count at which `maxEdgePixels` halves. DeepSeek drops 8192 → 4096
+   * once a request carries 15 or more images.
+   */
+  edgeDowngradeAtCount?: number
+  /** Downgraded edge cap, used once `edgeDowngradeAtCount` is reached. */
+  downgradedEdgePixels?: number
+  /** Whether a public http(s) URL can be sent instead of inline base64. */
+  acceptsImageUrl: boolean
+  /** Per-image token ceiling; providers scale to a fixed budget before inference. */
+  imageTokenCeiling: number
+}
+
 /** Per-model overrides layered on top of the provider defaults. */
 export interface ModelSpec {
   contextWindow: number
@@ -63,6 +102,8 @@ export interface ModelSpec {
   pricing: ModelPricing
   /** Optional per-model capability overrides (e.g. a tier with no thinking). */
   capabilities?: Partial<Capabilities>
+  /** Image-input limits. Only meaningful when `capabilities.vision` is true. */
+  vision?: VisionLimits
 }
 
 export interface ProviderSpec {
@@ -78,6 +119,12 @@ export interface ProviderSpec {
   modelMatchers: string[]
   models: { default: string; fallback?: string; flash: string }
   capabilities: Capabilities
+  /**
+   * Image limits for this provider's vision-capable models, when the model
+   * itself names none. Kept at provider level so the twelve Claude entries do
+   * not each repeat the same table.
+   */
+  defaultVision?: VisionLimits
   /** Per-model table keyed by model-name prefix (longest match wins). */
   modelTable: Record<string, ModelSpec>
 }
@@ -101,6 +148,10 @@ export interface ResolvedProvider {
 
 const CAP_ANTHROPIC: Capabilities = {
   anthropicBetas: true, anthropicThinkingParam: true, reasoningEffort: false,
+  // Every current Claude model takes images on the same wire shape the runtime
+  // already stores internally, so this is the one provider where the default is
+  // safe.
+  vision: true,
 }
 const CAP_ZHIPU: Capabilities = {
   // GLM speaks the Anthropic wire format and empirically accepts the thinking
@@ -108,14 +159,85 @@ const CAP_ZHIPU: Capabilities = {
   // — measured 2026-07-27, HTTP 200; an earlier comment here claimed otherwise.
   // Nothing sends cache_control anyway; Zhipu caches prefixes implicitly.)
   anthropicBetas: false, anthropicThinkingParam: true, reasoningEffort: false,
+  // GLM became natively multimodal at 5.3; 5.2 and earlier reject images. The
+  // provider default is therefore off and the per-model table opts in.
+  //
+  // VERIFIED 2026-08-27 by a live run: Zhipu's Anthropic-compat endpoint
+  // (/api/anthropic) DOES accept an Anthropic-shaped `image` block with a
+  // base64 source — glm-5.3-flash read an attached PNG and described content
+  // only visible in the pixels. This had been the open question, because
+  // Zhipu's published image docs cover only the OpenAI-style `image_url` block
+  // on /paas/v4. No protocol routing is needed: vision-capable GLM models stay
+  // on the Anthropic path with everything else.
+  vision: false,
 }
 const CAP_DEEPSEEK: Capabilities = {
   anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: true,
+  // Only deepseek-*-vision-* accepts images; everything else returns
+  // `400 This model does not support image`. Opt in per model.
+  vision: false,
 }
 const CAP_QWEN: Capabilities = {
   // Qwen rides the DashScope Anthropic-compat endpoint; treat thinking as
   // unsupported until proven (gate it off rather than risk a 400).
   anthropicBetas: false, anthropicThinkingParam: false, reasoningEffort: false,
+  vision: false,
+}
+
+// ── Vision limits ────────────────────────────────────────────────────────────
+
+const MIB = 1024 * 1024
+
+/**
+ * Source: api-docs.deepseek.com/zh-cn/guides/vision §限制 (read 2026-08-27).
+ * `maxImageBytes` is the inline/URL ceiling; the Files API path allows 64 MiB
+ * but the runtime does not use it (see the vision plan, §6).
+ */
+const DEEPSEEK_VISION: VisionLimits = {
+  maxImagesPerRequest: 600,
+  maxImageBytes: 32 * MIB,
+  maxRequestImageBytes: 64 * MIB,
+  maxEdgePixels: 8192,
+  edgeDowngradeAtCount: 15,
+  downgradedEdgePixels: 4096,
+  acceptsImageUrl: true,
+  imageTokenCeiling: 384,
+}
+
+/**
+ * GLM publishes no numeric image limits, so these are the DeepSeek figures
+ * pulled in by roughly an order of magnitude — deliberately conservative, since
+ * the failure mode of a too-low cap is a clear local error message while a
+ * too-high one is a late 400 on an already-uploaded payload. `imageTokenCeiling`
+ * is a guess pending measurement (see the vision plan, §3③).
+ */
+const GLM_VISION: VisionLimits = {
+  maxImagesPerRequest: 64,
+  maxImageBytes: 20 * MIB,
+  maxRequestImageBytes: 40 * MIB,
+  maxEdgePixels: 6000,
+  acceptsImageUrl: true,
+  imageTokenCeiling: 1600,
+}
+
+/** Anthropic's documented limits: 100 images/request, 5 MB each, 8000 px/side. */
+const CLAUDE_VISION: VisionLimits = {
+  maxImagesPerRequest: 100,
+  maxImageBytes: 5 * MIB,
+  maxRequestImageBytes: 30 * MIB,
+  maxEdgePixels: 8000,
+  acceptsImageUrl: true,
+  imageTokenCeiling: 1600,
+}
+
+/** Applied when a model claims vision but names no limits of its own. */
+export const DEFAULT_VISION_LIMITS: VisionLimits = {
+  maxImagesPerRequest: 20,
+  maxImageBytes: 5 * MIB,
+  maxRequestImageBytes: 20 * MIB,
+  maxEdgePixels: 4096,
+  acceptsImageUrl: false,
+  imageTokenCeiling: 1600,
 }
 
 const CLAUDE_OPUS:   ModelPricing = { input: 15.0, output: 75.0, cacheRead: 1.5,  cacheWrite: 18.75 }
@@ -138,6 +260,7 @@ export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
     modelMatchers: ['claude-'],
     models: { default: 'claude-opus-4-6', fallback: 'claude-sonnet-4-6', flash: 'claude-haiku-4-5-20251001' },
     capabilities: CAP_ANTHROPIC,
+    defaultVision: CLAUDE_VISION,
     modelTable: {
       'claude-opus-4-6':            { contextWindow: 200_000, maxOutput: 131_072, pricing: CLAUDE_OPUS },
       'claude-opus-4-5':            { contextWindow: 200_000, maxOutput: 131_072, pricing: CLAUDE_OPUS },
@@ -166,11 +289,18 @@ export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
     // sets the auto-compact trigger at 65% of the effective window (~637k).
     models: { default: 'glm-5.2', fallback: 'glm-4.6', flash: 'glm-5.2' },
     capabilities: CAP_ZHIPU,
+    defaultVision: GLM_VISION,
     modelTable: {
       // -air entries MUST precede their bare prefixes; longest-match guards this
       // regardless, but keep the order readable.
       'glm-4.5-air': { contextWindow: 128_000, maxOutput: 131_072, pricing: GLM_AIR },
-      'glm-5.3':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
+      // GLM-5.3-Flash is the first natively multimodal model in the GLM-5 line:
+      // 320B total / 18B active, 1M context, images + video + files.
+      'glm-5.3-flash': {
+        contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD,
+        capabilities: { vision: true }, vision: GLM_VISION,
+      },
+      'glm-5.3':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD, capabilities: { vision: true }, vision: GLM_VISION },
       'glm-5.2':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5.1':     { contextWindow: 1_000_000, maxOutput: 131_072, pricing: GLM_STD },
       'glm-5-turbo': { contextWindow: 200_000, maxOutput: 131_072, pricing: GLM_AIR },
@@ -190,8 +320,18 @@ export const PROVIDERS: Record<Exclude<ProviderId, 'unknown'>, ProviderSpec> = {
     modelMatchers: ['deepseek-'],
     models: { default: 'deepseek-v4-flash', fallback: 'deepseek-v4-flash', flash: 'deepseek-v4-flash' },
     capabilities: CAP_DEEPSEEK,
+    defaultVision: DEEPSEEK_VISION,
     modelTable: {
       // Source: platform.deepseek.com pricing (CNY ÷ 7.2 → USD/M tokens)
+      //
+      // The vision entry MUST precede 'deepseek-v4-flash': longest-prefix match
+      // already handles it, but the two differ only in a suffix and the
+      // capability difference between them is a 400 rather than a degradation.
+      'deepseek-v4-flash-vision-exp': {
+        contextWindow: 1_000_000, maxOutput: 131_072,
+        pricing: { input: 0.1389, output: 0.2778, cacheRead: 0.00278, cacheWrite: 0.1389 },
+        capabilities: { vision: true }, vision: DEEPSEEK_VISION,
+      },
       'deepseek-v4-flash': { contextWindow: 1_000_000, maxOutput: 131_072, pricing: { input: 0.1389, output: 0.2778, cacheRead: 0.00278, cacheWrite: 0.1389 } },
       'deepseek-v4-pro':   { contextWindow: 1_000_000, maxOutput: 131_072, pricing: { input: 1.6667, output: 3.3333, cacheRead: 0.01389, cacheWrite: 1.6667 } },
       'deepseek-v3':       { contextWindow: 1_000_000, maxOutput: 131_072, pricing: { input: 0.1389, output: 0.2778, cacheRead: 0.00278, cacheWrite: 0.1389 } },
@@ -295,12 +435,23 @@ const MODEL_FAMILY_RULES: ModelFamilyRule[] = [
       contextWindow: major >= 5 ? 1_000_000 : minor >= 6 ? 200_000 : 128_000,
       maxOutput: 131_072,
       pricing: GLM_STD,
+      // Native multimodality arrived with 5.3 and is a line-wide property from
+      // there on, so a future glm-5.4 or glm-6 resolves correctly without an
+      // edit. Below 5.3 the flag stays off and images are refused locally.
+      capabilities: { vision: major > 5 || (major === 5 && minor >= 3) },
+      vision: GLM_VISION,
     }),
   },
   {
     id: 'deepseek',
     test: /^deepseek[-.]?(\d+)?/,
     // The whole current DeepSeek line is 1M.
+    //
+    // Vision is NOT inferred at family level, unlike GLM: DeepSeek ships it on
+    // one experimental model and every other model in the family answers a
+    // request containing an image with a 400. A family-wide `vision: true` would
+    // convert a routine `--model deepseek-v4-pro` into a hard failure, so the
+    // capability stays pinned to the exact table entry.
     resolve: () => ({ contextWindow: 1_000_000, maxOutput: 131_072, pricing: DEEPSEEK_STD }),
   },
   {
@@ -308,7 +459,10 @@ const MODEL_FAMILY_RULES: ModelFamilyRule[] = [
     test: /^claude-(\d+)?/,
     // Anthropic's published default remains 200k; a longer window is opt-in per
     // deployment, so it is not assumed here.
-    resolve: () => ({ contextWindow: 200_000, maxOutput: 65_536, pricing: CLAUDE_SONNET }),
+    resolve: () => ({
+      contextWindow: 200_000, maxOutput: 65_536, pricing: CLAUDE_SONNET,
+      capabilities: { vision: true }, vision: CLAUDE_VISION,
+    }),
   },
 ]
 
@@ -429,6 +583,63 @@ export function getModelCapabilities(model: string, baseURL?: string): Capabilit
   const base = specOf(id).capabilities
   const override = findModelSpec(model)?.capabilities
   return override ? { ...base, ...override } : base
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Vision
+// ─────────────────────────────────────────────────────────────────────────────
+
+/**
+ * Provider identity WITHOUT the default-to-Anthropic fallback.
+ *
+ * `specOf` resolves 'unknown' to Anthropic, which is the right default for the
+ * wire protocol and the thinking params — Anthropic format is what an
+ * unidentified endpoint most likely speaks. It is the wrong default for vision:
+ * inheriting `vision: true` from that fallback makes every unrecognised model
+ * claim image support, which is precisely the mistake this capability exists to
+ * prevent. Vision resolution therefore refuses to guess.
+ */
+function identifiedProvider(model: string | undefined, baseURL?: string): ProviderId {
+  const fromUrl = inferProviderFromURL(baseURL)
+  if (fromUrl !== 'unknown') return fromUrl
+  return inferProviderFromModel(model)
+}
+
+/** Whether this model accepts image content blocks. */
+export function modelSupportsVision(model: string | undefined, baseURL?: string): boolean {
+  if (!model) return false
+  // An explicit per-model or family answer always wins, in either direction.
+  const override = findModelSpec(model)?.capabilities?.vision
+  if (override !== undefined) return override
+  const id = identifiedProvider(model, baseURL)
+  return id === 'unknown' ? false : PROVIDERS[id].capabilities.vision
+}
+
+/**
+ * Image limits for a model: per-model table → provider default → conservative
+ * fallback. Callers should gate on `modelSupportsVision` first; the limits are
+ * meaningless for a model that takes no images at all.
+ */
+export function getVisionLimits(model: string | undefined, baseURL?: string): VisionLimits {
+  const fromModel = model ? findModelSpec(model)?.vision : undefined
+  if (fromModel) return fromModel
+  const id = identifiedProvider(model, baseURL)
+  return id === 'unknown' ? DEFAULT_VISION_LIMITS : (PROVIDERS[id].defaultVision ?? DEFAULT_VISION_LIMITS)
+}
+
+/**
+ * The edge cap in force for a request carrying `imageCount` images.
+ *
+ * Separated out because the cap is not a constant: DeepSeek halves it once a
+ * request reaches 15 images, so an image that passes on its own can fail purely
+ * because of what it is batched with.
+ */
+export function effectiveEdgePixels(limits: VisionLimits, imageCount: number): number {
+  const threshold = limits.edgeDowngradeAtCount
+  if (threshold !== undefined && imageCount >= threshold) {
+    return limits.downgradedEdgePixels ?? limits.maxEdgePixels
+  }
+  return limits.maxEdgePixels
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

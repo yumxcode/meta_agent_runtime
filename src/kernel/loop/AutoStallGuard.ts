@@ -66,9 +66,41 @@ export const SELF_EVAL_PROMPT =
  */
 export const BUDGET_WARNING_FRACTION = 0.8
 
-/** Injected once, when spend first crosses BUDGET_WARNING_FRACTION. */
+/**
+ * Absolute headroom, in USD, that the wrap-up warning aims to leave.
+ *
+ * The fraction alone stopped being the right rule when the ceilings were raised
+ * (2026-08-28, infra/budgets.ts). What the warning needs is "enough left to
+ * summarise", which is an ABSOLUTE quantity — a turn or two — not a proportion.
+ * At the old $20 session budget those coincided: 20% was $4. At $300 the same
+ * fraction reserves $60 and tells the model to stop working while a fifth of the
+ * session is still unspent, which on a token plan is pure waste.
+ *
+ * The effective trigger is therefore whichever leaves LESS headroom, so small
+ * budgets keep their old behaviour and large ones stop giving away 20%.
+ */
+export const BUDGET_WARNING_RESERVE_USD = 5
+
+/**
+ * Spend level at which to warn, for a given ceiling.
+ *
+ * @returns the USD figure at which {@link BUDGET_WARNING_PROMPT} should fire
+ */
+export function budgetWarningThresholdUsd(maxBudgetUsd: number): number {
+  const fractionReserve = maxBudgetUsd * (1 - BUDGET_WARNING_FRACTION)
+  const reserve = Math.min(fractionReserve, BUDGET_WARNING_RESERVE_USD)
+  return maxBudgetUsd - reserve
+}
+
+/**
+ * Injected once, when spend first crosses {@link budgetWarningThresholdUsd}.
+ *
+ * Deliberately says "接近上限" rather than a percentage: the trigger is no longer
+ * a fixed fraction, and quoting "80%" when the real figure is ~98% would teach
+ * the model to discount the warning.
+ */
 export const BUDGET_WARNING_PROMPT =
-  '[系统·预算预警] 本次运行已用掉约 80% 的成本预算，达到上限会被**硬性中断**，' +
+  '[系统·预算预警] 本次运行的成本预算已接近上限，达到上限会被**硬性中断**，' +
   '届时你没有任何机会再补交结果。请立刻收尾：停止继续检索/读取新材料，' +
   '用现有材料给出交付物（若你是子代理，现在就调用 return_result），' +
   '并在交付物中明确写出哪些部分尚未完成、缺什么。宁可交一份标注了缺口的成果，也不要被截断成半句话。'

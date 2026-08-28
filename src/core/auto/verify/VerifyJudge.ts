@@ -21,9 +21,11 @@ import { DEFAULT_SUB_AGENT_MAX_DURATION_MS, TERMINAL_STATUSES } from '../../../s
 import type { VerifyGateFn, VerifyVerdict } from '../../../kernel/loop/VerifyGate.js'
 import { buildVerdictOutputProtocol, parseFromVerdictChannels } from '../../../subagent/verdictChannel.js'
 import { timeout } from '../../timeouts.js'
+import { parseStrictInt, parseStrictFloat } from '../../../infra/env/strictNumber.js'
 import { withReadonlySnapshot, THIS_ROUND_DIFF_FILE, type SnapshotDiff } from './JudgeSnapshot.js'
 import type { TurnDiffTracker } from '../../../infra/fs/TurnDiffTracker.js'
 import { renderTurnDiffSection, pathsInGitStat } from '../turnDiffSection.js'
+import { DEFAULT_VERIFY_BUDGET_USD, DEFAULT_JUDGE_MAX_TURNS } from '../../../infra/budgets.js'
 
 export interface AutoVerifyGateDeps {
   /** Spawns the isolated judge sub-agent. */
@@ -69,29 +71,34 @@ const JUDGE_TOOLS_READONLY = ['read_file', 'grep', 'glob']
 // beyond setting the variable), keeping the knobs out of code.
 export const VERIFY_JUDGE_DEFAULTS = {
   /** Max tool-batch turns before the judge is force-stopped. */
-  maxTurns: 30,
+  maxTurns: DEFAULT_JUDGE_MAX_TURNS,
   /**
    * Max spend (USD) before the judge is force-stopped. A finite default keeps
    * unattended verification inside the parent auto-session budget.
    */
-  maxBudgetUsd: 1,
+  maxBudgetUsd: DEFAULT_VERIFY_BUDGET_USD,
   /** Wall-clock cap (ms) for a single judge run. */
   maxDurationMs: DEFAULT_SUB_AGENT_MAX_DURATION_MS,
 } as const
 
+// P2-3 (review 2026-08-27) applies to these two as well: `parseInt`/`parseFloat`
+// accept a valid prefix followed by garbage, so `META_AGENT_VERIFY_MAX_TURNS=1oops`
+// silently became a 1-turn judge — which cannot gather evidence and therefore
+// cannot produce a verdict, i.e. exactly the "verify unavailable" halt this
+// file's own gate reports. Whole-string parsing only.
 function verifyEnvInt(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]
   if (raw === undefined) return fallback
-  const n = Number.parseInt(raw, 10)
-  if (!Number.isFinite(n)) return fallback
+  const n = parseStrictInt(raw)
+  if (n === undefined) return fallback
   return Math.min(max, Math.max(min, n))
 }
 
 function verifyEnvFloat(name: string, fallback: number, min: number, max: number): number {
   const raw = process.env[name]
   if (raw === undefined) return fallback
-  const n = Number.parseFloat(raw)
-  if (!Number.isFinite(n)) return fallback
+  const n = parseStrictFloat(raw)
+  if (n === undefined) return fallback
   return Math.min(max, Math.max(min, n))
 }
 
@@ -99,8 +106,8 @@ function verifyEnvFloat(name: string, fallback: number, min: number, max: number
  * Resolve the judge's circuit-breaker limits, applying env-var overrides over
  * the defaults. Read per-invocation so config can change without a code change.
  *
- *   META_AGENT_VERIFY_MAX_TURNS        (int,   default 30)
- *   META_AGENT_VERIFY_MAX_BUDGET_USD   (float, default 1)
+ *   META_AGENT_VERIFY_MAX_TURNS        (int,   default 100)
+ *   META_AGENT_VERIFY_MAX_BUDGET_USD   (float, default 50)
  *   META_AGENT_VERIFY_MAX_DURATION_MS  (int,   default 1800000)
  */
 export function resolveJudgeLimits(): { maxTurns: number; maxBudgetUsd: number; maxDurationMs: number } {
@@ -135,7 +142,7 @@ ${toolLine}
 2. 必须亲自到工作区取证来对照目标——不要凭空判断，也不要轻信任何"已完成"的说法。
 3. verify 不运行 typecheck/test/lint；你必须仅基于原始目标和亲自读取到的代码/产物作出 LLM 审核判断。
 4. 对每一条判断都要给出具体证据（文件:行号，或只读命令输出）。给不出证据的"完成"不成立。
-5. 预算有限：一旦接近轮次/预算上限，立即给出 JSON 裁决（哪怕 done:false，并在 unfinished/note 里写明还没核到的部分），切勿在没有裁决的情况下耗尽预算。
+5. 你的实际约束是**轮次**（默认 100 轮）与墙钟，不是费用——费用额度是充裕的，不要为了省钱而少读材料或提前收工。但一旦接近轮次上限，立即给出 JSON 裁决（哪怕 done:false，并在 unfinished/note 里写明还没核到的部分），切勿在没有裁决的情况下耗尽轮次。
 
 ${buildVerdictOutputProtocol(`{
   "done": true 或 false,
@@ -143,7 +150,15 @@ ${buildVerdictOutputProtocol(`{
   "evidence": ["证据1（file:line 或 命令+退出码）", "..."],
   "note": "可选：无法判断时的说明"
 }`)}
-done=true 时 unfinished 必须为空数组。`
+done=true 时 unfinished 必须为空数组。
+
+\`done\` 是一个二值判断，没有第三种取值。以下情形**全部**记为 \`done: false\`，并把尚未满足的部分逐条写进 \`unfinished\`：
+
+- 部分指标达成、其余仍待收敛（**最常见**——不要因为"大部分已达成"就写 true，也不要因为难以取舍就改用散文陈述）；
+- 主体功能完成但仍有已知遗留问题；
+- 证据不足以确认某一条目标，无论你主观上认为它多半已完成。
+
+无论你有多不确定，都必须输出上面的 JSON。用散文描述"部分达成"不是一个可接受的裁决：调用方只解析 \`done\` 字段，一段没有 \`done\` 的文字会被判定为"无法裁决"，整轮审核作废并重跑一次完整的 judge。若确有话要说，写进 \`note\`，但 \`done\` 仍必须给出。`
 }
 
 /** Build the judge's task: pure goal + where to inspect + pre-computed round diff. */

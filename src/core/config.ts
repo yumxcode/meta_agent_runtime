@@ -228,7 +228,12 @@ export interface MetaAgentConfig {
   appendSystemPrompt?: string
 
   // ── Limits ─────────────────────────────────────────────────────────────────
-  /** Maximum number of agentic turns before stopping. Default: 10 */
+  /**
+   * Maximum number of agentic turns before stopping. Defaults to `Infinity`
+   * (see resolveConfig) — the CLI caps it at 100 for interactive use, and
+   * unattended runs are bounded by budget and wall-clock instead. The old
+   * "Default: 10" here had not been true for a long time.
+   */
   maxTurns?: number
 
   /** Maximum USD cost before stopping. */

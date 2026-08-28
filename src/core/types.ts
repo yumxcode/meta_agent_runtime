@@ -1,4 +1,5 @@
 import type { ExecutionFailure } from '../infra/failures/ExecutionFailure.js'
+import type { ContentBlockLike } from '../kernel/types/KernelTool.js'
 
 /**
  * Core type definitions for Meta-Agent Runtime
@@ -215,6 +216,19 @@ export interface ToolCallContext {
 export interface ToolResult {
   content: string
   isError: boolean
+  /**
+   * Structured content, when a plain string cannot carry the result — today
+   * that means images (a screenshot, a chart, an image file the model asked to
+   * read).
+   *
+   * `content` is deliberately left `string` and stays REQUIRED: every
+   * third-party tool that predates this field keeps compiling untouched, and
+   * `content` remains the text fallback used by the compact summariser, the
+   * trajectory record and the debug transcript — none of which can render an
+   * image. A tool that sets `blocks` should still put something meaningful in
+   * `content`, because that is what those three consumers will show.
+   */
+  blocks?: ContentBlockLike[]
   /**
    * Structured execution evidence for trajectory/audit consumers. Optional so
    * every existing third-party tool remains source-compatible. Shell tools

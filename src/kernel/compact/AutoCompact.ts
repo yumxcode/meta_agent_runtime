@@ -69,7 +69,7 @@ export function shouldAutoCompact(
   const compactModel = typeof compactModelOrForce === 'string' ? compactModelOrForce : undefined
   const forceCompact = typeof compactModelOrForce === 'boolean' ? compactModelOrForce : force
   if (forceCompact) return true
-  const tokenCount = tokenCountWithEstimation(messagesForQuery)
+  const tokenCount = tokenCountWithEstimation(messagesForQuery, model)
   return shouldCompactForTokenCount(tokenCount, model, maxOutputTokens, compactModel)
 }
 
@@ -111,7 +111,7 @@ export async function autoCompactIfNeeded(
   }
 
   // ── Token threshold check (needed before the circuit-breaker fallback) ─────
-  const tokenCount = tokenCountWithEstimation(messagesForQuery)
+  const tokenCount = tokenCountWithEstimation(messagesForQuery, model)
   const isAtCompactThreshold = shouldCompactForTokenCount(
     tokenCount,
     model,

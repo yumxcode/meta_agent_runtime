@@ -615,9 +615,15 @@ export function buildDelegationGuidanceSection(mode: AgentMode): SystemPromptSec
     if (isAutonomousMode(mode)) {
       parts.push(
         '',
-        '**无人值守约束**：并发数与总预算被收紧（默认 3 并发 / 共享预算上限）。' +
+        // The budget half of this used to say it was "收紧" (tightened). That was
+        // true at the old $20 session / $0.5 child ceilings; after the
+        // 2026-08-28 raise it is not, and telling the model its budget is scarce
+        // makes it under-fan-out — the exact behaviour these ceilings were
+        // raised to stop. Concurrency IS still restricted (3 vs 4), so the two
+        // constraints are now described separately rather than as one.
+        '**无人值守约束**：并发数被收紧为默认 3 个同时在跑（总预算是充裕的，不必为省钱而少发）。' +
           '优先把彼此独立的工作一次性异步扇出，让它们重叠跑完，而不是串行等待；' +
-          '但不要无谓地多发——每个子代理都消耗共享预算，超额会在入队前被拒绝。',
+          '真正的限制是并发席位与每个子代理的轮次上限，不是钱。',
       )
     }
 

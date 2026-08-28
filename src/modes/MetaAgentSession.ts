@@ -31,6 +31,7 @@ import { writeFile, mkdir } from 'node:fs/promises'
 import { join } from 'node:path'
 import { buildAnthropicAuth } from '../kernel/api/AnthropicClient.js'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
+import { promptTextOf, withPromptPrefix, type PromptInput } from '../core/promptInput.js'
 import {
   resolveConfig,
   DEFAULT_SYSTEM_PROMPT,
@@ -258,7 +259,7 @@ export class MetaAgentSession {
    *                 Defaults to 'agentic'.
    */
   async *submit(
-    prompt: string,
+    prompt: PromptInput,
     mode: AgentMode = this._defaultMode,
   ): AsyncGenerator<MetaAgentEvent, void, unknown> {
     if (this._submitInFlight) {
@@ -276,7 +277,7 @@ export class MetaAgentSession {
   }
 
   private async *_submitInner(
-    prompt: string,
+    prompt: PromptInput,
     mode: AgentMode,
   ): AsyncGenerator<MetaAgentEvent, void, unknown> {
     // ── Step 1: Stable system prompt (memoized sections only) ──────────────
@@ -367,12 +368,15 @@ export class MetaAgentSession {
     // externalPromptAssembly: the caller already injected its own <context>
     // (loop_capsule) into `prompt`, so skip the default volatile sections
     // (memory recall / sub-agent notifications) entirely.
-    let effectivePrompt: string
+    let effectivePrompt: PromptInput
     if (this.config.externalPromptAssembly) {
       effectivePrompt = prompt
     } else {
       const volatileSections = buildVolatileContextSections({
-        currentQuery:   prompt,
+        // Memory recall and mode detection reason about what the user SAID; an
+        // attachment contributes nothing to either, and interpolating one into
+        // a query string yields '[object Object]'.
+        currentQuery:   promptTextOf(prompt),
         // Any Anthropic-format provider (native Anthropic, GLM/Zhipu, Qwen) can
         // use the flash model for memory recall; OpenAI-protocol providers
         // (DeepSeek) fall back to keyword matching since this client can't reach them.
@@ -392,7 +396,7 @@ export class MetaAgentSession {
       const resolvedVolatile = await this.sectionRegistry.resolve(volatileSections)
       const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
       effectivePrompt = volatilePrefix
-        ? `${volatilePrefix}\n\n---\n\n${prompt}`
+        ? withPromptPrefix(prompt, `${volatilePrefix}\n\n---`)
         : prompt
     }
 

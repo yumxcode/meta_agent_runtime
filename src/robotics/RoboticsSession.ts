@@ -42,6 +42,7 @@
 
 import { createHash, randomUUID } from 'crypto'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool } from '../core/types.js'
+import { promptTextOf, withPromptPrefix, type PromptInput } from '../core/promptInput.js'
 import { AgenticSession } from '../modes/AgenticSession.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import { buildStaticSystemPrompt } from '../core/staticPrompt.js'
@@ -1085,7 +1086,11 @@ export class RoboticsSession implements RoboticsCapabilities {
 
   // ── SessionImpl interface ─────────────────────────────────────────────────
 
-  async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
+  async *submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent> {
+    // Mode classification, intent tracking, experience recall and volatile
+    // context all reason about the user's words; attachments are carried
+    // through untouched and rejoin at the inner submit below.
+    const promptText = promptTextOf(prompt)
     // #11: Friendlier reentrancy check at the RoboticsSession level.
     if (this._submitInFlight) {
       throw new Error(
@@ -1101,7 +1106,7 @@ export class RoboticsSession implements RoboticsCapabilities {
     try {
       // ── First submit only: classify agent mode ────────────────────────────────
       if (!this._modeClassified) {
-        await this._classifyAgentMode(prompt)
+        await this._classifyAgentMode(promptText)
       }
 
       // ── Re-hydrate _state from disk ───────────────────────────────────────────
@@ -1122,7 +1127,7 @@ export class RoboticsSession implements RoboticsCapabilities {
       // of critical-path wait) whose result had exactly one consumer: the
       // experience working set below.
       const turnIntentPromise = this.intentTracker
-        ? this.intentTracker.intentForTurn(prompt).catch(() => null)
+        ? this.intentTracker.intentForTurn(promptText).catch(() => null)
         : Promise.resolve(null)
 
       // ── Stable system prompt (memoized sections) ──────────────────────────────
@@ -1171,14 +1176,14 @@ export class RoboticsSession implements RoboticsCapabilities {
         await this._persistProjectIntent()
       }
 
-      await this.experienceWorkingSet.preload(prompt, intent)
+      await this.experienceWorkingSet.preload(promptText, intent)
 
       // ── Volatile user-message prefix (per-turn, recomputed each turn) ────────
       // R2 (experience_index), R3 (subagent_tasks), R5 (progress_notes),
       // team_context_boundary, D1b (memory), and D11 (notifications) are resolved
       // here and prepended to the user message as XML-tagged context blocks.
       const volatileSections = buildVolatileContextSections({
-        currentQuery:       prompt,
+        currentQuery:       promptText,
         mode:               'robotics',
         subAgentBridge:     this.bridge,
         volatileExtensions: this._getVolatileRoboticsExtensions(),
@@ -1187,7 +1192,7 @@ export class RoboticsSession implements RoboticsCapabilities {
       const volatilePrefix   = formatVolatileContext(volatileSections, resolvedVolatile)
 
       const effectivePrompt = volatilePrefix
-        ? `${volatilePrefix}\n\n---\n\n${prompt}`
+        ? withPromptPrefix(prompt, `${volatilePrefix}\n\n---`)
         : prompt
 
       // The context for this turn is now fixed, so what was injected is known.

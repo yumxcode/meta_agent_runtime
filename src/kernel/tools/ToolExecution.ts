@@ -3,7 +3,7 @@
  * Mirrors CC's toolExecution.ts.
  */
 import type { KernelTool, KernelToolContext, KernelToolControl, KernelToolExecutionMetadata } from '../types/KernelTool.js'
-import type { KernelMessage } from '../types/KernelMessage.js'
+import type { KernelMessage, ContentBlock } from '../types/KernelMessage.js'
 import type { CanUseToolFn, PermissionDecisionSource } from '../types/KernelConfig.js'
 import type { PermissionDenial } from '../types/KernelEvent.js'
 import { makeToolResultMessage } from '../messages/MessageFactory.js'
@@ -301,15 +301,26 @@ export async function executeToolCall(
         ])
       : await callPromise
 
-    const rawContentStr =
-      typeof result.data === 'string'
-        ? result.data
-        : JSON.stringify(result.data)
-    const contentStr = truncateString(rawContentStr, tool.maxResultSizeChars)
+    // A block array used to be JSON.stringify'd, which turned a tool's image
+    // into a wall of base64 inside a text block — the model saw the encoding,
+    // not the picture, and paid for every character of it. Blocks now travel as
+    // blocks; `makeToolResultMessage` already accepts them.
+    //
+    // Truncation still applies, but only to TEXT: `maxResultSizeChars` is a
+    // guard against runaway command output, and an image's cost is set by its
+    // pixel dimensions rather than its byte length, so clipping the base64 by
+    // character count would corrupt the image without saving any tokens.
+    const resultContent = Array.isArray(result.data)
+      ? (result.data.map(block =>
+          block.type === 'text'
+            ? { ...block, text: truncateString(block.text, tool.maxResultSizeChars) }
+            : block,
+        ) as unknown as ContentBlock[])
+      : truncateString(result.data, tool.maxResultSizeChars)
 
     const resultMessage = makeToolResultMessage(
       toolUseId,
-      contentStr,
+      resultContent,
       result.isError ?? false,
       assistantMessageUuid,
     )

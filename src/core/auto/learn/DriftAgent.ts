@@ -30,6 +30,7 @@ import { createAutoExperienceStore, renderRecentExperiences } from './AutoExperi
 import { timeout } from '../../timeouts.js'
 import type { TurnDiffTracker } from '../../../infra/fs/TurnDiffTracker.js'
 import { renderTurnDiffSection } from '../turnDiffSection.js'
+import { DEFAULT_DRIFT_BUDGET_USD, DEFAULT_JUDGE_MAX_TURNS } from '../../../infra/budgets.js'
 
 export interface AutoDriftGateDeps {
   /** Spawns the isolated drift sub-agent. */
@@ -53,8 +54,8 @@ export interface AutoDriftGateDeps {
 
 /** Read-only investigation tools + the direct experience writer. */
 const DRIFT_TOOLS = ['read_file', 'grep', 'glob', 'bash', 'experience_write']
-export const DRIFT_AGENT_DEFAULT_MAX_BUDGET_USD = 0.5
-export const DRIFT_AGENT_DEFAULT_MAX_TURNS = 30
+export const DRIFT_AGENT_DEFAULT_MAX_BUDGET_USD = DEFAULT_DRIFT_BUDGET_USD
+export const DRIFT_AGENT_DEFAULT_MAX_TURNS = DEFAULT_JUDGE_MAX_TURNS
 
 /** Per-invocation override so long-running hosts can change the cap live. */
 export function resolveDriftMaxBudgetUsd(): number {

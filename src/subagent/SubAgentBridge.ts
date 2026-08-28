@@ -39,6 +39,7 @@ import {
 import type { ISubAgentDispatcher } from './ISubAgentDispatcher.js'
 import type { MetaAgentEvent, MetaAgentTool } from '../core/types.js'
 import type { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
+import { DEFAULT_SUB_AGENT_POOL_BUDGET_USD } from '../infra/budgets.js'
 
 const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
@@ -55,7 +56,7 @@ const DEFAULT_DESTROY_WAIT_MS = 10_000
 const DEFAULT_AUTO_RETRY_LIMIT = 2
 /** Auto-mode conservative scheduler defaults (override-able by env vars). */
 const AUTO_MAX_CONCURRENT_SUB_AGENTS = 3
-const AUTO_DEFAULT_TOTAL_BUDGET_USD = 10
+const AUTO_DEFAULT_TOTAL_BUDGET_USD = DEFAULT_SUB_AGENT_POOL_BUDGET_USD
 
 export class SubAgentBudgetExceededError extends Error {
   readonly code = 'SUB_AGENT_BUDGET_EXCEEDED'

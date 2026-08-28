@@ -165,6 +165,126 @@ describe('a failure BEFORE the turn ran is still retried', () => {
   })
 })
 
+/**
+ * Second line of defence, added after the 2026-08-27 run.
+ *
+ * The classification above is correct but it is a judgement the resume path has
+ * to make right EVERY time, and it missed one: a turn that ended in
+ * `auto_verify_unavailable` returned an error RESULT rather than throwing, so
+ * the post-turn check threw a bare Error, the scheduler read that as
+ * "failed before the turn ran", retried, and the history fence — 826 loaded vs
+ * 818 armed — cancelled a live session permanently.
+ *
+ * `isWakeStillRunnable` asks the fences directly, so a missed classification
+ * costs one wake instead of the whole session.
+ */
+describe('pre-retry fence probe', () => {
+  it('does not retry when the fences no longer pass', async () => {
+    const store = new AutoContinuationStore(await project())
+    const record = await scheduleDue(store)
+    const events: string[] = []
+
+    const scheduler = new AutoScheduler(
+      store,
+      // A bare Error from a turn that HAS already run — the exact shape of the
+      // incident, and the shape the primary classification misses.
+      async () => { throw new Error('Stopped (auto mode): completion could not be independently verified.') },
+      {
+        onEvent: m => events.push(m),
+        retryBaseMs: 1,
+        isWakeStillRunnable: async () => false,   // history moved on
+      },
+    )
+    await scheduler.tickOnce()
+
+    // 'done', not 'pending' — and emphatically not the terminal 'cancelled'
+    // that a retry would have produced.
+    expect(await statusOf(store, record.wakeId)).toBe('done')
+    // Match the retry-scheduling line specifically; a bare /retry/ also hits
+    // the "NOT retrying" explanation this path emits.
+    expect(events.join('\n')).not.toMatch(/retry \S+ in \d+ms/)
+  })
+
+  it('explains itself and tells the operator how to resume', async () => {
+    const store = new AutoContinuationStore(await project())
+    await scheduleDue(store, 'sess-abc')
+    const events: string[] = []
+    const scheduler = new AutoScheduler(
+      store,
+      async () => { throw new Error('verify unavailable') },
+      { onEvent: m => events.push(m), isWakeStillRunnable: async () => false },
+    )
+    await scheduler.tickOnce()
+
+    const log = events.join('\n')
+    expect(log).toMatch(/fences no longer pass/)
+    expect(log).toMatch(/NOT retrying/)
+    expect(log).toMatch(/--resume sess-abc/)
+    expect(log).toMatch(/verify unavailable/)   // the real cause survives
+  })
+
+  it('still retries when the fences DO pass', async () => {
+    // A genuine pre-turn failure must keep its retry. Suppressing those would
+    // strand recoverable wakes — the opposite harm.
+    const store = new AutoContinuationStore(await project())
+    const record = await scheduleDue(store)
+    const scheduler = new AutoScheduler(
+      store,
+      async () => { throw new Error('transient: session store unreadable') },
+      { retryBaseMs: 5_000, isWakeStillRunnable: async () => true },
+    )
+    await scheduler.tickOnce()
+    expect(await statusOf(store, record.wakeId)).toBe('pending')
+  })
+
+  it('retries when the probe itself throws', async () => {
+    // "Cannot tell" must fall back to the previous behaviour, not to refusing.
+    const store = new AutoContinuationStore(await project())
+    const record = await scheduleDue(store)
+    const scheduler = new AutoScheduler(
+      store,
+      async () => { throw new Error('transient') },
+      {
+        retryBaseMs: 5_000,
+        isWakeStillRunnable: async () => { throw new Error('probe exploded') },
+      },
+    )
+    await scheduler.tickOnce()
+    expect(await statusOf(store, record.wakeId)).toBe('pending')
+  })
+
+  it('behaves exactly as before when no probe is injected', async () => {
+    const store = new AutoContinuationStore(await project())
+    const record = await scheduleDue(store)
+    const scheduler = new AutoScheduler(
+      store,
+      async () => { throw new Error('transient') },
+      { retryBaseMs: 5_000 },
+    )
+    await scheduler.tickOnce()
+    expect(await statusOf(store, record.wakeId)).toBe('pending')
+  })
+
+  it('does not consult the probe for an already-tagged consumed wake', async () => {
+    // AutoWakeConsumedError is conclusive on its own; the probe is a fallback,
+    // so a probe outage must not be able to turn that path into a retry.
+    const store = new AutoContinuationStore(await project())
+    const record = await scheduleDue(store)
+    let probed = 0
+    const scheduler = new AutoScheduler(
+      store,
+      async () => { throw new AutoWakeConsumedError('s1', new Error('boom')) },
+      {
+        retryBaseMs: 1,
+        isWakeStillRunnable: async () => { probed++; return true },
+      },
+    )
+    await scheduler.tickOnce()
+    expect(probed).toBe(0)
+    expect(await statusOf(store, record.wakeId)).toBe('done')
+  })
+})
+
 describe('normal outcomes', () => {
   it('a done resume marks the wake done', async () => {
     const store = new AutoContinuationStore(await project())

@@ -30,6 +30,7 @@
  */
 
 import { parseStrictInt, parseStrictFloat } from './strictNumber.js'
+import { DEFAULT_AUTO_SESSION_BUDGET_USD } from '../budgets.js'
 
 // ── Invalid-value reporting ──────────────────────────────────────────────────
 //
@@ -272,6 +273,15 @@ export const RuntimeEnv = {
   maxTimedOutRunningTools(fallback: number): number {
     return readIntEnvOr('META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS', fallback, 1)
   },
+  /**
+   * How many of the most recent images stay at full fidelity. Clamped >= 0.
+   *
+   * Counted in images, not turns: an image costs a flat per-image token budget
+   * regardless of where it sits, so the count is what the bill tracks.
+   */
+  imageRetainCount(fallback: number): number {
+    return readIntEnvOr('META_AGENT_IMAGE_RETAIN', fallback, 0)
+  },
   /** Max concurrent tool_use executions. Clamped [1,64] (CC parity). */
   toolUseConcurrency(fallback: number): number {
     return readIntEnvOr('META_AGENT_MAX_TOOL_USE_CONCURRENCY', fallback, 1, 64)
@@ -303,7 +313,8 @@ export const RuntimeEnv = {
 
   /** Finite whole-session USD ceiling for unattended auto/simple_auto runs. */
   autoSessionBudgetUsd(): number {
-    return readFloatEnv('META_AGENT_AUTO_MAX_BUDGET_USD', { gt: 0, max: 1_000_000 }) ?? 20
+    return readFloatEnv('META_AGENT_AUTO_MAX_BUDGET_USD', { gt: 0, max: 1_000_000 })
+      ?? DEFAULT_AUTO_SESSION_BUDGET_USD
   },
 
   // ── CLI ───────────────────────────────────────────────────────────────────
@@ -376,18 +387,19 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_MAX_CONCURRENT_SUB_AGENTS', type: 'int', default: '4 (auto: 3)', description: 'Max concurrently running sub-agents.' },
   { name: 'META_AGENT_MAX_QUEUED_SUB_AGENTS', type: 'int', default: '64', description: 'Max queued sub-agents beyond the running cap. Range [0,10000].' },
   { name: 'META_AGENT_SUB_AGENT_START_DELAY_MS', type: 'int', default: '50', description: 'Stagger delay before starting each queued sub-agent (ms).' },
-  { name: 'META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD', type: 'float', default: 'unlimited (auto: 10)', description: 'Total spend cap across ordinary sub-agents (USD).' },
-  { name: 'META_AGENT_AUTO_MAX_BUDGET_USD', type: 'float', default: '20', description: 'Whole-session USD ceiling for auto/simple_auto, including sub-agents and gates.' },
-  { name: 'META_AGENT_VERIFY_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto verify judge.' },
-  { name: 'META_AGENT_VERIFY_MAX_BUDGET_USD', type: 'float', default: '1', description: 'Maximum USD spend for one auto verify judge.' },
-  { name: 'META_AGENT_DRIFT_MAX_BUDGET_USD', type: 'float', default: '0.5', description: 'Maximum USD spend for one auto drift judge.' },
-  { name: 'META_AGENT_DRIFT_MAX_TURNS', type: 'int', default: '30', description: 'Maximum turns for one auto drift judge.' },
+  { name: 'META_AGENT_MAX_TOTAL_SUB_AGENT_BUDGET_USD', type: 'float', default: 'unlimited (auto: 200)', description: 'Total spend cap across ordinary sub-agents (USD).' },
+  { name: 'META_AGENT_AUTO_MAX_BUDGET_USD', type: 'float', default: '300', description: 'Whole-session USD ceiling for auto/simple_auto, including sub-agents and gates. CUMULATIVE ACROSS RESUME — a resumed session starts from the cost already recorded in its checkpoint.' },
+  { name: 'META_AGENT_VERIFY_MAX_TURNS', type: 'int', default: '100', description: 'Maximum turns for one auto verify judge.' },
+  { name: 'META_AGENT_VERIFY_MAX_BUDGET_USD', type: 'float', default: '50', description: 'Maximum USD spend for one auto verify judge.' },
+  { name: 'META_AGENT_DRIFT_MAX_BUDGET_USD', type: 'float', default: '50', description: 'Maximum USD spend for one auto drift judge.' },
+  { name: 'META_AGENT_DRIFT_MAX_TURNS', type: 'int', default: '100', description: 'Maximum turns for one auto drift judge.' },
   // ── Timeouts (all overridable by config.json → "timeouts") ────────────────
   { name: 'META_AGENT_LLM_FIRST_TOKEN_TIMEOUT_MS', type: 'int', default: '90000', description: 'Streaming LLM call: budget to the FIRST stream event. Range [1000,3600000]. Config key: timeouts.llmFirstTokenMs.' },
   { name: 'META_AGENT_LLM_IDLE_TIMEOUT_MS', type: 'int', default: '60000', description: 'Streaming LLM call: max silence BETWEEN stream events. There is deliberately no total cap. Range [1000,3600000]. Config key: timeouts.llmIdleMs.' },
   { name: 'META_AGENT_COMPACT_TIMEOUT_MS', type: 'int', default: '720000', description: 'Compaction side-call (non-streaming, bounds the whole call). Range [10000,3600000]. Config key: timeouts.compactMs.' },
   { name: 'META_AGENT_FLASH_TTFT_MS', type: 'int', default: '30000', description: 'Flash side-calls: first-token half of the derived budget. Range [1000,600000]. Config key: timeouts.flashTtftMs.' },
   { name: 'META_AGENT_FLASH_TOKENS_PER_SEC', type: 'int', default: '20', description: 'Flash side-calls: assumed output rate used to size the generation half. Range [1,10000]. Config key: timeouts.flashTokensPerSec.' },
+  { name: 'META_AGENT_IMAGE_RETAIN', type: 'int', default: '4', description: 'Most recent N images kept at full fidelity; older ones become text placeholders. 0 strips every image.' },
   { name: 'META_AGENT_TOOL_TIMEOUT_MS', type: 'int', default: '180000', description: 'Global per-tool timeout (ms). 0 disables. Config key: timeouts.toolMs.' },
   { name: 'META_AGENT_MCP_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one HTTP MCP RPC. Range [1000,600000]. Config key: timeouts.mcpMs.' },
   { name: 'META_AGENT_MCP_STDIO_TIMEOUT_MS', type: 'int', default: '60000', description: 'Wall-clock timeout for one stdio MCP RPC. Range [100,600000]. Config key: timeouts.mcpStdioMs.' },

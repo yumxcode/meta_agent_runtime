@@ -4,6 +4,7 @@ import { tmpdir } from 'os'
 import { join } from 'path'
 import { makeAutoVerifyGate, parseVerdict, buildJudgeRubric, resolveJudgeLimits, VERIFY_JUDGE_DEFAULTS } from '../VerifyJudge.js'
 import { buildVerifyRejectionPrompt } from '../../../../kernel/loop/VerifyGate.js'
+import { DEFAULT_VERIFY_BUDGET_USD, DEFAULT_JUDGE_MAX_TURNS } from '../../../../infra/budgets.js'
 import type { ISubAgentDispatcher } from '../../../../subagent/ISubAgentDispatcher.js'
 import type { SubAgentRecord } from '../../../../subagent/types.js'
 
@@ -146,7 +147,31 @@ describe('buildJudgeRubric — tool alignment', () => {
   })
 
   it('always asks for a best-effort JSON verdict before exhausting budget', () => {
-    expect(buildJudgeRubric(['read_file'])).toContain('接近轮次/预算上限')
+    expect(buildJudgeRubric(['read_file'])).toContain('接近轮次上限')
+  })
+
+  // 2026-08-27: the judge finished its investigation genuinely undecided — some
+  // acceptance metrics met, others still converging — and wrote prose instead of
+  // committing to a boolean. `parseVerdict` requires `typeof done === 'boolean'`,
+  // so both channels missed, the gate reported "unavailable", and the run halted.
+  // The rubric never told it where "partially done" lands.
+  it('gives a partially-done judgement a determinate landing spot', () => {
+    const r = buildJudgeRubric(['read_file', 'grep', 'glob'])
+    expect(r).toContain('二值判断')
+    expect(r).toContain('部分指标达成')
+    expect(r).toContain('done: false')
+  })
+
+  it('says explicitly that prose is not an acceptable verdict', () => {
+    const r = buildJudgeRubric(['read_file'])
+    // Naming the CONSEQUENCE matters more than the instruction: a model that
+    // knows prose costs a full re-run has a reason to commit to the boolean.
+    expect(r).toMatch(/散文/)
+    expect(r).toMatch(/无法裁决|作废|重跑/)
+  })
+
+  it('still requires unfinished to be empty when done', () => {
+    expect(buildJudgeRubric(['read_file'])).toContain('done=true 时 unfinished 必须为空数组')
   })
 })
 
@@ -160,9 +185,10 @@ describe('resolveJudgeLimits — env-overridable budget', () => {
   beforeEach(() => { for (const k of KEYS) { saved[k] = process.env[k]; delete process.env[k] } })
   afterEach(() => { for (const k of KEYS) { if (saved[k] === undefined) delete process.env[k]; else process.env[k] = saved[k] } })
 
-  it('falls back to the documented defaults (30 turns / $1 budget / 30min)', () => {
-    expect(resolveJudgeLimits()).toEqual({ maxTurns: 30, maxBudgetUsd: 1, maxDurationMs: 1_800_000 })
-    expect(VERIFY_JUDGE_DEFAULTS).toEqual({ maxTurns: 30, maxBudgetUsd: 1, maxDurationMs: 1_800_000 })
+  it('falls back to the documented defaults (ladder turns / ladder budget / 30min)', () => {
+    const expected = { maxTurns: DEFAULT_JUDGE_MAX_TURNS, maxBudgetUsd: DEFAULT_VERIFY_BUDGET_USD, maxDurationMs: 1_800_000 }
+    expect(resolveJudgeLimits()).toEqual(expected)
+    expect(VERIFY_JUDGE_DEFAULTS).toEqual(expected)
   })
 
   it('applies env overrides', () => {
@@ -176,7 +202,19 @@ describe('resolveJudgeLimits — env-overridable budget', () => {
     process.env['META_AGENT_VERIFY_MAX_TURNS'] = 'abc'      // → default 30
     process.env['META_AGENT_VERIFY_MAX_BUDGET_USD'] = '-5'  // → clamped to min 0.01
     const r = resolveJudgeLimits()
-    expect(r.maxTurns).toBe(30)
+    expect(r.maxTurns).toBe(DEFAULT_JUDGE_MAX_TURNS)
     expect(r.maxBudgetUsd).toBe(0.01)
+  })
+
+  it('rejects a valid prefix followed by garbage rather than reading the prefix', () => {
+    // P2-3 class. `parseInt('1oops')` is 1 — a one-turn judge cannot gather
+    // evidence, so it produces no verdict, which surfaces as the very same
+    // "verify unavailable" halt this file's gate reports. A typo in a budget
+    // knob must not disarm the judge.
+    process.env['META_AGENT_VERIFY_MAX_TURNS'] = '1oops'
+    process.env['META_AGENT_VERIFY_MAX_BUDGET_USD'] = '0.5junk'
+    const r = resolveJudgeLimits()
+    expect(r.maxTurns).toBe(DEFAULT_JUDGE_MAX_TURNS)
+    expect(r.maxBudgetUsd).toBe(DEFAULT_VERIFY_BUDGET_USD)
   })
 })

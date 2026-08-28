@@ -94,6 +94,41 @@ const PUBLIC_VALUES: Record<string, readonly string[]> = {
     'compileCommandRules',
     'loadCommandRules',
   ],
+  // `MetaAgentSession.query()` accepts a PromptInput that may carry images, so
+  // the means to BUILD one is public surface too. Shipped 0.9.5 exporting the
+  // signature but nothing to satisfy it — the same gap this file was written
+  // for after v0.9.0.
+  'multimodal prompts (0.9.5)': [
+    'promptTextOf',
+    'promptImagesOf',
+    'promptHasImages',
+    'withPromptPrefix',
+    'withPromptText',
+    'promptToContentBlocks',
+    'SUPPORTED_IMAGE_MEDIA_TYPES',
+    'makeImageBlockFromBytes',
+    'makeImageBlockFromFile',
+    'makeImageBlockFromUrl',
+    'sniffImageMediaType',
+    'readImageDimensions',
+    'hasImageExtension',
+    'isImageBlock',
+    'imageBlockByteLength',
+    'imageBlockBytes',
+    'imageBlockToDataUrl',
+    'imageBlockMediaType',
+    'downgradeImageBlock',
+    'UnsupportedImageError',
+    'modelSupportsVision',
+    'getVisionLimits',
+    'effectiveEdgePixels',
+  ],
+  'store id containment (review 2026-08-27)': [
+    'validateStoreId',
+    'isValidStoreId',
+    'resolveWithinRoot',
+    'StoreIdError',
+  ],
   'pre-existing core surface': [
     'SessionRouter',
     'MetaAgentSession',

@@ -4,6 +4,7 @@
  * Storage layout under ~/.meta-agent/sessions/:
  *   index.json                           — list of all sessions (newest first)
  *   <sessionId>/history.jsonl            — newline-delimited ConversationMessage records
+ *   <sessionId>/blobs/<sha256>.<ext>     — image bytes, referenced from history
  *
  * Design decisions:
  *   - JSONL (append-only) for history so every message is written atomically
@@ -17,7 +18,8 @@
  *     session. Administrative cleanup remains best-effort.
  */
 
-import { readFile, appendFile, mkdir, open, stat, rm, readdir } from 'node:fs/promises'
+import { readFile, writeFile, appendFile, mkdir, open, stat, rm, readdir } from 'node:fs/promises'
+import { createHash } from 'node:crypto'
 import { atomicWriteFile, atomicWriteJson, withFileLock } from '../infra/persist/index.js'
 import { validateStoreId, isValidStoreId, resolveWithinRoot } from '../infra/persist/storeId.js'
 import { SessionMetaSchema, parseArrayFiltered } from '../infra/persist/schemas.js'
@@ -129,13 +131,165 @@ function stripThinkingForStorage(message: ConversationMessage): ConversationMess
   return { ...message, content } as ConversationMessage
 }
 
-function serializeMessages(messages: readonly ConversationMessage[]): string {
+// ── Image externalisation ─────────────────────────────────────────────────────
+//
+// Image bytes never enter history.jsonl. A single 1 MB screenshot becomes ~1.4 MB
+// of base64 on one line, and a session with a handful of them blows past the
+// 64 MiB resume read guard while META_AGENT_MAX_RESUME_MESSAGES — a count, not a
+// size — reports everything as fine. Bytes go to a content-addressed blob file
+// and the message keeps a reference.
+//
+// Content addressing means re-attaching the same image across many turns costs
+// one file, and `deleteSession`'s recursive rm of the session directory already
+// takes the blobs with it.
+
+/** Storage-only image source. Never sent to any provider. */
+interface BlobImageSource {
+  type: 'blob_ref'
+  sha256: string
+  media_type: string
+  bytes: number
+}
+
+const MEDIA_TYPE_EXTENSIONS: Record<string, string> = {
+  'image/png': 'png',
+  'image/jpeg': 'jpg',
+  'image/gif': 'gif',
+  'image/webp': 'webp',
+}
+
+function blobsDir(sessionId: string, options: SessionStoreOptions = {}): string {
+  return resolveWithinRoot(sessionDir(sessionId, options), 'blobs')
+}
+
+function blobPath(sessionId: string, sha: string, mediaType: string, options: SessionStoreOptions = {}): string {
+  const ext = MEDIA_TYPE_EXTENSIONS[mediaType] ?? 'bin'
+  // `sha` is hex from createHash, so it cannot escape; validated anyway because
+  // the rehydrate path reads it back from a file an operator may have edited.
+  return resolveWithinRoot(blobsDir(sessionId, options), `${validateStoreId(sha, 'blobSha')}.${ext}`)
+}
+
+type StoredBlock = Record<string, unknown>
+
+async function externalizeBlock(
+  block: StoredBlock,
+  sessionId: string,
+  options: SessionStoreOptions,
+): Promise<StoredBlock> {
+  if (block['type'] === 'image') {
+    const source = block['source'] as Record<string, unknown> | undefined
+    if (!source || source['type'] !== 'base64' || typeof source['data'] !== 'string') return block
+    const mediaType = typeof source['media_type'] === 'string' ? source['media_type'] : 'image/png'
+    const bytes = Buffer.from(source['data'], 'base64')
+    const sha = createHash('sha256').update(bytes).digest('hex')
+    const path = blobPath(sessionId, sha, mediaType, options)
+    if (!existsSync(path)) {
+      await mkdir(blobsDir(sessionId, options), { recursive: true })
+      await writeFile(path, bytes)
+    }
+    const ref: BlobImageSource = { type: 'blob_ref', sha256: sha, media_type: mediaType, bytes: bytes.length }
+    return { type: 'image', source: ref }
+  }
+  if (block['type'] === 'tool_result' && Array.isArray(block['content'])) {
+    const content = await Promise.all(
+      (block['content'] as StoredBlock[]).map(inner =>
+        inner && typeof inner === 'object' ? externalizeBlock(inner, sessionId, options) : inner,
+      ),
+    )
+    return { ...block, content }
+  }
+  return block
+}
+
+async function externalizeImagesForStorage(
+  message: ConversationMessage,
+  sessionId: string,
+  options: SessionStoreOptions,
+): Promise<ConversationMessage> {
+  if (!Array.isArray(message.content)) return message
+  const blocks = message.content as unknown as StoredBlock[]
+  if (!blocks.some(hasImageSomewhere)) return message
+  const content = await Promise.all(blocks.map(b => externalizeBlock(b, sessionId, options)))
+  return { ...message, content } as unknown as ConversationMessage
+}
+
+function hasImageSomewhere(block: StoredBlock): boolean {
+  if (!block || typeof block !== 'object') return false
+  if (block['type'] === 'image') return true
+  if (block['type'] === 'tool_result' && Array.isArray(block['content'])) {
+    return (block['content'] as StoredBlock[]).some(hasImageSomewhere)
+  }
+  return false
+}
+
+async function rehydrateBlock(
+  block: StoredBlock,
+  sessionId: string,
+  options: SessionStoreOptions,
+): Promise<StoredBlock> {
+  if (block['type'] === 'image') {
+    const source = block['source'] as Record<string, unknown> | undefined
+    if (!source || source['type'] !== 'blob_ref' || typeof source['sha256'] !== 'string') return block
+    const mediaType = typeof source['media_type'] === 'string' ? source['media_type'] : 'image/png'
+    try {
+      const bytes = await readFile(blobPath(sessionId, source['sha256'], mediaType, options))
+      return { type: 'image', source: { type: 'base64', media_type: mediaType, data: bytes.toString('base64') } }
+    } catch {
+      // A missing blob must degrade, never abort the resume: the transcript is
+      // the valuable part and one unreadable attachment is not worth losing it.
+      return { type: 'text', text: '[image: attachment no longer available]' }
+    }
+  }
+  if (block['type'] === 'tool_result' && Array.isArray(block['content'])) {
+    const content = await Promise.all(
+      (block['content'] as StoredBlock[]).map(inner =>
+        inner && typeof inner === 'object' ? rehydrateBlock(inner, sessionId, options) : inner,
+      ),
+    )
+    return { ...block, content }
+  }
+  return block
+}
+
+async function rehydrateImagesFromStorage(
+  messages: readonly ConversationMessage[],
+  sessionId: string,
+  options: SessionStoreOptions,
+): Promise<ConversationMessage[]> {
+  return Promise.all(messages.map(async message => {
+    if (!Array.isArray(message.content)) return message
+    const blocks = message.content as unknown as StoredBlock[]
+    if (!blocks.some(hasBlobRefSomewhere)) return message
+    const content = await Promise.all(blocks.map(b => rehydrateBlock(b, sessionId, options)))
+    return { ...message, content } as unknown as ConversationMessage
+  }))
+}
+
+function hasBlobRefSomewhere(block: StoredBlock): boolean {
+  if (!block || typeof block !== 'object') return false
+  if (block['type'] === 'image') {
+    const source = block['source'] as Record<string, unknown> | undefined
+    return source?.['type'] === 'blob_ref'
+  }
+  if (block['type'] === 'tool_result' && Array.isArray(block['content'])) {
+    return (block['content'] as StoredBlock[]).some(hasBlobRefSomewhere)
+  }
+  return false
+}
+
+async function serializeMessages(
+  messages: readonly ConversationMessage[],
+  sessionId: string,
+  options: SessionStoreOptions = {},
+): Promise<string> {
   if (messages.length === 0) return ''
-  return messages
-    .map(stripThinkingForStorage)
-    .filter(m => !Array.isArray(m.content) || m.content.length > 0)
-    .map(m => JSON.stringify(m))
-    .join('\n') + '\n'
+  const prepared = await Promise.all(
+    messages
+      .map(stripThinkingForStorage)
+      .filter(m => !Array.isArray(m.content) || m.content.length > 0)
+      .map(m => externalizeImagesForStorage(m, sessionId, options)),
+  )
+  return prepared.map(m => JSON.stringify(m)).join('\n') + '\n'
 }
 
 function contentBlocks(message: ConversationMessage): Array<Record<string, unknown>> {
@@ -355,7 +509,7 @@ async function loadHistoryUnlocked(
   if (dropped > 0) {
     console.warn(`[SessionStore] Skipped ${dropped} corrupt history line(s) for session ${sessionId}`)
   }
-  return normalizeResumedHistory(parsed)
+  return normalizeResumedHistory(await rehydrateImagesFromStorage(parsed, sessionId, options))
 }
 
 // ── SessionStore ──────────────────────────────────────────────────────────────
@@ -412,9 +566,9 @@ export class SessionStore {
           `[SessionStore] History divergence for ${sessionId}: index has ${current.messageCount} ` +
           `messages, caller expected ${appendFrom}. Rewriting full history from memory.`,
         )
-        await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
+        await atomicWriteFile(historyPath(sessionId, options), await serializeMessages(messages, sessionId, options))
       } else {
-        const lines = serializeMessages(messages.slice(appendFrom))
+        const lines = await serializeMessages(messages.slice(appendFrom), sessionId, options)
         await appendFile(historyPath(sessionId, options), lines, 'utf-8')
       }
     })
@@ -482,7 +636,7 @@ export class SessionStore {
       }
       // Atomic rename: a crash leaves either the old complete transcript or
       // the new complete transcript, never a truncated history.jsonl.
-      await atomicWriteFile(historyPath(sessionId, options), serializeMessages(messages))
+      await atomicWriteFile(historyPath(sessionId, options), await serializeMessages(messages, sessionId, options))
     })
 
     await SessionStore._commitIndex({ sessionId, ...meta }, options)

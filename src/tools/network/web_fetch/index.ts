@@ -1,3 +1,7 @@
+import {
+  makeImageBlockFromBytes, readImageDimensions, sniffImageMediaType,
+  SUPPORTED_IMAGE_MEDIA_TYPES,
+} from '../../../kernel/messages/imageBlocks.js'
 import { lookup } from 'node:dns/promises'
 import { isIP, type LookupFunction } from 'node:net'
 import { request as httpRequest } from 'node:http'
@@ -123,6 +127,66 @@ function stripHtml(html: string): string {
 // both cheaper and actionable.
 
 type BodyKind = 'html' | 'json' | 'text' | 'binary'
+
+/** Inline cap for a fetched image; below every provider's per-image limit. */
+const MAX_IMAGE_BYTES = 5 * 1024 * 1024
+
+/**
+ * Turn an image response into a tool result.
+ *
+ * Exported for tests: the SSRF guard refuses loopback by design, so this branch
+ * cannot be driven through a local server — the same reason `classifyBody` and
+ * `renderPage` are exported.
+ *
+ * @param truncated whether the transfer was cut short by the byte budget
+ * @internal
+ */
+export function renderImageResponse(
+  finalUrl: string,
+  contentType: string,
+  body: Buffer,
+  truncated: boolean,
+): ToolResult {
+  // Truncation must be checked BEFORE the format sniff, not after. Magic bytes
+  // live at offset 0, so a body cut off at the transfer cap still sniffs as a
+  // perfectly good PNG/JPEG — the partial image would be inlined and described
+  // as complete, and neither the model nor the user would have any way to tell
+  // it was half a picture. Refusing is the only honest answer available: we
+  // cannot know what the rest of the image contained.
+  if (truncated || body.length > MAX_IMAGE_BYTES) {
+    return {
+      content:
+        `Refused: ${finalUrl} returned an image larger than ${MAX_IMAGE_BYTES / (1024 * 1024)} MiB ` +
+        `(stopped after ${(body.length / (1024 * 1024)).toFixed(1)} MiB). ` +
+        'Inlining the partial download would hand the model a corrupt image. ' +
+        'Download and downscale it first, then attach the file.',
+      isError: true,
+    }
+  }
+  // The declared content-type only routes us here; the BYTES decide the format,
+  // so a server that mislabels a PNG as image/tiff is reported rather than
+  // passed through with a media_type the API would reject.
+  const view = new Uint8Array(body.buffer, body.byteOffset, body.byteLength)
+  const mediaType = sniffImageMediaType(view)
+  if (!mediaType) {
+    return {
+      content:
+        `Refused: ${finalUrl} declared ${mimeOf(contentType)} but its bytes are not a supported image ` +
+        `(${SUPPORTED_IMAGE_MEDIA_TYPES.join(', ')}).`,
+      isError: true,
+    }
+  }
+  const dims = readImageDimensions(view)
+  const shape = dims ? `, ${dims.width}×${dims.height}` : ''
+  return {
+    content: `[image: ${finalUrl} (${mediaType}${shape}, ${body.length} bytes)]`,
+    blocks: [
+      { type: 'text', text: `Image fetched from ${finalUrl}` },
+      makeImageBlockFromBytes(view, finalUrl),
+    ],
+    isError: false,
+  }
+}
 
 /** `application/…` subtypes that are text despite not living under `text/`. */
 const TEXTUAL_APPLICATION_SUBTYPE =
@@ -306,6 +370,16 @@ interface PinnedResponse {
   statusText: string
   headers: Map<string, string>
   bytes(): Buffer
+  /**
+   * True when the transfer was cut short by the byte budget rather than by the
+   * server finishing.
+   *
+   * Text callers can live without this — they truncate for display anyway and
+   * say so. Images cannot: a partial JPEG still carries valid magic bytes at
+   * offset 0, so without this flag a half-downloaded image sniffs as a good
+   * one and gets inlined as though it were complete.
+   */
+  truncated: boolean
 }
 
 type PinnedLookupCallback = (
@@ -387,16 +461,25 @@ function requestPinned(
             statusText: res.statusMessage ?? '',
             headers,
             bytes: () => Buffer.alloc(0),
+            truncated: false,
           })
           return
         }
+        // Images need a far larger budget than text: MAX_CONTENT is sized for
+        // "how much prose is worth showing a model", and 200 KiB would cut off
+        // most real photographs mid-file. Chosen from the declared content-type
+        // because that is all we know before reading, and re-checked against
+        // the actual bytes once they arrive.
+        const isImageResponse = mimeOf(headers.get('content-type') ?? '').startsWith('image/')
+        const byteBudget = isImageResponse ? MAX_IMAGE_BYTES : MAX_CONTENT * 2
+
         const chunks: Buffer[] = []
         let total = 0
         res.on('data', (chunk: Buffer) => {
           total += chunk.length
-          // Read a little past MAX_CONTENT so the caller's truncation message
-          // is accurate; then stop to bound memory.
-          if (total <= MAX_CONTENT * 2) {
+          // Read a little past the cap so the caller's truncation message is
+          // accurate; then stop to bound memory.
+          if (total <= byteBudget) {
             chunks.push(chunk)
             return
           }
@@ -411,6 +494,7 @@ function requestPinned(
             statusText: res.statusMessage ?? '',
             headers,
             bytes: () => body,
+            truncated: true,
           })
           res.destroy()
         })
@@ -421,6 +505,7 @@ function requestPinned(
             statusText: res.statusMessage ?? '',
             headers,
             bytes: () => body,
+            truncated: false,
           })
         })
         res.on('error', reject)
@@ -602,6 +687,14 @@ export async function createWebFetchTool(options: WebFetchToolOptions = {}): Pro
         const ct = res.headers.get('content-type') ?? ''
         const body = res.bytes()
         const kind = classifyBody(ct, body)
+
+        // Images are the one binary kind the model can actually consume. They
+        // return directly rather than through the page cache: CachedPage stores
+        // text, and an image is fetched to be looked at once, not re-read.
+        if (mimeOf(ct).startsWith('image/')) {
+          return renderImageResponse(finalUrl, ct, body, res.truncated)
+        }
+
         if (kind === 'binary') {
           // Refuse rather than hand the model 100 KB of decoded noise it will
           // try to interpret. Naming the type is what makes this recoverable.

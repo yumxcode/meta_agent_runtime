@@ -13,6 +13,7 @@
  */
 import { KernelSession } from '../kernel/index.js'
 import type { ConversationMessage, MetaAgentEvent, MetaAgentTool, TokenUsage } from '../core/types.js'
+import { promptTextOf, withPromptPrefix, type PromptInput } from '../core/promptInput.js'
 import type { MetaAgentConfig } from '../core/config.js'
 import { resolveConfig } from '../core/config.js'
 import { instrumentTool } from '../runtime/instrumentTool.js'
@@ -155,7 +156,7 @@ export class CampaignSession {
 
   // ── Submission ────────────────────────────────────────────────────────────
 
-  async *submit(prompt: string): AsyncGenerator<MetaAgentEvent> {
+  async *submit(prompt: PromptInput): AsyncGenerator<MetaAgentEvent> {
     // #11: Friendlier reentrancy check at the CampaignSession level.
     if (this._submitInFlight) {
       throw new Error(
@@ -173,9 +174,12 @@ export class CampaignSession {
     // message), which collapses the cacheable prefix to zero — losing cache hits
     // on the entire conversation history.  Injecting the volatile content into the
     // user message instead keeps messages[0] identical across turns.
-    const suffix = await this._buildEnrichedSuffix(prompt)
+    const suffix = await this._buildEnrichedSuffix(promptTextOf(prompt))
     const effectivePrompt = suffix
-      ? `<context>\n<campaign_state>\n${suffix}\n</campaign_state>\n</context>\n\n---\n\n${prompt}`
+      ? withPromptPrefix(
+          prompt,
+          `<context>\n<campaign_state>\n${suffix}\n</campaign_state>\n</context>\n\n---`,
+        )
       : prompt
     // NOTE: setAppendSystemPrompt is intentionally NOT called here.
     // The system prompt (resolved.systemPrompt = static S1-S6) stays frozen.
