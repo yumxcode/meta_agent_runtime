@@ -1,6 +1,7 @@
 /** CLI for the durable-graph-v2 Loop runtime. */
 import { access, constants as fsConstants, lstat, mkdir, readFile, readdir, rename, rm, stat, writeFile } from 'node:fs/promises'
 import { delimiter, join, resolve } from 'node:path'
+import { DEFAULT_READ_CONCURRENCY, mapWithConcurrency } from '../infra/persist/index.js'
 import type { ISubAgentDispatcher } from '../subagent/ISubAgentDispatcher.js'
 import type { ProviderId } from '../providers/registry.js'
 import {
@@ -630,13 +631,34 @@ function formatElapsed(ms: number): string {
   return `${Math.floor(minutes / 60)}h${minutes % 60}m`
 }
 
+/**
+ * Total on-disk size below `path`.
+ *
+ * Iterative with an explicit stack, and bounded fan-out per directory: the
+ * recursive `Promise.all(entries.map(recurse))` it replaces opened every file in
+ * a subtree simultaneously and nested one stack frame per directory level, so a
+ * `.loop/` with many instances could hit EMFILE or a stack overflow while merely
+ * printing `loop status`.
+ */
 async function filesystemSize(path: string): Promise<number> {
-  const info = await lstat(path).catch(() => null)
-  if (!info) return 0
-  if (!info.isDirectory() || info.isSymbolicLink()) return info.size
-  const entries = await readdir(path).catch(() => [])
-  const sizes = await Promise.all(entries.map(entry => filesystemSize(join(path, entry))))
-  return sizes.reduce((sum, size) => sum + size, 0)
+  let total = 0
+  const stack = [path]
+  while (stack.length > 0) {
+    const batch = stack.splice(0, DEFAULT_READ_CONCURRENCY)
+    const settled = await mapWithConcurrency(batch, DEFAULT_READ_CONCURRENCY, async current => {
+      const info = await lstat(current).catch(() => null)
+      if (!info) return { size: 0, children: [] as string[] }
+      if (!info.isDirectory() || info.isSymbolicLink()) return { size: info.size, children: [] }
+      const entries = await readdir(current).catch(() => [])
+      return { size: 0, children: entries.map(entry => join(current, entry)) }
+    })
+    for (const result of settled) {
+      if (result.status !== 'fulfilled') continue
+      total += result.value.size
+      stack.push(...result.value.children)
+    }
+  }
+  return total
 }
 
 async function countJsonFiles(path: string): Promise<number> {

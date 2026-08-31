@@ -76,8 +76,25 @@ export async function readJsonFile<T = unknown>(
   } catch (err) {
     // A missing file is normal and stays silent.
     if ((err as NodeJS.ErrnoException)?.code === 'ENOENT') return null
-    // Anything else is a real fault. Enumeration callers may opt out.
-    if (opts.tolerateUnreadable) {
+    // Anything else is a real fault. Enumeration callers may opt out — but NOT
+    // for descriptor exhaustion.
+    //
+    // `tolerateUnreadable` means "this RECORD is bad, skip it and keep going".
+    // EMFILE/ENFILE are not a property of the record: they are a property of the
+    // process, they hit every concurrent read in the same batch, and they clear
+    // up on their own. Reporting them as "no record" turns a transient resource
+    // spike into a confident wrong answer about the whole store — and the worst
+    // case is not cosmetic. GraphStore.listPreparedIntents() opens every commit
+    // intent on every tick; under EMFILE it would report an EMPTY prepared set,
+    // so recoverPrepared() silently skips crash recovery precisely when the
+    // system is under the pressure that makes crash recovery necessary. Worse,
+    // it is self-sustaining: unrecovered intents accumulate, which raises the
+    // fan-out, which makes the next EMFILE more likely.
+    //
+    // So resource exhaustion always throws. The caller retries or fails loudly;
+    // neither outcome is a silent data-loss report.
+    const code = (err as NodeJS.ErrnoException)?.code
+    if (opts.tolerateUnreadable && code !== 'EMFILE' && code !== 'ENFILE') {
       console.error(
         `[meta-agent] unreadable JSON at ${filePath}:`,
         err instanceof Error ? err.message : String(err),

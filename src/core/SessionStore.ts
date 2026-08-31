@@ -412,6 +412,56 @@ function startsWithOrphanToolResult(messages: readonly ConversationMessage[]): b
     .some(block => typeof block['tool_use_id'] === 'string' && !toolUseIds.has(block['tool_use_id']))
 }
 
+/**
+ * Synthesise tool_result blocks for any tool_use left unanswered at the END of
+ * a transcript.
+ *
+ * The producer side (KernelLoop.doneBeforeTools) now guarantees every exit
+ * between "assistant turn committed" and "tools ran" writes its own results, but
+ * transcripts recorded before that fix are already on disk and cannot be
+ * rewritten retroactively. Without this repair they are unresumable: the
+ * Messages API rejects a request whose tool_use has no following tool_result, so
+ * the first turn after `--resume` fails with a 400 and the session is lost for
+ * good.
+ *
+ * Repair rather than drop: the offending assistant message also carries the
+ * model's reasoning text, and discarding it would silently delete the very
+ * context the resume exists to recover. A synthetic error result is honest about
+ * what happened and keeps the protocol valid.
+ */
+function repairDanglingToolUse(messages: readonly ConversationMessage[]): ConversationMessage[] {
+  const answered = new Set<string>()
+  for (const message of messages) {
+    for (const block of contentBlocks(message)) {
+      if (block['type'] === 'tool_result' && typeof block['tool_use_id'] === 'string') {
+        answered.add(block['tool_use_id'])
+      }
+    }
+  }
+  const unanswered: string[] = []
+  for (const message of messages) {
+    for (const block of contentBlocks(message)) {
+      if (block['type'] === 'tool_use' && typeof block['id'] === 'string' && !answered.has(block['id'])) {
+        unanswered.push(block['id'])
+      }
+    }
+  }
+  if (unanswered.length === 0) return [...messages]
+  return [
+    ...messages,
+    {
+      role: 'user',
+      content: unanswered.map(id => ({
+        type: 'tool_result' as const,
+        tool_use_id: id,
+        content: 'This tool never ran: the previous session ended before executing it.',
+        is_error: true,
+      })),
+      isMeta: true,
+    } as ConversationMessage,
+  ]
+}
+
 function trimToSafeResumeBoundary(messages: readonly ConversationMessage[]): ConversationMessage[] {
   let start = 0
   while (start < messages.length) {
@@ -440,7 +490,7 @@ export function normalizeResumedHistory(
   // history into a single local summary.
   const cap = RuntimeEnv.resumeMaxMessages()
   if (parsed.length <= cap) {
-    return trimToSafeResumeBoundary(parsed)
+    return repairDanglingToolUse(trimToSafeResumeBoundary(parsed))
   }
 
   const recentLimit = cap - 1
@@ -449,7 +499,9 @@ export function normalizeResumedHistory(
   const omitted = parsed.slice(0, parsed.length - recentRaw.length + (recentRaw.length - recent.length))
   const summary = buildLocalResumeSummary(omitted, recent.length, parsed.length)
 
-  return summary ? [summary, ...recent] : recent
+  // Repair AFTER the head trim and the summary splice, so the dangling scan sees
+  // exactly the message list that will go on the wire.
+  return repairDanglingToolUse(summary ? [summary, ...recent] : recent)
 }
 
 async function readIndex(options: SessionStoreOptions = {}): Promise<SessionMeta[]> {

@@ -28,6 +28,7 @@ import { PasteAccumulator, BRACKETED_PASTE_ENABLE, BRACKETED_PASTE_DISABLE } fro
 import { sanitizeTerminalPreview, sanitizeTerminalText } from './terminalSanitizer.js'
 import { formatLocalClock, formatLocalTimestamp } from '../loop/localTime.js'
 import { disposeMcpClients } from '../tools/mcp/index.js'
+import { isSchedulerAlive, listSchedulers } from '../core/auto/SchedulerRegistry.js'
 import { getModelProtocol, resolveProvider } from '../providers/registry.js'
 import { loadModelConfig } from '../core/config/ConfigService.js'
 import {
@@ -1222,6 +1223,19 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     void (async () => {
       try {
         if (!opts.json) {
+          // "N items are waiting for review" is a promise that they will still be
+          // there next session — which is only true if they reached disk. When the
+          // pending store reports a failed write, say that instead of repeating a
+          // reassurance the queue can no longer keep.
+          const reviewHint = (
+            store: { persistenceDegradedReason?: string | null } | null | undefined,
+            hint: string,
+          ): string => {
+            const degraded = store?.persistenceDegradedReason
+            return degraded
+              ? red(`⚠️  未能写入磁盘（${degraded}）——这些条目只存在于内存中，退出后将丢失。`)
+              : dim(hint)
+          }
           // Show LLM-guided experience summary at session end (not per-turn).
           const pending = router.getPendingExperiences()
           const pendingCount = pending?.count ?? 0
@@ -1229,7 +1243,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
             await streamExperienceSummary(router, [...pending.list()])
             console.log(
               `${yellow(`⏸  ${pendingCount} 条经验待审核`)} — ` +
-              `${dim('下次在同一项目启动 robotics 模式后，可用 /experience review 继续审核。')}\n`,
+              `${reviewHint(pending, '下次在同一项目启动 robotics 模式后，可用 /experience review 继续审核。')}\n`,
             )
           }
           // Show pending physical anchor count (populated after dispose() extraction).
@@ -1240,7 +1254,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
           if (anchorCount > 0) {
             console.log(
               `${yellow(`⚓  ${anchorCount} 条物理锚点待审核`)} — ` +
-              `${dim('下次在同一项目启动 robotics 模式后，可用 /anchor review 审核提交。')}\n`,
+              `${reviewHint(pendingAnchors, '下次在同一项目启动 robotics 模式后，可用 /anchor review 审核提交。')}\n`,
             )
           }
           const pendingPrinciples = router.getPendingPrinciples()
@@ -1248,7 +1262,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
           if (principleCount > 0) {
             console.log(
               `${yellow(`⏸  ${principleCount} 条原则待审核`)} — ` +
-              `${dim('下次在同一项目启动 robotics 模式后，可用 /principle review 审核提交。')}\n`,
+              `${reviewHint(pendingPrinciples, '下次在同一项目启动 robotics 模式后，可用 /principle review 审核提交。')}\n`,
             )
           }
           // Memory is global (all modes). Surface tool-proposed memories queued
@@ -1749,15 +1763,48 @@ export async function runRepl(opts: CliOptions): Promise<void> {
         historyMessageCount: fencedHistoryCount,
       })
       if (!opts.json) {
+        // Only claim the wake WILL be serviced when a scheduler is actually
+        // running for this workspace. Otherwise the record just sits pending
+        // until staleWakeMs (7 days) retires it unexecuted — the failure mode
+        // SchedulerRegistry exists to detect, and which nothing was asking it
+        // about. The registry read is best-effort: a broken registry must not
+        // stop a park that already succeeded.
+        const workspace = resolve(opts.workspace ?? process.cwd())
+        const schedulerAlive = await listSchedulers()
+          .then(records => records.some(r =>
+            resolve(r.workspace) === workspace && isSchedulerAlive(r)))
+          .catch(() => true)
+        const when = new Date(record.fireAt).toLocaleString()
         console.log(
           `${yellow('⏲')} Auto wake armed: ${record.wakeId}\n` +
-          `${dim(`auto-scheduler 将在 ${new Date(record.fireAt).toLocaleString()} 后恢复同一会话。`)}\n`,
+          (schedulerAlive
+            ? `${dim(`auto-scheduler 将在 ${when} 后恢复同一会话。`)}\n`
+            : `${yellow(`   到期时间 ${when}，但本工作区当前没有运行中的 auto-scheduler。`)}\n` +
+              `${dim('   唤醒记录已持久化，启动调度器后会立刻被认领：')}\n` +
+              `   ${cyan(`meta-agent -w ${workspace} auto-scheduler`)}\n`),
         )
       }
-      exiting = true
       if (teamReminderTimer) clearInterval(teamReminderTimer)
-      rl.close()
-      break
+      // Exit explicitly instead of relying on rl.on('close').
+      //
+      // That handler is the only thing on this route that calls process.exit(0),
+      // and it opens with `if (exiting) return`. Setting `exiting = true` before
+      // rl.close() — as this path used to — was meant to skip the goodbye
+      // summary, but it skipped the exit with it. Control then fell out of the
+      // loop and off the end of runRepl with nothing left to terminate the
+      // process, so whether the CLI came back to the shell depended entirely on
+      // the event loop draining by itself.
+      //
+      // It usually did, which is what made this look fine. But stdio MCP servers
+      // are long-lived child processes that outlive the CLI unless explicitly
+      // killed (see disposeAndExit), so with one configured the terminal simply
+      // hung after parking: no output, no prompt, nothing to interrupt.
+      //
+      // router.dispose() already ran above; mirror the rest of disposeAndExit.
+      exiting = true
+      try { disposeMcpClients() } catch { /* best-effort */ }
+      try { rl.close() } catch { /* best-effort */ }
+      process.exit(0)
     }
 
     // Fire-and-forget: generate (new sessions) or persist (carried titles).

@@ -560,6 +560,7 @@ export class AutoWorktreeCoordinator {
           const rollbackError = await this._rollbackMainTransaction(
             record.preMergeHead,
             record.stashCommit,
+            { crashRecovery: true },
           )
           await this._updateRecord(record, {
             phase: rollbackError ? 'failed' : 'conflicted',
@@ -635,16 +636,61 @@ export class AutoWorktreeCoordinator {
     return result.orphansRemoved
   }
 
+  /**
+   * Roll the MAIN worktree back to a recorded pre-merge commit.
+   *
+   * `crashRecovery` separates two situations that used to share this code and
+   * must not:
+   *
+   *   • in-transaction (default) — `_finalizeUnlocked` is unwinding a merge it
+   *     started moments ago. HEAD is known, the pre-merge tree is already
+   *     stashed, and `reset --hard` + `clean -fd` remove only what this merge
+   *     itself produced. Destructive by design, and correct.
+   *
+   *   • crashRecovery — `reconcile()` found a `merging` record left by a process
+   *     that died, possibly days ago, and runs on EVERY agentic/auto session
+   *     start. Here `preMergeHead` is a claim about the past, not a fact about
+   *     now: the user may have finished the merge by hand and committed on top,
+   *     and `reset --hard` would delete those commits while `clean -fd` deleted
+   *     every untracked file created since. That is silent loss of the user's
+   *     own work, triggered by merely launching the tool.
+   *
+   * Crash recovery therefore rolls back only while that claim is still checkable:
+   * when HEAD is exactly `preMergeHead`, nothing has been committed since, so a
+   * reset destroys no history. Once HEAD has moved the two cases are
+   * indistinguishable from git alone — a squash commit this transaction made
+   * moments before dying looks identical to a commit the user made afterwards —
+   * so recovery keeps the commits and finishes the rest of the transaction
+   * instead. That is not a degraded outcome: if the commit was ours the merge
+   * genuinely succeeded and belongs in HEAD; if it was the user's it is the only
+   * copy. Either way the stash still gets restored, so the interrupted
+   * transaction ends in a consistent state rather than being abandoned.
+   *
+   * `clean -fd` is likewise in-transaction only. There it removes what the merge
+   * produced; on the crash path the untracked files are the user's.
+   */
   private async _rollbackMainTransaction(
     preMergeHead: string,
     stashCommit?: string,
+    opts?: { crashRecovery?: boolean },
   ): Promise<string | undefined> {
     try {
+      const headMoved = opts?.crashRecovery
+        ? (await this._git(['rev-parse', 'HEAD'])) !== preMergeHead
+        : false
       await this._git(['merge', '--abort']).catch(() => undefined)
-      await this._git(['reset', '--hard', preMergeHead])
-      await this._git(['clean', '-fd', '--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**'])
+      if (!headMoved) {
+        await this._git(['reset', '--hard', preMergeHead])
+      }
+      if (!opts?.crashRecovery) {
+        await this._git(['clean', '-fd', '--', '.', ':(exclude).meta-agent/**', ':(exclude).loop/**'])
+      }
       if (stashCommit) {
+        // `--index` cannot restore a staged state onto a tree that has moved on;
+        // fall back to a plain apply so the user's pre-crash content is still
+        // recovered, just unstaged.
         await this._git(['stash', 'apply', '--index', stashCommit])
+          .catch(() => this._git(['stash', 'apply', stashCommit]))
       }
       return undefined
     } catch (err) {

@@ -333,10 +333,20 @@ export interface GraphExternalEventRecord {
   name: string
   correlation?: JsonValue
   payload?: JsonValue
-  status: 'pending' | 'consumed'
+  /**
+   * `expired` is terminal like `consumed`, but records that nothing ever matched
+   * this delivery. Without it a never-matched event stays `pending` forever:
+   * checkpoint retention keeps every pending event unconditionally, and both
+   * resumePendingExternalEvents() passes per tick rescan and structurally
+   * compare all of them — so an unmatchable event (late past its Wait deadline,
+   * wrong correlation, cancelled target) is a permanent, silent tax on tick cost.
+   */
+  status: 'pending' | 'consumed' | 'expired'
   createdAt: number
   consumedAt?: number
   consumedBy?: string[]
+  /** When a `pending` event aged out without ever matching an Activation. */
+  expiredAt?: number
 }
 
 export interface GraphExternalEventInput {
@@ -419,6 +429,17 @@ export type GraphJournalEvent =
       at: number
       externalEvent: GraphExternalEventRecord
       activations: ActivationRecord[]
+    }
+  | {
+      /**
+       * A pending delivery aged out without ever matching an Activation. Journaled
+       * rather than swept silently: "the event arrived but nobody was waiting for
+       * it" is exactly the kind of thing an operator debugging a webhook needs to
+       * see in the audit trail.
+       */
+      type: 'external_event_expired'
+      at: number
+      externalEvent: GraphExternalEventRecord
     }
 
 export interface SequencedGraphJournalEvent {

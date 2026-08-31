@@ -38,6 +38,7 @@
 
 import { mkdirSync } from 'node:fs'
 import { red, yellow, terminalText, installBrokenPipeGuards } from './term.js'
+import { disposeMcpClients } from '../tools/mcp/index.js'
 import { parseCliArgs } from './args.js'
 import { sanitizeEnvKeys, assertApiKeyConfigured } from './keys.js'
 import { getMissingBwrapWarning } from './bwrapCheck.js'
@@ -154,6 +155,13 @@ async function main(): Promise<void> {
     }
   } finally {
     await mcpAppsHost?.close()
+    // Every command above has finished by the time we get here, so nothing still
+    // needs an MCP server. Stdio servers are long-lived child processes: without
+    // an explicit kill they keep the parent's event loop populated, and a CLI
+    // that returns normally then never gets its terminal back. Only the REPL's
+    // signal path used to do this, so the one-shot routes could hang on exit for
+    // reasons entirely invisible from the transcript.
+    try { disposeMcpClients() } catch { /* best-effort */ }
   }
 }
 

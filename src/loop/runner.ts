@@ -209,6 +209,14 @@ function isGraphLevelWake(activationId: string): boolean {
 }
 
 function isDeterministicGraphError(error: unknown): boolean {
+  // GraphKernel.tick wraps a wave's kernel failures in an AggregateError whose
+  // own message is only a count ("graph tick finished with N kernel failures").
+  // Matching against that string classified every such tick as transient, so a
+  // deterministic invariant violation inside — "cannot commit from succeeded",
+  // a capability mismatch — burned all MAX_WAKE_ATTEMPTS on pointless retries
+  // and then filed the instance as `paused` with "inspect infrastructure",
+  // pointing the operator away from the graph, which is where the fault is.
+  if (error instanceof AggregateError) return error.errors.some(isDeterministicGraphError)
   if (error instanceof ExprError) return true
   // A stack overflow while parsing/evaluating a graph is a property of the
   // GRAPH, not of the host: retrying it with backoff burns MAX_WAKE_ATTEMPTS

@@ -232,15 +232,43 @@ async function runDriftAgent(
   const MAX_WAIT_MS = limits.maxDurationMs + 60_000
   const deadline = Date.now() + MAX_WAIT_MS
   let latest = rec
-  while (!TERMINAL_STATUSES.has(latest.status)) {
-    if (signal.aborted || Date.now() > deadline) break
-    await new Promise(r => setTimeout(r, POLL_MS))
-    const polled = await dispatcher.getStatus(rec.taskId)
-    if (!polled) break
-    latest = polled
+  try {
+    while (!TERMINAL_STATUSES.has(latest.status)) {
+      if (signal.aborted || Date.now() > deadline) break
+      await sleep(POLL_MS, signal)
+      const polled = await dispatcher.getStatus(rec.taskId)
+      if (!polled) break
+      latest = polled
+    }
+    if (latest.status !== 'completed') return undefined
+    return parseFromVerdictChannels(latest, parseDriftVerdict)
+  } finally {
+    // Same reasoning as the verify judge: the comment above already says that
+    // reaching this deadline means the sub-agent's own timer failed, so waiting
+    // longer is pointless — but so is walking away from a runner nothing else
+    // will stop. Abandoning it leaks the seat and its budget, and the gate's
+    // retry then adds a second one beside it.
+    if (!TERMINAL_STATUSES.has(latest.status)) {
+      await dispatcher
+        .cancelTask(rec.taskId, 'drift agent exceeded the gate deadline')
+        .catch(() => undefined)
+    }
   }
-  if (latest.status !== 'completed') return undefined
-  return parseFromVerdictChannels(latest, parseDriftVerdict)
+}
+
+/** Abortable poll delay — an interrupted run should not wait out a full tick. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms)
+    timer.unref?.()
+    function done(): void {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    signal.addEventListener('abort', done, { once: true })
+  })
 }
 
 /** Build the drift gate for an auto session. Skips are handled by KernelLoop policy. */

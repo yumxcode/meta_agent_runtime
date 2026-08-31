@@ -51,6 +51,39 @@
 export const DEFAULT_AUTO_SESSION_BUDGET_USD = 300
 
 /**
+ * Wall-clock allowance for ONE unattended auto run — i.e. one `submitMessage`,
+ * not one session. Whichever of this and {@link DEFAULT_AUTO_MAX_TOOL_BATCHES}
+ * is reached first ends the run, checkpointed and resumable.
+ *
+ * It measures the wall clock, so everything the run does counts: model
+ * streaming, tool execution (a simulation or test suite can dominate here),
+ * sub-agents, and the verify/drift gates.
+ *
+ * Raised from 2h to 5h. Two hours was too short for the workloads this mode is
+ * actually pointed at — engineering and robotics loops where a single tool call
+ * is a build or a simulation sweep — and hitting it cost a round trip through
+ * the operator every time. The ceiling exists to bound an UNATTENDED run, not to
+ * pace a supervised one, and the session USD budget is the real backstop: it is
+ * cumulative across resume, so raising a per-run ceiling that resets anyway
+ * never widens total spend, it only removes a checkpoint the user had to babysit.
+ *
+ * Override per run with `META_AGENT_AUTO_MAX_RUNTIME_MIN` (minutes, 1..1440).
+ */
+export const DEFAULT_AUTO_MAX_RUNTIME_MS = 5 * 60 * 60 * 1000
+
+/**
+ * Completed-tool-batch allowance for one unattended auto run.
+ *
+ * Kept proportional to the wall clock above: raising only the clock would have
+ * moved the wall rather than removed it, stopping the same runs at the same
+ * point under a different name. Sized off the observed rate (~100 batches in the
+ * old 2h window) with headroom.
+ *
+ * Override with `META_AGENT_AUTO_MAX_TOOL_BATCHES`.
+ */
+export const DEFAULT_AUTO_MAX_TOOL_BATCHES = 750
+
+/**
  * Ceiling for the sub-agent POOL managed by one SubAgentBridge, when no session
  * ledger owns the budget. Sits below the session ceiling so the main loop keeps
  * a reserve even if children exhaust the pool.

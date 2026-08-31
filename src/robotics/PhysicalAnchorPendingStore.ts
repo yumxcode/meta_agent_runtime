@@ -1,9 +1,9 @@
 import { createHash } from 'crypto'
-import { readFile, rm } from 'fs/promises'
+import { readFile } from 'fs/promises'
 import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
-import { atomicWriteJson } from '../infra/persist/index.js'
+import { PendingSnapshotWriter } from './pendingPersistence.js'
 import type { PhysicalAnchorStore } from './PhysicalAnchorStore.js'
 import {
   KNOWLEDGE_CONFIDENCE_TIERS,
@@ -26,12 +26,27 @@ export interface PendingPhysicalAnchor {
 export class PhysicalAnchorPendingStore {
   private readonly _pending: PendingPhysicalAnchor[] = []
   private readonly _filePath: string | null
+  private readonly _writer: PendingSnapshotWriter<PendingPhysicalAnchor>
   private _persistTail: Promise<void> = Promise.resolve()
 
   constructor(projectDir?: string, root = PENDING_ROOT) {
     this._filePath = projectDir
       ? join(root, `${createHash('sha256').update(projectDir).digest('hex').slice(0, 16)}.json`)
       : null
+    this._writer = new PendingSnapshotWriter(
+      this._filePath, MAX_PENDING_ENTRIES, 'anchor-pending', isPendingPhysicalAnchor,
+    )
+  }
+
+  /**
+   * Non-null when the queue could not be written to disk.
+   *
+   * The CLI's exit summary promises the user their pending items will be there
+   * next session; if persistence is degraded that promise is false and the
+   * summary has to say so instead.
+   */
+  get persistenceDegradedReason(): string | null {
+    return this._writer.degradedReason
   }
 
   async load(): Promise<void> {
@@ -44,6 +59,9 @@ export class PhysicalAnchorPendingStore {
       for (const item of parsed) {
         if (isPendingPhysicalAnchor(item)) this._pending.push(item)
       }
+      // Everything we loaded is ours to govern; anything that appears on disk
+      // later belongs to another writer and must survive our merges.
+      this._writer.observe(this._pending)
       this._trimToLimit()
     } catch {
       // Missing or malformed pending file: start empty.
@@ -56,6 +74,7 @@ export class PhysicalAnchorPendingStore {
     }
     const pendingId = `pa_pending_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 7)}`
     this._pending.push({ pendingId, proposedAt: Date.now(), input })
+    this._writer.observeId(pendingId)
     this._persistSoon()
     return pendingId
   }
@@ -101,10 +120,11 @@ export class PhysicalAnchorPendingStore {
       proposedAt: item.proposedAt,
       input: { ...item.input },
     }))
+    // The writer records its own failures (and warns once), so the tail only
+    // needs to stay unbroken — it must never swallow a fault silently again.
     this._persistTail = this._persistTail
       .catch(() => {})
-      .then(() => this._persist(snapshot))
-      .catch(() => {})
+      .then(() => this._writer.persist(snapshot))
   }
 
   private _trimToLimit(): void {
@@ -113,14 +133,6 @@ export class PhysicalAnchorPendingStore {
     this._persistSoon()
   }
 
-  private async _persist(snapshot: PendingPhysicalAnchor[]): Promise<void> {
-    if (!this._filePath) return
-    if (snapshot.length === 0) {
-      await rm(this._filePath, { force: true }).catch(() => undefined)
-      return
-    }
-    await atomicWriteJson(this._filePath, snapshot)
-  }
 }
 
 type NormalizedPhysicalAnchorInput = {

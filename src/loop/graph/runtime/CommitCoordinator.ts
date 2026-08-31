@@ -316,16 +316,37 @@ export class CommitCoordinator {
         })
         .sort((a, b) => b.updatedAt - a.updatedAt || b.id.localeCompare(a.id))[0]
       if (!activation) throw new Error('paused graph has no resumable paused Terminal')
-      const decision = await withTimeout(decideTransition({
-        graph: this.graph,
-        activation,
-        outcome: 'resume',
-        output: activation.output ?? activation.terminalResult ?? activation.input,
-        state: snapshot.state,
-        functions: this.functions,
-        reducers: this.reducers,
-        now,
-      }), TRANSITION_EVALUATION_TIMEOUT_MS, 'paused-terminal transition evaluation')
+      // Same hazard commit() guards against, and for the same reason: this runs
+      // reducer/function plugin code. Letting a throw escape the transaction
+      // leaves the instance paused with no state change, so every subsequent
+      // `loop resume` replays the identical throw — the graph can never be
+      // resumed again. Turn it into a durable `failed` status instead, which is
+      // inspectable and terminal rather than an infinite retry.
+      let decision: Awaited<ReturnType<typeof decideTransition>>
+      try {
+        decision = await withTimeout(decideTransition({
+          graph: this.graph,
+          activation,
+          outcome: 'resume',
+          output: activation.output ?? activation.terminalResult ?? activation.input,
+          state: snapshot.state,
+          functions: this.functions,
+          reducers: this.reducers,
+          now,
+        }), TRANSITION_EVALUATION_TIMEOUT_MS, 'paused-terminal transition evaluation')
+      } catch (error) {
+        const reason =
+          `paused-terminal resume transition failed for node '${activation.nodeId}': ${message(error)}`
+        const failed: GraphInstanceRecord = {
+          ...snapshot.instance,
+          status: 'failed',
+          statusReason: reason,
+          updatedAt: now,
+        }
+        await this.store.appendEventLocked({ type: 'graph_status_changed', at: now, instance: failed })
+        await this.store.writeInstanceProjectionLocked(failed)
+        return { spawned: [], instance: failed }
+      }
       const resumedActivation: ActivationRecord = { ...activation, resumedAt: now, updatedAt: now }
       const totalLimit = this.graph.limits.maxTotalActivations ?? this.graph.limits.maxActivations
       const projectedTotal = snapshot.instance.activationCount + decision.spawned.length
@@ -395,7 +416,10 @@ export class CommitCoordinator {
         await this.store.appendEventLocked({ type: 'external_event_recorded', at: now, externalEvent: event })
         await this.store.writeExternalEventProjectionLocked(event)
       }
-      if (event.status === 'consumed') return { event, resumed: [], duplicate }
+      // Both terminal statuses stop here. `expired` matters as much as
+      // `consumed`: a redelivery of an event we already retired must not quietly
+      // resurrect it into the pending set the sweep just drained.
+      if (event.status === 'consumed' || event.status === 'expired') return { event, resumed: [], duplicate }
       // A redelivery may be the call that repairs a crash between accepting a
       // pending event and consuming it. Re-run matching without creating a
       // second inbox record.
@@ -441,6 +465,38 @@ export class CommitCoordinator {
         resumed.push(...activations)
       }
       return resumed
+    })
+  }
+
+  /**
+   * Retire pending deliveries that can no longer match anything.
+   *
+   * `matchingEventActivations` only accepts an event whose `createdAt` precedes
+   * the waiting Activation's `wakeAt`, so a delivery that arrives after its Wait
+   * timed out is unmatchable the moment it lands — as is one whose correlation
+   * never had a listener, or whose target was cancelled. Those records used to
+   * stay `pending` forever, and pending was the one status checkpoint retention
+   * never dropped. The result was a monotonically growing set that
+   * resumePendingExternalEvents() rescanned twice per tick, canonicalising up to
+   * 1 MB of JSON per comparison: a long-lived instance got permanently slower for
+   * events that could never do anything.
+   *
+   * Expiry is journaled rather than swept quietly, because "the webhook arrived
+   * and nothing was listening" is a diagnosis an operator needs, not noise.
+   */
+  async expireStaleExternalEvents(now = Date.now()): Promise<GraphExternalEventRecord[]> {
+    return this.store.withTransaction(async () => {
+      const snapshot = await this.store.authoritativeSnapshotLocked()
+      const horizon = now - EXTERNAL_EVENT_PENDING_TTL_MS
+      const expired: GraphExternalEventRecord[] = []
+      for (const event of snapshot.externalEvents.values()) {
+        if (event.status !== 'pending' || event.createdAt > horizon) continue
+        const record: GraphExternalEventRecord = { ...event, status: 'expired', expiredAt: now }
+        await this.store.appendEventLocked({ type: 'external_event_expired', at: now, externalEvent: record })
+        await this.store.writeExternalEventProjectionLocked(record)
+        expired.push(record)
+      }
+      return expired
     })
   }
 
@@ -787,6 +843,14 @@ const MAX_AGENT_SERIALIZABLE_REPLAYS = 5
 const MAX_SERIALIZABLE_REPLAYS = 50
 const MAX_EXTERNAL_EVENT_BYTES = 1024 * 1024
 const MAX_EXTERNAL_EVENT_DEPTH = 64
+/**
+ * How long an unmatched delivery stays eligible to resume an Activation.
+ *
+ * Matched to the webhook-redelivery horizon used for consumed-event dedup
+ * (GraphStore.EXTERNAL_EVENT_RETENTION_MS): a delivery that has found no
+ * listener in a week is not going to, and keeping it only slows every tick.
+ */
+const EXTERNAL_EVENT_PENDING_TTL_MS = 7 * 24 * 60 * 60_000
 const TRANSITION_EVALUATION_TIMEOUT_MS = 30_000
 
 function countLiveActivations(activations: Iterable<ActivationRecord>): number {

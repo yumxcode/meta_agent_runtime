@@ -16,6 +16,7 @@ import { sanitizeTerminalText } from './terminalSanitizer.js'
 import { getModelProtocol } from '../providers/registry.js'
 import { renderPromptContent, sessionPromptPreview } from './transcript.js'
 import { dim, bold, cyan, gray, green, red, yellow, safeStdoutWrite, terminalText } from './term.js'
+import { terminationLabel } from './termination.js'
 
 // ── Experience summary side-call ──────────────────────────────────────────────
 //
@@ -155,17 +156,16 @@ const TERMINATION_DIAGNOSIS_SYSTEM = `你是一个自主 Agent 运行的"终态�
 
 具体、克制，不要空话，不要复述本提示或原始数据。总长控制在 200 字以内。`
 
-/** Human-readable label for a non-success result subtype, used in the diagnosis prompt. */
+/**
+ * Human-readable label for a non-success result subtype.
+ *
+ * @deprecated Superseded by `terminationLabel` in ./termination.js, which also
+ * takes `stopReason`. Subtype alone cannot distinguish the ten reasons
+ * KernelSession folds into `error_during_execution`, so this could only ever
+ * return the "可能是…或…" hedge below. Kept as a thin shim for external callers.
+ */
 export function terminationReasonLabel(subtype: string): string {
-  switch (subtype) {
-    case 'error_max_turns':      return '达到最大步数上限（max_turns）'
-    case 'error_max_budget_usd': return '超出预算/费用上限（max_budget）'
-    case 'error_max_output_tokens': return '模型输出达到上限（max_output_tokens）'
-    case 'error_blocking_limit': return '达到阻塞操作上限（blocking_limit）'
-    case 'error_during_execution':
-      return '执行中止（可能是无进展死循环、verify 未通过、被外部依赖阻塞，或运行时错误）'
-    default: return subtype
-  }
+  return terminationLabel({ subtype })
 }
 
 /**
@@ -175,7 +175,19 @@ export function terminationReasonLabel(subtype: string): string {
  */
 export async function analyzeAbnormalTermination(
   router: SessionRouter,
-  opts: { goal: string; subtype: string; recentText: string; toolTrail: string[] },
+  opts: {
+    goal: string
+    subtype: string
+    /**
+     * Precise `LoopTerminationReason`. The subtype alone folds ten reasons into
+     * `error_during_execution`, so without this the prompt asked the model to
+     * guess between "无进展死循环 / verify 未通过 / 被外部依赖阻塞 / 运行时错误"
+     * — a distinction the runtime had already made and then discarded.
+     */
+    stopReason?: string | null
+    recentText: string
+    toolTrail: string[]
+  },
 ): Promise<string | null> {
   try {
     const { apiKey, baseURL, flashModel } = router.getProviderConfig()
@@ -185,7 +197,7 @@ export async function analyzeAbnormalTermination(
     const recent = opts.recentText.trim() ? opts.recentText.slice(-4000) : '（无可见输出）'
     const userMessage =
       `【原始目标】\n${opts.goal.slice(0, 2000)}\n\n` +
-      `【终止原因】\n${terminationReasonLabel(opts.subtype)}\n\n` +
+      `【终止原因】\n${terminationLabel({ subtype: opts.subtype, stopReason: opts.stopReason })}\n\n` +
       `【Agent 最近输出（截断）】\n${recent}\n\n` +
       `【最近工具调用轨迹（截断）】\n${trail}`
 

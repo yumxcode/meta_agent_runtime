@@ -148,6 +148,9 @@ export class GraphKernel {
     if (isTerminal(snapshot.instance)) return { ...emptyResult(snapshot.instance), recovered: recoveredResults.length }
 
     await this.options.store.releaseExpiredClaims(now)
+    // Retire deliveries that can no longer match anything, BEFORE the scan that
+    // would otherwise keep paying for them (see expireStaleExternalEvents).
+    await this.coordinator.expireStaleExternalEvents(now)
     // An event created before a wait deadline wins even when this tick runs
     // after both timestamps. Event matching enforces createdAt < wakeAt.
     await this.coordinator.resumePendingExternalEvents(now)
@@ -178,8 +181,19 @@ export class GraphKernel {
     let retried = 0
     let blocked = 0
     let failed = 0
+    // One snapshot for the whole wave, not one per claim.
+    //
+    // These Activations were all claimed by the same claimReady transaction, so
+    // they were all admitted against the same State — taking a fresh snapshot
+    // inside the map produced N copies of that identical view while costing N
+    // acquisitions of the global transaction lock, each replaying the journal
+    // tail. That lock is also held by commit() for up to
+    // TRANSITION_EVALUATION_TIMEOUT_MS and is contended by every running
+    // Activation's heartbeat, so the redundant traffic did not merely waste
+    // I/O: it pushed heartbeats toward their failure tolerance, and a heartbeat
+    // that gives up discards a whole finished Agent segment and burns an attempt.
+    const live = await this.options.store.snapshot()
     const results = await Promise.allSettled(claims.map(async activation => {
-      const live = await this.options.store.snapshot()
       let result: NodeExecutionResult
       try {
         result = await this.executeWithHeartbeat(activation, signal => this.executor.execute(activation, live, signal))

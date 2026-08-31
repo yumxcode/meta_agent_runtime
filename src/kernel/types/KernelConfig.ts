@@ -245,13 +245,20 @@ export interface KernelConfig {
    */
   autonomousMode?: boolean
 
-  /** Auto-mode wall-clock allowance per process run. Defaults to 2 hours. */
+  /**
+   * Auto-mode wall-clock allowance for ONE run (one `submitMessage`), not one
+   * session — the clock restarts on every submission, including a scheduler
+   * wake. Defaults to {@link DEFAULT_AUTO_MAX_RUNTIME_MS} (5 hours); override
+   * per run with `META_AGENT_AUTO_MAX_RUNTIME_MIN`.
+   */
   autoMaxRuntimeMs?: number
 
   /**
-   * Auto-mode completed tool-batch allowance per process run. Defaults to 300.
-   * Works alongside the wall-clock (`autoMaxRuntimeMs`); whichever limit is hit
-   * first ends the run (with a checkpoint, so it can resume). Set 0 to disable.
+   * Auto-mode completed tool-batch allowance for one run. Defaults to
+   * {@link DEFAULT_AUTO_MAX_TOOL_BATCHES} (750); override with
+   * `META_AGENT_AUTO_MAX_TOOL_BATCHES`. Works alongside the wall-clock
+   * (`autoMaxRuntimeMs`); whichever limit is hit first ends the run (with a
+   * checkpoint, so it can resume). Set 0 to disable.
    */
   autoMaxToolBatches?: number
 

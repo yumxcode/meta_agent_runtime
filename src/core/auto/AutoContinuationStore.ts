@@ -11,8 +11,10 @@ import { join, resolve } from 'path'
 import {
   atomicWriteJson,
   deleteJsonFile,
+  DEFAULT_READ_CONCURRENCY,
   ensureDir,
   listJsonIds,
+  mapWithConcurrency,
   readJsonFile,
   withFileLock,
 } from '../../infra/persist/index.js'
@@ -522,11 +524,18 @@ export class AutoContinuationStore {
     // Enumeration: one unreadable record must not fail the whole listing —
     // the scheduler would then service nothing at all. Single-record reads in
     // this store deliberately keep the throwing default (B1).
-    const values = await Promise.all(ids.map(id =>
-      readJsonFile<AutoContinuationRecord>(join(this.dir, `${id}.json`), { tolerateUnreadable: true })))
-    return values
-      .filter(isAutoContinuationRecord)
-      .sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)
+    // Bounded fan-out: AutoScheduler lists on every poll (and again per
+    // hasLiveWork check), so an unbounded map turns a large queue into an EMFILE.
+    const settled = await mapWithConcurrency(ids, DEFAULT_READ_CONCURRENCY, id =>
+      readJsonFile<AutoContinuationRecord>(join(this.dir, `${id}.json`), { tolerateUnreadable: true }))
+    const values: AutoContinuationRecord[] = []
+    for (const result of settled) {
+      // Descriptor exhaustion is not "no record" — see readJsonFile. Reporting
+      // an empty queue would make the scheduler believe there is nothing to do.
+      if (result.status === 'rejected') throw result.reason
+      if (isAutoContinuationRecord(result.value)) values.push(result.value)
+    }
+    return values.sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)
   }
 }
 

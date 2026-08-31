@@ -19,8 +19,10 @@ import { join, resolve } from 'path'
 import {
   atomicWriteJson,
   deleteJsonFile,
+  DEFAULT_READ_CONCURRENCY,
   ensureDir,
   listJsonIds,
+  mapWithConcurrency,
   readJsonFile,
   withFileLock,
 } from '../../infra/persist/index.js'
@@ -153,10 +155,17 @@ export class WakeStore {
 
   private async listUnlocked(): Promise<WakeRecord[]> {
     const ids = await listJsonIds(this.dir)
-    const records = await Promise.all(ids.map(id => readJsonFile<WakeRecord>(this.pathFor(id), { tolerateUnreadable: true })))
-    return records
-      .filter((r): r is WakeRecord => r !== null)
-      .sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)
+    // Bounded fan-out: this runs on every scheduler poll and the wake directory
+    // retains terminal records until `loop gc`, so an unbounded map opens the
+    // whole backlog at once.
+    const settled = await mapWithConcurrency(ids, DEFAULT_READ_CONCURRENCY, id =>
+      readJsonFile<WakeRecord>(this.pathFor(id), { tolerateUnreadable: true }))
+    const records: WakeRecord[] = []
+    for (const result of settled) {
+      if (result.status === 'rejected') throw result.reason
+      if (result.value) records.push(result.value)
+    }
+    return records.sort((a, b) => a.fireAt - b.fireAt || a.createdAt - b.createdAt)
   }
 
   /**

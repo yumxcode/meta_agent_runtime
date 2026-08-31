@@ -60,6 +60,18 @@ export interface AutoSchedulerOptions {
 /** Why `run()` returned. */
 export type AutoSchedulerExitReason = 'aborted' | 'idle'
 
+/** Claim-lease renewal cadence, against AutoContinuationStore's 10min TTL. */
+const HEARTBEAT_INTERVAL_MS = 30_000
+/**
+ * Consecutive heartbeat I/O failures tolerated before the claim is abandoned.
+ *
+ * A rejected heartbeat is not evidence the claim was lost — the queue lock is
+ * contended by every poll — so a single failure must not discard an in-flight
+ * turn. Three misses against a 30s beat is 90s of sustained failure, well past
+ * anything transient, and still far inside the 10min lease TTL.
+ */
+const HEARTBEAT_FAILURE_TOLERANCE = 3
+
 export type AutoResumeOutcome = 'done' | 'cancelled'
 export type AutoResumeHandler = (
   record: AutoContinuationRecord,
@@ -230,15 +242,50 @@ export class AutoScheduler {
     parentSignal?: AbortSignal,
   ): Promise<void> {
     const token = record.claim?.token
-    if (!token) return
+    if (!token) {
+      // A claimed record with no token cannot be released by us; it stays
+      // `claimed` until reconcileOrphans times its lease out. Silent before —
+      // say so, because from the outside this looks like a wake that vanished.
+      this.options.onEvent?.(
+        `[auto-scheduler] skipped ${record.sessionId} (${record.wakeId}): claimed record carries no token; ` +
+        'it will be reclaimed when its lease expires.',
+      )
+      return
+    }
     const controller = new AbortController()
     const onAbort = () => controller.abort(parentSignal?.reason)
     parentSignal?.addEventListener('abort', onAbort, { once: true })
+    // The heartbeat MUST NOT produce an unhandled rejection: the CLI installs
+    // `process.once('unhandledRejection', … disposeAndExit(1))`, so one transient
+    // lock timeout inside this timer would take down the whole unattended run.
+    //
+    // store.heartbeat() rejects for real reasons — withFileLock times out after
+    // 10s and the queue lock is also taken every poll by reconcileOrphans and
+    // claimDue — so this is contention, not an exotic failure. It is therefore
+    // handled the same way GraphKernel.executeWithHeartbeat handles it: a
+    // definitive "not owned" answer is authoritative and discards the claim
+    // immediately, while I/O failures only do so after repeated consecutive
+    // misses. `inFlight` keeps a slow beat from stacking up behind itself.
+    let consecutiveFailures = 0
+    let inFlight = false
     const heartbeat = setInterval(() => {
-      void this.store.heartbeat(record.wakeId, token).then(owned => {
-        if (!owned) controller.abort('auto continuation claim lost')
-      })
-    }, 30_000)
+      if (inFlight) return
+      inFlight = true
+      void this.store.heartbeat(record.wakeId, token).then(
+        owned => {
+          if (!owned) controller.abort('auto continuation claim lost')
+          else consecutiveFailures = 0
+        },
+        error => {
+          if (++consecutiveFailures >= HEARTBEAT_FAILURE_TOLERANCE) {
+            controller.abort(
+              `auto continuation heartbeat failed ${consecutiveFailures} times: ` +
+              `${error instanceof Error ? error.message : String(error)}`,
+            )
+          }
+        },
+      ).finally(() => { inFlight = false })
+    }, HEARTBEAT_INTERVAL_MS)
     heartbeat.unref?.()
     try {
       this.options.onEvent?.(

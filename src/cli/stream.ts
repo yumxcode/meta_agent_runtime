@@ -21,7 +21,13 @@ import { formatLocalClock } from '../loop/localTime.js'
 import type { MetaAgentEvent, MetaAgentResultEvent } from '../core/types.js'
 import { isAutonomousMode } from '../core/modes.js'
 import type { SessionMode } from '../core/modes.js'
-import { analyzeAbnormalTermination, terminationReasonLabel } from './sideCalls.js'
+import { analyzeAbnormalTermination } from './sideCalls.js'
+import {
+  classifyTermination,
+  resumeCommand,
+  terminationLabel,
+  warrantsTerminationDiagnosis,
+} from './termination.js'
 import {
   c, bold, cyan, dim, gray, green, red, yellow, isTTY, terminalText, abortError,
   safeStdoutWrite, setActiveThinkingMeter, pauseActiveThinkingMeter,
@@ -249,12 +255,12 @@ export async function streamPrompt(
         // bare reason code on abnormal exit. Emit a follow-up diagnosis event so
         // they receive the same LLM analysis a human would see.
         if (
-          event.type === 'result' && event.isError &&
+          event.type === 'result' && warrantsTerminationDiagnosis(event) &&
           isAutonomousMode(router.mode)
         ) {
           const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
             goal: promptTextOf(prompt), subtype: event.subtype,
-            recentText: recentAgentText, toolTrail: recentToolTrail,
+            stopReason: event.stopReason, recentText: recentAgentText, toolTrail: recentToolTrail,
           }) : null
           if (analysis) {
             console.log(JSON.stringify({
@@ -357,7 +363,31 @@ export async function streamPrompt(
           if (hasText) await safeStdoutWrite('\n')
           // Show explicit warnings for non-success result subtypes so the user
           // is never silently left wondering why the agent stopped.
-          if (event.subtype === 'error_max_turns') {
+          //
+          // Classify on stopReason, not subtype: KernelSession folds ten distinct
+          // termination reasons into `error_during_execution`, so branching on
+          // the subtype announced "执行过程中发生错误" for a planned, checkpointed
+          // wall-clock suspension — and for a Ctrl+C. See cli/termination.ts.
+          const terminationClass = classifyTermination(event)
+          if (terminationClass === 'suspended') {
+            // The run did everything right and saved its work. The only useful
+            // next step is resuming it, so print the command rather than the
+            // generic "adjust your instructions and retry".
+            const raiseHint = event.stopReason === 'auto_runtime_limit'
+              ? '   下次想跑更久：META_AGENT_AUTO_MAX_RUNTIME_MIN=<分钟>'
+              : '   下次想跑更多步：META_AGENT_AUTO_MAX_TOOL_BATCHES=<批次数>'
+            await safeStdoutWrite(
+              `\n${yellow('⏸')}  ${yellow(terminationLabel(event))}\n` +
+              `${dim('   进度已检查点保存，继续执行：')}\n` +
+              `   ${cyan(resumeCommand(event.sessionId, router.mode))}\n` +
+              `${dim(raiseHint)}\n`,
+            )
+          } else if (terminationClass === 'interrupted') {
+            await safeStdoutWrite(
+              `\n${yellow('⏹')}  ${yellow('已中断。')} ` +
+              `${dim('本轮进度保留在会话中，可直接继续输入。')}\n`,
+            )
+          } else if (event.subtype === 'error_max_turns') {
             await safeStdoutWrite(
               `\n${yellow('⚠')}  ${yellow('已达到本轮最大步数上限。')} ` +
               `${dim('继续输入以接着分析，或用 --max-turns <n> 提高上限。')}\n`,
@@ -378,12 +408,17 @@ export async function streamPrompt(
               `\n${yellow('⚠')}  ${yellow('模型输出连续达到上限，结果可能不完整。')} ` +
               `${dim('请缩小任务范围、提高输出上限或继续该任务。')}\n`,
             )
-          } else if (event.subtype === 'error_during_execution') {
+          } else if (terminationClass === 'abnormal') {
             const errDetails = sanitizeTerminalText((event as { errors?: string[] }).errors?.join('\n  ') ?? '')
+            // Name the actual reason, and only promise details when there ARE
+            // any: `errors` is populated solely when the loop THREW, so on a
+            // reason-based termination the old "请检查以下错误信息" pointed at
+            // information that structurally could not exist.
             await safeStdoutWrite(
-              `\n${red('✗')}  ${red('执行过程中发生错误。')} ` +
-              `${dim('请检查以下错误信息，调整指令后重试。')}\n` +
-              (errDetails ? `${red('  错误详情：')} ${errDetails}\n` : ''),
+              `\n${red('✗')}  ${red(`${terminationLabel(event)}。`)}\n` +
+              (errDetails
+                ? `${red('   错误详情：')} ${errDetails}\n`
+                : `${dim('   调整指令或缩小任务范围后重试；下方诊断给出了更具体的判断。')}\n`),
             )
           } else if (event.subtype === 'parked' && !suppressParkedPresentation) {
             const wakeAt = event.parkRequest
@@ -396,10 +431,16 @@ export async function streamPrompt(
           }
           // Auto-series abnormal exit: replace the bare reason with an actual
           // LLM diagnosis (what happened / root cause / what's needed next).
-          if (event.isError && isAutonomousMode(router.mode)) {
+          //
+          // Gated on a genuine anomaly rather than `isError`. `isError` is true
+          // for every non-success ending, so this used to bill the user for a
+          // model call explaining their own Ctrl+C, and for narrating a
+          // wall-clock limit whose message already stated both what happened and
+          // what to do next.
+          if (warrantsTerminationDiagnosis(event) && isAutonomousMode(router.mode)) {
             const analysis = router instanceof SessionRouter ? await analyzeAbnormalTermination(router, {
               goal: promptTextOf(prompt), subtype: event.subtype,
-              recentText: recentAgentText, toolTrail: recentToolTrail,
+              stopReason: event.stopReason, recentText: recentAgentText, toolTrail: recentToolTrail,
             }) : null
             if (analysis) {
               await safeStdoutWrite(

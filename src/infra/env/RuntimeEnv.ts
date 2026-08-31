@@ -316,6 +316,25 @@ export const RuntimeEnv = {
     return readFloatEnv('META_AGENT_AUTO_MAX_BUDGET_USD', { gt: 0, max: 1_000_000 })
       ?? DEFAULT_AUTO_SESSION_BUDGET_USD
   },
+  /**
+   * Wall-clock ceiling for one unattended auto run, in minutes. Clamped [1, 1440].
+   *
+   * This ceiling and the tool-batch one below were previously reachable only by
+   * an in-process caller setting KernelConfig — and nothing in the CLI ever did,
+   * so in practice they were unreachable constants. A long single-run task then
+   * stopped at two hours with a message naming a limit the user had no way to
+   * change. Both stops are checkpointed and resumable, so the lever is a
+   * convenience rather than a safety valve; but a limit you are told about and
+   * cannot adjust is just a wall.
+   */
+  autoMaxRuntimeMs(fallback: number): number {
+    const minutes = readIntEnv('META_AGENT_AUTO_MAX_RUNTIME_MIN', { min: 1, max: 1440 })
+    return minutes === undefined ? fallback : minutes * 60_000
+  },
+  /** Completed-tool-batch ceiling for one unattended auto run. Clamped [1, 100000]. */
+  autoMaxToolBatches(fallback: number): number {
+    return readIntEnvOr('META_AGENT_AUTO_MAX_TOOL_BATCHES', fallback, 1, 100_000)
+  },
 
   // ── CLI ───────────────────────────────────────────────────────────────────
   /** Max visible chars before the CLI truncates a rendered block. [10k, 2M]. */

@@ -297,16 +297,47 @@ async function runJudge(
   const deadline = Date.now() + MAX_WAIT_MS
   let status = rec.status
   let latest = rec
-  while (!TERMINAL_STATUSES.has(status)) {
-    if (signal.aborted || Date.now() > deadline) break
-    await new Promise(r => setTimeout(r, POLL_MS))
-    const polled = await deps.dispatcher.getStatus(rec.taskId)
-    if (!polled) break
-    latest = polled
-    status = polled.status
+  try {
+    while (!TERMINAL_STATUSES.has(status)) {
+      if (signal.aborted || Date.now() > deadline) break
+      await sleep(POLL_MS, signal)
+      const polled = await deps.dispatcher.getStatus(rec.taskId)
+      if (!polled) break
+      latest = polled
+      status = polled.status
+    }
+    if (latest.status !== 'completed') return undefined
+    return parseFromVerdictChannels(latest, parseVerdict)
+  } finally {
+    // Giving up on WAITING is not the same as giving up on the judge. Reaching
+    // the deadline means the sub-agent's own wall-clock cap failed to fire, so
+    // nothing else is going to stop it: without this it keeps running, keeps
+    // spending, and keeps occupying the `internal: true` lane that exists so the
+    // completion gate can never be starved — while KernelLoop, seeing the gate
+    // report "unavailable", retries and spawns ANOTHER judge into that same lane.
+    // (Parent abort is already forwarded through spawnSubAgent's abortSignal;
+    // this covers the local deadline, which nothing else observes.)
+    if (!TERMINAL_STATUSES.has(latest.status)) {
+      await deps.dispatcher
+        .cancelTask(rec.taskId, 'verify judge exceeded the gate deadline')
+        .catch(() => undefined)
+    }
   }
-  if (latest.status !== 'completed') return undefined
-  return parseFromVerdictChannels(latest, parseVerdict)
+}
+
+/** Abortable poll delay — an interrupted run should not wait out a full tick. */
+function sleep(ms: number, signal: AbortSignal): Promise<void> {
+  if (signal.aborted) return Promise.resolve()
+  return new Promise(resolve => {
+    const timer = setTimeout(done, ms)
+    timer.unref?.()
+    function done(): void {
+      clearTimeout(timer)
+      signal.removeEventListener('abort', done)
+      resolve()
+    }
+    signal.addEventListener('abort', done, { once: true })
+  })
 }
 
 /**

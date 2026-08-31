@@ -5,8 +5,10 @@ import { join, resolve } from 'node:path'
 import {
   atomicWriteJson,
   deleteJsonFile,
+  DEFAULT_READ_CONCURRENCY,
   ensureDir,
   listJsonIds,
+  mapWithConcurrency,
   readJsonFile,
   withFileLock,
 } from '../../../infra/persist/index.js'
@@ -471,12 +473,32 @@ export class GraphStore {
     })
   }
 
+  /**
+   * Every prepared (uncommitted) intent, oldest first.
+   *
+   * recoverPrepared() calls this on EVERY tick, and settled intents live for
+   * INTENT_RETENTION_MS (7 days) while the sweeper only inspects
+   * HOUSEKEEPING_BATCH of them every HOUSEKEEPING_INTERVAL_MS — so an active
+   * instance legitimately holds thousands of files here. A bare
+   * `Promise.all(ids.map(read))` opened all of them at once, which is an EMFILE
+   * on any normal descriptor budget. Bounded fan-out keeps the same result with
+   * a fixed descriptor cost.
+   */
   async listPreparedIntents(): Promise<ActivationCommitIntent[]> {
     const ids = await listJsonIds(this.paths.intentsDir)
-    const intents = await Promise.all(ids.map(id => readJsonFile<ActivationCommitIntent>(join(this.paths.intentsDir, `${id}.json`), { tolerateUnreadable: true })))
-    return intents
-      .filter((intent): intent is ActivationCommitIntent => intent?.status === 'prepared')
-      .sort((a, b) => a.createdAt - b.createdAt || a.commitKey.localeCompare(b.commitKey))
+    const settled = await mapWithConcurrency(ids, DEFAULT_READ_CONCURRENCY, id =>
+      readJsonFile<ActivationCommitIntent>(join(this.paths.intentsDir, `${id}.json`), { tolerateUnreadable: true }))
+    const intents: ActivationCommitIntent[] = []
+    for (const result of settled) {
+      // A rejection here is descriptor exhaustion or a genuine I/O fault (a
+      // merely corrupt file is tolerated and comes back fulfilled/null). Both
+      // mean this listing is INCOMPLETE, and an incomplete prepared-intent list
+      // silently disables crash recovery — so surface it instead of returning a
+      // partial set that looks authoritative.
+      if (result.status === 'rejected') throw result.reason
+      if (result.value?.status === 'prepared') intents.push(result.value)
+    }
+    return intents.sort((a, b) => a.createdAt - b.createdAt || a.commitKey.localeCompare(b.commitKey))
   }
 
   /** Persist the Effect operation before contacting the external provider. */
@@ -893,6 +915,7 @@ export class GraphStore {
           instance = event.instance
           break
         case 'external_event_recorded':
+        case 'external_event_expired':
           externalEvents.set(event.externalEvent.id, event.externalEvent)
           break
         case 'external_event_consumed':
@@ -958,7 +981,9 @@ export class GraphStore {
   }
 
   private activationPath(id: string): string { return join(this.paths.activationsDir, `${id}.json`) }
-  private intentPath(commitKey: string): string { return join(this.paths.intentsDir, `${commitKey}.json`) }
+  private intentPath(commitKey: string): string {
+    return join(this.paths.intentsDir, `${encodeRecordId(commitKey)}.json`)
+  }
   private effectIntentPath(operationKey: string): string { return join(this.paths.effectIntentsDir, `${operationKey}.json`) }
   private journalPath(sequence: number): string { return join(this.paths.journalDir, `${String(sequence).padStart(12, '0')}.json`) }
 
@@ -1030,6 +1055,7 @@ export class GraphStore {
         await this.writePausedResumeProjectionLocked(event)
         return
       case 'external_event_recorded':
+      case 'external_event_expired':
         await this.writeExternalEventProjectionLocked(event.externalEvent)
         return
       case 'external_event_consumed':
@@ -1048,9 +1074,15 @@ export class GraphStore {
     const spec = await this.readSpecCachedLocked()
     const activations = [...snapshot.activations.values()]
       .filter(activation => retainActivationInCheckpoint(activation, spec, now))
+    // A `pending` event is retained while it can still match. It used to be
+    // retained UNCONDITIONALLY, which made every unmatchable delivery permanent:
+    // matchingEventActivations requires `createdAt < wakeAt`, so an event that
+    // arrives after its Wait deadline can never match, yet it stayed pending —
+    // rescanned and structurally compared on every tick, forever. Past the
+    // retention horizon a pending event is no longer matchable in practice, and
+    // CommitCoordinator.expireStaleExternalEvents has already journaled it.
     const externalEvents = [...snapshot.externalEvents.values()]
-      .filter(event => event.status === 'pending' ||
-        now - (event.consumedAt ?? event.createdAt) < EXTERNAL_EVENT_RETENTION_MS)
+      .filter(event => now - (event.consumedAt ?? event.expiredAt ?? event.createdAt) < EXTERNAL_EVENT_RETENTION_MS)
     // Two-generation rotation: keep the outgoing checkpoint as .prev so a
     // corrupt current checkpoint still recovers without the full journal.
     const previous = await readJsonFile<GraphCheckpoint>(this.paths.checkpointJson)
@@ -1253,6 +1285,28 @@ function activationId(): string {
   return `act-${randomUUID()}`
 }
 
+/**
+ * Make a record id safe to use as a file name on every supported platform.
+ *
+ * `commitKey` is `${activationId}:${continuationVersion}`, and on NTFS `:` opens
+ * an alternate data stream: `act-<uuid>:0.json` writes a stream named `0.json`
+ * ON the file `act-<uuid>` rather than creating a file. `readdir` does not
+ * enumerate streams, so `listJsonIds` returned nothing, `listPreparedIntents`
+ * found no prepared intents, and crash recovery was silently a no-op on Windows
+ * — no error anywhere, just a durability guarantee that quietly did not hold.
+ *
+ * Percent-encoding every character outside `[A-Za-z0-9._-]` keeps the mapping
+ * total and reversible, so this is not specific to `:` and the next id scheme
+ * that picks a punctuation separator is safe by construction. Existing keys made
+ * only of safe characters encode to themselves, so files written before this
+ * change are still found at the same path — there is nothing to migrate on the
+ * platforms where the old form worked.
+ */
+export function encodeRecordId(id: string): string {
+  return id.replace(/[^A-Za-z0-9._-]/g, ch =>
+    `%${ch.charCodeAt(0).toString(16).toUpperCase().padStart(2, '0')}`)
+}
+
 function compareActivation(a: ActivationRecord, b: ActivationRecord): number {
   return a.createdAt - b.createdAt || a.id.localeCompare(b.id)
 }
@@ -1287,18 +1341,25 @@ function isFinalStatus(status: GraphInstanceRecord['status']): boolean {
 /**
  * Pure existence check for one journal entry — deliberately NOT readJsonFile().
  *
- * M3-fix: readJsonFile() quarantines a file it cannot parse (renames it to
- * `<path>.<ts>.corrupt`) and returns null. Both journal scans used it as their
- * existence probe, so probing a CORRUPT entry deleted it, stopped the scan at
- * that sequence, and let the next append reuse the number — the event vanished
- * and, because the numbering stayed contiguous, readJournalRangeLocked's
- * `journal sequence gap` check never fired. A destructive read was silently
- * repairing away the very evidence the recovery path is built on.
+ * "Does sequence N exist?" must not depend on whether N can be PARSED. A probe
+ * built on readJsonFile answers null for a corrupt entry just as it does for a
+ * missing one, so the scan stops at the corruption and the next append reuses
+ * that number. The event is then overwritten while the numbering stays
+ * contiguous, which is precisely the shape readJournalRangeLocked's `journal
+ * sequence gap` check cannot see: the evidence of damage is erased by the
+ * routine that exists to find it.
  *
- * With a plain access() the bad entry stays put, so the next reconcile raises
- * `graph journal sequence gap at N` — which isDeterministicGraphError already
- * classifies as deterministic, parking the instance as `failed` for inspection
- * instead of continuing on a corrupted history.
+ * access() answers only the question asked. A corrupt entry stays put, the next
+ * reconcile raises `graph journal sequence gap at N`, and
+ * isDeterministicGraphError classifies that as deterministic — so the instance
+ * parks as `failed` for inspection instead of running on a history it cannot
+ * reconstruct.
+ *
+ * (Historical note: readJsonFile also used to QUARANTINE unparsable files by
+ * renaming them, so the old probe was actively destructive. Quarantine is opt-in
+ * now and GraphStore never asks for it, but the argument above never depended on
+ * that — it is about conflating "absent" with "unreadable", which is still
+ * exactly what a parsing probe does.)
  */
 async function journalEntryExists(path: string): Promise<boolean> {
   try {

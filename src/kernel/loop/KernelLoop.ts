@@ -67,6 +67,8 @@ import { getModelProtocol, modelSupportsVision } from '../../providers/registry.
 import { assembleSystemPrompt } from '../utils/AssembleSystemPrompt.js'
 import { stripVolatileContextPrefix } from '../utils/VolatileContext.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
+import { formatDuration } from '../../infra/duration.js'
+import { DEFAULT_AUTO_MAX_RUNTIME_MS, DEFAULT_AUTO_MAX_TOOL_BATCHES } from '../../infra/budgets.js'
 import type { FileStateCache } from '../session/FileStateCache.js'
 import type {
   CheckpointBoundaryEvent,
@@ -599,6 +601,23 @@ function toolResultSignature(messages: readonly { content: readonly unknown[] }[
  */
 const ALTERNATION_WINDOW = 6
 const AUTO_GATE_MAX_ATTEMPTS_DEFAULT = 2
+/**
+ * Pause between verify/drift gate retries.
+ *
+ * Both gates spawn a judge sub-agent, so a failure that returns instantly
+ * (missing credentials, dispatcher down) previously burned every attempt inside
+ * a few milliseconds — the retries could not observe anything the first call
+ * had not already seen.
+ */
+const AUTO_GATE_RETRY_DELAY_MS = 2_000
+/**
+ * How soon a FAILED drift check may be retried, measured in tool batches.
+ *
+ * Short enough that a broken gate reaches autoDriftFailureLimit while the run
+ * still has budget to stop cleanly; long enough that a persistent failure does
+ * not respawn a judge on every batch.
+ */
+const DRIFT_GATE_RETRY_BATCHES = 5
 const AUTO_DRIFT_FAILURE_LIMIT_DEFAULT = 3
 
 /**
@@ -656,10 +675,14 @@ export async function* runKernelLoop(
   const maxTurns = config.maxTurns ?? 100
   const autoRunStartedAt = Date.now()
   const autoInitialToolBatchCount = ctx.initialToolBatchCount ?? 0
-  const autoMaxRuntimeMs = config.autoMaxRuntimeMs ?? 2 * 60 * 60 * 1000
-  // Auto run bounds: the 2h wall-clock above AND a 300 completed-tool-batch cap.
+  // Auto run bounds: a wall-clock ceiling AND a completed-tool-batch cap.
   // Whichever is hit first ends the run (with a checkpoint, so it can resume).
-  const autoMaxToolBatches = config.autoMaxToolBatches ?? 300
+  // Both are overridable from the environment — an explicit config value still
+  // wins — because they were otherwise unreachable constants: no CLI path set
+  // them, so a run that legitimately needed longer than the default had no lever
+  // at all, only a message naming a limit it could not move.
+  const autoMaxRuntimeMs = config.autoMaxRuntimeMs ?? RuntimeEnv.autoMaxRuntimeMs(DEFAULT_AUTO_MAX_RUNTIME_MS)
+  const autoMaxToolBatches = config.autoMaxToolBatches ?? RuntimeEnv.autoMaxToolBatches(DEFAULT_AUTO_MAX_TOOL_BATCHES)
   // #6 fix: only claim "checkpointed; resume" when durable checkpointing is
   // actually wired (onCheckpointBoundary). simple_auto runs autonomously but
   // intentionally has NO checkpoint coordinator, so its limit messages must not
@@ -850,6 +873,33 @@ export async function* runKernelLoop(
     }
   }
 
+  /**
+   * Terminate AFTER the assistant turn was committed to history but BEFORE its
+   * tools ran.
+   *
+   * `append(...assistantMessages)` publishes tool_use blocks into the durable
+   * transcript (onMessagesAppended writes them through immediately), so any exit
+   * taken between that append and runTools() leaves tool_use blocks with no
+   * matching tool_result. That transcript is not resumable: the Messages API
+   * requires a tool_result immediately after every tool_use, so the next request
+   * on a `--resume` is a hard 400 and the session can never be continued.
+   *
+   * The abort-after-streaming path has always synthesised the missing results;
+   * the no-progress guards and the post_query / pre_tool phase-hook aborts did
+   * not. Every such exit now goes through here so the invariant is a property of
+   * the function rather than of five call sites remembering to hold it — see the
+   * `no dangling tool_use` regression test.
+   */
+  function doneBeforeTools(
+    reason: LoopTerminationReason,
+    pendingAssistantMessages: readonly KernelMessage[],
+    note: string,
+  ): LoopResult {
+    const missing = buildMissingToolResultMessages([...pendingAssistantMessages], note)
+    if (missing.length > 0) append(...missing)
+    return done(reason)
+  }
+
   // Wrap the whole loop so the auto-runtime watchdog timer is cleared on EVERY
   // exit path. done() already clears it on normal returns, but a throw (e.g.
   // exhausted stream-error recovery at the `throw streamError` below, or any
@@ -866,7 +916,7 @@ export async function* runKernelLoop(
       Date.now() - autoRunStartedAt >= autoMaxRuntimeMs
     ) {
       resultText =
-        `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+        `Auto run reached its ${formatDuration(autoMaxRuntimeMs)} wall-clock limit. ` +
         autoResumeHint
       yield { type: 'text_delta', delta: `\n[auto] ${resultText}\n`, sessionId }
       return done('auto_runtime_limit')
@@ -1313,7 +1363,7 @@ export async function* runKernelLoop(
       append(...assistantMessages, ...missingResults)
       if (signal.reason === 'auto_runtime_limit') {
         resultText =
-          `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+          `Auto run reached its ${formatDuration(autoMaxRuntimeMs)} wall-clock limit. ` +
           autoResumeHint
         return done('auto_runtime_limit')
       }
@@ -1383,7 +1433,11 @@ export async function* runKernelLoop(
       const ph = await runPhaseHook('post_query')
       if (ph.abort) {
         resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort after query.'
-        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
+        return doneBeforeTools(
+          ph.failed ? 'phase_hook_fail' : 'phase_hook_abort',
+          assistantMessages,
+          'Not executed: a phase hook stopped the session after the model replied.',
+        )
       }
     }
 
@@ -1517,6 +1571,7 @@ export async function* runKernelLoop(
         let verdict: VerifyVerdict | undefined
         let unavailableNote: string | null = null
         for (let attempt = 1; attempt <= autoGateMaxAttempts; attempt++) {
+          if (signal.aborted) break
           try {
             const candidate = await config.verifyGate({
               workspaceRoot: ctx.cwd,
@@ -1526,6 +1581,9 @@ export async function* runKernelLoop(
             })
             if (candidate.skipped) {
               unavailableNote = candidate.note ?? 'verify gate returned skipped'
+              // A `skipped` verdict used to `continue` straight past the abort
+              // check at the foot of the loop; the check now leads the body so
+              // every path observes it.
               continue
             }
             verdict = candidate
@@ -1533,8 +1591,10 @@ export async function* runKernelLoop(
             break
           } catch (err) {
             unavailableNote = errorNote(err)
+            // The gate can fail instantly and repeatedly (missing key, dead
+            // dispatcher). Space the retries so the attempts are worth spending.
+            if (attempt < autoGateMaxAttempts) await delay(AUTO_GATE_RETRY_DELAY_MS, signal)
           }
-          if (signal.aborted) break
         }
         if (signal.aborted) {
           return done(signal.reason === 'auto_runtime_limit'
@@ -1632,13 +1692,13 @@ export async function* runKernelLoop(
       resultText =
         `Stopped: the model repeated the same tool request ${repeatedToolRequestCount} times without making progress.`
       yield { type: 'text_delta', delta: resultText, sessionId }
-      return done('no_progress')
+      return doneBeforeTools('no_progress', assistantMessages, resultText)
     }
     if (pollingRepeatCount >= NO_PROGRESS_POLLING_LIMIT) {
       resultText =
         `Stopped: the model issued the same tool request ${pollingRepeatCount} times; the results kept changing but the task did not advance.`
       yield { type: 'text_delta', delta: resultText, sessionId }
-      return done('no_progress')
+      return doneBeforeTools('no_progress', assistantMessages, resultText)
     }
     // A↔B oscillation guard: the consecutive counter above resets on every
     // signature change, so a model ping-ponging between two identical tool
@@ -1649,7 +1709,7 @@ export async function* runKernelLoop(
       resultText =
         'Stopped: the model alternated between the same two tool requests repeatedly without making progress.'
       yield { type: 'text_delta', delta: resultText, sessionId }
-      return done('no_progress')
+      return doneBeforeTools('no_progress', assistantMessages, resultText)
     }
 
     // Emit tool_use events
@@ -1688,7 +1748,11 @@ export async function* runKernelLoop(
       const ph = await runPhaseHook('pre_tool', { toolNames: batchToolNames })
       if (ph.abort) {
         resultText = ph.note || resultText || 'Stopped (phase hook): a phase hook requested abort before tool execution.'
-        return done(ph.failed ? 'phase_hook_fail' : 'phase_hook_abort')
+        return doneBeforeTools(
+          ph.failed ? 'phase_hook_fail' : 'phase_hook_abort',
+          assistantMessages,
+          'Not executed: a phase hook stopped the session before this tool batch ran.',
+        )
       }
     }
 
@@ -1929,11 +1993,16 @@ export async function* runKernelLoop(
       const enoughBatches =
         toolBatchCount - lastDriftToolBatchCount >= DRIFT_TURN_INTERVAL
       if (checkpointAdvanced && enoughBatches) {
+        // Remember where the cadence stood BEFORE consuming it, so an
+        // unavailable gate can hand the window back (see below).
+        const driftWindowBatches = lastDriftToolBatchCount
+        const driftWindowRevision = lastDriftCheckpointRevision
         lastDriftToolBatchCount = toolBatchCount
         lastDriftCheckpointRevision = checkpointRevision
         let drift: DriftVerdict | undefined
         let unavailableNote: string | null = null
         for (let attempt = 1; attempt <= autoGateMaxAttempts; attempt++) {
+          if (signal.aborted) break
           try {
             const candidate = await config.driftGate({
               workspaceRoot: ctx.cwd,
@@ -1943,6 +2012,9 @@ export async function* runKernelLoop(
             })
             if (candidate.skipped) {
               unavailableNote = candidate.note ?? 'drift gate returned skipped'
+              // A `skipped` verdict used to `continue` straight past the abort
+              // check at the foot of the loop; the check now leads the body so
+              // every path observes it.
               continue
             }
             drift = candidate
@@ -1950,11 +2022,31 @@ export async function* runKernelLoop(
             break
           } catch (err) {
             unavailableNote = errorNote(err)
+            // The gate can fail instantly and repeatedly (missing key, dead
+            // dispatcher). Space the retries so the attempts are worth spending.
+            if (attempt < autoGateMaxAttempts) await delay(AUTO_GATE_RETRY_DELAY_MS, signal)
           }
-          if (signal.aborted) break
         }
         if (!signal.aborted && !drift && unavailableNote !== null) {
           consecutiveDriftGateFailures++
+          // Give the cadence window back — but only part of it.
+          //
+          // Consuming the full window on a FAILED check made the failure limit
+          // nearly unreachable: `consecutiveDriftGateFailures` could only rise
+          // once per DRIFT_TURN_INTERVAL (30) further tool batches AND another
+          // checkpoint advance, so "stop after N consecutive failures" really
+          // meant "stop after N×30 batches" — most of the 300-batch auto budget
+          // before the safety net engages at all. Rewinding to a short retry
+          // window lets a genuinely broken gate reach its limit while the run
+          // still has budget left to stop cleanly.
+          //
+          // Not a full rewind: that would re-run the gate on the very next batch
+          // and turn a persistent failure into a hot loop of judge spawns.
+          lastDriftToolBatchCount = Math.max(
+            driftWindowBatches,
+            toolBatchCount - DRIFT_TURN_INTERVAL + DRIFT_GATE_RETRY_BATCHES,
+          )
+          lastDriftCheckpointRevision = driftWindowRevision
           const msg =
             `[drift] 航向检查不可用，已尝试 ${autoGateMaxAttempts} 次` +
             `（连续 ${consecutiveDriftGateFailures}/${autoDriftFailureLimit}）：${unavailableNote}`
@@ -1999,7 +2091,7 @@ export async function* runKernelLoop(
     if (signal.aborted) {
       if (signal.reason === 'auto_runtime_limit') {
         resultText =
-          `Auto run reached its ${autoMaxRuntimeMs}ms wall-clock limit. ` +
+          `Auto run reached its ${formatDuration(autoMaxRuntimeMs)} wall-clock limit. ` +
           autoResumeHint
         return done('auto_runtime_limit')
       }

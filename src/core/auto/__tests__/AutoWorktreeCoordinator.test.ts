@@ -211,14 +211,89 @@ describe('AutoWorktreeCoordinator', () => {
     }
     writeFileSync(registryPath, JSON.stringify(registry, null, 2))
 
+    const partiallyIntegrated = git(repo, ['rev-parse', 'HEAD']).trim()
     const resumed = new AutoWorktreeCoordinator(repo)
     const result = await resumed.reconcile()
     expect(result.recoveredTransactions).toContain('task-crash')
-    expect(git(repo, ['rev-parse', 'HEAD']).trim()).toBe(preMergeHead)
+    // The transaction committed before it died, so HEAD is one commit past
+    // preMergeHead. Recovery does NOT reset over that commit: from git alone it
+    // is indistinguishable from a commit the user made after the crash, and
+    // destroying the latter is unrecoverable while keeping the former is merely
+    // the merge having succeeded.
+    expect(git(repo, ['rev-parse', 'HEAD']).trim()).toBe(partiallyIntegrated)
+    expect(existsSync(join(repo, 'feature.txt'))).toBe(true)
+    // The rest of the transaction still completes: the pre-merge working state
+    // comes back out of the stash, and the record is handed to a human.
     expect(readFileSync(join(repo, 'README.md'), 'utf-8')).toBe('main dirty before crash\n')
-    expect(existsSync(join(repo, 'feature.txt'))).toBe(false)
     expect(resumed.recordFor('task-crash')?.phase).toBe('conflicted')
     expect(git(repo, ['stash', 'list', '--format=%H'])).not.toContain(stashCommit)
+  })
+
+  it('rolls back an interrupted merge that never committed', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const handle = await coord.allocate('task-uncommitted', 'session-1')
+    writeFileSync(join(handle!.worktreePath, 'feature.txt'), 'branch output\n')
+    await coord.finalize('task-uncommitted')
+
+    const preMergeHead = git(repo, ['rev-parse', 'HEAD']).trim()
+    writeFileSync(join(repo, 'README.md'), 'main dirty before crash\n')
+    git(repo, ['stash', 'push', '--include-untracked', '-m', 'simulated transaction',
+      '--', '.', ':(exclude).meta-agent/**'])
+    const stashCommit = git(repo, ['rev-parse', 'refs/stash']).trim()
+    // Staged by the squash but never committed — the common crash shape.
+    git(repo, ['merge', '--squash', handle!.branchName])
+
+    const registryPath = join(repo, '.git', 'meta-agent', 'auto-worktrees.json')
+    const registry = JSON.parse(readFileSync(registryPath, 'utf-8'))
+    registry.tasks['task-uncommitted'] = {
+      ...registry.tasks['task-uncommitted'], phase: 'merging', preMergeHead, stashCommit,
+    }
+    writeFileSync(registryPath, JSON.stringify(registry, null, 2))
+
+    const resumed = new AutoWorktreeCoordinator(repo)
+    const result = await resumed.reconcile()
+    expect(result.recoveredTransactions).toContain('task-uncommitted')
+    // HEAD never moved, so nothing can be lost by resetting: the half-applied
+    // merge is unwound and the pre-merge state restored.
+    expect(git(repo, ['rev-parse', 'HEAD']).trim()).toBe(preMergeHead)
+    expect(existsSync(join(repo, 'feature.txt'))).toBe(false)
+    expect(readFileSync(join(repo, 'README.md'), 'utf-8')).toBe('main dirty before crash\n')
+  })
+
+  it('never destroys commits the user made after an interrupted merge', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const handle = await coord.allocate('task-abandoned', 'session-1')
+    writeFileSync(join(handle!.worktreePath, 'feature.txt'), 'branch output\n')
+    await coord.finalize('task-abandoned')
+
+    const preMergeHead = git(repo, ['rev-parse', 'HEAD']).trim()
+    const registryPath = join(repo, '.git', 'meta-agent', 'auto-worktrees.json')
+    const registry = JSON.parse(readFileSync(registryPath, 'utf-8'))
+    registry.tasks['task-abandoned'] = {
+      ...registry.tasks['task-abandoned'], phase: 'merging', preMergeHead,
+    }
+    writeFileSync(registryPath, JSON.stringify(registry, null, 2))
+
+    // The user comes back after the crash, works, and commits — twice.
+    writeFileSync(join(repo, 'user-work.txt'), 'hand-written after the crash\n')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-q', '-m', 'user work 1'])
+    writeFileSync(join(repo, 'user-work.txt'), 'and refined\n')
+    git(repo, ['add', '-A'])
+    git(repo, ['commit', '-q', '-m', 'user work 2'])
+    const userHead = git(repo, ['rev-parse', 'HEAD']).trim()
+    // Untracked, unstaged, uncommitted — the copy with no other backup.
+    writeFileSync(join(repo, 'scratch-notes.md'), 'not yet added to git\n')
+
+    // Merely STARTING a session runs reconcile(); it must not eat any of that.
+    const resumed = new AutoWorktreeCoordinator(repo)
+    await resumed.reconcile()
+
+    expect(git(repo, ['rev-parse', 'HEAD']).trim()).toBe(userHead)
+    expect(readFileSync(join(repo, 'user-work.txt'), 'utf-8')).toBe('and refined\n')
+    expect(existsSync(join(repo, 'scratch-notes.md'))).toBe(true)
   })
 
   it('does not let runtime .meta-agent files enter the main merge transaction', async () => {
