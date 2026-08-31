@@ -94,6 +94,8 @@ ${bold('AUTO SCHEDULER (plain auto self_timer)')}
   meta-agent tasks [list|show <id>]        See every Auto task, finished included
       --active --json --workspace <dir>  ${dim('Alive? parked? ORPHANED? No API key needed.')}
       ${dim('`show <id>` also lists the run\'s artifact paths; --active hides finished tasks.')}
+  meta-agent tasks --manage --max-running 3
+      ${dim('Open the TUI and execute due wakes across workspaces; r runs the selected task now.')}
   meta-agent -w <dir> --mode auto --attached "goal"
       Keep the original terminal attached across repeated self_timer wakes.
   By default self_timer persists state and exits; --attached instead keeps

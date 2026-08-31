@@ -242,6 +242,7 @@ export class AutoContinuationStore {
     now = Date.now(),
     owner = autoContinuationClaimOwner(),
     limit = Number.POSITIVE_INFINITY,
+    filter?: (record: AutoContinuationRecord) => boolean,
   ): Promise<AutoContinuationRecord[]> {
     await ensureDir(this.dir)
     return withFileLock(this.lockPath(), async () => {
@@ -255,6 +256,7 @@ export class AutoContinuationStore {
       const claimed: AutoContinuationRecord[] = []
       for (const record of all) {
         if (record.status !== 'pending') continue
+        if (filter && !filter(record)) continue
 
         // Retire instead of running: a wake this far past due belongs to a
         // workspace whose scheduler went away, and its premise no longer holds.

@@ -114,6 +114,8 @@ export interface TaskView {
     host?: string
     lastSeen?: number
     configFile?: string
+    /** Present only for a transient worker launched by `tasks --manage`. */
+    managedWakeId?: string
   }
   pendingSteerCount: number
   /**
@@ -300,6 +302,7 @@ function schedulerFor(
     host: chosen.host,
     lastSeen: chosen.lastSeen,
     ...(chosen.configFile ? { configFile: chosen.configFile } : {}),
+    ...(chosen.managedWakeId ? { managedWakeId: chosen.managedWakeId } : {}),
   }
 }
 

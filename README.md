@@ -2,7 +2,7 @@
 
 面向工程与机器人算法开发的 TypeScript 智能体运行时。把流式模型调用、多轮工具循环、会话恢复、权限与沙箱、上下文压缩、无人值守自治、并发子代理、长周期图循环与知识沉淀封装成统一接口。既是 npm 库,也是开箱即用的 CLI。
 
-> 当前版本:`0.9.6` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
+> 当前版本:`0.9.7` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
 
 ---
 
@@ -153,11 +153,14 @@ meta-agent --json "检查项目结构"
 # plain auto 的持久定时恢复调度器(一个 workspace 一个常驻进程)
 meta-agent -w /path/to/project auto-scheduler
 
+# 单终端管理全部 workspace；全局最多同时执行 3 个 Auto turn
+meta-agent tasks --manage --max-running 3
+
 # attached:原命令窗口等待,到期后仍在原窗口继续输出
 meta-agent -w /path/to/project --mode auto --attached "持续检查任务,必要时用 self_timer 等待"
 ```
 
-`auto` 中的 `self_timer` 是**持久化 park**,不是进程内 `sleep`:CLI 先保存完整会话与 checkpoint 再写 wake,默认随后退出,由 `auto-scheduler` 到期恢复同一 session/goal。attached 模式下等待阶段 `Ctrl+C` 仅解除附着并保留 wake;执行中 `Ctrl+C` 表示放弃该 Auto 会话并取消其全部 wake(已写入工作区的文件修改不回滚)。`simple_auto` 不暴露该工具。机制与部署见 [自动调度器](docs/自动模式/自动调度器.md)。
+`auto` 中的 `self_timer` 是**持久化 park**,不是进程内 `sleep`:CLI 先保存完整会话与 checkpoint 再写 wake,默认随后退出,由独立 `auto-scheduler` 或 `tasks --manage` 到期恢复同一 session/goal。manage TUI 中选择任务按 `r` 可立即运行，无需额外 scheduler shell；`--max-running` 是跨 workspace 的全局执行上限。选中正在运行的托管任务时，TUI 下半区会实时跟随它的 Agent 回复、工具调用/结果、重试和终态信息。attached 模式下等待阶段 `Ctrl+C` 仅解除附着并保留 wake;执行中 `Ctrl+C` 表示放弃该 Auto 会话并取消其全部 wake(已写入工作区的文件修改不回滚)。`simple_auto` 不暴露该工具。机制与部署见 [自动调度器](docs/自动模式/自动调度器.md)。
 
 ---
 
@@ -453,4 +456,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.9.6`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。
+当前包版本:`0.9.7`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。

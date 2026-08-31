@@ -9,6 +9,8 @@ export interface AutoSchedulerOptions {
   maxConcurrent?: number
   retryBaseMs?: number
   onEvent?: (message: string) => void
+  /** Restrict this scheduler to an exact managed wake or another queue slice. */
+  claimFilter?: (record: AutoContinuationRecord) => boolean
   /**
    * Exit once the queue has held no live work (no pending, no claimed, nothing
    * running) for this long. 0 disables it and the scheduler polls forever.
@@ -136,7 +138,12 @@ export class AutoScheduler {
     // never steal a claim this process is still working on.
     const capacity = Math.max(0, this.maxConcurrent - this.active.size)
     if (capacity === 0) return 0
-    const records = await this.store.claimDue(now, undefined, capacity)
+    const records = await this.store.claimDue(
+      now,
+      undefined,
+      capacity,
+      this.options.claimFilter,
+    )
     for (const record of records) {
       // runClaim already funnels every failure into a release + onEvent, but a
       // throw from the release itself would now escape as an UNHANDLED

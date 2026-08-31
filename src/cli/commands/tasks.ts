@@ -13,8 +13,9 @@
  * paths and the final cost are all still on disk; nothing would show them.
  * `--active` restores the old filter for anyone watching a live queue.
  *
- * Read-only and API-key-free on purpose: this must work in a workspace with no
- * credentials configured, and it must never be the thing that starts a turn.
+ * The default/list/show surfaces stay read-only and API-key-free. `--manage` is
+ * an explicit opt-in execution mode; its isolated workers perform the normal
+ * scheduler credential check before starting a turn.
  *
  * `--json` is the stable contract every future frontend consumes; the human
  * table is a rendering of the same `TaskView[]` and carries no extra logic.
@@ -38,6 +39,10 @@ import {
 import { formatLocalTimestamp } from '../../loop/localTime.js'
 import { bold, cyan, dim, gray, green, isTTY, red, yellow, terminalText } from '../term.js'
 import { TaskTui } from '../tui/TaskTui.js'
+import {
+  TaskManager,
+  createSubprocessManagedWorkerLauncher,
+} from '../tui/TaskManager.js'
 import type { CliOptions } from '../args.js'
 
 function usage(): string {
@@ -59,13 +64,13 @@ function usage(): string {
     dim('  --all                   Accepted for compatibility; finished tasks'),
     dim('                          are shown by default and --all overrides --active'),
     dim('  --workspace <dir>       Restrict to one workspace'),
+    dim('  --manage                Run due Auto wakes from this TUI; no extra scheduler shell'),
+    dim('  --max-running <n>        Global managed-turn limit (default: 3)'),
     dim('  --yes                   Confirm a destructive action'),
     '',
-    dim('  Actions only edit the durable queue — they never start a turn. The'),
-    dim('  running scheduler executes; that is why no API key is required here.'),
-    dim('  Workspaces are discovered from the scheduler registry, so a workspace'),
-    dim('  that has never run `auto-scheduler` will not appear; pass --workspace'),
-    dim('  to inspect it anyway.'),
+    dim('  Without --manage, actions only edit the durable queue and a separate'),
+    dim('  scheduler executes it. In --manage mode, r runs the selected wake and'),
+    dim('  due timers are resumed automatically under the global concurrency cap.'),
   ].join('\n')
 }
 
@@ -113,18 +118,54 @@ export async function runTasksCommand(opts: CliOptions): Promise<void> {
   const showFinished = !activeOnly
   const yes = takeFlag(args, '--yes') || takeFlag(args, '-y')
   const workspace = takeOption(args, '--workspace') ?? takeOption(args, '-w') ?? opts.workspace
+  const manage = takeFlag(args, '--manage')
+  const hadMaxRunning = args.includes('--max-running')
+  const rawMaxRunning = takeOption(args, '--max-running')
+  if (hadMaxRunning && rawMaxRunning === undefined) {
+    console.error(red('--max-running requires a positive integer.'))
+    process.exitCode = 1
+    return
+  }
+  if (
+    rawMaxRunning !== undefined &&
+    (!/^[1-9]\d*$/.test(rawMaxRunning) || !Number.isSafeInteger(Number(rawMaxRunning)))
+  ) {
+    console.error(red(`--max-running must be a positive integer (got ${terminalText(rawMaxRunning)}).`))
+    process.exitCode = 1
+    return
+  }
+  if (!manage && rawMaxRunning !== undefined) {
+    console.error(red('--max-running requires --manage.'))
+    process.exitCode = 1
+    return
+  }
+  const maxRunning = rawMaxRunning === undefined ? 3 : Number(rawMaxRunning)
 
   const noTui = takeFlag(args, '--no-tui')
   const sub = args[0] && !args[0].startsWith('-') ? args.shift()! : ''
   const workspaces = workspace ? [resolve(workspace)] : undefined
 
+  if (manage && (json || noTui || !isTTY || !process.stdin.isTTY || sub !== '')) {
+    console.error(red('--manage is an interactive TUI mode; run bare `meta-agent tasks --manage`.'))
+    process.exitCode = 1
+    return
+  }
+
   // Bare `meta-agent tasks` on a terminal opens the full-screen view; through a
   // pipe or in CI it degrades to a single list so `tasks | grep ORPHANED` and
   // `tasks --json` keep working unchanged.
   if (sub === '' && isTTY && process.stdin.isTTY && !json && !noTui) {
+    const manager = manage
+      ? new TaskManager({
+          maxRunning,
+          ...(workspaces ? { workspaces } : {}),
+          launcher: createSubprocessManagedWorkerLauncher({ cli: opts }),
+        })
+      : undefined
     await new TaskTui({
       ...(workspaces ? { workspaces } : {}),
       showFinished,
+      ...(manager ? { manager } : {}),
     }).run()
     return
   }
@@ -249,7 +290,7 @@ async function listTasks(input: {
   if (tasks.length === 0) {
     const known = input.workspaces ?? await listKnownWorkspaces()
     console.log(known.length === 0
-      ? dim('No workspace has registered a scheduler yet. Start one with `meta-agent -w <dir> auto-scheduler`.')
+      ? dim('No Auto workspace has been registered yet. A workspace appears when its first wake is armed.')
       : dim(`No Auto tasks found in ${known.length} known workspace(s).`))
     return
   }

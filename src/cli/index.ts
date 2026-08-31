@@ -75,9 +75,9 @@ async function main(): Promise<void> {
       await runSteerCommand(opts)
       return
     }
-    // `tasks` is read-only and must work with no provider key configured — it
-    // is the thing you reach for when something has gone wrong, and demanding
-    // credentials to LOOK at task state would be exactly backwards.
+    // Task inspection is read-only and must work with no provider key. Managed
+    // mode still enters here, but each scheduler worker performs its own normal
+    // credential check before it starts a turn.
     if (opts.loopCommand.name === 'tasks') {
       await runTasksCommand(opts)
       return

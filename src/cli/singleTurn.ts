@@ -508,6 +508,7 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
         'max-concurrent': { type: 'string' },
         'idle-exit-ms': { type: 'string' },
         'stale-wake-ms': { type: 'string' },
+        'wake-id': { type: 'string' },
       },
       strict: true,
       allowPositionals: false,
@@ -540,6 +541,10 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
     '--stale-wake-ms',
     DEFAULT_STALE_WAKE_MS,
   )
+  const wakeId = parsed.values['wake-id'] as string | undefined
+  if (wakeId && !parsed.values['once']) {
+    throw new Error('auto-scheduler: --wake-id requires --once')
+  }
   const projectDir = resolve(opts.workspace ?? process.cwd())
   const store = new AutoContinuationStore(projectDir, { staleWakeMs })
   const abort = new AbortController()
@@ -561,6 +566,7 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
   try {
     registration = await SchedulerRegistration.register({
       workspace: projectDir, pollIntervalMs, maxConcurrent,
+      ...(wakeId ? { managedWakeId: wakeId } : {}),
     })
   } catch { /* monitoring is best-effort */ }
 
@@ -583,6 +589,7 @@ export async function runAutoSchedulerCommand(opts: CliOptions): Promise<void> {
       pollIntervalMs,
       maxConcurrent,
       idleExitMs,
+      ...(wakeId ? { claimFilter: record => record.wakeId === wakeId } : {}),
       onEvent: emit,
       onTick: now => registration?.beat(now),
       // Pre-retry safety net. If the fences no longer pass, the turn already
@@ -771,4 +778,3 @@ function parsePositiveIntOption(
   }
   return parsed
 }
-

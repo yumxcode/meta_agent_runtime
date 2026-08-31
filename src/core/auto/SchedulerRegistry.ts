@@ -1,5 +1,5 @@
 /**
- * SchedulerRegistry — which `auto-scheduler` processes exist, and are they alive.
+ * SchedulerRegistry — Auto workspace discovery and scheduler liveness.
  *
  * Wake records are per-workspace (`<ws>/.meta-agent/auto/wakes/`), so nothing in
  * the system could answer "show me every long-running task on this machine".
@@ -9,8 +9,8 @@
  *
  * This registry is the missing piece, and it answers two questions at once:
  *
- *   1. DISCOVERY — which workspaces have ever run a scheduler, so a global view
- *      knows where to look.
+ *   1. DISCOVERY — which workspaces have armed durable Auto work, so a global
+ *      view and managed scheduler know where to look before any daemon starts.
  *   2. LIVENESS — is a scheduler actually servicing that workspace right now.
  *
  * (2) matters because of a failure mode that is otherwise invisible: a pending
@@ -45,6 +45,8 @@ export interface SchedulerHeartbeat {
   lastSeen: number
   pollIntervalMs: number
   maxConcurrent: number
+  /** Exact wake handled by a transient `tasks --manage` worker. */
+  managedWakeId?: string
   /**
    * Which provider profile this scheduler runs under (`$META_AGENT_CONFIG_FILE`).
    * A workspace can legitimately be serviced by a GLM-profile scheduler while
@@ -54,6 +56,13 @@ export interface SchedulerHeartbeat {
   configFile?: string
   /** Set on graceful exit. Present = "this one is done", not "never existed". */
   stoppedAt?: number
+}
+
+/** A workspace containing durable Auto work, independent of scheduler state. */
+export interface AutoWorkspaceRegistration {
+  schemaVersion: '1.0'
+  workspace: string
+  updatedAt: number
 }
 
 /** Registry records untouched for this long are dropped by the next writer. */
@@ -71,6 +80,17 @@ const BEAT_MIN_INTERVAL_MS = 5_000
 
 function registryDir(): string {
   return join(META_AGENT_HOME, 'schedulers')
+}
+
+function workspaceRegistryDir(): string {
+  return join(META_AGENT_HOME, 'auto-workspaces')
+}
+
+function workspaceRecordId(workspace: string): string {
+  return createHash('sha1')
+    .update(resolve(workspace))
+    .digest('hex')
+    .slice(0, 16)
 }
 
 /**
@@ -129,10 +149,27 @@ export async function listSchedulers(): Promise<SchedulerHeartbeat[]> {
   return records.sort((a, b) => b.lastSeen - a.lastSeen)
 }
 
-/** Distinct workspaces that have ever registered a scheduler, newest first. */
+/** Distinct workspaces known from armed work or scheduler history, newest first. */
 export async function listKnownWorkspaces(): Promise<string[]> {
   const seen = new Set<string>()
   const ordered: string[] = []
+
+  const workspaceRecords: AutoWorkspaceRegistration[] = []
+  for (const id of await listJsonIds(workspaceRegistryDir())) {
+    const record = await readJsonFile<AutoWorkspaceRegistration>(
+      join(workspaceRegistryDir(), `${id}.json`),
+      { tolerateUnreadable: true },
+    )
+    if (record?.workspace && typeof record.updatedAt === 'number') workspaceRecords.push(record)
+  }
+  workspaceRecords.sort((a, b) => b.updatedAt - a.updatedAt)
+  for (const record of workspaceRecords) {
+    const workspace = resolve(record.workspace)
+    if (seen.has(workspace)) continue
+    seen.add(workspace)
+    ordered.push(workspace)
+  }
+
   for (const record of await listSchedulers()) {
     const workspace = resolve(record.workspace)
     if (seen.has(workspace)) continue
@@ -140,6 +177,26 @@ export async function listKnownWorkspaces(): Promise<string[]> {
     ordered.push(workspace)
   }
   return ordered
+}
+
+/**
+ * Register at park time so `tasks --manage` can discover a workspace before
+ * any standalone scheduler has ever run there.
+ */
+export async function registerKnownWorkspace(
+  workspace: string,
+  now = Date.now(),
+): Promise<void> {
+  const resolved = resolve(workspace)
+  const record: AutoWorkspaceRegistration = {
+    schemaVersion: '1.0',
+    workspace: resolved,
+    updatedAt: now,
+  }
+  await atomicWriteJson(
+    join(workspaceRegistryDir(), `${workspaceRecordId(resolved)}.json`),
+    record,
+  )
 }
 
 /**
@@ -160,6 +217,7 @@ export class SchedulerRegistration {
     workspace: string
     pollIntervalMs: number
     maxConcurrent: number
+    managedWakeId?: string
     now?: number
   }): Promise<SchedulerRegistration> {
     const now = input.now ?? Date.now()
@@ -172,6 +230,7 @@ export class SchedulerRegistration {
       lastSeen: now,
       pollIntervalMs: input.pollIntervalMs,
       maxConcurrent: input.maxConcurrent,
+      ...(input.managedWakeId ? { managedWakeId: input.managedWakeId } : {}),
       ...(process.env['META_AGENT_CONFIG_FILE']?.trim()
         ? { configFile: process.env['META_AGENT_CONFIG_FILE']!.trim() }
         : {}),

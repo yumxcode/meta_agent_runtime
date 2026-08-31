@@ -34,7 +34,31 @@ beforeEach(() => {
 
 afterEach(async () => {
   vi.restoreAllMocks()
+  process.exitCode = undefined
   await Promise.all(dirs.splice(0).map(d => rm(d, { recursive: true, force: true })))
+})
+
+describe('managed mode flags', () => {
+  it('requires the interactive TUI instead of silently degrading to a list', async () => {
+    const ws = await workspace()
+    await runTasksCommand(opts(ws, ['--manage', '--max-running', '3']))
+    expect(printed()).toContain('--manage is an interactive TUI mode')
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('rejects a global running limit when manage mode is absent', async () => {
+    const ws = await workspace()
+    await runTasksCommand(opts(ws, ['--max-running', '3']))
+    expect(printed()).toContain('--max-running requires --manage')
+    expect(process.exitCode).toBe(1)
+  })
+
+  it('rejects invalid managed concurrency values', async () => {
+    const ws = await workspace()
+    await runTasksCommand(opts(ws, ['--manage', '--max-running', '0']))
+    expect(printed()).toContain('--max-running must be a positive integer')
+    expect(process.exitCode).toBe(1)
+  })
 })
 
 async function workspace(): Promise<string> {

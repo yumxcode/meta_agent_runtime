@@ -21,6 +21,7 @@ import {
   autoContinuationClaimOwner,
   type AutoContinuationRecord,
 } from '../core/auto/AutoContinuationStore.js'
+import { registerKnownWorkspace } from '../core/auto/SchedulerRegistry.js'
 import { sanitizeTerminalText } from './terminalSanitizer.js'
 import { bold, cyan, dim, gray, green, red, yellow, terminalText } from './term.js'
 import { askQuestion } from './prompts.js'
@@ -276,6 +277,10 @@ export async function armAutoContinuation(input: {
     await store.cancel(record.wakeId, record.claim?.token)
     throw new Error('Auto history was saved, but the wake checkpoint could not be persisted; wake was cancelled.')
   }
+  // Bootstrap global discovery at park time. Requiring a scheduler heartbeat
+  // here would force the operator to start the very extra shell that managed
+  // task mode is intended to remove. This index is monitoring-only, so failure
+  // must not roll back an otherwise durable wake.
+  await registerKnownWorkspace(projectDir).catch(() => undefined)
   return record
 }
-

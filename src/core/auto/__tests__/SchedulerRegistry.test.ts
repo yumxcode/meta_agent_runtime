@@ -17,6 +17,7 @@ import {
   listKnownWorkspaces,
   listSchedulers,
   pruneAncient,
+  registerKnownWorkspace,
   type SchedulerHeartbeat,
 } from '../SchedulerRegistry.js'
 import { rm } from 'node:fs/promises'
@@ -25,6 +26,7 @@ import { META_AGENT_HOME } from '../../../infra/metaAgentHome.js'
 
 afterEach(async () => {
   await rm(join(META_AGENT_HOME, 'schedulers'), { recursive: true, force: true })
+  await rm(join(META_AGENT_HOME, 'auto-workspaces'), { recursive: true, force: true })
 })
 
 const base = (over: Partial<SchedulerHeartbeat> = {}): SchedulerHeartbeat => ({
@@ -70,6 +72,12 @@ describe('liveness', () => {
 })
 
 describe('registration lifecycle', () => {
+  it('discovers parked work before any scheduler has ever started', async () => {
+    await registerKnownWorkspace('/w/parked-only', 5_000)
+    expect(await listSchedulers()).toEqual([])
+    expect(await listKnownWorkspaces()).toContain('/w/parked-only')
+  })
+
   it('registers, beats, and survives a graceful stop as a workspace record', async () => {
     const registration = await SchedulerRegistration.register({
       workspace: '/w/alpha', pollIntervalMs: 1_000, maxConcurrent: 1,

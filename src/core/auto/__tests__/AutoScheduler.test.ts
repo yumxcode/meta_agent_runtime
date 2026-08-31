@@ -318,6 +318,23 @@ describe('normal outcomes', () => {
     expect(calls).toBe(0)
   })
 
+  it('can claim only the exact wake assigned by the tasks manager', async () => {
+    const store = new AutoContinuationStore(await project())
+    const first = await scheduleDue(store, 'first')
+    const assigned = await scheduleDue(store, 'assigned')
+    const resumed: string[] = []
+    const scheduler = new AutoScheduler(
+      store,
+      async record => { resumed.push(record.wakeId); return 'done' },
+      { claimFilter: record => record.wakeId === assigned.wakeId },
+    )
+
+    expect(await scheduler.tickOnce()).toBe(1)
+    expect(resumed).toEqual([assigned.wakeId])
+    expect(await statusOf(store, assigned.wakeId)).toBe('done')
+    expect(await statusOf(store, first.wakeId)).toBe('pending')
+  })
+
   it('respects maxConcurrent', async () => {
     const store = new AutoContinuationStore(await project())
     await scheduleDue(store, 'a')

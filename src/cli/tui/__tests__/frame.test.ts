@@ -103,6 +103,112 @@ describe('the row warns when nothing will ever pick the wake up', () => {
     }))
     expect(out).not.toContain('no-sched')
   })
+
+  it('shows manager capacity and treats it as the scheduler', () => {
+    const out = plain(render([task({
+      status: 'parked',
+      scheduler: { alive: false },
+      wake: { wakeId: 'w1', fireAt: NOW + 60_000, reason: 'x', attempts: 1 },
+    })], {
+      manager: { enabled: true, running: 2, queued: 1, maxRunning: 3 },
+    }))
+    expect(out).toContain('manage 2/3')
+    expect(out).toContain('1 queued')
+    expect(out).toContain('tasks manager')
+    expect(out).not.toContain('no-sched')
+  })
+})
+
+describe('managed task activity panel', () => {
+  const running = task({
+    status: 'running',
+    wake: {
+      wakeId: 'wake-live', fireAt: NOW - 60_000, reason: 'continue', attempts: 1,
+      claim: { owner: 'managed', claimedAt: NOW - 45_000, expiresAt: NOW + 60_000 },
+    },
+  })
+
+  it('uses the lower half for the selected task live activity', () => {
+    const out = plain(render([running, task({ sessionId: 'other' })], {
+      manager: { enabled: true, running: 1, queued: 0, maxRunning: 3 },
+      activity: {
+        run: {
+          workspace: running.workspace,
+          sessionId: running.sessionId,
+          wakeId: 'wake-live',
+          state: 'running',
+          startedAt: NOW - 45_000,
+          pid: 43210,
+          logPath: '/tmp/live.log',
+        },
+        feed: {
+          truncated: false,
+          entries: [
+            { kind: 'agent', text: '正在评估训练结果，并检查失败样本。' },
+            { kind: 'tool', text: 'exec_command {"cmd":"npm test"}' },
+            { kind: 'tool-result', text: '93 tests passed' },
+          ],
+        },
+      },
+    }))
+    expect(out).toContain('live activity')
+    expect(out).toContain('running · pid 43210 · 45s')
+    expect(out).toContain('agent ›')
+    expect(out).toContain('正在评估训练结果')
+    expect(out).toContain('exec_command')
+    expect(out).toContain('93 tests passed')
+  })
+
+  it('explains when a running task belongs to an external scheduler', () => {
+    const out = plain(render([running], {
+      manager: { enabled: true, running: 0, queued: 0, maxRunning: 3 },
+    }))
+    expect(out).toContain('Live output unavailable')
+    expect(out).toContain('not launched by this tasks manager')
+  })
+
+  it('labels completed output as recent activity', () => {
+    const finished = task({ status: 'finished' })
+    const out = plain(render([finished], {
+      showFinished: true,
+      manager: { enabled: true, running: 0, queued: 0, maxRunning: 3 },
+      activity: {
+        run: {
+          workspace: finished.workspace,
+          sessionId: finished.sessionId,
+          wakeId: 'wake-finished',
+          state: 'succeeded',
+          startedAt: NOW - 10_000,
+          endedAt: NOW - 1_000,
+        },
+        feed: { truncated: false, entries: [{ kind: 'status', text: '本轮完成' }] },
+      },
+    }))
+    expect(out).toContain('recent activity')
+    expect(out).toContain('completed')
+    expect(out).toContain('本轮完成')
+  })
+
+  it('keeps wrapped CJK activity inside the terminal', () => {
+    const lines = buildFrame({
+      tasks: [running], selected: 0, mode: { kind: 'browse' }, showFinished: false,
+      now: NOW, rows: 16, columns: 48,
+      manager: { enabled: true, running: 1, queued: 0, maxRunning: 3 },
+      activity: {
+        run: {
+          workspace: running.workspace, sessionId: running.sessionId,
+          wakeId: 'wake-live', state: 'running', startedAt: NOW - 1_000,
+        },
+        feed: {
+          truncated: false,
+          entries: [{ kind: 'agent', text: '持续输出当前任务进度和评估信息'.repeat(20) }],
+        },
+      },
+    })
+    for (const line of lines) {
+      expect(visibleLength(line), plain(line)).toBeLessThanOrEqual(48)
+    }
+  })
 })
 
 describe('the unhealthy hint routes to the recovery command without inlining it', () => {

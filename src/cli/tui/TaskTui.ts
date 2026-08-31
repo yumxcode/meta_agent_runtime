@@ -28,8 +28,10 @@ import {
   applyTaskAction,
   type TaskActionKind,
 } from '../../core/auto/TaskActions.js'
-import { buildFrame, type FrameMode } from './frame.js'
+import { buildFrame, type FrameMode, type SelectedTaskActivity } from './frame.js'
 import { decodeKeys, type Key } from './keys.js'
+import type { TaskManager } from './TaskManager.js'
+import { readTaskActivityLog } from './TaskActivityLog.js'
 
 const ENTER_ALT_SCREEN = '\x1b[?1049h\x1b[?25l'
 const LEAVE_ALT_SCREEN = '\x1b[?25h\x1b[?1049l'
@@ -53,6 +55,8 @@ export interface TaskTuiOptions {
   refreshMs?: number
   /** Defaults to true — see the header of cli/commands/tasks.ts. */
   showFinished?: boolean
+  /** Present only for `tasks --manage`; owns execution and global admission. */
+  manager?: TaskManager
 }
 
 export class TaskTui {
@@ -65,6 +69,9 @@ export class TaskTui {
   private refreshing = false
   private running = false
   private pendingAction: TaskActionKind | undefined
+  private activity: SelectedTaskActivity | undefined
+  /** Invalidates a slow log read when the selection changes underneath it. */
+  private activityReadVersion = 0
   /** The task an in-progress confirm/steer prompt refers to. See startAction. */
   private pendingTask: TaskView | undefined
   private readonly refreshMs: number
@@ -81,6 +88,7 @@ export class TaskTui {
 
   async run(): Promise<void> {
     this.running = true
+    const exited = new Promise<void>(resolve => { this.resolveExit = resolve })
     process.stdout.write(ENTER_ALT_SCREEN)
     process.stdin.setRawMode?.(true)
     process.stdin.resume()
@@ -88,18 +96,23 @@ export class TaskTui {
     process.stdout.on('resize', this.onResize)
     process.on('exit', this.onProcessExit)
 
+    await this.options.manager?.start()
+    if (!this.running) return
     await this.refresh()
+    if (!this.running) return
     this.timer = setInterval(() => void this.refresh(), this.refreshMs)
     this.timer.unref?.()
 
-    await new Promise<void>(resolve => { this.resolveExit = resolve })
+    await exited
     this.teardown()
   }
 
   private teardown(): void {
     if (!this.running) return
     this.running = false
+    this.activityReadVersion++
     if (this.timer) clearInterval(this.timer)
+    void this.options.manager?.stop()
     process.stdin.off('data', this.onData)
     process.stdout.off('resize', this.onResize)
     process.off('exit', this.onProcessExit)
@@ -131,6 +144,7 @@ export class TaskTui {
         if (moved >= 0) this.selected = moved
       }
       this.clampSelection()
+      await this.refreshSelectedActivity(false)
     } catch (error) {
       this.status = {
         ok: false,
@@ -176,6 +190,8 @@ export class TaskTui {
       rows,
       columns,
       refreshing: this.refreshing,
+      ...(this.options.manager ? { manager: this.options.manager.snapshot() } : {}),
+      ...(this.activity ? { activity: this.activity } : {}),
     }).slice(0, rows)
 
     process.stdout.write(
@@ -195,6 +211,9 @@ export class TaskTui {
         case 'confirm': this.handleConfirmKey(key); break
       }
     }
+    // Cursor movement should switch the lower panel immediately instead of
+    // leaving the previous task's output visible until the next 1s poll.
+    void this.refreshSelectedActivity()
     this.paint()
   }
 
@@ -225,7 +244,10 @@ export class TaskTui {
       this.status = undefined
       return
     }
-    if (key.ch === 'r') return this.startAction('run-now')
+    if (key.ch === 'r') {
+      if (this.options.manager) return void this.runManagedNow()
+      return this.startAction('run-now')
+    }
     if (key.ch === 'c') return this.startAction('cancel')
     if (key.ch === 'K') return this.startAction('kill')
     if (key.ch === 's') return this.startAction('steer')
@@ -312,5 +334,48 @@ export class TaskTui {
     }
     // Show the consequence immediately rather than up to a second later.
     await this.refresh()
+  }
+
+  private async runManagedNow(): Promise<void> {
+    const task = this.filtered[this.selected]
+    if (!task || !this.options.manager) return
+    try {
+      const result = await this.options.manager.runNow(task)
+      this.status = { ok: result.ok, text: result.message }
+    } catch (error) {
+      this.status = {
+        ok: false,
+        text: `run failed: ${error instanceof Error ? error.message : String(error)}`,
+      }
+    }
+    await this.refresh()
+  }
+
+  private async refreshSelectedActivity(paintWhenDone = true): Promise<void> {
+    const version = ++this.activityReadVersion
+    const task = this.filtered[this.selected]
+    const manager = this.options.manager
+    this.activity = undefined
+    if (!this.running || !task || !manager) {
+      if (paintWhenDone) this.paint()
+      return
+    }
+
+    const run = manager.activityFor(task)
+    if (!run) {
+      if (paintWhenDone) this.paint()
+      return
+    }
+    const feed = run.logPath
+      ? await readTaskActivityLog(run.logPath)
+      : { entries: [], truncated: false }
+
+    const selected = this.filtered[this.selected]
+    if (
+      version !== this.activityReadVersion || !this.running || !selected ||
+      selected.workspace !== task.workspace || selected.sessionId !== task.sessionId
+    ) return
+    this.activity = { run, feed }
+    if (paintWhenDone) this.paint()
   }
 }

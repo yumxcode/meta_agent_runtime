@@ -13,6 +13,8 @@ import { basename } from 'node:path'
 import { bold, cyan, dim, gray, green, red, yellow } from '../term.js'
 import { sanitizeTerminalText } from '../terminalSanitizer.js'
 import { isUnhealthy, summarize, type TaskStatus, type TaskView } from '../../core/auto/TaskRegistry.js'
+import type { ManagedTaskActivity, TaskManagerSnapshot } from './TaskManager.js'
+import type { TaskActivityEntry, TaskActivityFeed } from './TaskActivityLog.js'
 
 /** Transient input the TUI is collecting, if any. */
 export type FrameMode =
@@ -34,6 +36,14 @@ export interface FrameInput {
   columns: number
   /** Set while a refresh is in flight, so a slow scan is visible. */
   refreshing?: boolean
+  manager?: TaskManagerSnapshot
+  /** Live/recent output for the selected task, supplied only by managed mode. */
+  activity?: SelectedTaskActivity
+}
+
+export interface SelectedTaskActivity {
+  run: ManagedTaskActivity
+  feed: TaskActivityFeed
 }
 
 const STATUS_LABEL: Record<TaskStatus, string> = {
@@ -78,13 +88,41 @@ export function buildFrame(input: FrameInput): string[] {
   const rule = dim('─'.repeat(width))
   const body = rows - FIXED_CHROME_LINES
 
+  const selectedTask = input.tasks[input.selected]
+  const wantsActivity = Boolean(
+    input.activity || (input.manager && selectedTask?.status === 'running'),
+  )
+
+  // Managed output gets the lower half of a normal terminal. The list always
+  // keeps at least one row; tiny terminals fall back to the compact detail
+  // layout below so the footer/confirmation contract remains intact.
+  if (wantsActivity && selectedTask && body >= 5) {
+    const panelBudget = Math.max(2, Math.ceil((body - 1) * 0.55))
+    const listBudget = Math.max(1, body - panelBudget - 1)
+    const panel = activityPanel(
+      selectedTask,
+      input.activity,
+      width,
+      body - listBudget - 1,
+      input.now,
+    )
+    return [
+      header(input, width),
+      rule,
+      ...list(input, width, listBudget).slice(0, listBudget),
+      rule,
+      ...panel,
+      footer(input, width),
+    ]
+  }
+
   // The detail panel needs its own rule, so it costs `detailHeight + 1`. It is
   // only worth showing if at least one list row survives.
   const detailBudget = input.tasks.length > 0 && body >= 3
     ? Math.min(MAX_DETAIL_LINES, body - 2)
     : 0
   const detailLines = detailBudget > 0
-    ? detail(input.tasks[input.selected], width, detailBudget)
+    ? detail(input.tasks[input.selected], width, detailBudget, input.manager)
     : []
   const listBudget = Math.max(0, body - (detailLines.length > 0 ? detailLines.length + 1 : 0))
 
@@ -92,6 +130,87 @@ export function buildFrame(input: FrameInput): string[] {
   if (detailLines.length > 0) lines.push(rule, ...detailLines)
   lines.push(footer(input, width))
   return lines
+}
+
+function activityPanel(
+  task: TaskView,
+  activity: SelectedTaskActivity | undefined,
+  width: number,
+  height: number,
+  now: number,
+): string[] {
+  if (height <= 0) return []
+  if (!activity) {
+    const left = ` ${bold('live activity')}`
+    const context = fit(
+      `${basename(task.workspace)} · ${task.sessionId.slice(0, 8)}`,
+      Math.max(1, width - visibleLength(left) - 2),
+    )
+    return [
+      `${left}  ${dim(context)}`,
+      ` ${yellow(fit('Live output unavailable — this turn was not launched by this tasks manager.', width - 2))}`,
+    ].slice(0, height)
+  }
+
+  const run = activity.run
+  const elapsed = duration((run.endedAt ?? now) - run.startedAt)
+  const state = run.state === 'running' ? 'running' : run.state === 'succeeded' ? 'completed' : 'failed'
+  const title = run.state === 'running' ? 'live activity' : 'recent activity'
+  const facts = [
+    state,
+    run.pid ? `pid ${run.pid}` : '',
+    elapsed,
+    activity.feed.truncated ? 'tail' : '',
+  ].filter(Boolean).join(' · ')
+  const left = ` ${bold(title)}`
+  const fittedFacts = fit(facts, Math.max(1, width - visibleLength(left) - 2))
+  const headerLine = `${left}  ${run.state === 'failed' ? red(fittedFacts) : green(fittedFacts)}`
+
+  if (height === 1) return [headerLine]
+  if (activity.feed.error) {
+    return [headerLine, ` ${red(fit(clean(activity.feed.error), width - 2))}`].slice(0, height)
+  }
+  if (activity.feed.entries.length === 0) {
+    return [headerLine, ` ${dim('Waiting for worker output…')}`].slice(0, height)
+  }
+
+  const rendered = activity.feed.entries.flatMap(entry => activityEntryLines(entry, width))
+  return [headerLine, ...rendered.slice(-(height - 1))]
+}
+
+function activityEntryLines(entry: TaskActivityEntry, width: number): string[] {
+  const label = activityLabel(entry)
+  const labelWidth = displayWidth(label.text)
+  const contentWidth = Math.max(4, width - labelWidth - 3)
+  const chunks = wrap(clean(entry.text), contentWidth)
+  const continuation = ' '.repeat(labelWidth)
+  return (chunks.length ? chunks : ['']).map((chunk, index) => {
+    const marker = index === 0 ? label.coloured : continuation
+    const content = activityText(entry, chunk)
+    return ` ${marker} ${content}`
+  })
+}
+
+function activityLabel(entry: TaskActivityEntry): { text: string; coloured: string } {
+  switch (entry.kind) {
+    case 'agent': return { text: 'agent ›', coloured: bold(green('agent ›')) }
+    case 'thinking': return { text: '·', coloured: dim('·') }
+    case 'tool': return { text: '⚙', coloured: cyan('⚙') }
+    case 'tool-result': return { text: '→', coloured: dim('→') }
+    case 'warning': return { text: '⚠', coloured: yellow('⚠') }
+    case 'error': return { text: '✗', coloured: red('✗') }
+    case 'status': return { text: '●', coloured: cyan('●') }
+  }
+}
+
+function activityText(entry: TaskActivityEntry, text: string): string {
+  switch (entry.kind) {
+    case 'thinking':
+    case 'tool-result': return dim(text)
+    case 'warning': return yellow(text)
+    case 'error': return red(text)
+    default: return text
+  }
 }
 
 function header(input: FrameInput, width: number): string {
@@ -105,6 +224,13 @@ function header(input: FrameInput, width: number): string {
   if (counts.finished && input.showFinished) parts.push(gray(`${counts.finished} finished`))
 
   const left = `${bold('meta-agent tasks')}${input.refreshing ? dim(' ·') : ''}`
+  if (input.manager) {
+    parts.unshift(cyan(
+      `manage ${input.manager.running}/${input.manager.maxRunning}` +
+      (input.manager.queued ? ` · ${input.manager.queued} queued` : ''),
+    ))
+    if (input.manager.lastError) parts.unshift(red('manager error'))
+  }
   const right = parts.join(dim(' · ')) || dim('no tasks')
   return pad(left, right, width)
 }
@@ -114,7 +240,7 @@ function list(input: FrameInput, width: number, height: number): string[] {
     return [
       '',
       `  ${dim('No Auto tasks found.')}`,
-      `  ${dim('Workspaces are discovered from schedulers that have run at least once.')}`,
+      `  ${dim('Workspaces are discovered when an Auto wake is armed.')}`,
     ].slice(0, height)
   }
 
@@ -128,21 +254,34 @@ function list(input: FrameInput, width: number, height: number): string[] {
     const index = input.tasks.indexOf(task)
     const marker = index === input.selected ? cyan('▸') : ' '
     const status = paint(task.status, `● ${STATUS_LABEL[task.status]}`)
-    const ws = cyan(fit(basename(task.workspace), 14))
     const id = dim(task.sessionId.slice(0, 8))
     const when = describeWhen(task, input.now)
     const cost = task.progress.estimatedCostUsd !== undefined
       ? `$${task.progress.estimatedCostUsd.toFixed(2)}`
       : ''
-    const warn = !task.scheduler.alive && (task.status === 'parked' || task.status === 'overdue')
+    const warn = !input.manager && !task.scheduler.alive && (task.status === 'parked' || task.status === 'overdue')
       ? red(' no-sched')
       : ''
-    const left = ` ${marker} ${padVisible(status, 13)} ${ws} ${id}  ${fit(when, 20)}`
-    return pad(left, `${cost}${warn}`, width)
+    let right = `${cost}${warn}`
+    // Keep the warning rather than the cost when a narrow terminal cannot fit
+    // both. Status + task identity are the irreducible left side (30 cols).
+    if (visibleLength(right) > width - 31) right = warn || fit(cost, width - 31)
+    const leftLimit = width - visibleLength(right) - (right ? 1 : 0)
+    const wsWidth = Math.min(14, Math.max(4, Math.floor((leftLimit - 26) / 2)))
+    const wsCell = padVisible(cyan(fit(basename(task.workspace), wsWidth)), wsWidth)
+    const fixed = ` ${marker} ${padVisible(status, 13)} ${wsCell} ${id}`
+    const remaining = Math.max(0, leftLimit - visibleLength(fixed))
+    const left = remaining >= 4 ? `${fixed}  ${fit(when, remaining - 2)}` : fixed
+    return pad(left, right, width)
   })
 }
 
-function detail(task: TaskView | undefined, width: number, height: number): string[] {
+function detail(
+  task: TaskView | undefined,
+  width: number,
+  height: number,
+  manager?: TaskManagerSnapshot,
+): string[] {
   if (!task) return []
   const rows: string[] = []
   const field = (label: string, value: string): void => {
@@ -169,7 +308,11 @@ function detail(task: TaskView | undefined, width: number, height: number): stri
 
   field('scheduler', task.scheduler.alive
     ? `alive · pid ${task.scheduler.pid}${task.scheduler.configFile ? ` · ${basename(task.scheduler.configFile)}` : ''}`
-    : 'down — this workspace has no scheduler running')
+    : manager
+      ? `tasks manager · global ${manager.running}/${manager.maxRunning}`
+      : 'down — this workspace has no scheduler running')
+
+  if (manager?.lastError) field('manager', clean(manager.lastError))
 
   if (isUnhealthy(task.status)) {
     rows.push(` ${red(fit(hint(task), Math.max(10, width - 2)))}`)
@@ -218,7 +361,7 @@ function footer(input: FrameInput, width: number): string {
   // colouring the pieces first would let escape codes count toward the width
   // and truncate a line that actually fits.
   const keys = [
-    '↑↓ select', 'r run-now', 'c cancel', 'K kill', 'D delete',
+    '↑↓ select', input.manager ? 'r run' : 'r run-now', 'c cancel', 'K kill', 'D delete',
     's steer', input.showFinished ? 'a hide done' : 'a show done', '/ filter', 'q quit',
   ].join(' · ')
   return ` ${dim(fit(keys, width - 2))}`
@@ -302,6 +445,26 @@ export function fit(text: string, limit: number): string {
   return `${out}…`
 }
 
+/** Wrap sanitized activity text without splitting a wide CJK glyph. */
+function wrap(text: string, limit: number): string[] {
+  if (!text) return []
+  const lines: string[] = []
+  let current = ''
+  let width = 0
+  for (const ch of text) {
+    const chWidth = isWide(ch) ? 2 : 1
+    if (current && width + chWidth > limit) {
+      lines.push(current)
+      current = ''
+      width = 0
+    }
+    current += ch
+    width += chWidth
+  }
+  if (current) lines.push(current)
+  return lines
+}
+
 /** Strip SGR escapes so padding math counts glyphs, not colour codes. */
 export function visibleLength(text: string): number {
   // eslint-disable-next-line no-control-regex
@@ -315,6 +478,7 @@ function padVisible(text: string, width: number): string {
 
 /** Left text, right text, flush to the given width. */
 function pad(left: string, right: string, width: number): string {
+  if (!right) return left + ' '.repeat(Math.max(0, width - visibleLength(left)))
   const gap = Math.max(1, width - visibleLength(left) - visibleLength(right))
   return left + ' '.repeat(gap) + right
 }

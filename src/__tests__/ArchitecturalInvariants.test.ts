@@ -195,6 +195,10 @@ describe('architectural invariants', () => {
       ['tools/mcp/mcpConfigFile.ts', 'stdio MCP servers; uses buildChildEnv("filtered")'],
       ['tools/fs/grep/index.ts', 'fixed argv (rg); no shell, no model-controlled argv'],
       ['cli/mcpAppsHost.ts', 'MCP Apps host process; config-controlled argv'],
+      [
+        'cli/tui/TaskManager.ts',
+        'trusted same-runtime worker; fixed argv, exact durable wake id, explicit buildChildEnv("inherit")',
+      ],
       ['sandbox/detect.ts', 'capability probes (sandbox-exec / bwrap --version), 3s timeout'],
     ])
 
