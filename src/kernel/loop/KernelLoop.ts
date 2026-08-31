@@ -1980,11 +1980,17 @@ export async function* runKernelLoop(
           }
         } else if (!signal.aborted && drift) {
           consecutiveDriftGateFailures = 0
-        }
-        if (!signal.aborted && drift?.drifted) {
-          append(makeTextUserMessage(buildDriftCorrectionPrompt(drift), { isMeta: true }))
-          await checkpoint({ type: 'drift_corrected' })
-          yield { type: 'text_delta', delta: '\n[drift] 检测到航向偏离，注入一次校正…\n', sessionId }
+          if (drift.drifted) {
+            append(makeTextUserMessage(buildDriftCorrectionPrompt(drift), { isMeta: true }))
+          }
+          // Persist every completed review, not only corrections, so frequent
+          // scheduler park/resume cycles cannot reset the 30-batch cadence.
+          await checkpoint({ type: drift.drifted ? 'drift_corrected' : 'drift_reviewed' })
+          // The review boundary itself is bookkeeping, not new executor progress.
+          lastDriftCheckpointRevision = checkpointRevision
+          if (drift.drifted) {
+            yield { type: 'text_delta', delta: '\n[drift] 检测到航向偏离，注入一次校正…\n', sessionId }
+          }
         }
       }
     }

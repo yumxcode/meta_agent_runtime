@@ -11,6 +11,7 @@ export type CheckpointBoundaryType =
   | 'compact_before'
   | 'compact_after'
   | 'verify_rejected'
+  | 'drift_reviewed'
   | 'drift_corrected'
   | 'external_before'
   | 'external_after'

@@ -49,6 +49,7 @@ export interface AutoCheckpointCoordinatorDeps {
     compactions?: number
     lastVerifyRejectTurn?: number
     lastDriftCorrectionTurn?: number
+    lastDriftReviewTurn?: number
   }
 }
 
@@ -83,6 +84,7 @@ export class AutoCheckpointCoordinator {
   private compactions: number
   private lastVerifyRejectTurn: number | undefined
   private lastDriftCorrectionTurn: number | undefined
+  private lastDriftReviewTurn: number | undefined
 
   constructor(private readonly deps: AutoCheckpointCoordinatorDeps) {
     this.revision = deps.initialRevision ?? 0
@@ -94,6 +96,7 @@ export class AutoCheckpointCoordinator {
     this.compactions = h?.compactions ?? 0
     this.lastVerifyRejectTurn = h?.lastVerifyRejectTurn
     this.lastDriftCorrectionTurn = h?.lastDriftCorrectionTurn
+    this.lastDriftReviewTurn = h?.lastDriftReviewTurn
   }
 
   get latestRevision(): number {
@@ -171,6 +174,10 @@ export class AutoCheckpointCoordinator {
     this.compactions = 0
     this.lastVerifyRejectTurn = undefined
     this.lastDriftCorrectionTurn = undefined
+    // Tool batches stay monotonic across goals, so the new goal starts its own
+    // drift window at the current durable position rather than inheriting the
+    // previous goal's cadence.
+    this.lastDriftReviewTurn = this.toolBatchCount
     this.fsOnlyStreak = 0
     this.accumPaths.clear()
     this.pendingEditSummary = null
@@ -234,6 +241,10 @@ export class AutoCheckpointCoordinator {
       case 'drift_corrected':
         this.driftCorrections++
         this.lastDriftCorrectionTurn = this.toolBatchCount
+        this.lastDriftReviewTurn = this.toolBatchCount
+        break
+      case 'drift_reviewed':
+        this.lastDriftReviewTurn = this.toolBatchCount
         break
       case 'compact_before':
         this.compactions++
@@ -272,6 +283,7 @@ export class AutoCheckpointCoordinator {
             compactions: this.compactions,
             lastVerifyRejectTurn: this.lastVerifyRejectTurn,
             lastDriftCorrectionTurn: this.lastDriftCorrectionTurn,
+            lastDriftReviewTurn: this.lastDriftReviewTurn,
           },
         )
         if (!writeResult.written) continue

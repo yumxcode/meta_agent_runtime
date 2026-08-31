@@ -20,6 +20,7 @@ import { writeAutoCheckpoint, AUTO_CHECKPOINT_SCHEMA_VERSION } from '../auto/Aut
 let ws: string
 let tracker: TurnDiffTracker
 let capturedTask = ''
+let capturedSystemPrompt = ''
 
 const p = (n: string): string => join(ws, n)
 
@@ -31,8 +32,9 @@ function stubDispatcher(verdictJson: string): ISubAgentDispatcher {
     result: { summary: verdictJson },
   } as unknown as SubAgentRecord
   return {
-    async spawnSubAgent(opts: { config: { taskDescription: string } }) {
+    async spawnSubAgent(opts: { config: { taskDescription: string; systemPrompt?: string } }) {
       capturedTask = opts.config.taskDescription
+      capturedSystemPrompt = opts.config.systemPrompt ?? ''
       return record
     },
     async getStatus() { return record },
@@ -43,6 +45,7 @@ function stubDispatcher(verdictJson: string): ISubAgentDispatcher {
 beforeEach(async () => {
   ws = mkdtempSync(join(tmpdir(), 'gate-diff-'))
   capturedTask = ''
+  capturedSystemPrompt = ''
   tracker = new TurnDiffTracker()
   tracker.beginTurn('run')
   // A change only the TOOL tracker can see — this workspace is not a git repo,
@@ -169,5 +172,7 @@ describe('drift gate', () => {
     })
     expect(verdict.drifted).toBe(false)
     expect(capturedTask).toContain('进度快照')
+    expect(capturedSystemPrompt).toContain('只能说明任务仍在行动')
+    expect(capturedSystemPrompt).toContain('整体梳理仓库的逻辑和关键细节')
   })
 })

@@ -327,6 +327,9 @@ export interface KernelConfig {
   /** Resume seed for the latest durable checkpoint revision. */
   initialCheckpointRevision?: number
 
+  /** Resume seed for the tool-batch position of the last completed drift review. */
+  initialLastDriftToolBatchCount?: number
+
   // ── Compact ───────────────────────────────────────────────────────────────
 
   /** Auto-compact configuration */

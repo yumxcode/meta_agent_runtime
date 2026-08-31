@@ -128,6 +128,7 @@ export class AgenticSession {
       onCheckpointBoundary: config.onCheckpointBoundary,
       initialToolBatchCount: config.initialToolBatchCount,
       initialCheckpointRevision: config.initialCheckpointRevision,
+      initialLastDriftToolBatchCount: config.initialLastDriftToolBatchCount,
       maxTurns: resolved.maxTurns,
       maxBudgetUsd: resolved.maxBudgetUsd,
       initialCostUsd: resolved.initialCostUsd,

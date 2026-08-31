@@ -209,6 +209,7 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
               compactions: resumeCheckpoint.compactions,
               lastVerifyRejectTurn: resumeCheckpoint.lastVerifyRejectTurn,
               lastDriftCorrectionTurn: resumeCheckpoint.lastDriftCorrectionTurn,
+              lastDriftReviewTurn: resumeCheckpoint.lastDriftReviewTurn,
             }
           : undefined,
         summarizeEdits,
@@ -259,6 +260,8 @@ export async function createAgenticBackend(input: AgenticBackendInput): Promise<
       : undefined,
     initialToolBatchCount: resumeCheckpoint?.turnCount ?? 0,
     initialCheckpointRevision: resumeCheckpoint?.revision ?? 0,
+    initialLastDriftToolBatchCount:
+      resumeCheckpoint?.lastDriftReviewTurn ?? resumeCheckpoint?.turnCount ?? 0,
     initialCostUsd: resumedCostUsd,
   })
   sessionIdForRoles = session.getSessionId()

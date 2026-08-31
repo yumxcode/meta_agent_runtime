@@ -444,6 +444,7 @@ export class SessionRouter {
       updatedAt: Date.now(),
       revision: this._autoCheckpointCoordinator.latestRevision ?? 0,
       goal: prompt,
+      lastDriftReviewTurn: this._autoCheckpointCoordinator.latestToolBatchCount,
     })
   }
 

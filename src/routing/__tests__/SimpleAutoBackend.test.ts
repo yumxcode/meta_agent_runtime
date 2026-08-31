@@ -173,6 +173,7 @@ describe('simple_auto backend wiring', () => {
     })
     expect(mismatched.config['initialCheckpointRevision']).toBe(0)
     expect(mismatched.config['initialToolBatchCount']).toBe(0)
+    expect(mismatched.config['initialLastDriftToolBatchCount']).toBe(0)
     expect(mismatched.config['initialCostUsd']).toBe(0)
 
     await writeAutoCheckpoint(projectDir, {
@@ -181,6 +182,7 @@ describe('simple_auto backend wiring', () => {
       updatedAt: Date.now(),
       revision: 7,
       turnCount: 13,
+      lastDriftReviewTurn: 4,
       estimatedCostUsd: 4.25,
     })
     const matched = await buildBackend('auto', {
@@ -190,6 +192,7 @@ describe('simple_auto backend wiring', () => {
     })
     expect(matched.config['initialCheckpointRevision']).toBe(7)
     expect(matched.config['initialToolBatchCount']).toBe(13)
+    expect(matched.config['initialLastDriftToolBatchCount']).toBe(4)
     expect(matched.config['initialCostUsd']).toBe(4.25)
   })
 })

@@ -437,6 +437,43 @@ describe('KernelSession — auto checkpoint and drift boundaries', () => {
     ])
   })
 
+  it('continues the drift window from the last durable review across resume', async () => {
+    let revision = 7
+    const boundaryTypes: string[] = []
+    const driftGate = vi.fn(async () => ({ drifted: false, corrective: [] }))
+    const onCheckpointBoundary = vi.fn(async (event: { type: string }) => {
+      boundaryTypes.push(event.type)
+      revision++
+      return { updated: true, revision }
+    })
+
+    let apiCall = 0
+    mockStream.mockImplementation(async function* () {
+      apiCall++
+      if (apiCall <= 5) {
+        yield* toolUseStream(`resume-${apiCall}`, 'todo_write', { batch: apiCall })
+      } else {
+        yield* textStream('done')
+      }
+    })
+
+    const session = new KernelSession(makeConfig({
+      maxTurns: 10,
+      tools: [makeTool('todo_write')],
+      autonomousMode: true,
+      driftGate,
+      onCheckpointBoundary,
+      initialToolBatchCount: 25,
+      initialCheckpointRevision: 7,
+      initialLastDriftToolBatchCount: 0,
+    }))
+    await collectEvents(session, 'resume')
+
+    expect(driftGate).toHaveBeenCalledTimes(1)
+    expect(driftGate).toHaveBeenCalledWith(expect.objectContaining({ turnCount: 30 }))
+    expect(boundaryTypes).toContain('drift_reviewed')
+  })
+
   it('does not run drift after 30 batches when no checkpoint revision advanced', async () => {
     let revision = 0
     const driftGate = vi.fn(async () => ({ drifted: false, corrective: [] }))

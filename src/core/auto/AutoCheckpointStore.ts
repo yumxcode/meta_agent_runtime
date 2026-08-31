@@ -85,6 +85,8 @@ export interface AutoCheckpoint {
   lastVerifyRejectTurn?: number
   /** turnCount at the most recent drift correction (recency for drift). */
   lastDriftCorrectionTurn?: number
+  /** turnCount at the most recent completed drift review (cadence across resume). */
+  lastDriftReviewTurn?: number
 }
 
 function checkpointFilename(sessionId: string): string {
@@ -342,6 +344,7 @@ export async function updateAutoCheckpointWithStatus(
     compactions: patch.compactions ?? prior?.compactions,
     lastVerifyRejectTurn: patch.lastVerifyRejectTurn ?? prior?.lastVerifyRejectTurn,
     lastDriftCorrectionTurn: patch.lastDriftCorrectionTurn ?? prior?.lastDriftCorrectionTurn,
+    lastDriftReviewTurn: patch.lastDriftReviewTurn ?? prior?.lastDriftReviewTurn,
   }
   return {
     checkpoint: next,

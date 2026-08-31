@@ -173,6 +173,7 @@ describe('AutoCheckpointCoordinator', () => {
       })
 
       await flush('verify_rejected', 5)
+      await flush('drift_reviewed', 7)
       await flush('drift_corrected', 8)
       await flush('compact_before', 10)
       await flush('compact_after', 10)   // must NOT double-count the compaction
@@ -184,6 +185,7 @@ describe('AutoCheckpointCoordinator', () => {
         compactions: 1,
         lastVerifyRejectTurn: 12,
         lastDriftCorrectionTurn: 8,
+        lastDriftReviewTurn: 8,
       })
     } finally {
       rmSync(dir, { recursive: true, force: true })
@@ -242,6 +244,7 @@ describe('AutoCheckpointCoordinator', () => {
         updatedAt: Date.now(),
         revision: coordinator.latestRevision,
         goal: 'task two',
+        lastDriftReviewTurn: coordinator.latestToolBatchCount,
       })
 
       // The new task's first durable write must advance the revision (no drift
@@ -254,6 +257,7 @@ describe('AutoCheckpointCoordinator', () => {
       expect(cp?.driftCorrections ?? 0).toBe(0)
       expect(cp?.lastVerifyRejectTurn).toBeUndefined()
       expect(cp?.lastDriftCorrectionTurn).toBeUndefined()
+      expect(cp?.lastDriftReviewTurn).toBe(8)
     } finally {
       rmSync(dir, { recursive: true, force: true })
     }

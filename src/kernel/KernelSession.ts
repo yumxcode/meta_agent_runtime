@@ -223,10 +223,13 @@ export class KernelSession {
     this._fileCache = new FileStateCache()
     this._toolBatchCount = Math.max(0, config.initialToolBatchCount ?? 0)
     this._checkpointRevision = Math.max(0, config.initialCheckpointRevision ?? 0)
-    // A resumed session starts a fresh 30-batch drift window from the durable
-    // recovery point. This avoids an immediate duplicate drift check caused by
-    // comparing restored cumulative counters against zero.
-    this._lastDriftToolBatchCount = this._toolBatchCount
+    // Continue the durable drift cadence across scheduler park/resume cycles.
+    // Older checkpoints have no review marker, so they safely start a fresh
+    // window at the recovery point. Clamp malformed/future values defensively.
+    this._lastDriftToolBatchCount = Math.min(
+      this._toolBatchCount,
+      Math.max(0, config.initialLastDriftToolBatchCount ?? this._toolBatchCount),
+    )
     this._lastDriftCheckpointRevision = this._checkpointRevision
     const bootstrap = createBootstrapState(config.cwd, config.sessionId)
     this._sessionId = bootstrap.sessionId
@@ -602,8 +605,8 @@ export class KernelSession {
     // A NEW top-level task starts a fresh drift window from the current durable
     // point: the new goal must produce its OWN checkpoint advance + 30 new tool
     // batches before drift fires, instead of inheriting the prior task's drift
-    // cadence (which could fire immediately or never). Mirrors the resume-path
-    // baseline reset in the constructor. Revision itself stays monotonic.
+    // cadence (which could fire immediately or never). Ordinary resume differs:
+    // it continues the persisted cadence for the same goal. Revision stays monotonic.
     this._lastDriftToolBatchCount = this._toolBatchCount
     this._lastDriftCheckpointRevision = this._checkpointRevision
   }

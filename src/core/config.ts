@@ -459,6 +459,9 @@ export interface MetaAgentConfig {
   /** Resume seed for the latest durable checkpoint revision. */
   initialCheckpointRevision?: number
 
+  /** Resume seed for the tool-batch position of the last completed drift review. */
+  initialLastDriftToolBatchCount?: number
+
   /**
    * Auto mode experience recall. When set, MetaAgentSession appends the returned
    * block (relevant prior lessons) to the stable system prompt each turn so the
@@ -519,6 +522,7 @@ export type ResolvedConfig = Required<
     | 'onCheckpointBoundary'
     | 'initialToolBatchCount'
     | 'initialCheckpointRevision'
+    | 'initialLastDriftToolBatchCount'
     | 'initialCostUsd'
     | 'getExperienceRecallBlock'
     | 'initialMessages'
@@ -567,6 +571,7 @@ export type ResolvedConfig = Required<
   onCheckpointBoundary?: MetaAgentConfig['onCheckpointBoundary']
   initialToolBatchCount?: number
   initialCheckpointRevision?: number
+  initialLastDriftToolBatchCount?: number
   initialCostUsd?: number
   /** Auto mode experience recall provider; absent → no recall injection. */
   getExperienceRecallBlock?: MetaAgentConfig['getExperienceRecallBlock']
@@ -697,6 +702,7 @@ export function resolveConfig(config: MetaAgentConfig): ResolvedConfig {
     onCheckpointBoundary: config.onCheckpointBoundary,
     initialToolBatchCount: config.initialToolBatchCount,
     initialCheckpointRevision: config.initialCheckpointRevision,
+    initialLastDriftToolBatchCount: config.initialLastDriftToolBatchCount,
     getExperienceRecallBlock: config.getExperienceRecallBlock,
     initialMessages: config.initialMessages,
     externalPromptAssembly: config.externalPromptAssembly,
