@@ -1,4 +1,4 @@
-import { describe, it, expect, beforeEach, afterEach } from 'vitest'
+import { describe, it, expect, beforeEach, afterEach, vi } from 'vitest'
 import { mkdtempSync, rmSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
@@ -125,6 +125,64 @@ describe('makeAutoVerifyGate judge toolset', () => {
       expect(capturedMaxBudget).toBe(VERIFY_JUDGE_DEFAULTS.maxBudgetUsd)
       expect(verdict.done).toBe(true)
     } finally {
+      rmSync(dir, { recursive: true, force: true })
+    }
+  })
+})
+
+describe('makeAutoVerifyGate process liveness', () => {
+  it('keeps the status-poll timer referenced until the judge verdict is observed', async () => {
+    // Regression: the managed one-shot scheduler used to exit with code 0 in
+    // the sub-agent completion -> next 500ms poll gap. The judge had already
+    // persisted its verdict, but an unref'ed poll timer did not keep Node alive,
+    // so the parent never consumed the verdict or released the wake.
+    const dir = mkdtempSync(join(tmpdir(), 'ma-verify-liveness-'))
+    const running = {
+      taskId: 'judge-liveness',
+      status: 'running',
+    } as unknown as SubAgentRecord
+    const completed = {
+      taskId: 'judge-liveness',
+      status: 'completed',
+      result: {
+        summary: '```json\n{"done": false, "unfinished": ["still pending"], "evidence": ["result.txt:1"]}\n```',
+      },
+    } as unknown as SubAgentRecord
+
+    const dispatcher: ISubAgentDispatcher = {
+      spawnSubAgent: async () => running,
+      getStatus: async () => completed,
+      cancelTask: async () => true,
+    }
+
+    const realSetTimeout = globalThis.setTimeout
+    const pollHandle = realSetTimeout(() => undefined, 60_000)
+    let firePoll: (() => void) | undefined
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback => {
+      firePoll = () => callback()
+      return pollHandle
+    }) as typeof setTimeout)
+
+    try {
+      const gate = makeAutoVerifyGate({ dispatcher, projectDir: dir, getGoal: () => 'finish the task' })
+      const pending = gate({
+        workspaceRoot: dir,
+        turnCount: 1,
+        round: 1,
+        signal: new AbortController().signal,
+      })
+
+      // Let the async snapshot/spawn path reach the first status-poll delay.
+      for (let i = 0; i < 20 && !firePoll; i++) await Promise.resolve()
+      expect(firePoll).toBeTypeOf('function')
+      expect(pollHandle.hasRef()).toBe(true)
+
+      firePoll?.()
+      const verdict = await pending
+      expect(verdict).toMatchObject({ done: false, unfinished: ['still pending'] })
+    } finally {
+      timeoutSpy.mockRestore()
+      clearTimeout(pollHandle)
       rmSync(dir, { recursive: true, force: true })
     }
   })

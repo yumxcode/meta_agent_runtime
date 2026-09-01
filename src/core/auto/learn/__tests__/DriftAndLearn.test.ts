@@ -13,6 +13,7 @@ import {
   updateAutoCheckpoint,
   readAutoCheckpoint,
 } from '../../AutoCheckpointStore.js'
+import type { SubAgentRecord } from '../../../../subagent/types.js'
 
 describe('parseDriftVerdict', () => {
   it('parses a drifted verdict with corrective steps', () => {
@@ -84,6 +85,69 @@ describe('AutoDriftGate', () => {
       note: 'checkpoint missing',
     })
     expect(spawnSubAgent).not.toHaveBeenCalled()
+  })
+
+  it('keeps the status-poll timer referenced until the drift verdict is observed', async () => {
+    await updateAutoCheckpoint(dir, 'sess-live', {
+      goal: 'finish the task',
+      completedSteps: ['implementation'],
+      pendingTodos: ['verification'],
+    })
+    const running = {
+      taskId: 'drift-liveness',
+      status: 'running',
+    } as unknown as SubAgentRecord
+    const completed = {
+      taskId: 'drift-liveness',
+      status: 'completed',
+      result: {
+        summary: '```json\n{"drifted": false, "corrective": []}\n```',
+      },
+    } as unknown as SubAgentRecord
+    const dispatcher = {
+      spawnSubAgent: async () => running,
+      getStatus: async () => completed,
+      cancelTask: async () => true,
+    }
+
+    const realSetTimeout = globalThis.setTimeout
+    const pollHandle = realSetTimeout(() => undefined, 60_000)
+    let firePoll: (() => void) | undefined
+    const timeoutSpy = vi.spyOn(globalThis, 'setTimeout').mockImplementation((callback => {
+      firePoll = () => callback()
+      return pollHandle
+    }) as typeof setTimeout)
+
+    try {
+      const gate = makeAutoDriftGate({
+        dispatcher,
+        projectDir: dir,
+        getGoal: () => 'finish the task',
+        getSessionId: () => 'sess-live',
+      })
+      const pending = gate({
+        workspaceRoot: dir,
+        turnCount: 2,
+        reason: 'turn_interval',
+        signal: new AbortController().signal,
+      })
+
+      // Drift also initialises the on-disk experience index before spawning,
+      // so yield through that I/O phase rather than only draining microtasks.
+      for (let i = 0; i < 20 && !firePoll; i++) {
+        await new Promise<void>(resolve => realSetTimeout(resolve, 5))
+      }
+      expect(firePoll).toBeTypeOf('function')
+      expect(pollHandle.hasRef()).toBe(true)
+
+      firePoll?.()
+      const verdict = await pending
+      expect(verdict).toMatchObject({ drifted: false, corrective: [] })
+      expect(verdict.skipped).toBeUndefined()
+    } finally {
+      timeoutSpy.mockRestore()
+      clearTimeout(pollHandle)
+    }
   })
 })
 

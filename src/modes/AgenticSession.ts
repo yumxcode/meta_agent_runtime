@@ -21,8 +21,14 @@ import { translateKernelEvent, type TranslationState } from './eventAdapter.js'
 import { createPermissionPolicy } from '../kernel/permissions/PermissionPolicy.js'
 import { toKernelMessages } from './messageBridge.js'
 import { ToolRuntimeGuards } from './toolRuntimeGuards.js'
-import { resolveSandboxPolicy } from '../sandbox/sandboxPolicyConfig.js'
-import { setGitCredentialPassthrough } from '../infra/env/childProcessEnv.js'
+import {
+  resolveSandboxPolicy,
+  type ResolvedSandboxPolicy,
+} from '../sandbox/sandboxPolicyConfig.js'
+import {
+  setGitCredentialPassthrough,
+  setEnvAllowlist,
+} from '../infra/env/childProcessEnv.js'
 import { getValue as getConfigValue } from '../core/config/ConfigService.js'
 
 /** `sandbox.gitCredentialPassthrough` — whether GITHUB_TOKEN & co reach children. */
@@ -32,6 +38,21 @@ function readGitCredentialPassthrough(projectDir: string): boolean | undefined {
     return typeof raw === 'boolean' ? raw : undefined
   } catch {
     return undefined
+  }
+}
+
+/**
+ * Surface dropped grants at session start.
+ *
+ * Dropping a non-existent path or a blocklisted env var is correct; doing it
+ * silently is what made "I configured it and nothing happened" indistinguishable
+ * from "my config file was never loaded". Warn, never throw — the operator is
+ * usually not watching when a session starts, and a stale grant must not be able
+ * to prevent one.
+ */
+function warnSandboxDiagnostics(policy: ResolvedSandboxPolicy): void {
+  for (const d of policy.diagnostics) {
+    console.warn(`[sandbox] ${d.kind}: ${d.subject} — ${d.detail}`)
   }
 }
 
@@ -63,8 +84,19 @@ export class AgenticSession {
     // disagree about which external paths are legal — a disagreement would show
     // up as "I granted this directory and it still doesn't work".
     const projectDir = resolved.projectDir ?? process.cwd()
-    const sandboxPolicy = resolveSandboxPolicy(projectDir)
+    // Hoisted out of the trajectory block below (which computes the same
+    // expression) because the sandbox policy now depends on it: `sandbox.modes.
+    // <mode>` overrides and the autonomy narrowing of restricted toolAccess
+    // presets both key off the session mode.
+    const sessionMode =
+      config.trajectory?.mode ?? config.promptMode ?? (config.autonomy ? 'auto' : 'agentic')
+    const sandboxPolicy = resolveSandboxPolicy(projectDir, sessionMode)
     setGitCredentialPassthrough(readGitCredentialPassthrough(projectDir))
+    // Operator env allowlist (sandbox.envAllowlist + toolAccess preset env
+    // sets). Blocklisted names were already stripped during resolution, and
+    // buildChildEnv re-checks — neither layer trusts the other.
+    setEnvAllowlist(sandboxPolicy.envAllowlist)
+    warnSandboxDiagnostics(sandboxPolicy)
     this._runtimeGuards = new ToolRuntimeGuards({
       projectDir,
       autonomy: config.autonomy,
@@ -92,7 +124,7 @@ export class AgenticSession {
       initialMessages: toKernelMessages(resolved.initialMessages),
       trajectory: {
         ...config.trajectory,
-        mode: config.trajectory?.mode ?? config.promptMode ?? (config.autonomy ? 'auto' : 'agentic'),
+        mode: sessionMode,
         source: config.trajectory?.source ?? 'kernel_session',
       },
       turnDiff: config.turnDiff ?? resolved.runtimeContext?.turnDiff,

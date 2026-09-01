@@ -261,7 +261,10 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()
   return new Promise(resolve => {
     const timer = setTimeout(done, ms)
-    timer.unref?.()
+    // This gate is foreground scheduler work, just like completion verify. The
+    // sub-agent may clear its final referenced handle after persisting a
+    // terminal record; keeping this poll referenced guarantees the parent gets
+    // a chance to observe that record and finish/release the current wake.
     function done(): void {
       clearTimeout(timer)
       signal.removeEventListener('abort', done)

@@ -8,6 +8,7 @@ export { createSkillTool } from './skill/index.js'
 export { createConfigTool } from './config/index.js'
 export { createMemoryWriteTool } from './memory_write/index.js'
 export { createMemoryDeleteTool } from './memory_delete/index.js'
+export { createSandboxProbeTool } from './sandbox_probe/index.js'
 export { listCronJobs, deleteCronJob, createCronJob, deleteJobsForSession } from './cronStore.js'
 export type { CronJob } from './cronStore.js'
 
@@ -23,6 +24,7 @@ import { createSkillTool } from './skill/index.js'
 import { createConfigTool } from './config/index.js'
 import { createMemoryWriteTool } from './memory_write/index.js'
 import { createMemoryDeleteTool } from './memory_delete/index.js'
+import { createSandboxProbeTool } from './sandbox_probe/index.js'
 import { AUTO_DENIED_TOOL_NAMES, isAutonomousMode } from '../../core/modes.js'
 
 export interface SystemToolsOptions {
@@ -60,6 +62,10 @@ export async function createSystemTools(options: SystemToolsOptions = {}): Promi
     createConfigTool(options.cwd),
     createMemoryWriteTool({ mode: options.mode ?? 'agentic', domain: options.domain }),
     createMemoryDeleteTool(),
+    // Read-only and deliberately NOT in AUTO_DENIED_TOOL_NAMES: an unattended
+    // run is exactly where a silently-dropped grant is most expensive, and this
+    // tool executes nothing and reveals no credential values.
+    createSandboxProbeTool(options.mode ?? 'agentic'),
   ])
   if (!isAutonomousMode(options.mode)) return tools
   const denied = new Set<string>(AUTO_DENIED_TOOL_NAMES)

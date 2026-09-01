@@ -89,6 +89,40 @@ function gitCredentialPassthroughEnabled(): boolean {
   return _gitPassthrough !== false
 }
 
+/**
+ * Operator-supplied env allowlist, from `sandbox.envAllowlist` and the `env`
+ * field of `sandbox.toolAccess` presets. Injected the same lazy way as the git
+ * passthrough switch above, for the same reason.
+ *
+ * WHY THIS EXISTS: GIT_CREDENTIAL_ALLOWLIST is four hardcoded names with a
+ * single boolean switch. `GH_ENTERPRISE_TOKEN` matches SENSITIVE_ENV_PATTERN's
+ * `TOKEN$` and is not on that list, so before this hook there was NO
+ * configuration — none — that let it reach a child. The operator's only
+ * recourse was patching this file.
+ *
+ * WHAT IT DELIBERATELY CANNOT DO: unlock EXPLICIT_ENV_BLOCKLIST. The suffix
+ * pattern is an over-matching heuristic whose false positives need an escape
+ * hatch; the blocklist is a precise inventory of known credentials, and an
+ * escape hatch for it would turn this feature into the exfiltration bypass the
+ * 'filtered' policy exists to prevent. See `isBlockedEnvName`, which is the one
+ * gate both this module and the preset expander check.
+ */
+let _envAllowlist: ReadonlySet<string> = new Set()
+export function setEnvAllowlist(names: readonly string[] | undefined): void {
+  _envAllowlist = new Set(names ?? [])
+}
+
+/**
+ * True when `name` is a known credential that no operator config may forward.
+ *
+ * Exported so `sandbox/toolAccessPresets.ts` can report a blocked variable at
+ * config-resolution time instead of letting it fail silently at spawn time —
+ * the operator needs to learn WHY their npm auth still does not work.
+ */
+export function isBlockedEnvName(name: string): boolean {
+  return EXPLICIT_ENV_BLOCKLIST.has(name)
+}
+
 const MINIMAL_ENV_KEYS = [
   'PATH', 'HOME', 'USER', 'LOGNAME', 'LANG', 'LC_ALL', 'TZ', 'SHELL',
   'TMPDIR', 'TEMP', 'TMP',
@@ -127,7 +161,13 @@ export function buildChildEnv(
       // Git remote credentials are allowed through (see GIT_CREDENTIAL_ALLOWLIST):
       // checked first so the blocklist / sensitive-pattern below cannot strip them.
       const gitAllowed = GIT_CREDENTIAL_ALLOWLIST.has(key) && gitCredentialPassthroughEnabled()
-      if (!gitAllowed) {
+      // Operator allowlist (sandbox.envAllowlist / toolAccess presets). The
+      // blocklist check is folded into the condition itself rather than left to
+      // the branch below, so the §5.1 boundary — operator config may override
+      // the heuristic, never the known-credential inventory — is visible at the
+      // one place it is decided.
+      const operatorAllowed = _envAllowlist.has(key) && !isBlockedEnvName(key)
+      if (!gitAllowed && !operatorAllowed) {
         if (EXPLICIT_ENV_BLOCKLIST.has(key)) continue
         // The suffix pattern deliberately over-matches (it must cover providers
         // we have never heard of), so named non-credentials are exempted.

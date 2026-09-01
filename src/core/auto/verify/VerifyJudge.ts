@@ -330,7 +330,12 @@ function sleep(ms: number, signal: AbortSignal): Promise<void> {
   if (signal.aborted) return Promise.resolve()
   return new Promise(resolve => {
     const timer = setTimeout(done, ms)
-    timer.unref?.()
+    // Keep this timer referenced. runJudge() is the foreground work of a
+    // one-shot auto-scheduler, and the judge runner may release its final
+    // referenced handle immediately after persisting the terminal record. If
+    // this polling timer is unref'ed at that exact boundary, Node can exit with
+    // code 0 before the next poll observes the verdict. The scheduler then
+    // never releases its wake and it eventually appears as STALE-CLAIM.
     function done(): void {
       clearTimeout(timer)
       signal.removeEventListener('abort', done)

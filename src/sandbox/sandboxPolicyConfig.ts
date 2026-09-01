@@ -11,6 +11,9 @@
  *
  *   {
  *     "sandbox": {
+ *       "toolAccess": ["gh", "git"],
+ *       "envAllowlist": ["GH_ENTERPRISE_TOKEN"],
+ *       "modes": { "auto": { "toolAccess": ["git"] } },
  *       "writeAllowPaths": ["~/scratch", "/data/shared"],
  *       "readAllowPaths":  ["~/datasets", "/opt/models"],
  *       "writeDenyPaths":  ["/data/shared/golden"],
@@ -23,6 +26,18 @@
  *
  * Semantics
  * ---------
+ *   toolAccess       Capability presets (see toolAccessPresets.ts). One name
+ *                    expands into read/write/env/network grants, so an operator
+ *                    states the INTENT ("gh should work") instead of rederiving
+ *                    which three config keys that intent needs.
+ *   envAllowlist     Extra env var names allowed past the 'filtered' policy.
+ *                    Cannot unlock EXPLICIT_ENV_BLOCKLIST — see childProcessEnv.
+ *   modes            Per-mode overrides. A field present under
+ *                    `modes.<mode>` REPLACES the top-level field of the same
+ *                    name for that mode; absent fields inherit. Overrides may
+ *                    only widen within the autonomy floor — they can never
+ *                    unlock `lockWorkspace` (that lives in PermissionPolicy and
+ *                    reads no config).
  *   writeAllowPaths  Readable AND writable outside the workspace. Write implies
  *                    read: a directory you can write but not read is useless.
  *   readAllowPaths   Readable only. Use for datasets, model weights, reference
@@ -38,6 +53,14 @@
  *   allowUnsandboxedFallback
  *                    Whether to degrade to plain `bash -c` on a host with no
  *                    sandbox backend. Auto modes force this to false regardless.
+ *
+ * Diagnostics
+ * -----------
+ * Every entry this resolver drops — a path that does not exist, an unknown
+ * preset, a blocklisted env var, a credential default lifted by an explicit
+ * grant — is recorded in `diagnostics`. Dropping is often correct; dropping
+ * SILENTLY is what left operators unable to tell "my config never loaded" from
+ * "my config loaded and the tool is still broken". `sandbox_probe` renders it.
  *
  * Precedence when a path appears in both an allow and a deny list: the OPERATOR'S
  * OWN allow wins over the credential DEFAULTS (that is the documented way to
@@ -57,6 +80,8 @@ import { existsSync } from 'fs'
 import { homedir } from 'os'
 import { isAbsolute, resolve, relative, sep } from 'path'
 import { getValue as getConfigValue } from '../core/config/ConfigService.js'
+import { expandToolAccess, type ToolAccessName } from './toolAccessPresets.js'
+import { isBlockedEnvName } from '../infra/env/childProcessEnv.js'
 import type { SandboxConfig } from './types.js'
 
 /**
@@ -91,6 +116,19 @@ export const DEFAULT_CREDENTIAL_DENY_PATHS: readonly string[] = [
   '~/Library/Keychains',
 ]
 
+export type SandboxDiagnosticKind =
+  | 'dropped-path'
+  | 'dropped-preset'
+  | 'blocked-env'
+  | 'credential-deny-lifted'
+  | 'malformed-config'
+
+export interface SandboxDiagnostic {
+  kind: SandboxDiagnosticKind
+  subject: string
+  detail: string
+}
+
 export interface ResolvedSandboxPolicy {
   /** External roots that are readable and writable. */
   writeAllowPaths: string[]
@@ -106,6 +144,16 @@ export interface ResolvedSandboxPolicy {
    * a legal cwd.
    */
   allowedRoots: string[]
+  /**
+   * Env var names allowed past the 'filtered' child-env policy, from
+   * `sandbox.envAllowlist` plus the `env` field of every granted preset.
+   * Feeds `setEnvAllowlist`. Never contains a blocklisted name.
+   */
+  envAllowlist: string[]
+  /** Presets that actually took effect, after autonomy narrowing. */
+  toolAccess: ToolAccessName[]
+  /** Everything dropped or lifted while resolving. Never a reason to fail. */
+  diagnostics: SandboxDiagnostic[]
 }
 
 /** Expand `~`, resolve to absolute. Returns null for a non-absolute result. */
@@ -120,21 +168,84 @@ export function expandHostPath(value: string): string | null {
   return resolve(path)
 }
 
-function readPathList(key: string, projectDir: string | undefined): string[] {
-  let raw: unknown
-  try {
-    raw = getConfigValue(key, projectDir ? { projectDir } : {})
-  } catch {
-    return []
+/**
+ * Read `sandbox.<field>`, letting `sandbox.modes.<mode>.<field>` replace it.
+ *
+ * REPLACE, not merge: an operator writing `modes.auto.toolAccess: ["git"]` is
+ * saying "under auto, only git" — silently unioning the top-level list back in
+ * would grant exactly what they were trying to withhold. Absent fields inherit.
+ */
+function readSandboxField(
+  field: string,
+  projectDir: string | undefined,
+  mode: string | undefined,
+): { value: unknown; fromMode: boolean } {
+  const opts = projectDir ? { projectDir } : {}
+  if (mode) {
+    try {
+      const scoped = getConfigValue(`sandbox.modes.${mode}.${field}`, opts)
+      if (scoped !== undefined) return { value: scoped, fromMode: true }
+    } catch {
+      /* fall through to the top-level field */
+    }
   }
+  try {
+    return { value: getConfigValue(`sandbox.${field}`, opts), fromMode: false }
+  } catch {
+    return { value: undefined, fromMode: false }
+  }
+}
+
+/** Coerce a config value to a string[]; anything else yields []. */
+function asStringList(raw: unknown): string[] {
   if (!Array.isArray(raw)) return []
   const out: string[] = []
   for (const entry of raw) {
     if (typeof entry !== 'string') continue
+    const trimmed = entry.trim()
+    if (trimmed && !out.includes(trimmed)) out.push(trimmed)
+  }
+  return out
+}
+
+function readPathList(
+  field: string,
+  projectDir: string | undefined,
+  mode?: string,
+): string[] {
+  const { value } = readSandboxField(field, projectDir, mode)
+  const out: string[] = []
+  for (const entry of asStringList(value)) {
     const path = expandHostPath(entry)
     if (path && !out.includes(path)) out.push(path)
   }
   return out
+}
+
+/**
+ * Existence-filter that records what it drops.
+ *
+ * Bind-mount sources must exist on the host (bwrap fails the whole command on a
+ * missing `--bind` source), so dropping is the correct behaviour and is
+ * unchanged. What is new is that the operator can now find out it happened.
+ */
+function filterExisting(
+  paths: readonly string[],
+  field: string,
+  diagnostics: SandboxDiagnostic[],
+): string[] {
+  const kept: string[] = []
+  for (const path of paths) {
+    if (existsSync(path)) kept.push(path)
+    else {
+      diagnostics.push({
+        kind: 'dropped-path',
+        subject: path,
+        detail: `sandbox.${field}: path does not exist on this host; grant ignored.`,
+      })
+    }
+  }
+  return kept
 }
 
 /** Segment-wise containment, so `/data/shared-backup` is not "under" `/data/shared`. */
@@ -152,42 +263,135 @@ function isUnder(path: string, root: string): boolean {
  * shell call. Dropping a non-existent DENY path is safe by definition: there is
  * nothing there to protect.
  */
-export function resolveSandboxPolicy(projectDir?: string): ResolvedSandboxPolicy {
-  const writeAllow = readPathList('sandbox.writeAllowPaths', projectDir).filter(existsSync)
-  const readAllow = readPathList('sandbox.readAllowPaths', projectDir).filter(existsSync)
-  const writeDeny = readPathList('sandbox.writeDenyPaths', projectDir).filter(existsSync)
-  const explicitReadDeny = readPathList('sandbox.readDenyPaths', projectDir).filter(existsSync)
+export function resolveSandboxPolicy(
+  projectDir?: string,
+  mode?: string,
+): ResolvedSandboxPolicy {
+  const diagnostics: SandboxDiagnostic[] = []
+
+  // ── toolAccess presets ──────────────────────────────────────────────────────
+  // Expanded first so their paths join the allow lists BEFORE the credential
+  // defaults are computed: every preset except `git` targets a directory in
+  // DEFAULT_CREDENTIAL_DENY_PATHS (~/.config/gh, ~/.aws, ~/.kube, ~/.npmrc,
+  // ~/.docker/config.json), and the "explicit grant lifts the default deny"
+  // rule below is what makes `toolAccess: ["gh"]` actually work.
+  const rawToolAccess = readSandboxField('toolAccess', projectDir, mode)
+  const expanded = expandToolAccess(asStringList(rawToolAccess.value), {
+    autonomous: mode === 'auto' || mode === 'simple_auto',
+    explicitForMode: rawToolAccess.fromMode,
+  })
+  for (const drop of expanded.dropped) {
+    diagnostics.push({
+      kind: drop.reason === 'env-blocklisted' ? 'blocked-env' : 'dropped-preset',
+      subject: drop.subject,
+      detail: drop.detail,
+    })
+  }
+
+  const presetRead = expanded.read
+    .map(expandHostPath)
+    .filter((p): p is string => p !== null)
+  const presetWrite = expanded.write
+    .map(expandHostPath)
+    .filter((p): p is string => p !== null)
+
+  const writeAllow = filterExisting(
+    [...new Set([...readPathList('writeAllowPaths', projectDir, mode), ...presetWrite])],
+    'writeAllowPaths', diagnostics,
+  )
+  const readAllow = filterExisting(
+    [...new Set([...readPathList('readAllowPaths', projectDir, mode), ...presetRead])],
+    'readAllowPaths', diagnostics,
+  )
+  const writeDeny = filterExisting(
+    readPathList('writeDenyPaths', projectDir, mode), 'writeDenyPaths', diagnostics,
+  )
+  const explicitReadDeny = filterExisting(
+    readPathList('readDenyPaths', projectDir, mode), 'readDenyPaths', diagnostics,
+  )
 
   let protectCredentials = true
   let network: 'none' | 'unrestricted' | undefined
   let allowUnsandboxedFallback: boolean | undefined
   try {
-    const opts = projectDir ? { projectDir } : {}
-    const rawProtect = getConfigValue('sandbox.protectCredentials', opts)
+    const rawProtect = readSandboxField('protectCredentials', projectDir, mode).value
     if (typeof rawProtect === 'boolean') protectCredentials = rawProtect
-    const rawNetwork = getConfigValue('sandbox.network', opts)
+    const rawNetwork = readSandboxField('network', projectDir, mode).value
     if (rawNetwork === 'none' || rawNetwork === 'unrestricted') network = rawNetwork
-    const rawFallback = getConfigValue('sandbox.allowUnsandboxedFallback', opts)
+    const rawFallback = readSandboxField('allowUnsandboxedFallback', projectDir, mode).value
     if (typeof rawFallback === 'boolean') allowUnsandboxedFallback = rawFallback
   } catch {
     /* malformed config — fall back to the safe defaults above */
+  }
+
+  // A preset declaring `network: 'unrestricted'` states a REQUIREMENT, it does
+  // not override an operator or tool that asked for 'none' (applySandboxPolicy
+  // keeps 'none' sticky). Record the conflict so "I enabled toolAccess:gh but
+  // it still cannot reach the network" is answerable.
+  if (expanded.network === 'unrestricted') {
+    if (network === 'none') {
+      diagnostics.push({
+        kind: 'malformed-config',
+        subject: 'network',
+        detail:
+          `toolAccess [${expanded.granted.join(', ')}] needs network egress, but ` +
+          "sandbox.network is 'none'. 'none' wins; these tools will fail to reach the network.",
+      })
+    } else if (network === undefined) {
+      network = 'unrestricted'
+    }
   }
 
   // Credential defaults are a FLOOR, not a ceiling: an operator who explicitly
   // grants ~/.aws in readAllowPaths has opted in, so that grant is honoured and
   // the corresponding default deny is dropped. An explicit readDenyPaths entry
   // is never dropped.
-  const credentialDeny = protectCredentials
-    ? DEFAULT_CREDENTIAL_DENY_PATHS
-        .map(expandHostPath)
-        .filter((p): p is string => p !== null && existsSync(p))
-        .filter(denied => ![...writeAllow, ...readAllow].some(granted =>
-          isUnder(denied, granted) || isUnder(granted, denied),
-        ))
-    : []
+  const credentialDeny: string[] = []
+  if (protectCredentials) {
+    for (const raw of DEFAULT_CREDENTIAL_DENY_PATHS) {
+      const denied = expandHostPath(raw)
+      if (denied === null || !existsSync(denied)) continue
+      const granted = [...writeAllow, ...readAllow].find(
+        g => isUnder(denied, g) || isUnder(g, denied),
+      )
+      if (granted === undefined) {
+        credentialDeny.push(denied)
+        continue
+      }
+      diagnostics.push({
+        kind: 'credential-deny-lifted',
+        subject: denied,
+        detail:
+          `Default credential protection removed because "${granted}" was ` +
+          'explicitly granted (toolAccess preset or writeAllow/readAllowPaths). ' +
+          'The sandboxed shell can now read it.',
+      })
+    }
+  }
 
   const readDeny = [...new Set([...credentialDeny, ...explicitReadDeny])]
   const allowedRoots = [...new Set([...writeAllow, ...readAllow])]
+
+  // Operator escape hatch, unioned with the preset env sets. Blocklisted names
+  // are stripped here as well as in childProcessEnv — belt and braces, and it
+  // keeps `policy.envAllowlist` honest for anything that reads it directly.
+  const envAllowlist: string[] = []
+  for (const name of [
+    ...asStringList(readSandboxField('envAllowlist', projectDir, mode).value),
+    ...expanded.env,
+  ]) {
+    if (isBlockedEnvName(name)) {
+      diagnostics.push({
+        kind: 'blocked-env',
+        subject: name,
+        detail:
+          'On the explicit credential blocklist; no operator config may forward it. ' +
+          'Pass it to one specific child via an mcp.json env entry instead.',
+      })
+      continue
+    }
+    if (!envAllowlist.includes(name)) envAllowlist.push(name)
+  }
 
   return {
     writeAllowPaths: writeAllow,
@@ -197,6 +401,9 @@ export function resolveSandboxPolicy(projectDir?: string): ResolvedSandboxPolicy
     network,
     allowUnsandboxedFallback,
     allowedRoots,
+    envAllowlist,
+    toolAccess: expanded.granted,
+    diagnostics,
   }
 }
 
