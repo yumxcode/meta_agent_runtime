@@ -165,3 +165,41 @@ describe('backends honour read grants and denies', () => {
     expect(args.join(' ')).toContain('--bind-try /data/scratch /data/scratch')
   })
 })
+
+/**
+ * Regression: a deny NESTED under a grant used to be dropped by both backends,
+ * so this config —
+ *
+ *   readAllowPaths: ["~/.ssh"]          (needed for known_hosts)
+ *   readDenyPaths:  ["~/.ssh/id_ed25519"]
+ *
+ * — read like a precise carve-out and produced a fully readable ~/.ssh. It
+ * also contradicted sandboxPolicyConfig's documented precedence ("an
+ * operator's explicit deny always wins over an operator's allow").
+ */
+describe('an explicit deny nested under a grant survives', () => {
+  const nested: SandboxConfig = {
+    readAllowPaths: ['/home/u/.ssh'],
+    readDenyPaths: ['/home/u/.ssh/id_ed25519'],
+  }
+
+  it('seatbelt still denies the key', () => {
+    expect(buildMacOSProfile(nested, '/ws')).toContain('/home/u/.ssh/id_ed25519')
+  })
+
+  it('bwrap still shadows the key', () => {
+    expect(buildBwrapArgs(nested, '/ws').join(' ')).toContain('--tmpfs /home/u/.ssh/id_ed25519')
+  })
+
+  it('an EXACT overlap is still treated as the caller contradicting itself', () => {
+    // Unchanged behaviour: naming the same path in both lists is not a
+    // carve-out, and resolveSandboxPolicy has already applied the one rule
+    // where an allow legitimately cancels a deny (credential DEFAULTS).
+    const exact: SandboxConfig = {
+      readAllowPaths: ['/home/u/.aws'],
+      readDenyPaths: ['/home/u/.aws'],
+    }
+    expect(buildMacOSProfile(exact, '/ws')).not.toContain('(deny file-read*')
+    expect(buildBwrapArgs(exact, '/ws').join(' ')).not.toContain('--tmpfs /home/u/.aws')
+  })
+})

@@ -66,4 +66,36 @@ describe('managed task activity parsing', () => {
     const feed = await readTaskActivityLog(path)
     expect(feed.entries).toEqual([{ kind: 'agent', text: 'complete' }])
   })
+
+  // ── non-JSON lines ──────────────────────────────────────────────────────────
+  //
+  // The worker's stdout AND stderr share this file with the NDJSON event log
+  // (`stdio: ['ignore', logFd, logFd]`), so raw text lines are expected, not
+  // exceptional. Every one of them used to render as a red ✗.
+  describe('raw stdio lines are not automatically errors', () => {
+    it('shows the sandbox-active notice as status, not error', () => {
+      const feed = parseTaskActivityLog(
+        '[meta-agent/sandbox:subtask-a8a79c4c] sandbox active — macos/sandbox-exec workspace=/ws\n',
+      )
+      expect(feed.entries[0]?.kind).toBe('status')
+    })
+
+    it('shows the credential-deny-lifted warning as status, not error', () => {
+      const feed = parseTaskActivityLog(
+        '[sandbox] credential-deny-lifted: /Users/u/.config/gh — Default credential protection removed.\n',
+      )
+      expect(feed.entries[0]?.kind).toBe('status')
+    })
+
+    it('still surfaces unrecognised output, as a warning rather than silence', () => {
+      const feed = parseTaskActivityLog('TypeError: undefined is not a function\n')
+      expect(feed.entries[0]?.kind).toBe('warning')
+      expect(feed.entries[0]?.text).toContain('TypeError')
+    })
+
+    it('does not let a bracketed prefix in ordinary text pass as a notice', () => {
+      const feed = parseTaskActivityLog('[worker] something exploded\n')
+      expect(feed.entries[0]?.kind).toBe('warning')
+    })
+  })
 })

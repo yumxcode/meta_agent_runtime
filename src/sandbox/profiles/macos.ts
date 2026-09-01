@@ -141,12 +141,25 @@ export function buildMacOSProfile(
   // list by default: without it a sandboxed shell can read ~/.ssh and ~/.aws
   // and — since `network` is unrestricted unless the operator says otherwise —
   // send them anywhere.
+  // An explicit deny WINS over an explicit allow, including when the deny names
+  // a path underneath the grant. This is the precedence sandboxPolicyConfig's
+  // header documents ("an operator's explicit deny always wins over an
+  // operator's allow"), and until now this builder implemented the opposite.
+  //
+  // The bug that motivated the fix: granting `~/.ssh` (needed for known_hosts)
+  // and denying `~/.ssh/id_ed25519` silently dropped the key's deny, because
+  // the key is under the grant. The operator saw a config that reads like a
+  // precise carve-out and got a fully readable `~/.ssh`.
+  //
+  // Only an EXACT overlap is skipped: the same path in both lists is a caller
+  // contradiction rather than a carve-out, and resolveSandboxPolicy has already
+  // resolved the one case where an allow legitimately cancels a deny (a
+  // credential DEFAULT yielding to an operator grant — those paths never reach
+  // this builder in readDenyPaths at all). Anything still denied here was
+  // denied on purpose.
   const readAllow = config.readAllowPaths ?? []
   const denyRead = (config.readDenyPaths ?? []).filter(
-    // An explicit read grant wins over a deny. Seatbelt takes the LAST matching
-    // rule, so we could also emit an allow after the deny; filtering instead
-    // keeps the generated profile honest about what it enforces.
-    p => !readAllow.some(granted => granted === p || p.startsWith(`${granted}/`)),
+    p => !readAllow.includes(p),
   )
   if (denyRead.length > 0) {
     lines.push(';; Caller-specified read-deny paths (credentials, secrets).')

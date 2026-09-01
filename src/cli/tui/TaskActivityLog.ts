@@ -30,6 +30,14 @@ export interface TaskActivityFeed {
   error?: string
 }
 
+/**
+ * Bracketed prefixes this runtime writes to stdout/stderr as plain text rather
+ * than as NDJSON events (`[sandbox] …`, `[meta-agent/sandbox:<id>] …`). Matching
+ * on our OWN prefixes keeps the classification a fact rather than a heuristic
+ * about arbitrary child output.
+ */
+const RUNTIME_NOTICE_PREFIX = /^\[(?:sandbox\]|meta-agent[/\]:])/
+
 const DEFAULT_TAIL_BYTES = 128 * 1024
 const MAX_ENTRIES = 120
 const MAX_AGENT_CHARS = 4_000
@@ -108,7 +116,21 @@ export function parseTaskActivityLog(raw: string, truncated = false): TaskActivi
       if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) throw new Error('not an event')
       event = parsed as Record<string, unknown>
     } catch {
-      push('error', line, 500)
+      // Not an NDJSON event. The worker is spawned with
+      // `stdio: ['ignore', logFd, logFd]`, so this file is a MIXED stream: the
+      // kernel's event log plus whatever the child wrote to stdout/stderr
+      // directly. A raw line therefore carries no evidence of severity, and
+      // classifying every one as `error` painted the TUI red for two entirely
+      // normal notices — `[meta-agent/sandbox:…] sandbox active — …` on every
+      // sub-agent start, and `[sandbox] credential-deny-lifted: …` on every
+      // session start. Red that appears when nothing is wrong stops meaning
+      // anything.
+      //
+      // Runtime notices are recognised by their own bracketed prefix (we own
+      // those strings, so this is not a guess about foreign output) and shown
+      // as status. Everything else stays visible as a warning rather than
+      // silently blending in — an unparsed line could still be a stack trace.
+      push(RUNTIME_NOTICE_PREFIX.test(line) ? 'status' : 'warning', line, 500)
       continue
     }
 

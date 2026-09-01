@@ -165,6 +165,20 @@ export interface ToolAccessPreset {
 | `kubectl` | `~/.kube/config` | `~/.kube/cache` | `KUBECONFIG` `KUBE_CONTEXT` `KUBERNETES_SERVICE_*` | `unrestricted` |
 | `aws` | `~/.aws` | `~/.aws/cli/cache` | `AWS_PROFILE` `AWS_REGION` `AWS_DEFAULT_REGION` `AWS_CONFIG_FILE` `AWS_SHARED_CREDENTIALS_FILE` | `unrestricted` |
 | `npm` | `~/.npmrc` | `~/.npm/_cacache` | `NPM_TOKEN` `NPM_CONFIG_REGISTRY` `NPM_CONFIG_USERCONFIG` | `unrestricted` |
+| `keychain` | `~/Library/Keychains` | — | （无） | — |
+
+**`keychain` 预设**（2026-09-01 追加，回填 §9.1/§9.2）
+
+macOS 上 `gh auth login` 默认把 token 存 login keychain 而非 hosts.yml（"keyring" 模式）。此时沙箱里的 `gh` 能正常读到 `~/.config/gh/hosts.yml`，但里面没有 `oauth_token`，于是回退匿名——**看起来配置齐全，写操作照样 401**。挡路的是 `~/Library/Keychains`，它在 `DEFAULT_CREDENTIAL_DENY_PATHS`（`sandboxPolicyConfig.ts:116`）。
+
+这是**唯一一条纯配置就能取到 keyring 凭证的路径**。它与 §9.1 的 env 注入方案互斥，且论安全性更优：token 始终留在 keychain，securityd 仍在这层文件授权之上逐条执行 item ACL，不像 `export GH_TOKEN` 会把裸 token 交给会话的每一个后代进程。
+
+代价是它是本表中**最宽的一条授权**：login keychain 装着用户存过的所有密钥，不只是 GitHub token。因此：
+
+- 独立命名而不并入 `gh`，使 `sandbox_probe` 能把它单独列一行
+- 只读，不给写——沙箱会话不应改写 keychain
+- 无 `env` 字段，无 `network`：整条设计的前提就是凭证不经过环境变量
+- 列入 `AUTONOMOUS_RESTRICTED`（理由是**触及范围**而非破坏力：它是唯一会暴露与本会话无关的其他应用密钥的授权）
 
 **关于预设的四条设计约束：**
 
@@ -214,6 +228,7 @@ const allowOutsideWorkspace =
 - `aws`（`~/.aws` 是长期凭证，无人值守下被误用的代价最高）
 - `docker`（`DOCKER_HOST` 可指向远端 daemon，等价于宿主机 root）
 - `kubectl`（同上，集群级副作用）
+- `keychain`（触及范围：会暴露与本会话无关的其他应用密钥）
 
 `gh` / `git` / `npm` 在 autonomous 下随顶层配置生效——它们的副作用范围与既有的 `gitCredentialPassthrough` 默认开启的风险等级相当，不额外收窄。
 
@@ -322,11 +337,15 @@ env 被拒绝: (无)
 
 在它落地前，operator 侧的缓解措施是使用最小 scope 的 PAT（`gh` dispatch 只需 `actions:write`，private repo 另加 `repo`），而非完整 scope 的 token。
 
-**9.2 macOS keychain 在沙箱子进程中的可用性未经实测。**
+**9.2 macOS keychain 在沙箱子进程中的可用性 —— 已实测，结论：可用。**（2026-09-01 回填）
 
-Seatbelt profile 以 `(allow default)` 开头且不含任何 mach 相关 deny（`sandbox/profiles/macos.ts:76-84`），理论上 `mach-lookup` 到 `com.apple.SecurityServer` 是通的。但 keychain item ACL 绑定调用方代码签名，`sandbox-exec` 下的行为需要在真机上验证。
+真机验证（macOS，gh 2.73.0，robotics 模式）：配置 `toolAccess: ["gh","git","keychain"]` 后，沙箱内 `gh auth status` 返回 `✓ Logged in to github.com`，token 携带完整 `repo` / `workflow` scope，`gh api` 正常工作。
 
-若实测可用，`gh` 预设可以不依赖 §9.1 的 env 注入，直接走 keychain——那会是明显更好的方案。**建议在实现前先用 `sandbox_probe` 打一次实测**，结论回填本节。
+**结论：不需要任何 mach-lookup 规则。** Seatbelt 的 `(allow default)` 基座本就放行到 `com.apple.SecurityServer` 的 Mach IPC，securityd 通路一直是通的；唯一的拦路石是 `~/Library/Keychains` 落在 `DEFAULT_CREDENTIAL_DENY_PATHS` 里被 read-deny。解除它，keychain 即可读，item ACL 未对 `sandbox-exec` 下的调用方产生额外阻拦。
+
+这条实测把 §9.1 从「必须解决」降级为「可选」：**keyring 模式下的凭证注入问题已由 `keychain` 预设纯配置解决**，无需 env 转发。§9.1 的 credential helper / `GIT_ASKPASS` 方案仍是更精细的形态（把凭证交给单次调用而非整个进程树），但不再是 gh 可用性的前置条件。
+
+顺带证伪了排查期间的两条误判，均记录在案以免重复：DBUS 探针（Linux 机制，macOS 上恒为空）；以及一条把 `security` 的报错文本当成 token 长度来量的探针（`2>&1` 把 stderr 折进了被测字符串）。两者都指向同一个缺失——运行时没有可信自省接口，即 §6.5 `sandbox_probe` 存在的理由。
 
 **9.3 `CampaignSession` 与 `spawn_sub_agent` 的继承路径未核实。**
 

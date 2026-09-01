@@ -1715,8 +1715,11 @@ export async function runRepl(opts: CliOptions): Promise<void> {
       router.mode === 'robotics' && !opts.hardwareId && !hardwareBindingPrompted
     ) {
       hardwareBindingPrompted = true
+      // Wording: "模式已激活" read as though robotics had just been switched on,
+      // which is confusing when it appears after a turn has already run in
+      // robotics mode. The actual condition is "in robotics, nothing bound yet".
       console.log(
-        `\n${c.magenta}robotics${c.reset} 模式已激活，请绑定硬件配置以优化后续回复。\n`,
+        `\n${c.magenta}robotics${c.reset} 模式尚未绑定硬件配置，绑定后续回复将包含硬件上下文。\n`,
       )
       const hp = new HardwareProfile()
       const selected = await runWizard(() => selectHardwareProfile(hp, opts.workspace, rl))
@@ -1725,12 +1728,42 @@ export async function runRepl(opts: CliOptions): Promise<void> {
       if (hardwareProfileText) {
         await persistCurrentSession(input)
         opts.mode = 'robotics'
+        // Carry the live conversation AND the session id into the rebuilt
+        // router.
+        //
+        // Rebuilding is how the hardware profile reaches the system prompt, but
+        // this prompt appears unbidden after the first turn has already run. It
+        // previously passed `undefined` for initialMessages and no
+        // resumeSessionId, so answering it silently discarded the whole
+        // conversation — including the turn that had just been paid for — while
+        // the confirmation below reported only that hardware was bound. The
+        // explicit hardware-change command elsewhere in this REPL does the same
+        // rebuild but announces "新会话已启动"; here nothing said so.
+        //
+        // resumeSessionId matters independently: persistSessionSnapshot keys the
+        // file by router.getSessionId(), so a fresh id would split one
+        // conversation across two session files. This mirrors the resume wiring
+        // where the REPL's first router is built.
+        // Copied: getMessages() hands back a readonly view over the router's
+        // own buffer, and the router is disposed on the next line.
+        const carried = [...router.getMessages()]
+        const carriedSessionId = router.getSessionId()
         await router.dispose().catch(() => undefined)
-        router = makeRouter(opts, hardwareProfileText, rl, undefined, getCurrentRouter, _promptLineInline)
-        savedMessageCount = 0
+        router = makeRouter(
+          opts,
+          hardwareProfileText,
+          rl,
+          carried.length > 0 ? carried : undefined,
+          getCurrentRouter,
+          _promptLineInline,
+          carriedSessionId,
+        )
+        // Matches what persistCurrentSession just wrote, so the next append
+        // continues the file instead of re-appending from zero.
+        savedMessageCount = carried.length
       }
       if (opts.hardwareId) {
-        console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定，后续回复将包含硬件上下文。\n`))
+        console.log(green(`✓ 硬件配置 "${opts.hardwareId}" 已绑定，对话上下文已保留。\n`))
       }
     }
 

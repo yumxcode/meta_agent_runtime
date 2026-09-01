@@ -22,6 +22,7 @@ import { resolveSandboxPolicy, applySandboxPolicy } from '../sandboxPolicyConfig
 import {
   expandToolAccess,
   TOOL_ACCESS_PRESETS,
+  TOOL_ACCESS_NAMES,
   AUTONOMOUS_RESTRICTED,
 } from '../toolAccessPresets.js'
 import {
@@ -272,8 +273,49 @@ describe('case 5: restricted presets need an explicit per-mode grant', () => {
     expect(resolveSandboxPolicy(projectDir, 'auto').toolAccess).toEqual(['git'])
   })
 
-  it('keeps docker and kubectl restricted alongside aws', () => {
-    expect([...AUTONOMOUS_RESTRICTED].sort()).toEqual(['aws', 'docker', 'kubectl'])
+  it('keeps docker, kubectl and keychain restricted alongside aws', () => {
+    expect([...AUTONOMOUS_RESTRICTED].sort()).toEqual(['aws', 'docker', 'keychain', 'kubectl'])
+  })
+})
+
+// ── keychain: the config-only route to a keyring-stored token ─────────────────
+
+describe('keychain preset', () => {
+  it('grants ~/Library/Keychains read and lifts its default deny', () => {
+    const keychains = makeHomePath('Library/Keychains')
+    writeProjectConfig({ toolAccess: ['gh', 'keychain'] })
+    const policy = resolveSandboxPolicy(projectDir, 'robotics')
+
+    expect(policy.toolAccess).toEqual(['gh', 'keychain'])
+    expect(policy.allowedRoots).toContain(keychains)
+    // ~/Library/Keychains is in DEFAULT_CREDENTIAL_DENY_PATHS; without the lift
+    // a keyring-mode `gh` reads hosts.yml fine, finds no token, and 401s.
+    expect(policy.readDenyPaths).not.toContain(keychains)
+  })
+
+  it('is read-only — a sandboxed session must not rewrite the keychain', () => {
+    const keychains = makeHomePath('Library/Keychains')
+    writeProjectConfig({ toolAccess: ['keychain'] })
+    const policy = resolveSandboxPolicy(projectDir, 'robotics')
+    expect(policy.writeAllowPaths).not.toContain(keychains)
+  })
+
+  it('forwards no environment variable at all', () => {
+    // The whole point of this preset is that no credential travels via env.
+    expect(TOOL_ACCESS_PRESETS.keychain.env).toBeUndefined()
+    expect(expandToolAccess(['keychain']).env).toEqual([])
+  })
+
+  it('needs an explicit per-mode grant under auto', () => {
+    makeHomePath('Library/Keychains')
+    writeProjectConfig({ toolAccess: ['keychain'] })
+    expect(resolveSandboxPolicy(projectDir, 'auto').toolAccess).toEqual([])
+
+    writeProjectConfig({
+      toolAccess: ['keychain'],
+      modes: { auto: { toolAccess: ['gh', 'keychain'] } },
+    })
+    expect(resolveSandboxPolicy(projectDir, 'auto').toolAccess).toEqual(['gh', 'keychain'])
   })
 })
 
@@ -433,5 +475,9 @@ describe('expandToolAccess', () => {
     for (const [name, preset] of Object.entries(TOOL_ACCESS_PRESETS)) {
       expect(preset.rationale, name).toBeTruthy()
     }
+  })
+
+  it('has a table entry for every declared name (and vice versa)', () => {
+    expect(Object.keys(TOOL_ACCESS_PRESETS).sort()).toEqual([...TOOL_ACCESS_NAMES].sort())
   })
 })

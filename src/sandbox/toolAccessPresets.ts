@@ -26,7 +26,9 @@
 
 import { isBlockedEnvName } from '../infra/env/childProcessEnv.js'
 
-export const TOOL_ACCESS_NAMES = ['gh', 'git', 'docker', 'kubectl', 'aws', 'npm'] as const
+export const TOOL_ACCESS_NAMES = [
+  'gh', 'git', 'docker', 'kubectl', 'aws', 'npm', 'keychain',
+] as const
 export type ToolAccessName = (typeof TOOL_ACCESS_NAMES)[number]
 
 export interface ToolAccessPreset {
@@ -112,6 +114,39 @@ export const TOOL_ACCESS_PRESETS: Record<ToolAccessName, ToolAccessPreset> = {
       'explicit blocklist and no operator config may forward them.',
   },
 
+  /**
+   * The OS credential store itself, not any one tool.
+   *
+   * WHY IT IS SEPARATE FROM `gh`: on macOS, `gh auth login` stores its token in
+   * the login keychain rather than in hosts.yml ("keyring" mode). A sandboxed
+   * `gh` then reads hosts.yml successfully, finds no oauth_token, and falls
+   * back to anonymous — so granting `~/.config/gh` alone produces a session
+   * that looks configured and still gets 401 on every write. `~/Library/
+   * Keychains` is in DEFAULT_CREDENTIAL_DENY_PATHS, which is what blocks it.
+   *
+   * This is the ONLY way to reach a keyring-stored credential from config
+   * alone. The alternative — exporting GH_TOKEN into the launching shell —
+   * forwards a bare token to every descendant of the session (see the residual
+   * risk note on GIT_CREDENTIAL_ALLOWLIST). This preset is arguably the safer
+   * of the two: the token stays in the keychain, and securityd still enforces
+   * per-item ACLs on top of this filesystem grant.
+   *
+   * But it is also the widest grant in this table. The login keychain holds
+   * every secret the user has ever saved, not just a GitHub token, which is
+   * why it is separately named (so `sandbox_probe` can show it as its own
+   * line) and why it is restricted under autonomous modes.
+   *
+   * No `env`: the entire point is that no credential passes through the
+   * environment. No `network`: the keychain is local.
+   */
+  keychain: {
+    read: ['~/Library/Keychains'],
+    rationale:
+      'macOS login keychain, for tools that store credentials there instead of ' +
+      'in a dotfile (gh in keyring mode, git-credential-osxkeychain). Grants the ' +
+      'whole keychain database, not one entry — securityd still applies per-item ACLs.',
+  },
+
   npm: {
     read: ['~/.npmrc'],
     write: ['~/.npm/_cacache'],
@@ -131,14 +166,20 @@ export const TOOL_ACCESS_PRESETS: Record<ToolAccessName, ToolAccessPreset> = {
  *
  * Same rationale as AUTO_DENIED_TOOL_NAMES in core/modes.ts: their effects
  * cannot be proven to stay inside the workspace. A remote docker daemon, a
- * kube cluster and a set of long-lived AWS keys are all host- or fleet-level
- * blast radius, and an unattended run has nobody to notice.
+ * kube cluster, a set of long-lived AWS keys and the OS keychain are all host-
+ * or fleet-level blast radius, and an unattended run has nobody to notice.
+ *
+ * `keychain` is here for reach rather than for blast radius: it is read-only
+ * and securityd still gates each item, but it is the one grant that exposes
+ * secrets belonging to applications that have nothing to do with this session.
  *
  * An operator who really wants them must repeat the name under
  * `sandbox.modes.<mode>.toolAccess` — a deliberate second act, not an
  * inherited default.
  */
-export const AUTONOMOUS_RESTRICTED: readonly ToolAccessName[] = ['aws', 'docker', 'kubectl']
+export const AUTONOMOUS_RESTRICTED: readonly ToolAccessName[] = [
+  'aws', 'docker', 'kubectl', 'keychain',
+]
 
 export type ToolAccessDropReason =
   | 'unknown-preset'

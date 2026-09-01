@@ -89,14 +89,20 @@ export function buildBwrapArgs(
   // ── Read-deny ─────────────────────────────────────────────────────────────
   // Mount a fresh tmpfs over each denied path, making it appear empty.
   //
-  // A path that is BOTH read-denied and explicitly read-granted is skipped: the
-  // operator's explicit grant wins. resolveSandboxPolicy() normally removes such
-  // overlaps before we get here, but a caller may hand-build a SandboxConfig, and
-  // silently shadowing a directory the caller just asked for would be worse than
-  // either honouring or rejecting it.
+  // An explicit deny WINS over an explicit allow, including when the deny names
+  // a path underneath the grant — matching the precedence sandboxPolicyConfig's
+  // header documents, and matching the Seatbelt builder. Both backends
+  // previously skipped a deny nested under a grant, so `readAllow: ["~/.ssh"]`
+  // plus `readDeny: ["~/.ssh/id_ed25519"]` left the key readable on either
+  // platform while reading like a precise carve-out.
+  //
+  // Only an EXACT overlap is skipped: the same path in both lists is a caller
+  // contradiction, not a carve-out, and resolveSandboxPolicy already resolved
+  // the legitimate "credential default yields to an operator grant" case before
+  // anything reaches here.
   const readAllow = config.readAllowPaths ?? []
   for (const p of config.readDenyPaths ?? []) {
-    if (readAllow.some(granted => granted === p || p.startsWith(`${granted}/`))) continue
+    if (readAllow.includes(p)) continue
     args.push('--tmpfs', p)
   }
 
