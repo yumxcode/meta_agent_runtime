@@ -13,6 +13,7 @@
  * an erase-to-end-of-line escape; it never prints a trailing newline, so the
  * caller wipes it (hide()) before writing real content.
  */
+import { displayWidth, clampWidth } from './textWidth.js'
 
 /** Spinner frames (Braille dots) cycled by tick(). */
 const SPINNER_FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'] as const
@@ -142,10 +143,16 @@ export class ThinkingMeter {
     // Truncate on the VISIBLE text, before colouring, so the cap counts
     // characters the terminal actually advances the cursor for — measuring the
     // coloured string would count escape bytes and truncate far too early.
+    //
+    // Measured in COLUMNS, not code units: the label is Chinese ("推理中"), and
+    // each of those glyphs advances the cursor twice while `String.length`
+    // counts it once. With the old `.length` test a line could pass the fit
+    // check and still wrap, and CLEAR_LINE erases exactly one row — so hide()
+    // left the wrapped tail on screen. See cli/textWidth.ts.
     const plain = `${spinner} ${label}`
     const limit = Math.max(1, this.columns() - WIDTH_MARGIN)
-    if (plain.length > limit) {
-      return `${CLEAR_LINE}${dim(plain.slice(0, limit))}`
+    if (displayWidth(plain) > limit) {
+      return `${CLEAR_LINE}${dim(clampWidth(plain, limit))}`
     }
     return `${CLEAR_LINE}${magenta(spinner)} ${dim(label)}`
   }

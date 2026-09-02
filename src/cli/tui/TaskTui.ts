@@ -7,6 +7,13 @@
  *     exit path unconditional — including `process.on('exit')`, because a crash
  *     that skips the teardown leaves the operator in a terminal with no cursor
  *     and no echo.
+ *     `process.on('exit')` alone is NOT unconditional: Node's DEFAULT action
+ *     for SIGTERM/SIGHUP/SIGQUIT is to terminate without running exit handlers,
+ *     so `kill <pid>`, a dropped SSH session, or a closed terminal emulator
+ *     used to leave the surviving shell in the alternate screen with raw mode
+ *     still on — no echo, no working Ctrl+C, recoverable only by `reset`. The
+ *     signals are therefore handled explicitly (see installExitHooks below);
+ *     cli/repl.ts has covered them for a while, this view had not caught up.
  *  2. RAW MODE SWALLOWS Ctrl+C. The tty stops turning `^C` into SIGINT and
  *     delivers byte 0x03 instead. It is handled as "quit" here, which is what
  *     the key means in a viewer.
@@ -28,9 +35,9 @@ import {
   applyTaskAction,
   type TaskActionKind,
 } from '../../core/auto/TaskActions.js'
-import { buildFrame, type FrameMode, type SelectedTaskActivity } from './frame.js'
+import { buildFrame, reportBodyLines, type FrameMode, type SelectedTaskActivity } from './frame.js'
 import { decodeKeys, type Key } from './keys.js'
-import type { TaskManager } from './TaskManager.js'
+import { resolveFinishedTaskActivity, type TaskManager } from './TaskManager.js'
 import { readTaskActivityLog } from './TaskActivityLog.js'
 
 const ENTER_ALT_SCREEN = '\x1b[?1049h\x1b[?25l'
@@ -80,6 +87,22 @@ export class TaskTui {
   private readonly onData = (chunk: Buffer): void => this.handleInput(chunk.toString('utf-8'))
   private readonly onResize = (): void => this.paint()
   private readonly onProcessExit = (): void => this.teardown()
+  /**
+   * Give the terminal back, then die with the conventional 128+signal code.
+   *
+   * Registering a handler at all is what makes this necessary: it REPLACES
+   * Node's default action, so the process would otherwise keep running with a
+   * half-torn-down view. Restore first, exit second — the ordering cli/repl.ts
+   * settled on for the same reason.
+   */
+  private readonly onFatalSignal = (signal: NodeJS.Signals, code: number): void => {
+    this.teardown()
+    this.resolveExit?.()
+    process.exit(code)
+  }
+  private readonly onSigTerm = (): void => this.onFatalSignal('SIGTERM', 143)
+  private readonly onSigHup  = (): void => this.onFatalSignal('SIGHUP', 129)
+  private readonly onSigInt  = (): void => this.onFatalSignal('SIGINT', 130)
 
   constructor(private readonly options: TaskTuiOptions = {}) {
     this.refreshMs = Math.max(200, options.refreshMs ?? 1_000)
@@ -95,6 +118,13 @@ export class TaskTui {
     process.stdin.on('data', this.onData)
     process.stdout.on('resize', this.onResize)
     process.on('exit', this.onProcessExit)
+    // SIGINT is here as a belt-and-braces measure only: in raw mode the tty
+    // delivers 0x03 as data (handled as "quit" by decodeKeys) and never raises
+    // the signal. It still matters if raw mode could not be entered — a piped
+    // or otherwise non-tty stdin — where Ctrl+C IS a signal.
+    process.on('SIGTERM', this.onSigTerm)
+    process.on('SIGHUP', this.onSigHup)
+    process.on('SIGINT', this.onSigInt)
 
     await this.options.manager?.start()
     if (!this.running) return
@@ -116,6 +146,9 @@ export class TaskTui {
     process.stdin.off('data', this.onData)
     process.stdout.off('resize', this.onResize)
     process.off('exit', this.onProcessExit)
+    process.off('SIGTERM', this.onSigTerm)
+    process.off('SIGHUP', this.onSigHup)
+    process.off('SIGINT', this.onSigInt)
     process.stdin.setRawMode?.(false)
     process.stdin.pause()
     process.stdout.write(LEAVE_ALT_SCREEN)
@@ -209,12 +242,52 @@ export class TaskTui {
         case 'filter': this.handleTextKey(key, 'filter'); break
         case 'steer': this.handleTextKey(key, 'steer'); break
         case 'confirm': this.handleConfirmKey(key); break
+        case 'report': this.handleReportKey(key); break
       }
     }
     // Cursor movement should switch the lower panel immediately instead of
     // leaving the previous task's output visible until the next 1s poll.
-    void this.refreshSelectedActivity()
+    //
+    // Not while reading the report: those keys scroll rather than select, and
+    // re-reading a 128 KB log tail on every arrow press buys nothing — the
+    // selection cannot change from in here, and the 1s poll keeps the content
+    // fresh anyway.
+    if (this.mode.kind !== 'report') void this.refreshSelectedActivity()
     this.paint()
+  }
+
+  /**
+   * Scroll the report. Movement keys only — every action key is deliberately
+   * inert here, because the report is a reading surface and the operator's
+   * hands are on the arrow keys, one row away from `D`.
+   */
+  private handleReportKey(key: Key): void {
+    if (key.name === 'escape' || key.ch === 'q') { this.mode = { kind: 'browse' }; return }
+    if (key.name === 'enter') { this.mode = { kind: 'browse' }; return }
+    const page = Math.max(1, (process.stdout.rows ?? 24) - 4)
+    const delta =
+      key.name === 'up' || key.ch === 'k' ? -1 :
+      key.name === 'down' || key.ch === 'j' ? 1 :
+      key.name === 'pageup' ? -page :
+      key.name === 'pagedown' ? page :
+      key.name === 'home' ? Number.NEGATIVE_INFINITY :
+      key.name === 'end' ? Number.POSITIVE_INFINITY : 0
+    if (delta === 0) return
+    this.mode = { kind: 'report', scroll: this.clampScroll(this.mode.kind === 'report' ? this.mode.scroll + delta : 0) }
+  }
+
+  /**
+   * Clamp against the REAL wrapped line count, using the same builder the frame
+   * renders with. Guessing here scrolls past the end and leaves the operator
+   * looking at a blank screen where the conclusion should be.
+   */
+  private clampScroll(next: number): number {
+    const task = this.filtered[this.selected]
+    if (!task) return 0
+    const width = Math.max(40, process.stdout.columns ?? 80)
+    const body = Math.max(1, (process.stdout.rows ?? 24) - 3)
+    const total = reportBodyLines(task, this.activity, width).length
+    return Math.max(0, Math.min(next, Math.max(0, total - body)))
   }
 
   private handleBrowseKey(key: Key): void {
@@ -223,6 +296,10 @@ export class TaskTui {
       this.clampSelection()
       this.status = undefined
     }
+    // The report is read-only and reversible, so it gets the unshifted key that
+    // "open this" means everywhere else. Nothing destructive is one keystroke
+    // away in report mode.
+    if (key.name === 'enter') { this.mode = { kind: 'report', scroll: 0 }; return }
     if (key.name === 'up' || key.ch === 'k') return move(-1)
     if (key.name === 'down' || key.ch === 'j') return move(1)
     if (key.name === 'pageup') return move(-10)
@@ -354,15 +431,30 @@ export class TaskTui {
   private async refreshSelectedActivity(paintWhenDone = true): Promise<void> {
     const version = ++this.activityReadVersion
     const task = this.filtered[this.selected]
-    const manager = this.options.manager
-    this.activity = undefined
-    if (!this.running || !task || !manager) {
+    // Drop the current feed only when it belongs to a DIFFERENT task. Clearing
+    // it unconditionally made every 1s poll blank the panel for the duration of
+    // the log read, which is invisible in a two-line panel and very visible in
+    // the full-screen report — the body collapsed and the scroll position
+    // snapped to the top mid-read.
+    const stale = this.activity && (
+      !task ||
+      this.activity.run.workspace !== task.workspace ||
+      this.activity.run.sessionId !== task.sessionId
+    )
+    if (stale) this.activity = undefined
+    if (!this.running || !task) {
+      this.activity = undefined
       if (paintWhenDone) this.paint()
       return
     }
 
-    const run = manager.activityFor(task)
+    // With a manager, its in-memory record wins — it knows about a turn that is
+    // running right now. Without one (bare `meta-agent tasks`), durable wake
+    // state still identifies the last finished turn's log, so the report is
+    // readable in both modes.
+    const run = this.options.manager?.activityFor(task) ?? resolveFinishedTaskActivity(task)
     if (!run) {
+      this.activity = undefined
       if (paintWhenDone) this.paint()
       return
     }

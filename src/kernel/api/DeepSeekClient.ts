@@ -31,6 +31,7 @@ import { withStreamWatchdog } from './StreamWatchdog.js'
 import { timeout } from '../../core/timeouts.js'
 import {
   isRetryableError,
+  retryAfterMsFromError,
   isPromptTooLongError,
   PromptTooLongError,
   AvailabilityFallbackTriggeredError,
@@ -308,7 +309,11 @@ export async function* streamDeepSeekMessages(
         attempt++
         const base = Math.min(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS)
         const jitter = Math.random() * 0.25 * base
-        const delayMs = Math.floor(base + jitter)
+        // Honour the server's `retry-after` when it is longer than our ladder —
+        // see the matching comment in AnthropicClient. Bounded by
+        // MAX_RETRY_AFTER_MS.
+        const serverHintMs = retryAfterMsFromError(error)
+        const delayMs = Math.max(Math.floor(base + jitter), serverHintMs ?? 0)
         onRetry?.(attempt, maxRetries, delayMs, getErrorStatus(error))
         const completed = await abortableSleep(delayMs, activeAbortSignal)
         if (!completed) {

@@ -41,6 +41,12 @@ export const yellow = (s: string): string => `${c.yellow}${s}${c.reset}`
 /** Strip control sequences from untrusted text before it reaches the terminal. */
 export const terminalText = (input: unknown): string => sanitizeTerminalText(input)
 
+// Terminal display width lives in ./textWidth.ts (a leaf below this one, so
+// every surface that truncates to the terminal width can reach it without an
+// import cycle). Re-exported so callers that already have `term` need only one
+// import.
+export { displayWidth, fit, clampWidth, wrapToWidth } from './textWidth.js'
+
 // ── Output ────────────────────────────────────────────────────────────────────
 
 /**

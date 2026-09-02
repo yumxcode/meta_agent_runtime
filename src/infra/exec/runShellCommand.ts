@@ -128,6 +128,22 @@ export function resolveJailedCwd(
 }
 
 /**
+ * Grace period between killing the process group and giving up on `close`.
+ *
+ * `close` fires only after every stdio stream has ended, which requires every
+ * holder of the inherited fds to be gone. A grandchild that escaped the group
+ * (`setsid`, a daemonising installer, `nohup`) keeps the pipe open forever, so
+ * without this second fuse the promise never settles and `timeoutMs` is
+ * decorative — the tool hangs, and with it the kernel loop.
+ *
+ * `exit` does not have that problem: it fires when the direct child terminates,
+ * regardless of who still holds the pipes. So after the kill we wait a short
+ * grace for the ordinary `close` (which carries the last buffered output) and
+ * otherwise settle from whatever `exit` reported.
+ */
+const POST_KILL_GRACE_MS = 3_000
+
+/**
  * Run `command` in its OWN PROCESS GROUP and, on timeout/abort, kill the whole
  * group (`kill(-pid)`), not just the direct child.
  *
@@ -171,7 +187,34 @@ function runProcessGroup(
     const outDecoder = new StringDecoder('utf8')
     const errDecoder = new StringDecoder('utf8')
 
+    // Populated by 'exit'; used by the post-kill fuse when 'close' never comes.
+    let exitCode: number | null = null
+    let exitSignal: NodeJS.Signals | null = null
+    let graceTimer: ReturnType<typeof setTimeout> | undefined
+
+    /**
+     * Second fuse. Armed the moment we kill, because from then on the only
+     * thing that can still hold `close` back is a process we cannot reach.
+     */
+    const armPostKillGrace = (): void => {
+      if (graceTimer || settled) return
+      graceTimer = setTimeout(() => {
+        finish(() => resolve({
+          ...flushDecoders(),
+          code: exitCode,
+          signal: exitSignal,
+          timedOut,
+          aborted,
+        }))
+      }, POST_KILL_GRACE_MS)
+      graceTimer.unref?.()
+    }
+
     const killGroup = (): void => {
+      // Armed unconditionally, before the kill attempt: once we have decided to
+      // stop this command there must be an exit from this promise no matter
+      // what the kill does (or whether there was a pid to kill at all).
+      armPostKillGrace()
       if (child.pid === undefined) return
       try {
         if (useGroup) process.kill(-child.pid, 'SIGKILL') // negative pid = whole group
@@ -209,28 +252,37 @@ function runProcessGroup(
       stderr += text.slice(0, opts.captureLimit - stderr.length)
     })
 
+    /** Flush any bytes the decoders held back at a chunk boundary. */
+    const flushDecoders = (): { stdout: string; stderr: string } => {
+      const outTail = outDecoder.end()
+      const errTail = errDecoder.end()
+      if (outTail && stdout.length < opts.captureLimit) {
+        stdout += outTail.slice(0, opts.captureLimit - stdout.length)
+      }
+      if (errTail && stderr.length < opts.captureLimit) {
+        stderr += errTail.slice(0, opts.captureLimit - stderr.length)
+      }
+      return { stdout, stderr }
+    }
+
     const finish = (fn: () => void): void => {
       if (settled) return
       settled = true
       clearTimeout(timer)
+      if (graceTimer) clearTimeout(graceTimer)
       opts.signal.removeEventListener('abort', onAbort)
       fn()
     }
 
     child.on('error', err => finish(() => reject(err)))
+    // Recorded, not settled on: `close` is still preferred because it means the
+    // output really is complete. This only feeds the post-kill fuse above.
+    child.on('exit', (code, signal) => {
+      exitCode = code
+      exitSignal = signal
+    })
     child.on('close', (code, signal) =>
-      finish(() => {
-        // Flush any bytes the decoders held back at a chunk boundary.
-        const outTail = outDecoder.end()
-        const errTail = errDecoder.end()
-        if (outTail && stdout.length < opts.captureLimit) {
-          stdout += outTail.slice(0, opts.captureLimit - stdout.length)
-        }
-        if (errTail && stderr.length < opts.captureLimit) {
-          stderr += errTail.slice(0, opts.captureLimit - stderr.length)
-        }
-        resolve({ stdout, stderr, code, signal, timedOut, aborted })
-      }),
+      finish(() => resolve({ ...flushDecoders(), code, signal, timedOut, aborted })),
     )
   })
 }

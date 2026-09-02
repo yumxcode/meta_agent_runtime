@@ -2,7 +2,7 @@
 
 面向工程与机器人算法开发的 TypeScript 智能体运行时。把流式模型调用、多轮工具循环、会话恢复、权限与沙箱、上下文压缩、无人值守自治、并发子代理、长周期图循环与知识沉淀封装成统一接口。既是 npm 库,也是开箱即用的 CLI。
 
-> 当前版本:`0.9.7` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
+> 当前版本:`0.9.8` · Node.js `>= 18` · 全部文档见 [docs/README.md](docs/README.md)
 
 ---
 
@@ -456,4 +456,4 @@ import type {
 
 ## 版本
 
-当前包版本:`0.9.7`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。
+当前包版本:`0.9.8`。版本号由 `npm run version:sync` 与 `package.json` 保持一致。

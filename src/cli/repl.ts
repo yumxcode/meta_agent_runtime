@@ -95,6 +95,12 @@ class ReadlineOutput extends Writable {
   constructor(private readonly target: NodeJS.WriteStream) {
     super()
     this.isTTY = target.isTTY
+    // _write() below can now fail the callback when stdout dies mid-backpressure.
+    // A Writable with no 'error' listener THROWS on emit, so without this the
+    // fix for a stalled render would become a second, more confusing crash on
+    // top of the stdout failure that installBrokenPipeGuards is already
+    // handling (EPIPE → exit 0, anything else → the normal fatal path).
+    this.on('error', () => { /* the underlying stdout error is authoritative */ })
   }
 
   get columns(): number | undefined { return this.target.columns }
@@ -136,9 +142,29 @@ class ReadlineOutput extends Writable {
       callback()
       return
     }
-    const done = (err?: Error | null) => callback(err ?? undefined)
-    if (this.target.write(chunk, encoding)) done()
-    else this.target.once('drain', done)
+    let finished = false
+    const done = (err?: Error | null): void => {
+      if (finished) return
+      finished = true
+      this.target.off('drain', onDrain)
+      this.target.off('error', onError)
+      this.target.off('close', onClose)
+      callback(err ?? undefined)
+    }
+    // A backpressured write that never drains must still complete this
+    // _write(), or the Writable stalls forever and every subsequent readline
+    // render silently disappears. 'drain' is not guaranteed: a stream that
+    // errors or is destroyed under backpressure emits 'error'/'close' instead.
+    const onDrain = (): void => done()
+    const onError = (err: Error): void => done(err)
+    const onClose = (): void => done(new Error('stdout closed while draining'))
+    if (this.target.write(chunk, encoding)) {
+      done()
+      return
+    }
+    this.target.once('drain', onDrain)
+    this.target.once('error', onError)
+    this.target.once('close', onClose)
   }
 }
 
@@ -226,6 +252,31 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     terminal: isTTY,
     historySize: 100,
   })
+
+  // ── readline internals probe ──────────────────────────────────────────────
+  //
+  // The `[已粘贴N字]` placeholder is drawn by writing readline's own `line` /
+  // `cursor` and calling its private `_refreshLine()`. Those are not public
+  // API, and the call sites all guard with `?.()` — which means a Node release
+  // that renames them degrades SILENTLY: the placeholder stops updating, the
+  // cursor lands in the wrong column, and the atomic backspace over a pasted
+  // block stops working, with nothing anywhere saying why.
+  //
+  // Probe once instead. When the internals are missing we simply never create a
+  // placeholder — pastes echo verbatim, which is what this REPL did before the
+  // feature existed and is always correct for what gets SUBMITTED (the paste
+  // accumulator is independent of the display layer).
+  const readlineInternalsOk = (() => {
+    const probe = rl as readline.Interface & { line?: unknown; cursor?: unknown; _refreshLine?: unknown }
+    return typeof probe._refreshLine === 'function' &&
+      typeof probe.line === 'string' &&
+      typeof probe.cursor === 'number'
+  })()
+  if (!readlineInternalsOk && !opts.json && isTTY && opts.debug) {
+    console.log(dim(
+      '⚙  readline 内部字段不可用（Node 版本差异）——粘贴占位符已停用，粘贴内容将原样回显。\n',
+    ))
+  }
 
   // ── Session resume ────────────────────────────────────────────────────────
   let resumedMessages: ConversationMessage[] = []
@@ -641,6 +692,10 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   }
 
   function shouldShowPasteNotice(pasteInfo: { source: string; text: string }): boolean {
+    // No placeholder without the readline internals that keep it honest — see
+    // the probe above. Everything downstream keys off a segment existing, so
+    // this single gate disables the whole display path.
+    if (!readlineInternalsOk) return false
     if (pasteInfo.source === 'none') return false
     if (pasteInfo.source === 'markerless-bare-newline') return _pasteNoticeChars > 0
     const textChars = charCount(pasteInfo.text)
@@ -858,6 +913,11 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   }
 
   function handleShiftEnterChunk(chunk: string): boolean {
+    // Same gate as the paste placeholder: inserting the newline means writing
+    // readline's private line/cursor and asking it to redraw. Without those,
+    // hand the chunk back so readline deals with it its own way rather than
+    // half-applying an edit we cannot render.
+    if (!readlineInternalsOk) return false
     let count = 0
     for (const seq of SHIFT_ENTER_SEQUENCES) {
       let idx = chunk.indexOf(seq)
@@ -881,67 +941,66 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     return true
   }
 
+  /**
+   * The one place paste state is torn down.
+   *
+   * There used to be four near-identical nine-line bodies here, differing only
+   * in whether they rendered the pending notice first and whether they dropped
+   * the accumulated segments. That is a shape where a later edit lands in three
+   * of the four (T8 above is exactly such a scar), so the differences are now
+   * parameters and the four names below are one-line wrappers that document
+   * WHEN each is the right call.
+   *
+   * `render`        — flush a debounced notice to the line before resetting, so
+   *                   the placeholder the user is about to submit is accurate.
+   * `dropSegments`  — forget the pasted blocks entirely (the line they belonged
+   *                   to is gone). Leaving them is right when only the CURRENT
+   *                   collection ended but earlier placeholders are still on
+   *                   the line and must stay editable/expandable.
+   */
+  function resetPasteState(opts: { render?: boolean; dropSegments?: boolean } = {}): void {
+    if (opts.render) {
+      // renderPasteNotice() clears and nulls the timer itself, and
+      // pasteNoticeActive() is true whenever the timer is set — so there is no
+      // path out of it that leaves one armed.
+      if (pasteNoticeActive()) renderPasteNotice()
+    } else {
+      if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
+      _pasteNoticeTimer = null
+    }
+    _pasteNoticeChars = 0
+    _pendingPasteTail = ''
+    _pendingPasteText = ''
+    _prePasteLine = ''
+    _prePasteCursor = 0
+    _pasteCollecting = false
+    _activePasteSegment = null
+    if (opts.dropSegments) {
+      _pasteSegments.length = 0
+      _pendingOrderedSubmit = null
+    }
+    _pasteApplySerial++
+    endPasteOutputMute()
+  }
+
+  /** A complete message is being submitted: render the final placeholder, then forget everything. */
   function finishPasteNotice(): void {
-    // renderPasteNotice() already clears and nulls the timer, and
-    // pasteNoticeActive() is true whenever the timer is set — so there is no
-    // path out of the line above that leaves one armed. (T8: a redundant
-    // `_pasteNoticeTimer = null` used to sit here, implying otherwise.)
-    if (pasteNoticeActive()) renderPasteNotice()
-    _pasteNoticeChars = 0
-    _pendingPasteTail = ''
-    _pendingPasteText = ''
-    _prePasteLine = ''
-    _prePasteCursor = 0
-    _pasteCollecting = false
-    _activePasteSegment = null
-    _pasteSegments.length = 0
-    _pendingOrderedSubmit = null
-    _pasteApplySerial++
-    endPasteOutputMute()
+    resetPasteState({ render: true, dropSegments: true })
   }
 
+  /** The line is being abandoned (SIGINT, EOF): drop it all without drawing anything. */
   function clearPasteNotice(): void {
-    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
-    _pasteNoticeTimer = null
-    _pasteNoticeChars = 0
-    _pendingPasteTail = ''
-    _pendingPasteText = ''
-    _prePasteLine = ''
-    _prePasteCursor = 0
-    _pasteCollecting = false
-    _activePasteSegment = null
-    _pasteSegments.length = 0
-    _pendingOrderedSubmit = null
-    _pasteApplySerial++
-    endPasteOutputMute()
+    resetPasteState({ dropSegments: true })
   }
 
+  /** This paste run ended, but its placeholder stays on the line. */
   function endCurrentPasteDisplaySegment(): void {
-    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
-    _pasteNoticeTimer = null
-    _pasteNoticeChars = 0
-    _pendingPasteTail = ''
-    _pendingPasteText = ''
-    _prePasteLine = ''
-    _prePasteCursor = 0
-    _pasteCollecting = false
-    _activePasteSegment = null
-    _pasteApplySerial++
-    endPasteOutputMute()
+    resetPasteState()
   }
 
+  /** What looked like a paste turned out to be typing — drop the candidate only. */
   function discardCurrentPasteCandidate(): void {
-    if (_pasteNoticeTimer) clearTimeout(_pasteNoticeTimer)
-    _pasteNoticeTimer = null
-    _pasteNoticeChars = 0
-    _pendingPasteTail = ''
-    _pendingPasteText = ''
-    _prePasteLine = ''
-    _prePasteCursor = 0
-    _pasteCollecting = false
-    _activePasteSegment = null
-    _pasteApplySerial++
-    endPasteOutputMute()
+    resetPasteState()
   }
 
   function pasteNoticeActive(): boolean {
@@ -978,7 +1037,28 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   // loop boundary via router.steer().
   let _isStreaming = false
   let _steerArmed = false
-  let _steerNotify: (() => void) | null = null
+  // ONE promise per armed-state, reused across every waitArmed() call.
+  //
+  // streamPrompt races each incoming model event against waitArmed(). With a
+  // fresh promise per call, a long turn's thousands of events each left behind
+  // a promise that could never settle (its resolver was overwritten by the next
+  // call) plus the `.then()` closure attached to it by Promise.race. Not a leak
+  // — they become unreachable once the race resolves — but thousands of
+  // allocations per turn for a flag that only ever changes twice.
+  let _steerWaiter: { promise: Promise<void>; resolve: () => void } | null = null
+  const _steerWaitPromise = (): Promise<void> => {
+    if (!_steerWaiter) {
+      let resolve!: () => void
+      const promise = new Promise<void>(r => { resolve = r })
+      _steerWaiter = { promise, resolve }
+    }
+    return _steerWaiter.promise
+  }
+  const _resolveSteerWaiter = (): void => {
+    const waiter = _steerWaiter
+    _steerWaiter = null
+    waiter?.resolve()
+  }
   // True only while readline owns the `steer ›` prompt during a steer input, so
   // the paste-driven prompt sync below doesn't clobber it back to `you ›`.
   let _steerInputActive = false
@@ -994,16 +1074,16 @@ export async function runRepl(opts: CliOptions): Promise<void> {
   let _wizardActive = false
   const _armSteer = (): void => {
     _steerArmed = true
-    const notify = _steerNotify
-    _steerNotify = null
-    notify?.()
+    _resolveSteerWaiter()
   }
   const _steerPrompt = `${bold(cyan('steer'))} › `
   const steerHooks = {
     waitArmed: (): Promise<void> =>
-      _steerArmed ? Promise.resolve() : new Promise<void>(resolve => { _steerNotify = resolve }),
+      _steerArmed ? Promise.resolve() : _steerWaitPromise(),
     isArmed: (): boolean => _steerArmed,
-    consume: (): void => { _steerArmed = false; _steerNotify = null },
+    // Drop the shared waiter WITHOUT resolving it: the next waitArmed() makes a
+    // new one, so a stale promise can never satisfy a later race.
+    consume: (): void => { _steerArmed = false; _steerWaiter = null },
     beginInput: (): void => {
       // readline now renders + redraws THIS prompt as the user types, so the
       // line stays a `steer ›` line instead of reverting to `you ›`.
@@ -1663,7 +1743,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
     const _steerEnabled = isTTY && !opts.json
     if (_steerEnabled) {
       _steerArmed = false
-      _steerNotify = null
+      _steerWaiter = null
       _isStreaming = true
     }
     let turnStream: StreamPromptResult | undefined
@@ -1681,7 +1761,7 @@ export async function runRepl(opts: CliOptions): Promise<void> {
       // Disarm steering so a stray Ctrl+G at the idle prompt does nothing.
       _isStreaming = false
       _steerArmed = false
-      _steerNotify = null
+      _steerWaiter = null
     }
 
     // ── Post-turn: nudge for newly queued physical anchors ───────────────────

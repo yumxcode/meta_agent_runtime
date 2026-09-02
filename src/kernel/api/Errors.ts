@@ -76,6 +76,79 @@ export function isRateLimitError(error: unknown): boolean {
   return false
 }
 
+/**
+ * Upper bound on how long a server-supplied `retry-after` may park a request.
+ *
+ * The header is attacker-influenceable in a proxy/gateway deployment, and a
+ * misconfigured one is not exotic (`retry-after: 86400` on a quota page). The
+ * cap keeps an honest hint useful while making a hostile one merely annoying.
+ */
+export const MAX_RETRY_AFTER_MS = 120_000
+
+/**
+ * Read the server's own "come back in N" hint from a failed API call.
+ *
+ * Both vendor SDKs attach the response headers to the thrown error, and both
+ * our retry loops used to ignore them: a 429 whose quota window resets in 60 s
+ * was retried on a fixed 1 s→30 s exponential ladder, so all five attempts were
+ * spent inside the window and the call was declared a provider outage — which
+ * then triggers a model fallback. Honouring the hint turns that into one wait.
+ *
+ * Accepts both RFC 7231 forms (delta-seconds and HTTP-date) plus Anthropic's
+ * `anthropic-ratelimit-*-reset` absolute timestamps. Returns null when there is
+ * no usable hint; clamps to [0, MAX_RETRY_AFTER_MS].
+ */
+export function retryAfterMsFromError(error: unknown, now = Date.now()): number | null {
+  if (!error || typeof error !== 'object') return null
+  const headers = (error as Record<string, unknown>)['headers']
+  if (!headers) return null
+
+  const read = (name: string): string | undefined => {
+    // Headers may be a fetch Headers instance or a plain object, and plain
+    // objects are not case-normalised by every SDK version.
+    if (typeof (headers as Headers).get === 'function') {
+      return (headers as Headers).get(name) ?? undefined
+    }
+    const record = headers as Record<string, unknown>
+    for (const key of Object.keys(record)) {
+      if (key.toLowerCase() !== name) continue
+      const value = record[key]
+      if (typeof value === 'string') return value
+      if (Array.isArray(value) && typeof value[0] === 'string') return value[0]
+    }
+    return undefined
+  }
+
+  const clamp = (ms: number): number | null =>
+    Number.isFinite(ms) && ms > 0 ? Math.min(ms, MAX_RETRY_AFTER_MS) : null
+
+  const retryAfter = read('retry-after')
+  if (retryAfter) {
+    const seconds = Number(retryAfter.trim())
+    if (Number.isFinite(seconds)) return clamp(seconds * 1000)
+    const at = Date.parse(retryAfter)
+    if (Number.isFinite(at)) return clamp(at - now)
+  }
+
+  // Anthropic reports absolute reset instants per limit dimension; the soonest
+  // one is when the request could possibly succeed again.
+  let soonest: number | null = null
+  for (const name of [
+    'anthropic-ratelimit-requests-reset',
+    'anthropic-ratelimit-input-tokens-reset',
+    'anthropic-ratelimit-output-tokens-reset',
+    'anthropic-ratelimit-tokens-reset',
+  ]) {
+    const raw = read(name)
+    if (!raw) continue
+    const at = Date.parse(raw)
+    if (!Number.isFinite(at)) continue
+    const ms = at - now
+    if (ms > 0 && (soonest === null || ms < soonest)) soonest = ms
+  }
+  return soonest === null ? null : clamp(soonest)
+}
+
 export function isRetryableError(error: unknown): boolean {
   // A first-token / idle stream timeout is a transport-level stall, not a
   // semantic failure — re-issuing the request is the correct response. Callers

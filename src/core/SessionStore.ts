@@ -18,7 +18,9 @@
  *     session. Administrative cleanup remains best-effort.
  */
 
-import { readFile, writeFile, appendFile, mkdir, open, stat, rm, readdir } from 'node:fs/promises'
+import { readFile, writeFile, appendFile, mkdir, stat, rm, readdir } from 'node:fs/promises'
+import { createReadStream } from 'node:fs'
+import { createInterface } from 'node:readline'
 import { createHash } from 'node:crypto'
 import { atomicWriteFile, atomicWriteJson, withFileLock } from '../infra/persist/index.js'
 import { validateStoreId, isValidStoreId, resolveWithinRoot } from '../infra/persist/storeId.js'
@@ -526,6 +528,26 @@ async function writeIndex(entries: SessionMeta[], options: SessionStoreOptions =
   await atomicWriteJson(indexFile(options), entries)
 }
 
+/**
+ * Read a session's JSONL history, newest-bounded, one line at a time.
+ *
+ * Streamed rather than slurped for two reasons, one correctness and one cost:
+ *
+ *   - The previous tail read did `Buffer.alloc(maxBytes)` and then discarded
+ *     `fh.read()`'s `bytesRead`, so a SHORT READ (network filesystem, a file
+ *     truncated concurrently, a signal) left the buffer's zero fill in place.
+ *     Those NULs were decoded into the final line, `JSON.parse` rejected it, and
+ *     it was silently counted as "corrupt" — losing precisely the newest
+ *     messages, which is the opposite of what a resume wants.
+ *   - The whole-file branch held the raw string (two bytes per character for
+ *     CJK), the array from `split('\n')`, and the parsed objects in memory at
+ *     the same time. At the 64 MiB default guard that is a several-hundred-MB
+ *     spike, taken before the user has typed anything.
+ *
+ * Reading the TAIL when the file exceeds the guard is intentional: a resume
+ * needs the most recent turns. The first line of that window is almost always
+ * cut in half (and may start mid-UTF-8), so it is dropped rather than parsed.
+ */
 async function loadHistoryUnlocked(
   sessionId: string,
   options: SessionStoreOptions,
@@ -533,31 +555,33 @@ async function loadHistoryUnlocked(
   const path = historyPath(sessionId, options)
   const info = await stat(path)
   const maxBytes = RuntimeEnv.resumeMaxBytes(DEFAULT_MAX_RESUME_BYTES)
-  let raw: string
-  if (info.size > maxBytes) {
-    const fh = await open(path, 'r')
-    try {
-      const buffer = Buffer.alloc(maxBytes)
-      await fh.read(buffer, 0, maxBytes, info.size - maxBytes)
-      raw = buffer.toString('utf-8')
-      const firstNewline = raw.indexOf('\n')
-      if (firstNewline >= 0) raw = raw.slice(firstNewline + 1)
-    } finally {
-      await fh.close()
-    }
-  } else {
-    raw = await readFile(path, 'utf-8')
-  }
+  const startAt = info.size > maxBytes ? info.size - maxBytes : 0
+
   const parsed: ConversationMessage[] = []
   let dropped = 0
-  for (const line of raw.split('\n')) {
-    if (!line) continue
-    try {
-      parsed.push(JSON.parse(line) as ConversationMessage)
-    } catch {
-      dropped++
+  // A window that does not start at byte 0 begins inside a line.
+  let needToDropPartialFirstLine = startAt > 0
+
+  const stream = createReadStream(path, { encoding: 'utf-8', start: startAt })
+  const lines = createInterface({ input: stream, crlfDelay: Infinity })
+  try {
+    for await (const line of lines) {
+      if (needToDropPartialFirstLine) {
+        needToDropPartialFirstLine = false
+        continue
+      }
+      if (!line) continue
+      try {
+        parsed.push(JSON.parse(line) as ConversationMessage)
+      } catch {
+        dropped++
+      }
     }
+  } finally {
+    lines.close()
+    stream.destroy()
   }
+
   if (dropped > 0) {
     console.warn(`[SessionStore] Skipped ${dropped} corrupt history line(s) for session ${sessionId}`)
   }

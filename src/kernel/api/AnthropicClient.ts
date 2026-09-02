@@ -17,6 +17,7 @@ import { DebugWriter } from './DebugWriter.js'
 import { acquireRegisteredModelCall } from '../../infra/modelCallAdmission.js'
 import {
   isRetryableError,
+  retryAfterMsFromError,
   isPromptTooLongError,
   isFallbackTriggeredError,
   PromptTooLongError,
@@ -298,7 +299,13 @@ export async function* streamMessages(
         attempt++
         const base = Math.min(INITIAL_RETRY_DELAY_MS * 2 ** (attempt - 1), MAX_RETRY_DELAY_MS)
         const jitter = Math.random() * 0.25 * base
-        const delayMs = Math.floor(base + jitter)
+        // The server's own hint wins when it is LONGER than our ladder: on a
+        // 429 the quota window is the physical constraint, and retrying inside
+        // it just burns the attempt budget and ends in a spurious model
+        // fallback. Bounded by MAX_RETRY_AFTER_MS so a hostile or misconfigured
+        // header cannot park the agent for hours.
+        const serverHintMs = retryAfterMsFromError(error)
+        const delayMs = Math.max(Math.floor(base + jitter), serverHintMs ?? 0)
         onRetry?.(attempt, maxRetries, delayMs, getErrorStatus(error))
         const completed = await abortableSleep(delayMs, activeAbortSignal)
         if (!completed) {

@@ -376,6 +376,11 @@ export class KernelSession {
       // still emitted even when the loop throws.
       let loopResult: LoopResult | undefined
       let loopError: unknown
+      // Held outside the try so the catch can hand the loop generator back.
+      // Our consumer can throw INTO `yield event` below; that unwinds this
+      // frame but leaves `gen` parked at its own yield, so runKernelLoop's
+      // finally — which clears the auto-runtime watchdog timer — never runs.
+      let loopGen: AsyncGenerator<KernelEvent, LoopResult> | undefined
 
       try {
         const gen = runKernelLoop({
@@ -416,6 +421,7 @@ export class KernelSession {
           },
         })
 
+        loopGen = gen
         let step = await gen.next()
         while (!step.done) {
           const event = step.value as KernelEvent
@@ -459,8 +465,18 @@ export class KernelSession {
         }
         // The generator's return value is the LoopResult
         loopResult = step.value as LoopResult | undefined
+        loopGen = undefined   // drained normally; its finally already ran
       } catch (err: unknown) {
         loopError = err
+        // Not awaited: `return()` queues behind whatever the generator is
+        // parked on, and awaiting a generator stuck in an un-resolving await
+        // would hang this session forever. Queueing it is enough to run the
+        // loop's finally (see StreamWatchdog.closeSource for the same rule).
+        try {
+          void Promise.resolve(loopGen?.return(undefined as unknown as LoopResult))
+            .catch(() => { /* teardown is best-effort */ })
+        } catch { /* teardown is best-effort */ }
+        loopGen = undefined
       }
 
       // Every natural loop exit is a hard checkpoint boundary. This runs before

@@ -24,6 +24,7 @@ import { ToolRuntimeGuards } from './toolRuntimeGuards.js'
 import {
   resolveSandboxPolicy,
   type ResolvedSandboxPolicy,
+  type SandboxDiagnostic,
 } from '../sandbox/sandboxPolicyConfig.js'
 import {
   setGitCredentialPassthrough,
@@ -42,16 +43,26 @@ function readGitCredentialPassthrough(projectDir: string): boolean | undefined {
 }
 
 /**
- * Surface dropped grants at session start.
+ * Diagnostics worth interrupting the operator for at session start.
  *
- * Dropping a non-existent path or a blocklisted env var is correct; doing it
- * silently is what made "I configured it and nothing happened" indistinguishable
- * from "my config file was never loaded". Warn, never throw — the operator is
- * usually not watching when a session starts, and a stale grant must not be able
- * to prevent one.
+ * The dividing line is whether the config did what it says. A dropped path, an
+ * unknown preset, a blocklisted env var or a network conflict all mean "you
+ * wrote this and it did not take effect" — surfacing those unprompted is the
+ * whole reason the diagnostics channel exists.
+ *
+ * `credential-deny-lifted` is the opposite: it means the config worked exactly
+ * as written. Printing it every single session — three lines for a routine
+ * `toolAccess: ["gh", "git", "keychain"]` — trains the operator to skim past
+ * the block that also carries the actionable kinds. It keeps its audit value on
+ * demand via `sandbox_probe`, and under --debug.
  */
-function warnSandboxDiagnostics(policy: ResolvedSandboxPolicy): void {
+const STARTUP_WARN_KINDS: ReadonlySet<SandboxDiagnostic['kind']> = new Set([
+  'dropped-path', 'dropped-preset', 'blocked-env', 'malformed-config',
+])
+
+function warnSandboxDiagnostics(policy: ResolvedSandboxPolicy, debug = false): void {
   for (const d of policy.diagnostics) {
+    if (!debug && !STARTUP_WARN_KINDS.has(d.kind)) continue
     console.warn(`[sandbox] ${d.kind}: ${d.subject} — ${d.detail}`)
   }
 }
@@ -96,7 +107,7 @@ export class AgenticSession {
     // sets). Blocklisted names were already stripped during resolution, and
     // buildChildEnv re-checks — neither layer trusts the other.
     setEnvAllowlist(sandboxPolicy.envAllowlist)
-    warnSandboxDiagnostics(sandboxPolicy)
+    warnSandboxDiagnostics(sandboxPolicy, resolved.debugMode === true)
     this._runtimeGuards = new ToolRuntimeGuards({
       projectDir,
       autonomy: config.autonomy,

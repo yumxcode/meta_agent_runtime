@@ -11,6 +11,7 @@
  */
 import { basename } from 'node:path'
 import { bold, cyan, dim, gray, green, red, yellow } from '../term.js'
+import { displayWidth, fit, wrapToWidth } from '../textWidth.js'
 import { sanitizeTerminalText } from '../terminalSanitizer.js'
 import { isUnhealthy, summarize, type TaskStatus, type TaskView } from '../../core/auto/TaskRegistry.js'
 import type { ManagedTaskActivity, TaskManagerSnapshot } from './TaskManager.js'
@@ -22,6 +23,15 @@ export type FrameMode =
   | { kind: 'filter'; query: string }
   | { kind: 'steer'; text: string }
   | { kind: 'confirm'; prompt: string }
+  /**
+   * The completion report, full screen and scrollable.
+   *
+   * Its own mode rather than a taller panel because a report is the one thing
+   * here that does not fit the board's shape: every other surface is a fixed
+   * number of `slice(0, height)` rows, which is right for state you glance at
+   * and wrong for prose you read. `scroll` is the first visible wrapped line.
+   */
+  | { kind: 'report'; scroll: number }
 
 export interface FrameInput {
   tasks: readonly TaskView[]
@@ -89,8 +99,20 @@ export function buildFrame(input: FrameInput): string[] {
   const body = rows - FIXED_CHROME_LINES
 
   const selectedTask = input.tasks[input.selected]
+
+  // The report takes the whole screen. It is a reading surface, not a status
+  // surface, and sharing rows with the list would put it back in the situation
+  // that made the report unreadable in the first place.
+  if (input.mode.kind === 'report' && selectedTask) {
+    return reportView(input, selectedTask, input.mode.scroll, width, rows)
+  }
+
+  // The inline panel stays a MANAGED-mode surface. `activity` is now populated
+  // in both modes (bare `tasks` can resolve a finished turn's log too), but that
+  // is for the report view; flipping the read-only board into the 55%-height
+  // split layout for every finished row would be a UI change nobody asked for.
   const wantsActivity = Boolean(
-    input.activity || (input.manager && selectedTask?.status === 'running'),
+    input.manager && (input.activity || selectedTask?.status === 'running'),
   )
 
   // Managed output gets the lower half of a normal terminal. The list always
@@ -132,6 +154,134 @@ export function buildFrame(input: FrameInput): string[] {
   return lines
 }
 
+/**
+ * Wrapped lines of the report body, independent of scroll position.
+ *
+ * Exported so the TUI can clamp scrolling against the real line count without
+ * duplicating the wrap rules — an off-by-one there scrolls past the end and
+ * shows a blank screen where the conclusion should be.
+ */
+export function reportBodyLines(
+  task: TaskView,
+  activity: SelectedTaskActivity | undefined,
+  width: number,
+): string[] {
+  const content = Math.max(20, width - 2)
+  const lines: string[] = []
+  const para = (text: string, paint?: (s: string) => string): void => {
+    for (const raw of text.split('\n')) {
+      if (!raw.trim()) { lines.push(''); continue }
+      for (const chunk of wrapToWidth(sanitizeTerminalText(raw), content)) {
+        lines.push(` ${paint ? paint(chunk) : chunk}`)
+      }
+    }
+  }
+  const section = (title: string): void => {
+    if (lines.length > 0) lines.push('')
+    lines.push(` ${bold(title)}`)
+  }
+
+  const report = activity?.feed.report
+
+  if (task.goal) {
+    section('目标')
+    para(clean(task.goal), dim)
+  }
+
+  if (report?.text) {
+    section('完成报告')
+    para(report.text)
+  }
+  if (report?.diagnosis) {
+    // For an abnormal ending this is the real explanation; `resultText` is a
+    // canned "Stopped: …" line. Showing one without the other is misleading in
+    // exactly the case that needs it most.
+    section('终态诊断 (LLM)')
+    para(report.diagnosis, yellow)
+  }
+
+  if (!report?.text && !report?.diagnosis) {
+    section('完成报告')
+    para(
+      activity
+        ? '这一轮的日志里没有完成报告——可能仍在运行，或该轮被中断/停放。下方为最近活动。'
+        : '找不到这个任务最近一轮的运行日志。它可能从未由 tasks manager 运行过，或日志已被清理。',
+      dim,
+    )
+  }
+
+  const steps = task.progress.completedSteps
+  if (steps.length > 0) {
+    section(`已完成 ${steps.length}`)
+    for (const step of steps.slice(-12)) para(`• ${clean(step)}`)
+  }
+
+  const todos = task.progress.pendingTodos
+  if (todos.length > 0) {
+    section(`待办 ${todos.length}`)
+    for (const todo of todos.slice(0, 12)) para(`• ${clean(todo)}`, yellow)
+  }
+
+  // Verbatim and unwrapped-by-word: an artifact path's whole value is that it
+  // can be copied. Wrapping is by column only, never by inserting anything.
+  const artifacts = task.progress.artifacts
+  if (artifacts.length > 0) {
+    section(`产物 ${artifacts.length}`)
+    for (const artifact of artifacts) para(artifact, cyan)
+  }
+
+  if (activity?.feed.entries.length) {
+    section('最近活动')
+    for (const entry of activity.feed.entries.slice(-40)) {
+      if (entry.kind === 'report') continue   // already shown above, in full
+      lines.push(...activityEntryLines(entry, width))
+    }
+  }
+
+  return lines
+}
+
+function reportView(
+  input: FrameInput,
+  task: TaskView,
+  scroll: number,
+  width: number,
+  rows: number,
+): string[] {
+  const body = Math.max(1, rows - FIXED_CHROME_LINES)
+  const all = reportBodyLines(task, input.activity, width)
+  const maxScroll = Math.max(0, all.length - body)
+  const top = Math.max(0, Math.min(scroll, maxScroll))
+  const visible = all.slice(top, top + body)
+  while (visible.length < body) visible.push('')
+
+  const report = input.activity?.feed.report
+  const facts = [
+    report?.subtype ?? (input.activity ? undefined : 'no log'),
+    report?.stopReason,
+    report?.numTurns !== undefined ? `${report.numTurns} turns` : undefined,
+    report?.durationMs !== undefined ? duration(report.durationMs) : undefined,
+    report?.totalCostUsd !== undefined ? `$${report.totalCostUsd.toFixed(4)}` : undefined,
+    report?.clipped ? 'clipped' : undefined,
+    input.activity?.run.reattached ? 'from log' : undefined,
+  ].filter(Boolean).join(' · ')
+  const left = ` ${bold('report')}  ${dim(`${basename(task.workspace)} · ${task.sessionId.slice(0, 8)}`)}`
+  const right = facts ? (report?.isError ? red(facts) : green(facts)) : ''
+
+  const position = maxScroll > 0
+    ? `${Math.round((top / maxScroll) * 100)}%`
+    : 'all'
+  // `q` closes the pane rather than the board — the `less`/`man`/`git log`
+  // convention, and the reason the browse-mode footer's "q quit" must not be
+  // repeated verbatim here. Ctrl+C still exits from anywhere.
+  const footer = ` ${dim(fit(
+    `↑↓/PgUp/PgDn scroll · ${position} · esc/q back · ^C quit`,
+    width - 2,
+  ))}`
+
+  return [pad(left, right, width), dim('─'.repeat(width)), ...visible, footer]
+}
+
 function activityPanel(
   task: TaskView,
   activity: SelectedTaskActivity | undefined,
@@ -153,13 +303,19 @@ function activityPanel(
   }
 
   const run = activity.run
-  const elapsed = duration((run.endedAt ?? now) - run.startedAt)
   const state = run.state === 'running' ? 'running' : run.state === 'succeeded' ? 'completed' : 'failed'
   const title = run.state === 'running' ? 'live activity' : 'recent activity'
+  // A reattached record has no measured start: `startedAt` is the wake's
+  // terminal timestamp, so the "elapsed" would read 0s and claim the turn took
+  // no time. Report when it ended instead — the only thing we actually know.
+  const timing = run.reattached
+    ? (run.endedAt ? `ended ${duration(now - run.endedAt)} ago` : '')
+    : duration((run.endedAt ?? now) - run.startedAt)
   const facts = [
     state,
     run.pid ? `pid ${run.pid}` : '',
-    elapsed,
+    timing,
+    activity.feed.report ? 'report ready' : '',
     activity.feed.truncated ? 'tail' : '',
   ].filter(Boolean).join(' · ')
   const left = ` ${bold(title)}`
@@ -200,6 +356,7 @@ function activityLabel(entry: TaskActivityEntry): { text: string; coloured: stri
     case 'warning': return { text: '⚠', coloured: yellow('⚠') }
     case 'error': return { text: '✗', coloured: red('✗') }
     case 'status': return { text: '●', coloured: cyan('●') }
+    case 'report': return { text: '报告 ›', coloured: bold(cyan('报告 ›')) }
   }
 }
 
@@ -361,8 +518,8 @@ function footer(input: FrameInput, width: number): string {
   // colouring the pieces first would let escape codes count toward the width
   // and truncate a line that actually fits.
   const keys = [
-    '↑↓ select', input.manager ? 'r run' : 'r run-now', 'c cancel', 'K kill', 'D delete',
-    's steer', input.showFinished ? 'a hide done' : 'a show done', '/ filter', 'q quit',
+    '↑↓ select', 'enter report', input.manager ? 'r run' : 'r run-now', 'c cancel', 'K kill',
+    'D delete', 's steer', input.showFinished ? 'a hide done' : 'a show done', '/ filter', 'q quit',
   ].join(' · ')
   return ` ${dim(fit(keys, width - 2))}`
 }
@@ -405,65 +562,14 @@ function clean(text: string): string {
   return sanitizeTerminalText(text.replace(/\s+/g, ' ').trim())
 }
 
-/**
- * Truncate to a display width. CJK goal text is the common case here, and every
- * one of those characters occupies two columns — measuring in code units would
- * overflow the line and wrap, which in a full-screen renderer corrupts the
- * frame rather than just looking untidy.
- */
-export function displayWidth(text: string): number {
-  let width = 0
-  for (const ch of text) width += isWide(ch) ? 2 : 1
-  return width
-}
-
-function isWide(ch: string): boolean {
-  const cp = ch.codePointAt(0) ?? 0
-  return (
-    (cp >= 0x1100 && cp <= 0x115f) ||
-    (cp >= 0x2e80 && cp <= 0xa4cf) ||
-    (cp >= 0xac00 && cp <= 0xd7a3) ||
-    (cp >= 0xf900 && cp <= 0xfaff) ||
-    (cp >= 0xfe30 && cp <= 0xfe6f) ||
-    (cp >= 0xff00 && cp <= 0xff60) ||
-    (cp >= 0xffe0 && cp <= 0xffe6) ||
-    (cp >= 0x20000 && cp <= 0x3fffd)
-  )
-}
-
-export function fit(text: string, limit: number): string {
-  if (limit <= 0) return ''
-  if (displayWidth(text) <= limit) return text
-  let out = ''
-  let width = 0
-  for (const ch of text) {
-    const w = isWide(ch) ? 2 : 1
-    if (width + w > limit - 1) break
-    out += ch
-    width += w
-  }
-  return `${out}…`
-}
+// Width measurement lives in ../textWidth.ts so every CLI surface that
+// truncates to the terminal width shares ONE definition (the thinking meter
+// used to have its own, measured in code units, and wrapped on Chinese text).
+// Re-exported here because the frame is where callers and tests look for it.
+export { displayWidth, fit } from '../textWidth.js'
 
 /** Wrap sanitized activity text without splitting a wide CJK glyph. */
-function wrap(text: string, limit: number): string[] {
-  if (!text) return []
-  const lines: string[] = []
-  let current = ''
-  let width = 0
-  for (const ch of text) {
-    const chWidth = isWide(ch) ? 2 : 1
-    if (current && width + chWidth > limit) {
-      lines.push(current)
-      current = ''
-      width = 0
-    }
-    current += ch
-    width += chWidth
-  }
-  if (current) lines.push(current)
-  return lines
-}
+const wrap = wrapToWidth
 
 /** Strip SGR escapes so padding math counts glyphs, not colour codes. */
 export function visibleLength(text: string): number {

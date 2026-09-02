@@ -10,6 +10,23 @@ import { makeToolResultMessage } from '../messages/MessageFactory.js'
 import { RuntimeEnv } from '../../infra/env/RuntimeEnv.js'
 import { timeout } from '../../core/timeouts.js'
 
+/**
+ * The kernel's own per-tool deadline firing — as opposed to a tool reporting
+ * that something IT called timed out.
+ *
+ * A distinct type because the outcome below is consumed by AutoStallGuard, and
+ * the flag used to be derived with `errorMsg.includes('timed out')`. Any tool
+ * forwarding a downstream timeout ("upstream request timed out", extremely
+ * common for HTTP and MCP tools) was therefore recorded as a kernel timeout,
+ * which is a different fault with different remedies.
+ */
+export class ToolTimeoutError extends Error {
+  constructor(message: string) {
+    super(message)
+    this.name = 'ToolTimeoutError'
+  }
+}
+
 const TRUNCATION_NOTICE =
   '\n\n[Content truncated: result exceeded maximum allowed size. ' +
   'Use a more targeted request to retrieve specific information.]'
@@ -291,7 +308,7 @@ export async function executeToolCall(
                 incrementTimedOutRunning(context.sessionId)
               }
               reject(
-                new Error(
+                new ToolTimeoutError(
                   `Tool "${toolName}" timed out after ${effectiveTimeoutMs}ms ` +
                   `(set tool.timeoutMs / META_AGENT_TOOL_TIMEOUT_MS to adjust).`,
                 ),
@@ -360,7 +377,7 @@ export async function executeToolCall(
           cwd: typeof input === 'object' && input !== null && typeof (input as Record<string, unknown>)['cwd'] === 'string'
             ? (input as Record<string, unknown>)['cwd'] as string
             : undefined,
-          timedOut: errorMsg.includes('timed out'),
+          timedOut: error instanceof ToolTimeoutError,
           aborted: context.abortSignal.aborted,
         },
       }),

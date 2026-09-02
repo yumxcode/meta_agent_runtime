@@ -83,6 +83,17 @@ export interface TaskView {
   /** How the most recent finished wake ended. */
   lastOutcome?: 'done' | 'cancelled' | 'expired'
   lastOutcomeAt?: number
+  /**
+   * Which wake that was.
+   *
+   * A finished task has no live wake, so `wake` is undefined and every id-keyed
+   * artifact of its last turn became unaddressable — including the managed
+   * worker's log, whose path is `sha256(wakeId)`. The registry was already
+   * computing this record to read `.status` and `.updatedAt` off it; it simply
+   * dropped the id. Exposing it costs nothing and is what lets the board show a
+   * completed task's report instead of "output unavailable".
+   */
+  lastWakeId?: string
   progress: {
     turnCount?: number
     estimatedCostUsd?: number
@@ -262,6 +273,7 @@ async function collectWorkspaceTasks(
         ? {
             lastOutcome: lastTerminal.status as 'done' | 'cancelled' | 'expired',
             lastOutcomeAt: lastTerminal.updatedAt,
+            lastWakeId: lastTerminal.wakeId,
           }
         : {}),
       progress: toProgress(checkpoint),

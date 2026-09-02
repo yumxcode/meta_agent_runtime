@@ -17,10 +17,47 @@ export type TaskActivityKind =
   | 'warning'
   | 'error'
   | 'status'
+  | 'report'
 
 export interface TaskActivityEntry {
   kind: TaskActivityKind
   text: string
+}
+
+/**
+ * What the task CONCLUDED, lifted out of the stream.
+ *
+ * The closing report was already in this log and the reader threw it away:
+ * `resultSummary()` renders the `result` event as turns/duration/cost and never
+ * touched `resultText`, which is the agent's own final message (KernelLoop sets
+ * `resultText = assistantText` on the ordinary completion path). What survived
+ * on screen was only the `text` deltas that fed the same message — folded in
+ * with every tool call that happened to follow, split wherever a tool
+ * interrupted them, and tail-clipped at MAX_AGENT_CHARS. The most valuable
+ * moment in a task's life read as "the last thing that scrolled by".
+ *
+ * Kept as structured data rather than another entry so the full-screen report
+ * view can render it whole, while the inline activity panel still gets a
+ * bounded one-entry preview.
+ *
+ * `diagnosis` matters for the other half of the problem: when a run ends
+ * abnormally, `resultText` is a canned "Stopped: …" line and the real
+ * explanation is the runtime's `termination_analysis`. A report view that shows
+ * one without the other is misleading in exactly the cases that need it most.
+ */
+export interface TaskReport {
+  /** The agent's own closing message. */
+  text?: string
+  /** LLM termination diagnosis, emitted only for an abnormal ending. */
+  diagnosis?: string
+  subtype?: string
+  stopReason?: string
+  numTurns?: number
+  durationMs?: number
+  totalCostUsd?: number
+  isError?: boolean
+  /** True when `text` was clipped at MAX_REPORT_CHARS. */
+  clipped?: boolean
 }
 
 export interface TaskActivityFeed {
@@ -28,6 +65,11 @@ export interface TaskActivityFeed {
   /** True when the beginning of the log was intentionally omitted. */
   truncated: boolean
   error?: string
+  /**
+   * The most recent completion report in this log, when the turn produced one.
+   * Latest-wins: a log may hold several turns and only the last one is current.
+   */
+  report?: TaskReport
 }
 
 /**
@@ -41,6 +83,14 @@ const RUNTIME_NOTICE_PREFIX = /^\[(?:sandbox\]|meta-agent[/\]:])/
 const DEFAULT_TAIL_BYTES = 128 * 1024
 const MAX_ENTRIES = 120
 const MAX_AGENT_CHARS = 4_000
+/**
+ * Cap on the retained report text. Generous because this is the ONE thing the
+ * operator opened the view to read, and head-clipped rather than tail-clipped:
+ * a report leads with its conclusion, so the front is the half worth keeping.
+ */
+const MAX_REPORT_CHARS = 20_000
+/** The inline stream gets a preview; the report view gets the whole thing. */
+const MAX_REPORT_PREVIEW_CHARS = 700
 
 export async function readTaskActivityLog(
   logPath: string,
@@ -95,6 +145,7 @@ function withoutPartialTrailingEvent(raw: string): string {
 export function parseTaskActivityLog(raw: string, truncated = false): TaskActivityFeed {
   const entries: TaskActivityEntry[] = []
   let agentText = ''
+  let report: TaskReport | undefined
 
   const flushAgent = (): void => {
     if (!agentText) return
@@ -175,12 +226,27 @@ export function parseTaskActivityLog(raw: string, truncated = false): TaskActivi
       case 'compact_failed':
         push('warning', `会话压缩失败：${String(event['error'] ?? 'unknown error')}`)
         break
-      case 'result':
+      case 'result': {
+        // The stats line stays — it answers "how much did this cost me" at a
+        // glance, which the prose does not.
         push(event['isError'] === true ? 'error' : 'status', resultSummary(event), 700)
+        const closing = headClip(cleanMultiline(event['resultText']), MAX_REPORT_CHARS)
+        report = {
+          ...report,
+          ...reportFacts(event),
+          ...(closing.text ? { text: closing.text, clipped: closing.clipped } : {}),
+        }
+        if (closing.text) push('report', closing.text, MAX_REPORT_PREVIEW_CHARS)
         break
-      case 'termination_analysis':
-        push('warning', `终态诊断：${String(event['analysis'] ?? '')}`, 1_200)
+      }
+      case 'termination_analysis': {
+        const diagnosis = headClip(cleanMultiline(event['analysis']), MAX_REPORT_CHARS).text
+        if (diagnosis) {
+          report = { ...report, diagnosis }
+          push('report', `终态诊断：${diagnosis}`, MAX_REPORT_PREVIEW_CHARS)
+        }
         break
+      }
       case 'auto_scheduler':
         push('status', event['message'])
         break
@@ -203,7 +269,46 @@ export function parseTaskActivityLog(raw: string, truncated = false): TaskActivi
   return {
     entries: entries.slice(-MAX_ENTRIES),
     truncated,
+    ...(report ? { report } : {}),
   }
+}
+
+/** The measurable half of a result event, for the report header. */
+function reportFacts(event: Record<string, unknown>): Partial<TaskReport> {
+  const num = (key: string): number | undefined =>
+    typeof event[key] === 'number' ? event[key] as number : undefined
+  const str = (key: string): string | undefined =>
+    typeof event[key] === 'string' && event[key] ? event[key] as string : undefined
+  return {
+    ...(str('subtype') ? { subtype: str('subtype')! } : {}),
+    ...(str('stopReason') ? { stopReason: str('stopReason')! } : {}),
+    ...(num('numTurns') !== undefined ? { numTurns: num('numTurns')! } : {}),
+    ...(num('durationMs') !== undefined ? { durationMs: num('durationMs')! } : {}),
+    ...(num('totalCostUsd') !== undefined ? { totalCostUsd: num('totalCostUsd')! } : {}),
+    ...(event['isError'] === true ? { isError: true } : {}),
+  }
+}
+
+/**
+ * Sanitize while KEEPING line structure.
+ *
+ * `sanitizeTerminalPreview` collapses all whitespace, which is right for a
+ * one-line stream entry and wrong for a report: paragraphs, lists and indented
+ * blocks are how a report is readable at all. Control sequences are still
+ * stripped — this text came from a model.
+ */
+function cleanMultiline(value: unknown): string {
+  if (typeof value !== 'string' || !value) return ''
+  return sanitizeTerminalText(value)
+    .replace(/[ \t]+$/gm, '')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim()
+}
+
+/** Keep the FRONT — a report states its conclusion first. */
+function headClip(text: string, max: number): { text: string; clipped?: boolean } {
+  if (text.length <= max) return { text }
+  return { text: `${text.slice(0, max)}\n\n[报告过长，已截断]`, clipped: true }
 }
 
 function resultSummary(event: Record<string, unknown>): string {

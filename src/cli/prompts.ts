@@ -76,27 +76,63 @@ export async function askQuestion(rl: readline.Interface, question: string, sign
     }
     process.stdin.resume()
     nativeQuestionInterfaces.add(rl)
+
+    // EOF safety net, for BOTH the signal and no-signal paths.
+    //
+    // readline does not invoke a pending question's callback when the interface
+    // closes, so Ctrl+D (or a closed stdin) at a prompt left this promise
+    // pending forever. The REPL happened to survive that — its own 'close'
+    // handler calls process.exit — but every other caller inherited a silent
+    // hang from a keystroke users press all the time. Settle explicitly
+    // instead of relying on someone else's exit path.
+    //
+    // Resolves empty rather than rejecting: every call site already reads an
+    // empty answer as "cancelled" (that is what a bare Enter gives them), and
+    // Ctrl+D at a prompt means the same thing. Rejecting would turn an ordinary
+    // keystroke into an unhandled rejection, which this CLI treats as fatal —
+    // trading a silent hang for a spurious `Fatal:` on the way out.
+    let settled = false
+    const onClose = (): void => {
+      if (settled) return
+      settled = true
+      nativeQuestionInterfaces.delete(rl)
+      resolve('')
+    }
+    rl.once('close', onClose)
+    const done = (fn: () => void): void => {
+      if (settled) return
+      settled = true
+      rl.off('close', onClose)
+      fn()
+    }
+
     // With a signal, readline cancels the pending question on abort — the
     // callback never fires and the interface is free for the next prompt.
     // Without this, a timed-out ask_user leaves a zombie question that
     // swallows the user's next input line (seen after Distill completion).
     if (signal) {
       const onAbort = (): void => {
-        nativeQuestionInterfaces.delete(rl)
-        process.stdout.write('\n')
-        reject(new Error('interactive input timed out or was cancelled; treat this question as unresolved'))
+        done(() => {
+          nativeQuestionInterfaces.delete(rl)
+          process.stdout.write('\n')
+          reject(new Error('interactive input timed out or was cancelled; treat this question as unresolved'))
+        })
       }
       signal.addEventListener('abort', onAbort, { once: true })
       rl.question(question, { signal }, answer => {
         signal.removeEventListener('abort', onAbort)
-        queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
-        resolve(answer.trim())
+        done(() => {
+          queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
+          resolve(answer.trim())
+        })
       })
       return
     }
     rl.question(question, answer => {
-      queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
-      resolve(answer.trim())
+      done(() => {
+        queueMicrotask(() => nativeQuestionInterfaces.delete(rl))
+        resolve(answer.trim())
+      })
     })
   })
 }

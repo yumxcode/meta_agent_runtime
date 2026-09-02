@@ -32,6 +32,29 @@ type State = 'normal' | 'esc' | 'csi' | 'osc' | 'oscEsc' | 'stString' | 'stEsc'
  */
 const MAX_SEQUENCE_CHARS = 4096
 
+/**
+ * Characters that change how text READS without being control sequences.
+ *
+ * The state machine above strips everything that drives the terminal; these
+ * drive the *reader* instead. U+202A–202E and U+2066–2069 reorder the glyphs
+ * around them (the "Trojan Source" trick), so a tool-call preview can be made
+ * to display a command that is not the one about to run — and that preview line
+ * is exactly what the operator approves from. U+200B–200F and U+FEFF are
+ * invisible: they hide differences between two strings that look identical.
+ *
+ * Both classes are legitimate in real prose, but nothing the CLI renders is
+ * prose that needs them, and neither survives a copy-paste review either.
+ * Dropped outright rather than replaced, so the visible text is what remains.
+ */
+function isTextDirectionOrInvisible(code: number): boolean {
+  return (
+    (code >= 0x200b && code <= 0x200f) ||  // ZWSP … RLM
+    (code >= 0x202a && code <= 0x202e) ||  // LRE RLE PDF LRO RLO
+    (code >= 0x2066 && code <= 0x2069) ||  // LRI RLI FSI PDI
+    code === 0xfeff                        // BOM / zero-width no-break space
+  )
+}
+
 function isCsiFinal(code: number): boolean {
   return code >= 0x40 && code <= 0x7e
 }
@@ -127,6 +150,7 @@ export class TerminalSanitizer {
           }
           this.pendingCr = false
           if (code === 0x7f) break
+          if (isTextDirectionOrInvisible(code)) break
           out += ch
           break
         }

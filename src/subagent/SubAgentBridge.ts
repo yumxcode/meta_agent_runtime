@@ -558,10 +558,23 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       runner.abort('Session disposed')
       this._clearParentAbortForwarder(taskId)
     }
-    await Promise.race([
-      Promise.allSettled(running.map(([, runner]) => runner.wait())),
-      new Promise(resolve => setTimeout(resolve, Math.max(0, waitMs))),
-    ])
+    // The loser of this race used to be left armed: even when every runner
+    // settled immediately, a live 10 s timer kept the event loop open. On the
+    // CLI exit path (disposeAndExit → router.dispose()) that is the whole
+    // delay between Ctrl+D and "Goodbye" — it looked like a hang, and only the
+    // 15 s hard-exit fuse kept it bounded. Clear it once the race is decided.
+    let disposeTimer: ReturnType<typeof setTimeout> | undefined
+    try {
+      await Promise.race([
+        Promise.allSettled(running.map(([, runner]) => runner.wait())),
+        new Promise(resolve => {
+          disposeTimer = setTimeout(resolve, Math.max(0, waitMs))
+          disposeTimer.unref?.()
+        }),
+      ])
+    } finally {
+      if (disposeTimer) clearTimeout(disposeTimer)
+    }
     for (const [taskId] of running) {
       this.runners.delete(taskId)
       this.activeTaskIds.delete(taskId)

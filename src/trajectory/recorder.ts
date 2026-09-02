@@ -398,6 +398,12 @@ export class TrajectoryRecorder {
       const raw = JSON.parse(await readFile(path, 'utf8')) as Partial<LeaseRecord>
       const info = await stat(path)
       const freshHeartbeat = this.now() - info.mtimeMs < LEASE_STALE_MS
+      // Both conditions, deliberately. `processAlive` alone is not sound: PIDs
+      // are recycled, so an unrelated process can inherit the id of the crashed
+      // holder and make a dead lease look live forever. The heartbeat is what
+      // actually bounds that — nobody is refreshing the mtime of a lease whose
+      // owner is gone, so a recycled pid buys the stale lease at most
+      // LEASE_STALE_MS. Removing either check reopens the other's failure mode.
       if (typeof raw.pid === 'number' && processAlive(raw.pid) && freshHeartbeat) return false
       await unlink(path)
       return true

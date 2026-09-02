@@ -76,6 +76,12 @@ export interface ManagedTaskActivity {
   logPath?: string
   endedAt?: number
   result?: ManagedWorkerResult
+  /**
+   * True when this record was reconstructed from durable wake state rather than
+   * from a launch this process performed. The elapsed time is then the wake's,
+   * not the turn's, so the view must not present it as a measured duration.
+   */
+  reattached?: boolean
 }
 
 interface ActiveWorker {
@@ -162,19 +168,20 @@ export class TaskManager {
     // launch record, but the scheduler heartbeat identifies its exact wake and
     // the log path is deterministic. Reattach the read-only view without ever
     // claiming or launching it again.
-    const wakeId = task.scheduler.managedWakeId
-    if (task.status === 'running' && wakeId && task.wake?.wakeId === wakeId) {
+    const liveWakeId = task.scheduler.managedWakeId
+    if (task.status === 'running' && liveWakeId && task.wake?.wakeId === liveWakeId) {
       return {
         workspace: task.workspace,
         sessionId: task.sessionId,
-        wakeId,
+        wakeId: liveWakeId,
         state: 'running',
         startedAt: task.wake.claim?.claimedAt ?? task.scheduler.lastSeen ?? this.now(),
         ...(task.scheduler.pid ? { pid: task.scheduler.pid } : {}),
-        logPath: managedWorkerLogPath(wakeId),
+        logPath: managedWorkerLogPath(liveWakeId),
       }
     }
-    return undefined
+
+    return resolveFinishedTaskActivity(task, this.now())
   }
 
   /**
@@ -385,6 +392,45 @@ export function createSubprocessManagedWorkerLauncher(
       })
     })
     return { ...(child.pid ? { pid: child.pid } : {}), logPath, completion }
+  }
+}
+
+/**
+ * Locate the log of a task's most recent FINISHED turn, from durable state only.
+ *
+ * Deliberately a free function rather than a TaskManager method, because the
+ * board runs without a manager: bare `meta-agent tasks` opens the same TUI with
+ * `manager: undefined`. Had this stayed a method, the completion report would
+ * have existed only under `--manage` — which is the mode for *executing* work,
+ * not the mode for reading what it concluded.
+ *
+ * `latestByTask` is in-memory, so quitting the manager took the completed run
+ * with it and the frame fell back to "this turn was not launched by this tasks
+ * manager". For a task the manager ran ten minutes ago that message is simply
+ * false, and it was the last thing shown before the report became unreachable.
+ * `lastWakeId` makes the log addressable again — the path is `sha256(wakeId)`,
+ * so nothing new has to be stored.
+ *
+ * Not gated on status: 'parked' and 'orphaned' tasks also have a most-recent
+ * finished turn worth reading. `state` is 'succeeded' because the WAKE reached
+ * a terminal status; how the RUN ended is a finer fact that lives in the report
+ * itself (subtype / stopReason), and claiming 'failed' here would paint a
+ * healthy task red on no evidence.
+ */
+export function resolveFinishedTaskActivity(
+  task: TaskView,
+  now = Date.now(),
+): ManagedTaskActivity | undefined {
+  if (!task.lastWakeId || task.status === 'running') return undefined
+  return {
+    workspace: task.workspace,
+    sessionId: task.sessionId,
+    wakeId: task.lastWakeId,
+    state: 'succeeded',
+    startedAt: task.lastOutcomeAt ?? now,
+    ...(task.lastOutcomeAt ? { endedAt: task.lastOutcomeAt } : {}),
+    logPath: managedWorkerLogPath(task.lastWakeId),
+    reattached: true,
   }
 }
 

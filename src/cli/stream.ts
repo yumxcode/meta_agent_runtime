@@ -100,6 +100,54 @@ export async function streamPrompt(
   const onAbort = () => router.interrupt?.()
   signal?.addEventListener('abort', onAbort, { once: true })
   const gen = router.submit(prompt)
+  // Tracks the pre-fetched gen.next() so an abnormal exit can hand the
+  // generator back instead of orphaning it. See abandonStream().
+  let pending: ReturnType<typeof gen.next> | null = null
+  let generatorDone = false
+  let streamAbandoned = false
+  /**
+   * Hand the event generator back when this function leaves WITHOUT having
+   * drained it (a throw from the render loop, the ERR_STREAM_PREMATURE_CLOSE
+   * early return, an abort).
+   *
+   * The loop below drives `gen` by hand — instead of `for await` — so a Ctrl+G
+   * steer can pre-empt an already-resolved event. `for await` calls
+   * `gen.return()` on break/throw; a hand-rolled loop does not, and everything
+   * downstream assumes it happens:
+   *
+   *   - KernelSession.submitMessage's `finally` clears `_submitInFlight`.
+   *     Skipping it wedges the session permanently — every later turn throws
+   *     "Cannot call submitMessage() concurrently", with nothing on screen to
+   *     explain why.
+   *   - streamMessages' `finally` releases the host model-call lease (whose
+   *     heartbeat would otherwise keep renewing a lease nobody holds) and
+   *     closes the debug writer's file handle.
+   *   - runKernelLoop's `finally` clears the auto-runtime watchdog timer.
+   *   - The trajectory's "consumer abandoned" run_result is written there too.
+   *
+   * `interrupt()` first: `return()` is queued BEHIND the in-flight `next()`, so
+   * without cancelling the model call the teardown would not start until the
+   * current turn finished on its own.
+   *
+   * Deliberately NOT awaited — same reason as StreamWatchdog's closeSource():
+   * a generator parked in an un-resolving await returns a promise that never
+   * settles, and awaiting it here would hang the CLI on exactly the stall this
+   * exists to escape. Queueing the return is enough; the generator runs every
+   * `finally` on its way out.
+   */
+  function abandonStream(): void {
+    if (streamAbandoned) return
+    streamAbandoned = true
+    // The orphaned next() may reject (an aborted API call); the CLI treats
+    // unhandledRejection as fatal, so observe it.
+    if (pending) void pending.catch(() => { /* expected once we bail */ })
+    pending = null
+    try { router.interrupt?.() } catch { /* best-effort */ }
+    try {
+      void Promise.resolve(gen.return(undefined))
+        .catch(() => { /* teardown is best-effort */ })
+    } catch { /* teardown is best-effort */ }
+  }
   const loopGuard = guardDegenerateLoop ? createDegenerateLoopGuard() : null
   let degenerateLoop: string | undefined
   const steering = steerHooks ?? null
@@ -180,7 +228,7 @@ export async function streamPrompt(
     // reasoning phase. We race the pending event against the steer signal; if
     // steering wins we pause, collect a correction, inject it, then re-race the
     // SAME pending event — so the model is never aborted, only back-pressured.
-    let pending = gen.next()
+    pending = gen.next()
     while (true) {
       // An already-armed steer must pre-empt the next event. During a heavy
       // reasoning phase `pending` is almost always already resolved, so a plain
@@ -191,8 +239,8 @@ export async function streamPrompt(
       const raced = steering
         ? (steering.isArmed()
             ? ('__steer__' as const)
-            : await Promise.race([pending, steering.waitArmed().then(() => '__steer__' as const)]))
-        : await pending
+            : await Promise.race([pending!, steering.waitArmed().then(() => '__steer__' as const)]))
+        : await pending!
 
       if (raced === '__steer__') {
         steering!.consume()
@@ -226,7 +274,13 @@ export async function streamPrompt(
       }
 
       const step = raced
-      if (step.done) break
+      if (step.done) {
+        // Drained normally — the generator already ran its own finally blocks,
+        // so there is nothing to hand back.
+        generatorDone = true
+        pending = null
+        break
+      }
       const event = step.value
       pending = gen.next()
 
@@ -478,6 +532,10 @@ export async function streamPrompt(
     if ((err as NodeJS.ErrnoException)?.code === 'ERR_STREAM_PREMATURE_CLOSE') return { text: capturedText, ...(terminalResult ? { result: terminalResult } : {}), ...(degenerateLoop ? { degenerateLoop } : {}) }
     throw err
   } finally {
+    // Runs before the throw / early return actually leaves this function, so it
+    // covers every abnormal exit path at once (render error, premature close,
+    // future additions) rather than each one remembering to clean up.
+    if (!generatorDone) abandonStream()
     signal?.removeEventListener('abort', onAbort)
     // Always tear down the spinner timer and wipe any lingering status line —
     // including on interrupt/error paths — so it never bleeds into the prompt.
