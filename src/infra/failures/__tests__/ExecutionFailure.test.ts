@@ -46,7 +46,6 @@ describe('structured execution failures', () => {
     }, {
       sessionId: 'meta',
       startMs: Date.now(),
-      turnCount: 0,
       totalCostUsd: 0,
       usage: {
         inputTokens: 0,
@@ -60,6 +59,30 @@ describe('structured execution failures', () => {
       errors: ['status=429 rate limit'],
       failure: { category: 'provider_transient', status: 429 },
     })
+  })
+
+  it('uses the Kernel tool-batch turn count instead of tool-use cardinality', () => {
+    const [translated] = translateKernelEvent({
+      type: 'result',
+      subtype: 'success',
+      sessionId: 'kernel',
+      usage: { inputTokens: 0, outputTokens: 0, cacheReadTokens: 0, cacheWriteTokens: 0 },
+      costUsd: 0,
+      numTurns: 2,
+      stopReason: 'end_turn',
+      resultText: 'done',
+    }, {
+      sessionId: 'meta',
+      startMs: Date.now(),
+      totalCostUsd: 0,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadInputTokens: 0,
+        cacheCreationInputTokens: 0,
+      },
+    })
+    expect(translated).toMatchObject({ type: 'result', numTurns: 2 })
   })
 
   it('does not mistake deterministic orchestration stops for provider outages', () => {

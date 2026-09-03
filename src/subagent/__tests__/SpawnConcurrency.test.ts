@@ -50,11 +50,46 @@ describe('spawn_sub_agent concurrency + isolation contract', () => {
     const { bridge, calls } = makeCapturingBridge()
     const tool = makeSpawnSubAgentTool(bridge)
     await tool.call(
-      { task_description: 'refactor module X', workspace_mode: 'isolated_write' },
+      {
+        task_description: 'refactor module X',
+        workspace_mode: 'isolated_write',
+        allowed_tools: ['apply_patch'],
+      },
       {} as never,
     )
     expect(calls[0]!.config.workspaceMode).toBe('isolated_write')
     expect(calls[0]!.config.isolateWorktree).toBe(true)
+  })
+
+  it('surfaces the Bridge capability error without a weaker tool-layer validator', async () => {
+    let calls = 0
+    const bridge = {
+      async spawnSubAgent(): Promise<SubAgentRecord> {
+        calls++
+        throw new Error('isolated_write requires at least one resolved workspace mutation tool')
+      },
+    } as unknown as SubAgentBridge
+    const tool = makeSpawnSubAgentTool(bridge)
+    const res = await tool.call({
+      task_description: 'refactor module X',
+      workspace_mode: 'isolated_write',
+    }, {} as never)
+    expect(res.isError).toBe(true)
+    expect(res.content).toContain('requires at least one resolved workspace mutation tool')
+    expect(calls).toBe(1)
+  })
+
+  it('allows shared_readonly pure reasoning with an empty tool list', async () => {
+    const { bridge, calls } = makeCapturingBridge()
+    const tool = makeSpawnSubAgentTool(bridge)
+    const res = await tool.call({
+      task_description: 'reason from the supplied context',
+      workspace_mode: 'shared_readonly',
+      allowed_tools: [],
+    }, {} as never)
+    expect(res.isError).toBeFalsy()
+    expect(calls).toHaveLength(1)
+    expect(calls[0]!.config.allowedTools).toEqual([])
   })
 
   it('does not expose shared_write on the async tool (forces isolation for writes)', () => {

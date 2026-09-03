@@ -5,6 +5,7 @@ import { DEFAULT_SUB_AGENT_MAX_DURATION_MS } from '../../../subagent/types.js'
 import { DEFAULT_SUB_AGENT_BUDGET_USD, DEFAULT_SUB_AGENT_MAX_TURNS } from '../../../infra/budgets.js'
 import { withReturnResultHint } from '../../../subagent/tools/return_result.js'
 import { loopTaskScopeFromSessionId } from '../../../subagent/loopScope.js'
+import { exportSubAgentResultArtifact } from '../../../subagent/resultArtifact.js'
 
 export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<MetaAgentTool> {
   const description = await loadToolPrompt(import.meta.url)
@@ -127,6 +128,15 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
         if (!status) return { content: `Internal error: task ${record.taskId} not found`, isError: true }
 
         if (status.status === 'completed') {
+          const exported = await exportSubAgentResultArtifact(
+            record.taskId,
+            status.result?.output,
+            ctx.workspaceRoot ?? process.cwd(),
+          ).then(
+            artifact => ({ artifact }),
+            error => ({ error: error instanceof Error ? error.message : String(error) }),
+          )
+          const artifact = 'artifact' in exported ? exported.artifact : undefined
           return {
             content: JSON.stringify({
               task_id: record.taskId,
@@ -136,6 +146,21 @@ export async function createRunAgentTool(bridge: ISubAgentDispatcher): Promise<M
               cost_usd: status.result?.costUsd,
               duration_ms: status.result?.durationMs,
               workspace_mode: status.config.workspaceMode,
+              ...(status.result?.integration ? {
+                merge_required: status.result.integration.mergeRequired,
+                worktree_status: status.result.integration.status,
+                commit_hash: status.result.integration.commitHash,
+                changed_files: status.result.integration.changedFiles,
+              } : {}),
+              ...(artifact ? {
+                output_path: artifact.outputPath,
+                output_length: artifact.outputLength,
+                output_bytes: artifact.outputBytes,
+                output_sha256: artifact.outputSha256,
+                output_path_scope: artifact.outputPathScope,
+                output_path_lifetime: artifact.outputPathLifetime,
+              } : {}),
+              ...('error' in exported ? { output_export_error: exported.error } : {}),
             }, null, 2),
             isError: false,
           }

@@ -1,6 +1,11 @@
 import { describe, it, expect } from 'vitest'
 import { extractLastJsonBlock, buildSummaryFromText } from '../SubAgentRunner.js'
-import { makeReturnResultTool, type ReturnedResult } from '../tools/return_result.js'
+import {
+  makeReturnResultTool,
+  RETURN_RESULT_HINT,
+  withReturnResultHint,
+  type ReturnedResult,
+} from '../tools/return_result.js'
 import { toKernelTool } from '../../modes/toolAdapter.js'
 
 describe('extractLastJsonBlock', () => {
@@ -55,6 +60,32 @@ describe('makeReturnResultTool', () => {
     expect(captured).toBeUndefined()
   })
 
+  it('rejects oversized data before recording a false success', async () => {
+    let captured: ReturnedResult | undefined
+    const tool = makeReturnResultTool(r => { captured = r }, undefined, {
+      maxDataChars: 100,
+      fileProducingTask: true,
+    })
+    const res = await tool.call({
+      summary: 'done',
+      data: { source: 'x'.repeat(200) },
+    }, {} as never)
+    expect(res.isError).toBe(true)
+    expect(res.content).toContain('Write large deliverables to workspace files')
+    expect(captured).toBeUndefined()
+  })
+
+  it('rejects non-serializable data before invoking the sink', async () => {
+    let captured: ReturnedResult | undefined
+    const tool = makeReturnResultTool(r => { captured = r })
+    const cyclic: Record<string, unknown> = {}
+    cyclic['self'] = cyclic
+    const res = await tool.call({ summary: 'done', data: cyclic }, {} as never)
+    expect(res.isError).toBe(true)
+    expect(res.content).toContain('JSON-serializable')
+    expect(captured).toBeUndefined()
+  })
+
   it('binds return_result.data to a caller-supplied Graph output schema', () => {
     const tool = toKernelTool(makeReturnResultTool(() => undefined, {
       type: 'object',
@@ -87,5 +118,18 @@ describe('makeReturnResultTool', () => {
     const valid = await tool.call({ summary: 'done', data: { trend: 'improved' } }, {} as never)
     expect(valid.isError).toBe(false)
     expect(captured?.data).toEqual({ trend: 'improved' })
+  })
+})
+
+describe('withReturnResultHint', () => {
+  it('still appends the delivery rules when a task merely mentions return_result', () => {
+    const output = withReturnResultHint('Inspect why return_result was truncated.')
+    expect(output).toContain(RETURN_RESULT_HINT)
+    expect(output).toContain('never\nthe full contents')
+  })
+
+  it('is idempotent for the actual hint block', () => {
+    const once = withReturnResultHint('do work')
+    expect(withReturnResultHint(once)).toBe(once)
   })
 })

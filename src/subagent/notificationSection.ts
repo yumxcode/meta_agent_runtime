@@ -68,7 +68,9 @@ export function buildSubAgentNotificationSection(bridge: SubAgentBridge): string
     lines.push('')
     lines.push(
       '> These sub-tasks just reached terminal state. ' +
-      'Use `get_sub_agent_status` to retrieve full results. ' +
+      'Use `get_sub_agent_status` to retrieve result summaries and output paths; ' +
+      'use `get_sub_agent_result` for paged fallback retrieval. Cross-session recovery ' +
+      'requires explicit user approval through `recover_sub_agent_result`. ' +
       'If `pending_human_approval` is true, you MUST present the result to the user before proceeding.',
     )
   }

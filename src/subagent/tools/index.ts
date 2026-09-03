@@ -1,5 +1,5 @@
 /**
- * Sub-agent tool factory — exports all 5 sub-agent tools.
+ * Sub-agent tool factory — exports the complete sub-agent control surface.
  *
  * Usage:
  *   const bridge = new SubAgentBridge(sessionId)
@@ -12,6 +12,8 @@ import type { MetaAgentTool } from '../../core/types.js'
 import type { SubAgentBridge } from '../SubAgentBridge.js'
 import { makeSpawnSubAgentTool }           from './spawn_sub_agent.js'
 import { makeGetSubAgentStatusTool }       from './get_sub_agent_status.js'
+import { makeGetSubAgentResultTool }       from './get_sub_agent_result.js'
+import { makeRecoverSubAgentResultTool }   from './recover_sub_agent_result.js'
 import { makeGetSubAgentIntermediateTool } from './get_sub_agent_intermediate.js'
 import { makeCancelSubAgentTool }          from './cancel_sub_agent.js'
 import { makeListSubAgentsTool }           from './list_sub_agents.js'
@@ -19,6 +21,8 @@ import { makeListSubAgentsTool }           from './list_sub_agents.js'
 export {
   makeSpawnSubAgentTool,
   makeGetSubAgentStatusTool,
+  makeGetSubAgentResultTool,
+  makeRecoverSubAgentResultTool,
   makeGetSubAgentIntermediateTool,
   makeCancelSubAgentTool,
   makeListSubAgentsTool,
@@ -34,6 +38,8 @@ export function makeSubAgentTools(bridge: SubAgentBridge): MetaAgentTool[] {
   return [
     makeSpawnSubAgentTool(bridge),
     makeGetSubAgentStatusTool(bridge),
+    makeGetSubAgentResultTool(bridge),
+    makeRecoverSubAgentResultTool(),
     makeGetSubAgentIntermediateTool(bridge),
     makeCancelSubAgentTool(bridge),
     makeListSubAgentsTool(bridge),

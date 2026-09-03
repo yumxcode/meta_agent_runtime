@@ -23,6 +23,11 @@ import { DEFAULT_SUB_AGENT_BUDGET_USD, DEFAULT_SUB_AGENT_MAX_TURNS } from '../in
 /** Format: `subtask-{uuid8}` */
 export type SubAgentTaskId = string
 
+/** Safe flat-file identifier accepted by the durable subtask store. */
+export function isValidSubAgentTaskId(value: string): value is SubAgentTaskId {
+  return /^[A-Za-z0-9][A-Za-z0-9._-]{0,159}$/.test(value)
+}
+
 export type SubAgentWorkspaceMode =
   | 'shared_readonly'
   | 'shared_write'
@@ -314,8 +319,8 @@ export const DEFAULT_SUB_AGENT_CONFIG: Omit<SubAgentConfig, 'taskDescription'> =
  */
 export interface SubAgentProgressState {
   /**
-   * Number of tool-call rounds completed (proxy for "steps done").
-   * Derived from tool_result event count in the agentic loop.
+   * Number of individual tool calls completed (proxy for "steps done").
+   * Checkpoint cadence is tracked separately by completed model tool batches.
    */
   toolCallsCompleted: number
   /**
@@ -350,6 +355,13 @@ export interface SubAgentResult {
   summary: string
   /** Structured output if the sub-agent emitted one (tool_result or JSON block). */
   output?: unknown
+  /** Isolated-worktree integration outcome, persisted after automatic finalize. */
+  integration?: {
+    mergeRequired: boolean
+    status: 'committed' | 'already_committed' | 'no_changes'
+    commitHash?: string
+    changedFiles: string[]
+  }
   /** Error message when success=false. */
   error?: string
   /** Structured provider/runtime/task failure; contains no credentials. */
@@ -398,6 +410,8 @@ export interface SubAgentRecord {
   /** Latest checkpoint text (updated every checkpointEveryNTurns turns). */
   latestCheckpoint?: string
   latestCheckpointAt?: number
+  /** Liveness heartbeat while the runner owns this task. Updated at most every 30s. */
+  lastHeartbeatAt?: number
   /**
    * When requireHumanApproval=true and status=completed, this flag is true
    * until the main agent confirms it has presented the result to the user.

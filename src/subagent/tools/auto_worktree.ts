@@ -48,6 +48,9 @@ export function makeAutoMergeWorktreeTool(bridge: SubAgentBridge): MetaAgentTool
         const strategy = input['strategy'] === 'merge' ? 'merge' : 'squash'
         const result = await coord.merge(id, { strategy, message: input['message'] as string | undefined })
         if (!result) return { content: `Error: no worktree found for task "${id}".`, isError: true }
+        if (!result.mergeRequired) {
+          return { content: `Sub-agent ${id} produced no changes; no merge was required.`, isError: false }
+        }
         return { content: `Merged sub-agent ${id} (${strategy}) → ${result.commitHash}`, isError: false }
       } catch (err) {
         return {
@@ -82,6 +85,7 @@ export function makeAutoFinalizeWorktreeTool(bridge: SubAgentBridge): MetaAgentT
           content: JSON.stringify({
             task_id: id,
             status: result.status,
+            merge_required: result.mergeRequired,
             commit_hash: result.commitHash,
             changed_files: result.changedFiles,
           }, null, 2),

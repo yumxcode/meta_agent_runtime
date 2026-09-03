@@ -1,6 +1,6 @@
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import { execFileSync } from 'child_process'
-import { mkdtempSync, rmSync, writeFileSync } from 'fs'
+import { existsSync, mkdtempSync, rmSync, writeFileSync } from 'fs'
 import { tmpdir } from 'os'
 import { join } from 'path'
 import type { SubAgentRecord, SubAgentTaskId } from '../types.js'
@@ -452,16 +452,30 @@ describe('SubAgentBridge scheduler', () => {
       allowUnsandboxedFallback: false,
     })
   })
+
+  it('does not expose task records owned by another parent session', async () => {
+    const owner = new SubAgentBridge(`owner-${crypto.randomUUID()}`, { startDelayMs: 60_000 })
+    const foreign = new SubAgentBridge(`foreign-${crypto.randomUUID()}`, { startDelayMs: 60_000 })
+    const task = await owner.spawnSubAgent({ config: { taskDescription: 'private result' } })
+
+    expect(await owner.getStatus(task.taskId)).not.toBeNull()
+    expect((await owner.lookupStatus(task.taskId)).kind).toBe('owned')
+    expect((await foreign.lookupStatus(task.taskId)).kind).toBe('foreign')
+    expect(await foreign.getStatus(task.taskId)).toBeNull()
+    expect((await foreign.lookupStatus('subtask-missing' as SubAgentTaskId)).kind).toBe('not_found')
+  })
 })
 
 describe('SubAgentBridge isolated-write contract', () => {
   it('fails closed when isolated_write is requested without a git coordinator', async () => {
     const bridge = new SubAgentBridge(`isolated-${crypto.randomUUID()}`)
+    bridge.setToolRegistry(new Map([['write_file', tool('write_file', 'write')]]))
     try {
       await expect(bridge.spawnSubAgent({
         config: {
           taskDescription: 'write code',
           workspaceMode: 'isolated_write',
+          allowedTools: ['write_file'],
         },
       })).rejects.toThrow(/requires an auto-mode git worktree coordinator/)
     } finally {
@@ -476,11 +490,13 @@ describe('SubAgentBridge isolated-write contract', () => {
     const bridge = new SubAgentBridge(sessionId, { startDelayMs: 0 })
     const coordinator = new AutoWorktreeCoordinator(repo)
     bridge.setWorktreeCoordinator(coordinator)
+    bridge.setToolRegistry(new Map([['write_file', tool('write_file', 'write')]]))
     try {
       const task = await bridge.spawnSubAgent({
         config: {
           taskDescription: 'write code',
           workspaceMode: 'isolated_write',
+          allowedTools: ['write_file'],
         },
       })
       await waitFor(() => mockState.runners.some(r => r.taskId === task.taskId))
@@ -504,9 +520,109 @@ describe('SubAgentBridge isolated-write contract', () => {
         notifications += bridge.drainNotifications().join('\n')
         return notifications.includes('等待 auto_merge_subagent')
       })
+      expect(mockState.tasks.get(task.taskId)?.result?.integration).toMatchObject({
+        mergeRequired: true,
+        status: 'committed',
+      })
     } finally {
       await bridge.dispose()
       rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it.each([
+    ['omitted', undefined],
+    ['empty', []],
+  ] as const)('rejects isolated_write when allowed_tools is %s', async (_label, allowedTools) => {
+    const repo = mkdtempSync(join(tmpdir(), 'bridge-isolated-empty-'))
+    initRepo(repo)
+    const bridge = new SubAgentBridge(`isolated-${crypto.randomUUID()}`)
+    bridge.setWorktreeCoordinator(new AutoWorktreeCoordinator(repo))
+    try {
+      await expect(bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'write code',
+          workspaceMode: 'isolated_write',
+          allowedTools,
+        },
+      })).rejects.toThrow(/requires at least one resolved workspace mutation tool/)
+    } finally {
+      await bridge.dispose()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('rejects isolated_write when requested tools resolve but are read-only', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'bridge-isolated-readonly-'))
+    initRepo(repo)
+    const bridge = new SubAgentBridge(`isolated-${crypto.randomUUID()}`)
+    bridge.setWorktreeCoordinator(new AutoWorktreeCoordinator(repo))
+    bridge.setToolRegistry(new Map([['read_file', tool('read_file', 'read')]]))
+    try {
+      await expect(bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'write code',
+          workspaceMode: 'isolated_write',
+          allowedTools: ['read_file'],
+        },
+      })).rejects.toThrow(/requires at least one resolved workspace mutation tool/)
+    } finally {
+      await bridge.dispose()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('marks an unchanged worktree merge_required=false and reclaims it', async () => {
+    const repo = mkdtempSync(join(tmpdir(), 'bridge-isolated-nochange-'))
+    initRepo(repo)
+    const sessionId = `isolated-${crypto.randomUUID()}`
+    const bridge = new SubAgentBridge(sessionId, { startDelayMs: 0 })
+    const coordinator = new AutoWorktreeCoordinator(repo)
+    bridge.setWorktreeCoordinator(coordinator)
+    bridge.setToolRegistry(new Map([['write_file', tool('write_file', 'write')]]))
+    try {
+      const task = await bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'write code',
+          workspaceMode: 'isolated_write',
+          allowedTools: ['write_file'],
+        },
+      })
+      await waitFor(() => mockState.runners.some(r => r.taskId === task.taskId))
+      const worktree = mockState.tasks.get(task.taskId)!.config.projectDir!
+      completeTask(task.taskId)
+      const completed = mockState.tasks.get(task.taskId)!.result!
+      CampaignEventBus.emit('subagent:completed', {
+        taskId: task.taskId,
+        parentSessionId: sessionId,
+        result: completed,
+      })
+      await waitFor(() => mockState.tasks.get(task.taskId)?.result?.integration !== undefined)
+      expect(mockState.tasks.get(task.taskId)?.result?.integration).toMatchObject({
+        status: 'no_changes',
+        mergeRequired: false,
+      })
+      expect(coordinator.activeTasks()).not.toContain(task.taskId)
+      expect(existsSync(worktree)).toBe(false)
+    } finally {
+      await bridge.dispose()
+      rmSync(repo, { recursive: true, force: true })
+    }
+  })
+
+  it('allows shared_readonly without tools for pure reasoning', async () => {
+    const bridge = new SubAgentBridge(`readonly-${crypto.randomUUID()}`, { startDelayMs: 0 })
+    try {
+      const record = await bridge.spawnSubAgent({
+        config: {
+          taskDescription: 'reason only',
+          workspaceMode: 'shared_readonly',
+          allowedTools: [],
+        },
+      })
+      expect(record.status).toBe('queued')
+    } finally {
+      await bridge.dispose(0)
     }
   })
 })

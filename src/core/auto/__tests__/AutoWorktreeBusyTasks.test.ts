@@ -84,6 +84,10 @@ describe('busyTasks — phases that must NOT block a park', () => {
     expect(coordinatorWith({ t1: 'failed' }).busyTasks()).toEqual([])
   })
 
+  it('no_changes is not busy', () => {
+    expect(coordinatorWith({ t1: 'no_changes' }).busyTasks()).toEqual([])
+  })
+
   it('merged is not busy', () => {
     expect(coordinatorWith({ t1: 'merged' }).busyTasks()).toEqual([])
   })

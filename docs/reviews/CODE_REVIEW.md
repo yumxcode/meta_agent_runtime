@@ -411,16 +411,16 @@ this.sandboxHandles.set(cacheKey, handle)
 - `src/kernel/loop/KernelLoop.ts:562` — `parts.join('\x00')`（分隔符）
 - `src/kernel/api/DeepSeekClient.ts:80` — `` `${sessionId}\x00${model}\x00...` ``（缓存 key）
 
-这两处用的是**字面 NUL 字节**而不是转义序列 ` `。后果：
+这两处用的是**字面 NUL 字节**而不是转义序列 `\x00`。后果：
 
 ```
 $ grep -rn "TODO" src/
 grep: ./kernel/loop/KernelLoop.ts: binary file matches   ← 内容不显示
 ```
 
-`grep`、`git diff`、部分编辑器和 code review 工具都会把这两个文件当二进制处理，**审查时直接看不到内容**。用 ` ` 转义写法语义完全等价，且文件保持纯文本。
+`grep`、`git diff`、部分编辑器和 code review 工具都会把这两个文件当二进制处理，**审查时直接看不到内容**。用 `\x00` 转义写法语义完全等价，且文件保持纯文本。
 
-**建议**：`' '` 替换字面字节。可以加一条 CI 检查：`git grep -Il '' -- 'src/**/*.ts'` 找出非文本源文件。
+**建议**：`'\x00'` 替换字面字节。可以加一条 CI 检查：`git grep -Il '' -- 'src/**/*.ts'` 找出非文本源文件。
 
 ---
 
@@ -587,7 +587,7 @@ child.stdout?.on('data', (chunk: Buffer) => {
 | 5 | **P1-4** 沙箱降级时告警 + 在 env 输出里暴露后端 | S | 消除"以为有沙箱"的错觉 |
 | 6 | **P2-7** `.finally(async)` 顺序调整 | XS | 消除一条 CLI 崩溃路径 |
 | 7 | **P2-3** `withFileLock` 持锁续期 | S | 修复长临界区的互斥破坏 |
-| 8 | **P3-4** NUL 字节 → ` ` | XS | 让两个核心文件重新可 grep/可 review |
+| 8 | **P3-4** NUL 字节 → `\x00` | XS | 让两个核心文件重新可 grep/可 review |
 | 9 | **P2-5** MCP stdio env 过滤 | S | 与 shell 的凭证策略对齐 |
 | 10 | **P4-2** 补 `sandbox/` + PermissionPolicy 的逃逸用例表测试 | M | 防止上述修复回归 |
 | 11 | **P2-8 / P3-3** 收敛三份工作区边界实现到 `workspaceGuard` | M | 消除已知漂移 |

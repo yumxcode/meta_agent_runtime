@@ -13,6 +13,7 @@
  */
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest'
 import type { SubAgentRecord } from '../types.js'
+import type { MetaAgentTool } from '../../core/types.js'
 
 const mockState = vi.hoisted(() => {
   const tasks = new Map<string, SubAgentRecord>()
@@ -176,6 +177,16 @@ describe('SubAgentBridge admission is atomic under a concurrent fan-out', () => 
       maxTotalSubAgentBudgetUsd: 1,
       startDelayMs: 0,
     })
+    bridge.setToolRegistry(new Map([[
+      'write_file',
+      {
+        name: 'write_file',
+        description: 'write',
+        inputSchema: { type: 'object' },
+        permission: { category: 'write' },
+        call: async () => ({ content: 'ok', isError: false }),
+      } satisfies MetaAgentTool,
+    ]]))
 
     // isolated_write without a coordinator fails AFTER the synchronous
     // admission claim — the rollback must hand the seat and budget back.
@@ -184,6 +195,7 @@ describe('SubAgentBridge admission is atomic under a concurrent fan-out', () => 
         config: {
           taskDescription: 'needs a worktree',
           workspaceMode: 'isolated_write',
+          allowedTools: ['write_file'],
           maxBudgetUsd: 0.9,
         },
       }),

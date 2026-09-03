@@ -10,15 +10,22 @@
  *   tool description and by a warning injected into the response.
  */
 
-import type { MetaAgentTool, ToolResult } from '../../core/types.js'
+import type { MetaAgentTool, ToolCallContext, ToolResult } from '../../core/types.js'
 import type { SubAgentBridge } from '../SubAgentBridge.js'
+import { exportSubAgentResultArtifact } from '../resultArtifact.js'
+import { isValidSubAgentTaskId } from '../types.js'
 
 export function makeGetSubAgentStatusTool(bridge: SubAgentBridge): MetaAgentTool {
   return {
     name: 'get_sub_agent_status',
+    permission: { category: 'state' },
     description: `Get the current status (and final result, if complete) of a sub-agent task.
 
 Returns: task_id, status, pending_human_approval, result (when terminal), timestamps.
+When structured output exists it is exported as a sanitized output-only artifact
+inside the caller workspace; result includes output_path, length, and sha256.
+Repeated polls reuse identical content. The path lives only as long as that
+workspace; use get_sub_agent_result for durable paged access.
 
 IMPORTANT — Human approval gate:
 If pending_human_approval=true in the response, you MUST:
@@ -48,19 +55,33 @@ Status values:
 
     async call(
       input: Record<string, unknown>,
+      ctx: ToolCallContext,
     ): Promise<ToolResult> {
       const taskId = String(input['task_id'] ?? '').trim()
       if (!taskId) {
         return { content: 'Error: task_id is required', isError: true }
       }
+      if (!isValidSubAgentTaskId(taskId)) {
+        return { content: 'Error: task_id has an invalid format', isError: true }
+      }
 
-      const record = await bridge.getStatus(taskId)
-      if (!record) {
+      const lookup = await bridge.lookupStatus(taskId)
+      if (lookup.kind === 'foreign') {
+        return {
+          content:
+            `Error: Task "${taskId}" exists but belongs to a different parent session. ` +
+            'Resume that session, or use recover_sub_agent_result with explicit user approval. ' +
+            'Owner identity and the raw task-record path are intentionally not exposed.',
+          isError: true,
+        }
+      }
+      if (lookup.kind === 'not_found') {
         return {
           content: `Error: No task found with ID "${taskId}". Use list_sub_agents to see all active tasks.`,
           isError: true,
         }
       }
+      const record = lookup.record
 
       const out: Record<string, unknown> = {
         task_id:                record.taskId,
@@ -71,8 +92,20 @@ Status values:
 
       if (record.startedAt)   out['started_at']   = new Date(record.startedAt).toISOString()
       if (record.completedAt) out['completed_at']  = new Date(record.completedAt).toISOString()
+      if (record.lastHeartbeatAt) {
+        out['last_heartbeat_at'] = new Date(record.lastHeartbeatAt).toISOString()
+      }
 
       if (record.result) {
+        const exported = await exportSubAgentResultArtifact(
+          record.taskId,
+          record.result.output,
+          ctx.workspaceRoot ?? process.cwd(),
+        ).then(
+          artifact => ({ artifact }),
+          error => ({ error: error instanceof Error ? error.message : String(error) }),
+        )
+        const artifact = 'artifact' in exported ? exported.artifact : undefined
         out['result'] = {
           success:      record.result.success,
           summary:      record.result.summary,
@@ -82,6 +115,21 @@ Status values:
           input_tokens: record.result.inputTokens,
           output_tokens: record.result.outputTokens,
           ...(record.result.error ? { error: record.result.error } : {}),
+          ...(record.result.integration ? {
+            merge_required: record.result.integration.mergeRequired,
+            worktree_status: record.result.integration.status,
+            commit_hash: record.result.integration.commitHash,
+            changed_files: record.result.integration.changedFiles,
+          } : {}),
+          ...(artifact ? {
+            output_path: artifact.outputPath,
+            output_length: artifact.outputLength,
+            output_bytes: artifact.outputBytes,
+            output_sha256: artifact.outputSha256,
+            output_path_scope: artifact.outputPathScope,
+            output_path_lifetime: artifact.outputPathLifetime,
+          } : {}),
+          ...('error' in exported ? { output_export_error: exported.error } : {}),
         }
       }
 

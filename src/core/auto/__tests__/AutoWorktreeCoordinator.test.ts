@@ -110,6 +110,7 @@ describe('AutoWorktreeCoordinator', () => {
     expect(first.status).toBe('committed')
     expect(second).toEqual({
       status: 'already_committed',
+      mergeRequired: true,
       commitHash: first.commitHash,
       changedFiles: [],
     })
@@ -362,22 +363,39 @@ describe('AutoWorktreeCoordinator', () => {
     expect(coord.activeTasks()).toEqual([])
   })
 
-  it('safe cleanup removes no-change finalized worktrees and preserves unmerged commits', async () => {
+  it('finalize immediately reclaims no-change worktrees and preserves unmerged commits', async () => {
     initRepo(repo)
     const coord = new AutoWorktreeCoordinator(repo)
     const empty = await coord.allocate('task-empty')
     const changed = await coord.allocate('task-changed')
     writeFileSync(join(changed!.worktreePath, 'feature.txt'), 'keep me\n')
 
-    await coord.finalize('task-empty')
+    const emptyResult = await coord.finalize('task-empty')
     await coord.finalize('task-changed')
 
-    const result = await coord.cleanup('safe')
-    expect(result.removed).toContain('task-empty')
-    expect(result.preserved.map(p => p.taskId)).toContain('task-changed')
+    expect(emptyResult).toEqual({
+      status: 'no_changes',
+      mergeRequired: false,
+      changedFiles: [],
+    })
     expect(existsSync(empty!.worktreePath)).toBe(false)
+    expect(coord.activeTasks()).toEqual(['task-changed'])
+
+    const result = await coord.cleanup('safe')
+    expect(result.removed).not.toContain('task-empty')
+    expect(result.preserved.map(p => p.taskId)).toContain('task-changed')
     expect(existsSync(changed!.worktreePath)).toBe(true)
     expect(coord.activeTasks()).toEqual(['task-changed'])
+  })
+
+  it('merge reports merge_required=false and reclaims an unchanged worktree', async () => {
+    initRepo(repo)
+    const coord = new AutoWorktreeCoordinator(repo)
+    const handle = await coord.allocate('task-empty-merge')
+    const result = await coord.merge('task-empty-merge')
+    expect(result).toEqual({ merged: false, mergeRequired: false })
+    expect(existsSync(handle!.worktreePath)).toBe(false)
+    expect(coord.activeTasks()).not.toContain('task-empty-merge')
   })
 
   it('aggressive cleanup discards tracked worktrees even when commits await merge', async () => {

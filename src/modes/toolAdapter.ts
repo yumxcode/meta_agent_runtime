@@ -69,7 +69,8 @@ const BUILTIN_BOUNDED_TOOLS = new Set([
   'enter_plan_mode', 'exit_plan_mode', 'experience_delete', 'experience_load',
   'experience_search', 'experience_write', 'find_duplicate_computation', 'glob',
   'grep', 'get_computation_lineage', 'get_provenance',
-  'get_sub_agent_intermediate', 'get_sub_agent_status', 'hardware_profile_read',
+  'get_sub_agent_intermediate', 'get_sub_agent_result', 'get_sub_agent_status', 'hardware_profile_read',
+  'recover_sub_agent_result',
   // `list_dir` was missing from this list while every one of its siblings
   // (glob, grep, read_file) was present — a single bounded readdir that auto
   // mode would nonetheless have rejected as an undeclared tool. Found by the

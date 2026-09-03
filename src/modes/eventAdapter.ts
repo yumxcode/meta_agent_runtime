@@ -11,7 +11,6 @@ import type { MetaAgentEvent, TokenUsage } from '../core/types.js'
 export interface TranslationState {
   sessionId: string
   startMs: number
-  turnCount: number
   totalCostUsd: number
   usage: TokenUsage
 }
@@ -84,7 +83,7 @@ export function translateKernelEvent(
         result: event.resultText,
         isError: subtype !== 'success' && subtype !== 'parked',
         durationMs,
-        numTurns: state.turnCount,
+        numTurns: event.numTurns,
         stopReason: event.stopReason,
         totalCostUsd: event.costUsd,
         usage: kernelUsageToMetaAgentUsage(event.usage),

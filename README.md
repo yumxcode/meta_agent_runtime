@@ -210,7 +210,8 @@ meta-agent -w /path/to/workspace loop timeline <instanceId>
 | --- | --- | --- |
 | `run_agent` | **同步**,阻塞到子代理跑完 | 下一步依赖该结果、或子任务间有严格依赖 |
 | `spawn_sub_agent` | **异步**,立即返回 task_id | 相互独立、可并行、长耗时、失败不应阻塞主流程 |
-| `get_sub_agent_status` / `_intermediate` / `cancel_sub_agent` / `list_sub_agents` | 异步收口与控制 | 取结果、查进度、取消、查总览 |
+| `get_sub_agent_status` / `_result` / `_intermediate` / `cancel_sub_agent` / `list_sub_agents` | 异步收口与控制 | 取摘要与交付路径、分页取结果、查进度、取消、查总览 |
+| `recover_sub_agent_result` | 跨会话结果恢复 | 经显式审批后分页读取已知历史任务的脱敏终态输出 |
 | `research_dispatch` | 同步,隔离调研后只回一行结论 + 落盘报告 | 需读全文但不想污染主上下文的资料调研 |
 | `experiment_dispatch` | 异步(robotics),各自独立 worktree/分支 | 并行实验,主代理事后合并 |
 
@@ -232,7 +233,7 @@ meta-agent -w /path/to/workspace loop timeline <instanceId>
 | MCP | `mcp_call`、`list_mcp_resources`、`read_mcp_resource` |
 | UI | `ask_user`、`send_message`、`todo_write`、`progress_note`、`artifacts_register` |
 | 系统 | `sleep`、`skill`、`config`、`enter_plan_mode`、`exit_plan_mode`、`cron_*`、`memory_write` |
-| 子代理 | `run_agent`、`spawn_sub_agent`、`get_sub_agent_status`、`get_sub_agent_intermediate`、`cancel_sub_agent`、`list_sub_agents`、`research_dispatch` |
+| 子代理 | `run_agent`、`spawn_sub_agent`、`get_sub_agent_status`、`get_sub_agent_result`、`recover_sub_agent_result`、`get_sub_agent_intermediate`、`cancel_sub_agent`、`list_sub_agents`、`research_dispatch` |
 | 溯源 | `get_provenance`、`list_recent`、`find_duplicate`、`get_lineage` |
 | 工作流 | `workflow_status`、`workflow_advance`、`workflow_complete_gate`、`workflow_list_phases` |
 | Robotics | `experiment_dispatch`、`paper_search`、`experience_*`、`principle_*`、`physical_anchor_*`、`hardware_profile_*`、team 与 git 协调工具 |

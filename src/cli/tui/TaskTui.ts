@@ -36,12 +36,19 @@ import {
   type TaskActionKind,
 } from '../../core/auto/TaskActions.js'
 import { buildFrame, reportBodyLines, type FrameMode, type SelectedTaskActivity } from './frame.js'
-import { decodeKeys, type Key } from './keys.js'
+import { createKeyDecoder, type Key } from './keys.js'
 import { resolveFinishedTaskActivity, type TaskManager } from './TaskManager.js'
 import { readTaskActivityLog } from './TaskActivityLog.js'
 
 const ENTER_ALT_SCREEN = '\x1b[?1049h\x1b[?25l'
 const LEAVE_ALT_SCREEN = '\x1b[?25h\x1b[?1049l'
+/**
+ * How long a partial escape sequence is held before it is treated as a real
+ * Escape keypress. A terminal emits a sequence in one write unless it is under
+ * burst load — a trackpad scroll — in which case the rest arrives immediately.
+ */
+const PARTIAL_KEY_FLUSH_MS = 40
+
 const HOME = '\x1b[H'
 const ERASE_LINE_END = '\x1b[K'
 const ERASE_SCREEN_END = '\x1b[J'
@@ -83,6 +90,9 @@ export class TaskTui {
   private pendingTask: TaskView | undefined
   private readonly refreshMs: number
   private timer: NodeJS.Timeout | undefined
+  /** Carries an escape sequence split across two stdin chunks. See ./keys.ts. */
+  private readonly decoder = createKeyDecoder()
+  private keyFlushTimer: NodeJS.Timeout | undefined
   private resolveExit: (() => void) | undefined
   private readonly onData = (chunk: Buffer): void => this.handleInput(chunk.toString('utf-8'))
   private readonly onResize = (): void => this.paint()
@@ -142,6 +152,7 @@ export class TaskTui {
     this.running = false
     this.activityReadVersion++
     if (this.timer) clearInterval(this.timer)
+    this.cancelKeyFlush()
     void this.options.manager?.stop()
     process.stdin.off('data', this.onData)
     process.stdout.off('resize', this.onResize)
@@ -235,7 +246,32 @@ export class TaskTui {
   // ── input ───────────────────────────────────────────────────────────────────
 
   private handleInput(chunk: string): void {
-    for (const key of decodeKeys(chunk)) {
+    // A held partial sequence is resolved by the next chunk if one arrives, so
+    // cancel the deadline before decoding.
+    this.cancelKeyFlush()
+    this.dispatchKeys(this.decoder.decode(chunk))
+    if (!this.running) return
+
+    // Nothing distinguishes a lone Escape keypress from the head of a sequence
+    // that got split across chunks, so the decoder holds it and we decide by
+    // deadline. Short enough to be imperceptible on a real Escape; long enough
+    // that a burst's continuation always wins.
+    if (this.decoder.hasPending()) {
+      this.keyFlushTimer = setTimeout(() => {
+        this.keyFlushTimer = undefined
+        if (!this.running) return
+        this.dispatchKeys(this.decoder.flush())
+        if (!this.running) return
+        this.afterKeys()
+      }, PARTIAL_KEY_FLUSH_MS)
+      this.keyFlushTimer.unref?.()
+    }
+    this.afterKeys()
+  }
+
+  private dispatchKeys(keys: readonly Key[]): void {
+    for (const key of keys) {
+      if (!this.running) return
       if (key.name === 'ctrl-c' || key.name === 'ctrl-d') return this.quit()
       switch (this.mode.kind) {
         case 'browse': this.handleBrowseKey(key); break
@@ -245,6 +281,9 @@ export class TaskTui {
         case 'report': this.handleReportKey(key); break
       }
     }
+  }
+
+  private afterKeys(): void {
     // Cursor movement should switch the lower panel immediately instead of
     // leaving the previous task's output visible until the next 1s poll.
     //
@@ -254,6 +293,12 @@ export class TaskTui {
     // fresh anyway.
     if (this.mode.kind !== 'report') void this.refreshSelectedActivity()
     this.paint()
+  }
+
+  private cancelKeyFlush(): void {
+    if (!this.keyFlushTimer) return
+    clearTimeout(this.keyFlushTimer)
+    this.keyFlushTimer = undefined
   }
 
   /**

@@ -430,7 +430,7 @@ export const ENV_REGISTRY: readonly EnvVarDoc[] = [
   { name: 'META_AGENT_MAX_TIMED_OUT_RUNNING_TOOLS', type: 'int', default: '3', description: 'Auto-mode circuit cap on timed-out-but-running tools.' },
   { name: 'META_AGENT_MAX_TOOL_USE_CONCURRENCY', type: 'int', default: '10', description: 'Max concurrent tool_use executions. Range [1,64].' },
   { name: 'META_AGENT_MAX_TOOL_OUTPUT_CHARS', type: 'int', default: '102400', description: 'Max chars of a bash tool output. Range [1KiB,1MiB].' },
-  { name: 'META_AGENT_MAX_TOOL_RESULT_CHARS', type: 'int', default: '204800', description: 'Max chars of a tool result surfaced to the model. Range [1KiB,1MiB].' },
+  { name: 'META_AGENT_MAX_TOOL_RESULT_CHARS', type: 'int', default: '65536', description: 'Max chars of a tool result surfaced to the model. Range [1KiB,1MiB].' },
   { name: 'META_AGENT_MAX_OUTPUT_TOKENS', type: 'flag', default: 'unset', description: 'When set, pins max output tokens and disables auto-escalation.' },
   { name: 'META_AGENT_CLI_MAX_VISIBLE_CHARS', type: 'int', default: '50000', description: 'Max visible chars before the CLI truncates a block. Range [10k,2M].' },
   { name: 'META_AGENT_MAX_RESUME_MESSAGES', type: 'int', default: 'unlimited', description: 'Max messages loaded verbatim on resume; older history is folded into one summary. Unset = full history.' },

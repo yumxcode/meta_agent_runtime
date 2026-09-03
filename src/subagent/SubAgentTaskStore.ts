@@ -19,7 +19,12 @@ import { homedir } from 'os'
 import { META_AGENT_HOME } from '../core/metaAgentHome.js'
 import { join } from 'path'
 import { atomicWriteJson, readJsonFile, ensureDir } from '../infra/persist/index.js'
-import { TERMINAL_STATUSES, type SubAgentRecord, type SubAgentTaskId } from './types.js'
+import {
+  isValidSubAgentTaskId,
+  TERMINAL_STATUSES,
+  type SubAgentRecord,
+  type SubAgentTaskId,
+} from './types.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Storage path
@@ -30,6 +35,9 @@ function subtaskDir(): string {
 }
 
 function taskPath(taskId: SubAgentTaskId): string {
+  if (!isValidSubAgentTaskId(taskId)) {
+    throw new Error(`Invalid sub-agent task id: ${JSON.stringify(taskId)}`)
+  }
   return join(subtaskDir(), `${taskId}.json`)
 }
 
@@ -59,6 +67,7 @@ function envInt(name: string, fallback: number, min: number, max: number): numbe
 export async function readTask(
   taskId: SubAgentTaskId,
 ): Promise<SubAgentRecord | null> {
+  if (!isValidSubAgentTaskId(taskId)) return null
   return readJsonFile<SubAgentRecord>(taskPath(taskId))
 }
 
@@ -73,6 +82,9 @@ export async function readTask(
  */
 export function writeTask(record: SubAgentRecord): Promise<void> {
   const taskId = record.taskId
+  if (!isValidSubAgentTaskId(taskId)) {
+    return Promise.reject(new Error(`Invalid sub-agent task id: ${JSON.stringify(taskId)}`))
+  }
 
   const doWrite = async () => {
     await ensureDir(subtaskDir())
@@ -105,6 +117,9 @@ export function mutateTask(
   taskId: SubAgentTaskId,
   mutate: (current: SubAgentRecord | null) => SubAgentRecord | null,
 ): Promise<SubAgentRecord | null> {
+  if (!isValidSubAgentTaskId(taskId)) {
+    return Promise.reject(new Error(`Invalid sub-agent task id: ${JSON.stringify(taskId)}`))
+  }
   const doMutate = async (): Promise<SubAgentRecord | null> => {
     const current = await readJsonFile<SubAgentRecord>(taskPath(taskId))
     const next = mutate(current)
@@ -130,6 +145,19 @@ export function mutateTask(
 }
 
 /**
+ * Refresh a running task's liveness marker without ever reviving or
+ * overwriting a terminal record. Serialized through the normal task chain.
+ */
+export function touchTaskHeartbeat(
+  taskId: SubAgentTaskId,
+  now = Date.now(),
+): Promise<SubAgentRecord | null> {
+  return mutateTask(taskId, current =>
+    current?.status === 'running' ? { ...current, lastHeartbeatAt: now } : null,
+  )
+}
+
+/**
  * Release the in-memory write chain for a task after all pending writes drain.
  * This keeps terminal task records on disk while preventing long-running
  * processes from retaining one Promise chain per historical task.
@@ -146,6 +174,7 @@ export async function releaseWriteChain(taskId: SubAgentTaskId): Promise<void> {
  * reaches a terminal state and the main agent has acknowledged the result.
  */
 export async function cleanupTask(taskId: SubAgentTaskId): Promise<void> {
+  if (!isValidSubAgentTaskId(taskId)) return
   // Drain any pending writes first
   await releaseWriteChain(taskId)
   try {

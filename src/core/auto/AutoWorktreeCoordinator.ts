@@ -38,6 +38,7 @@ export type AutoWorktreePhase =
   | 'allocated'
   | 'running'
   | 'finalizing'
+  | 'no_changes'
   | 'awaiting_merge'
   | 'merging'
   | 'conflicted'
@@ -72,13 +73,15 @@ export interface AutoWorktreeHandle {
 
 export interface AutoFinalizeResult {
   status: 'committed' | 'already_committed' | 'no_changes'
+  mergeRequired: boolean
   commitHash?: string
   changedFiles: string[]
 }
 
 export interface AutoMergeResult {
   merged: boolean
-  commitHash: string
+  mergeRequired: boolean
+  commitHash?: string
 }
 
 export interface AutoWorktreeReconcileResult {
@@ -169,6 +172,7 @@ export class AutoWorktreeCoordinator {
    * Phase rationale:
    *   allocated/running/finalizing — the sub-agent is or may still be writing
    *   merging                      — the PRIMARY tree is being mutated right now
+   *   no_changes                   — finalized empty result awaiting cleanup retry
    *   awaiting_merge               — work is already committed on its own branch;
    *                                  the merge is a separate agent-driven step
    *                                  (`auto_merge_subagent`) that resumes fine
@@ -262,16 +266,30 @@ export class AutoWorktreeCoordinator {
   private async _finalizeUnlocked(taskId: SubAgentTaskId): Promise<AutoFinalizeResult> {
     const record = this.records.get(taskId)
     if (!record) throw new Error(`No worktree found for task "${taskId}"`)
+    if (record.phase === 'no_changes') {
+      if (await this._removeWorktreeAndBranch(record)) {
+        await this._forgetRemovedRecord(record)
+      }
+      return { status: 'no_changes', mergeRequired: false, changedFiles: [] }
+    }
     if (!existsSync(record.worktreePath)) {
       throw new Error(`Worktree path is missing for task "${taskId}"`)
     }
     if (record.phase === 'awaiting_merge' || record.phase === 'merged') {
       if (record.finalizedCommit) {
-        return { status: 'already_committed', commitHash: record.finalizedCommit, changedFiles: [] }
+        return {
+          status: 'already_committed',
+          mergeRequired: true,
+          commitHash: record.finalizedCommit,
+          changedFiles: [],
+        }
       }
-      return { status: 'no_changes', changedFiles: [] }
+      await this._updateRecord(record, { phase: 'no_changes', error: undefined })
+      if (await this._removeWorktreeAndBranch(record)) {
+        await this._forgetRemovedRecord(record)
+      }
+      return { status: 'no_changes', mergeRequired: false, changedFiles: [] }
     }
-
     await this._updateRecord(record, { phase: 'finalizing', error: undefined })
     try {
       await this._assertNoGitOperation(record.worktreePath)
@@ -303,7 +321,7 @@ export class AutoWorktreeCoordinator {
             finalizedCommit: commitHash,
             error: undefined,
           })
-          return { status: 'committed', commitHash, changedFiles }
+          return { status: 'committed', mergeRequired: true, commitHash, changedFiles }
         }
       }
 
@@ -318,15 +336,23 @@ export class AutoWorktreeCoordinator {
           finalizedCommit: commitHash,
           error: undefined,
         })
-        return { status: 'already_committed', commitHash, changedFiles: [] }
+        return {
+          status: 'already_committed',
+          mergeRequired: true,
+          commitHash,
+          changedFiles: [],
+        }
       }
 
       await this._updateRecord(record, {
-        phase: 'awaiting_merge',
+        phase: 'no_changes',
         finalizedCommit: undefined,
         error: undefined,
       })
-      return { status: 'no_changes', changedFiles: [] }
+      if (await this._removeWorktreeAndBranch(record)) {
+        await this._forgetRemovedRecord(record)
+      }
+      return { status: 'no_changes', mergeRequired: false, changedFiles: [] }
     } catch (err) {
       await this._updateRecord(record, {
         phase: 'failed',
@@ -343,7 +369,10 @@ export class AutoWorktreeCoordinator {
     return this._exclusive(async () => {
       const record = this.records.get(taskId)
       if (!record) return null
-      await this._finalizeUnlocked(taskId)
+      const finalized = await this._finalizeUnlocked(taskId)
+      if (!finalized.mergeRequired) {
+        return { merged: false, mergeRequired: false }
+      }
       return this._mergeTransaction(record, opts)
     })
   }
@@ -412,7 +441,7 @@ export class AutoWorktreeCoordinator {
         this.records.delete(record.taskId)
         await this._requireRegistryPersist()
       }
-      return { merged: true, commitHash }
+      return { merged: true, mergeRequired: true, commitHash }
     } catch (err) {
       const originalError = err instanceof Error ? err.message : String(err)
       const rollbackError = await this._rollbackMainTransaction(preMergeHead, stashCommit)
@@ -700,11 +729,30 @@ export class AutoWorktreeCoordinator {
 
   private async _removeWorktreeAndBranch(record: AutoWorktreeRecord): Promise<boolean> {
     try {
-      await this._git(['worktree', 'remove', '--force', record.worktreePath])
-      await this._git(['branch', '-D', record.branchName])
+      if (existsSync(record.worktreePath)) {
+        await this._git(['worktree', 'remove', '--force', record.worktreePath])
+      }
+      const branchExists = await this._gitExitZero(this.projectDir, [
+        'show-ref',
+        '--verify',
+        '--quiet',
+        `refs/heads/${record.branchName}`,
+      ])
+      if (branchExists) await this._git(['branch', '-D', record.branchName])
       return true
     } catch {
       return false
+    }
+  }
+
+  /** Remove a reclaimed record without losing it if the registry write fails. */
+  private async _forgetRemovedRecord(record: AutoWorktreeRecord): Promise<void> {
+    this.records.delete(record.taskId)
+    try {
+      await this._requireRegistryPersist()
+    } catch (err) {
+      this.records.set(record.taskId, record)
+      throw err
     }
   }
 
@@ -721,6 +769,8 @@ export class AutoWorktreeCoordinator {
           ? { remove: false, reason: 'unmerged changes remain' }
           : { remove: true, reason: 'awaiting merge with no changes' }
       }
+      case 'no_changes':
+        return { remove: true, reason: 'finalized with no changes' }
       case 'failed': {
         const hasChanges = await this._recordHasRecoverableChanges(record).catch(() => true)
         return hasChanges

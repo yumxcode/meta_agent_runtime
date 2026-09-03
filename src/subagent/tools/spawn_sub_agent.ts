@@ -26,8 +26,11 @@ Returns IMMEDIATELY with a task_id; the sub-agent runs in the background. To fan
 work in parallel, issue SEVERAL spawn_sub_agent calls in the same turn — they run
 concurrently. You are NOT blocked: continue with other work, and you will be notified
 on completion via a "Sub-Agent Notifications" section at the top of a later system
-prompt (event-driven), or poll get_sub_agent_status. Retrieve the full result with
-get_sub_agent_status(task_id).
+prompt (event-driven), or poll get_sub_agent_status. Retrieve the summary and
+workspace-local output path with get_sub_agent_status(task_id); use
+get_sub_agent_result(task_id) as a paged fallback. Historical output from a
+different parent session requires explicit user approval through
+recover_sub_agent_result(task_id).
 
 The sub-agent has its OWN empty conversation context (it does NOT inherit this
 session's history) — put everything it needs into task_description.
@@ -159,6 +162,10 @@ would corrupt the tree.`,
 
       try {
         const loopScope = loopTaskScopeFromSessionId(ctx.sessionId)
+        const workspaceMode = input['workspace_mode'] === 'isolated_write'
+          ? 'isolated_write'
+          : 'shared_readonly'
+        const allowedTools = input['allowed_tools'] as string[] | undefined
         // Parse optional sandbox config from input
         const sandboxInput = input['sandbox'] as Record<string, unknown> | undefined
         const sandboxConfig = sandboxInput
@@ -176,7 +183,7 @@ would corrupt the tree.`,
           config: {
             taskDescription:       withReturnResultHint(taskDescription),
             systemPrompt:          input['system_prompt'] as string | undefined,
-            allowedTools:          input['allowed_tools'] as string[] | undefined,
+            allowedTools,
             maxTurns:              typeof input['max_turns']        === 'number' ? input['max_turns']        : 10,
             maxBudgetUsd:          typeof input['max_budget_usd']   === 'number' ? input['max_budget_usd']   : 0.5,
             requireHumanApproval:  typeof input['require_human_approval'] === 'boolean' ? input['require_human_approval'] : false,
@@ -187,11 +194,8 @@ would corrupt the tree.`,
             // Default shared_readonly (concurrency-safe). Writes must opt into
             // isolated_write so each concurrent writer gets its own git branch —
             // shared_write is deliberately NOT exposed on this async tool.
-            workspaceMode:
-              input['workspace_mode'] === 'isolated_write'
-                ? 'isolated_write'
-                : 'shared_readonly',
-            isolateWorktree: input['workspace_mode'] === 'isolated_write',
+            workspaceMode,
+            isolateWorktree: workspaceMode === 'isolated_write',
             ...(loopScope ?? {}),
           },
           abortSignal: ctx.abortSignal,

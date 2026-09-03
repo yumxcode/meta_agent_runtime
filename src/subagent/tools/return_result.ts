@@ -20,6 +20,16 @@
 import type { MetaAgentTool, ToolResult } from '../../core/types.js'
 import { validateJsonSchemaValue } from '../../core/jsonSchema.js'
 
+export const DEFAULT_RETURN_RESULT_MAX_DATA_CHARS = 512 * 1024
+export const FILE_DELIVERY_MAX_DATA_CHARS = 32 * 1024
+
+export interface ReturnResultToolOptions {
+  /** Serialized data limit. File-producing tasks use the smaller manifest-only cap. */
+  maxDataChars?: number
+  /** Adds explicit file-delivery guidance to the tool description and errors. */
+  fileProducingTask?: boolean
+}
+
 /**
  * Guidance appended to a sub-agent's task description so it knows to hand its
  * result back through return_result rather than relying on chat text capture.
@@ -29,13 +39,17 @@ export const RETURN_RESULT_HINT = `\
 When you have finished, call the return_result tool exactly once to hand your
 result back to the calling agent:
   - summary: a concise natural-language summary of the outcome.
-  - data:    (optional) any structured result, preserved verbatim.
+  - data:    (optional) a compact structured result.
+If the task creates code/files, write and test the deliverables in the workspace.
+In data return only a manifest (paths, hashes, tests, and remaining issues), never
+the full contents of generated files. Large non-file results should be split into
+durable artifacts and referenced by path.
 This is the authoritative channel — do not rely on your chat text being captured.
 After calling return_result you may stop.`
 
 /** Append the return_result guidance to a task description (idempotent-ish). */
 export function withReturnResultHint(taskDescription: string): string {
-  if (taskDescription.includes('return_result')) return taskDescription
+  if (taskDescription.includes(RETURN_RESULT_HINT)) return taskDescription
   return `${taskDescription.trimEnd()}\n\n${RETURN_RESULT_HINT}\n`
 }
 
@@ -49,22 +63,29 @@ export interface ReturnedResult {
 export function makeReturnResultTool(
   sink: (result: ReturnedResult) => void,
   dataSchema?: Record<string, unknown>,
+  options: ReturnResultToolOptions = {},
 ): MetaAgentTool {
+  const maxDataChars = options.maxDataChars ?? DEFAULT_RETURN_RESULT_MAX_DATA_CHARS
   const dataDescription =
-    'Authoritative structured result, preserved verbatim and prioritized over narration.'
+    'Compact authoritative structured result, preserved verbatim and prioritized over narration.'
+  const fileDeliveryGuidance = options.fileProducingTask
+    ? `\n\nThis task can write files. Put deliverables in the workspace and return only a compact\n` +
+      `manifest in data (paths, hashes, tests, remaining issues). Do NOT paste file contents\n` +
+      `into data. The serialized data limit for this task is ${maxDataChars} characters.`
+    : `\n\nThe serialized data limit is ${maxDataChars} characters. Persist larger results as artifacts.`
   return {
     name: 'return_result',
     isConcurrencySafe: false,
     description: `Submit your FINAL result for this task.
 
 Call this exactly once, when you are done, instead of relying on your chat text to
-be captured. Whatever you pass here is what the calling agent receives — verbatim
-and untruncated-by-narration.
+be captured. Accepted data is preserved independently of narration, subject to
+the serialized-size limit below.
 
 - summary: a concise natural-language summary of what you found / did.
 - data:    (optional) the structured result object. For a literature survey this
            is { papers: [...], synthesis: "...", recommendation: "..." }. It is
-           preserved whole and prioritized if the summary must be shortened.
+           preserved whole and prioritized if the summary must be shortened.${fileDeliveryGuidance}
 
 After calling return_result you may stop — no further tool calls are needed.`,
     inputSchema: {
@@ -93,6 +114,26 @@ After calling return_result you may stop — no further tool calls are needed.`,
       if (dataSchema) {
         const error = validateJsonSchemaValue(input['data'], dataSchema, 'return_result.data')
         if (error) return { content: `Error: ${error}.`, isError: true }
+      }
+      if (input['data'] !== undefined) {
+        let serialized: string
+        try {
+          serialized = JSON.stringify(input['data'])
+        } catch {
+          return {
+            content: 'Error: return_result.data must be JSON-serializable.',
+            isError: true,
+          }
+        }
+        if (serialized.length > maxDataChars) {
+          return {
+            content:
+              `Error: return_result.data is ${serialized.length} characters; limit is ${maxDataChars}. ` +
+              'Write large deliverables to workspace files, then retry with data containing only ' +
+              'the file paths, hashes, test results, and remaining issues.',
+            isError: true,
+          }
+        }
       }
       const result: ReturnedResult = { summary }
       if (input['data'] !== undefined) result.data = input['data']

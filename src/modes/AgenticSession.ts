@@ -293,13 +293,11 @@ export class AgenticSession {
     const state: TranslationState = {
       sessionId: this._sessionId,
       startMs: Date.now(),
-      turnCount: 0,
       totalCostUsd: this._totalCostUsd,
       usage: { ...this._usage },
     }
 
     for await (const event of this._engine.submitMessage(prompt)) {
-      if (event.type === 'tool_use') state.turnCount++
       if (event.type === 'result') {
         this._totalCostUsd = event.costUsd
         this._usage = {

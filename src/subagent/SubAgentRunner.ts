@@ -23,7 +23,13 @@ import { registerModelCallScope } from '../infra/modelCallAdmission.js'
 import { classifyExecutionFailure } from '../infra/failures/ExecutionFailure.js'
 import { resolveProvider } from '../providers/registry.js'
 import { DEFAULT_SUB_AGENT_SYSTEM_PROMPT } from '../core/staticPrompt.js'
-import { writeTask, readTask, mutateTask, releaseWriteChain } from './SubAgentTaskStore.js'
+import {
+  writeTask,
+  readTask,
+  mutateTask,
+  releaseWriteChain,
+  touchTaskHeartbeat,
+} from './SubAgentTaskStore.js'
 import { CampaignEventBus } from './CampaignEventBus.js'
 import {
   TERMINAL_STATUSES,
@@ -37,7 +43,11 @@ import {
 import { createSandboxExecutor } from '../sandbox/index.js'
 import type { SandboxHandle } from '../sandbox/types.js'
 import { createBashTool } from '../tools/shell/bash/index.js'
-import { makeReturnResultTool, type ReturnedResult } from './tools/return_result.js'
+import {
+  FILE_DELIVERY_MAX_DATA_CHARS,
+  makeReturnResultTool,
+  type ReturnedResult,
+} from './tools/return_result.js'
 import type { SubAgentRuntimeEvent } from './SubAgentBridge.js'
 import { isAbsolute, relative, resolve } from 'path'
 import { tmpdir } from 'os'
@@ -45,6 +55,8 @@ import { canonicalizeForGuard, pathIsUnder } from '../tools/fs/workspaceGuard.js
 import { dirname } from 'path'
 import { findIndexedTrajectory, findTrajectoryBySessionId } from '../trajectory/indexStore.js'
 import { openTrajectory, recordTrajectoryItem } from '../trajectory/hub.js'
+import { resolvedWorkspaceMutationTools } from './workspaceCapability.js'
+import { CompletedToolBatchCounter } from './CompletedToolBatchCounter.js'
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Constants
@@ -52,6 +64,7 @@ import { openTrajectory, recordTrajectoryItem } from '../trajectory/hub.js'
 
 const SUMMARY_MAX_CHARS = 12_000
 const ERROR_MAX_CHARS   = 500
+const HEARTBEAT_INTERVAL_MS = 30_000
 
 function truncate(s: string, max: number): string {
   return s.length <= max ? s : s.slice(0, max - 3) + '...'
@@ -162,6 +175,7 @@ export class SubAgentRunner {
   private _returnedResult?: ReturnedResult
   /** Set when a self-park tool (via cfg.parkSignal) ended the segment — terminal 'completed' with {label:'wait'}. */
   private _parked = false
+  private _heartbeatTimer?: ReturnType<typeof setInterval>
   private _trajectorySessionId: string | undefined
   /** Serialize parent lifecycle projection so terminal cannot overtake start. */
   private _trajectoryProjection: Promise<void> = Promise.resolve()
@@ -254,6 +268,7 @@ export class SubAgentRunner {
     // Mark as running
     this.record.status    = 'running'
     this.record.startedAt = Date.now()
+    this.record.lastHeartbeatAt = this.record.startedAt
     await writeTask(this.record)
     this._emitRuntime({ type: 'runner_started', taskId: this.taskId })
     const cfg = this.record.config
@@ -262,7 +277,8 @@ export class SubAgentRunner {
     let turnsUsed = 0
     let inputTokens = 0
     let outputTokens = 0
-    let toolResultCount = 0   // counts completed tool-call rounds (turn proxy)
+    let toolResultCount = 0
+    const toolBatchCounter = new CompletedToolBatchCounter()
     let executionPhase: SubAgentExecutionPhase = 'initializing'
     let runtimeEventCount = 0
     let firstRuntimeEventAt: number | undefined
@@ -307,6 +323,17 @@ export class SubAgentRunner {
     let unregisterModelScope: (() => void) | null = null
     try { // ← outer try: ensures sandboxHandle.destroy() always runs
 
+    // Durable liveness signal for long provider/tool waits. The interval is
+    // intentionally coarse to avoid turning each stream event into a disk
+    // write. mutateTask refuses to revive a terminal task if the timer races
+    // completion.
+    this._heartbeatTimer = setInterval(() => {
+      const now = Date.now()
+      this.record.lastHeartbeatAt = now
+      void touchTaskHeartbeat(this.record.taskId, now).catch(() => undefined)
+    }, HEARTBEAT_INTERVAL_MS)
+    this._heartbeatTimer.unref?.()
+
     // Build the isolated session config.
     // Forward provider credentials from the parent session when explicit —
     // otherwise MetaAgentSession.resolveConfig() picks them up from env vars.
@@ -342,6 +369,28 @@ export class SubAgentRunner {
       })
       return
     }
+    const resolvedMutationTools = resolvedWorkspaceMutationTools(
+      tools.map(tool => tool.name),
+      new Map(tools.map(tool => [tool.name, tool])),
+      cfg.extraTools,
+    )
+    if (cfg.workspaceMode === 'isolated_write' && resolvedMutationTools.length === 0) {
+      await this._writeTerminal('failed', {
+        success: false,
+        summary: '',
+        error: truncate(
+          'isolated_write requires at least one resolved workspace mutation tool; ' +
+          'the task was stopped before model execution.',
+          ERROR_MAX_CHARS,
+        ),
+        turnsUsed: 0,
+        inputTokens: 0,
+        outputTokens: 0,
+        costUsd: 0,
+        durationMs: Date.now() - startMs,
+      })
+      return
+    }
 
     // Always give the sub-agent an explicit result channel. The payload it submits
     // here becomes the authoritative summary (see _summaryFor), independent of how
@@ -350,6 +399,12 @@ export class SubAgentRunner {
     const returnResultTool = makeReturnResultTool(
       r => { this._returnedResult = r },
       cfg.resultSchema,
+      {
+        fileProducingTask: resolvedMutationTools.length > 0,
+        ...(resolvedMutationTools.length > 0
+          ? { maxDataChars: FILE_DELIVERY_MAX_DATA_CHARS }
+          : {}),
+      },
     )
     const sessionTools = [...tools, returnResultTool, ...(cfg.extraTools ?? [])]
 
@@ -481,16 +536,30 @@ export class SubAgentRunner {
           lastText += event.text
         }
 
-        // Each tool_result marks the end of one tool-use round.
-        // We use this as a turn proxy for checkpoint scheduling.
+        if (event.type === 'tool_use') {
+          const recovery = toolBatchCounter.observeToolUse(event.toolUseId)
+          if (recovery) {
+            process.stderr.write(
+              `[SubAgentRunner] Recovered stale tool batch for ${this.taskId}; ` +
+              `missing result(s): ${recovery.staleToolUseIds.join(', ')}. ` +
+              'Checkpoint cadence will continue.\n',
+            )
+          }
+        }
+
+        // Count every completed tool call for progress, but checkpoint only
+        // once the whole model-issued batch has settled. Parallel tools in one
+        // turn must not consume N checkpoint turns.
         if (event.type === 'tool_result') {
           toolResultCount++
+          const completedBatches = toolBatchCounter.observeToolResult(event.toolUseId)
           if (
+            completedBatches !== undefined &&
             cfg.checkpointEveryNTurns > 0 &&
-            toolResultCount % cfg.checkpointEveryNTurns === 0 &&
+            completedBatches % cfg.checkpointEveryNTurns === 0 &&
             lastText.trim()
           ) {
-            await this._saveCheckpoint(lastText, toolResultCount)
+            await this._saveCheckpoint(lastText, completedBatches)
           }
           // Self-park (loop worker `timer`): the tool flipped parkSignal. End the
           // segment MECHANICALLY — interrupt the session so no further model turn
@@ -655,6 +724,10 @@ export class SubAgentRunner {
     }
     } finally {
       if (durationTimer) clearTimeout(durationTimer)
+      if (this._heartbeatTimer) {
+        clearInterval(this._heartbeatTimer)
+        this._heartbeatTimer = undefined
+      }
       unregisterModelScope?.()
       this.parentAbortSignal.removeEventListener('abort', this._forwardAbort)
       this.abortSignal.removeEventListener('abort', this._interruptSessionOnAbort)
@@ -745,22 +818,9 @@ export class SubAgentRunner {
     return buildSummaryFromText(source, SUMMARY_MAX_CHARS)
   }
 
-  /**
-   * The structured `data` payload from return_result, size-capped so a runaway
-   * sub-agent cannot bloat the task store (cap ≈ 512 KB serialized).
-   */
+  /** The structured data already validated by return_result before acceptance. */
   private _returnedData(): unknown {
-    const data = this._returnedResult?.data
-    if (data === undefined) return undefined
-    try {
-      const serialized = JSON.stringify(data)
-      if (serialized.length > 512 * 1024) {
-        return { truncated: true, reason: `return_result data exceeded 512KB (${serialized.length} chars)` }
-      }
-    } catch {
-      return undefined
-    }
-    return data
+    return this._returnedResult?.data
   }
 
   private _stopReasonToError(subtype: string): string {
@@ -831,6 +891,10 @@ export class SubAgentRunner {
     status: 'completed' | 'failed' | 'cancelled',
     result: SubAgentResult,
   ): Promise<void> {
+    if (this._heartbeatTimer) {
+      clearInterval(this._heartbeatTimer)
+      this._heartbeatTimer = undefined
+    }
     // Guard against double-terminal (e.g. abort + error racing)
     if (TERMINAL_STATUSES.has(this.record.status) && this.record.status !== 'running') return
 

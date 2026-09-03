@@ -21,6 +21,8 @@
  * The main agent can then call:
  *   spawn_sub_agent       — delegate a sub-task
  *   get_sub_agent_status  — query final status
+ *   get_sub_agent_result  — page through authoritative structured output
+ *   recover_sub_agent_result — explicitly recover a historical task output
  *   get_sub_agent_intermediate — query checkpoint
  *   cancel_sub_agent      — abort a running sub-agent
  *   list_sub_agents       — list all tasks this session
@@ -45,6 +47,7 @@ export type {
 } from './types.js'
 export {
   makeSubAgentTaskId,
+  isValidSubAgentTaskId,
   DEFAULT_SUB_AGENT_CONFIG,
   TERMINAL_STATUSES,
 } from './types.js'
@@ -56,6 +59,7 @@ export { CampaignEventBus } from './CampaignEventBus.js'
 export {
   readTask,
   writeTask,
+  touchTaskHeartbeat,
   releaseWriteChain,
   cleanupTask,
   listTasksForSession,
@@ -68,6 +72,7 @@ export { SubAgentRunner } from './SubAgentRunner.js'
 export {
   SubAgentBridge,
   type SubAgentBridgeOptions,
+  type SubAgentStatusLookup,
   type SpawnSubAgentOptions,
 } from './SubAgentBridge.js'
 // Prompt section builder now lives in its own module (separated from the
@@ -79,6 +84,8 @@ export {
   makeSubAgentTools,
   makeSpawnSubAgentTool,
   makeGetSubAgentStatusTool,
+  makeGetSubAgentResultTool,
+  makeRecoverSubAgentResultTool,
   makeGetSubAgentIntermediateTool,
   makeCancelSubAgentTool,
   makeListSubAgentsTool,

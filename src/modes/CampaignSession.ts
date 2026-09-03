@@ -187,14 +187,12 @@ export class CampaignSession {
     const state: TranslationState = {
       sessionId: this._sessionId,
       startMs: Date.now(),
-      turnCount: 0,
       totalCostUsd: this._totalCostUsd,
       usage: { ...this._usage },
     }
 
     try {
       for await (const event of this._engine.submitMessage(effectivePrompt)) {
-        if (event.type === 'tool_use') state.turnCount++
         if (event.type === 'result') {
           this._totalCostUsd = event.costUsd
           this._usage = {

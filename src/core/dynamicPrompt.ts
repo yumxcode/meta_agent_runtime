@@ -600,7 +600,9 @@ export function buildDelegationGuidanceSection(mode: AgentMode): SystemPromptSec
       '',
       '异步完成后，你会在后续某轮**用户消息开头 `<context>` 块内的 `<notifications>` 标签**里' +
         '看到子代理完成通知（不在系统提示里）；' +
-        '用 `get_sub_agent_status(task_id)` 取完整结果，必要时 `get_sub_agent_intermediate` 看中途进度、' +
+        '用 `get_sub_agent_status(task_id)` 取结果摘要和交付物路径；无法读取路径时用 `get_sub_agent_result` 分页获取；' +
+        '只有用户明确要求抢救其他会话的已知历史任务时，才使用需审批的 `recover_sub_agent_result`，' +
+        '必要时 `get_sub_agent_intermediate` 看中途进度、' +
         '`cancel_sub_agent` 取消跑偏的任务、`list_sub_agents` 查总览。',
       '',
       '**子代理是白纸**：它看不到你的对话历史，task_description 必须自带全部上下文。',

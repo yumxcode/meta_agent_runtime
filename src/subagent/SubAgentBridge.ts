@@ -40,9 +40,15 @@ import type { ISubAgentDispatcher } from './ISubAgentDispatcher.js'
 import type { MetaAgentEvent, MetaAgentTool } from '../core/types.js'
 import type { AutoCostLedger } from '../core/auto/AutoCostLedger.js'
 import { DEFAULT_SUB_AGENT_POOL_BUDGET_USD } from '../infra/budgets.js'
+import { resolvedWorkspaceMutationTools } from './workspaceCapability.js'
 
 const DEFAULT_MAX_CONCURRENT_SUB_AGENTS = 4
 const DEFAULT_MAX_QUEUED_SUB_AGENTS = 64
+
+export type SubAgentStatusLookup =
+  | { kind: 'owned'; record: SubAgentRecord }
+  | { kind: 'foreign' }
+  | { kind: 'not_found' }
 // P2-1: 50 ms is enough to avoid a thundering-herd of simultaneous session
 // constructions while keeping a 4-task fan-out under 200 ms of added latency
 // (was 250 ms → 750 ms for 4 tasks). Raise via META_AGENT_SUB_AGENT_START_DELAY_MS
@@ -307,6 +313,10 @@ export class SubAgentBridge implements ISubAgentDispatcher {
 
   /** Poll timers for non-event-driven tasks. */
   private readonly pollTimers = new Map<SubAgentTaskId, ReturnType<typeof setInterval>>()
+  /** Deduplicate completion-event/status races that both opportunistically finalize. */
+  private readonly finalizePromises = new Map<SubAgentTaskId, Promise<
+    import('../core/auto/AutoWorktreeCoordinator.js').AutoFinalizeResult | undefined
+  >>()
 
   /** Active runners — kept for cancel() calls. */
   private readonly runners = new Map<SubAgentTaskId, SubAgentRunner>()
@@ -625,6 +635,28 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       }
     }
 
+    // Capability invariant: allocating an isolated write worktree without a
+    // resolved local mutation channel can only produce a hollow run. Check the
+    // effective registry (not merely the requested names) before reserving
+    // budget or creating a worktree. Undefined and [] intentionally fail the
+    // same way; shared_readonly remains valid for pure-reasoning workers.
+    if (isolatedWrite) {
+      const mutationTools = resolvedWorkspaceMutationTools(
+        config.allowedTools,
+        this._effectiveToolRegistry(),
+        config.extraTools,
+      )
+      if (mutationTools.length === 0) {
+        const requested = config.allowedTools?.length
+          ? ` Requested: [${config.allowedTools.join(', ')}].`
+          : ''
+        throw new Error(
+          'isolated_write requires at least one resolved workspace mutation tool ' +
+          '(for example apply_patch, write_file, edit_file, or bash).' + requested,
+        )
+      }
+    }
+
     // Internal safety-gate tasks (verify/drift) get a reserved side lane: they
     // bypass the queue-full and total-budget caps so ordinary research/worker
     // sub-agents can never starve the gate that is supposed to police them.
@@ -792,8 +824,9 @@ export class SubAgentBridge implements ISubAgentDispatcher {
   // ── Status queries ──────────────────────────────────────────────────────────
 
   /**
-   * Read the current status of a sub-agent task.
-   * Returns null when the taskId is unknown.
+   * Classify a task lookup without exposing another session's record. This lets
+   * user-facing tools distinguish "missing" from "belongs to another session"
+   * while keeping the owner id, config, prompts and credentials private.
    *
    * This is a pure READ from the caller's perspective: it never throws and never
    * lets a write side-effect break the read. For a completed isolated_write task
@@ -804,16 +837,60 @@ export class SubAgentBridge implements ISubAgentDispatcher {
    * no-op (not an error), and a finalize failure is swallowed — neither must turn
    * a status query into a failed tool call.
    */
-  async getStatus(taskId: SubAgentTaskId): Promise<SubAgentRecord | null> {
-    const record = await readTask(taskId)
+  async lookupStatus(taskId: SubAgentTaskId): Promise<SubAgentStatusLookup> {
+    let record = await readTask(taskId)
+    if (!record) return { kind: 'not_found' }
+    if (record.parentSessionId !== this.parentSessionId) return { kind: 'foreign' }
     if (
-      record?.status === 'completed' &&
+      record.status === 'completed' &&
       record.config.workspaceMode === 'isolated_write' &&
+      !record.result?.integration &&
       this._worktreeCoordinator
     ) {
-      await this._worktreeCoordinator.finalize(taskId).catch(() => undefined)
+      await this._finalizeCompletedWorktree(taskId).catch(() => undefined)
+      record = await readTask(taskId) ?? record
     }
-    return record
+    return { kind: 'owned', record }
+  }
+
+  /** Return an owned task record, or null when it is missing/inaccessible. */
+  async getStatus(taskId: SubAgentTaskId): Promise<SubAgentRecord | null> {
+    const lookup = await this.lookupStatus(taskId)
+    return lookup.kind === 'owned' ? lookup.record : null
+  }
+
+  /** Finalize once and persist the integration contract into the task result. */
+  private async _finalizeCompletedWorktree(
+    taskId: SubAgentTaskId,
+  ): Promise<import('../core/auto/AutoWorktreeCoordinator.js').AutoFinalizeResult | undefined> {
+    const existing = this.finalizePromises.get(taskId)
+    if (existing) return existing
+    const finalize = (async () => {
+      const finalized = await this._worktreeCoordinator?.finalize(taskId)
+      if (!finalized) return undefined
+      await mutateTask(taskId, current => {
+        if (!current?.result) return null
+        return {
+          ...current,
+          result: {
+            ...current.result,
+            integration: {
+              mergeRequired: finalized.mergeRequired,
+              status: finalized.status,
+              ...(finalized.commitHash ? { commitHash: finalized.commitHash } : {}),
+              changedFiles: finalized.changedFiles,
+            },
+          },
+        }
+      })
+      return finalized
+    })()
+    this.finalizePromises.set(taskId, finalize)
+    try {
+      return await finalize
+    } finally {
+      this.finalizePromises.delete(taskId)
+    }
   }
 
   async waitForTerminal(
@@ -840,7 +917,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       }
 
       const readAndSettle = () => {
-        void readTask(taskId).then(settle, () => settle(null))
+        void this.getStatus(taskId).then(settle, () => settle(null))
       }
 
       const onCompleted = (e: SubAgentCompletedEvent) => {
@@ -865,7 +942,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         if (timer.unref) timer.unref()
       }
 
-      void readTask(taskId).then(record => {
+      void this.getStatus(taskId).then(record => {
         if (record && TERMINAL_STATUSES.has(record.status)) settle(record)
       }, () => undefined)
       void initialRunner?.wait().then(readAndSettle, readAndSettle)
@@ -1153,11 +1230,11 @@ export class SubAgentBridge implements ISubAgentDispatcher {
     const record = await readTask(e.taskId).catch(() => null)
     if (record?.config.workspaceMode === 'isolated_write') {
       try {
-        const finalized = await this._worktreeCoordinator?.finalize(e.taskId)
+        const finalized = await this._finalizeCompletedWorktree(e.taskId)
         worktreeSuffix = finalized
           ? ` | worktree: ${finalized.status}` +
             (finalized.commitHash ? ` ${finalized.commitHash.slice(0, 12)}` : '') +
-            '，等待 auto_merge_subagent'
+            (finalized.mergeRequired ? '，等待 auto_merge_subagent' : '，无改动且已回收')
           : ' | worktree finalize unavailable'
       } catch (err) {
         worktreeSuffix =
@@ -1190,7 +1267,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
       if (!worktree) continue
       const task = byId.get(taskId)
       if (task?.status === 'completed') {
-        await coordinator.finalize(taskId).catch(() => undefined)
+        await this._finalizeCompletedWorktree(taskId).catch(() => undefined)
       } else if (
         task?.status === 'failed' ||
         task?.status === 'cancelled' ||
@@ -1297,7 +1374,7 @@ export class SubAgentBridge implements ISubAgentDispatcher {
         let resultLine: string
         if (record.result?.success) {
           if (record.config.workspaceMode === 'isolated_write') {
-            await this._worktreeCoordinator?.finalize(taskId).catch(() => undefined)
+            await this._finalizeCompletedWorktree(taskId).catch(() => undefined)
           }
           const ps = record.result.progressState
           const progressSuffix = ps
